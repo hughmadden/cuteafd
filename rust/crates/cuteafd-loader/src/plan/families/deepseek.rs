@@ -412,6 +412,8 @@ impl DeepSeekModel {
 }
 
 impl FamilyModel for DeepSeekModel {
+    fn contract_admission(&self) -> bool { self.id == "deepseek_v41" }
+
     fn spec(&self) -> &ModelSpec {
         &self.spec
     }

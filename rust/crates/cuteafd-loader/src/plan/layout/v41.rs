@@ -142,10 +142,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if automatic {
         pool.target = pool.target.min(options.target_pool_tokens.max(shape.context_tokens));
     }
+    pool.validate_explicit()?;
     let maximum_pool_tokens = pool.maximum_tokens();
-    // V4.1's context is a dynamic extent: an explicit pool sets the serving
-    // context, so the admitted minimum is the smaller of the two.
-    let context = shape.context_tokens.min(maximum_pool_tokens);
+    let context = shape.context_tokens.max(if automatic { pool.floor } else { 0 });
     let mut working = SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..40).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: slots as u64 };
@@ -191,21 +190,29 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut encoders = encoder_candidates(report, options, &devices[..ranks], &sparks,
         vision_weights, vision_scratch);
     if report.vision == crate::plan::MediaMode::Auto && vision_weights > 0 {
-        // Keep the RTX alternative even when the tower alone exceeds capacity:
-        // the shared contract supplies the phase-specific refusal diagnostic.
-        if !encoders.iter().any(|encoder| matches!(encoder.kind, crate::plan::encoder::EncoderKind::Rtx { .. })) {
-            for encoder in encoder_candidates(report, options, &devices[..ranks], &sparks,
-                vision_weights, vision_scratch) {
-                if matches!(encoder.kind, crate::plan::encoder::EncoderKind::Rtx { .. }) {
-                    encoders.push(encoder);
-                }
-            }
-        }
         encoders.push(crate::plan::encoder::encoder_placement(crate::plan::MediaMode::Off,
             &encoder_hardware(true, &devices[..ranks], &sparks, options), 0, 0, 1));
     }
     if encoders.is_empty() { anyhow::bail!("requested bundled encoder has no executable device"); }
     let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host_facts = admission::HostFacts::prepare(&checkpoint.config,
+        &checkpoint.tensors.iter().map(|tensor| &tensor.meta).collect::<Vec<_>>(),
+        PrefillShape { rows, waves: slots as u64 }, ranks, spark_ranks, context, shape.concurrency,
+        dspark, options.host_cache_bytes, options.host_cache_bytes != Some(0) && turns > 0,
+        256 << 20, host, report.mapped_placement.cap_bytes, Some(report.mapped_placement.host_budget_bytes), options.full_prefill_logits)?;
+    report.mapped_placement = host_facts.mapped.clone();
+    report.bytes_by_owner.remove("host-preloaded");
+    if host_facts.mapped.preloaded_bytes > 0 {
+        report.bytes_by_owner.insert("host-preloaded".into(), host_facts.mapped.preloaded_bytes);
+    }
+    mapped_table_note(report, &mut notes);
+    if notes.iter().any(|note| note.starts_with("embedding placement: host")) {
+        let bytes = checkpoint.tensors.iter().filter(|tensor| tensor.meta.name == "embed.weight")
+            .map(|tensor| tensor.meta.byte_length).sum();
+        physical.push(Owner::host(Category::Embedding, "embedding", bytes).at(Location::PINNED));
+    }
+    physical.extend(host_facts.owners.clone());
+    reserves.extend(host_facts.estimates.clone());
     let budgets = admission::production_budgets(&cards, 0, Some(host), 0,
         &vec![options.spark_bytes; spark_ranks])?;
     let request = admission::production_request(context, options.pool_tokens, onboard,
@@ -241,6 +248,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     prepared.recipe.encoders = encoders.clone();
     prepared.recipe.media_cache_bytes = media_cache_bytes;
     let admitted = prepared.admit(request)?;
+    report.host_ledger = Some(admitted.host_ledger(host_facts.prefix_bytes)?);
     let mut encoder = encoders[admitted.solved.decisions.encoder.context("missing admitted encoder")?].clone();
     if report.vision == crate::plan::MediaMode::Auto && vision_weights > 0
         && encoder.kind == crate::plan::encoder::EncoderKind::Off {

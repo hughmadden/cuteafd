@@ -199,24 +199,14 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
 /// cache configuration or allocation failure must fail startup, not leave a
 /// healthy-looking front door whose worker has already exited.
 pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
-    requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool) -> Result<PrefixCache<'a>> {
+    requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool, admitted: &super::admission::Admitted) -> Result<PrefixCache<'a>> {
     let units = requests.cache().unit_capacity();
     let layout = super::prefix::layout(units, draft, true);
     let mut config = args.host_cache_config()?;
     config.eviction_headroom = crate::shared::prefix::budget::eviction_headroom(layout, args.host_cache_evict_tokens)?;
     if args.host_cache_evict_tokens > 0 { config.eviction_headroom[3] = super::scores::VOCAB as u64 * 4; }
-    if matches!(args.host_cache_bytes, crate::shared::prefix::HostBudget::Auto) {
-        let required = crate::shared::prefix::budget::retained_bytes(layout,
-            args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes)?;
-        let memory = crate::shared::prefix::budget::host_memory()?;
-        config.bytes = crate::shared::prefix::budget::resolve_bytes(layout, None,
-            args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes, memory)?;
-        anyhow::ensure!(config.bytes > 0,
-            "automatic host prefix quota resolves to zero; provide a positive quota or disable host retention explicitly");
-        config.validate()?;
-        tracing::info!(target: "cuteafd::host_cache", required_bytes=required, resolved_bytes=config.bytes,
-            "automatic host cache budget (staging and snapshot overhead excluded from token capacity)");
-    }
+    config.bytes = admitted.host.prefix_bytes;
+    config.validate()?;
     let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: layout.page_rows as u64,
         page_bytes: layout.page_bytes as u64, mark_bytes: layout.mark_bytes as u64,
         draft_bytes: layout.draft_bytes as u64 };
@@ -229,13 +219,6 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
             "host prefix quota holds fewer 50K conversations than concurrency plus four");
     }
     let host = if config.enabled() && args.resolved_prefix_entries() > 0 {
-        let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
-            .context("invalid V4.1 prefill capacity for host logits")?;
-        let logits = cuteafd_core::memory_layout::host_logits_bytes(
-            u64::from(rows), u64::from(rows),
-            super::scores::VOCAB as u64).context("V4.1 host logits reservation overflow")?;
-        crate::shared::memory::budget::admit_host_memory_with_resident_formulas(config.bytes, &requests.engram_host_workspace(),
-            &requests.engram_host_formulas(), logits, 8 << 30)?;
         let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
             &requests.cache().source_buffers(), arenas.owners())?;
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");

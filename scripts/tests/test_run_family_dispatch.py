@@ -1237,6 +1237,8 @@ def capture_v41_real_planner_launch(snapshot: Path, example: Path, binary: Path,
              if " plan " in line and "--deployment" in line and "--pool-tokens" in line]
     assert len(plans) == 1, result.stderr
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    if "KV_POOL_SIZE" in config:
+        assert plans[0][plans[0].index("--kv-pool-size") + 1] == config["KV_POOL_SIZE"]
     assert "prefill reserve does not fit" not in result.stderr
     if not (programs.parent / "V41_FP8_AOT.json").is_file():
         # The CPU gate's placement inputs carry only the exporter manifest; the

@@ -181,21 +181,32 @@ impl EngramPipeline {
         shape: crate::EngramStagingShape,
         preload_cap: u64,
     ) -> Result<Self> {
-        let capacity = shape.rows();
-        // SAFETY: forwarded from this constructor's immutable checkpoint contract.
-        let mut tables = unsafe { [catalog.map_engram(ENGRAM_LAYERS[0] as usize)?,
-            catalog.map_engram(ENGRAM_LAYERS[1] as usize)?] };
-        use crate::formats::mapped_preload::{host_budget_bytes, MappedPlacement, PRELOAD_READERS};
-        let host_budget = host_budget_bytes().unwrap_or_else(|error| {
+        let headers = catalog.tensors().iter().map(|tensor| &tensor.metadata).collect::<Vec<_>>();
+        let budget = crate::formats::mapped_preload::host_budget_bytes().unwrap_or_else(|error| {
             tracing::warn!(%error, "cannot admit mapped table preload; keeping all tables mapped");
             0
         });
-        let host_budget = shape.preload_budget(host_budget, tables[0].row_width());
-        let scales = tables.iter().filter_map(|table| table.scales()).count();
-        let scale_bytes = tables.iter().filter_map(|table| table.scales()).map(|table| table.bytes()).sum();
-        let table_bytes = tables.iter().map(|table| table.weights().bytes()).sum::<u64>() + scale_bytes;
-        let mut placement = MappedPlacement::resolve(2 + scales, scales, scale_bytes, preload_cap, host_budget)
-            .admit_tables(table_bytes);
+        let placement = crate::placement::families::deepseek_v41::admission::HostFacts::mapped_placement(
+            &headers, shape, budget, preload_cap)?;
+        // SAFETY: forwarded immutable checkpoint contract.
+        unsafe { Self::new_admitted(library, catalog, token_map, shape, placement) }
+    }
+
+    /// Consume the table placement already charged by the serving recipe.
+    /// # Safety
+    /// Official checkpoint files remain immutable while mappings/jobs are alive.
+    pub unsafe fn new_admitted(library: &cuteafd_ffi::NativeLibrary, catalog: &OfficialV41Catalog,
+        token_map: EngramTokenMap, shape: crate::EngramStagingShape,
+        mut placement: crate::formats::mapped_preload::MappedPlacement) -> Result<Self> {
+        let capacity = shape.rows();
+        // SAFETY: forwarded immutable checkpoint contract.
+        let mut tables = unsafe { [catalog.map_engram(ENGRAM_LAYERS[0] as usize)?,
+            catalog.map_engram(ENGRAM_LAYERS[1] as usize)?] };
+        use crate::formats::mapped_preload::PRELOAD_READERS;
+        let scale_bytes = placement.scale_bytes;
+        let table_bytes = placement.table_bytes;
+        let preload_cap = placement.cap_bytes;
+        let host_budget = placement.host_budget_bytes;
         let started = std::time::Instant::now();
         if placement.preloaded > 0 {
             if placement.tables_preloaded() {

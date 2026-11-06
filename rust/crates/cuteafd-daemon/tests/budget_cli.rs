@@ -645,7 +645,7 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
         if name == "mimo-v26-flash-mxfp4-min.config" {
             installed_mimo_min_onboarding_matches_smoke(root, &snapshot, &example, &programs);
         }
-        if name.starts_with("deepseek-v41-") || name.starts_with("v41-flash-strided-") {
+        if config.get("MODEL_ID").is_some_and(|id| id.contains("DeepSeek-V4.1")) {
             let temporary = tempfile::tempdir().unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
                 .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");

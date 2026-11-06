@@ -134,7 +134,7 @@ pub fn growth_allowances(total: u64, ranks: usize, gpu: u8) -> Vec<Opaque> {
             bytes: runtime,
             basis: Basis::Estimated,
             lifetime,
-            source: "V4.1 runtime growth reserve".into(),
+            source: "V4.1 runtime growth reserve (estimated; qualified max cards observed 780-854 MiB)".into(),
         });
     }
     if total <= 32 << 30 {
@@ -345,7 +345,7 @@ pub fn cache_owners(
         let fixed_owner = Allocation::buffer(
             format!("v41.kv.fixed.{gpu}"),
             Location::coordinator(gpu as u8),
-            fixed.max(1),
+            fixed,
             Lifetime::TARGET,
             Category::Kv,
             "window state, table headers and compressor carry",
@@ -414,6 +414,142 @@ fn bounded_curve(per_page: u64, tails: u64, cap: u64, maximum: u64) -> Result<By
 
 fn invalid(detail: &str) -> Refusal {
     Refusal::InvalidFact(format!("V4.1 component contract: {detail}"))
+}
+
+/// Header-derived host owners shared by offline planning and the live executor.
+#[derive(Debug, Clone)]
+pub struct HostFacts {
+    pub owners: Vec<Owner>,
+    pub estimates: Vec<Opaque>,
+    pub prefix_bytes: u64,
+    pub mapped: crate::formats::mapped_preload::MappedPlacement,
+    pub push: crate::push_load::PushHostEnvelope,
+}
+
+impl HostFacts {
+    pub fn mapped_placement(headers: &[&crate::SafetensorsTensorMetadata],
+        shape: crate::EngramStagingShape, host_budget: u64, preload_cap: u64)
+        -> anyhow::Result<crate::formats::mapped_preload::MappedPlacement> {
+        use anyhow::{Context, ensure};
+        let table_headers = headers.iter().copied().filter(|h| h.name.contains(".engram.embed.")
+            && h.shape.len() == 2).collect::<Vec<_>>();
+        let first = table_headers.first().context("V4.1 host contract requires Engram headers")?;
+        let stem = first.name.split_once(".engram.embed.").unwrap().0;
+        let row_bytes = if first.name.contains(".engram.embed.strided_") { first.shape[1] } else {
+            table_headers.iter().filter(|h| h.name.starts_with(&format!("{stem}.engram.embed.")))
+                .map(|h| h.shape[1]).sum::<usize>()
+        };
+        ensure!(row_bytes > 0, "V4.1 Engram row width is zero");
+        let scales = table_headers.iter().filter(|h| h.name.ends_with(".scale")).count();
+        let scale_bytes = table_headers.iter().filter(|h| h.name.ends_with(".scale")).map(|h| h.byte_length).sum();
+        let table_bytes = table_headers.iter().map(|h| h.byte_length).sum();
+        Ok(crate::formats::mapped_preload::MappedPlacement::resolve(table_headers.len(), scales,
+            scale_bytes, preload_cap, shape.preload_budget(host_budget, row_bytes))
+            .admit_tables(table_bytes))
+    }
+
+    pub fn prepare(config: &serde_json::Value, headers: &[&crate::SafetensorsTensorMetadata],
+        prefill: PrefillShape, gpus: usize, sparks: usize, context: u64, concurrency: u64,
+        draft: bool, prefix: Option<u64>, prefix_enabled: bool, chunk: u64,
+        host: (u64, u64), preload_cap: u64, preload_budget: Option<u64>, full_logits: bool) -> anyhow::Result<Self> {
+        use anyhow::{Context, ensure};
+        let shape = crate::EngramStagingShape::new(prefill.rows as usize, prefill.waves as usize)?;
+        let mapped = Self::mapped_placement(headers, shape, preload_budget.unwrap_or_else(|| host.1.saturating_sub(host.0 / 10)), preload_cap)?;
+        let row_bytes = headers.iter().find(|h| h.name.contains(".engram.embed."))
+            .map(|h| if h.name.contains("strided_") { h.shape[1] } else {
+                headers.iter().filter(|other| other.name.split_once(".engram.embed.").map(|v| v.0)
+                    == h.name.split_once(".engram.embed.").map(|v| v.0) && other.shape.len() == 2)
+                    .map(|other| other.shape[1]).sum()
+            }).context("V4.1 host contract requires Engram headers")?;
+        let cache = crate::serving_capacity::deepseek_v41_cache_geometry(config, gpus)?;
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: cache.logical_unit_rows,
+            page_bytes: cache.ranks.iter().map(|r| r.persistent_unit_bytes).sum(),
+            mark_bytes: cache.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>()
+                + if draft { 3 * 128 * 528 } else { 0 }, draft_bytes: 0 };
+        ensure!(chunk > 0, "V4.1 host cache chunk must be positive");
+        let prefix_bytes = if prefix_enabled { geometry.resolve(prefix, context, concurrency, host.0, chunk)
+            .context("invalid V4.1 host prefix quota")? } else { 0 };
+        let mut owners = Vec::new();
+        let mut add = |name: &str, bytes: u64, pinned: bool, category| {
+            if bytes > 0 { owners.push(Owner::host(category, name, bytes)
+                .at(if pinned { Location::PINNED } else { Location::HOST })); }
+        };
+        add("v41/engram-prefill", shape.host_resident_bytes() as u64, true, Category::Staging);
+        add("v41/engram-decode", shape.decode_host_resident_bytes() as u64, true, Category::Staging);
+        add("v41/engram-prefill-worker", shape.host_workspace_bytes() as u64, false, Category::Workspace);
+        add("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64, false, Category::Workspace);
+        add("v41/engram-row-cache", shape.cache_bytes(row_bytes) as u64, false, Category::Workspace);
+        add("mapped-tables/preloaded (coordinator local)", mapped.preloaded_bytes, false, Category::Tables);
+        add("workspace/table-read-reactor", crate::formats::mapped_table::table_reactor_workspace_bytes(mapped.mapped) as u64,
+            false, Category::Workspace);
+        add("host prefix cache", prefix_bytes / chunk.max(1) * chunk, true, Category::Prefix);
+        let rows = prefill.rows * prefill.waves;
+        let vocab = config.get("text_config").unwrap_or(config)["vocab_size"].as_u64().context("missing V4.1 vocab")?;
+        add("scoring/full-logits", cuteafd_core::memory_layout::host_logits_bytes(rows.max(256), rows, vocab)
+            .context("host logits overflow")?, false, Category::Workspace);
+        // Estimated upper bounds from the live wire/row metadata allocators, not a measured census.
+        let mut estimates = Vec::new();
+        let mut estimate = |name: &str, bytes: u64, pinned: bool| {
+            estimates.push(Opaque { location: if pinned { Location::PINNED } else { Location::HOST }, bytes,
+                basis: Basis::Estimated, lifetime: Lifetime::RESIDENT, source: format!("{name} (estimated allocator upper bound)") });
+        };
+        let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
+        if sparks > 0 {
+            let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+            let mut ring_bytes = 0;
+            for capacity in [prefill.rows.min(256), prefill.rows.min(256), prefill.rows] {
+                let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: capacity as u32,
+                    ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None };
+                ring_bytes += endpoint.ring_bytes(geometry, rings).context("host transport overflow")? as u64 * sparks as u64;
+            }
+            add("transport/rdma-rings", ring_bytes, true, Category::Transport);
+            let request = geometry.compact_wire_bytes(prefill.rows as u32, false).context("host egress overflow")?.0 as u64;
+            add("transport/egress", request * (prefill.waves + 2), true, Category::Transport);
+            estimate("spark-intake", rows * 5120 * 4 * sparks as u64 * 3, true);
+        }
+        estimate("workspace/router", (prefill.rows + 64) * (5120 * 2 + 8 * 8), false);
+        estimate("staging/tables-and-sync", (prefill.rows + 64) * 5120 * 8 + (2 << 20), true);
+        // Estimated ring-frontier bound: one maximum dense step per receive
+        // slot, not twice the checkpoint. prepare_admitted checks real usage.
+        let dense = 128 * crate::shared::dense_read::STEP_BYTES as u64;
+        let expert = headers.iter().filter(|h| h.name.contains(".ffn.experts.") && h.name.ends_with(".scale"))
+            .map(|h| h.byte_length).sum::<u64>();
+        let push = crate::push_load::PushHostEnvelope::new(vec![expert.saturating_add(1 << 20); gpus], vec![dense; gpus], 128, 1 << 20)?;
+        for allocation in push.allocations("v41.push")? {
+            if allocation.id.ends_with(".dense") {
+                estimates.push(Opaque { location: allocation.location, bytes: allocation.bytes,
+                    basis: Basis::Estimated, lifetime: allocation.lifetime,
+                    source: "V4.1 dense push staging (estimated: 128 slots x 32 MiB maximum step)".into() });
+            } else {
+                owners.push(Owner::host(allocation.category, allocation.group, allocation.bytes)
+                    .at(allocation.location).with_lifetime(allocation.lifetime));
+            }
+        }
+        let _ = full_logits; // The executor retains a full-span scoring plane in both modes.
+        Ok(Self { owners, estimates, prefix_bytes, mapped, push })
+    }
+}
+
+impl AdmittedV41 {
+    /// A projection of the admitted shared host budget, never another admission.
+    pub fn host_ledger(&self, quota: u64) -> Result<cuteafd_core::memory_layout::HostLayout, Refusal> {
+        use cuteafd_core::memory_layout::{HostLayout, Item, ItemLifetime};
+        let budget = self.solved.budgets.iter().find(|b| b.locations.contains(&Location::HOST))
+            .ok_or_else(|| invalid("missing host budget"))?;
+        let available = budget.available()?;
+        let peak = self.solved.phases.iter().filter(|p| p.budget == budget.id)
+            .map(|p| p.owned + p.opaque).max().unwrap_or(0);
+        let mut items = self.solved.items(Location::HOST)?;
+        items.extend(self.solved.items(Location::PINNED)?);
+        items.retain(|item| item.group != "host prefix cache");
+        let ready = items.iter().map(|i| i.bytes).sum::<u64>() + quota;
+        if peak > ready { items.push(Item::new(Category::Staging, "load phase above retained host owners", "", peak - ready,
+            Basis::Exact).with_lifetime(ItemLifetime::ReadyResident)); }
+        Ok(HostLayout { total_bytes: budget.physical_bytes, available_bytes: available,
+            reserve_bytes: budget.headroom, host_budget_bytes: quota,
+            resident_bytes: peak.saturating_sub(quota), deferred_bytes: 0,
+            headroom_bytes: available.saturating_sub(peak), shortfall_bytes: peak.saturating_sub(available), items })
+    }
 }
 
 /// Physical capacity and the operator ceiling are independent inputs. The
@@ -583,7 +719,7 @@ impl V41Recipe<'_> {
         solved: &ResolvedPlan,
     ) -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet), Refusal> {
         use crate::placement::{AttentionClass, ExpertHome, ExpertRange, LayerAssignment, Placement,
-            PoolLimits, SparkWorkingSet, Tp2Range, plan_hops, residual_homes};
+            PoolLimits, Tp2Range, plan_hops, residual_homes};
         let modes = &solved.decisions.attention;
         if !(1..=2).contains(&self.gpus)
             || *modes != self.attention
@@ -1098,6 +1234,7 @@ impl Recipe for V41Recipe<'_> {
                 .variables
                 .push(Variable::Attention { layer, values: vec![mode] });
         }
+        if self.draft.is_some() { contract.variables.push(Variable::DraftHome(vec![(self.gpus - 1) as u8])); }
         let prefill = contract.variables.len();
         contract.variables.push(Variable::Prefill(vec![self.prefill]));
         let lanes = contract.variables.len();

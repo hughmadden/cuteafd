@@ -1,4 +1,4 @@
-//! V4.1 startup ownership guards; all pool/expert decisions use placement::solve.
+//! V4.1 pre-weight facts for the shared planner; execution consumes its one admission.
 pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
@@ -240,26 +240,39 @@ pub(super) fn verify_expert_charges(catalog: &cuteafd_loader::OfficialV41Catalog
 
 /// Startup admission runs before any weight payload or device owner.
 /// Loading-only owners are charged at their sequential phase, not retained in the KV ledger.
+fn validate_owner_modes(args: &crate::cli::NativeServeArgs) -> Result<()> {
+    for (enabled, mode, missing) in [
+        (args.tp2_attention, "--tp2-attention", "replicated attention weights and per-lane workspaces"),
+        (args.tp2_query_projection, "--tp2-query-projection", "query projection weights, load peaks and wave workspaces"),
+        (args.tp2_output_projection, "--tp2-output-projection", "output projection weights, load peaks and wave workspaces"),
+    ] {
+        ensure!(!enabled, "unsupported V4.1 {mode}: pre-weight contract is missing owner facts for {missing}");
+    }
+    Ok(())
+}
+
 pub(super) fn admit_startup(
     lib: &cuteafd_ffi::NativeLibrary,
     catalog: &cuteafd_loader::OfficialV41Catalog,
     args: &crate::cli::NativeServeArgs,
-) -> Result<()> {
+) -> Result<Admitted> {
     use super::*;
+    validate_owner_modes(args)?;
     let (_, total) = lib.cuda_memory_info()?;
+    let ranks = args.rtx_gpus as usize;
     let capacity = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
         .context("invalid V4.1 prefill batch")?;
     use cuteafd_core::memory_layout::{Basis, Category};
     use families::deepseek_v41::{owners, resident};
     let config = serde_json::from_slice(&std::fs::read(catalog.snapshot().join("config.json"))?)?;
     let retained = resident::resident_headers(&config,
-        catalog.tensors().iter().map(|tensor| &tensor.metadata), 1, false)
+        catalog.tensors().iter().map(|tensor| &tensor.metadata), ranks, false)
         .context("unsupported V4.1 native backbone residency")?;
-    let weights = retained.into_iter().next().unwrap().into_iter()
-        .filter(|item| item.category != Category::Embedding
+    let weights = retained.into_iter().enumerate().flat_map(|(rank, items)| items.into_iter().map(move |item| (rank, item)))
+        .filter(|(_, item)| item.category != Category::Embedding
             || embedding_placement(args.embedding_placement, total)
                 == crate::shared::memory::EmbedPlacement::Gpu)
-        .map(|item| Demand::new(0, item.category, item.group, item.bytes, item.basis)
+        .map(|(rank, item)| Demand::new(rank as u8, item.category, item.group, item.bytes, item.basis)
             .with_resident_weights(ResidentWeights(item.bytes)))
         .collect::<Vec<_>>();
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
@@ -268,10 +281,10 @@ pub(super) fn admit_startup(
     let shape = super::AdmittedPrefill::resolve(args)?;
     let passes = shape.waves;
     let mut target = programs.target(u64::from(super::DECODE_LANE_ROWS), shape.reserve_rows() as u64,
-        u64::from(capacity), 1, passes, u64::from(args.concurrency),
+        u64::from(capacity), ranks, passes, u64::from(args.concurrency),
         crate::families::deepseek_v41::v41_tensors::fp8_head(),
-        BackboneExecution::window_batch_enabled())?;
-    validate_engram_rows(&target, shape.reserve_rows(), super::DECODE_LANE_ROWS as usize)?;
+        ranks == 1 && BackboneExecution::window_batch_enabled())?;
+    if ranks == 1 { validate_engram_rows(&target, shape.reserve_rows(), super::DECODE_LANE_ROWS as usize)?; }
     // Test builds retain the materialized query reference buffer; production
     // intentionally has no such owner.
     #[cfg(test)]
@@ -279,20 +292,24 @@ pub(super) fn admit_startup(
         target.push(Demand::new(0, Category::Workspace,
             format!("lane {lane} test query reference"), u64::from(capacity) * 65536, Basis::Formula));
     }
-    let mut startup = vec![owners::vocabulary_load_phase(&weights, &target,
-        VocabularyHead::plan(catalog)? as u64)?];
+    let mut startup = if ranks == 1 { vec![owners::vocabulary_load_phase(&weights, &target,
+        VocabularyHead::plan(catalog)? as u64)?] } else { Vec::new() };
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled());
-    let mut target_owners = owners::TargetOwners::new(weights, target, 1,
+    let mut target_owners = owners::TargetOwners::new(weights, target, ranks,
         owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?, slots)?;
     let draft = if args.dspark {
-        let mut draft =
+        let mut draft = if ranks == 1 {
             crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(
-                lib, catalog, capacity, args.concurrency,
-                if args.dspark_draft_limit > 5 { 7 } else { 5 })?;
+                lib, catalog, capacity, args.concurrency, if args.dspark_draft_limit > 5 { 7 } else { 5 })?
+        } else {
+            crate::shared::memory::device::Device { library: lib, id: 1 }.run(||
+                crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
+                    lib, catalog, capacity, args.concurrency, if args.dspark_draft_limit > 5 { 7 } else { 5 },
+                    args.tp2_dspark_experts, 64640, (slots * 3 * 128 * 528) as usize))?
+        };
+        draft.marks = slots * 3 * 128 * 528;
         startup.extend(target_owners.draft_load_phases(&draft)?);
-        draft.marks = resident::prefix_arena_bytes(slots, true, 1)[0]
-            - resident::prefix_arena_bytes(slots, false, 1)[0];
         Some(draft)
     } else { None };
     if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
@@ -306,22 +323,25 @@ pub(super) fn admit_startup(
         n.checked_add(d.bytes).context("startup fixed-owner overflow"))?;
     let expert_rows = cuteafd_core::coordinator_programs::v41_aot_rows(capacity)
         .context("invalid local expert capacity")?;
-    let experts = if args.rtx_expert_layers == LocalLayers::Count(0) {
-        Vec::new()
-    } else {
-        expert_demands(lib, catalog, expert_rows, 1)?
+    let experts = expert_demands(lib, catalog, expert_rows, ranks)?;
+    let workspace = if ranks == 1 { local_workspace(lib, catalog, args, expert_rows)? } else {
+        let lane = |rows, unit| crate::families::deepseek_v41::v41_experts::tp2_ffn::Storage::storage_bytes(lib, rows, unit, catalog.nvfp4().is_some());
+        (lane(shape.reserve_rows() as u32, capacity)? + 2 * lane(super::DECODE_LANE_ROWS, super::DECODE_LANE_ROWS)?) as u64
     };
-    let workspace = local_workspace(lib, catalog, args, expert_rows)?;
     // Native geometry queries may initialize modules. Observe that CUDA cost
     // only after every query, still before payloads or retained device owners.
-    let (free, total) = measured_pool_memory(lib)?;
-    let pool = resolve_with_owners(args, &[(free, total)], experts, workspace, &[0], 0,
+    let mut memory = Vec::new();
+    for gpu in 0..ranks {
+        lib.cuda_set_device(gpu as i32)?;
+        memory.push(measured_pool_memory(lib)?);
+    }
+    lib.cuda_set_device(0)?;
+    let pool = resolve_with_owners(args, &memory, experts, workspace, &vec![0; ranks], usize::from(ranks == 2),
         &fixed_demands, &startup, draft.as_ref())
-        .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}; reduce the prefill batch or increase coordinator memory"))?;
-    tracing::info!(fixed_owner_bytes=fixed, loading_phases=?startup, owners=?fixed_demands,
-        draft=?draft, admitted_cache_bytes=?pool.cache_bytes,
-        "V4.1 allocation-owner startup admission before weight loads");
-    Ok(())
+        .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}"))?;
+    tracing::info!(fixed_owner_bytes=fixed, admitted_cache_bytes=?pool.cache_bytes,
+        host_ledger=?pool.host_ledger, "V4.1 single allocation-owner startup admission before weight loads");
+    Ok(pool)
 }
 
 /// The Engram upload planes are formula owners, separate from the gates:
@@ -440,6 +460,8 @@ pub(super) struct Admitted {
     pub global_bytes: usize,
     pub reservation_bytes: Vec<usize>,
     pub placement: Placement,
+    pub host: families::deepseek_v41::admission::HostFacts,
+    pub host_ledger: cuteafd_core::memory_layout::HostLayout,
 }
 
 pub(super) fn local_workspace(
@@ -513,7 +535,7 @@ pub(super) fn resolve_with_owners(
             "explicit V4.1 prefix exceeds available expert inventory"
         );
     }
-    let automatic = args.pool_tokens == Some(0);
+    let automatic = PoolPolicy::normalize_request(args.pool_tokens).is_none();
     // A reservation is a logical ceiling; automatic plans keep the 97% and
     // small-card admission margins on top of the sampled free bytes.
     let mut ceilings = Vec::with_capacity(ranks);
@@ -600,6 +622,47 @@ pub(super) fn resolve_with_owners(
     let formats = cuteafd_core::spark_reply::requested();
     let sparks =
         vec![cuteafd_loader::plan::layout::DEFAULT_SPARK_DEVICE_BYTES; args.peers.len()];
+    #[cfg(not(test))]
+    let host_memory = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
+    #[cfg(test)]
+    let host_memory = (1u64 << 40, 1u64 << 40);
+    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let mut host = admission::HostFacts::prepare(&config,
+        &catalog.tensors().iter().map(|tensor| &tensor.metadata).collect::<Vec<_>>(),
+        prefill, ranks, args.peers.len(), args.max_context_tokens as u64, args.concurrency as u64,
+        args.dspark, match args.host_cache_bytes { crate::shared::prefix::HostBudget::Auto => None,
+            crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes) },
+        args.host_cache_bytes.enabled() && args.resolved_prefix_entries() > 0, args.host_cache_chunk_bytes,
+        host_memory, cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?, None, false)?;
+    if embedding_placement(args.embedding_placement, memory[0].1) == crate::shared::memory::EmbedPlacement::Host {
+        let bytes = catalog.tensors().iter().filter(|tensor| tensor.metadata.name == "embed.weight")
+            .map(|tensor| tensor.metadata.byte_length).sum();
+        retained.push(Owner::host(Category::Embedding, "embedding", bytes)
+            .at(cuteafd_loader::placement::planner::Location::PINNED));
+    }
+    #[cfg(not(test))]
+    if catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none() {
+        use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, WholeOwner}};
+        let owners = (0..ranks).map(|rank| WholeOwner { rank, budget: usize::MAX,
+            selections: (0..40).map(|layer| if ranks == 1 { ExpertLayer::BackboneFull { layer } }
+                else { ExpertLayer::BackboneTp2 { layer, rank } })
+                .chain((0..if args.dspark && ranks == 2 { 3 } else { 0 })
+                    .map(|stage| ExpertLayer::DsparkTp2 { stage, rank })).collect() }).collect();
+        let actual = CoordinatorExperts::Native { owners }.host_envelope(&catalog, ranks, &[])?;
+        host.push.validate_usage(&actual)?;
+        host.push.expert_bytes = actual.expert_bytes;
+        host.push.retained_bytes = actual.retained_bytes;
+        host.owners.retain(|owner| !owner.group.starts_with("coordinator push "));
+        for owner in host.push.allocations("v41.push")?.into_iter().filter(|owner| !owner.id.ends_with(".dense")) {
+            host.owners.push(Owner::host(owner.category, owner.group, owner.bytes)
+                .at(owner.location).with_lifetime(owner.lifetime));
+        }
+    }
+    retained.extend(host.owners.clone());
+    allowances.extend(host.estimates.clone());
+    let mut budgets = live_budgets(&cards, &sparks)?;
+    budgets.extend(admission::production_budgets(&cards.iter().map(|&(total, ceiling, _)| (total, ceiling)).collect::<Vec<_>>(),
+        0, Some(host_memory), 0, &[])?.into_iter().filter(|budget| budget.locations.contains(&cuteafd_loader::placement::planner::Location::HOST)));
     let input = ProductionInput {
         config: &config,
         gpus: ranks,
@@ -623,7 +686,7 @@ pub(super) fn resolve_with_owners(
         resident_weight_limit: limit,
         spark_reply_formats: formats,
         operation: Operation::Serving,
-        budgets: live_budgets(&cards, &sparks)?,
+        budgets,
     };
     let request = production_request(
         context,
@@ -634,7 +697,9 @@ pub(super) fn resolve_with_owners(
         limit,
         formats,
     );
-    let placement = input.prepare()?.admit(request)?.placement;
+    let admitted = input.prepare()?.admit(request)?;
+    let host_ledger = admitted.host_ledger(host.prefix_bytes)?;
+    let placement = admitted.placement;
     let groups = usize::try_from(placement.pool_tokens.div_ceil(512) + tails)?;
     let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
         &config,
@@ -655,6 +720,7 @@ pub(super) fn resolve_with_owners(
         );
     }
     Ok(Admitted {
+        host, host_ledger,
         pages: [groups, groups, groups, 2 * groups],
         cache_bytes: exact
             .into_iter()
@@ -707,49 +773,6 @@ pub(super) fn expert_demands(
 
 /// Charge all occupancy arriving after the context/module inventory, including
 /// lazy module growth, not just the tracked weight allocations.
-pub(super) fn admission_memory(
-    lib: &cuteafd_ffi::NativeLibrary,
-    inventory: &crate::shared::inventory::RuntimeInventory,
-) -> Result<Vec<(usize, usize)>> {
-    let current = lib.cuda_get_device()?;
-    let sampled = (|| -> Result<Vec<_>> {
-        inventory
-            .gpus
-            .iter()
-            .map(|g| {
-                lib.cuda_set_device(g.device)?;
-                measured_pool_memory(lib)
-            })
-            .collect()
-    })();
-    lib.cuda_set_device(current)?;
-    let sampled = sampled?;
-    let loaded = inventory
-        .gpus
-        .iter()
-        .zip(&sampled)
-        .map(|(g, (free, _))| g.free_bytes.saturating_sub(*free as u64))
-        .collect::<Vec<_>>();
-    let baselines = inventory.baselines(&loaded);
-    let free = baselines
-        .iter()
-        .map(|(_, baseline)| match baseline {
-            Baseline::Measured { free_bytes } => *free_bytes,
-            _ => unreachable!(),
-        })
-        .collect::<Vec<_>>();
-    inventory.record("deepseek_v41", &free);
-    baselines
-        .into_iter()
-        .map(|(total, baseline)| match baseline {
-            Baseline::Measured { free_bytes } => {
-                Ok((usize::try_from(free_bytes)?, usize::try_from(total)?))
-            }
-            _ => unreachable!(),
-        })
-        .collect()
-}
-
 /// Bind target modules before the inventory sample and first immutable weight upload.
 pub(super) fn preload(
     lib: &cuteafd_ffi::NativeLibrary,
@@ -845,6 +868,9 @@ mod admission_tests {
     use clap::Parser;
 
     fn args(directory: &std::path::Path) -> crate::cli::NativeServeArgs {
+        if !directory.join("model.safetensors.index.json").exists() {
+            cuteafd_loader::plan::testing::write_v41_snapshot(directory);
+        }
         let cli = crate::cli::Cli::try_parse_from([
             "cuteafd",
             "serve-native",
@@ -1254,6 +1280,40 @@ mod admission_tests {
         args.prefix_cache_entries = 20;
         assert!(resolve(&args, &[(97usize << 30, 96usize << 30)], no_experts(), 0, &[0], 0, None).is_err());
         assert!(resolve(&args, &[(0, 0)], no_experts(), 0, &[0], 0, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_tp2_modes_name_the_missing_preweight_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = args(dir.path());
+        validate_owner_modes(&args).unwrap();
+        for mode in ["--tp2-attention", "--tp2-query-projection", "--tp2-output-projection"] {
+            args.tp2_attention = mode == "--tp2-attention";
+            args.tp2_query_projection = mode == "--tp2-query-projection";
+            args.tp2_output_projection = mode == "--tp2-output-projection";
+            let error = validate_owner_modes(&args).unwrap_err().to_string();
+            assert!(error.contains(mode) && error.contains("missing owner facts"), "{error}");
+        }
+    }
+
+    #[test]
+    fn omitted_and_zero_pool_consume_identical_live_admission() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut args = args(dir.path());
+        args.rtx_expert_layers = LocalLayers::Count(0);
+        args.max_context_tokens = 262_144;
+        for ranks in [1, 2] {
+            args.rtx_gpus = ranks as u32;
+            let memory = vec![(80usize << 30, 96usize << 30); ranks];
+            args.pool_tokens = None;
+            let omitted = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
+            args.pool_tokens = Some(0);
+            let zero = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
+            assert_eq!(omitted.placement, zero.placement);
+            assert_eq!(omitted.reservation_bytes, zero.reservation_bytes);
+            assert_eq!(omitted.host_ledger, zero.host_ledger);
+        }
         Ok(())
     }
 
