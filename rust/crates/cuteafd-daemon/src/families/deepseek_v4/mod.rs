@@ -466,7 +466,6 @@ pub(crate) fn with_engine<T>(
         .map(|value| value.parse::<u64>().context("CUTEAFD_PREFILL_SPAN_ROWS must be an integer")).transpose()?;
     let prefill = args.prefill_shape(prefill_kernel_rows as u64, span_rows)?;
     let prefill_rows = usize::try_from(prefill.unit_rows)?;
-    cuteafd_bench::context::ResolvedSettings::prefill(prefill).publish();
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)

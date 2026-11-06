@@ -117,6 +117,9 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
             engine_args.draft_sequences, max_sequences, None));
     }
     cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
+    cuteafd_bench::context::set_resolved("draft-fp8", if engine_args.draft.is_some() {
+        if engine_args.draft_fp8 == Some(false) { "false" } else { "true" }
+    } else { "unused" });
     if let Some(slots) = engine_args.draft_context_slots {
         cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
     }

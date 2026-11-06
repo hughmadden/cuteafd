@@ -252,7 +252,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             Duration::from_secs(120),
         )
     };
-    let attention_plan = super::attention_plan(args)?;
+    let attention_plan = super::attention_plan(&args)?;
     let mut pass = make_pass(decode_rows).context("constructing first distributed decode lane")?;
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;

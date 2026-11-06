@@ -54,6 +54,16 @@ def registry():
     return rules
 
 
+def rewritten_fields(code):
+    """Direct/mutating writes and destructuring writes to parsed argument objects."""
+    target = r'\b(?:args|engine_args|resolved|selected_args|context_args)\.(?:\w+\.)*(\w+)'
+    for match in re.finditer(target + r'\s*(?:=(?!=)|\.(?:clear|take|get_or_insert|push)\()', code):
+        yield match[1], match.start()
+    for assignment in re.finditer(r'\(([^();]*?)\)\s*=(?!=)', code):
+        for match in re.finditer(target, assignment[1]):
+            yield match[1], assignment.start(1) + match.start()
+
+
 def test_every_rewritten_serve_argument_is_marked_derived():
     rules = registry()
     common = {}
@@ -70,18 +80,16 @@ def test_every_rewritten_serve_argument_is_marked_derived():
         derived = rules[None] | rules.get(directory.name, set())
         for path, (_, code) in sources.items():
             # Only parsed argument objects: engine state and request fields are not launch options.
-            rewrite = r'\b(?:args|engine_args|resolved|selected_args|context_args)\.(?:\w+\.)*(\w+)\s*(?:=(?!=)|\.(?:clear|take|get_or_insert|push)\()'
-            for match in re.finditer(rewrite, code):
-                field = match[1]
+            for field, offset in rewritten_fields(code):
                 if field not in fields:
                     continue
                 # These are diagnostic-only commands, never dispatched by serve.
-                functions = list(re.finditer(r'\bfn\s+(\w+)\s*(?:<[^\n]*>)?\(', code[:match.start()]))
+                functions = list(re.finditer(r'\bfn\s+(\w+)\s*(?:<[^\n]*>)?\(', code[:offset]))
                 function = functions[-1][1] if functions else None
                 if path.name in {'packed_check.rs', 'golden.rs'} or function in {'golden', 'run_golden'} or field == 'nll':
                     continue
                 if fields[field] not in derived:
-                    line = code.count('\n', 0, match.start()) + 1
+                    line = code.count('\n', 0, offset) + 1
                     missing.append(f'{path.relative_to(ROOT)}:{line}: {fields[field]}')
     assert not missing, 'mark rewritten serve arguments in DERIVED_ARGUMENTS:\n' + '\n'.join(missing)
 
@@ -96,6 +104,8 @@ fn later() { args.max_context = 512; }'''
     assert 'args.rings = 16' in code
     assert 'args.rings = 2' not in code
     assert 'args.max_context = 512' in code
+    assert list(rewritten_fields('(engine_args.draft_context_slots, engine_args.draft_sequences) = capacity();')) == [
+        ('draft_context_slots', 1), ('draft_sequences', 34)]
 
 
 def test_registry_names_have_runtime_publication_and_family_seam_coverage():
