@@ -476,6 +476,7 @@ mod tests {
         let total = 96 << 30;
         let budgets = admission::live_budgets(&vec![(total, total, free); ranks], &vec![64 << 30; 4])?;
         let input = ProductionInput {
+            expert_usage: false,
             config, gpus: ranks, context, maximum_pool_tokens: pool.unwrap_or(2 << 20),
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency, retained_turns: turns,
             replicated, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
@@ -487,6 +488,69 @@ mod tests {
         let request = production_request(context, pool, onboard, PrefillShape { rows: 128, waves: 1 },
             Operation::Serving, u64::MAX, Default::default());
         input.prepare()?.admit(request)
+    }
+
+    #[test]
+    fn expert_usage_is_admitted_once_per_canonical_ced_router() -> anyhow::Result<()> {
+        use crate::placement::planner::{ComponentKind, Recipe};
+        let config = config();
+        for ranks in [1, 2] {
+            for enabled in [false, true] {
+                let prepared = ProductionInput {
+                    expert_usage: enabled, config: &config, gpus: ranks, context: 512,
+                    maximum_pool_tokens: 4096, prefill: PrefillShape { rows: 128, waves: 1 },
+                    concurrency: 1, retained_turns: 0, replicated: false, spark_ranks: 4,
+                    onboard_minimum: 0, onboard_counts: None, experts: vec![cost(ranks); 40],
+                    workspace: 0, owners: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
+                    draft: None, encoders: Vec::new(), media_cache_bytes: 0,
+                    resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+                    operation: Operation::Serving,
+                    budgets: admission::live_budgets(&vec![(96 << 30, 96 << 30, 96 << 30); ranks],
+                        &vec![64 << 30; 4])?,
+                }.prepare()?;
+                let request = production_request(512, Some(4096), Onboard::Layers(0),
+                    PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
+                let contract = prepared.recipe.prepare(&request)?;
+                let mut found = std::collections::BTreeSet::new();
+                for component in &contract.components {
+                    let ComponentKind::Allocation { template, .. } = &component.kind else { continue; };
+                    if !template.id.starts_with("expert-usage.") { continue; }
+                    assert!(found.insert(template.id.clone()));
+                    assert_eq!(component.bytes.at(1)?, component.bytes.at(contract.maximum_pages)?);
+                    if template.id == "expert-usage.history" {
+                        assert_eq!(template.location, Location::HOST);
+                        assert_eq!(template.bytes, prepared.recipe.expert_usage.as_ref().unwrap()
+                            .host_bytes(ranks).unwrap() as u64);
+                    } else {
+                        assert_eq!(template.bytes, 40 * 384 * 2 * 8);
+                        let gpu = template.id.split('.').nth(1).unwrap().trim_start_matches("gpu").parse::<u8>()?;
+                        assert!(usize::from(gpu) < ranks);
+                        assert_eq!(template.location, if template.id.ends_with("pinned") {
+                            Location::PINNED
+                        } else { Location::coordinator(gpu) });
+                    }
+                }
+                assert_eq!(found.len(), if enabled { ranks * 3 + 1 } else { 0 });
+                let admitted = prepared.admit(request)?;
+                assert_eq!(admitted.expert_usage.is_some(), enabled);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expert_usage_geometry_comes_from_checkpoint_and_refuses_invalid_headers() {
+        let mut config = config();
+        let geometry = admission::expert_usage_geometry(&config).unwrap();
+        assert_eq!((geometry.layers, geometry.experts, geometry.topk), (40, 384, 6));
+        assert_eq!(geometry.routed_layers, (0..40).collect::<Vec<_>>());
+        assert_eq!(admission::expert_usage_geometry(&config["text_config"]).unwrap(), geometry);
+        for (key, value) in [("n_routed_experts", 0), ("num_experts_per_tok", 385), ("num_hidden_layers", 39)] {
+            let old = config["text_config"][key].take();
+            config["text_config"][key] = serde_json::json!(value);
+            assert!(admission::expert_usage_geometry(&config).is_err(), "{key}");
+            config["text_config"][key] = old;
+        }
     }
 
     #[test]
@@ -566,6 +630,7 @@ mod tests {
         let cards = vec![(96u64 << 30, 96u64 << 30, 64 << 20); 2];
         let budgets = admission::live_budgets(&cards, &vec![1 << 30; 4])?;
         let input = ProductionInput {
+            expert_usage: false,
             config: &config, gpus: 2, context: 262_144, maximum_pool_tokens: 2 << 20,
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,

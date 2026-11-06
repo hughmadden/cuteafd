@@ -1232,6 +1232,11 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// Count executed backbone expert routes by prefill/decode phase.
+    #[arg(long)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// V4.1 has a fixed pair of decode views; 1 is unsupported.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,

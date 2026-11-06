@@ -455,6 +455,7 @@ mod startup_tests {
 /// One shared decision before cache or conditional routed weights are allocated.
 /// `memory` is the context/module inventory less subsequent live owners.
 pub(super) struct Admitted {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub pages: [usize; 4],
     pub cache_bytes: Vec<usize>,
     pub global_bytes: usize,
@@ -653,6 +654,7 @@ pub(super) fn resolve_with_owners(
     budgets.extend(admission::production_budgets(&cards.iter().map(|&(total, ceiling, _)| (total, ceiling)).collect::<Vec<_>>(),
         0, Some(host_memory), 0, &[])?.into_iter().filter(|budget| budget.locations.contains(&cuteafd_loader::placement::planner::Location::HOST)));
     let input = ProductionInput {
+        expert_usage: args.expert_usage_enabled()?,
         config: &config,
         gpus: ranks,
         context,
@@ -709,6 +711,7 @@ pub(super) fn resolve_with_owners(
         );
     }
     Ok(Admitted {
+        expert_usage: admitted.expert_usage,
         host, host_ledger,
         pages: [groups, groups, groups, 2 * groups],
         cache_bytes: exact
