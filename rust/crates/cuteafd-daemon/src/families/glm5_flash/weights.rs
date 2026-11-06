@@ -1,7 +1,7 @@
 //! GLM 5.3 Flash coordinator weights, packed for the exported glmf_* programs.
 //!
-//! The MLA (`q_a|kv_a`, `q_b`, `o_proj`), dense and shared-expert projections
-//! are FP8 only: the primary checkpoint's E4M3 bytes and FP32 128x128 block
+//! Legacy MLA, dense and shared-expert projections use FP8:
+//! the primary checkpoint's E4M3 bytes and FP32 128x128 block
 //! scales, or 128x128 blocks quantized from its BF16 at load (the BF16 is
 //! never resident). Every other matrix operand is BF16, except where an FP8
 //! representation is selected instead: the KDA in/out projections
@@ -54,6 +54,7 @@ pub(crate) struct GlmfLayer<'a> {
     pub split: bool,
     pub attention_share: AttentionShare,
     pub(crate) core: std::collections::BTreeMap<String, crate::shared::dense_trellis::CoreWeights<'a>>,
+    pub(crate) attention_native: std::collections::BTreeMap<String, NativeAttention<'a>>,
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
     pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
@@ -90,11 +91,88 @@ impl GlmfLayer<'_> {
         self.operands.values().map(|a| a.buffer.bytes).sum::<usize>()
             + self.core.values().map(|w| w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes).sum::<usize>()
             + self.native.values().map(|w| w.buffer.bytes).sum::<usize>()
+            + self.attention_native.values().map(|w| w.values.buffer.bytes
+                + w.scales.as_ref().map_or(0, |s| s.buffer.bytes)).sum::<usize>()
     }
 
     pub fn native(&self, key: &str) -> Result<CuteafdDeviceBuffer> {
         Ok(self.native.get(key).with_context(|| format!("layer has no native operand {key}"))?.buffer)
     }
+}
+
+pub(crate) struct NativeAttention<'a> {
+    pub layout: cuteafd_loader::families::glm5_flash::core::NativeLayout,
+    pub values: DeviceAllocation<'a>,
+    pub scales: Option<DeviceAllocation<'a>>,
+}
+
+/// Shared mount/push recipe, inspectable on CPU without creating a CUDA owner.
+/// Native FP8 lands verbatim; only selected BF16 in fp8-compact is quantized.
+pub(crate) enum AttentionRecord {
+    Operand(crate::shared::experts::rtx::dense::Operand),
+    Step(crate::shared::experts::rtx::dense::Step),
+}
+
+pub(crate) fn attention_records(snapshot: &std::path::Path,
+    selected: &cuteafd_loader::plan::checkpoint::SelectedProjection,
+    mode: cuteafd_loader::plan::checkpoint::AttentionMode,
+    layout: &cuteafd_loader::families::glm5_flash::core::NativeLayout,
+    rule: crate::shared::fp8_linear::Fp8Scales, values: CuteafdDeviceBuffer,
+    scales: Option<CuteafdDeviceBuffer>) -> Result<Vec<AttentionRecord>> {
+    use cuteafd_loader::{families::glm5_flash::core::CoreSplit,
+        plan::checkpoint::{AttentionMode, ProjectionStorage}};
+    use crate::shared::experts::rtx::dense::{Operand, Step, windows};
+    let ProjectionStorage::Native { dtype, shape } = &selected.storage else {
+        anyhow::bail!("{}: native recipe received trellis", layout.stem);
+    };
+    ensure!(shape.len() == 2 && matches!(dtype, DType::Bf16 | DType::F8E4M3), "native attention source geometry");
+    let fp8 = *dtype == DType::F8E4M3 || mode == AttentionMode::Fp8Compact;
+    ensure!(fp8 == layout.fp8 && layout.ranks > 0 && layout.rank < layout.ranks,
+        "native attention recipe differs from selected mode");
+    let [n, k] = layout.shape;
+    let (rows, cols) = match layout.split {
+        CoreSplit::Output => (layout.rank*n..(layout.rank+1)*n, 0..k),
+        CoreSplit::Input => (0..n, layout.rank*k..(layout.rank+1)*k),
+        CoreSplit::Whole => (0..n, 0..k),
+    };
+    ensure!(rows.end <= shape[0] && cols.end <= shape[1]
+        && rows.len() == n && cols.len() == k, "native attention source slice");
+    let source = |name: &str, rows: std::ops::Range<usize>, cols: std::ops::Range<usize>, width: usize| -> Result<Rect> {
+        let t = selected.tensors.iter().find(|t| t.meta.name == name).context("native attention selected tensor missing")?;
+        ensure!(t.meta.shape.len() == 2 && rows.end <= t.meta.shape[0] && cols.end <= t.meta.shape[1],
+            "{name}: native rectangle outside selected tensor");
+        Ok(Rect { name: name.into(), path: snapshot.join(&t.shard), base: t.meta.byte_offset,
+            row_bytes: t.meta.shape[1]*width, rows, cols: cols.start*width..cols.end*width })
+    };
+    ensure!(values.bytes >= n*k*if fp8 { 1 } else { 2 }, "native attention values extent");
+    let weight = format!("{}.weight", layout.stem);
+    let device = values.device_id;
+    if !fp8 {
+        ensure!(scales.is_none(), "BF16 attention has scale allocation");
+        return Ok(vec![AttentionRecord::Operand(Operand { device, buffer: values,
+            lands: vec![(source(&weight, rows, cols, 2)?, 0)], bytes: n*k*2 })]);
+    }
+    ensure!(n%128 == 0 && k%128 == 0, "native attention whole FP8 blocks");
+    let grid = scales.context("native attention FP8 scale allocation missing")?;
+    ensure!(grid.device_id == device && grid.bytes >= n/128*(k/128)*4, "native attention scale extent");
+    if *dtype == DType::F8E4M3 {
+        return Ok(vec![AttentionRecord::Operand(Operand { device, buffer: values,
+            lands: vec![(source(&weight, rows.clone(), cols.clone(), 1)?, 0)], bytes: n*k }),
+            AttentionRecord::Operand(Operand { device, buffer: grid, lands: vec![(source(&format!("{weight}_scale_inv"),
+                rows.start/128..rows.end/128, cols.start/128..cols.end/128, 4)?, 0)], bytes: n/128*(k/128)*4 })]);
+    }
+    let rule = if mode == AttentionMode::Fp8Compact { crate::shared::fp8_linear::Fp8Scales::Amax } else { rule };
+    let whole = source(&weight, rows, cols, 2)?;
+    windows(&[whole], 128)?.into_iter().map(|(rects, rows)| {
+        let target = Target {
+            q: CuteafdDeviceBuffer { ptr: values.ptr.wrapping_byte_add(rows.start*k), bytes: rows.len()*k, ..values },
+            q_stride: k,
+            scales: CuteafdDeviceBuffer { ptr: grid.ptr.wrapping_byte_add(rows.start/128*(k/128)*4),
+                bytes: rows.len()/128*(k/128)*4, ..grid }, kmajor: None,
+        };
+        Ok(AttentionRecord::Step(Step { device, rects, jobs: vec![Job::Quant { rows: 0..rows.len(), pitch: k,
+            col0: 0, cols: k, layout: crate::shared::fp8_load_quant::Layout::Block, rule, target }] }))
+    }).collect()
 }
 
 pub(crate) struct GlmfWeights<'a> {
@@ -707,6 +785,7 @@ impl<'a> GlmfLoader<'a> {
             "native Flash FFNs retain intermediate ownership");
         let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(gpu), _ => None };
         let layouts = inventory.layer_weights(cfg, layer, ranks, owner)?;
+        let native_layouts = inventory.layer_native(cfg, layer, ranks, owner)?;
         let attention_shares = AttentionShare::bind(mode, ranks)?;
         let p = format!("{PREFIX}layers.{layer}");
         let a = |leaf: &str| format!("{p}.self_attn.{leaf}");
@@ -775,12 +854,31 @@ impl<'a> GlmfLoader<'a> {
                 }
             }
         }
-        ops.into_iter().zip(attention_shares).zip(layouts).enumerate().map(|(rank, ((operands, attention_share), layouts))| {
+        ops.into_iter().zip(attention_shares).zip(layouts.into_iter().zip(native_layouts)).enumerate()
+            .map(|(rank, ((operands, attention_share), (layouts, native_layouts)))| {
             let expected = if owner.is_some_and(|owner| usize::from(owner) != rank) { 3 } else { 7 };
-            ensure!(layouts.len() == expected, "native Flash requires complete attention and FFN operator groups");
+            ensure!(layouts.len() + native_layouts.len() == expected,
+                "native Flash requires complete attention and FFN operator groups");
+            let attention_native = native_layouts.into_iter().map(|(name, layout)| {
+                let selected = self.checkpoint.projection(&layout.stem)?;
+                let [n,k] = layout.shape;
+                let (values, scales) = self.on_rank(rank, || Ok((
+                    DeviceAllocation::new(self.library, (n*k*if layout.fp8 { 1 } else { 2 }).max(256))?,
+                    if layout.fp8 { Some(DeviceAllocation::new(self.library, (n/128*(k/128)*4).max(256))?) } else { None }
+                )))?;
+                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.attention_mode(),
+                    &layout, self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
+                for record in records {
+                    match record {
+                        AttentionRecord::Operand(record) => self.dense.operand(record)?,
+                        AttentionRecord::Step(record) => self.dense.step(record, self.rank_stream(rank)?)?,
+                    }
+                }
+                Ok((name, NativeAttention { layout, values, scales }))
+            }).collect::<Result<_>>()?;
             let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
                 .collect::<Result<_>>()?;
-            Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands,
+            Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands, attention_native,
                 native: HashMap::new(), native_projections: HashMap::new() })
         }).collect()
     }
@@ -875,7 +973,7 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
         Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole,
-            core: Default::default(), operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
+            core: Default::default(), attention_native: Default::default(), operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -1267,7 +1365,7 @@ impl<'a> GlmfLoader<'a> {
                 &[format!("{p}.mlp.gate.e_score_correction_bias")]))?);
         }
         Ok(ops.into_iter().zip(attention_shares).map(|(operands, attention_share)|
-            GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(), operands,
+            GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(), attention_native: Default::default(), operands,
                 native: HashMap::new(), native_projections: HashMap::new() }).collect())
     }
 
@@ -1343,7 +1441,7 @@ impl<'a> GlmfLoader<'a> {
                     }
                     Ok(GlmfLayer { attention, dense, split: self.ranks() == 2, attention_share, operands, native,
                         native_projections: source.projections.iter().map(|(&name, (projection, _))| (name, projection.clone())).collect(),
-                        core: Default::default() })
+                        core: Default::default(), attention_native: Default::default() })
                 })?;
                 share.push(part);
             }
@@ -1411,6 +1509,68 @@ mod tests {
     use crate::shared::peer_split::{slice_2d, Axis};
 
     #[test]
+    fn selected_attention_records_preserve_tp_slices_and_fp8_recipe() -> anyhow::Result<()> {
+        use super::{attention_records, AttentionRecord};
+        use cuteafd_loader::{plan::checkpoint::{SelectedProjection, ProjectionStorage, AttentionMode,
+            CheckpointTensor}, SafetensorsTensorMetadata, families::glm5_flash::core::{NativeLayout, CoreSplit}};
+        use cuteafd_ffi::CuteafdDeviceBuffer;
+        use cuteafd_core::DType;
+        use crate::shared::experts::rtx::dense::Job;
+        let buffer = |bytes| CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), bytes, device_id: 0, flags: 0 };
+        for split in [CoreSplit::Input, CoreSplit::Output] {
+            for rank in 0..2 {
+                for dtype in [DType::Bf16, DType::F8E4M3] {
+                    for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+                        let stem = "model.language_model.layers.3.self_attn.o_proj";
+                        let fp8 = dtype == DType::F8E4M3 || mode == AttentionMode::Fp8Compact;
+                        let shape = if split == CoreSplit::Input { [256, 512] } else { [512, 256] };
+                        let tensor = |name: String, dtype: DType, shape: Vec<usize>, width| CheckpointTensor {
+                            shard: "selected.safetensors".into(), meta: SafetensorsTensorMetadata {
+                                name, dtype, byte_offset: 100, byte_length: shape.iter().product::<usize>() as u64*width,
+                                shape } };
+                        let mut tensors = vec![tensor(format!("{stem}.weight"), dtype.clone(), shape.to_vec(),
+                            if dtype == DType::Bf16 { 2 } else { 1 })];
+                        if dtype == DType::F8E4M3 { tensors.push(tensor(format!("{stem}.weight_scale_inv"),
+                            DType::F32, vec![shape[0]/128,shape[1]/128],4)); }
+                        let selected = SelectedProjection { storage: ProjectionStorage::Native {
+                            dtype: dtype.clone(), shape: shape.to_vec() }, tensors, source_bytes: 0 };
+                        let layout = NativeLayout { stem: stem.into(), shape: [256,256], fp8, rank, ranks: 2, split };
+                        let records = attention_records(std::path::Path::new("/selected"), &selected, mode, &layout,
+                            Fp8Scales::Pow2, buffer(256*256*2), fp8.then(|| buffer(256)),)?;
+                        let expected_rows = if split == CoreSplit::Output { rank*256..(rank+1)*256 } else { 0..256 };
+                        let expected_col = if split == CoreSplit::Input { rank*256 } else { 0 };
+                        if dtype == DType::Bf16 && fp8 {
+                            assert_eq!(records.len(),1);
+                            let AttentionRecord::Step(step) = &records[0] else { panic!("missing quant step") };
+                            assert_eq!(step.rects[0].rows,expected_rows);
+                            assert_eq!(step.rects[0].cols,expected_col*2..(expected_col+256)*2);
+                            let Job::Quant { rule, layout, pitch, col0, cols, target, .. } = &step.jobs[0]
+                                else { panic!("missing quant job") };
+                            assert_eq!(*rule,Fp8Scales::Amax);
+                            assert_eq!(*layout,crate::shared::fp8_load_quant::Layout::Block);
+                            assert_eq!((*pitch,*col0,*cols),(256,0,256));
+                            assert_eq!(target.q_stride,256);
+                        } else {
+                            assert_eq!(records.len(),if fp8 { 2 } else { 1 });
+                            let AttentionRecord::Operand(operand) = &records[0] else { panic!("unexpected transform") };
+                            let width = if fp8 { 1 } else { 2 };
+                            assert_eq!(operand.lands[0].0.rows,expected_rows.clone());
+                            assert_eq!(operand.lands[0].0.cols,expected_col*width..(expected_col+256)*width);
+                            assert_eq!(operand.lands[0].0.path,std::path::Path::new("/selected/selected.safetensors"));
+                            if fp8 {
+                                let AttentionRecord::Operand(scales) = &records[1] else { panic!("scale transform") };
+                                assert_eq!(scales.lands[0].0.rows,expected_rows.start/128..expected_rows.end/128);
+                                assert_eq!(scales.lands[0].0.cols,expected_col/128*4..(expected_col+256)/128*4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn split_reads_bf16_blocks_without_a_companion_or_scale_tensors() {
         use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
         use cuteafd_loader::SafetensorsTensorMetadata;
@@ -1423,7 +1583,7 @@ mod tests {
             }
         }
         std::fs::write(dir.path().join("weights.bin"), &bytes).unwrap();
-        let checkpoint = Checkpoint { snapshot: dir.path().into(), config: serde_json::json!({}),
+        let checkpoint = Checkpoint { view: None, snapshot: dir.path().into(), config: serde_json::json!({}),
             quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: bytes.len() as u64,
             tensors: vec![CheckpointTensor { shard: "weights.bin".into(), meta: SafetensorsTensorMetadata {
                 name: "projection.weight".into(), dtype: cuteafd_core::DType::Bf16, shape: vec![256, 256],

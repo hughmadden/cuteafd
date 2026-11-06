@@ -343,6 +343,9 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             glmf::admission::DraftPush::for_snapshot(path, config,
                 crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only))
             .transpose()?.flatten();
+        if exlr8.is_none() && process.push_host.is_none() {
+            process.mount_load = Some(glmf::admission::mount_load(checkpoint, ranks)?);
+        }
         if let Some((facts, metadata)) = exlr8 {
             use crate::plan::exlr8::{dense::{DensePlan, DenseRole}, residency::ExpertSet};
             let owners = whole_mla(attention.first_owner as usize);

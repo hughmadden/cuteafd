@@ -232,6 +232,18 @@ mod vision_template {
     }
 
     #[test]
+    fn selected_config_drives_vision_and_eos_without_default_config() {
+        let temp = tempfile::tempdir().unwrap();
+        snapshot(temp.path(), VISION, None);
+        let config = read_json(&temp.path().join("config.json")).unwrap();
+        std::fs::write(temp.path().join("config.json"), b"invalid unselected config").unwrap();
+        assert_eq!(GlmEncoding::vision_template_gap_with_config(temp.path(), &config).unwrap(), None);
+        let encoding = GlmEncoding::from_snapshot_for_vision_with_config(temp.path(), &config, None, None).unwrap();
+        assert_eq!(encoding.render(&body(), &options()).unwrap(), "<boi><img><eoi>Read it.<think>");
+        assert!(GlmEncoding::from_snapshot_with_config(temp.path(), &config).is_ok());
+    }
+
+    #[test]
     fn compatible_checkpoint_records_its_own_template() {
         let temp = tempfile::tempdir().unwrap();
         snapshot(temp.path(), VISION, None);

@@ -33,7 +33,7 @@ pub(crate) enum KdaInputError {
 
 /// The KDA programs read the checkpoint's BF16 weights: as-is, or quantized
 /// at load to the only resident FP8 in/out projections (--kda-fp8). Native
-/// FP8 KDA source weights have no consumer. Validate only the layers this
+/// FP8 sources are supported by admitted mixed-group stage projections. Validate only the layers this
 /// invocation loads, before any native module.
 pub(crate) fn check_kda_inputs(
     checkpoint: &Checkpoint,
@@ -79,6 +79,11 @@ pub(crate) fn check_kda_inputs(
         ] {
             let name = format!("model.language_model.layers.{layer}.self_attn.{suffix}");
             if core.get_weight(&name).is_some() { continue; }
+            if core.native.get(name.strip_suffix(".weight").unwrap_or(&name)).is_some_and(|p| p.fp8) {
+                super::precision::block(checkpoint, name, shape[0], shape[1], "mixed KDA block projection")
+                    .map_err(|error| KdaInputError::Native(error.to_string()))?;
+                continue;
+            }
             let at = checkpoint
                 .tensors
                 .binary_search_by(|t| t.meta.name.cmp(&name))
@@ -169,7 +174,7 @@ mod tests {
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         (
             Checkpoint {
-                snapshot: "/unused".into(),
+                view: None, snapshot: "/unused".into(),
                 config: serde_json::Value::Null,
                 quantize_config: None, weight_map: Default::default(),
                 tensors,
@@ -213,6 +218,41 @@ mod tests {
         assert!(matches!(check_kda_inputs(&checkpoint, &cfg, cfg.layers), Err(KdaInputError::Dtype { .. })));
         tensor(&mut checkpoint, "f_a_proj.weight").dtype = DType::Bf16;
         checkpoint.tensors.retain(|t| !t.meta.name.ends_with("q_proj.svh"));
+        assert!(matches!(check_kda_inputs(&checkpoint, &cfg, cfg.layers), Err(KdaInputError::Native(_))));
+    }
+
+    #[test]
+    fn mixed_kda_accepts_stored_native_fp8_and_checks_scale_bytes() {
+        let (mut checkpoint, cfg) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        for (name, value) in [("config.compact-attention.json", "{}"),
+            ("model.compact-attention.safetensors.index.json", r#"{"weight_map":{}}"#),
+            ("quantize_config.compact-attention.json", "{}")] {
+            std::fs::write(root.path().join(name), value).unwrap();
+        }
+        checkpoint.view = Some(cuteafd_loader::plan::checkpoint::CheckpointView::select(root.path(),
+            cuteafd_loader::plan::checkpoint::AttentionMode::Compact).unwrap());
+        for leaf in ["q_proj", "k_proj", "v_proj"] {
+            let stem = format!("model.language_model.layers.0.self_attn.{leaf}");
+            let at = checkpoint.tensors.iter().position(|t| t.meta.name == format!("{stem}.weight")).unwrap();
+            let original = checkpoint.tensors.remove(at);
+            let (n, k) = (original.meta.shape[0], original.meta.shape[1]);
+            for (suffix, dtype, shape, width) in [("trellis", DType::I16, vec![k/16,n/16,96], 2),
+                ("suh", DType::F16, vec![k], 2), ("svh", DType::F16, vec![n], 2), ("mcg", DType::I32, vec![1], 4)] {
+                checkpoint.tensors.push(CheckpointTensor { shard: "unused.safetensors".into(), meta: SafetensorsTensorMetadata {
+                    name: format!("{stem}.{suffix}"), dtype, byte_offset: 0,
+                    byte_length: width * shape.iter().product::<usize>() as u64, shape } });
+            }
+        }
+        let weight = tensor(&mut checkpoint, "o_proj.weight");
+        weight.dtype = DType::F8E4M3;
+        weight.byte_length /= 2;
+        checkpoint.tensors.push(CheckpointTensor { shard: "unused.safetensors".into(), meta: SafetensorsTensorMetadata {
+            name: "model.language_model.layers.0.self_attn.o_proj.weight_scale_inv".into(),
+            dtype: DType::F32, shape: vec![32,64], byte_offset: 0, byte_length: 32*64*4 } });
+        checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        check_kda_inputs(&checkpoint, &cfg, cfg.layers).unwrap();
+        tensor(&mut checkpoint, "o_proj.weight_scale_inv").byte_length -= 4;
         assert!(matches!(check_kda_inputs(&checkpoint, &cfg, cfg.layers), Err(KdaInputError::Native(_))));
     }
 

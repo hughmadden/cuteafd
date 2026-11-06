@@ -265,7 +265,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
-    if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+    let view = args.attention.select(&snapshot)?;
+    if view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Hqa && cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {
             return Err(PlanError::InvalidOption { option: "--spark-range", reason:
                 "EXLR8 range geometry requires its native manifest planner".into() }.into());
@@ -309,13 +310,14 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     anyhow::ensure!(args.exlr8_prefill_activations.is_none(),
         "--exlr8-prefill-activations requires an EXLR8 checkpoint");
     let role_inventory = args.files || args.fetch || args.role.is_some();
-    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open(&snapshot)?) };
+    let input = if role_inventory { None } else { Some(cuteafd_loader::plan::PlanInput::open_view(&view)?) };
     let inventory;
     let checkpoint = if let Some(input) = &input { input.checkpoint() } else {
-        inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
+        inventory = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
         &inventory
     };
     let family = cuteafd_loader::plan::family::detect(checkpoint).map_or("", |family| family.id());
+    args.attention.validate_family(family)?;
     validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
@@ -353,7 +355,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if v41 { layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?; }
     }
     if args.files || args.fetch || args.role.is_some() {
-        use cuteafd_loader::plan::files::{manifest_roles, ReadRole};
+        use cuteafd_loader::plan::files::{manifest_roles_view, ReadRole};
         let args = file_args(args, &snapshot)?;
         let placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
         let parse = |name: &str| {
@@ -378,7 +380,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             } else {
                 let manifests = hosts.iter().map(|(host, names)| {
                     let roles = complete_roles(names.iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?);
-                    let mut manifest = manifest_roles(&snapshot, &roles)?;
+                    let mut manifest = manifest_roles_view(&view, &roles)?;
                     attach_snapshots(&mut manifest, &roles, &args)?;
                     Ok((host.clone(), manifest))
                 }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
@@ -408,7 +410,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             vec![parse(args.role.as_deref().unwrap_or("coordinator"))?]
         };
         let roles = complete_roles(roles);
-        let mut manifest = manifest_roles(&snapshot, &roles)?;
+        let mut manifest = manifest_roles_view(&view, &roles)?;
         attach_snapshots(&mut manifest, &roles, &args)?;
         if args.fetch {
             transfer(&snapshot, &manifest, &args)?;
@@ -420,14 +422,14 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             }
         } else {
             let mut headers = 0;
-            for role in &roles { headers += cuteafd_loader::plan::files::open_role(&snapshot, *role)?.tensors.len(); }
+            for role in &roles { headers += cuteafd_loader::plan::files::open_role_view(&view, *role)?.tensors.len(); }
             if args.json { println!("{}", serde_json::to_string_pretty(&manifest)?); }
             else { println!("role {} HEADERS READY: {headers} tensor headers, {} required files",
                 manifest.role, manifest.files.len()); }
         }
         return Ok(());
     }
-    options.vision = glm_flash_vision(&args, family, &snapshot);
+    options.vision = glm_flash_vision_view(&args, family, &view);
     let input = input.context("full planner input missing after role-inventory dispatch")?;
     if args.spark_range {
         let columns = input.spark_ranges(&options)?;
@@ -469,8 +471,13 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
 /// cannot mark images; the note goes to stderr once. Chat files a plan cannot read leave the policy
 /// as given: a plan needs only the checkpoint's config and tensor headers.
 fn glm_flash_vision(args: &PlanArgs, family: &str, snapshot: &std::path::Path) -> cuteafd_loader::plan::MediaMode {
+    args.attention.select(snapshot).map(|view| glm_flash_vision_view(args, family, &view)).unwrap_or(args.vision)
+}
+
+fn glm_flash_vision_view(args: &PlanArgs, family: &str,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> cuteafd_loader::plan::MediaMode {
     if family != "glm5_flash" { return args.vision; }
-    match crate::families::glm5_flash::serve::auto_vision(args.vision, snapshot, args.chat_template_from.as_deref()) {
+    match crate::families::glm5_flash::serve::auto_vision_view(args.vision, view, args.chat_template_from.as_deref()) {
         Ok((vision, note)) => {
             if let Some(note) = note { eprintln!("note: {note}"); }
             vision
@@ -547,7 +554,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
 /// Never execute a shell configuration while constructing a file inventory.
 fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs> {
     use cuteafd_loader::plan::MediaMode;
-    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+    let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory_view(&args.attention.select(snapshot)?)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).context("unsupported checkpoint family")?.id();
     let cfg = launch_config(args.config.as_deref())?;
     if let Some(model) = cfg.get("MODEL_ID") {
@@ -600,7 +607,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         args.vision = MediaMode::Off;
     }
     if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
-    args.audio = cuteafd_loader::plan::resolve_audio(args.audio, snapshot)?;
+    args.audio = cuteafd_loader::plan::resolve_audio_config(args.audio, snapshot, &inventory.config)?;
     Ok(args)
 }
 
@@ -823,6 +830,7 @@ mod tests {
     #[test]
     fn exlr8_native_cli_resolves_default_config_and_opt_out_before_admission() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"glm_moe_dsa"}"#).unwrap();
         let experts = dir.path().join("experts");
         std::fs::create_dir(&experts).unwrap();
         let header = br#"{"__metadata__":{"format":"exlr8-v2"}}"#;
@@ -1074,6 +1082,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            attention: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             exlr8_manifest: None,
@@ -1959,6 +1968,23 @@ mod tests {
             assert_eq!(options(&args).unwrap().layout.unwrap().glmf_index, index);
         }
         assert!(parse(&["--index-cache", "auto"]).is_err());
+    }
+
+    #[test]
+    fn compact_file_args_never_read_default_metadata() {
+        use clap::Parser;
+        let root = tempfile::tempdir().unwrap();
+        let config = cuteafd_loader::plan::testing::glm5_flash_config(5);
+        std::fs::write(root.path().join("config.compact-attention.json"), config.to_string()).unwrap();
+        std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#).unwrap();
+        std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}").unwrap();
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", root.path().to_str().unwrap(),
+            "--files", "--compact-attention", "--no-speculator"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { unreachable!() };
+        let selected = args.attention.select(root.path()).unwrap();
+        let args = file_args(args, root.path()).unwrap();
+        assert_eq!(args.audio, cuteafd_loader::plan::MediaMode::Off);
+        assert_eq!(args.attention.select(root.path()).unwrap().fingerprint(), selected.fingerprint());
     }
 
     #[test]

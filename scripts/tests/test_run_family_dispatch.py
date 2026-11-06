@@ -88,6 +88,40 @@ def test_glm_native_attention_reaches_plan_and_coordinator(tmp_path, gpus, atten
     assert f"CUTEAFD_ATTENTION_PLACEMENT={attention}" in coordinators[0]
 
 
+@pytest.mark.parametrize("mode,flag", [("hqa", None), ("compact", "--compact-attention"),
+                                        ("fp8-compact", "--fp8-compact-attention")])
+def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, flag):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = (f"ATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=2\n"
+            "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    source = tmp_path / "selected-checkpoint"
+    source.mkdir()
+    (source / "config.compact-attention.json").write_text(json.dumps(config))
+    (source / "config.json").write_text(json.dumps(config) if mode != "compact" else "invalid default must not open")
+    result = _family_launch_result(tmp_path, config, "test/hqa-flash", keys, checkpoint_source=source)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    for command in ["cuteafd plan", "cuteafd serve-glmf --snapshot", "cuteafd expertd-native"]:
+        selected = [line for line in lines if command in line]
+        assert selected, result.stderr
+        for line in selected:
+            if flag:
+                assert flag in line
+            else:
+                assert "--compact-attention" not in line and "--fp8-compact-attention" not in line
+
+
+@pytest.mark.parametrize("mode", ["compact", "fp8-compact", "unknown"])
+def test_attention_bundle_refuses_unsupported_modes_and_families(tmp_path, mode):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/no-hqa",
+                                  f"EXLR8_MANIFEST=up1\nATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode != 0
+    assert "ATTENTION_MODE" in result.stderr
+
+
 @pytest.mark.parametrize("activations", [None, "a16", "a8"])
 @pytest.mark.parametrize("wip", [False, True])
 def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, activations, wip):
@@ -879,6 +913,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config, "a" * 40 if native_v41 else "abc")
+    if "ATTENTION_MODE=compact" in keys:
+        selected = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
+        (selected / "config.compact-attention.json").write_text(json.dumps(family_config))
     if checkpoint_source is not None:
         staged = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         # Header fixtures have huge sparse tensor payloads; never materialize them.
@@ -1011,7 +1048,10 @@ if os.environ.get("STUB_REAL_DEPLOYMENT"):
 def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 config = json.loads(os.environ["STUB_CHECKPOINT"])
-described = subprocess.check_output([sys.executable, os.environ["STUB_FAMILY_READER"], os.environ["STUB_CONFIG_PATH"]], text=True).split()
+config_path = os.environ["STUB_CONFIG_PATH"]
+if "--compact-attention" in args:
+    config_path = os.path.join(os.path.dirname(config_path), "config.compact-attention.json")
+described = subprocess.check_output([sys.executable, os.environ["STUB_FAMILY_READER"], config_path], text=True).split()
 family, _, first, last = described
 ranks = int(os.environ["STUB_PREFERRED_RANKS"] if os.environ["STUB_FORCE_PREFERRED"] else value("--spark-ranks", os.environ["STUB_PREFERRED_RANKS"]))
 tp = int(value("--spark-tp", str(ranks)))

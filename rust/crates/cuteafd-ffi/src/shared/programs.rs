@@ -13,6 +13,65 @@ use std::ffi::c_void;
 use std::fmt;
 use std::path::Path;
 
+/// ABI records consumed by native/shared/cuda/fp8_load_quant.h. Admission and
+/// execution use these same layouts when sizing retained pinned job tables.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8LoadSegment { pub offset: u64, pub ptr: *const u8, pub bytes: u64 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8LoadJob {
+    pub segments: *const Fp8LoadSegment,
+    pub count: i32,
+    pub rows: i32,
+    pub cols: i32,
+    pub layout: i32,
+    pub rule: i32,
+    pub pad: i32,
+    pub col0: i64,
+    pub pitch: i64,
+    pub q: *mut u8,
+    pub q_stride: i64,
+    pub scales: *mut f32,
+    pub scale_stride: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Fp8LoadTableError {
+    #[error("FP8 load table requires nonzero rows and whole scale units")]
+    InvalidRows,
+    #[error("FP8 load table byte extent overflow")]
+    Overflow,
+}
+
+/// One segment and job per scale unit, with the executor's pinned minimum.
+/// Block quantization uses 128 rows per unit; row/channel layouts use one.
+pub fn fp8_load_table_bytes(rows: usize, unit_rows: usize) -> std::result::Result<usize, Fp8LoadTableError> {
+    if rows == 0 || !matches!(unit_rows, 1 | 128) || rows % unit_rows != 0 {
+        return Err(Fp8LoadTableError::InvalidRows);
+    }
+    let bytes = std::mem::size_of::<Fp8LoadSegment>().checked_add(std::mem::size_of::<Fp8LoadJob>())
+        .and_then(|stride| stride.checked_mul(rows / unit_rows)).ok_or(Fp8LoadTableError::Overflow)?;
+    Ok(bytes.max(1 << 20))
+}
+
+#[cfg(test)]
+mod fp8_load_table_tests {
+    use super::*;
+    #[test]
+    fn extent_uses_native_abi_and_checked_scale_units() {
+        assert_eq!(std::mem::size_of::<Fp8LoadSegment>(), 24);
+        assert_eq!(std::mem::size_of::<Fp8LoadJob>(), 80);
+        assert_eq!(fp8_load_table_bytes(128, 128).unwrap(), 1 << 20);
+        assert_eq!(fp8_load_table_bytes(32768, 1).unwrap(), 32768 * 104);
+        assert_eq!(fp8_load_table_bytes(128 * 32768, 128).unwrap(), 32768 * 104);
+        for (rows, units) in [(0, 1), (127, 128), (128, 0), (128, 2), (usize::MAX, 1)] {
+            assert!(fp8_load_table_bytes(rows, units).is_err());
+        }
+    }
+}
+
 /// Extents compiled into the coordinator programs. They describe one
 /// sequence's index, not the shared token pool or its physical GPU replicas.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

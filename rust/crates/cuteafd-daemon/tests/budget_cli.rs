@@ -30,12 +30,16 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
 
 #[test]
 fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_input() {
+    // GLM Flash selects its immutable metadata view before resolving concurrency.
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
+    std::fs::write(snapshot.path().join("model.safetensors.index.json"), r#"{"weight_map":{}}"#).unwrap();
     for family in ["serve-glmf", "serve-glm", "serve-mimo"] {
         for gib in [30u64, 32, 96] {
             let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
             for explicit in [None, Some(expected), Some(4)] {
                 let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
-                command.args([family, "--snapshot", "/direct-cli-missing-snapshot", "--native-lib", "/unused",
+                command.args([family, "--snapshot", snapshot.path().to_str().unwrap(), "--native-lib", "/unused",
                     "--coordinator-gpu-budget-gib", &gib.to_string(), "--vision", "off", "--audio", "off"]);
                 if let Some(value) = explicit { command.args(["--max-sequences", &value.to_string()]); }
                 let output = command.env("RUST_LOG", "info")

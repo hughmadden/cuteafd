@@ -1,6 +1,5 @@
-//! Header-only admission of the FP8 block consumers' inputs (MLA, dense and
-//! shared-expert projections): checkpoint E4M3 with FP32 128x128 scales, or
-//! BF16 quantized to those blocks at load (the FP8 copy is the only resident one).
+//! Header-only admission: selected native BF16 attention stays BF16; FP8 block
+//! consumers accept native E4M3/scales or BF16 quantized only when selected.
 use cuteafd_core::DType;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
@@ -44,7 +43,7 @@ fn require(checkpoint: &Checkpoint, name: String, dtype: DType, shape: Vec<usize
     Ok(())
 }
 
-fn block(checkpoint: &Checkpoint, name: String, rows: usize, cols: usize,
+pub(super) fn block(checkpoint: &Checkpoint, name: String, rows: usize, cols: usize,
     consumer: &'static str) -> Result<(), ProjectionInputError> {
     let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.cmp(&name))
         .map_err(|_| ProjectionInputError::Missing { name: name.clone() })?;
@@ -100,7 +99,11 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
                 ("o_proj.weight", h, v_width),
             ] {
                 let name = format!("{prefix}.self_attn.{suffix}");
-                if core.get_weight(&name).is_none() { block(primary, name, rows, cols, "MLA FP8 block projection")?; }
+                if core.get_weight(&name).is_some() { continue; }
+                let stem = name.strip_suffix(".weight").unwrap();
+                if core.native.get(stem).is_some_and(|p| !p.fp8) {
+                    require(primary, name, DType::Bf16, vec![rows, cols], 2, "native MLA BF16 projection")?;
+                } else { block(primary, name, rows, cols, "MLA FP8 block projection")?; }
             }
         }
         let dense = cfg.dense[layer];
@@ -188,7 +191,7 @@ mod tests {
             }
         }
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-        (Checkpoint { snapshot: "/no-payload".into(), config: serde_json::Value::Null, quantize_config: None, weight_map: Default::default(),
+        (Checkpoint { view: None, snapshot: "/no-payload".into(), config: serde_json::Value::Null, quantize_config: None, weight_map: Default::default(),
             tensors, missing_shards: vec![], shard_bytes: 0 }, cfg)
     }
 

@@ -87,9 +87,18 @@ impl GlmEncoding {
         Self::from_snapshot_template(snapshot, template)
     }
 
+    pub fn from_snapshot_with_config(snapshot: &Path, config: &Value) -> Result<Self> {
+        let (template, _) = read_chat_template(snapshot)?;
+        Self::from_snapshot_template_config(snapshot, template, Some(config))
+    }
+
     fn from_snapshot_template(snapshot: &Path, template: String) -> Result<Self> {
+        Self::from_snapshot_template_config(snapshot, template, None)
+    }
+
+    fn from_snapshot_template_config(snapshot: &Path, template: String, config: Option<&Value>) -> Result<Self> {
         let generation = read_json(&snapshot.join("generation_config.json"))
-            .or_else(|_| read_json(&snapshot.join("config.json")))?;
+            .or_else(|_| match config { Some(config) => Ok(config.clone()), None => read_json(&snapshot.join("config.json")) })?;
         let eos = match &generation["eos_token_id"] {
             Value::Number(id) => vec![id.as_u64().context("eos_token_id")? as u32],
             Value::Array(ids) => ids.iter().map(|id| id.as_u64().map(|id| id as u32))
@@ -116,14 +125,19 @@ impl GlmEncoding {
     /// Vision changes only the template source, never the served tokenizer or stops.
     /// Explicit sources take precedence; otherwise a text-only quant needs config metadata.
     pub fn from_snapshot_for_vision(snapshot: &Path, template_from: Option<&str>, hf_home: Option<&Path>) -> Result<Self> {
-        let (served_source, served_file) = read_chat_template(snapshot)?;
         let config = read_json(&snapshot.join("config.json"))?;
+        Self::from_snapshot_for_vision_with_config(snapshot, &config, template_from, hf_home)
+    }
+
+    pub fn from_snapshot_for_vision_with_config(snapshot: &Path, config: &Value,
+        template_from: Option<&str>, hf_home: Option<&Path>) -> Result<Self> {
+        let (served_source, served_file) = read_chat_template(snapshot)?;
         let tokenizer_path = snapshot.join("tokenizer.json");
         let tokenizer_bytes = std::fs::read(&tokenizer_path)?;
         let tokenizer: Value = serde_json::from_slice(&tokenizer_bytes)?;
         let markers = vision_markers(&config, &tokenizer)?;
-        let mut encoding = Self::from_snapshot_template(snapshot, served_source.clone())?;
-        let served_supports_images = supports_images(&encoding, snapshot, &markers)?;
+        let mut encoding = Self::from_snapshot_template_config(snapshot, served_source.clone(), Some(config))?;
+        let served_supports_images = supports_images(&encoding, snapshot, config, &markers)?;
         let requested = match template_from {
             Some(source) => Some(("explicit", source.to_owned())),
             None if served_supports_images => None,
@@ -142,8 +156,8 @@ impl GlmEncoding {
             anyhow::ensure!(vision_markers(&base_config, &base_tokenizer)? == markers,
                 "CHAT_TEMPLATE_FROM image marker IDs differ from the served checkpoint");
             let (source_text, file) = read_chat_template(&base)?;
-            encoding = Self::from_snapshot_template(snapshot, source_text.clone())?;
-            anyhow::ensure!(supports_images(&encoding, snapshot, &markers)?, "CHAT_TEMPLATE_FROM template does not render image marker spans");
+            encoding = Self::from_snapshot_template_config(snapshot, source_text.clone(), Some(config))?;
+            anyhow::ensure!(supports_images(&encoding, snapshot, config, &markers)?, "CHAT_TEMPLATE_FROM template does not render image marker spans");
             (base, file, source_text, selection, Some(source))
         } else {
             (snapshot.to_owned(), served_file, served_source, "checkpoint", None)
@@ -162,11 +176,15 @@ impl GlmEncoding {
     /// marker span and its config names no base model to take a template from. `None` when either
     /// can serve vision. Automatic vision serves text on a gap; `from_snapshot_for_vision` refuses it.
     pub fn vision_template_gap(snapshot: &Path) -> Result<Option<String>> {
-        let (served_source, _) = read_chat_template(snapshot)?;
         let config = read_json(&snapshot.join("config.json"))?;
-        let markers = vision_markers(&config, &read_json(&snapshot.join("tokenizer.json"))?)?;
-        let encoding = Self::from_snapshot_template(snapshot, served_source)?;
-        Ok((!supports_images(&encoding, snapshot, &markers)? && declared_base_model(&config)?.is_none())
+        Self::vision_template_gap_with_config(snapshot, &config)
+    }
+
+    pub fn vision_template_gap_with_config(snapshot: &Path, config: &Value) -> Result<Option<String>> {
+        let (served_source, _) = read_chat_template(snapshot)?;
+        let markers = vision_markers(config, &read_json(&snapshot.join("tokenizer.json"))?)?;
+        let encoding = Self::from_snapshot_template_config(snapshot, served_source, Some(config))?;
+        Ok((!supports_images(&encoding, snapshot, config, &markers)? && declared_base_model(&config)?.is_none())
             .then(|| template_gap(snapshot)))
     }
 
@@ -236,10 +254,9 @@ fn vision_markers(config: &Value, tokenizer: &Value) -> Result<[String; 3]> {
     Ok([marker(markers.start)?, marker(markers.placeholder)?, marker(markers.end)?])
 }
 
-fn supports_images(encoding: &GlmEncoding, snapshot: &Path, markers: &[String; 3]) -> Result<bool> {
+fn supports_images(encoding: &GlmEncoding, snapshot: &Path, config: &Value, markers: &[String; 3]) -> Result<bool> {
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-    let config = read_json(&snapshot.join("config.json"))?;
-    let text = config.get("text_config").unwrap_or(&config);
+    let text = config.get("text_config").unwrap_or(config);
     let vocabulary = u32::try_from(text["vocab_size"].as_u64().context("vocab_size")?)?;
     let span = cuteafd_loader::media::SpanExpander::from_config(&config, vocabulary)?;
     let options = GlmPromptOptions { thinking: true, reasoning_effort: None, tool_names: vec![], tool_choice: GlmToolChoice::Auto, response_format: None };
