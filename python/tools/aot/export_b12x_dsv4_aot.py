@@ -109,6 +109,8 @@ def native_attention_bf16_f32_shapes():
 
 
 def compile_native_attention_projection(n, k, max_rows, output="bf16"):
+    # CuTe resolves deferred JIT annotations in module globals, not this factory's locals.
+    global cute, cuda, Int32, Int64
     import torch
     import cutlass
     import cutlass.cute as cute
