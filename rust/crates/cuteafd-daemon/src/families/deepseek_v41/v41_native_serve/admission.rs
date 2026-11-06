@@ -945,8 +945,9 @@ mod admission_tests {
                     args.prefix_cache_entries = turns;
                     args.rtx_expert_layers = onboard;
                     let admitted = crate::commands::bench::assert_resolved_family_seam("deepseek_v41", &[], || {
-                        super::normalize_serving(&mut args)?;
-                        super::AdmittedPrefill::resolve(&args)?;
+                        super::super::normalize_serving(&mut args)?;
+                        super::super::AdmittedPrefill::resolve(&args)?;
+                        super::super::attention_plan(&args)?;
                         embedding_placement(args.embedding_placement, memory[0].1);
                         resolve_with_owners(&args, &memory, experts.clone(), workspace,
                             &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], None)

@@ -727,6 +727,8 @@ pub(crate) fn with_engine<T>(
         // the drafter's local stage experts are installed. Freeze it before capture.
         if context_mode.is_some() {
             engine.attach_context(context_extent, &loaded.manifest, args.attention_plan_rows.0)?;
+        } else {
+            cuteafd_bench::context::set_resolved("attention-plan-rows", "unused (heads)");
         }
         tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");

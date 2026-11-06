@@ -237,7 +237,7 @@ struct DerivedArguments { family: Option<&'static str>, names: &'static [&'stati
 const DERIVED_ARGUMENTS: &[DerivedArguments] = &[
     DerivedArguments { family: None, names: &["max-context", "pool-tokens", "kv-format", "prefill-rows", "prefill-waves",
         "prefill-span-rows", "prefill-units", "rtx-expert-layers", "onboard", "attention-placement",
-        "prefix-cache-entries", "spark-prefill-reply-format", "spark-decode-reply-format"] },
+        "attention-plan-rows", "prefix-cache-entries", "spark-prefill-reply-format", "spark-decode-reply-format"] },
     DerivedArguments { family: Some("glm5"), names: &["max-sequences", "draft-context-slots", "draft-window-marks"] },
     DerivedArguments { family: Some("glm5_flash"), names: &["max-sequences", "slots", "draft-sequences", "draft-context-slots",
         "index-cache", "prefix-marks", "split-device", "kda-output-shard", "kda-prefill-expanded", "kda-fp32-partials", "fp8-head",

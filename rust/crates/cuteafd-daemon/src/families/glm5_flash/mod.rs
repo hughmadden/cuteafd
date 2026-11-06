@@ -528,7 +528,7 @@ mod draft_cli_tests {
     fn resolved_flash_capacity_and_native_flags_are_runtime_facts() {
         let mut args = Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l"]).unwrap().engine;
         crate::commands::bench::assert_resolved_family_seam("glm5_flash",
-            &["max-context", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device"], || {
+            &["max-context", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device", "attention-plan-rows"], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
                 serve::resolve_serving_capacity(&mut args, 16);
                 native::normalize(&mut args);
@@ -2733,6 +2733,7 @@ impl Opened {
             engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
             engine.bind_draft_core_head()?;
             engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
+            cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
             tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
                 "GLM Flash immutable attention reduction plan");
             if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {

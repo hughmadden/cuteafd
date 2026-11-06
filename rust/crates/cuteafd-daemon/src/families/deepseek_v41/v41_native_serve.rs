@@ -138,6 +138,14 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     Ok(lanes)
 }
 
+fn attention_plan(args: &crate::cli::NativeServeArgs) -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
+    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
+        args.attention_plan_rows)?;
+    cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
+    Ok(plan)
+}
+
 /// Validate and normalize the launch, then spawn the CUDA worker thread.
 /// With `http`, the API and live console load where `serve-native` always loaded them.
 fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
@@ -480,9 +488,7 @@ fn worker(
     );
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
     admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
-    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
-        args.attention_plan_rows)?;
+    let attention_plan = attention_plan(&args)?;
     let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots, &pool)?;
     let engram_weights = [0, 1]
         .map(|i| EngramLayerWeights::load(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024))

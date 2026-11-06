@@ -129,7 +129,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     if host { argv.extend(["--host-cache-bytes".into(), "auto".into()]); }
     if let Some(attention) = case.attention { argv.extend(["--attention-placement".into(), attention.to_string()]); }
     let mut cli = Cli::try_parse_from(argv)?;
-    crate::commands::bench::assert_resolved_family_seam("deepseek_v4", &[], || {
+    crate::commands::bench::assert_resolved_family_seam("deepseek_v4", &["attention-plan-rows"], || {
     cli.prefix.resolve_entries(cli.engine.max_sequences);
     // The selected model owns caches only for its retained dSpark stages.
     let stages = (0..).take_while(|stage| catalog.tensors().iter()

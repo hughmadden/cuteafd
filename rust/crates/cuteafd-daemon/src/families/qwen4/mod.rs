@@ -311,8 +311,10 @@ fn attention_plan(args: &EngineArgs, loaded_mtp: bool)
     -> std::result::Result<cuteafd_core::coordinator_programs::AttentionReductionPlan,
         cuteafd_core::coordinator_programs::AttentionPlanError>
 {
-    cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)
+    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)?;
+    cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -365,7 +367,7 @@ mod weight_representation_tests {
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
             let shape = crate::commands::bench::assert_resolved_family_seam("qwen4",
-                &["max-context", "pool-tokens", "slots", "mtp", "rtx-expert-layers"], || {
+                &["max-context", "pool-tokens", "slots", "mtp", "rtx-expert-layers", "attention-plan-rows"], || {
                     crate::commands::bench::fixture_prefix().resolve_entries(16);
                     let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
                     let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
