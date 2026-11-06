@@ -123,6 +123,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves)]
+                if "--split-device" in before["command"] and "--dspark" in before["command"]:
+                    before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
             if entry["family"] == "glm5_flash":
                 # The span is exactly the live rows (no old 16384 span).
                 position = before["command"].index("--console-secret-file")

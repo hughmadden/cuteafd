@@ -2079,12 +2079,12 @@ release_resolve_tp2_dspark_experts() {
   local family="$1" rtx_gpus="$2"
   if [[ -z "$TP2_DSPARK_EXPERTS" ]]; then
     TP2_DSPARK_EXPERTS=off
-    if [[ "$family" == deepseek_v41 && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ]]; then
+    if [[ ( "$family" == deepseek_v41 || "$family" == deepseek_v4 ) && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ]]; then
       TP2_DSPARK_EXPERTS=on
     fi
   fi
-  [[ "$TP2_DSPARK_EXPERTS" != on || ( "$family" == deepseek_v41 && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ) ]] ||
-    release_die "TP2_DSPARK_EXPERTS requires V4.1, two selected RTX GPUs and dSpark"
+  [[ "$TP2_DSPARK_EXPERTS" != on || ( ( "$family" == deepseek_v41 || "$family" == deepseek_v4 ) && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ) ]] ||
+    release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark"
 }
 
 release_tp2_enabled() {

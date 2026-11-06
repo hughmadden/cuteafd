@@ -309,8 +309,10 @@ impl OfficialV41Catalog {
     pub fn backbone_tp2_slice(&self, name: &str, rank: usize) -> Result<crate::V41Exl3TensorSlice> {
         let tensor = self.tensor(name)?;
         ensure!(rank < 2, "invalid TP2 rank");
-        let V41TensorPlacement::BackboneExpertTp4 { axis, .. } = tensor.placement else {
-            anyhow::bail!("TP2 slice requires a native backbone projection");
+        let axis = match tensor.placement {
+            V41TensorPlacement::BackboneExpertTp4 { axis, .. } => axis,
+            V41TensorPlacement::CoordinatorRtx if name.starts_with("mtp.") && name.contains(".ffn.experts.") => usize::from(name.contains(".w2.")),
+            _ => anyhow::bail!("TP2 slice requires a native routed projection"),
         };
         let bytes = usize::try_from(tensor.metadata.byte_length)?;
         ensure!(bytes % 2 == 0, "uneven TP2 projection bytes");
@@ -393,6 +395,9 @@ impl OfficialV41Catalog {
         &self, name: &str, rank: usize, dst: &mut [u8], scratch: &mut [u8],
     ) -> Result<usize> {
         let tensor = self.tensor(name)?;
+        if name.starts_with("mtp.") && name.contains(".ffn.experts.") {
+            return self.read_coordinator_tp2_into(name, usize::from(name.contains(".w2.")), rank, dst, scratch);
+        }
         ensure!(rank < 2 && matches!(tensor.placement, V41TensorPlacement::BackboneExpertTp4 { .. }),
             "TP2 read requires a backbone expert and rank in 0..2");
         let bytes = usize::try_from(tensor.metadata.byte_length / 2)?;
@@ -2223,6 +2228,24 @@ mod tests {
                 assert_eq!(&out[16..], &[255; 4]);
             }
         }
+        // V4 stage experts retain coordinator placement but use backbone TP2
+        // projection slicing in both paired mount and coordinator-push loads.
+        for (projection, axis) in [("w1", 0), ("w3", 0), ("w2", 1)] {
+            let name = format!("mtp.0.ffn.experts.0.{projection}.weight");
+            catalog.tensors[0].metadata.name = name.clone();
+            let pair = [catalog.backbone_tp2_slice(&name, 0).unwrap(), catalog.backbone_tp2_slice(&name, 1).unwrap()];
+            crate::V41Exl3TensorSlice::validate_pair(pair, 32).unwrap();
+            for rank in 0..2 {
+                let mut actual = [0; 16];
+                let mut expected = [0; 16];
+                catalog.read_backbone_tp2_into(&name, rank, &mut actual, &mut [0; 16]).unwrap();
+                catalog.read_coordinator_tp2_into(&name, axis, rank, &mut expected, &mut [0; 16]).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+        catalog.tensors[0].metadata.name = "mtp.0.main_proj.weight".into();
+        assert!(catalog.backbone_tp2_slice("mtp.0.main_proj.weight", 0).is_err());
+        catalog.tensors[0].metadata.name = name.into();
         assert!(catalog.read_coordinator_tp2_into(name, 1, 0, &mut [0; 16], &mut [0; 7]).is_err());
         assert!(catalog.read_coordinator_tp2_into(name, 0, 2, &mut [0; 16], &mut []).is_err());
         assert!(catalog.read_coordinator_tp2_into(name, 2, 0, &mut [0; 16], &mut []).is_err());

@@ -28,13 +28,50 @@ pub(super) fn output_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usiz
         .context("TP2 output extent overflow")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageInventory {
+    geometry: ExpertGeometry,
+    stages: usize,
+}
+
+impl StageInventory {
+    fn new(geometry: ExpertGeometry, accepted_families: &[&str], stages: usize) -> Result<Self> {
+        ensure!(geometry.family().is_some_and(|family| accepted_families.contains(&family)),
+            "stage inventory does not accept the process expert family");
+        (geometry.layers as usize).checked_add(stages).context("stage inventory overflow")?;
+        Ok(Self { geometry, stages })
+    }
+}
+
+static STAGE_INVENTORY: std::sync::OnceLock<StageInventory> = std::sync::OnceLock::new();
+
+/// The family launch layer declares same-geometry absolute stages before loading
+/// any arena. Like the process geometry, this inventory cannot change afterward.
+pub(crate) fn register_stage_inventory(accepted_families: &[&str], stages: usize) -> Result<()> {
+    let inventory = StageInventory::new(expert_geometry(), accepted_families, stages)?;
+    let registered = STAGE_INVENTORY.get_or_init(|| inventory);
+    ensure!(*registered == inventory, "process stage inventory already differs");
+    Ok(())
+}
+
 pub(super) fn validate_layers(layers: &[usize], rank: u8) -> Result<()> {
-    ensure!(
-        rank < 2 && !layers.is_empty()
-            && layers.windows(2).all(|ids| ids[0] < ids[1])
-            && layers.iter().all(|&layer| layer < expert_geometry().layers as usize),
-        "invalid TP2 rank or ordered absolute layer IDs"
-    );
+    validate_layers_for(expert_geometry(), STAGE_INVENTORY.get().copied(), layers, rank)
+}
+
+fn validate_layers_for(geometry: ExpertGeometry, inventory: Option<StageInventory>,
+    layers: &[usize], rank: u8) -> Result<()> {
+    let stages = match inventory {
+        Some(inventory) => {
+            ensure!(inventory.geometry == geometry, "stage inventory geometry differs");
+            inventory.stages
+        }
+        None => 0,
+    };
+    let bound = (geometry.layers as usize).checked_add(stages).context("stage inventory overflow")?;
+    ensure!(rank < 2 && !layers.is_empty()
+        && layers.windows(2).all(|ids| ids[0] < ids[1])
+        && layers.iter().all(|&layer| layer < bound),
+        "invalid TP2 rank or ordered absolute layer IDs");
     Ok(())
 }
 
@@ -970,6 +1007,27 @@ mod tests {
             }
         }
         assert!(validate_layers(&[0], 2).is_err());
+    }
+
+    #[test]
+    fn absolute_stages_require_matching_declared_inventory() {
+        let geometry = expert_geometry();
+        let accepted = [geometry.family().unwrap()];
+        let first = geometry.layers as usize;
+        for stages in [0, 1, 3, 5] {
+            let inventory = StageInventory::new(geometry, &accepted, stages).unwrap();
+            for rank in 0..2 {
+                let layers: Vec<_> = std::iter::once(0).chain(first..first + stages).collect();
+                assert!(validate_layers_for(geometry, Some(inventory), &layers, rank).is_ok());
+                assert!(validate_layers_for(geometry, Some(inventory), &[first + stages], rank).is_err());
+            }
+        }
+        assert!(StageInventory::new(geometry, &[], 1).is_err());
+        assert!(StageInventory::new(geometry, &accepted, usize::MAX).is_err());
+        assert!(validate_layers_for(geometry, None, &[first], 0).is_err());
+        let other = ExpertGeometry { layers: geometry.layers + 1, ..geometry };
+        let inventory = StageInventory::new(geometry, &accepted, 1).unwrap();
+        assert!(validate_layers_for(other, Some(inventory), &[0], 0).is_err());
     }
 
     #[test]

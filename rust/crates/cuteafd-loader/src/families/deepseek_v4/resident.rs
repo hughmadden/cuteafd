@@ -445,7 +445,7 @@ mod tests {
             for ranks in [1, 2] {
                 let whole = if ranks == 1 { vec![vec![1, 3]] } else { vec![vec![], vec![]] };
                 let mut startup = StartupInventory::default();
-                startup.add_selected_experts(catalog, stages, &whole, if ranks == 2 { Some(&tp2) } else { None })?;
+                startup.add_selected_experts(catalog, stages, &whole, if ranks == 2 { Some(&tp2) } else { None }, false)?;
                 assert!(startup.device.is_empty());
                 assert!(startup.host.iter().filter(|item| item.name != "weight-push/coordinator-experts")
                     .all(|item| item.bytes == 0)); // Native V4 lands scale bytes directly, without scale-code staging.
@@ -453,12 +453,18 @@ mod tests {
                 assert!(startup.notes()?.iter().any(|note| note.contains("validation/coordinator-experts")));
             }
         }
+        let mut split = StartupInventory::default();
+        let stages_only = crate::placement::Tp2Range { layers: 0, ..tp2 };
+        split.add_selected_experts(catalog, 3, &[vec![], vec![]], Some(&stages_only), true)?;
+        assert_eq!(split.host_bytes()?, 2 * ring);
+        assert_eq!(split.host.iter().filter(|item| item.name == "weight-push/coordinator-experts")
+            .map(|item| item.bytes).collect::<Vec<_>>(), vec![ring; 2]);
         let mut empty = StartupInventory::default();
-        empty.add_selected_experts(catalog, 0, &[vec![]], None)?;
+        empty.add_selected_experts(catalog, 0, &[vec![]], None, false)?;
         assert!(empty.host.is_empty());
-        assert!(empty.add_selected_experts(catalog, 4, &[vec![]], None).is_err());
+        assert!(empty.add_selected_experts(catalog, 4, &[vec![]], None, false).is_err());
         let bad = crate::placement::Tp2Range { first: usize::MAX, layers: 2, peak_bytes: [0; 2] };
-        assert!(empty.add_selected_experts(catalog, 0, &[vec![], vec![]], Some(&bad)).is_err());
+        assert!(empty.add_selected_experts(catalog, 0, &[vec![], vec![]], Some(&bad), false).is_err());
         Ok(())
     }
 
@@ -470,7 +476,7 @@ mod tests {
         let catalog = input.expert_catalog()?;
         let tp2 = crate::placement::Tp2Range { first: 1, layers: 1, peak_bytes: [0; 2] };
         let mut startup = StartupInventory::default();
-        startup.add_selected_experts(catalog, 0, &[vec![], vec![]], Some(&tp2))?;
+        startup.add_selected_experts(catalog, 0, &[vec![], vec![]], Some(&tp2), false)?;
         for rank in 0..2 {
             let residency = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(1), 2, rank)?;
             let expected = residency.loads.iter().filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4;
@@ -490,7 +496,7 @@ mod tests {
         assert!(catalog.mxfp4_scale_codes());
         let layer = catalog.routed_experts().first_layer;
         let mut startup = StartupInventory::default();
-        startup.add_selected_experts(catalog, 0, &[vec![layer]], None)?;
+        startup.add_selected_experts(catalog, 0, &[vec![layer]], None, false)?;
         let mut expected = 0;
         for expert in 0..catalog.routed_experts().experts {
             let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneFull { layer, expert })?;
@@ -599,24 +605,26 @@ impl StartupInventory {
     /// Sum independent startup groups conservatively, even though dense, whole
     /// experts and TP2 experts receive sequentially. Host owners never enter VRAM.
     pub fn add_experts(&mut self, catalog: &crate::OfficialV41Catalog, draft_stages: usize,
-        placement: &crate::placement::Placement) -> Result<()> {
+        placement: &crate::placement::Placement, tp2_draft: bool) -> Result<()> {
         let whole = (0..placement.expert_ranges.len()).map(|rank| placement.layers.iter().enumerate()
             .filter_map(|(layer, home)| (home.experts == crate::placement::ExpertHome::RtxWhole { gpu: rank as u8 })
                 .then_some(layer)).collect::<Vec<_>>()).collect::<Vec<_>>();
-        self.add_selected_experts(catalog, draft_stages, &whole, placement.tp2.as_ref())
+        self.add_selected_experts(catalog, draft_stages, &whole, placement.tp2.as_ref(), tp2_draft)
     }
 
     fn add_selected_experts(&mut self, catalog: &crate::OfficialV41Catalog, draft_stages: usize,
-        whole: &[Vec<usize>], tp2: Option<&crate::placement::Tp2Range>) -> Result<()> {
+        whole: &[Vec<usize>], tp2: Option<&crate::placement::Tp2Range>, tp2_draft: bool) -> Result<()> {
         ensure!((1..=2).contains(&whole.len()), "V4 startup experts need one or two ranks");
         ensure!(draft_stages <= catalog.routed_experts().draft_stages, "V4 startup draft stage out of range");
         ensure!(tp2.is_none_or(|t| t.layers == 0 || whole.len() == 2), "V4 startup TP2 needs two ranks");
+        ensure!(!tp2_draft || (whole.len() == 2 && tp2.is_some() && draft_stages > 0), "V4 startup split draft needs two TP2 ranks and retained stages");
         let ring = (cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64)
             .checked_mul(cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64).context("V4 expert ring overflow")?;
         for (rank, layers) in whole.iter().enumerate() {
             let mut selections = layers.iter().map(|&layer| (false, layer)).collect::<Vec<_>>();
-            if rank == 0 { selections.extend((0..draft_stages).map(|stage| (true, stage))); }
+            if rank == 0 && !tp2_draft { selections.extend((0..draft_stages).map(|stage| (true, stage))); }
             let local_group = !selections.is_empty();
+            if tp2_draft { selections.extend((0..draft_stages).map(|stage| (true, stage))); }
             if let Some(t) = tp2.filter(|t| t.layers > 0) {
                 let end = t.first.checked_add(t.layers).context("V4 expert range overflow")?;
                 ensure!(end <= catalog.routed_experts().layers, "V4 startup expert range out of bounds");
@@ -650,7 +658,7 @@ impl StartupInventory {
                 (std::mem::size_of::<cuteafd_ffi::V41ScaleCodeJob>() as u64)
                     .checked_add(8).context("V4 expert scale table overflow")?.max(1 << 20)
             };
-            let groups = u64::from(local_group) + u64::from(tp2.is_some_and(|t| t.layers > 0));
+            let groups = u64::from(local_group) + u64::from(tp2_draft || tp2.is_some_and(|t| t.layers > 0));
             self.host.extend([
                 StartupItem { rank, name: "staging/coordinator-expert-scales", bytes: scales },
                 StartupItem { rank, name: "staging/coordinator-expert-scale-table", bytes: table.checked_mul(groups)

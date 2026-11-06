@@ -1255,8 +1255,8 @@ echo "  context/output: $MAX_CONTEXT_TOKENS/$MAX_OUTPUT_TOKENS; dSpark: $SPECULA
 # The family: run.sh passes --family; a direct call reads the checkpoint's own config.json.
 detected_family="$(release_config_family "$config")"
 [[ -n "$family" ]] || family="$detected_family"
-[[ "$family" == deepseek_v41 || "$(get TP2_DSPARK_EXPERTS off)" != on ]] ||
-  release_die "TP2_DSPARK_EXPERTS requires V4.1, two selected RTX GPUs and dSpark"
+[[ "$family" == deepseek_v41 || "$family" == deepseek_v4 || "$(get TP2_DSPARK_EXPERTS off)" != on ]] ||
+  release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark"
 if [[ "$family" == deepseek_v41 ]]; then
   [[ "$detected_family" == deepseek_v41 ]] ||
     release_die "--family deepseek_v41 does not match the checkpoint ($detected_family)"
@@ -2034,6 +2034,12 @@ fi
 if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
   release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
 fi
+if [[ "$family" == deepseek_v4 ]]; then
+  TP2_DSPARK_EXPERTS="$(get TP2_DSPARK_EXPERTS)"
+  SPECULATOR="$speculator"
+  release_resolve_tp2_dspark_experts "$family" "$((1 + head_split))"
+  [[ "$TP2_DSPARK_EXPERTS" != on ]] || dspark_args+=(--tp2-dspark-experts)
+fi
 # GLM 5.3 Flash: MLA and shared-expert projections use the primary checkpoint's
 # FP8 blocks or BF16 quantized to 128x128 blocks at load. Dense MLPs use the
 # same route, or native packed NVFP4. Resolve precision after the split: both
@@ -2498,8 +2504,22 @@ audio_encoder_hash=""
   [[ -z "$(get MEMORY_RESERVATION)" ]] || deployment_args+=(--memory-reservation "$(get MEMORY_RESERVATION)")
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
+  plan_config_mounts=()
+  if [[ "$family" == deepseek_v4 ]]; then
+    # Pass the resolved value, including explicit off, to default-on admission.
+    plan_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS"
+      for ((rank = 0; rank < available_sparks; rank++)); do
+        printf '%s=%s\n' "SPARK_${rank}_HOST" "$(get "SPARK_${rank}_HOST")"
+      done)"
+    plan_config_dir="$HOME/.cache/cuteafd/run-config"
+    mkdir -p "$plan_config_dir"
+    plan_config="$plan_config_dir/plan-$(printf '%s\n' "$plan_config_text" | sha256sum | cut -c1-16).config"
+    printf '%s\n' "$plan_config_text" >"$plan_config.tmp.$$" && mv "$plan_config.tmp.$$" "$plan_config"
+    count_args+=(--config /run/cuteafd-plan.config)
+    plan_config_mounts=(-v "$plan_config:/run/cuteafd-plan.config:ro")
+  fi
   # Keep checkpoint paths unchanged inside the full namespace mount.
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" \
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"

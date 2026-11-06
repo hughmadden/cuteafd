@@ -207,6 +207,7 @@ EOF
   case "$1" in
     deepseek_v4)
       cat <<'EOF'
+TP2_DSPARK_EXPERTS
 PREFILL_PACKING
 PREFILL_ROWS
 PREFILL_WAVES

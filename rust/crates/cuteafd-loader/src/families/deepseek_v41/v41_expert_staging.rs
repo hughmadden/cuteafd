@@ -259,11 +259,15 @@ impl OfficialV41Catalog {
                 )
             }
             V41ExpertSelection::BackboneTp2 { layer, expert, rank } => {
-                ensure!(layer < config.layers, "backbone layer out of range");
+                let prefix = if layer < config.layers { format!("layers.{layer}.ffn.experts.{expert}") } else {
+                    let stage = layer - config.layers;
+                    ensure!(stage < config.draft_stages && config.draft_experts == config.experts, "backbone layer out of range");
+                    format!("mtp.{stage}.ffn.experts.{expert}")
+                };
                 ensure!(expert < config.experts, "backbone expert out of range");
                 ensure!(rank < 2, "backbone TP2 rank must be in 0..2");
                 (
-                    format!("layers.{layer}.ffn.experts.{expert}"),
+                    prefix,
                     Some(rank),
                     config.intermediate / 2,
                     None,

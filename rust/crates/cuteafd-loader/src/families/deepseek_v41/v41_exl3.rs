@@ -965,7 +965,11 @@ mod tests {
             .unwrap();
         assert_eq!((plan.experts, plan.intermediate, plan.intermediate_start), (3, 256, 0));
         assert_eq!(plan.loads[0].tensor, "model.layers.1.mlp.experts.0.gate_proj.trellis");
-        assert!(parsed.residency(crate::V41Exl3Layer::Backbone(2), 2, 0).is_err());
+        let stage = parsed.residency(crate::V41Exl3Layer::Backbone(2), 2, 0).unwrap();
+        let split_draft = parsed.residency(crate::V41Exl3Layer::Dspark(0), 2, 0).unwrap();
+        assert_eq!(serde_json::to_value(&stage.loads).unwrap(),
+            serde_json::to_value(&split_draft.loads).unwrap());
+        assert!(parsed.residency(crate::V41Exl3Layer::Backbone(3), 2, 0).is_err());
         let draft = parsed.residency(crate::V41Exl3Layer::Dspark(0), 1, 0).unwrap();
         assert_eq!(draft.loads[0].tensor, "mtp.0.mlp.experts.0.gate_proj.trellis");
     }
