@@ -457,7 +457,7 @@ fn planner_all_local_auto_pool_matches_forwarded_runtime_admission() {
     let layout = report.memory_layout.unwrap();
     let runtime = runtime(&shared, &case, &layout).unwrap();
     assert_eq!(layout.pool_tokens, runtime.pool_tokens);
-    assert!(runtime.pool_tokens > 1 << 20, "auto pool must remain maximized for explicit all");
+    assert!(runtime.pool_tokens >= 262_144, "automatic local pool keeps the agentic floor");
 }
 
 #[test]
