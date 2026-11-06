@@ -4,6 +4,9 @@ use cuteafd_api::openai::{media::MediaPreparer, NativeRequest};
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
 use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander}, plan::MediaMode};
 use std::sync::Arc;
+use cuteafd_loader::plan::checkpoint::CheckpointView;
+#[cfg(test)]
+use cuteafd_loader::plan::checkpoint::AttentionMode;
 
 pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
     if mode == MediaMode::Off { return Ok(None); }
@@ -222,12 +225,14 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
 
-fn snapshot_identity(snapshot: &std::path::Path) -> Result<serde_json::Value> {
+fn snapshot_identity(view: &CheckpointView) -> Result<serde_json::Value> {
+    let snapshot = view.snapshot();
     use sha2::{Digest, Sha256};
     let mut identity = serde_json::json!({"snapshot_revision": snapshot.file_name().and_then(|s| s.to_str())
         .context("snapshot revision")?});
-    for (key, file) in [("config", "config.json"), ("tokenizer", "tokenizer.json"),
-        ("preprocessor", "processor_config.json"), ("index", "model.safetensors.index.json")] {
+    identity["config_sha256"] = view.metadata_sha256(view.config_name())?.into();
+    identity["index_sha256"] = view.metadata_sha256(view.index_name())?.into();
+    for (key, file) in [("tokenizer", "tokenizer.json"), ("preprocessor", "processor_config.json")] {
         identity[format!("{key}_sha256")] = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join(file))?)).into();
     }
     // Compile the actual locked transformer module into the diagnostic identity;
@@ -246,14 +251,14 @@ use crate::shared::probe::features::feature_payload;
 /// Strict paired-G4 hook. Only scoring probes bypass the encoder; ordinary
 /// generation remains native. Separate cache identities cannot warm native images.
 pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
-    cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &std::path::Path) -> Result<()> {
+    cache: &mut cuteafd_engine::media::EmbeddingCache, view: &CheckpointView) -> Result<()> {
     let Some(probe) = prompt.job.probe.as_ref().filter(|p| p.spec.score_from.is_some() && !p.spec.media.is_empty()) else {
         return Ok(());
     };
     let Some(root) = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR") else { return Ok(()); };
     anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation, "feature probes require explicit cold/no_speculation");
     probe.spec.validate_media()?;
-    apply_probe_features(prompt, media, cache, &std::path::PathBuf::from(root), &snapshot_identity(snapshot)?)
+    apply_probe_features(prompt, media, cache, &std::path::PathBuf::from(root), &snapshot_identity(view)?)
 }
 
 fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
@@ -462,28 +467,41 @@ mod tests {
         assert!(feature_payload(&path, 16, &hash, Some(&cached)).is_err());
     }
     #[test]
-    fn snapshot_identity_binds_actual_snapshot_files() {
-        use sha2::{Digest, Sha256};
+    fn snapshot_identity_binds_selected_metadata_and_live_media_files() {
+        const COMPACT_CONFIG: &str = "config.compact-attention.json";
+        const COMPACT_INDEX: &str = "model.compact-attention.safetensors.index.json";
+        const COMPACT_QUANT: &str = "quantize_config.compact-attention.json";
         let root = tempfile::tempdir().unwrap();
-        for file in ["config.json", "tokenizer.json", "processor_config.json", "model.safetensors.index.json"] {
+        std::fs::write(root.path().join(COMPACT_CONFIG), "{}").unwrap();
+        std::fs::write(root.path().join(COMPACT_INDEX), r#"{"weight_map":{}}"#).unwrap();
+        std::fs::write(root.path().join(COMPACT_QUANT), "{}").unwrap();
+        for file in ["tokenizer.json", "processor_config.json"] {
             std::fs::write(root.path().join(file), file).unwrap();
         }
-        let before = snapshot_identity(root.path()).unwrap();
-        assert_eq!(before["config_sha256"], format!("{:x}", Sha256::digest(b"config.json")));
+        let view = CheckpointView::select(root.path(), AttentionMode::Compact).unwrap();
+        let before = snapshot_identity(&view).unwrap();
+        assert_eq!(before["config_sha256"], view.metadata_sha256(COMPACT_CONFIG).unwrap());
+        std::fs::remove_file(root.path().join(COMPACT_CONFIG)).unwrap();
+        std::fs::remove_file(root.path().join(COMPACT_INDEX)).unwrap();
+        assert_eq!(snapshot_identity(&view).unwrap(), before);
         std::fs::write(root.path().join("processor_config.json"), "changed").unwrap();
-        assert_ne!(snapshot_identity(root.path()).unwrap(), before);
+        assert_ne!(snapshot_identity(&view).unwrap(), before);
         std::fs::remove_file(root.path().join("tokenizer.json")).unwrap();
-        assert!(snapshot_identity(root.path()).is_err());
+        assert!(snapshot_identity(&view).is_err());
     }
     #[test]
     fn ordinary_and_generation_requests_never_consult_feature_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), "{}").unwrap();
+        let view = CheckpointView::select(root.path(), AttentionMode::Hqa).unwrap();
+        std::fs::remove_file(root.path().join("config.json")).unwrap();
         let (mut prompt, mut media, _) = feature_request(); prompt.job.probe = None;
         let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
-        probe_features(&prompt, &mut media, &mut cache, std::path::Path::new("/does/not/exist")).unwrap();
+        probe_features(&prompt, &mut media, &mut cache, &view).unwrap();
         let (mut prompt, mut media, _) = feature_request();
         let mut spec = prompt.job.probe.as_ref().unwrap().spec.clone(); spec.score_from = None;
         prompt.job.probe = Some(cuteafd_api::openai::probe::Probe::new(spec));
-        probe_features(&prompt, &mut media, &mut cache, std::path::Path::new("/does/not/exist")).unwrap();
+        probe_features(&prompt, &mut media, &mut cache, &view).unwrap();
         assert_eq!(cache.bytes(), 0);
     }
     #[test]

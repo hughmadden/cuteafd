@@ -4,7 +4,12 @@ use std::path::Path;
 
 pub(crate) fn checkpoint_context(snapshot: &Path, manifest: &Path, family: &str, requested: usize) -> Result<usize> {
     let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-    let checkpoint: usize = cuteafd_loader::serving_capacity::checkpoint_context_limit(&config)?
+    checkpoint_context_config(&config, manifest, family, requested)
+}
+
+pub(crate) fn checkpoint_context_config(config: &serde_json::Value, manifest: &Path,
+    family: &str, requested: usize) -> Result<usize> {
+    let checkpoint: usize = cuteafd_loader::serving_capacity::checkpoint_context_limit(config)?
         .with_context(|| format!("{family} checkpoint lacks max_position_embeddings"))?.try_into()?;
     let compiled = if family == "mimo_v2" { None } else {
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest)?)?;

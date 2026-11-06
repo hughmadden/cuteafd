@@ -607,7 +607,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         args.vision = MediaMode::Off;
     }
     if let Some(mode) = cfg.get("AUDIO") { args.audio = mode.parse().map_err(anyhow::Error::msg)?; }
-    args.audio = cuteafd_loader::plan::resolve_audio(args.audio, snapshot)?;
+    args.audio = cuteafd_loader::plan::resolve_audio_config(args.audio, snapshot, &inventory.config)?;
     Ok(args)
 }
 
@@ -1968,6 +1968,23 @@ mod tests {
             assert_eq!(options(&args).unwrap().layout.unwrap().glmf_index, index);
         }
         assert!(parse(&["--index-cache", "auto"]).is_err());
+    }
+
+    #[test]
+    fn compact_file_args_never_read_default_metadata() {
+        use clap::Parser;
+        let root = tempfile::tempdir().unwrap();
+        let config = cuteafd_loader::plan::testing::glm5_flash_config(5);
+        std::fs::write(root.path().join("config.compact-attention.json"), config.to_string()).unwrap();
+        std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#).unwrap();
+        std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}").unwrap();
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", root.path().to_str().unwrap(),
+            "--files", "--compact-attention", "--no-speculator"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { unreachable!() };
+        let selected = args.attention.select(root.path()).unwrap();
+        let args = file_args(args, root.path()).unwrap();
+        assert_eq!(args.audio, cuteafd_loader::plan::MediaMode::Off);
+        assert_eq!(args.attention.select(root.path()).unwrap().fingerprint(), selected.fingerprint());
     }
 
     #[test]

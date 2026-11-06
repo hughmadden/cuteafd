@@ -122,6 +122,7 @@ impl CheckpointView {
             let bytes = metadata_bytes(&snapshot.join(&index_name))?;
             let index: Index = serde_json::from_slice(&bytes).context("decoding selected weight_map")?;
             hash.update(index_name.as_bytes());
+            metadata_digests.insert(index_name.clone(), Sha256::digest(&bytes).into());
             hash.update(bytes);
             Some(Arc::new(index.weight_map))
         } else {
@@ -145,6 +146,10 @@ impl CheckpointView {
     pub fn index_name(&self) -> &str { &self.index_name }
     pub fn quant_names(&self) -> &[String] { &self.quant_names }
     pub fn fingerprint(&self) -> &str { &self.fingerprint }
+    pub fn metadata_sha256(&self, name: &str) -> Result<String> {
+        let digest = self.metadata_digests.get(name).context("metadata was not selected")?;
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
     pub fn config(&self) -> Result<Value> { Ok(self.config.as_ref().clone()) }
     pub(super) fn quantize_config(&self) -> Option<Value> { self.quantize_config.as_deref().cloned() }
     pub(super) fn weight_map(&self) -> Option<&BTreeMap<String, String>> { self.weight_map.as_deref() }
