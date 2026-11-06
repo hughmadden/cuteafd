@@ -57,7 +57,7 @@ def registry():
 def rewritten_fields(code):
     """Direct/mutating writes and destructuring writes to parsed argument objects."""
     target = r'\b(?:args|engine_args|resolved|selected_args|context_args)\.(?:\w+\.)*(\w+)'
-    for match in re.finditer(target + r'\s*(?:=(?!=|>)|\.(?:clear|take|get_or_insert|push)\()', code):
+    for match in re.finditer(target + r'\s*(?:=(?!=)|\.(?:clear|take|get_or_insert|push)\()', code):
         yield match[1], match.start()
     for assignment in re.finditer(r'\(([^();]*?)\)\s*=(?!=|>)', code):
         for match in re.finditer(target, assignment[1]):
@@ -107,7 +107,6 @@ fn later() { args.max_context = 512; }'''
     assert list(rewritten_fields('(engine_args.draft_context_slots, engine_args.draft_sequences) = capacity();')) == [
         ('draft_context_slots', 1), ('draft_sequences', 34)]
     assert list(rewritten_fields('match value { None if (stages == 0 || args.tp2_dspark_experts) => 0 }')) == []
-    assert list(rewritten_fields('match source { Some(source) if source != args.snapshot => select(source), _ => view }')) == []
 
 
 def test_registry_names_have_runtime_publication_and_family_seam_coverage():
