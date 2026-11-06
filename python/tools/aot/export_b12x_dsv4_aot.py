@@ -987,7 +987,7 @@ def mla_draft_programs(max_rows: int, max_context: int):
         g = kimi_mla.MlaDraftGeometry(window_size=window, kv_cache=cache)
         fn = getattr(kimi_mla, f"compile_mla_draft_{op}_aot")
         kwargs = {"max_rows": max_rows}
-        if op == "attention":
+        if op in ("attention", "partial"):
             kwargs["max_context"] = max_context
         return fn(g, **kwargs)
 
@@ -1002,6 +1002,9 @@ def mla_draft_programs(max_rows: int, max_context: int):
             out.append((f"mla_draft_attention_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_attention",
                         {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
                         lambda w=window, c=cache: build("attention", w, c)))
+            out.append((f"mla_draft_partial_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_partial",
+                        {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
+                        lambda w=window, c=cache: build("partial", w, c)))
     return out
 
 

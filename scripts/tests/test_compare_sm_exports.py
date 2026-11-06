@@ -261,7 +261,9 @@ def test_ml4_context_fc_has_a_scoped_cross_sm_gate():
 def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
     names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
              "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
-             "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"]
+             "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64",
+             "mla_draft_partial_full_m64", "mla_draft_partial_w4096_m64",
+             "mla_draft_partial_full_fp8_m64", "mla_draft_partial_w4096_fp8_m64"]
     job = next(job for job in compare_sm.jobs("suspects") if job[0] == "mla-draft-h64")
     assert job == ("mla-draft-h64", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(names)])
@@ -277,7 +279,7 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
 
     module = SimpleNamespace(kimi_mla=SimpleNamespace(
         MlaDraftGeometry=lambda **kwargs: kwargs,
-        **{f"compile_mla_draft_{op}_aot": compile_fake for op in ("producer", "output", "attention")}))
+        **{f"compile_mla_draft_{op}_aot": compile_fake for op in ("producer", "output", "attention", "partial")}))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", module)
     ns = {}
     exec(compile(tree, str(source), "exec"), ns)
@@ -289,6 +291,7 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
         (dict(window_size=window, kv_cache=cache), dict(max_rows=64, **extra))
         for cache in ("bf16", "fp8")
         for window, extra in ((None, {}), (None, {"max_context": 262144}),
+                              (None, {"max_context": 262144}), (4096, {"max_context": 262144}),
                               (4096, {"max_context": 262144}))]
 
 
