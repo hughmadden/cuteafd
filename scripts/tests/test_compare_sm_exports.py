@@ -69,6 +69,17 @@ def test_draft_bf16_group_matches_exported_shapes():
         assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only", expected])
 
 
+@pytest.mark.parametrize("hidden,heads", [(6144, 128), (4096, 64)])
+def test_mimo_tp2_draft_exports_cover_local_projection_shapes(hidden, heads):
+    exporter = compare_sm.load_file("test_mimo_tp2_draft_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    shapes = exporter.draft_bf16_shapes()
+    family = f"dflash-mimo-{'pro' if hidden == 6144 else 'flash'}-tp2"
+    expected = {(hidden * 5, hidden), (hidden, (heads // 2 + 8) * 128),
+                (hidden, 1024), (heads // 2 * 128, hidden),
+                (hidden, 16384), (8192, hidden)}
+    assert {shape for shape, families in shapes.items() if family in families} == expected
+
+
 def test_kimi_context_group_covers_both_tiles_formats_and_shared_primitives():
     job, = (job for job in compare_sm.jobs("all") if job[0] == "context-split-kimik3")
     stems = [f"mla_partial{cache}_h{begin}_t{tile}_m64"

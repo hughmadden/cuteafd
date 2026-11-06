@@ -296,6 +296,7 @@ impl<'a> ExpertUsage<'a> {
         devices: &[UsageDevice],
         reader: Reader,
     ) -> Result<Self> {
+        reader.require_enabled().map_err(anyhow::Error::msg)?;
         ensure!(geometry.validate(), "invalid expert usage geometry");
         ensure!(
             validate_devices(devices),
@@ -320,7 +321,6 @@ impl<'a> ExpertUsage<'a> {
         let restored = library.cuda_set_device(current);
         let raw = Arc::new(owners?);
         restored?;
-        let _owner = memory_ledger::owner("expert-usage.history");
         reader
             .initialize((*geometry).clone())
             .map_err(anyhow::Error::msg)?;

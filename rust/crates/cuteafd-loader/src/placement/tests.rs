@@ -260,7 +260,7 @@ fn explicit_diagnostic_pool_clamps_only_automatic_context() {
 }
 
 #[test]
-fn spark_auto_pool_can_shrink_below_context_but_v41_refuses_it() {
+fn spark_auto_pool_can_shrink_below_context() {
     let req = request(1, GIB, 40, 4, Onboard::Auto);
     let placement = solve(&req).unwrap();
     assert_eq!(placement.pool_tokens, 65_536);
@@ -269,9 +269,6 @@ fn spark_auto_pool_can_shrink_below_context_but_v41_refuses_it() {
     measured.pool.pin_selected(placement.pool_tokens);
     assert_eq!(measured.pool.requested, None);
     assert_eq!(solve_frozen(&measured, &placement).unwrap(), placement);
-
-    assert!(matches!(families::deepseek_v41::validate_pool_floor(&req.pool, &placement),
-        Err(PlacementError::BelowFloor { pool: 65_536, floor: 131_072, .. })));
 }
 
 #[test]
@@ -1729,10 +1726,7 @@ fn compulsory_prefix_reserves_exact_costs_before_an_automatic_pool() {
         assert!(solve(&req).is_err());
         req.pool.requested = None;
         req.pool.floor = req.pool.target;
-        let below_floor = solve(&req).unwrap();
-        assert!(below_floor.pool_tokens < req.pool.floor);
-        assert!(matches!(families::deepseek_v41::validate_pool_floor(&req.pool, &below_floor),
-            Err(PlacementError::BelowFloor { .. })));
+        assert!(solve(&req).unwrap().pool_tokens < req.pool.floor);
         req.pool.floor = 131_072;
         req.onboard = Onboard::Layers(3);
         assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));

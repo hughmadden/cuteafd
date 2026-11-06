@@ -208,6 +208,7 @@ mod tests {
             half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2,
             whole_supported: true, spark_ok: true };
         admission::ProductionInput {
+            expert_usage: false,
             cfg, layers: 4, kv: MimoKvFormats::default(), mtp_stages: 0, context,
             maximum_pool_tokens: admission::maximum_pool_tokens(&[96 << 30; 2][..ranks], context,
                 None, spark.pool_unit_rows, false),
@@ -218,7 +219,7 @@ mod tests {
             expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
             tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] },
             spark: phase_profiles(spark), no_spark: phase_profiles(no_spark),
-            post_kv_additional: vec![vec![]; ranks], draft_packing: vec![],
+            post_kv_additional: vec![vec![]; ranks], draft_packing: vec![vec![]; ranks],
             host: admission::HostOwners { expert_input: Default::default(), output: crate::families::mimo_v2::MimoPrefillOutput::LastRow,
                 serving: true, scoring_rows: 64, diagnostic_rows: 256, prefix_bytes: 0, media_bytes: 0, headroom: 0 },
             spark_reply_formats: Default::default(),
@@ -229,6 +230,65 @@ mod tests {
                     occupied: 0, source: "unit test".into(), assumed: false }; ranks],
                 (128 << 30, 128 << 30), 108 << 30, 6).unwrap(),
         }
+    }
+
+    #[test]
+    fn expert_usage_prices_one_canonical_producer_even_with_tp2() {
+        use crate::placement::planner::{ComponentKind, Location, Operation, Recipe};
+        for ranks in [1, 2] {
+            let (cfg, spark, no_spark) = fixture(ranks, 4096);
+            let off = input(&cfg, &spark, &no_spark, ranks, 4096).prepare().unwrap();
+            assert!(off.recipe.expert_usage.is_none());
+            let mut facts = input(&cfg, &spark, &no_spark, ranks, 4096);
+            facts.expert_usage = true;
+            let on = facts.prepare().unwrap();
+            let geometry = on.recipe.expert_usage.as_ref().unwrap();
+            assert_eq!(geometry.routed_layers, [1, 2, 3]);
+            assert_eq!((geometry.layers, geometry.experts, geometry.topk), (4, cfg.experts, cfg.topk));
+            let request = admission::production_request(4096, Some(4096), Onboard::Layers(1),
+                on.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+            let contract = on.recipe.prepare(&request).unwrap();
+            let mut owners = Vec::new();
+            let mut unchanged = Vec::new();
+            for component in contract.components {
+                if let ComponentKind::Allocation { template, .. } = &component.kind {
+                    if template.id.starts_with("expert-usage.") {
+                        assert_eq!(component.bytes.at(1).unwrap(), component.bytes.at(on.recipe.maximum_pages).unwrap());
+                        owners.push(template.clone());
+                        continue;
+                    }
+                }
+                unchanged.push(component);
+            }
+            assert_eq!(format!("{unchanged:?}"), format!("{:?}", off.recipe.prepare(&request).unwrap().components));
+            assert_eq!(owners.len(), 4);
+            let table = geometry.table_bytes().unwrap() as u64;
+            for (suffix, location, bytes) in [
+                ("gpu0.counters", Location::coordinator(0), table),
+                ("gpu0.snapshot", Location::coordinator(0), table),
+                ("gpu0.pinned", Location::PINNED, table),
+                ("history", Location::HOST, geometry.host_bytes(1).unwrap() as u64),
+            ] {
+                let owner = owners.iter().find(|owner| owner.id == format!("expert-usage.{suffix}")).unwrap();
+                assert_eq!((owner.location, owner.bytes), (location, bytes));
+            }
+        }
+    }
+
+    #[test]
+    fn expert_usage_geometry_follows_backbone_not_expert_costs() {
+        let (mut cfg, spark, no_spark) = fixture(1, 4096);
+        let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
+        facts.expert_usage = true;
+        facts.experts.fill(None);
+        let prepared = facts.prepare().unwrap();
+        assert!(prepared.recipe.routed.is_empty());
+        assert_eq!(prepared.recipe.expert_usage.unwrap().routed_layers, [1, 2, 3]);
+        cfg.dense.fill(true);
+        let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
+        facts.expert_usage = true;
+        facts.experts.fill(None);
+        assert!(facts.prepare().unwrap().recipe.expert_usage.is_none());
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub(crate) mod copy;
 pub(crate) mod evidence;
 pub(crate) mod probe;
 pub(crate) mod remote;
+pub(crate) mod remote_dflash;
 pub(crate) mod resource;
 pub(crate) mod routes;
 pub(crate) mod runtime;

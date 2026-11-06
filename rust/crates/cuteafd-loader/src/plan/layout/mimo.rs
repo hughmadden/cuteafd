@@ -22,6 +22,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let checkpoint = input.checkpoint();
     let ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let mut notes = vec![format!("resolved context {context} tokens"), "MiMo attention placement heads".into()];
+    if options.tp2_dflash && (ranks != 2 || mimo_dflash_dir(checkpoint, options).is_none()) {
+        report.refuse_placement("TP2 DFlash requires two target GPUs and DFlash".into(),
+            "Select --rtx 2 with DFlash or disable --tp2-dflash.");
+        return MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes };
+    }
     if options.host_embedding || (!options.force_gpu_embedding && options.rtx_bytes[0] <= 32 * GIB) {
         match checkpoint.require_untied_embedding("model.embed_tokens.weight") {
             Ok(()) => if let Some(tensor) = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight") {
@@ -272,10 +277,10 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         Some(draft_config::DflashConfig::read(&dir)?)
     } else { None };
     let draft_mark = if options.mimo_prefix_draft && mimo_dflash_dir(checkpoint, options).is_some() {
-        if let Some(draft) = &draft { draft_representation::mimo_draft_mark_bytes(draft.layers as u64, draft.kv_heads as u64, draft.head_dim as u64, options.draft_kv_cache)? }
+        if let Some(draft) = &draft { draft.mark_bytes(if options.tp2_dflash { 2 } else { 1 }, options.draft_kv_cache)? }
         else if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-            super::mimo_draft_prefix_bytes(&config, 1, rings, options.draft_kv_cache).map_err(anyhow::Error::msg)?.0
+            super::mimo_draft_prefix_bytes_tp(&config, 1, rings, options.draft_kv_cache, if options.tp2_dflash { 2 } else { 1 }).map_err(anyhow::Error::msg)?.0
         } else { 0 }
     } else { 0 };
     let mark = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>() + draft_mark;
@@ -287,24 +292,28 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         let mut additional = Vec::new();
         let mut resident_weights = crate::placement::ResidentWeights::default();
         additional.extend(transport_reservations(&cfg, ranks, rank, rows as usize, lanes, spark_ranks, options.resolved_spark_reply_format(false))?);
-        if rank == 0 {
-            additional.extend(sampling_reservations(cfg.vocab_size)?);
+        if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size)?); }
+        if rank == 0 || options.tp2_dflash {
             if let Some(draft) = &draft {
                 let sequences = options.mimo_draft_sequences().max(concurrency);
                 let slots = draft_representation::mimo_draft_context_slots(sequences, rings, options.draft_context_slots);
                 let mut capacity = draft_representation::MimoDraftCapacity::new(slots as usize, sequences as usize, draft.block)?;
                 capacity.kv_cache = options.draft_kv_cache;
                 let headers = crate::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?;
-                let costs = draft_reservations_with(draft, &headers,
+                let costs = draft_rank_reservations_with(draft, &headers,
                     if options.mimo_draft_bf16 { draft_representation::MimoDraftRepresentation::Bf16Only }
-                        else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity,
-                    |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
+                        else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity, rank,
+                    if options.tp2_dflash { 2 } else { 1 }, |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
                         crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?;
                 resident_weights = resident_weights.checked_add(costs.resident_weights)?;
                 additional.extend(costs.steady);
 
             }
-            additional.extend(draft_prefix_reservations(options.mimo_prefix_draft, draft_mark, marks, rings)?);
+            let local_mark = if options.tp2_dflash && draft_mark > 0 {
+                (draft_mark - 8) / 2 + if rank == 0 { 8 } else { 0 }
+            } else { draft_mark };
+            additional.extend(draft_prefix_reservations(options.mimo_prefix_draft, local_mark, marks,
+                if rank == 0 { rings } else { 0 })?);
         }
         let workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
             lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp,
@@ -343,19 +352,21 @@ fn selected_mtp(checkpoint: &super::super::Checkpoint, options: &LayoutOptions) 
 }
 
 fn offline_draft_packing(checkpoint: &super::super::Checkpoint, options: &LayoutOptions)
-    -> Result<Vec<cuteafd_core::serving_capacity::MemoryReservation>> {
+    -> Result<Vec<Vec<cuteafd_core::serving_capacity::MemoryReservation>>> {
+    let ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let Some(dir) = mimo_dflash_dir(checkpoint, options)
-        .filter(|dir| dir.join("dflash_draft_model.safetensors").is_file()) else { return Ok(vec![]); };
+        .filter(|dir| dir.join("dflash_draft_model.safetensors").is_file()) else { return Ok(vec![vec![]; ranks]); };
     let draft = draft_config::DflashConfig::read(&dir)?;
     let sequences = options.mimo_draft_sequences().max(options.resolved_concurrency("mimo_v2"));
     let slots = draft_representation::mimo_draft_context_slots(sequences, options.mimo_rings(), options.draft_context_slots);
     let mut capacity = draft_representation::MimoDraftCapacity::new(slots as usize, sequences as usize, draft.block)?;
     capacity.kv_cache = options.draft_kv_cache;
-    Ok(draft_reservations_with(&draft, &crate::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?,
+    let packing = draft_rank_reservations_with(&draft, &crate::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?,
         if options.mimo_draft_bf16 { draft_representation::MimoDraftRepresentation::Bf16Only }
-            else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity,
-        |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
-            crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?.packing)
+            else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity, 0,
+        if options.tp2_dflash { 2 } else { 1 }, |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
+            crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?.packing;
+    Ok((0..ranks).map(|rank| if rank == 0 || options.tp2_dflash { packing.clone() } else { vec![] }).collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -368,7 +379,7 @@ fn offline_host(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, 
     if let Some(dir) = mimo_dflash_dir(checkpoint, options).filter(|_| options.mimo_prefix_draft) {
         if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-            mark_bytes += super::mimo_draft_prefix_bytes(&config, 1, options.mimo_rings(), options.draft_kv_cache)
+            mark_bytes += super::mimo_draft_prefix_bytes_tp(&config, 1, options.mimo_rings(), options.draft_kv_cache, if options.tp2_dflash { 2 } else { 1 })
                 .map_err(anyhow::Error::msg)?.0;
         }
     }
@@ -524,6 +535,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let request = admission::production_request(context, options.pool_tokens, onboard, prefill,
         operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let prepared = ProductionInput {
+        expert_usage: options.expert_usage,
         cfg: &cfg, layers: cfg.layers, kv, mtp_stages: selected_mtp(checkpoint, options), context, maximum_pool_tokens,
         prefill, lanes: lanes as u64, embedding, gpus: ranks, spark_ranks,
         experts, expert_workspace, tp2_workspace,

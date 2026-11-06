@@ -23,8 +23,9 @@ use std::time::{Duration, Instant};
 /// What every DeepSeek V4 command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
-    /// Count executed expert routes on device, separately for prefill and decode.
-    #[arg(long)]
+    /// Count executed backbone expert routes by phase (disable with =false).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
+        default_missing_value = "true", require_equals = true)]
     pub expert_usage: bool,
     #[arg(skip)]
     pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
@@ -227,6 +228,25 @@ mod prefill_shape_tests {
     }
 
     #[test]
+    fn skipped_routed_experts_disable_usage_before_admission() {
+        for requested in [None, Some(false), Some(true)] {
+            for skip in [false, true] {
+                let mut argv = vec!["v4", "--snapshot", "/missing", "--native-lib", "/missing.so"];
+                if let Some(enabled) = requested {
+                    argv.push(if enabled { "--expert-usage" } else { "--expert-usage=false" });
+                }
+                if skip { argv.push("--skip-routed-experts"); }
+                let args = Cli::try_parse_from(argv).unwrap().engine;
+                assert_eq!(args.expert_usage, requested.unwrap_or(true));
+                let enabled = requested.unwrap_or(true) && !skip;
+                assert_eq!(args.expert_usage_enabled().unwrap(), enabled);
+                assert_eq!(args.expert_usage_reader.require_enabled().is_ok(), enabled);
+                assert_eq!(args.expert_usage_reader.snapshot()["enabled"], false);
+            }
+        }
+    }
+
+    #[test]
     fn runtime_shape_matches_planner_policy_and_preserves_explicit_pins() -> Result<()> {
         let base = Cli::try_parse_from(["v4", "--snapshot", "/missing", "--native-lib", "/missing.so"])?.engine;
         assert_eq!(base.prefill_waves, None);
@@ -270,6 +290,10 @@ mod prefill_shape_tests {
 }
 
 impl EngineArgs {
+    fn expert_usage_enabled(&self) -> Result<bool> {
+        self.expert_usage_reader.configure(self.expert_usage, self.skip_routed_experts).map_err(anyhow::Error::msg)
+    }
+
     fn prefill_shape(&self, compiled_rows: u64, span_rows: Option<u64>)
         -> std::result::Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan,
             cuteafd_loader::serving_capacity::prefill_waves::PrefillError> {

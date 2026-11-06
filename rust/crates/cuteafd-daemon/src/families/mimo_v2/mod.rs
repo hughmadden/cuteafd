@@ -33,6 +33,12 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Count executed backbone expert routes by phase (disable with =false).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
+        default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
@@ -120,6 +126,9 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
+    /// Split DFlash attention and FFN over both RTX ranks (default on with --split-device and --draft).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
     /// Native MTP drafter: run this many of the checkpoint's MTP stages
     /// (`model.mtp.layers.*`, 0 = off) after each next token.
     #[arg(long, default_value_t = 0)]
@@ -220,6 +229,10 @@ pub(crate) enum DraftRepresentationArg {
 pub(crate) enum WeightPolicyArg { Auto, Checkpoint }
 
 impl EngineArgs {
+    fn expert_usage_enabled(&self) -> Result<bool> {
+        self.expert_usage_reader.configure(self.expert_usage, self.skip_experts).map_err(anyhow::Error::msg)
+    }
+
     fn draft_storage(&self) -> Result<MimoDraftRepresentation> {
         match self.draft_representation {
             Some(DraftRepresentationArg::Checkpoint) => {
@@ -271,6 +284,23 @@ mod draft_storage_tests {
     fn args(extra: &[&str]) -> EngineArgs {
         Command::try_parse_from(["mimo", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
             .into_iter().chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn expert_usage_defaults_on_and_explicit_off_or_skipped_stays_disabled() {
+        let default = args(&[]);
+        assert!(default.expert_usage);
+        assert!(default.expert_usage_enabled().unwrap());
+        assert_eq!(default.expert_usage_reader.snapshot()["enabled"], false);
+        let off = args(&["--expert-usage=false"]);
+        assert!(!off.expert_usage_enabled().unwrap());
+        assert!(off.expert_usage_reader.require_enabled().is_err());
+        assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
+        assert!(args(&["--expert-usage"]).expert_usage);
+        let skipped = args(&["--skip-experts"]);
+        assert!(!skipped.expert_usage_enabled().unwrap());
+        assert!(skipped.expert_usage_reader.require_enabled().is_err());
+        assert_eq!(skipped.expert_usage_reader.snapshot()["enabled"], false);
     }
 
     #[test]
@@ -1190,6 +1220,9 @@ impl Opened {
         // Once an engine exists, setup and body failures share the same terminal
         // retirement path. Pre-engine loader ownership is a separate boundary.
         let result = (|| -> Result<T> {
+            engine.expert_usage = preflight.expert_usage.map(|geometry| cuteafd_ffi::expert_usage::ExpertUsage::new(
+                &self.library, geometry, &[cuteafd_ffi::expert_usage::UsageDevice { logical: 0, cuda: args.device }],
+                args.expert_usage_reader.clone())).transpose()?;
             engine.prefill_w8a8 = !args.prefill_w8a16;
             engine.output_fp8_decode = args.fp8_decode;
             engine.decode_graphs = args.decode_graphs;
@@ -1223,9 +1256,14 @@ impl Opened {
                 let capacity = args.draft_capacity(cfg.block)?;
                 let representation = self.weight_formats.draft;
                 let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
-                let drafter = crate::shared::experts::rtx::push::load_alone(dir, &[device], ||
+                let exchange = args.tp2_dflash.then(|| engine.draft_exchange()).transpose()?;
+                let mut devices = vec![device];
+                if let Some(exchange) = &exchange {
+                    devices.push(crate::shared::memory::device::Device { library: &self.library, id: exchange.device(1) });
+                }
+                let drafter = crate::shared::experts::rtx::push::load_alone(dir, &devices, ||
                     dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
-                        capacity.max_batch_sequences, representation, args.fp8_scales, args.draft_kv_cache))?;
+                        capacity.max_batch_sequences, representation, args.fp8_scales, args.draft_kv_cache, exchange))?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
             }

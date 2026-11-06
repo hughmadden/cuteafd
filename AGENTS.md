@@ -173,11 +173,13 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   nextest when present on PATH or in the persistent architecture Cargo home,
   with cargo test as fallback. Install without root:
   `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`.
-  Default is for iteration and feature merges: it excludes the 15 measured
-  full-plan/cache IDs in `scripts/dev/cpu-gate`'s `FULL_TESTS`; receipts list
-  every exclusion. Use `cpu-gate --full` before merging into dev and for
-  releases to restore every nonignored test, including installed example
-  plans through the launcher's `release_prefill_shape`. That sweep uses
+  Default is the merge gate (TJ, 2026-11-06): iteration, feature merges into
+  dev and SparkInfer pin bumps. It excludes the measured full-plan/cache IDs in
+  `scripts/dev/cpu-gate`'s `FULL_TESTS`; receipts list every exclusion. A pin
+  bump or placement-input republish also runs the installed deployment tests
+  by name, since they are what read the new inputs. Use `cpu-gate --full` for
+  release cuts only, to restore every nonignored test, including installed
+  example plans through the launcher's `release_prefill_shape`. That sweep uses
   `HF_HOME` (or `~/.cache/huggingface`); override with
   `CUTEAFD_DEPLOYMENT_TEST_HF_HOME` and optionally supply the matching
   `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports (default

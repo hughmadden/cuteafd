@@ -98,7 +98,18 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
+            if entry["family"] in {"deepseek_v4", "mimo_v2"}:
+                # Telemetry defaults on in adapted families; historical captures
+                # predate it. This is the first family-specific serve argument.
+                position = before["command"].index("--embedding-placement") + 2
+                before["command"][position:position] = ["--expert-usage"]
             if entry["family"] == "mimo_v2":
+                # MiMo defaults to the qualified TP2 drafter on split pairs.
+                tp2_dflash = ("true" if "--split-device" in before["command"]
+                              and "--draft" in before["command"] else "false")
+                # The launcher emits it after the telemetry switch.
+                position = before["command"].index("--embedding-placement") + 3
+                before["command"][position:position] = ["--tp2-dflash", tp2_dflash]
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
@@ -154,6 +165,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 before["command"][before["command"].index("--prefill-batch-tokens") + 1] = "2752"
             if before["command"][before["command"].index("--rtx-gpus") + 1] == "2" and "--dspark" in before["command"]:
                 before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
+            position = before["command"].index("--mapped-scale-preload-gib") + 2
+            before["command"][position:position] = ["--expert-usage"]
 
         if old["host"] == "coordinator" and entry["family"] != "deepseek_v41":
             # Every family's coordinator now takes its GPUs as V4.1's always did: CDI by

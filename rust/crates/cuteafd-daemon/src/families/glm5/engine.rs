@@ -549,7 +549,7 @@ pub(crate) struct GlmEngine<'a> {
     graphs_warming: Cell<bool>,
     graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
-    pub drafter: Option<crate::shared::speculation::dflash::DflashDrafter<'a>>,
+    pub drafter: Option<super::drafter::GlmDrafter<'a>>,
     /// Prefix marks admission charged for a window-ring drafter's draft windows (0: none).
     pub draft_window_marks: usize,
     draft_core_head: Option<super::core_runtime::CoreHead<'a>>,
@@ -3289,7 +3289,8 @@ mod long_graph_tests {
 impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
         if self.tp2.is_some() || self.layer_execution.is_some() || self.core_admission.is_some()
-            || (!self.native_experts.is_empty() && self.peer.is_some()) {
+            || (!self.native_experts.is_empty() && self.peer.is_some())
+            || self.drafter.as_ref().is_some_and(|drafter| drafter.is_remote()) {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }
         if !self.native_experts.is_empty() {

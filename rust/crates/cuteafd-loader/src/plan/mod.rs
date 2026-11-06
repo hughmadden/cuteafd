@@ -1224,22 +1224,6 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let mut memory = family_layout(model, input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
-        if family.id() == "deepseek_v41" && !memory.devices.is_empty() {
-            let shape = (|| -> anyhow::Result<crate::EngramStagingShape> {
-                use anyhow::Context;
-                Ok(crate::EngramStagingShape::new(
-                    usize::try_from(layout_options.prefill_unit_rows.context("V4.1 prefill unit missing")?)?,
-                    usize::try_from(layout_options.prefill_waves)?)?)
-            })()?;
-            report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
-                mapped_names, scales, scale_bytes, options.mapped_scale_preload_bytes,
-                shape.preload_budget(host_budget, layout::engram_row_bytes(input.checkpoint())?)).admit_tables(table_bytes);
-            report.bytes_by_owner.remove("host-preloaded");
-            if report.mapped_placement.preloaded_bytes > 0 {
-                report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
-            }
-            layout::mapped_table_note(&report, &mut memory.notes);
-        }
         if let Some(placement) = &report.solver_placement {
             report.onboard_layers = Some(placement.onboard_layers);
             report.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;

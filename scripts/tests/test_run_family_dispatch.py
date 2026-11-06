@@ -748,7 +748,7 @@ def test_glmf_tp2_combine_consumes_shared_before_reusing_exchange_slot() -> None
 
 def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
-    remote = (family / "remote_dflash.rs").read_text()
+    remote = (family.parent.parent / "shared/draft/remote_dflash.rs").read_text()
     shared = (family.parent.parent / "shared/speculation/dflash.rs").read_text()
     update = shared.split("    pub(crate) fn update_with(", 1)[1].split("    fn put(", 1)[0]
     assert update.index("self.put(&self.context_positions") < update.index("ready()?")
@@ -938,7 +938,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                              'exec bash -c "$command"; fi\n')
         if tool == "ssh" and native_v41:
             with (bin_dir / tool).open("a") as stream:
-                stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp2"*) echo "${STUB_SPARK_ROLES:-tp2}" ;; *"docker container inspect"*) exit 1 ;; esac\n')
+                stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp"[1-8]*) echo "${STUB_SPARK_ROLES:-tp2}" ;; *"docker container inspect"*) exit 1 ;; esac\n')
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
             intercept = ('case "$*" in *" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; '
@@ -976,7 +976,8 @@ exec python3 -c "$code" "$@"
     gpus = [gpu for gpu in gpus if gpu["index"] in physical_gpus]
     if native_v41:
         (bin_dir / "curl").write_text(
-            '#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"object":"list","data":[{"id":"deepseek-ai/DeepSeek-V4.1-Flash"}]}\'\n')
+            '#!/usr/bin/env bash\nprintf \'{"object":"list","data":[{"id":"%s"}]}\\n\' '
+            '"${STUB_SERVED_MODEL_ID:-deepseek-ai/DeepSeek-V4.1-Flash}"\n')
     deployment_stub = tmp_path / "deployment-stub.py"
     deployment_stub.write_text("""import json, os, subprocess, sys
 args = sys.argv[1:]
@@ -1211,6 +1212,54 @@ def capture_muse_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert deployment["prefill_waves"] == 3, deployment
     assert deployment["prefill_unit_rows"] >= 1024, deployment
 
+
+def capture_v41_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                    programs: Path, hf_home: Path, temporary: Path) -> None:
+    """A shipped V4.1 config through the real launcher argv and CPU Recipe admission."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    # Fake only hardware and execution: the planner reads the actual snapshot,
+    # drafter and native export manifests, not a canned deployment response.
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/v41-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_SPARK_ROLES": f"tp{config.get('SPARK_TP', config['SPARK_COUNT'])}",
+            "STUB_SERVED_MODEL_ID": "test/v41-real-plan",
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if " plan " in line and "--deployment" in line and "--pool-tokens" in line]
+    assert len(plans) == 1, result.stderr
+    assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    if "KV_POOL_SIZE" in config:
+        assert plans[0][plans[0].index("--kv-pool-size") + 1] == config["KV_POOL_SIZE"]
+    assert "prefill reserve does not fit" not in result.stderr
+    if not (programs.parent / "V41_FP8_AOT.json").is_file():
+        # The CPU gate's placement inputs carry only the exporter manifest; the
+        # launcher must surface the missing native export as the typed refusal.
+        assert result.returncode != 0, result.stderr
+        assert "missing V4.1 native FP8 allocation manifest" in result.stderr, result.stderr
+        assert "invalid deployment specification" in result.stderr, result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    deployment = json.loads(output.read_text())
+    assert deployment["family"] == "deepseek_v41", deployment
+    assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
+    # One shared prefill policy sizes the reserve and cuts it into three units.
+    assert (deployment["prefill_reserve_rows"], deployment["prefill_unit_rows"],
+            deployment["prefill_waves"]) == (8192, 2752, 3), deployment
+    assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "serve-native" in line and "--snapshot" in line)
+    assert serve[serve.index("--prefill-batch-tokens") + 1] == "2752"
+    assert serve[serve.index("--prefill-waves") + 1] == "3"
+    assert serve[serve.index("--prefill-reserve-rows") + 1] == "8192"
 
 
 def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path,
@@ -4825,3 +4874,35 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
     assert "prefill reserve does not fit" not in result.stderr
 
+
+@pytest.mark.parametrize("family,command", [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi")])
+@pytest.mark.parametrize("value,expected", [(None, None), ("off", "false"), ("on", "true")])
+def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, command, value, expected):
+    if expected is None:
+        expected = "true" if family == "mimo_v2" else "false"
+    config = {"model_type": family, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    if family == "kimi_k3":
+        config = {"model_type": family, "text_config": {"model_type": "kimi_linear",
+                  "num_hidden_layers": 93, "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+    keys = "RTX_GPUS=2\nSPECULATOR=dflash2\nVISION=off\nAUDIO=off\n"
+    if family == "kimi_k3":
+        keys += "SPECULATOR_MODEL_ID=test/tp2-dflash\n"
+    if value is not None:
+        keys += f"TP2_DFLASH={value}\n"
+    result = _family_launch_result(tmp_path, config, "test/tp2-dflash", keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    serve = next(line for line in lines if f"cuteafd {command} --snapshot" in line)
+    plans = [line for line in lines if "cuteafd plan " in line]
+    assert f"--tp2-dflash {expected}" in serve
+    assert plans and all(f"--tp2-dflash {expected}" in line for line in plans)
+
+
+@pytest.mark.parametrize("keys", ["RTX_GPUS=1\nSPECULATOR=dflash2\n",
+                                  "RTX_GPUS=2\nSPECULATOR=off\n",
+                                  "RTX_GPUS=2\nCOORDINATOR_SPLIT=off\nSPECULATOR=dflash2\n"])
+def test_tp2_dflash_rejects_inapplicable_launch(tmp_path, keys):
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2", "num_hidden_layers": 2},
+                                  "test/tp2-dflash", keys + "TP2_DFLASH=on\n")
+    assert result.returncode == 2, result.stderr
+    assert "TP2_DFLASH requires" in result.stderr
