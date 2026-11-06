@@ -158,7 +158,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     })();
     match admitted {
         Ok((placement, reserves, startup_notes, solved, prefix, solve_us, admissions)) => {
-            notes.push(format!("deepseek_v4 solve_us={solve_us} admissions={admissions} (prepare + solve/execution; excludes checkpoint inventory)"));
+            report.admission_timing = Some(crate::plan::AdmissionTiming { solve_us, admissions });
             notes.extend(startup_notes);
             report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&solved));
             report.host_budget_bytes = prefix.owners.quota_bytes;

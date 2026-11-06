@@ -244,6 +244,14 @@ impl SolvedPhaseLedger {
     }
 }
 
+/// Observed admission work, separate from deterministic placement output.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmissionTiming {
+    /// Prepare plus solve/execution work, excluding checkpoint inventory.
+    pub solve_us: u64,
+    pub admissions: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
     pub mapped_placement: crate::formats::mapped_preload::MappedPlacement,
@@ -254,6 +262,8 @@ pub struct PlanReport {
     /// Already solved startup and resident totals; never a second admission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_ledger: Option<SolvedPhaseLedger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_timing: Option<AdmissionTiming>,
     pub attention_placement: crate::placement::AttentionPlacement,
     /// The routed-expert weight budget per Spark rank this plan used
     /// (explicit, or the family's default).
@@ -858,6 +868,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         host_budget_bytes: 0,
         host_ledger: None,
         phase_ledger: None,
+        admission_timing: None,
         attention_placement: options.attention_placement.unwrap_or_default(),
         spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,
