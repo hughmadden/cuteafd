@@ -806,7 +806,7 @@ mod tests {
                 let device = &layout.devices[0];
                 assert!(device.items.iter().any(|i| i.group == "target incl PLE projections" && i.bytes > 0));
                 let baseline = device.items.iter().filter(|i| !matches!(i.group.as_str(), "records" | "state" |
-                    "marks" | "graphs" | "graph growth" | "decode step" | "prefill step"))
+                    "marks" | "startup graphs" | "decode step" | "prefill step"))
                     .map(|i| i.bytes).sum::<u64>();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
                     "--native-lib", "/nonexistent/lib.so", "--max-context", &context.to_string(),
@@ -817,12 +817,16 @@ mod tests {
                 let loaded_weights = super::single_weights(&args, &checkpoint, &cfg, cfg.layers, false)?
                     .checked_add(qwen4::single_expert_weights(&catalog, cfg.layers, true, false)?)?;
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
-                let placement = qwen4::placement(&qwen4::QwenInputs {
+                let planned = qwen4::QwenInputs {
                     loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: pool, spark_ranks: 0,
-                    startup_graph_modes: args.planner_graph_modes })?;
+                    startup_graph_modes: args.planner_graph_modes };
+                // The graph reserve is priced once at the widest compiled pool.
+                let policy = qwen4::single_policy(&planned);
+                let extent = policy.maximum_tokens().max(policy.floor) as usize;
+                let placement = qwen4::placement(&planned)?;
                 assert_eq!(placement.pool_tokens, layout.pool_tokens);
                 let pool = layout.pool_tokens as usize;
                 let executables = super::super::engine::serving_graph_count(context as usize, pool,
@@ -830,9 +834,11 @@ mod tests {
                 let graphs = qwen_startup_graphs(context as usize, pool, cfg.dense_context(),
                     concurrency as usize, true, cfg.layers).unwrap();
                 assert_eq!(graphs.ranks[0].executables, executables as u64);
-                let admitted = device.items.iter().filter(|item| matches!(item.group.as_str(), "graphs" | "graph growth"))
+                let admitted = device.items.iter().filter(|item| item.group == "startup graphs")
                     .map(|item| item.bytes).sum::<u64>();
-                assert_eq!(admitted, graphs.bytes(0));
+                let reserve = qwen_startup_graphs(context as usize, extent, cfg.dense_context(),
+                    concurrency as usize, true, cfg.layers).unwrap();
+                assert_eq!(admitted, reserve.bytes(0));
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let mut invalid = qwen4::QwenInputs {
                     loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),

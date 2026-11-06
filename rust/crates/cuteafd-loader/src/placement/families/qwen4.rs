@@ -726,13 +726,12 @@ fn dual_policy(inputs: &QwenDualInputs<'_>) -> PoolPolicy {
 }
 
 /// TP2 arenas follow the executor's load chronology: one workspace opened once,
-/// both halves' resident bytes, and the largest staging peak beside them.
+/// both halves' resident bytes, and the largest staging peak beside them. A
+/// layer without a routed expert package contributes nothing.
 fn tp2_arena(inputs: &QwenDualInputs<'_>) -> Result<([u64; 2], [u64; 2]), Refusal> {
     let mut resident = inputs.tp2_workspace;
     let mut peak = inputs.tp2_workspace;
-    for (layer, cost) in inputs.layer_experts.iter().enumerate() {
-        let cost = cost.ok_or_else(|| Refusal::InvalidFact(
-            format!("Qwen dual layer {layer} has no expert backing")))?;
+    for cost in inputs.layer_experts.iter().flatten() {
         for gpu in 0..2 {
             let loading = resident[gpu].checked_add(cost.half[gpu].resident)
                 .and_then(|bytes| bytes.checked_add(cost.half[gpu].staging))
@@ -777,9 +776,11 @@ impl<'a> QwenDual<'a> {
         if a.future_expert_bytes != 0 {
             return Err(Refusal::InvalidFact("Qwen dual experts must be solver-owned TP2 halves".into()));
         }
-        if inputs.layer_experts.iter().any(|cost| cost.is_none_or(|cost| !cost.tp2)) {
+        // A layer with no routed expert package has nothing to split; any
+        // package that is present must be the TP2 half the executor loads.
+        if inputs.layer_experts.iter().flatten().any(|cost| !cost.tp2) {
             return Err(Refusal::InvalidFact(
-                "Qwen dual requires TP2 expert packages on every backbone layer".into()));
+                "Qwen dual requires TP2 expert packages on every routed layer".into()));
         }
         match inputs.onboard {
             Onboard::Auto => {}
