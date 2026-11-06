@@ -174,24 +174,32 @@ impl CoreInventory {
         Ok(BTreeMap::from([("native attention F32 partial", bytes)]))
     }
 
+    pub fn native_programs(&self, unit: usize, ranks: usize,
+        manifest: Option<&crate::placement::inventory::ProgramsManifest>)
+        -> Result<crate::placement::planner::native_attention::NativePrograms> {
+        use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let layouts = self.native_layouts(ranks)?;
+        let requests = layouts.iter().map(|layout| NativeProgram { layout,
+            output: if layout.ranks == 2 && layout.split == CoreSplit::Input {
+                ProjectionOutput::F32
+            } else { ProjectionOutput::Bf16 } }).collect::<Vec<_>>();
+        Ok(NativePrograms::resolve(&requests, unit.max(64), manifest)?)
+    }
+
     pub fn native_package_stages(&self, manifest: &serde_json::Value, rows: usize, unit: usize,
         ranks: usize) -> Result<BTreeMap<&'static str, usize>> {
-        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let manifest = crate::placement::inventory::ProgramsManifest::from_manifest(manifest)?;
+        self.native_stages_from_manifest(&manifest, rows, unit, ranks)
+    }
+
+    pub fn native_stages_from_manifest(&self, manifest: &crate::placement::inventory::ProgramsManifest,
+        rows: usize, unit: usize, ranks: usize) -> Result<BTreeMap<&'static str, usize>> {
         let mut stages = self.native_attention_stages(rows, ranks)?;
-        let mut scratch = 0;
-        for (k, n, fp8, partial) in self.native_geometries(ranks)? {
-            let output = if partial { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 };
-            if fp8 {
-                scratch = scratch.max(cuteafd_ffi::native_attention::validate_package_geometry(
-                    manifest, k, n, unit.max(64), output)
-                    .with_context(|| format!("Kimi native attention K{k}/N{n}: export pending"))?.1);
-            } else {
-                cuteafd_ffi::draft_projection::validate_package_geometry_with_output(
-                    manifest, k, n, unit.max(64), output)
-                    .with_context(|| format!("Kimi native attention K{k}/N{n}: export pending"))?;
-            }
+        let native = self.native_programs(unit, ranks, Some(manifest))?;
+        if native.fp8_scratch_bytes != 0 {
+            stages.insert("native attention FP8 scratch", usize::try_from(native.fp8_scratch_bytes)?);
         }
-        if scratch != 0 { stages.insert("native attention FP8 scratch", scratch); }
         Ok(stages)
     }
 
@@ -227,10 +235,17 @@ impl CoreCharges {
 
     pub fn from_package_for_ranks(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
         manifest: &serde_json::Value, ranks: usize) -> Result<Self> {
+        let native = crate::placement::inventory::ProgramsManifest::from_manifest(manifest)?;
+        Self::from_package_with_native(cfg, core, rows, unit, manifest, &native, ranks)
+    }
+
+    pub fn from_package_with_native(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
+        manifest: &serde_json::Value, native: &crate::placement::inventory::ProgramsManifest,
+        ranks: usize) -> Result<Self> {
         ensure!(matches!(ranks, 1 | 2), "Kimi K6 charge physical rank count");
         let mut stages = if core.projections.is_empty() { BTreeMap::new() }
             else { package_lane_extents_for_ranks(manifest,rows,unit,ranks)? };
-        let native_stages = core.native_package_stages(manifest, rows, unit, ranks)?;
+        let native_stages = core.native_stages_from_manifest(native, rows, unit, ranks)?;
         let native_stage_bytes = native_stages.values().sum::<usize>();
         stages.extend(native_stages);
         let stage_bytes = if stages.is_empty() { 0 } else {

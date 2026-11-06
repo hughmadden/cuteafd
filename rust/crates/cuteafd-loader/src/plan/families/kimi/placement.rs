@@ -174,7 +174,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 demands.extend((0..gpus).map(|rank| allocation::graph_demand(&graphs, rank)));
             }
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
-            let programs = ProgramSet::from_manifest(manifest, families);
+            let native_manifest = input.programs_manifest(path)?;
+            let native = model.core.native_programs(unit, gpus, Some(&native_manifest))?;
+            let mut programs = ProgramSet::from_manifest(manifest, families);
+            programs.names.extend(native.programs);
+            programs.names.sort();
+            programs.names.dedup();
             for rank in 0..gpus {
                 let arch = ArchContext::for_device("sm_120", opts.rtx_bytes[rank]);
                 let code = crate::placement::inventory::loaded_code_allowance("kimik3", "exl3", gpus == 2,
@@ -184,7 +189,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             }
             if !model.core.projections.is_empty() {
                 // The baseline already includes the full peer receive allocation.
-                demands.extend(core::CoreCharges::from_package_for_ranks(cfg, &model.core, rows, unit, manifest, gpus)?.demands()?
+                demands.extend(core::CoreCharges::from_package_with_native(cfg, &model.core, rows, unit, manifest, &native_manifest, gpus)?.demands()?
                     .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
             }
             if opts.onboard != Some(OnboardSetting::Layers(0)) {
