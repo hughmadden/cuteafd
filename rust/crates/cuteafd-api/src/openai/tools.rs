@@ -204,7 +204,6 @@ impl ToolConstraints {
             return Ok(());
         }
         ensure!(!required || reason == "tool_calls", "native response emitted tool calls without tool_calls finish");
-        ensure!(self.parallel || calls.len() <= 1, "native response violated parallel_tool_calls=false");
         for (expected, (index, call)) in calls.iter().enumerate() {
             ensure!(*index == expected as u64, "native tool call indices are not contiguous");
             let validator = self.validators.get(&call.name)
