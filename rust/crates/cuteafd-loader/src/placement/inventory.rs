@@ -342,6 +342,77 @@ pub fn loaded_code_allowance(program_family: &str, experts: &str, split: bool, r
 
 pub use cuteafd_core::RuntimeSample;
 
+/// Typed native projection entries, parsed once at an artifact boundary. Other
+/// exporter programs remain opaque so their independent schemas can evolve.
+#[derive(Debug, Clone, Default)]
+pub struct ProgramsManifest {
+    entries: std::collections::BTreeMap<String, ProgramEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramEntry {
+    pub spec: cuteafd_ffi::programs::ProgramSpec,
+}
+
+impl ProgramsManifest {
+    pub fn from_manifest(manifest: &Value) -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        let programs = manifest["programs"].as_array().context("PROGRAMS.json has no program list")?;
+        let mut entries = std::collections::BTreeMap::new();
+        for entry in programs {
+            let Some(name) = entry["name"].as_str().filter(|name| Self::is_native(name)) else { continue; };
+            let parsed = ProgramEntry::from_manifest(entry).with_context(|| format!("native program {name}"))?;
+            ensure!(entries.insert(name.to_owned(), parsed).is_none(), "duplicate native program {name}");
+        }
+        Ok(Self { entries })
+    }
+
+    /// Reuse an already parsed runtime program table without rereading its manifest.
+    pub fn from_specs<'a>(specs: impl Iterator<Item = &'a cuteafd_ffi::programs::ProgramSpec>)
+        -> anyhow::Result<Self> {
+        let mut entries = std::collections::BTreeMap::new();
+        for spec in specs.filter(|spec| Self::is_native(&spec.name)) {
+            anyhow::ensure!(entries.insert(spec.name.clone(), ProgramEntry { spec: spec.clone() }).is_none(),
+                "duplicate native program {}", spec.name);
+        }
+        Ok(Self { entries })
+    }
+
+    fn is_native(name: &str) -> bool {
+        name.starts_with("draft_bf16_k") || name.starts_with("native_attention_n")
+    }
+
+    pub fn get(&self, name: &str) -> Option<&ProgramEntry> { self.entries.get(name) }
+}
+
+impl ProgramEntry {
+    fn from_manifest(entry: &Value) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        #[derive(Deserialize)]
+        struct Pointer { name: String }
+        #[derive(Deserialize)]
+        struct Scalar { #[serde(rename = "type")] kind: String }
+        #[derive(Deserialize)]
+        struct Entry {
+            name: String,
+            pointers: Vec<Pointer>,
+            scalars: Vec<Scalar>,
+            scratch_bytes_at_capacity: std::collections::HashMap<String, u64>,
+            capacity_rows: u32,
+            geometry: Option<Value>,
+        }
+        let entry: Entry = serde_json::from_value(entry.clone()).context("native projection schema")?;
+        let geometry = entry.geometry.context("native projection geometry missing")?;
+        let scalar_kinds = entry.scalars.into_iter().map(|scalar| match scalar.kind.as_str() {
+            "int32" => Ok(b'i'), "int64" => Ok(b'l'), "float32" => Ok(b'f'),
+            kind => Err(anyhow::anyhow!("unsupported native scalar {kind}")),
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self { spec: cuteafd_ffi::programs::ProgramSpec { name: entry.name,
+            pointers: entry.pointers.into_iter().map(|pointer| pointer.name).collect(), scalar_kinds,
+            scratch: entry.scratch_bytes_at_capacity, capacity_rows: entry.capacity_rows, geometry } })
+    }
+}
+
 /// The programs a family launches: a prefix filter over the image's program
 /// manifest (`<family>_...` and its head-split `<family>2_...`), not every
 /// program in the image. Runtime module loads and shared scratch use the same
