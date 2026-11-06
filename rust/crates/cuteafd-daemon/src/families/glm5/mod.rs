@@ -1229,7 +1229,7 @@ impl Opened {
         let largest_native = native_records.iter().flatten().flat_map(|record| &record.components)
             .map(|component| component.source.bytes as u64).max().unwrap_or(0);
         let admitted_push_host = push_host_envelope(&push_headers, &self.cfg, layers, devices.len(),
-            &self.catalog, metadata.as_ref(), largest_native)?;
+            Some(&self.catalog), metadata.as_ref(), largest_native)?;
         let mut additional = Vec::new();
         if let Some(envelope) = &admitted_push_host {
             additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {

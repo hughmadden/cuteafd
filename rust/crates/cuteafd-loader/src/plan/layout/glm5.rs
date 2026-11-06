@@ -541,7 +541,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let source = local.as_ref().map(|local| LocalPhysicalSource::read(&cfg, &catalog, local, &physical, None)).transpose()?;
     let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpus, maximum_pages)?;
-    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpus, &catalog, None, 0)? {
+    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpus, Some(&catalog), None, 0)? {
         additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
             let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
             Component::allocation(owner, bytes, false, maximum_pages)
@@ -703,13 +703,9 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
     let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpu_count, maximum_pages)?;
-    let catalog = match checkpoint.view.as_ref() {
-        Some(view) => crate::read_expert_catalog_view(view)?,
-        None => crate::read_expert_catalog(&checkpoint.snapshot)?,
-    };
     let largest_native = records.iter().flat_map(|record| &record.components)
         .map(|component| component.source.bytes as u64).max().unwrap_or(0);
-    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpu_count, &catalog,
+    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpu_count, None,
         Some(metadata), largest_native)? {
         additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
             let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
@@ -833,6 +829,28 @@ mod tests {
                 assert!(ledger.phases.iter().any(|row| row.budget == host.id && row.phase == Phase::Load && row.owned > 0));
                 assert!(ledger.phases.iter().all(|row| row.owned + row.opaque <= row.available));
             }
+        }
+    }
+
+    #[test]
+    fn native_metadata_admission_does_not_reopen_full_forward_catalog() {
+        use crate::plan::exlr8::residency::MetadataInput;
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::exlr8::glm_admission_snapshot(dir.path());
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        assert_eq!(cfg.layers, 2);
+        // This fixture deliberately cannot enter the shipping full-forward catalog.
+        let error = crate::read_expert_catalog(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("78 layers/hidden6144/first routed3"), "{error:#}");
+        let metadata = MetadataInput::open(dir.path(), "k4").unwrap();
+        let manifest = crate::plan::testing::exlr8::glm_admission_programs();
+        for gpus in 1..=2 {
+            let options = native_fixture_options(gpus);
+            let (layout, _) = native_layout_with_metadata(&checkpoint, &options, 4, &manifest,
+                "k4", Some(&metadata), None, None).unwrap();
+            assert_eq!(layout.devices.len(), gpus);
+            assert_eq!(layout.pool_tokens, options.pool_tokens.unwrap());
         }
     }
 

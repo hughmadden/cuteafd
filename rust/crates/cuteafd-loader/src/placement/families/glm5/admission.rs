@@ -303,7 +303,7 @@ impl NativeLoad {
 
 /// Selected dense and expert push owners, charged before the complete recipe solve.
 pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, cfg: &GlmDsaConfig,
-    layers: usize, ranks: usize, catalog: &crate::OfficialV41Catalog,
+    layers: usize, ranks: usize, catalog: Option<&crate::OfficialV41Catalog>,
     metadata: Option<&crate::plan::exlr8::residency::MetadataInput>, largest_native: u64)
     -> anyhow::Result<Option<crate::push_load::PushHostEnvelope>> {
     use anyhow::{ensure, Context};
@@ -324,16 +324,19 @@ pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, cfg: &GlmDsaConf
                 expert[rank] = expert[rank].max(plan.descriptor_host_bytes()? as u64);
                 retained[rank] = retained[rank].checked_add(plan.host_bytes() as u64)
                     .context("GLM retained push metadata overflow")?;
-            } else if let Some(manifest) = catalog.exl3() {
-                let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?;
-                expert[rank] = expert[rank].checked_add(plan.loads.iter()
-                    .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
-                    .context("GLM push validation overflow")?;
             } else {
-                expert[rank] = catalog.tensors().iter().filter(|t| t.metadata.name.ends_with("input_scale")
-                    || t.metadata.name.ends_with("weight_scale_2"))
-                    .map(|t| t.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
-                    .context("GLM native push scratch overflow")?.max(2 << 20);
+                let catalog = catalog.context("GLM push experts require a catalog or selected EXLR8 metadata")?;
+                if let Some(manifest) = catalog.exl3() {
+                    let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?;
+                    expert[rank] = expert[rank].checked_add(plan.loads.iter()
+                        .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
+                        .context("GLM push validation overflow")?;
+                } else {
+                    expert[rank] = catalog.tensors().iter().filter(|t| t.metadata.name.ends_with("input_scale")
+                        || t.metadata.name.ends_with("weight_scale_2"))
+                        .map(|t| t.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
+                        .context("GLM native push scratch overflow")?.max(2 << 20);
+                }
             }
         }
     }
