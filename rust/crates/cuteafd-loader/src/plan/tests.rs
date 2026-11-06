@@ -2901,11 +2901,12 @@ fn v4_plan_shared_span_matches_unit_rows_and_waves() {
 #[test]
 fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
     let dir = v4_snapshot();
-    // Unset follows the descriptor's measured best k3 (#785); pins override it.
+    // With actual remote experts, unset follows k3 (#785); pins override it.
     for (requested, expected, unit) in [(0, 3, 2752), (1, 1, 4096), (2, 2, 4096), (3, 3, 2752), (4, 4, 2048)] {
         let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
             host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
             prefill_lanes: requested, prefill_waves: requested.max(1),
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)),
             pool_tokens: Some(32768), ..Default::default()
         }), ..sparks(4) }).unwrap();
         assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
