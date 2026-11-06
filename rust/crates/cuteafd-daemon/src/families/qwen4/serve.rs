@@ -187,6 +187,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let media_push = vision.as_mut().map(|vision| std::mem::take(&mut vision.push)).unwrap_or_default();
     let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
     let (encoder, bytes) = vision.map_or((crate::shared::qwen::Encoder::Off, 0), |vision| (vision.encoder, vision.cache_bytes));
+    args.planner_media_cache_bytes = bytes as u64;
     let health = encoder.health_handle();
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     if args.pool_tokens == 0 {

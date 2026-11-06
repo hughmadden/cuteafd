@@ -36,6 +36,8 @@ pub struct LayoutOptions {
     pub media_cache_bytes: Option<u64>,
     /// Deterministic host/cgroup sample for offline inventory tests.
     pub host_memory: Option<(u64, u64)>,
+    /// A tensor-only inventory pass (no `--layout`): no host admission.
+    pub inventory: bool,
     /// Usable bytes of each coordinator GPU (1 or 2).
     pub rtx_bytes: Vec<u64>,
     /// Number of Spark vision tower replicas (default one).
@@ -243,6 +245,7 @@ impl Default for LayoutOptions {
             spark_reply_formats: cuteafd_core::spark_reply::requested(),
             media_cache_bytes: None,
             host_memory: None,
+            inventory: false,
             rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
             vision_replicas: 1,
             host_embedding: false,
@@ -1587,10 +1590,32 @@ pub(crate) fn recipe_host_memory(options: &LayoutOptions) -> anyhow::Result<(u64
     }
 }
 
+/// Coordinator host Spark transport: registered rings, egress request slots
+/// and the host-mode intake upper bound, for `ranks` Spark ranks.
+pub(crate) fn spark_host_transport(report: &PlanReport, options: &LayoutOptions, input: &super::PlanInput,
+    native: bool, unit_rows: u64, intake_rows: u64, lanes: u64) -> anyhow::Result<[u64; 3]> {
+    use anyhow::Context;
+    use cuteafd_core::ExpertGeometry;
+    let checkpoint = input.checkpoint();
+    let spec = report.spec.as_ref().context("Spark host transport without a model spec")?;
+    let family = report.family.as_deref().unwrap_or("");
+    let moe = spec.moe.as_ref().context("Spark layout without MoE geometry")?;
+    let geometry = ExpertGeometry { hidden: u32::try_from(spec.hidden)?, experts: u32::try_from(moe.experts)?,
+        topk: u32::try_from(moe.top_k)?, intermediate: u32::try_from(moe.intermediate)?,
+        layers: u32::try_from(spec.layers.len())? };
+    let v4_decode = (family == "deepseek_v4").then(|| options.workspace_manifest.as_deref().or_else(|| {
+        let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+        path.is_file().then_some(path)
+    }).and_then(|path| input.manifest(path).ok())
+        .and_then(|manifest| manifest["capacities"]["decode_rows"].as_u64()).unwrap_or(64));
+    crate::serving_capacity::spark_host_transport(geometry, spark_endpoints(family, lanes), report.spark_ranks,
+        native, native || family == "qwen4", !native && checkpoint.spark_input_is_bf16(), unit_rows, intake_rows,
+        options.prefill_waves, v4_decode)
+}
+
 pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, input: &super::PlanInput, native: bool) -> anyhow::Result<()> {
     let checkpoint = input.checkpoint();
     use anyhow::{Context, ensure};
-    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
     let Some(spec) = report.spec.as_ref() else { return Ok(()) };
     let family = report.family.as_deref().unwrap_or("");
@@ -1650,45 +1675,11 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
             push(Category::Transport, "transport/egress", "registered request slots", host.egress, Basis::Exact);
             push(Category::Transport, "spark-intake", "host-mode upper bound", host.intake, Basis::Estimated);
         } else if ranks > 0 {
-            let geometry = ExpertGeometry { hidden: u32::try_from(hidden)?,
-                experts: u32::try_from(spec.moe.as_ref().context("Spark layout without MoE geometry")?.experts)?,
-                topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
-                layers: u32::try_from(spec.layers.len())? };
-            let endpoints = spark_endpoints(family, lanes);
-            let bf16 = native || family == "qwen4";
-            let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
-                else { SparkIngress::Fp8K32 };
-            let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress, partial_reply_bytes: None };
-            let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
-            let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
-                depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-            let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
-                .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
-                .context("coordinator host rings overflow")?;
-            push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
-            let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?,
-                !native && checkpoint.spark_input_is_bf16()).context("host egress geometry overflow")?.0;
-            let egress = if family == "deepseek_v4" {
-                let decode = options.workspace_manifest.as_deref().or_else(|| {
-                    let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
-                    path.is_file().then_some(path)
-                }).and_then(|path| input.manifest(path).ok())
-                    .and_then(|manifest| manifest["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
-                let decode_request = geometry.compact_wire_bytes(u32::try_from(decode)?, false)
-                    .context("V4 decode egress geometry overflow")?.0 as u64;
-                (egress_request as u64).checked_mul(options.prefill_waves)
-                    .and_then(|bytes| bytes.checked_add(decode_request))
-                    .context("V4 registered egress overflow")?
-            } else {
-                (egress_request as u64).checked_mul(options.prefill_waves)
-                    .and_then(|n| n.checked_mul(endpoints as u64)).context("coordinator registered egress overflow")?
-            };
-            push(Category::Transport, "transport/egress", "registered request slots", egress, Basis::Formula);
+            let host = spark_host_transport(report, options, input, native, unit_rows, intake_rows, lanes)?;
+            push(Category::Transport, "transport/rdma-rings", "registered", host[0], Basis::Formula);
+            push(Category::Transport, "transport/egress", "registered request slots", host[1], Basis::Formula);
             // Host-mode intake is the upper bound; auto/GPU landing can use less.
-            let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
-                .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
-                .context("coordinator intake overflow")?;
-            push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
+            push(Category::Transport, "spark-intake", "host-mode upper bound", host[2], Basis::Estimated);
         }
         let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
         if !matches!(family, "qwen4" | "muse_spark") {

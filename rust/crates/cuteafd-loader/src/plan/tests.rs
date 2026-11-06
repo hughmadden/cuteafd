@@ -5200,6 +5200,23 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, 32768);
     let vision = auto.components.iter().find(|c| c.component == Component::Vision).unwrap();
     assert_eq!(vision.status, Status::Ready);
+    // The tower is the solve's choice: its owners are admitted device items.
+    let rtx = &auto.memory_layout.as_ref().unwrap().devices[0];
+    let tower = |group: &str| rtx.items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+    assert_eq!((tower("vision tower"), tower("vision scratch")), (898_680_904, 447_778_048));
+    let ledger = auto.phase_ledger.as_ref().expect("recipe phase ledger");
+    assert!(ledger.budgets.iter().any(|b| b.id == "host"));
+    // Pool first: where the tower and the pinned pool cannot both fit, Auto
+    // turns vision off with the solver's reason instead of shrinking the pool.
+    let base = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
+    let used = base.memory_layout.as_ref().unwrap().devices[0].used_bytes();
+    let tight = layout::LayoutOptions { rtx_bytes: vec![used + (4 << 30)], ..options.layout.clone().unwrap() };
+    let crowded = plan(dir.path(), &PlanOptions { layout: Some(tight), ..options.clone() }).unwrap();
+    let declined = crowded.encoder.as_ref().unwrap();
+    assert_eq!(declined.kind, EncoderKind::Off, "{}", render(&crowded));
+    assert!(declined.reason.contains("pool-first"), "{}", declined.reason);
+    assert_eq!(crowded.memory_layout.as_ref().unwrap().pool_tokens, 32768);
+    assert!(!crowded.memory_layout.as_ref().unwrap().devices[0].items.iter().any(|i| i.group == "vision tower"));
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
     assert_eq!(off.max_image_tokens, Some(1024));
     assert_eq!(off.encoder.as_ref().unwrap().kind, EncoderKind::Off);

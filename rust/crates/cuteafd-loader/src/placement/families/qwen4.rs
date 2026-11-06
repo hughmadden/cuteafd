@@ -19,6 +19,11 @@ use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::{SparkReplyFormat, SparkReplyFormats};
 use std::collections::BTreeMap;
 
+pub mod encoder;
+pub mod host;
+pub use encoder::QwenEncoders;
+pub use host::QwenHost;
+
 pub const DEFAULT_MARK_SLOTS: u64 = 18;
 pub const LAZY_GRAPH_BYTES: u64 = (1 << 30) / 2;
 pub const SPARK_WORKSPACE_BYTES: u64 = 56 * (1 << 30) / 100;
@@ -50,6 +55,10 @@ pub struct QwenInputs<'a> {
     pub spark_ranks: usize,
     /// None means lazy diagnostic graphs, not the serving startup set.
     pub startup_graph_modes: Option<(usize, bool)>,
+    /// Coordinator host owners and the host sample they are admitted against.
+    pub host: QwenHost,
+    /// Bundled vision tower candidates, chosen by the solve.
+    pub encoders: QwenEncoders,
 }
 
 const WHOLE_OWNER_0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
@@ -209,7 +218,7 @@ impl<'a> QwenSingle<'a> {
     }
 
     pub fn admit(&self) -> Result<ResolvedPlan, Refusal> {
-        solve(self.request()?, vec![self.budget()?], self)
+        solve(self.request()?, vec![self.budget()?, self.inputs.host.budget()?], self)
     }
 
     /// Mechanical executor output: the admitted owners, not a second solve.
@@ -322,10 +331,15 @@ impl Recipe for QwenSingle<'_> {
         };
         components.push(allowance(graph_source, gpu, graph_bytes, graph_life, self.maximum_pages));
         components.push(weights("qwen.loaded.owners", gpu, inputs.loaded_weights, self.maximum_pages));
-        let variables = (0..a.layers)
+        if inputs.host.uploads.len() != 1 {
+            return Err(Refusal::InvalidFact("Qwen single-owner host owners must name one upload owner".into()));
+        }
+        components.extend(inputs.host.components(self.maximum_pages)?);
+        let mut variables: Vec<_> = (0..a.layers)
             .map(|layer| Variable::Attention { layer, values: vec![WHOLE_OWNER_0] })
             .chain([Variable::Prefill(vec![prefill_of(a)]), Variable::Lanes(vec![1])])
             .collect();
+        inputs.encoders.extend(&mut variables, &mut components, 1, self.maximum_pages)?;
         Ok(Contract { phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (inputs.spark_ranks > 0)
                 .then(|| reply_formats(inputs.spark_reply_format, inputs.spark_ranks)),
@@ -336,12 +350,17 @@ impl Recipe for QwenSingle<'_> {
 
 /// Admit the single-owner route and publish the executor's placement.
 pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
+    Ok(admitted(inputs)?.0)
+}
+
+/// The placement with its solved plan (phase ledger and host owners).
+pub fn admitted(inputs: &QwenInputs<'_>) -> anyhow::Result<(Placement, ResolvedPlan)> {
     if let Some((sequences, _)) = inputs.startup_graph_modes {
         cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
     }
     let recipe = QwenSingle::new(inputs)?;
     let solved = recipe.admit()?;
-    Ok(recipe.execution(&solved)?)
+    Ok((recipe.execution(&solved)?, solved))
 }
 
 /// Checkpoint owners on the single target owner; the mapped PLE backing and
@@ -705,6 +724,10 @@ pub struct QwenDualInputs<'a> {
     pub spark_ranks: usize,
     pub onboard: Onboard,
     pub startup_graph_modes: Option<(usize, bool)>,
+    /// Coordinator host owners and the host sample they are admitted against.
+    pub host: QwenHost,
+    /// Bundled vision tower candidates, chosen by the solve.
+    pub encoders: QwenEncoders,
 }
 
 /// The executor's only legal owner chain today is one contiguous cutover, so
@@ -831,12 +854,14 @@ impl<'a> QwenDual<'a> {
     }
 
     pub fn budgets(&self) -> Result<Vec<Budget>, Refusal> {
-        self.inputs.gpus.iter().enumerate().map(|(gpu, budget)| Ok(Budget {
+        let mut budgets = self.inputs.gpus.iter().enumerate().map(|(gpu, budget)| Ok(Budget {
             id: format!("rtx{gpu}"), locations: vec![Location::coordinator(gpu as u8)],
             physical_bytes: budget.capacity_bytes, logical_bytes: budget.capacity_bytes,
             baseline: plan_baseline(&budget.baseline, budget.capacity_bytes,
                 &format!("qwen4 dual owner{gpu}"))?,
-            headroom: budget.headroom_bytes })).collect()
+            headroom: budget.headroom_bytes })).collect::<Result<Vec<_>, Refusal>>()?;
+        budgets.push(self.inputs.host.budget()?);
+        Ok(budgets)
     }
 
     pub fn admit(&self) -> Result<ResolvedPlan, Refusal> {
@@ -1019,6 +1044,10 @@ impl Recipe for QwenDual<'_> {
                 a.full_prefill_logits, Category::Workspace, "probe prefill logits",
                 PlanLifetime::RESIDENT, self.maximum_pages));
         }
+        if inputs.host.uploads.len() != 2 {
+            return Err(Refusal::InvalidFact("Qwen dual host owners must name both upload owners".into()));
+        }
+        components.extend(inputs.host.components(self.maximum_pages)?);
         let mut variables = Vec::with_capacity(a.layers + 3);
         for (layer, &owner) in self.owners.iter().enumerate() {
             variables.push(Variable::Attention { layer,
@@ -1028,6 +1057,7 @@ impl Recipe for QwenDual<'_> {
         variables.push(Variable::Lanes(vec![1]));
         variables.push(Variable::Onboard { layers: (0..a.layers).collect(),
             destination: vec![0, 1], counts: vec![a.layers] });
+        inputs.encoders.extend(&mut variables, &mut components, 2, self.maximum_pages)?;
         Ok(Contract { phase_order: PhaseOrder::TARGET_THEN_DRAFT, spark_reply_formats: None,
             resident_weight_limit: request.resident_weight_limit, page_rows: page,
             maximum_pages: self.maximum_pages, gpus: 2, variables, requires: vec![], components })
@@ -1036,12 +1066,17 @@ impl Recipe for QwenDual<'_> {
 
 /// Admit the dual route and publish the executor's placement.
 pub fn dual_placement(inputs: &QwenDualInputs<'_>) -> anyhow::Result<Placement> {
+    Ok(dual_admitted(inputs)?.0)
+}
+
+/// The placement with its solved plan (phase ledger and host owners).
+pub fn dual_admitted(inputs: &QwenDualInputs<'_>) -> anyhow::Result<(Placement, ResolvedPlan)> {
     if let Some((sequences, _)) = inputs.startup_graph_modes {
         cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
     }
     let recipe = QwenDual::new(inputs)?;
     let solved = recipe.admit()?;
-    Ok(recipe.execution(&solved)?)
+    Ok((recipe.execution(&solved)?, solved))
 }
 
 #[cfg(test)]
@@ -1144,6 +1179,7 @@ mod tests {
             fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
             max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard: Onboard::Auto,
             startup_graph_modes: None,
+            host: QwenHost::ample(&cfg, 2, 4096).unwrap(), encoders: Default::default(),
         };
         let placement = dual_placement(&inputs).unwrap();
         assert_eq!(placement.pool_tokens, 2 << 20);
@@ -1359,7 +1395,8 @@ mod tests {
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
             capacity_bytes: 96 * gib, baseline, pending_code_bytes: 0, max_context: 131072,
-            requested_pool, spark_ranks, startup_graph_modes }
+            requested_pool, spark_ranks, startup_graph_modes,
+            host: QwenHost::ample(cfg, 1, 4096).unwrap(), encoders: Default::default() }
     }
 
     /// Plan-time and serve-time baselines describe the same owners; the recipe
@@ -1458,6 +1495,7 @@ mod tests {
             tp2_workspace: [1 << 20; 2], pending_code_bytes: [0; 2], mark_slots: 18,
             max_context: 131072, requested_pool: None, spark_ranks: 0, onboard: Onboard::Auto,
             startup_graph_modes: startup,
+            host: QwenHost::ample(&cfg, 2, 4096).unwrap(), encoders: Default::default(),
         };
         let lazy = build(None);
         let placement = dual_placement(&lazy).unwrap();

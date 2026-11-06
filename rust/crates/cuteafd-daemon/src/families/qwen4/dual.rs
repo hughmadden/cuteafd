@@ -72,7 +72,9 @@ impl Opened {
         let baselines = inventory.baselines(&[]);
         let enabled = engine::startup_graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
             std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
-        let placement = qwen4::dual_placement(&qwen4::QwenDualInputs {
+        let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, 0, false,
+            ple_info.map(|(row_bytes, _)| row_bytes), Vec::new())?;
+        let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs {
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), automatic_context: automatic_context,
             owner_manifests: manifests.each_ref().map(Some),
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,
@@ -85,7 +87,10 @@ impl Opened {
             onboard: args.onboard.map(|setting| setting.resolve(catalog.routed_experts().routed_layers()))
                 .unwrap_or(Onboard::Auto),
             startup_graph_modes: args.planner_graph_modes.filter(|_| enabled),
+            host: host.clone(), encoders: Default::default(),
         })?;
+        tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
+            "Qwen dual admitted phase ledger");
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
@@ -145,6 +150,7 @@ impl Opened {
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        engine.admitted_host = Some(host);
         engine.admit_host_memory(args)?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         let result = body(&engine);

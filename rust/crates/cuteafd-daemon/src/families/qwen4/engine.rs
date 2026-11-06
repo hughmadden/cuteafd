@@ -212,24 +212,45 @@ impl LocalExl3<'_> {
     /// group of this GPU alone, as the first [`Self::ensure`] would load it
     /// through the mount. Non-namespace windows stay lazy; a Required push
     /// failure refuses startup. Later windows reload through the mount.
-    pub(super) fn push_window(&self, snapshot: &std::path::Path, device: i32) -> Result<bool> {
+    /// The first window's selections and coordinator push host envelope, from
+    /// headers only, so the recipe can admit them before any push allocation.
+    pub(super) fn push_envelope(&self) -> Result<(Vec<crate::shared::experts::layer::ExpertLayer>, usize,
+        cuteafd_loader::push_load::PushHostEnvelope)> {
+        use crate::shared::experts::rtx::push::{CoordinatorExperts, WholeOwner};
+        let backbone: Vec<_> = (0..self.window.min(self.layers)).collect();
+        let (selections, weights_budget) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
+            &self.native_lib, self.catalog, usize::from(self.mtp), &backbone, self.max_rows, self.budget)?
+            .context("Qwen EXL3 expert window lacks a pushable package")?;
+        anyhow::ensure!(!selections.is_empty(), "Qwen EXL3 expert window has no selected layers");
+        let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
+            selections: selections.clone(), budget: weights_budget }] };
+        let envelope = experts.host_envelope(self.catalog, 1, &[])?;
+        Ok((selections, weights_budget, envelope))
+    }
+
+    pub(super) fn push_window(&self, snapshot: &std::path::Path, device: i32,
+        admitted: Option<&cuteafd_loader::push_load::PushHostEnvelope>) -> Result<bool> {
         if self.resident.borrow().is_some() { return Ok(true); }
         use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner};
         let policy = PushPolicy::for_snapshot(snapshot)?;
         let started = std::time::Instant::now();
         let planned = policy.plan(|| {
-            let backbone: Vec<_> = (0..self.window.min(self.layers)).collect();
-            let (selections, weights_budget) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
-                &self.native_lib, self.catalog, usize::from(self.mtp), &backbone, self.max_rows, self.budget)?
-                .context("Qwen EXL3 expert window lacks a pushable package")?;
-            anyhow::ensure!(!selections.is_empty(), "Qwen EXL3 expert window has no selected layers");
+            let (selections, weights_budget, envelope) = self.push_envelope()?;
             let selected_layers = selections.iter().filter_map(|s| match s {
                 crate::shared::experts::layer::ExpertLayer::BackboneFull { layer } => Some(*layer), _ => None,
             }).collect::<Vec<_>>();
             self.admit_weights(&selected_layers)?;
             let experts = CoordinatorExperts::Whole { owners: vec![WholeOwner { rank: 0,
                 selections: selections.clone(), budget: weights_budget }] };
-            let push = CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1, Some(experts))?;
+            // The recipe admitted this envelope before allocation; without a
+            // recipe solve (a fixed diagnostic pool) the legacy check remains.
+            let push = match admitted {
+                Some(admitted) => {
+                    admitted.validate_usage(&envelope)?;
+                    CoordinatorPush::prepare_alone_admitted(snapshot, Some(self.catalog), 1, Some(experts), admitted.clone())?
+                }
+                None => CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1, Some(experts))?,
+            };
             Ok((push, selections))
         }).context("Qwen EXL3 expert window push planning")?;
         let Some((push, selections)) = planned else { return Ok(false) };
@@ -448,6 +469,42 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
     let mut history = vec![eos; context];
     history.extend_from_slice(&tokens[tokens.len().saturating_sub(context)..]);
     NgramHistory(history.split_off(history.len() - context))
+}
+
+/// Actual future host owners against the admitted recipe owners (see
+/// `Qwen4Engine::admit_host_memory`); `units` is the engine's pool pages.
+pub(super) fn validate_admitted_host(host: &cuteafd_loader::placement::families::qwen4::QwenHost,
+    tables: &[(String, u64)], prefix_bytes: u64, units: u64) -> Result<()> {
+    let mut logits = 0u64;
+    for (name, bytes) in tables {
+        let parts: Vec<_> = name.split('/').collect();
+        let bound = match parts.as_slice() {
+            ["qwen4", _, _, "pinned-logits"] => {
+                logits = logits.checked_add(*bytes).context("Qwen pinned logits overflow")?;
+                continue;
+            }
+            ["qwen4", owner, kind, "staging"] => {
+                let owner: usize = owner.strip_prefix("owner-").context("Qwen upload owner")?.parse()?;
+                let bounds = host.uploads.get(owner).context("Qwen upload owner was not admitted")?;
+                match *kind {
+                    "prefill" => bounds[0],
+                    "decode" => bounds[1],
+                    "mtp-prefill" => host.mtp_upload.context("Qwen MTP prefill uploads were not admitted")?,
+                    other => anyhow::bail!("unadmitted Qwen upload owner {other}"),
+                }.at(units).context("Qwen upload bound overflow")?
+            }
+            ["staging", "mapped-table-worker"] => host.ple.context("Qwen PLE was not admitted")?.worker,
+            ["mapped-table", "row-cache"] => host.ple.context("Qwen PLE was not admitted")?.row_cache,
+            _ => anyhow::bail!("unadmitted Qwen host owner {name}"),
+        };
+        ensure!(*bytes <= bound, "Qwen host owner {name} needs {bytes} bytes, admitted {bound}");
+    }
+    ensure!(logits <= host.pinned_logits,
+        "Qwen pinned logits need {logits} bytes, admitted {}", host.pinned_logits);
+    ensure!(prefix_bytes <= host.prefix_quota,
+        "Qwen host prefix needs {prefix_bytes} bytes, admitted {}", host.prefix_quota);
+    tracing::info!(owners = tables.len(), prefix_bytes, "Qwen host owners within the admitted recipe");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1144,6 +1201,8 @@ pub(crate) struct Qwen4Engine<'a> {
     pub(super) prefill_shape: Option<cuteafd_loader::serving_capacity::PrefillShape>,
     pub(super) host_prefix_config: Option<cuteafd_hostcache::config::Config>,
     host_memory_admitted: bool,
+    /// Host owners the recipe admitted before allocation; None without a solve.
+    pub(super) admitted_host: Option<cuteafd_loader::placement::families::qwen4::QwenHost>,
     request_id: Cell<u64>,
     pub pages: usize,
     pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -1370,7 +1429,7 @@ impl<'a> Qwen4Engine<'a> {
         } else {
             (None, None)
         };
-        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, admitted_host: None, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)),
             pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
@@ -1443,12 +1502,29 @@ impl<'a> Qwen4Engine<'a> {
                 self.prefill_rows as u64, self.cfg.vocab_size as u64).context("Qwen host scoring overflow")?, 0),
         };
         let tables = self.future_host_workspaces(args.full_prefill_logits)?;
-        let views: Vec<_> = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
-        crate::shared::memory::budget::admit_host_memory(config.as_ref().map_or(0, |c| c.bytes),
-            &views, scoring, headroom)?;
+        match &self.admitted_host {
+            // The recipe charged every host owner against one host sample before
+            // allocation; check the actual owners fit what it admitted.
+            Some(host) => self.validate_admitted_host(host, &tables, config.as_ref().map_or(0, |c| c.bytes))?,
+            None => {
+                let views: Vec<_> = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
+                crate::shared::memory::budget::admit_host_memory(config.as_ref().map_or(0, |c| c.bytes),
+                    &views, scoring, headroom)?;
+            }
+        }
         self.host_prefix_config = config;
         self.host_memory_admitted = true;
         Ok(())
+    }
+
+    /// Actual future host owners against the admitted recipe owners: retained
+    /// uploads within their page-linear bounds, pinned logits within the
+    /// admitted landing, the PLE table's own staging and cache exactly, and the
+    /// resolved host prefix within its admitted quota.
+    fn validate_admitted_host(&self, host: &cuteafd_loader::placement::families::qwen4::QwenHost,
+        tables: &[(String, u64)], prefix_bytes: u64) -> Result<()> {
+        // One pool unit per 256-token pool page, the host curves' page domain.
+        validate_admitted_host(host, tables, prefix_bytes, self.pool_pages as u64)
     }
 
     fn future_host_workspaces(&self, full_logits: bool) -> Result<Vec<(String, u64)>> {

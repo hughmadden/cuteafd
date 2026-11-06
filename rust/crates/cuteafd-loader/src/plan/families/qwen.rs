@@ -222,6 +222,10 @@ struct QwenModel {
 }
 
 impl FamilyModel for QwenModel {
+    /// QwenSingle/QwenDual own host admission (PLE, uploads, logits, prefix,
+    /// media, Spark transport) and the fixed prefill shape, including refusals.
+    fn contract_admission(&self) -> bool { true }
+
     fn spec(&self) -> &ModelSpec {
         &self.spec
     }
