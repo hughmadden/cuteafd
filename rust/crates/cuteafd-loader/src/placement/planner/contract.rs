@@ -67,6 +67,10 @@ pub enum Variable {
     Embedding(Vec<EmbeddingHome>),
     /// Ordered coordinator homes for one drafter; lower index is preferred.
     DraftHome(Vec<u8>),
+    /// Ordered coordinator homes for the single vocabulary head.
+    HeadHome(Vec<u8>),
+    /// Ordered coordinator homes for the single Spark intake owner.
+    IntakeHome(Vec<u8>),
     /// Ordered optional bundled-encoder candidates; lower index is preferred.
     Encoder(Vec<usize>),
     /// Fallback rank set for this routed group, after the selected ordered
@@ -93,7 +97,7 @@ impl Variable {
             Self::Prefill(values) => values.len(),
             Self::Lanes(values) => values.len(),
             Self::Embedding(values) => values.len(),
-            Self::DraftHome(values) => values.len(),
+            Self::DraftHome(values) | Self::HeadHome(values) | Self::IntakeHome(values) => values.len(),
             Self::Encoder(values) => values.len(),
             Self::ExpertHome { rank_sets, .. } => rank_sets.len(),
             Self::Onboard { counts, .. } => counts.len(),
@@ -437,6 +441,8 @@ impl Contract {
         let mut remote_homes = BTreeMap::new();
         let mut embedding = None;
         let mut draft_home = None;
+        let mut head_home = None;
+        let mut intake_home = None;
         let mut encoder = None;
         for (variable, &option) in self.variables.iter().zip(selected) {
             match variable {
@@ -462,6 +468,16 @@ impl Contract {
                 Variable::DraftHome(values) => {
                     if draft_home.replace(values[option]).is_some() {
                         return Err(Refusal::InvalidFact("duplicate draft home domain".into()));
+                    }
+                }
+                Variable::HeadHome(values) => {
+                    if head_home.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate head home domain".into()));
+                    }
+                }
+                Variable::IntakeHome(values) => {
+                    if intake_home.replace(values[option]).is_some() {
+                        return Err(Refusal::InvalidFact("duplicate intake home domain".into()));
                     }
                 }
                 Variable::Encoder(values) => {
@@ -511,6 +527,8 @@ impl Contract {
             expert_homes,
             embedding,
             draft_home,
+            head_home,
+            intake_home,
             encoder,
             prefill: prefill
                 .ok_or_else(|| Refusal::InvalidFact("missing prefill domain".into()))?,
@@ -533,9 +551,9 @@ impl Contract {
                         return Err(Refusal::InvalidFact("embedding home has no physical budget".into()));
                     }
                 }
-                Variable::DraftHome(values) => {
+                Variable::DraftHome(values) | Variable::HeadHome(values) | Variable::IntakeHome(values) => {
                     if values.iter().any(|&gpu| !covered(Location::coordinator(gpu))) {
-                        return Err(Refusal::InvalidFact("draft home has no physical budget".into()));
+                        return Err(Refusal::InvalidFact("owner home has no physical budget".into()));
                     }
                 }
                 Variable::ExpertHome { rank_sets, .. } => {
@@ -573,6 +591,8 @@ impl Contract {
         let (mut prefill, mut lanes, mut embedding) = (0, 0, 0);
         let mut encoder = false;
         let mut draft_home = false;
+        let mut head_home = false;
+        let mut intake_home = false;
         for variable in &self.variables {
             if variable.len() == 0 {
                 return Err(Refusal::Unsupported);
@@ -620,12 +640,18 @@ impl Contract {
                         return Err(Refusal::InvalidFact("invalid embedding domain".into()));
                     }
                 }
-                Variable::DraftHome(values) => {
-                    if draft_home || values.iter().enumerate().any(|(index, &gpu)|
+                Variable::DraftHome(values) | Variable::HeadHome(values) | Variable::IntakeHome(values) => {
+                    let seen = match variable {
+                        Variable::DraftHome(_) => &mut draft_home,
+                        Variable::HeadHome(_) => &mut head_home,
+                        Variable::IntakeHome(_) => &mut intake_home,
+                        _ => unreachable!(),
+                    };
+                    if *seen || values.iter().enumerate().any(|(index, &gpu)|
                         usize::from(gpu) >= self.gpus || values[..index].contains(&gpu)) {
-                        return Err(Refusal::InvalidFact("invalid draft home domain".into()));
+                        return Err(Refusal::InvalidFact("invalid owner home domain".into()));
                     }
-                    draft_home = true;
+                    *seen = true;
                 }
                 Variable::Encoder(values) => {
                     if encoder || values.iter().copied().ne(0..values.len()) {
