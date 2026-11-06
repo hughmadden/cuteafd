@@ -31,7 +31,7 @@ pub(crate) fn prefer_device(first: anyhow::Error, second: anyhow::Error) -> anyh
 /// Combine a launch result with the drain or capture result that follows it.
 /// Both are inspected: a plain launch error must not hide a tagged device error
 /// from the drain, which is what the liveness gate classifies on.
-fn settle(launched: Result<()>, drained: Result<()>) -> Result<()> {
+pub(crate) fn settle(launched: Result<()>, drained: Result<()>) -> Result<()> {
     match (launched, drained) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -634,5 +634,35 @@ impl Drop for DsparkChain<'_, '_> {
         self.pending = None; // GPU work has drained before read reservations release.
         self.graphs.retire_all();
         fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "dSpark chain graphs");
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    fn device() -> anyhow::Error {
+        anyhow::Error::new(cuteafd_ffi::NativeStatusError { context: "capture".into(), status: 98,
+            detail: "invalid device function".into() }).context("capture failed")
+    }
+    #[test]
+    fn settling_never_masks_a_device_failure_in_either_order() -> Result<()> {
+        settle(Ok(()), Ok(()))?;
+        for (launch, drain) in [(Err(anyhow::anyhow!("host guard")), Err(device())),
+            (Err(device()), Err(anyhow::anyhow!("host drain"))), (Ok(()), Err(device())),
+            (Err(device()), Ok(()))] {
+            let error = settle(launch, drain).unwrap_err();
+            assert!(is_device_failure(&error));
+            let mut failure = DraftFailure::default();
+            failure.record(&error);
+            assert!(failure.check("draft").is_err());
+        }
+        let mut failure = DraftFailure::default();
+        failure.record(&settle(Err(anyhow::anyhow!("host")), Err(anyhow::anyhow!("host drain"))).unwrap_err());
+        failure.check("draft")?;
+        failure.record(&device());
+        let first = failure.check("draft").unwrap_err().to_string();
+        failure.record(&anyhow::anyhow!("later host failure"));
+        assert_eq!(failure.check("draft").unwrap_err().to_string(), first);
+        Ok(())
     }
 }

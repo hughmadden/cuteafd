@@ -103,7 +103,7 @@ impl V41AttentionOps<'_> {
                 stream,
             )
         };
-        crate::native_status("native backbone frequency status", status)?;
+        self._library.status_to_result("native backbone frequency status", status)?;
         Ok(())
     }
 
@@ -142,7 +142,7 @@ impl V41AttentionOps<'_> {
                 stream,
             ) }
         };
-        crate::native_status("native terminal layout CUDA status", status)?;
+        self._library.status_to_result("native terminal layout CUDA status", status)?;
         Ok(())
     }
 
@@ -184,7 +184,7 @@ impl V41AttentionOps<'_> {
                 stream,
             ) }
         };
-        crate::native_status("native embedding CUDA status", status)?;
+        self._library.status_to_result("native embedding CUDA status", status)?;
         Ok(())
     }
 
@@ -214,7 +214,7 @@ impl V41AttentionOps<'_> {
             (self.target_embed)(table.ptr.cast(), tokens.ptr.cast(), residual.ptr.cast(),
                 pre.ptr.cast(), rows as i32, stream)
         };
-        crate::native_status("native target embedding CUDA status", status)?;
+        self._library.status_to_result("native target embedding CUDA status", status)?;
         Ok(())
     }
 
@@ -245,7 +245,7 @@ impl V41AttentionOps<'_> {
                 stream,
             )
         };
-        crate::native_status("native tap CUDA status", status)?;
+        self._library.status_to_result("native tap CUDA status", status)?;
         Ok(())
     }
 
@@ -265,7 +265,7 @@ impl V41AttentionOps<'_> {
         let status = unsafe {
             (self.frequencies)(positions.ptr.cast(), output.ptr.cast(), rows as i32, stream)
         };
-        crate::native_status("native frequency CUDA status", status)?;
+        self._library.status_to_result("native frequency CUDA status", status)?;
         Ok(())
     }
 
@@ -296,7 +296,7 @@ impl V41AttentionOps<'_> {
                 stream,
             )
         };
-        crate::native_status("native KV CUDA status", status)?;
+        self._library.status_to_result("native KV CUDA status", status)?;
         Ok(())
     }
     /// # Safety
@@ -338,7 +338,7 @@ impl V41AttentionOps<'_> {
                 stream,
             )
         };
-        crate::native_status("native attention norm CUDA status", status)?;
+        self._library.status_to_result("native attention norm CUDA status", status)?;
         Ok(())
     }
     /// # Safety
@@ -373,7 +373,7 @@ impl V41AttentionOps<'_> {
                 stream,
             )
         };
-        crate::native_status("native attention RoPE CUDA status", status)?;
+        self._library.status_to_result("native attention RoPE CUDA status", status)?;
         Ok(())
     }
 }

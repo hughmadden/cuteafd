@@ -20,11 +20,6 @@ pub(crate) struct WindowLease {
     slot: usize,
     generation: u64,
 }
-#[cfg(test)]
-impl WindowLease {
-    /// A lease-shaped value for tests that never touch a real window.
-    pub(crate) fn for_test(slot: usize) -> Self { Self { owner: 0, slot, generation: 0 } }
-}
 #[derive(Clone, Copy)]
 pub(crate) struct WindowChunk {
     pub lease: WindowLease,

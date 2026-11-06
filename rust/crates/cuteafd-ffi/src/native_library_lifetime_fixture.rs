@@ -323,6 +323,12 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn configure_capture(&self, library: &NativeLibrary, status: i32) -> Result<()> {
+        // SAFETY: the CPU-only fixture export only updates its local injected status.
+        unsafe { library.lib.get::<unsafe extern "C" fn(i32)>(b"fixture_configure_capture")?(status); }
+        Ok(())
+    }
+
     pub fn configure_pack(&self, library: &NativeLibrary, pack: i32, drain: i32) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {

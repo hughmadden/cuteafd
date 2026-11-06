@@ -351,9 +351,12 @@ int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out)
     return 0;
 }
 
+static int capture_status;
+void fixture_configure_capture(int status) { capture_status = status; }
 struct graph_exec { int device; size_t bytes; };
 int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
     (void)stream;
+    if (capture_status) return capture_status;
     struct graph_exec *graph = malloc(sizeof(*graph));
     if (!graph) return 1;
     graph->device = current_device;
@@ -943,4 +946,27 @@ int cuteafd_rdma_rc_endpoint_destroy(void *handle) {
         free(endpoint->send); free(endpoint->recv); free(endpoint);
     }
     return 0;
+}
+
+/* CPU-only draft liveness probes; none dereference their launch pointers. */
+int cuteafd_v41_dspark_cache_write_fp8(const uint16_t *src, const void *writes,
+        uint8_t *ring, int rows, int slots, void *stream) {
+    (void)src; (void)writes; (void)ring; (void)rows; (void)slots; (void)stream;
+    return 0;
+}
+int cuteafd_cuda_graph_begin_capture(void *stream) { (void)stream; return 0; }
+int cuteafd_fp8_w8a16_linear(const void *x, const void *w, const void *s, void *out,
+        int f32, int rows, int k, int n, void *scratch, size_t bytes, void *stream) {
+    (void)x; (void)w; (void)s; (void)out; (void)f32; (void)rows;
+    (void)k; (void)n; (void)scratch; (void)bytes; (void)stream; return 98;
+}
+int cuteafd_fp8_linear(const void *x, const void *w, const void *s, void *out,
+        int f32, int rows, int k, int n, int mode, void *scratch, size_t bytes, void *stream) {
+    (void)mode;
+    return cuteafd_fp8_w8a16_linear(x, w, s, out, f32, rows, k, n, scratch, bytes, stream);
+}
+int cuteafd_packed_head_linear(const void *x, void *const *planes, void *out,
+        int f32, int rows, int k, int n, int coarse, void *scratch, size_t bytes, void *stream) {
+    (void)planes; (void)coarse;
+    return cuteafd_fp8_w8a16_linear(x, NULL, NULL, out, f32, rows, k, n, scratch, bytes, stream);
 }

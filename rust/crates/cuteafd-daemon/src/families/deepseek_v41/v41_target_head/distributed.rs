@@ -96,7 +96,8 @@ impl<'w, 'a> Rank<'w, 'a> {
                     }
                 },
                 (Err(error), Ok(graph)) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
-                (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
+                (Err(first), Err(second)) => return Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
+            (Ok(()), Err(error)) => return Err(error),
             }
             // Warmup already produced the result. The captured graph runs on
             // the next use of this shape, without repeating this projection.
@@ -106,7 +107,7 @@ impl<'w, 'a> Rank<'w, 'a> {
     async unsafe fn execute(&mut self, input: CuteafdDeviceBuffer, rows: usize, greedy: bool) -> Result<()> {
         let queued = unsafe { self.begin(input, rows, greedy) };
         let drained = self.stream.wait().await;
-        queued.and(drained)?;
+        crate::families::deepseek_v41::v41_experts::dspark::settle(queued, drained)?;
         unsafe { self.capture_ready(rows, greedy) }
     }
 
@@ -230,7 +231,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
                 lib.copy_peer_async(slice(remote, capacity * 4, rows * 4)?, scores, rows * 4, stream.raw)
             });
             let drained = stream.wait().await;
-            queued.and(drained)
+            crate::families::deepseek_v41::v41_experts::dspark::settle(queued, drained)
         };
         let second_work = second_device.future(unsafe { second.get_mut().execute(normalized, rows, true) });
         let (a, b) = tokio::join!(first_work, second_work);
@@ -242,7 +243,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
             stream.device.library.v41_vocabulary_merge_greedy([remote, local], output, rows, self.split, stream.raw)
         });
         let drained = stream.wait().await;
-        queued.and(drained)?;
+        crate::families::deepseek_v41::v41_experts::dspark::settle(queued, drained)?;
         self.ready = Some(rows);
         self.greedy_ready = true;
         Ok(())
@@ -460,6 +461,28 @@ impl Drop for DistributedVocabularyWave<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vocabulary_capture_preserves_device_error_over_host_enqueue_error() -> Result<()> {
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/finish-1156/fixtures");
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        let lib = fixture.load()?;
+        fixture.extent_only(&lib)?;
+        let weights = VocabularyShard::without_resident_weights_for_test();
+        let mut rank = Rank::new(&lib, &weights, 1)?;
+        rank.graphs[0].declare_startup(&[1])?;
+        fixture.configure_capture(&lib, 98)?;
+        // SAFETY: the real enqueue guard rejects absent resident weights before launching;
+        // the CPU fixture fails end_capture without publishing a graph or queued work.
+        let error = unsafe { rank.capture_ready(1, false) }.unwrap_err();
+        assert!(crate::families::deepseek_v41::v41_experts::dspark::is_device_failure(&error));
+        let mut failure = crate::families::deepseek_v41::v41_experts::dspark::DraftFailure::default();
+        failure.record(&error);
+        assert!(failure.check("draft").is_err());
+        fixture.configure_capture(&lib, 0)?;
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
     fn distributed_vocabulary_real_weights_match_full_and_cancel_safely() -> Result<()> {

@@ -84,8 +84,22 @@ impl NativeLibrary {
         // SAFETY: the caller's contract; the native call reads `planes` before it returns.
         let code = unsafe { f(x, planes.as_ptr(), out, i32::from(out_f32), i32::try_from(rows)?,
             i32::try_from(k)?, i32::try_from(n)?, i32::from(coarse), workspace, workspace_bytes, stream) };
-        ensure!(code == 0, "packed head linear ({}) [{rows}, {k}] x [{n}, {k}] failed with {code}",
-            if coarse { "coarse" } else { "exact" });
+        self.status_to_result("packed head linear", code)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_failure_tests {
+    use super::*;
+    #[test]
+    fn vocabulary_packed_native_failure_is_tagged() -> Result<()> {
+        let library = crate::tests::draft_failure_library()?;
+        let p = std::ptr::null_mut();
+        // SAFETY: the CPU fixture export returns an error without touching pointers.
+        crate::tests::assert_draft_native_failure(unsafe {
+            library.packed_head_linear(p, &[p; 6], p, true, 1, 128, 16, false, p, 0, p)
+        });
         Ok(())
     }
 }

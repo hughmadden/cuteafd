@@ -584,10 +584,7 @@ impl V41RouteReducer<'_> {
     ) -> Result<()> {
         let status =
             unsafe { (self.reduce)(planes.as_ptr(), shared, output, rows, ranks, topk, stream) };
-        ensure!(
-            status == 0,
-            "V4.1 route reduction failed with CUDA status {status}"
-        );
+        self._library.status_to_result("V4.1 route reduction", status)?;
         Ok(())
     }
 }
@@ -1230,10 +1227,7 @@ impl V41ExpertKernel<'_> {
     /// every captured graph replay, with stream ordering enforced by the caller.
     pub unsafe fn launch(&self, args: &V41ExpertLaunchArgs) -> Result<()> {
         let status = unsafe { (self.launch)(self.handle.as_ptr(), args) };
-        ensure!(
-            status == 0,
-            "V4.1 expert launch failed with CUDA status {status}"
-        );
+        self._library.status_to_result("V4.1 expert launch", status)?;
         Ok(())
     }
 }
@@ -1785,7 +1779,7 @@ impl V41ExpertInputQuantizer<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "expert input quantization failed: {status}");
+        self._library.status_to_result("expert input quantization", status)?;
         Ok(())
     }
 }
@@ -1931,6 +1925,39 @@ impl V41LocalExpertReducer<'_> {
         output: *mut u16, rows: u32, token_sums: bool, stream: *mut c_void) -> Result<()> {
         let status = unsafe { (self.finish)(routed, shared, output, rows, u32::from(token_sums), stream) };
         ensure!(status == 0, "local expert reduction failed with CUDA status {status}");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_failure_tests {
+    use super::*;
+    #[test]
+    fn expert_reducer_and_input_quantizer_native_failures_are_tagged() -> Result<()> {
+        let library = crate::tests::draft_failure_library()?;
+        unsafe extern "C" fn launch(_: *mut c_void, _: *const V41ExpertLaunchArgs) -> i32 { 98 }
+        unsafe extern "C" fn bind(_: *mut c_void, _: *mut c_void, _: u64, _: *mut *mut c_void) -> i32 { 0 }
+        unsafe extern "C" fn init(_: *mut c_void, _: *mut c_void, _: u64, _: *mut c_void) -> i32 { 0 }
+        unsafe extern "C" fn groups(_: i32, _: i32, _: *mut u32) -> i32 { 0 }
+        unsafe extern "C" fn reduce(_: *const *const f32, _: *const u16, _: *mut u16,
+            _: u32, _: u32, _: u32, _: *mut c_void) -> i32 { 98 }
+        unsafe extern "C" fn quantize(_: *mut c_void, _: *const u16, _: *mut u8, _: u32, _: *mut c_void) -> i32 { 98 }
+        let info = V41ExpertInfo { capacity_rows: 1, topk: 6, ..Default::default() };
+        let kernel = V41ExpertKernel { _library: &library, handle: NonNull::dangling(), launch,
+            bind_scratch: bind, initialize_scratch: init, info, output_kind: V41ExpertOutputKind::Fp32Routes,
+            group_rows: 1, query_group_rows: groups };
+        let b = CuteafdDeviceBuffer { ptr: NonNull::<u16>::dangling().as_ptr().cast(),
+            bytes: 10240, device_id: 0, flags: 0 };
+        let args = V41ExpertLaunchArgs::new(&info, [b.ptr; V41_EXPERT_POINTER_COUNT], 1, std::ptr::null_mut())?;
+        let reducer = V41RouteReducer { _library: &library, reduce };
+        let quantizer = V41ExpertInputQuantizer { _library: &library, handle: NonNull::dangling(), launch: quantize };
+        // SAFETY: these injected native callbacks return a status without dereferencing pointers.
+        unsafe {
+            crate::tests::assert_draft_native_failure(kernel.launch(&args));
+            crate::tests::assert_draft_native_failure(reducer.launch([b.ptr.cast(); 4], b.ptr.cast(),
+                b.ptr.cast(), 1, 4, 6, std::ptr::null_mut()));
+            crate::tests::assert_draft_native_failure(quantizer.launch(b, b, 1, std::ptr::null_mut()));
+        }
         Ok(())
     }
 }

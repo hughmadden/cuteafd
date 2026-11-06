@@ -94,7 +94,7 @@ impl<'a> DsparkFfn<'_, 'a> {
     pub unsafe fn execute(&mut self, rows: u32) -> Result<[CuteafdDeviceBuffer; 2]> {
         let launched = unsafe { self.enqueue(rows) };
         let drained = self.synchronize();
-        if let Err(error) = launched.and(drained) {
+        if let Err(error) = crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained) {
             self.boundary.invalidate();
             return Err(error);
         }
@@ -151,7 +151,8 @@ impl<'a> DsparkFfn<'_, 'a> {
                 }
                 Err(error)
             }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+            (Err(first), Err(second)) => Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
+            (Ok(()), Err(error)) => Err(error),
         }
     }
     /// # Safety
@@ -165,7 +166,7 @@ impl<'a> DsparkFfn<'_, 'a> {
         );
         let launched = unsafe { self.library.cuda_graph_launch(graph, self.stream()?) };
         let drained = self.synchronize();
-        launched.and(drained)?;
+        crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained)?;
         unsafe { self.boundary.complete_replay(rows as usize) }
     }
     /// Completed residual streams and next pre-mix; invalid after a failed execute.

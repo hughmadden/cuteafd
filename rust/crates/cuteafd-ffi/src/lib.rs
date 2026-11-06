@@ -530,15 +530,6 @@ pub struct NativeStatusError {
     pub detail: String,
 }
 
-/// A non-zero native status is a device failure. The draft liveness gate
-/// classifies on [`NativeStatusError`], so every wrapper on the draft path must
-/// return one instead of a plain `ensure!` message.
-pub(crate) fn native_status(context: &str, status: CuteafdStatus) -> Result<()> {
-    if status == CUTEAFD_STATUS_OK { return Ok(()); }
-    Err(anyhow::Error::new(NativeStatusError { context: context.to_string(), status,
-        detail: format!("native status {status}") }))
-}
-
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
 pub const CUTEAFD_STATUS_CUDA_UNAVAILABLE: CuteafdStatus = 3;
 pub const CUTEAFD_STATUS_RDMA_UNAVAILABLE: CuteafdStatus = 7;
@@ -5889,6 +5880,28 @@ mod tests {
     use std::env;
     use std::path::PathBuf;
     use std::slice;
+
+    pub(super) fn draft_failure_library() -> Result<NativeLibrary> {
+        let root = PathBuf::from(env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/finish-1156/fixtures");
+        let fixture = crate::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        fixture.load()
+    }
+
+    pub(super) fn assert_draft_native_failure(result: Result<()>) {
+        let error = result.unwrap_err();
+        let tagged = error.downcast_ref::<NativeStatusError>().expect("draft launch must retain the native tag");
+        assert_ne!(tagged.status, 0);
+        assert_eq!(tagged.detail, "injected CPU fixture failure");
+    }
+
+    #[test]
+    fn native_status_keeps_driver_diagnostics_and_success() -> Result<()> {
+        let library = draft_failure_library()?;
+        library.status_to_result("draft test", 0)?;
+        assert_draft_native_failure(library.status_to_result("draft test", 98));
+        Ok(())
+    }
 
     fn native_library_path() -> Option<PathBuf> {
         if let Ok(path) = env::var("CUTEAFD_NATIVE_LIB") {

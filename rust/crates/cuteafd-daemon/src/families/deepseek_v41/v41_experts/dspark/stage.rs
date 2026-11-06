@@ -153,7 +153,7 @@ impl<'a> DsparkStage<'_, 'a> {
         self.attention.upload(&read, requests)?;
         let launched = unsafe { self.enqueue(&read, requests.len()) };
         let drained = self.ffn.synchronize();
-        if let Err(error) = launched.and(drained) {
+        if let Err(error) = crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained) {
             self.invalidate();
             return Err(error);
         }
@@ -195,7 +195,8 @@ impl<'a> DsparkStage<'_, 'a> {
                 }
                 Err(error)
             }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+            (Err(first), Err(second)) => Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
+            (Ok(()), Err(error)) => Err(error),
         }
     }
     /// # Safety
@@ -214,7 +215,7 @@ impl<'a> DsparkStage<'_, 'a> {
         self.attention.upload(&read, requests)?;
         let launched = unsafe { self.library.cuda_graph_launch(graph, self.ffn.stream()?) };
         let drained = self.ffn.synchronize();
-        launched.and(drained)?;
+        crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained)?;
         unsafe {
             self.ffn.complete_replay(count as u32 * self.width as u32)?;
         }

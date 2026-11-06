@@ -1,6 +1,6 @@
 //! RTX-only ownership for every native dSpark tensor and independent stage experts.
 mod chain;
-pub(crate) use chain::{DsparkChain, DistributedDsparkChain, DraftFailure, is_device_failure};
+pub(crate) use chain::{DsparkChain, DistributedDsparkChain, DraftFailure, is_device_failure, prefer_device, settle};
 mod stage;
 pub(crate) use stage::DsparkStage;
 mod main_context;

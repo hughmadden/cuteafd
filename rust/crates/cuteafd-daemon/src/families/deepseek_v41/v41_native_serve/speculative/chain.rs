@@ -12,8 +12,6 @@ pub(crate) trait DraftChain<'a> {
     unsafe fn begin_replay(&mut self, windows: [&DsparkWindow<'_>; 3],
         bindings: [&[(WindowLease, u64)]; 3]) -> Result<()>;
     fn poll_replay(&mut self) -> Result<Option<(Vec<u32>, Vec<f32>)>>;
-    /// Copy a draft output buffer to the host on this chain's stream.
-    fn copy_d2h(&self, dst: &mut [u8], buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()>;
     /// Drop a pending replay so its requests can be released.
     fn cancel_replay(&mut self);
     /// Record a CUDA/replay failure as terminal for this chain.
@@ -45,6 +43,7 @@ pub(crate) trait ProposeChain<'a>: DraftChain<'a> {
     /// Same contract as [`DraftChain::begin_replay`].
     unsafe fn replay(&mut self, windows: [&DsparkWindow<'_>; 3],
         bindings: [&[(WindowLease, u64)]; 3]) -> Result<()>;
+    fn copy_d2h(&self, dst: &mut [u8], buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()>;
     fn draft_output(&self) -> Result<[cuteafd_ffi::CuteafdDeviceBuffer; 3]>;
 }
 impl<'w, 'a> ProposeChain<'a> for DsparkChain<'w, 'a> {
@@ -55,12 +54,15 @@ impl<'w, 'a> ProposeChain<'a> for DsparkChain<'w, 'a> {
     }
     unsafe fn capture(&mut self, windows: [&DsparkWindow<'_>; 3],
         bindings: [&[(WindowLease, u64)]; 3]) -> Result<()> {
+        // SAFETY: forwards the caller's stable window/binding contract.
         unsafe { self.capture(windows, bindings) }
     }
     unsafe fn replay(&mut self, windows: [&DsparkWindow<'_>; 3],
         bindings: [&[(WindowLease, u64)]; 3]) -> Result<()> {
+        // SAFETY: forwards the caller's stable window/binding contract.
         unsafe { self.replay(windows, bindings).map(drop) }
     }
+    fn copy_d2h(&self, dst: &mut [u8], buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> { self.copy_d2h(dst, buffer) }
     fn draft_output(&self) -> Result<[cuteafd_ffi::CuteafdDeviceBuffer; 3]> { self.draft_output() }
 }
 
@@ -69,36 +71,24 @@ macro_rules! chain {
         impl<'w, 'a> DraftChain<'a> for $ty<'w, 'a> {
             fn execution_device(&self) -> Option<crate::shared::memory::device::Device<'a>> { ($device)(self) }
             fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()> {
-                let result = self.stage_tokens(tokens);
-                if let Err(error) = &result { self.note_failure(error); }
-                result
+                self.stage_tokens(tokens)
             }
             fn stage_sampling(&mut self, rngs: &mut [&mut cuteafd_core::DsparkRng], temperatures: &[f32]) -> Result<()> {
-                let result = self.stage_sampling(rngs, temperatures);
-                if let Err(error) = &result { self.note_failure(error); }
-                result
+                self.stage_sampling(rngs, temperatures)
             }
             unsafe fn begin_replay(&mut self, windows: [&DsparkWindow<'_>; 3],
                 bindings: [&[(WindowLease, u64)]; 3]) -> Result<()> {
-                let result = unsafe { self.begin_replay(windows, bindings) };
-                if let Err(error) = &result { self.note_failure(error); }
-                result
+                // SAFETY: forwards the caller's window, binding and lifetime contract.
+                unsafe { self.begin_replay(windows, bindings) }
             }
             fn poll_replay(&mut self) -> Result<Option<(Vec<u32>, Vec<f32>)>> {
-                let result = self.poll_replay();
-                if let Err(error) = &result { self.note_failure(error); }
-                result
-            }
-            fn copy_d2h(&self, dst: &mut [u8], buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
-                self.copy_d2h(dst, buffer)
+                self.poll_replay()
             }
             fn cancel_replay(&mut self) { self.cancel_replay() }
             fn note_failure(&mut self, error: &anyhow::Error) { self.note_failure(error) }
             fn width(&self) -> usize { self.width() }
             fn set_width(&mut self, width: usize) -> Result<()> {
-                let result = self.set_width(width);
-                if let Err(error) = &result { self.note_failure(error); }
-                result
+                self.set_width(width)
             }
             fn require_live(&self) -> Result<()> { ($live)(self) }
         }

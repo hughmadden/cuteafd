@@ -52,9 +52,7 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
     /// A terminal draft is not a reusable target-only fallback.
     pub fn require_live(&self) -> Result<()> { self.failure.check("distributed dSpark draft chain") }
     /// Copy a draft output buffer to the host on this chain's stream.
-    pub fn copy_d2h(&self, dst: &mut [u8], buffer: CuteafdDeviceBuffer) -> Result<()> {
-        self.chain.copy_d2h(dst, buffer)
-    }
+
     /// Drop a pending replay so its requests can be released.
     pub fn cancel_replay(&mut self) { self.cancel(); }
     pub fn width(&self) -> usize { self.chain.width }

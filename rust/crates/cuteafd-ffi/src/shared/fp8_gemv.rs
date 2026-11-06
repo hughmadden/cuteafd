@@ -48,7 +48,7 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_fp8_w8a16_linear") }?;
         let status = unsafe { f(x, packed, scale, out, i32::from(out_f32), i32::try_from(rows)?, i32::try_from(k)?,
             i32::try_from(n)?, workspace, workspace_bytes, stream) };
-        ensure!(status == 0, "FP8 W8A16 linear [{rows}, {k}] x [{n}, {k}] failed with {status}");
+        self.status_to_result("FP8 W8A16 linear", status)?;
         Ok(())
     }
 
@@ -73,7 +73,23 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_fp8_linear") }?;
         let status = unsafe { f(x, packed, scale, out, i32::from(out_f32), i32::try_from(rows)?, i32::try_from(k)?,
             i32::try_from(n)?, mode, workspace, workspace_bytes, stream) };
-        ensure!(status == 0, "FP8 linear (mode {mode}) [{rows}, {k}] x [{n}, {k}] failed with {status}");
+        self.status_to_result("FP8 linear", status)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_failure_tests {
+    use super::*;
+    #[test]
+    fn vocabulary_fp8_native_failures_are_tagged() -> Result<()> {
+        let library = crate::tests::draft_failure_library()?;
+        let p = std::ptr::null_mut();
+        // SAFETY: the CPU fixture exports return errors without accessing these pointers.
+        unsafe {
+            crate::tests::assert_draft_native_failure(library.fp8_w8a16_linear(p, p, p, p, true, 1, 128, 16, p, 0, p));
+            crate::tests::assert_draft_native_failure(library.fp8_linear(p, p, p, p, true, 1, 128, 16, 0, p, 0, p));
+        }
         Ok(())
     }
 }
