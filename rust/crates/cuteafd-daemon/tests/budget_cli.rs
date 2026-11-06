@@ -129,7 +129,7 @@ fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
             if !accepted {
                 assert!(stderr.contains("is not servable"), "{stderr}");
                 assert!(report["hints"].as_array().unwrap().iter().any(|h| h["what"].as_str()
-                    .is_some_and(|h| h.contains("MiMo placement") && (h.contains("mandatory") || h.contains("pool")))), "{report}");
+                    .is_some_and(|h| h.contains("MiMo placement") && h.contains("memory budget 'rtx0'"))), "{report}");
             }
         }
     }

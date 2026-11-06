@@ -315,6 +315,8 @@ mod tests {
             let mut placement = ExpertPlacement::Local;
             match adapter.id() {
                 "mimo_v2" => {
+                    // An explicit pool below the selected context is a typed refusal.
+                    options.context_tokens = 32768;
                     let mut config = testing::mimo_flash_config();
                     config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
                         "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,

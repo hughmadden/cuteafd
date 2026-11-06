@@ -1933,11 +1933,11 @@ mod tests {
         let inventory = plan(snapshot.path(), &weight_only).unwrap();
         assert!(!inventory.fits && !inventory.placement_supported && !inventory.executable());
         assert!(inventory.hints.iter().any(|h| h.what.contains("MiMo placement")
-            && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", inventory.hints);
+            && h.what.contains("memory budget 'rtx0'")), "{:?}", inventory.hints);
         let report = plan(snapshot.path(), &options(&tiny).unwrap()).unwrap();
         assert!(!report.fits && !report.executable());
         assert!(report.hints.iter().any(|h| h.what.contains("MiMo placement")
-            && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", report.hints);
+            && h.what.contains("memory budget 'rtx0'")), "{:?}", report.hints);
         let error = run_plan(tiny).unwrap_err();
         assert!(error.to_string().contains("is not servable"), "{error:#}");
     }
