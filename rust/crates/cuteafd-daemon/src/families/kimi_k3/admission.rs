@@ -701,9 +701,15 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             }
         }
     }
-    let spark = spark_budget.iter().flat_map(|budget| (0..budget.resident.len()).flat_map(move |rank|
-        counts.iter().map(move |&count| SparkOwner { count, rank,
-            experts: budget.resident[rank][count..].iter().sum(), overhead: budget.overhead[rank] }))).collect();
+    let mut spark = Vec::new();
+    if let Some(budget) = &spark_budget {
+        for rank in 0..budget.resident.len() {
+            for &count in &counts {
+                spark.push(SparkOwner { count, rank,
+                    experts: budget.resident[rank][count..].iter().sum(), overhead: budget.overhead[rank] });
+            }
+        }
+    }
     let mut fixed = request.fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
     fixed.extend(request.context_buffers.demands()?.iter().map(FixedOwner::ready));
     // The post-module sample is declared once as an existing physical owner;
@@ -1291,7 +1297,15 @@ pub(super) mod tests {
             for (layer, assignment) in admitted.placement.layers.iter().enumerate() {
                 if cfg.attention[layer] == KimiAttention::Kda || attention == Some(AttentionPlacement::Heads) {
                     assert_eq!(assignment.mode, LayerMode::HeadSplit);
-                } else { assert!(matches!(assignment.mode, LayerMode::Whole { .. })); }
+                } else {
+                    assert_eq!(assignment.mode, LayerMode::Whole {
+                        gpu: u8::from(layer == 3), ffn: FfnMode::Split });
+                }
+            }
+            for rank in 0..2 {
+                let owners = if attention == Some(AttentionPlacement::Heads) { 2 } else { 1 };
+                assert_eq!(admitted.mla_layouts[rank].bytes(), owners
+                    * admitted.placement.pool_tokens as usize * MLA_RECORD_BYTES);
             }
         }
         Ok(())
@@ -1722,10 +1736,8 @@ pub(super) mod tests {
         assert_eq!(devices.len(), 1);
         let planned = devices[0];
         assert_eq!(planned.index, 0);
-        let non_pool = planned.items.iter().filter(|item| item.group != "records")
-            .map(|item| item.bytes).sum::<u64>();
-        assert_eq!(capacity - arch.context_bytes - non_pool,
-            admitted.placement.pool_limits.0[0].available_bytes);
+        let runtime_bytes = admitted.placement.items[0].iter().map(|item| item.bytes).sum::<u64>();
+        assert_eq!(planned.used_bytes(), runtime_bytes + (2 << 30));
         let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
         assert_eq!(planned.items.iter().filter(|item| item.category == Category::Prefix)
             .map(|item| item.bytes).sum::<u64>(), mark_bytes * marks as u64);
@@ -1949,10 +1961,9 @@ pub(super) mod tests {
                     .map(|item| item.bytes).sum::<u64>();
                 assert_eq!(planned_marks, mark_bytes as u64 / 2 * marks,
                     "rank {rank}, concurrency {slots}, {format}: planner must charge runtime staging marks");
-                let non_pool = planned.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum::<u64>();
-                let remaining = capacity - arch.context_bytes - non_pool;
-                assert_eq!(remaining, admitted.placement.pool_limits.0[rank].available_bytes,
-                    "rank {rank}, {format}: installed planner and runtime must leave identical KV room");
+                let runtime_bytes = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
+                assert_eq!(planned.used_bytes(), runtime_bytes + (2 << 30),
+                    "rank {rank}, {format}: installed planner and runtime must charge identical owners");
             }
             assert!(admitted.placement.pool_tokens >= context as u64);
         }
@@ -2484,7 +2495,7 @@ pub(super) mod tests {
         i.startup.push(reserve.clone());
         let admitted = admit(i)?;
         assert!(admitted.placement.items[0].iter().any(|item|
-            item.group == super::super::graphs::RESERVE && item.basis == Basis::Estimated));
+            item.group == super::super::graphs::RESERVE && item.basis == Basis::Exact));
         for case in 0..7 {
             let mut i = inputs(&cfg);
             let mut changed = reserve.clone();

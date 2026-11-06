@@ -438,8 +438,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let cache = crate::plan::FamilyModel::cache_geometry(model, crate::serving_capacity::CacheOptions {
             coordinator_ranks: gpus, attention_placement: Some(attention), mla_kv: opts.mla_kv, ..Default::default()
         })?.context("Kimi host cache geometry")?;
-        let page_bytes = cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>()
-            / if context_split { 2 } else { 1 };
+        let page_bytes = cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>();
         let mark_bytes = cache.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>()
             + draft_window_bytes;
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE,
