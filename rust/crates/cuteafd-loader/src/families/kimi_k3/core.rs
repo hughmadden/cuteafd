@@ -235,6 +235,7 @@ pub fn draft_head_demand(core: &CoreInventory, rows: usize, metadata: &serde_jso
 #[derive(Debug, Default, Clone)]
 pub struct CoreInventory {
     pub projections: BTreeMap<String, CoreProjection>,
+    pub native: BTreeMap<String, crate::families::glm5_flash::core::NativeProjection>,
 }
 
 impl CoreInventory {
@@ -250,13 +251,30 @@ impl CoreInventory {
                     && expected.get(&format!("{stem}.weight")).is_some_and(|shape|
                         shape.first() == Some(&(cfg.kv_lora_rank + cfg.qk_rope_dim))),
             }))?;
-        Ok(Self { projections })
+        let mut native = BTreeMap::new();
+        for (name, shape) in expected {
+            let Some(stem) = name.strip_suffix(".weight") else { continue; };
+            if !stem.contains(".self_attn.") || split(stem).is_none()
+                || projections.contains_key(stem) || !checkpoint.contains_tensor(name) { continue; }
+            let group = stem.rsplit_once('.').context("Kimi attention group")?.0;
+            if !projections.keys().any(|s| s.rsplit_once('.').is_some_and(|(parent, _)| parent == group)) {
+                continue;
+            }
+            let selected = checkpoint.projection(stem)?;
+            let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape: actual } = selected.storage else { continue; };
+            ensure!(actual == *shape && shape.len() == 2 && dtype == cuteafd_core::DType::Bf16,
+                "{stem}: Kimi native attention requires BF16 {shape:?}, found {dtype:?} {actual:?}");
+            native.insert(stem.into(), crate::families::glm5_flash::core::NativeProjection {
+                shape: [shape[0], shape[1]], split: split(stem).unwrap(),
+                fp8: checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact });
+        }
+        let inventory = Self { projections, native };
+        inventory.validate_runtime_groups(cfg)?;
+        Ok(inventory)
     }
 
-    /// The current projected engine admits complete operator groups only. The
-    /// quantizer's KDA fallback keeps all five projections BF16, preserving the
-    /// original fused path; partial groups require independently exported BF16
-    /// partner projections and are deliberately not admitted.
+    /// Attention dispatches each validated projection independently. Shared
+    /// FFNs and latent projections retain their existing whole-group contract.
     pub fn validate_runtime_groups(&self,cfg:&KimiK3Config)->Result<()> {
         for layer in 0..cfg.layers {
             let root=format!("language_model.model.layers.{layer}");
@@ -264,7 +282,10 @@ impl CoreInventory {
                 super::config::KimiAttention::Kda=>&["q_proj","k_proj","v_proj","g_proj","o_proj"],
                 super::config::KimiAttention::Mla=>&["q_a_proj","kv_a_proj_with_mqa","q_b_proj","g_proj","o_proj"],
             };
-            self.complete_group("attention",attention.iter().map(|leaf|format!("{root}.self_attn.{leaf}")))?;
+            let stems = attention.iter().map(|leaf| format!("{root}.self_attn.{leaf}")).collect::<Vec<_>>();
+            let staged = stems.iter().any(|stem| self.projections.contains_key(stem) || self.native.contains_key(stem));
+            ensure!(!staged || stems.iter().all(|stem| self.projections.contains_key(stem) || self.native.contains_key(stem)),
+                "Kimi attention group lacks a validated per-projection K6/BF16 operand: {root}.self_attn");
             if !cfg.dense[layer] {
                 self.complete_group("shared FFN",["gate_proj","up_proj","down_proj"].iter()
                     .map(|leaf|format!("{root}.block_sparse_moe.shared_experts.{leaf}")))?;
@@ -328,9 +349,66 @@ mod tests {
                 codebook:crate::formats::exl3_storage::Exl3Codebook::Mcg,shape:[128,128],stored_outputs:128,
                 split:split(&stem).unwrap(),source_bytes:0});
             let error=partial.validate_runtime_groups(&cfg).unwrap_err().to_string();
-            assert!(error.contains("only whole-group fallback") && error.contains(&stem)
-                && error.contains("BF16:"),"{error}");
+            assert!(if leaves[0].starts_with("self_attn.") {
+                error.contains("validated per-projection")
+            } else {
+                error.contains("only whole-group fallback") && error.contains(&stem) && error.contains("BF16:")
+            }, "{error}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hqa_attention_inventory_and_mode_charges_follow_selected_projections() -> Result<()> {
+        use crate::plan::{checkpoint::{AttentionMode, CheckpointView}, testing};
+        use crate::placement::{LayerMode, FfnMode};
+        let dir = tempfile::tempdir()?;
+        testing::write_kimi_core_snapshot(dir.path(), false);
+        let compact_index = std::fs::read(dir.path().join("model.safetensors.index.json"))?;
+        let mut index: serde_json::Value = serde_json::from_slice(&compact_index)?;
+        let mut restored = Vec::new();
+        for (name, dtype, shape) in testing::kimi_k3_tensors(false) {
+            if !name.contains(".self_attn.") || !(name.ends_with(".o_proj.weight") || name.ends_with(".q_b_proj.weight")) {
+                continue;
+            }
+            let stem = name.strip_suffix(".weight").unwrap();
+            for suffix in ["trellis", "suh", "svh", "mcg"] {
+                index["weight_map"].as_object_mut().unwrap().remove(&format!("{stem}.{suffix}"));
+            }
+            index["weight_map"][&name] = serde_json::json!("hqa.safetensors");
+            restored.push((name, dtype, shape));
+        }
+        testing::write_safetensors(&dir.path().join("hqa.safetensors"), &restored);
+        std::fs::write(dir.path().join("model.safetensors.index.json"), serde_json::to_vec(&index)?)?;
+        let expected = testing::kimi_k3_tensors(false).into_iter().map(|(n, _, s)| (n, s)).collect();
+        let mut charges = Vec::new();
+        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+            let checkpoint = Checkpoint::open_view(&CheckpointView::select(dir.path(), mode)?)?;
+            let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+            let core = CoreInventory::from_checkpoint(&cfg, &checkpoint, &expected)?;
+            assert_eq!(core.native.len(), restored.len());
+            assert!(core.native.values().all(|p| p.fp8 == (mode == AttentionMode::Fp8Compact)));
+            let mut bytes = 0;
+            for layer in 0..cfg.layers {
+                let pair = super::super::weight_layout::LayerLayout::pair_with_core(&cfg, layer, LayerMode::HeadSplit, &core)?;
+                for layout in pair {
+                    for (name, native) in &layout.native {
+                        assert!(!layout.operands.contains_key(name) && !layout.core.contains_key(name));
+                        assert_eq!(native.ranks, 2);
+                        assert_eq!(native.shape, if *name == "mla.q_b" { [9216, 1536] } else { [7168, 6144] });
+                        bytes += native.bytes()?;
+                    }
+                }
+                if cfg.attention[layer] == super::super::config::KimiAttention::Mla {
+                    let whole = super::super::weight_layout::LayerLayout::pair_with_core(&cfg, layer,
+                        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }, &core)?;
+                    assert!(whole[0].native.is_empty());
+                    assert!(whole[1].native.values().all(|p| p.rank == 0 && p.ranks == 1));
+                }
+            }
+            charges.push(bytes);
+        }
+        assert!(charges[1] < charges[0]);
         Ok(())
     }
 
