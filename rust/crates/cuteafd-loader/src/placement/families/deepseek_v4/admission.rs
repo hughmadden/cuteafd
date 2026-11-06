@@ -842,6 +842,14 @@ impl Recipe for PreparedV4<'_> {
             }
         }
         let mut owners = Owners::new(self.maximum_pages);
+        if inputs.expert_usage {
+            let geometry = cuteafd_core::expert_usage::Geometry {
+                layers: inputs.cfg.n_layers, experts: inputs.cfg.n_routed_experts,
+                topk: inputs.cfg.n_activated_experts,
+                routed_layers: (inputs.first_routed..inputs.cfg.n_layers).collect(),
+            };
+            owners.components.extend(crate::placement::expert_usage::components(&geometry, 0, self.maximum_pages)?);
+        }
         let (fixed, overhead, _) = fixed_demands(inputs).map_err(invalid)?;
         for (index, demand) in fixed.iter().chain(&inputs.weights.fixed).enumerate() {
             let id = format!("v4.fixed.{index}");

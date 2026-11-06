@@ -403,6 +403,7 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/expert_pack.cu
     shared/cuda/exl3_wire.cu
     shared/cuda/route_reduce.cu
+    shared/cuda/expert_usage.cu
     families/deepseek_v41/cuda/engram.cu
     families/deepseek_v41/cuda/v41_dspark.cu
     families/deepseek_v41/cuda/v41_hc.cu

@@ -35,6 +35,7 @@ pub use shared::v41_experts::{
     v41_pack_intermediate_supported, v41_rank_count_supported, V41ScaleCodeJob,
 };
 pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
+pub use shared::expert_usage;
 mod cuda_runtime;
 pub mod host_isa;
 pub mod memory_ledger;

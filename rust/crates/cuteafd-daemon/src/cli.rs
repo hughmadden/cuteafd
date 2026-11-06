@@ -407,6 +407,9 @@ pub(crate) struct PlanArgs {
     /// Include the diagnostic all-row prefill head reservation in --layout.
     #[arg(long)]
     pub(crate) full_prefill_logits: bool,
+    /// Include shared executed-route telemetry owners in --layout.
+    #[arg(long)]
+    pub(crate) expert_usage: bool,
     /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_waves: u64,

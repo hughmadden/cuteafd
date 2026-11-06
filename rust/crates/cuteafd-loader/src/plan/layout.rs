@@ -27,6 +27,8 @@ const GLM_FLASH_ENCODER_SCRATCH_BYTES: u64 = 791_907_584;
 /// The hardware and serving shape to lay out.
 #[derive(Debug, Clone)]
 pub struct LayoutOptions {
+    /// Charge shared route telemetry on the canonical coordinator rank.
+    pub expert_usage: bool,
     /// None sizes full-context KV for concurrency + 4, capped at min(32 GiB, 25% host RAM).
     /// Explicit bytes bypass both; Some(0) disables the host tier.
     pub host_cache_bytes: Option<u64>,
@@ -241,6 +243,7 @@ impl LayoutOptions {
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
+            expert_usage: false,
             host_cache_bytes: None,
             spark_reply_formats: cuteafd_core::spark_reply::requested(),
             media_cache_bytes: None,

@@ -298,6 +298,7 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
             .with_resident_weights(crate::placement::ResidentWeights(bytes)));
     }
     let inputs = v4::V4Inputs {
+        expert_usage: options.expert_usage,
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, cfg: cfg.clone(),
         weights,
         cache_stages: shape.native_layers, gpus, headroom_floor: options.headroom_bytes,

@@ -77,6 +77,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
                 full_prefill_logits: args.full_prefill_logits,
+                expert_usage: args.expert_usage,
                 // Lane families still read prefill_lanes until their unit ports land.
                 prefill_lanes: args.prefill_waves,
                 prefill_waves: args.prefill_waves.max(1),
@@ -1007,7 +1008,7 @@ mod tests {
             attention_placement: "auto".into(),
             context_tokens: 262144,
             prefill_rows: 0,
-            full_prefill_logits: false,
+            full_prefill_logits: false, expert_usage: false,
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,

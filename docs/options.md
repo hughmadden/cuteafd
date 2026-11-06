@@ -234,6 +234,7 @@ GLM Flash, MiMo, Qwen4 and Muse carry their own towers.
 | `ENABLE_BENCH` | `off` | `on`, `off` | Enable the in-server bench endpoints. |
 | `GATEWAY` | binary default `on` | `on`, `off` | Messages/Responses/Realtime routes. |
 | `USAGE` | `on` | `on`, `off` | Usage history tier. |
+| `EXPERT_USAGE` | `off` | `on`, `off` | Device-side executed expert routes, separate prefill/decode tallies and 5 s / 60 s / total windows at `/v1/stats`. Initially V4; shared adapters extend coverage. Rejected speculative verification rows count; graph padding and TP2 replicas do not. No disk persistence. |
 | `CONSOLE_ASSETS` | `off` | `on`, `off` | Serve console pages from a checkout; `on` needs `--wip`. |
 | `CONSOLE_TEXT` | `on` | `on`, `off` | Live console token text for unlocked viewers. |
 | `HOST_WAIT` | `block` | `spin`, `block` | Serving host-thread wait mode. |
@@ -473,6 +474,7 @@ accept/refuse behaviour. `✓` means the family's config validation accepts it;
 | `ENABLE_BENCH` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GATEWAY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `USAGE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `EXPERT_USAGE` | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `CONSOLE_ASSETS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CONSOLE_TEXT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `HOST_WAIT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |

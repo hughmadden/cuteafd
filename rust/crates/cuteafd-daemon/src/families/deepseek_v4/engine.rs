@@ -121,6 +121,7 @@ pub(crate) struct Engine<'a> {
     expert_graph_captures: std::cell::Cell<usize>,
     pub(super) graph_coverage: crate::shared::decode_graph::census::LaunchCoverage,
     draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
+    expert_usage: Option<cuteafd_ffi::expert_usage::ExpertUsage<'a>>,
 }
 
 /// The second GPU of a two-GPU head split (rank 1): its share of every
@@ -259,6 +260,7 @@ pub(crate) struct PeerParts {
 
 /// Everything an [`Engine`] needs besides its pools and workspaces.
 pub(crate) struct EngineParts<'a> {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Reader>,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: DeepseekV4Config,
@@ -561,7 +563,12 @@ impl<'a> Engine<'a> {
         };
         ensure!(parts.context.is_none() || (split_family.is_some() && parts.shape.units % 2 == 0),
             "C4 context attention needs the head-split programs and an even unit pool, not {} units", parts.shape.units);
+        let expert_usage = parts.expert_usage.map(|reader| cuteafd_ffi::expert_usage::ExpertUsage::new(parts.library,
+            cuteafd_core::expert_usage::Geometry { layers: parts.cfg.n_layers,
+                experts: parts.cfg.n_routed_experts, topk: parts.cfg.n_activated_experts,
+                routed_layers: (0..parts.cfg.n_layers).collect() }, reader)).transpose()?;
         Ok(Self {
+            expert_usage,
             device: parts.library.cuda_get_device()?,
             split_family,
             peer: None,
@@ -1361,7 +1368,7 @@ impl<'a> Engine<'a> {
         }
         self.attention_front(1, layer, weights, tables, lane, w, rows, cap)?;
         self.attention_sum(1, layer, index, w, rows)?;
-        self.attention_back(1, weights, lane, w, rows, cap, w.sum.buffer.ptr)?;
+        self.attention_back(1, layer, tables.decode, weights, lane, w, rows, cap, w.sum.buffer.ptr)?;
         self.run_on(1, weights.ffn_split, &format!("shared_ffn_m{}", self.kernel_rows(cap)), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
@@ -1425,7 +1432,7 @@ impl<'a> Engine<'a> {
         cap: usize,
     ) -> Result<()> {
         self.attention_front(0, layer, weights, tables, lane, w, rows, cap)?;
-        self.attention_back(0, weights, lane, w, rows, cap, w.delta.buffer.ptr)
+        self.attention_back(0, layer, tables.decode, weights, lane, w, rows, cap, w.delta.buffer.ptr)
     }
 
     /// [`Self::attention`] on rank 0 under a head split: the front, the attention
@@ -1435,7 +1442,7 @@ impl<'a> Engine<'a> {
         index: usize, w: &Workspace<'_>, rows: Scalar, cap: usize) -> Result<()> {
         self.attention_front(0, layer, weights, tables, lane, w, rows, cap)?;
         self.attention_sum(0, layer, index, w, rows)?;
-        self.attention_back(0, weights, lane, w, rows, cap, w.sum.buffer.ptr)
+        self.attention_back(0, layer, tables.decode, weights, lane, w, rows, cap, w.sum.buffer.ptr)
     }
 
     /// Rank `rank`'s attention partial into `delta` pushed to the other GPU, the
@@ -1586,7 +1593,7 @@ impl<'a> Engine<'a> {
     /// mHC post_pre over the attention output `x` (stream a -> stream b, y), then on
     /// rank 0 the router scores and expert input quantization.
     #[allow(clippy::too_many_arguments)]
-    fn attention_back(&self, rank: usize, weights: &LayerWeights<'_>, lane: &UnitSlot<'_>, w: &Workspace<'_>, rows: Scalar,
+    fn attention_back(&self, rank: usize, layer: usize, decode: bool, weights: &LayerWeights<'_>, lane: &UnitSlot<'_>, w: &Workspace<'_>, rows: Scalar,
         cap: usize, x: *mut c_void) -> Result<()> {
         let (a, b) = (&lane.stream_a, &lane.stream_b);
         self.run_on(rank, false, &format!("mhc_post_pre_m{}", self.kernel_rows(cap)), &[
@@ -1613,6 +1620,12 @@ impl<'a> Engine<'a> {
             self.library.dsv4_router_select(w.logits.buffer.ptr, bias, tid2eid, lane.tokens.buffer.ptr,
                 w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t as usize, self.cfg.n_routed_experts,
                 self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream_of(rank))?;
+            if let Some(usage) = &self.expert_usage {
+                let phase = if decode { cuteafd_ffi::expert_usage::UsagePhase::Decode }
+                    else { cuteafd_ffi::expert_usage::UsagePhase::Prefill };
+                usage.routes(layer, phase)?.record(w.route_ids.buffer.ptr, t as usize, None, u32::MAX,
+                    rank == 0, self.stream_of(rank))?;
+            }
             Ok(())
         })?;
         self.quantize_input(rank, w, t as usize)

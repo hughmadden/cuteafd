@@ -10,6 +10,7 @@ pub mod ffn_activation;
 pub use ffn_activation::FfnActivation;
 pub mod coordinator_programs;
 pub mod expert_geometry;
+pub mod expert_usage;
 pub mod spark_executions;
 pub mod spark_reply;
 pub use spark_reply::SparkReplyFormat;

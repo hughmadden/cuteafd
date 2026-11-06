@@ -40,6 +40,7 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 /// checkpoint, the program manifest and the CLI.
 #[derive(Debug, Clone)]
 pub struct V4Inputs {
+    pub expert_usage: bool,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
@@ -318,7 +319,7 @@ mod default_tests {
             cfg.index_topk = topk;
             for gpus in [1, 2] {
                 let mut input = V4Inputs {
-                    resident_weight_limit: None,
+                    expert_usage: false, resident_weight_limit: None,
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
                     cfg: cfg.clone(), weights: crate::families::deepseek_v4::resident::WeightInventory {
                         c4_attention: Vec::new(), fixed: Vec::new(), startup: Default::default() },
@@ -391,7 +392,7 @@ mod default_tests {
 
     fn plan_inputs(cfg: &DeepseekV4Config) -> V4Inputs {
         V4Inputs {
-            resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            expert_usage: false, resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             automatic_context: false, cfg: cfg.clone(),
             weights: crate::families::deepseek_v4::resident::WeightInventory {
                 c4_attention: vec![ModeBytes::default(); cfg.n_layers], fixed: Vec::new(), startup: Default::default() },

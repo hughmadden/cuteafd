@@ -23,6 +23,11 @@ use std::time::{Duration, Instant};
 /// What every DeepSeek V4 command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Count executed expert routes on device, separately for prefill and decode.
+    #[arg(long)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// Checkpoint snapshot directory.
     #[arg(long)]
     pub snapshot: PathBuf,
@@ -606,6 +611,7 @@ pub(crate) fn with_engine<T>(
             args.max_sequences), context_mode.is_some()),
     );
     let mut engine = engine::Engine::new(engine::EngineParts {
+        expert_usage: args.expert_usage.then(|| args.expert_usage_reader.clone()),
         library: &loaded.library,
         programs: &programs,
         cfg: loaded.cfg.clone(),

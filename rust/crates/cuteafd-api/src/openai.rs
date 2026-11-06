@@ -116,6 +116,7 @@ pub fn vision_input_enabled() -> bool {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    pub expert_usage: cuteafd_core::expert_usage::Reader,
     pub literal_tokens: Arc<cuteafd_loader::LiteralTokens>,
     pub engine_health: Option<health::HealthWitness>,
     /// Live readiness for remote vision; absent on existing local serving paths.
@@ -162,7 +163,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
+        Self { expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -470,6 +471,7 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let object = value.as_object_mut().unwrap();
     object.insert("host_heap".into(), HOST_HEAP.read().unwrap_or_else(|e| e.into_inner()).clone());
     object.extend(state.admission.metrics().as_object().unwrap().clone());
+    object.insert("expert_usage".into(), state.profile.expert_usage.snapshot());
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
     let thermal = cuteafd_core::thermal::current();
     if !thermal.is_null() { object.insert("thermal".into(), thermal); }
