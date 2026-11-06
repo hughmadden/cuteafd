@@ -401,6 +401,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     if cfg.attention.iter().any(|kind| *kind != crate::families::kimi_k3::config::KimiAttention::Mla) {
         kinds.push(AttentionClass::Kda);
     }
+    let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
+    let links = match kimi::production_links(head_rank as u8, ranks, LANES, prefill,
+        cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
+            slot_bytes: rings.slot_bytes, alignment: rings.alignment }, opts.spark_reply_formats) {
+        Ok(links) => links,
+        Err(error) => { report.refuse_placement(format!("Kimi transport owners refused: {error}"),
+            "Supply supported Spark endpoint geometry."); return memory; }
+    };
     let mut recipe = KimiRecipe {
         context, gpus, placement: attention, attention: modes,
         prefill, lanes: LANES, spark_links: ranks > 0,
@@ -415,7 +423,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         experts: Some(ExpertProfile { layers: spark_budget.layers.clone(),
             destination: if gpus == 2 { vec![0, 1] } else { vec![0] },
             counts, rank_sets: if ranks > 0 { vec![(0..ranks as u8).collect()] } else { Vec::new() } }),
-        arenas, spark, draft, fixed: fixed_owners, owners: Vec::new(),
+        arenas, spark, links, draft, fixed: fixed_owners, owners: Vec::new(),
     };
     let occupied = vec![0u64; gpus];
     for (rank, baseline) in baseline.iter().enumerate() {
@@ -456,6 +464,16 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(error) => { report.refuse_placement(error.to_string(), "Use supported scoring dimensions."); return memory; }
     };
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
+    recipe.owners.push(kimi::host_upload_owner(maximum_pages));
+    let push = kimi::push_host_envelope(cfg, gpus).and_then(|envelope|
+        kimi::push_host_owners(&envelope, maximum_pages));
+    match push {
+        Ok(owners) => recipe.owners.extend(owners),
+        Err(error) => { report.refuse_placement(format!("Kimi push host owners refused: {error}"),
+            "Supply supported coordinator push geometry."); return memory; }
+    }
+    memory.notes.push(format!("Kimi push Load-only host owners include {} GiB estimated dense staging per coordinator rank; #1329 measured 9,606,907,904 B aggregate with unknown rank split. These do not add to the Ready host ledger.",
+        kimi::PUSH_DENSE_BYTES_PER_RANK >> 30));
     let mut budgets = match kimi::budgets(&opts.rtx_bytes.iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
         opts.headroom_bytes, &occupied, &sparks) {
         Ok(value) => value,
@@ -464,9 +482,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     budgets.push(kimi::host_budget(host_total, host_available));
     report.host_budget_bytes = host_quota;
+    let mut host_items = vec![cuteafd_core::memory_layout::host_table_item("Kimi host scoring logits", scoring_bytes),
+        cuteafd_core::memory_layout::host_table_item("Kimi reusable H2D staging (estimated)", kimi::HOST_UPLOAD_BYTES)];
+    for (lane, link) in recipe.links.iter().enumerate() {
+        for (location, &bytes) in link.envelope() {
+            if matches!(*location, crate::placement::planner::Location::HOST | crate::placement::planner::Location::PINNED) {
+                host_items.push(cuteafd_core::memory_layout::host_table_item(format!("Kimi lane {lane} transport {location:?}"), bytes));
+            }
+        }
+    }
     report.host_ledger = cuteafd_core::memory_layout::HostLayout::new(host_total, host_available,
-        (8 << 30).max(host_total / 10), host_quota,
-        vec![cuteafd_core::memory_layout::host_table_item("Kimi host scoring logits", scoring_bytes)]);
+        (8 << 30).max(host_total / 10), host_quota, host_items);
     let resolved = recipe.admit(kimi::request(context, requested_pool, onboard, prefill,
         crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
     let onboarded = match resolved {

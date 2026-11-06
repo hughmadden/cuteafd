@@ -145,6 +145,8 @@ pub(crate) struct Admission<'a> {
     io_layouts: Vec<IoLayout>,
     io_allocated: Vec<Vec<bool>>,
     spark_connected: Vec<bool>,
+    spark_links: Vec<cuteafd_loader::placement::PreparedSparkLink>,
+    push_host: cuteafd_loader::push_load::PushHostEnvelope,
 }
 
 /// Startup retains these until persistent local lanes acquire the same owners.
@@ -281,7 +283,7 @@ impl<'a> Admission<'a> {
         let expected = self.check_spark(lane)?;
         ensure!(Rc::ptr_eq(&expected, local.stream()), "Kimi Spark lane differs from admitted GPU1 intake owner");
         let routed = super::spark::RoutedLane::connect(library, local, &self.placement, world, peers, config,
-            self.waves, self.unit_rows)?;
+            self.waves, self.unit_rows, self.spark_links.get(lane).context("Kimi missing admitted Spark link")?.clone())?;
         self.spark_connected[lane] = true;
         Ok(routed)
     }
@@ -336,7 +338,8 @@ impl<'a> Admission<'a> {
                         budget: budgets[0] }] }
                 } else { CoordinatorExperts::Tp2 { layers: layers.clone(), budgets } })
             }).transpose()?;
-            let prepared = CoordinatorPush::prepare(&checkpoint.snapshot, Some(catalog), RANKS, experts)?;
+            let prepared = CoordinatorPush::prepare_admitted(&checkpoint.snapshot, Some(catalog), RANKS,
+                experts, self.push_host.clone())?;
             Ok((prepared, owners, records, dense))
         })?;
         let (planned, ranks) = match planned {
@@ -689,7 +692,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         kimi::whole_arenas(&counts, request.expert_workspace, &parts)?
     };
     let mut records = vec![0; RANKS];
-    if RANKS == 2 && placement_mode == AttentionPlacement::Layers {
+    if RANKS == 2 && placement_mode == AttentionPlacement::Layers && cfg.mla_layers() > 0 {
         records.fill((MLA_PAGE_ROWS * cache_format.record_bytes()) as u64);
     } else {
         for (layer, mode) in request.layers.iter().zip(&attention) {
@@ -711,7 +714,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         }
     }
     let mut fixed = request.fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
-    fixed.extend(request.context_buffers.demands()?.iter().map(FixedOwner::ready));
+    fixed.extend(request.context_buffers.demands()?.iter().filter(|demand| demand.bytes > 0).map(FixedOwner::ready));
     // The post-module sample is declared once as an existing physical owner;
     // budgets are full capacities, not a second free-memory subtraction.
     for rank in 0..RANKS {
@@ -735,6 +738,10 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         experts: (!routed.is_empty()).then_some(ExpertProfile { layers: routed, destination: (0..RANKS as u8).collect(), counts,
             rank_sets: vec![(0..spark_ranks as u8).collect()] }),
         arenas, spark,
+        links: kimi::production_links((RANKS - 1) as u8, spark_ranks, lanes,
+            contract::PrefillShape { rows: unit_rows as u64, waves: inputs_waves as u64 },
+            crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
+            cuteafd_core::spark_reply::requested())?,
         draft: draft.as_ref().map(|layout| kimi::draft_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
         fixed, owners: Vec::new(),
     };
@@ -784,7 +791,12 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     recipe.owners.push(kimi::host_prefix_owner(host_prefix.as_ref().map_or(0, |config| config.bytes), maximum_pages));
     let scoring_bytes = kimi::host_scoring_bytes(lane_layouts[0][0].rows().min(64), lane_layouts[0][0].rows(), cfg.vocab_size)?;
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
-    budgets.push(kimi::host_budget(host_total, host_available));
+    recipe.owners.push(kimi::host_upload_owner(maximum_pages));
+    let push_host = kimi::push_host_envelope(cfg, RANKS)?;
+    recipe.owners.extend(kimi::push_host_owners(&push_host, maximum_pages)?);
+    let mut host_budget = kimi::host_budget(host_total, host_available);
+    host_budget.headroom = host_budget.headroom.max(prefix_args.map_or(0, |args| args.host_cache_headroom_bytes));
+    budgets.push(host_budget);
     let admitted = recipe.admit(kimi::request(request.pool.compiled_context, request.pool.requested, request.onboard,
         recipe.prefill, contract::Operation::Serving, request.resident_weight_limit.unwrap_or(ResidentWeights::DEFAULT_LIMIT),
         cuteafd_core::spark_reply::requested()), budgets)?;
@@ -828,7 +840,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         kda_layout, kda_allocated: vec![false; devices.len()], kda_owners: vec![Weak::new(); devices.len()],
         mla_layouts, mla_allocated: vec![false; devices.len()], mla_owners: vec![Weak::new(); devices.len()],
         global_layouts, global_uploaded: vec![false; devices.len()], global_owners: vec![Weak::new(); devices.len()],
-        io_layouts, io_allocated, spark_connected: vec![false; lanes as usize] };
+        io_layouts, io_allocated, spark_connected: vec![false; lanes as usize], spark_links: recipe.links.clone(), push_host };
     for rank in 0..RANKS {
         admission.check_kda(rank, devices[rank])?;
         admission.check_mla(rank, devices[rank])?;
@@ -1191,7 +1203,34 @@ pub(super) mod tests {
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 2048, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }, RANKS).unwrap()); 2],
             fixed: (0..RANKS).map(|rank| Demand::new(rank as u8, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
-            startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None, draft: None, verify_rows: 0, prefix: None }
+            startup: vec![], pool_bounded: vec![], rtx: None,
+            spark_budget: Some(SparkBudgetInventory {
+                layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
+                resident: vec![vec![0; cfg.dense.iter().filter(|dense| !**dense).count()]; 6],
+                overhead: vec![0; 6], budget: 112 << 30,
+            }), draft: None, verify_rows: 0, prefix: None }
+    }
+
+    #[test]
+    fn explicit_host_headroom_changes_admitted_host_budget() -> Result<()> {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            prefix: crate::shared::prefix::PrefixArgs,
+        }
+        let cfg = cfg();
+        let mut prefix = Cli::try_parse_from(["serve", "--host-cache-bytes", "0"])?.prefix;
+        let mut i = inputs(&cfg);
+        i.prefix = Some(&prefix);
+        admit(i)?;
+        prefix.host_cache_headroom_bytes = u64::MAX;
+        let mut i = inputs(&cfg);
+        i.prefix = Some(&prefix);
+        let error = admit(i).err().context("explicit host reserve must refuse")?;
+        assert!(matches!(error.downcast_ref::<cuteafd_loader::placement::planner::Refusal>(),
+            Some(cuteafd_loader::placement::planner::Refusal::Capacity { budget, .. }) if budget == "host"), "{error:#}");
+        Ok(())
     }
 
     fn context_layout(format: cuteafd_core::MlaCacheFormat) -> Result<cuteafd_loader::families::kimi_k3::context::ContextLayout> {
@@ -1244,7 +1283,7 @@ pub(super) mod tests {
             }
             for demand in layout.buffers().demands()? {
                 assert_eq!(admitted.placement.items[demand.gpu as usize].iter().filter(|item| item.group == demand.group)
-                    .map(|item| (item.bytes, item.basis)).collect::<Vec<_>>(), [(demand.bytes, demand.basis)]);
+                    .map(|item| (item.bytes, item.basis)).collect::<Vec<_>>(), [(demand.bytes, Basis::Exact)]);
             }
             let set = admitted.graph_set.as_ref().context("Kimi context graphs missing")?;
             super::super::graphs::check_placement(&cfg, &admitted.placement, &set.keys)?;
@@ -2306,7 +2345,7 @@ pub(super) mod tests {
             match case {
                 0 => record.bytes -= 1,
                 1 => record.category = Category::Workspace,
-                2 => record.basis = Basis::Exact,
+                2 => record.basis = Basis::Formula,
                 3 => { let duplicate = record.clone(); admitted.placement.items[0].push(duplicate); }
                 _ => admitted.placement.items[0].retain(|item| item.group != "records"),
             }

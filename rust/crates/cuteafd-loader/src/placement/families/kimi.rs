@@ -12,6 +12,52 @@ use crate::formats::dflash::MlaDraftRuntimeLayout;
 use cuteafd_core::memory_layout::Category;
 use cuteafd_core::spark_reply::SparkReplyFormats;
 
+/// One shared decode/prefill endpoint per lane, using the same finite probe
+/// candidates as execution. Its GPU intake is separately owned by the lane.
+pub fn production_links(gpu: u8, ranks: usize, lanes: u64, prefill: PrefillShape,
+    rings: cuteafd_core::SparkRings, replies: SparkReplyFormats)
+    -> Result<Vec<crate::placement::PreparedSparkLink>, Refusal> {
+    use crate::placement::{PreparedSparkLink, SparkEndpointOwners, SparkIntakeCandidates};
+    if ranks == 0 { return Ok(Vec::new()); }
+    (0..lanes).map(|lane| PreparedSparkLink::endpoint(&format!("kimi.lane.{lane}"), gpu,
+        SparkEndpointOwners { ranks, geometry: cuteafd_core::ExpertGeometry::KIMI_K3,
+            endpoint: cuteafd_core::SparkEndpoint {
+                capacity: u32::try_from(prefill.rows).map_err(|_| Refusal::Overflow("Kimi transport rows"))?,
+                ingress: cuteafd_core::SparkIngress::Fp8K32, ring_depth: None, partial_reply_bytes: None }, rings },
+        usize::try_from(prefill.waves).map_err(|_| Refusal::Overflow("Kimi transport waves"))?,
+        true, true, SparkIntakeCandidates::Probed, replies.prefill(false), Lifetime::TARGET)).collect()
+}
+
+/// Complete #1329 K6 max push bound was 9,606,907,904 B across both
+/// ranks; the split is unknown. Reserve 10 GiB independently on each rank
+/// until the shared push log supplies exact per-rank dense bounds.
+pub const PUSH_DENSE_BYTES_PER_RANK: u64 = 10 << 30;
+
+pub fn push_host_envelope(cfg: &crate::families::kimi_k3::config::KimiK3Config, gpus: usize)
+    -> Result<crate::push_load::PushHostEnvelope, Refusal> {
+    // EXL3 validation has one four-byte MCG scalar per expert projection.
+    // Any selected local prefix is bounded by the complete routed inventory.
+    let validation = (cfg.dense.iter().filter(|dense| !**dense).count() as u64)
+        .checked_mul(cfg.experts as u64).and_then(|bytes| bytes.checked_mul(3 * 4))
+        .ok_or(Refusal::Overflow("Kimi push EXL3 validation"))?;
+    crate::push_load::PushHostEnvelope::new(vec![validation; gpus],
+        vec![PUSH_DENSE_BYTES_PER_RANK; gpus], 128, 1 << 20)
+}
+
+pub fn push_host_owners(envelope: &crate::push_load::PushHostEnvelope, maximum: u64)
+    -> Result<Vec<Component>, Refusal> {
+    Ok(envelope.allocations("kimi.push")?.into_iter().map(|owner| {
+        if owner.id.ends_with(".dense") {
+            Component { activation: Activation::always(), bytes: ByteCurve::fixed(owner.bytes, maximum),
+                kind: ComponentKind::Allowance(Allowance { location: owner.location, bytes: owner.bytes,
+                    lifetime: owner.lifetime, assumed: true,
+                    source: format!("{} estimated: #1329 K6 max smoke 2026-11-06 complete push 9,606,907,904 B; per-rank split unknown", owner.id) }) }
+        } else {
+            Component::allocation(owner.clone(), ByteCurve::fixed(owner.bytes, maximum), false, maximum)
+        }
+    }).collect())
+}
+
 /// Native page quantum of the retained MLA records.
 pub const PAGE_ROWS: u64 = 64;
 
@@ -215,6 +261,7 @@ pub struct KimiRecipe {
     pub experts: Option<ExpertProfile>,
     pub arenas: Vec<Arena>,
     pub spark: Vec<SparkOwner>,
+    pub links: Vec<crate::placement::PreparedSparkLink>,
     pub draft: Option<Draft>,
     pub fixed: Vec<FixedOwner>,
     /// Additional physical owners (context, host retention and loaded code).
@@ -435,6 +482,13 @@ impl Recipe for KimiRecipe {
                 any_of: vec![] });
         }
         contract.components.extend(self.owners.clone());
+        // Intake GPU planes are already fixed owners. Only the transport's
+        // future host/pinned storage joins the shared physical RAM budget here.
+        for link in &self.links {
+            contract.components.extend(link.components(self.maximum_pages)?.into_iter().filter(|component|
+                matches!(&component.kind, ComponentKind::Allowance(owner)
+                    if matches!(owner.location, Location::HOST | Location::PINNED))));
+        }
         contract.variables.push(Variable::Prefill(vec![self.prefill]));
         contract.variables.push(Variable::Lanes(vec![self.lanes]));
         let onboard = self.experts.as_ref().map(|profile| -> Result<(usize, &ExpertProfile), Refusal> {
@@ -592,7 +646,8 @@ impl Recipe for KimiRecipe {
             }
         }
         for spark in &self.spark {
-            let choice = option(spark.count)?;
+            let activation = if self.experts.is_none() && spark.count == 0 { Activation::always() }
+                else { let choice = option(spark.count)?; Activation::choice(choice.variable, choice.option) };
             for (owner_kind, group, bytes) in [
                 ("experts", "routed experts (balanced H128, replicated 3584 rotations)", spark.experts),
                 ("overhead", "Spark rank I/O and estimated runtime residual", spark.overhead),
@@ -603,7 +658,7 @@ impl Recipe for KimiRecipe {
                     bytes, Lifetime::RESIDENT, Category::Experts, group);
                 let mut component = Component::allocation(owner,
                     ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages);
-                component.activation = Activation::choice(choice.variable, choice.option);
+                component.activation = activation.clone();
                 contract.components.push(component);
             }
         }
@@ -678,6 +733,18 @@ pub fn host_budget(total: u64, available: u64) -> Budget {
         baseline: Baseline::Forecast { occupied: total.saturating_sub(available),
             source: "host MemAvailable before retained owners".into(), assumed: true },
         headroom: (8 << 30).max(total / 10) }
+}
+
+/// Estimated retained upload storage: #1329 K6 max smoke observed 39,656,288 B
+/// in staging/sync-h2d after loading. This is independent of the link receipts.
+pub const HOST_UPLOAD_BYTES: u64 = 64 << 20;
+
+pub fn host_upload_owner(maximum: u64) -> Component {
+    Component { activation: Activation::always(), bytes: ByteCurve::fixed(HOST_UPLOAD_BYTES, maximum),
+        kind: ComponentKind::Allowance(Allowance { location: Location::PINNED,
+            bytes: HOST_UPLOAD_BYTES, lifetime: Lifetime::RESIDENT,
+            source: "Kimi reusable H2D staging (estimated): #1329 K6 max smoke 2026-11-06 measured 39,656,288 B".into(),
+            assumed: true }) }
 }
 
 pub fn host_scoring_bytes(decode_rows: usize, prefill_rows: usize, vocab: usize) -> Result<u64, Refusal> {
@@ -758,11 +825,75 @@ mod tests {
                 Arena { count: 1, peak: vec![1000], resident: vec![1000], weights: vec![900] },
             ],
             spark: vec![],
+            links: vec![],
             draft: None,
             owners: vec![],
             fixed: vec![FixedOwner { rank: 0, category: Category::Prefix, group: "Kimi exact KDA marks".into(),
                 bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT }],
         }
+    }
+
+    #[test]
+    fn push_host_load_peak_is_admitted_without_reducing_ready_retention() {
+        let cfg = crate::families::kimi_k3::config::KimiK3Config::from_hf(
+            &crate::plan::testing::kimi_k3_config()).unwrap();
+        let envelope = push_host_envelope(&cfg, 1).unwrap();
+        assert_eq!(envelope.dense_bytes, vec![10 << 30]);
+        assert_eq!(envelope.expert_bytes[0], cfg.dense.iter().filter(|dense| !**dense).count() as u64
+            * cfg.experts as u64 * 12);
+        let mut recipe = recipe();
+        let owners = push_host_owners(&envelope, recipe.maximum_pages).unwrap();
+        assert!(owners.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allowance(owner) if owner.assumed && owner.lifetime.last == Phase::Load)));
+        recipe.owners.extend(owners);
+        recipe.owners.push(host_prefix_owner(1024, recipe.maximum_pages));
+        let mut budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[]).unwrap();
+        let mut host = host_budget(32 << 30, 32 << 30);
+        host.headroom = 0;
+        host.logical_bytes = envelope.bytes().unwrap() + 1024;
+        budgets.push(host);
+        let admitted = recipe.admit(single(), budgets.clone()).unwrap();
+        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(0));
+        assert_eq!(admitted.solved.remaining("host", Phase::Ready), Some(envelope.bytes().unwrap()));
+        budgets.last_mut().unwrap().logical_bytes -= 1;
+        let refusal = recipe.admit(single(), budgets).unwrap_err();
+        let limiting = match &refusal {
+            Refusal::FullContextShortfall { limiting, .. } => limiting.as_ref(),
+            other => other,
+        };
+        assert!(matches!(limiting, Refusal::Capacity { phase: Phase::Load, .. }), "{refusal:?}");
+        let mut actual = envelope.clone();
+        actual.dense_bytes[0] += 1;
+        assert!(matches!(envelope.validate_usage(&actual), Err(Refusal::Capacity { .. })));
+    }
+
+    #[test]
+    fn transport_host_receipts_share_capacity_without_duplicate_device_intake() {
+        let mut recipe = recipe();
+        let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        let links = production_links(0, 6, 1, PrefillShape { rows: 2752, waves: 3 },
+            rings, SparkReplyFormats::default()).unwrap();
+        let host_bytes = links[0].envelope().iter().filter(|(location, _)|
+            matches!(**location, Location::HOST | Location::PINNED)).map(|(_, bytes)| *bytes).sum::<u64>();
+        assert!(host_bytes >= 1_466_499_072, "host envelope: {host_bytes}");
+        let before = recipe.prepare(&single()).unwrap();
+        recipe.links = links;
+        let contract = recipe.prepare(&single()).unwrap();
+        let device_allowances = |contract: &Contract| contract.components.iter().filter(|component|
+            matches!(&component.kind, ComponentKind::Allowance(owner)
+                if owner.location == Location::coordinator(0))).count();
+        assert_eq!(device_allowances(&contract), device_allowances(&before));
+        let mut budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[]).unwrap();
+        let mut host = host_budget(4 << 30, 4 << 30);
+        host.headroom = 0;
+        host.logical_bytes = host_bytes;
+        budgets.push(host);
+        let admitted = recipe.admit(single(), budgets.clone()).unwrap();
+        assert_eq!(admitted.solved.remaining("host", Phase::Ready), Some(0));
+        budgets.last_mut().unwrap().logical_bytes -= 1;
+        assert!(recipe.admit(single(), budgets).is_err());
+        assert!(production_links(0, 0, 1, recipe.prefill, rings, SparkReplyFormats::default()).unwrap().is_empty());
     }
 
     #[test]
