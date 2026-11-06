@@ -688,7 +688,13 @@ mod tests {
                 crate::plan::files::ReadRole::Spark { rank: 0, world: 6 }] {
                 let selected = crate::plan::files::required_tensors(&inventory, role)?;
                 let opened = crate::plan::files::open_role_view(&view, role)?;
+                assert_eq!(crate::plan::files::required_tensors(&opened, role)?, selected,
+                    "role-filtered checkpoint must remain classifiable for Spark admission");
                 assert!(!selected.is_empty());
+                if matches!(role, crate::plan::files::ReadRole::Spark { .. }) {
+                    assert_eq!(crate::plan::experts::checkpoint_spark_recipe(&opened, 6, &[1])?,
+                        crate::plan::experts::checkpoint_spark_recipe(&checkpoint, 6, &[1])?);
+                }
                 for (name, _, _) in &restored {
                     assert!(inventory.has_header(name));
                     assert_eq!(selected.contains(name), matches!(role,
