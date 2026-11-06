@@ -144,13 +144,52 @@ pub fn projection_key(layout: &CoreWeightLayout) -> ProjectionKey {
             crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" })
 }
 
-/// Every K6 program one coordinator rank binds, and the lane-private scratch
-/// they share (projections run serially on a lane; one scratch set per lane).
+/// One concrete native owner, including the caller's reduction output contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRequest {
+    pub layout: NativeLayout,
+    pub output: ProjectionOutput,
+}
+
+impl NativeRequest {
+    pub fn new(layout: NativeLayout) -> Self {
+        let output = if layout.ranks > 1 && layout.split == CoreSplit::Input {
+            ProjectionOutput::F32
+        } else { ProjectionOutput::Bf16 };
+        Self { layout, output }
+    }
+}
+
+/// Every projection one coordinator rank binds. Native owners retain their own
+/// row ceiling, independent of whether this rank has K6 scratch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankProjections {
     pub programs: BTreeMap<(ProjectionKey, ProjectionOutput), usize>,
     pub scratch: Option<crate::formats::trellis_core::ProjectionScratchLayout>,
-    pub native: Vec<NativeLayout>,
+    pub native: Vec<NativeRequest>,
+    pub native_rows: usize,
+}
+
+impl RankProjections {
+    /// Check actual owners against admission without resolving programs again.
+    pub fn validate_native_owners(&self, actual: &[NativeRequest], rows: usize)
+        -> Result<(), crate::placement::planner::Refusal> {
+        let invalid = |detail: &str| crate::placement::planner::Refusal::InvalidFact(
+            format!("Muse native owner contract: {detail}"));
+        if rows != self.native_rows { return Err(invalid("row ceiling differs from admission")); }
+        let by_stem = |owners: &[NativeRequest]| -> Result<BTreeMap<String, NativeRequest>> {
+            let mut map = BTreeMap::new();
+            for owner in owners {
+                ensure!(map.insert(owner.layout.stem.clone(), owner.clone()).is_none(),
+                    "duplicate Muse native owner {}", owner.layout.stem);
+            }
+            Ok(map)
+        };
+        let expected = by_stem(&self.native).map_err(|_| invalid("duplicate admitted owner"))?;
+        let actual = by_stem(actual).map_err(|_| invalid("duplicate actual owner"))?;
+        if expected != actual { return Err(invalid("shape, storage, output or ownership differs from admission")); }
+        Ok(())
+    }
 }
 
 /// Per rank: the K6 geometries of every layer plus the head on the head rank
@@ -158,13 +197,13 @@ pub struct RankProjections {
 /// the decode/verify width; wider prefill/drafter scoring uses head microbatches).
 pub fn projections(cfg: &MuseSparkConfig, core: &CoreInventory, ranks: usize, rows: usize)
     -> Result<Vec<RankProjections>> {
-    let mut out = vec![RankProjections { programs: BTreeMap::new(), scratch: None, native: Vec::new() }; ranks];
+    ensure!(rows > 0 && rows <= i32::MAX as usize, "Muse projection row ceiling outside signed launch domain");
+    let mut out = vec![RankProjections { programs: BTreeMap::new(), scratch: None,
+        native: Vec::new(), native_rows: rows }; ranks];
     for layer in 0..cfg.layers {
         for (rank, layout) in LayerLayout::ranks(cfg, layer, ranks, core)?.into_iter().enumerate() {
             for weight in layout.native.values() {
-                if !out[rank].native.iter().any(|existing| existing.shape == weight.shape && existing.fp8 == weight.fp8) {
-                    out[rank].native.push(weight.clone());
-                }
+                out[rank].native.push(NativeRequest::new(weight.clone()));
             }
             for weight in layout.core.values() {
                 // The package's K-split H128 egress is F32; narrow only after
@@ -222,6 +261,51 @@ mod tests {
         }
         let global = GlobalLayout::new(&cfg, &core).unwrap();
         assert_eq!(global.head.as_ref().unwrap().shape, [202112, 8192]);
+    }
+
+    #[test]
+    fn native_owner_contract_keeps_rows_outputs_and_every_layer() -> Result<()> {
+        let cfg = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config())?;
+        let mut core = CoreInventory::default();
+        for layer in 0..cfg.layers {
+            for (leaf, split) in [("q_proj", CoreSplit::Output), ("o_proj", CoreSplit::Input)] {
+                core.native.insert(format!("{PREFIX}{layer}.self_attn.{leaf}"),
+                    super::super::core::NativeProjection { shape: [8192, 8192], fp8: true, split });
+            }
+        }
+        for ranks in [1, 2] {
+            for rank in projections(&cfg, &core, ranks, 2752)? {
+                assert!(rank.scratch.is_none(), "native capacity must not depend on K6 scratch");
+                assert_eq!(rank.native_rows, 2752);
+                assert_eq!(rank.native.len(), cfg.layers * 2, "same-shaped owners must not disappear");
+                assert!(rank.native.iter().all(|request| request.output ==
+                    if ranks == 2 && request.layout.split == CoreSplit::Input {
+                        ProjectionOutput::F32
+                    } else { ProjectionOutput::Bf16 }));
+                let mut actual = rank.native.clone();
+                actual.reverse();
+                rank.validate_native_owners(&actual, 2752)?;
+                assert!(rank.validate_native_owners(&actual, 64).is_err());
+                for field in 0..7 {
+                    let mut wrong = actual.clone();
+                    match field {
+                        0 => wrong[0].layout.shape[1] /= 2,
+                        1 => wrong[0].layout.fp8 = false,
+                        2 => wrong[0].output = if wrong[0].output == ProjectionOutput::Bf16 {
+                            ProjectionOutput::F32
+                        } else { ProjectionOutput::Bf16 },
+                        3 => wrong[0].layout.rank += 1,
+                        4 => wrong[0].layout.ranks += 1,
+                        5 => { wrong.pop(); },
+                        _ => wrong.push(wrong[0].clone()),
+                    }
+                    assert!(matches!(rank.validate_native_owners(&wrong, 2752),
+                        Err(crate::placement::planner::Refusal::InvalidFact(_))), "field {field}");
+                }
+            }
+        }
+        assert!(projections(&cfg, &core, 2, 0).is_err());
+        Ok(())
     }
 
     #[test]

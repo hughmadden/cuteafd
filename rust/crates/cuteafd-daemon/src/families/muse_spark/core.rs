@@ -75,10 +75,11 @@ impl<'a> CorePrograms<'a> {
                 [&policy.native_input, &policy.native, &policy.output_program].into_iter()
                     .map(|name| (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))
             }), usize::MAX)?;
-        ensure!(admitted.native.iter().all(|weight| !weight.fp8 && weight.ranks == 1),
+        ensure!(admitted.native.iter().all(|request| !request.layout.fp8 && request.layout.ranks == 1),
             "Muse native TP2/Fp8 projection export pending");
-        let shapes = admitted.native.iter().map(|weight| (weight.shape[1], weight.shape[0])).collect::<Vec<_>>();
-        let rows = admitted.scratch.as_ref().map_or(1, |scratch| scratch.rows);
+        let shapes = admitted.native.iter().map(|request| (request.layout.shape[1], request.layout.shape[0]))
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        let rows = admitted.native_rows;
         let bf16 = device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs, &shapes, rows)?))?;
         Ok(Self { projections, scratch, exact_cap, bf16 })
     }
