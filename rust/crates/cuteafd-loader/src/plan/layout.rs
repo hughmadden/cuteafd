@@ -101,9 +101,6 @@ pub struct LayoutOptions {
     pub pool_tokens: Option<u64>,
     /// Upper bound for an automatically sized pool.
     pub target_pool_tokens: u64,
-    /// An automatic pool under a fixed onboard stops at its target instead of
-    /// growing to all free memory (it still shrinks to fit, down to its floor).
-    pub pool_ceiling_at_target: bool,
     /// Explicit checkpoint-resident drafter weights; no inferred runtime storage.
     pub drafter_bytes: u64,
     pub dense_qwen_drafter_snapshot: Option<std::path::PathBuf>,
@@ -165,6 +162,8 @@ pub struct LayoutOptions {
     pub physical_sms: Option<u32>,
     /// MiMo bundled drafter representation; launch cards select single-copy FP8.
     pub mimo_draft_bf16: bool,
+    /// Only DFlash2 owns the bundled external drafter; off/native MTP do not.
+    pub mimo_drafter_disabled: bool,
     /// Native local expert package manifest, required to qualify its scratch.
     pub mimo_expert_manifest: Option<std::path::PathBuf>,
     /// Compiled context extent (RoPE and index workspaces).
@@ -272,7 +271,6 @@ impl Default for LayoutOptions {
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
-            pool_ceiling_at_target: false,
             drafter_bytes: 0,
             dense_qwen_drafter_snapshot: None,
             dense_qwen_mtp: false,
@@ -307,6 +305,7 @@ impl Default for LayoutOptions {
             mimo_decode_graphs: false,
             physical_sms: None,
             mimo_draft_bf16: false,
+            mimo_drafter_disabled: false,
             mimo_expert_manifest: None,
             context_tokens: 0,
             native_mtp_layers: 3,
@@ -1531,8 +1530,8 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
             mark_bytes = mark_bytes.checked_add(windows).context("Kimi draft mark overflow")?;
         }
     }
-    if id == "mimo_v2" && options.mimo_prefix_draft {
-        let dir = checkpoint.snapshot.join("dflash");
+    if let Some(dir) = (id == "mimo_v2" && options.mimo_prefix_draft)
+        .then(|| mimo::mimo_dflash_dir(checkpoint, options)).flatten() {
         let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
             let cfg = crate::families::mimo_v2::draft_config::DflashConfig::read(&dir)?;
             crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_heads as u64, cfg.head_dim as u64, options.draft_kv_cache)?
@@ -1570,6 +1569,22 @@ pub(crate) fn engram_row_bytes(checkpoint: &super::Checkpoint) -> anyhow::Result
     anyhow::ensure!(bytes > 0, "V4.1 checkpoint has no engram table headers");
     layer.context("V4.1 checkpoint has no engram layer")?;
     Ok(bytes)
+}
+
+/// Host capacity for a whole-process recipe: the caller's sample, or one read
+/// before this process claims memory. Inventory-only plans synthesize their
+/// options, so tests take the same 128 GiB convention every planner fixture
+/// injects instead of live memory, keeping repeated plans identical.
+pub(crate) fn recipe_host_memory(options: &LayoutOptions) -> anyhow::Result<(u64, u64)> {
+    match options.host_memory {
+        Some(memory) => Ok(memory),
+        None => {
+            #[cfg(test)]
+            { Ok((128 << 30, 128 << 30)) }
+            #[cfg(not(test))]
+            { crate::formats::mapped_preload::host_memory_before_process() }
+        }
+    }
 }
 
 pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, input: &super::PlanInput, native: bool) -> anyhow::Result<()> {
@@ -1620,23 +1635,6 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
         items.push(Item::new(category, group, format, bytes, basis)
             .with_lifetime(ItemLifetime::PostReadyReserve));
     };
-    if family == "mimo_v2" {
-        let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
-        let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
-        let local_ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
-        let demands = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
-            usize::try_from(unit_rows)?, usize::try_from(options.prefill_waves)?, local_ranks,
-            pool, usize::try_from(options.context_tokens.max(1))?, ranks, options.mimo_expert_input,
-            crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
-            if options.full_prefill_logits { crate::families::mimo_v2::MimoPrefillOutput::AllRows }
-                else { crate::families::mimo_v2::MimoPrefillOutput::LastRow }, true,
-            usize::try_from(unit_rows.min(256))?, report.solver_placement.as_ref()
-                .and_then(|p| p.tp2).map_or(0, |tp2| tp2.layers))?;
-        for (name, bytes) in demands {
-            let category = if name.starts_with("mimo/transport/") { Category::Transport } else { Category::Staging };
-            push(category, &name, "pinned", bytes, Basis::Formula);
-        }
-    } else {
         if ranks > 0 && family == "muse_spark" {
             // Muse's sealed endpoint (partial-reply frames, waves + 1 deep) and its
             // own wire width: the transport the link registers (`host_transport`).
@@ -1723,7 +1721,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, inpu
                 if family == "qwen4" { Basis::Formula } else { Basis::Estimated });
         }
 
-    }
+
 
     if family == "deepseek_v41" {
         let shape = crate::EngramStagingShape::new(usize::try_from(unit_rows)?,

@@ -18,6 +18,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         ShapePolicy { context: ContextPolicy::Checkpoint, ..ShapePolicy::manifest_bounded() });
     let (concurrency, context, manifest) = (shape.concurrency, shape.context_tokens,
         shape.manifest.as_deref());
+    options.native_mtp_layers = shape.native_layers;
     let checkpoint = input.checkpoint();
     let ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let mut notes = vec![format!("resolved context {context} tokens"), "MiMo attention placement heads".into()];
@@ -34,7 +35,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let cfg = MimoV2Config::from_hf(&checkpoint.config).ok();
         let base = cfg.as_ref().and_then(|cfg| cfg.program_family().ok()).unwrap_or("mimo");
         let families = std::iter::once(base.to_string()).chain((ranks == 2).then(|| format!("{base}2"))).collect::<Vec<_>>();
-        let runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, total);
+        let mut runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, total);
+        if ranks == 1 && base == "mimof" {
+            runtime.bytes = crate::placement::families::mimo_v2::admission::FLASH_MIN_BASELINE_BYTES;
+            runtime.basis = Basis::Calibrated;
+        }
         DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, worker_budget_bytes: 0,
             items: vec![runtime], kv_tokens: 0 }
     }).collect::<Vec<_>>();
@@ -51,14 +56,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             == crate::placement::OnboardSetting::Auto {
             media_options.onboard = Some(crate::placement::OnboardSetting::Layers(0));
         }
-        // Fixed zero onboarding must not grow an automatic pool to all free
-        // memory: cap it at the target, but let it shrink to fit like the main
-        // solve. An explicit POOL_TOKENS stays strict.
-        media_options.pool_ceiling_at_target = true;
         let mut admission = devices.clone();
         let no_media = vec![crate::placement::ResidentWeights::default(); ranks];
-        match apply_resolved(input, &mut media_options, &mut admission, &no_media, spark_ranks, concurrency, context, manifest) {
-            Ok((placement, working)) => {
+        match apply_resolved(input, &mut media_options, &mut admission, &no_media, 0, spark_ranks, concurrency, context, manifest) {
+            Ok((placement, working, ..)) => {
                 if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
                     report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
                 }
@@ -103,10 +104,19 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let media_admission = media_weights.into_iter().try_for_each(|owner|
         crate::placement::families::mimo_v2::add_local_media_weights(&mut loaded_media,
             &media_devices, Some(owner), crate::placement::ResidentWeights(options.weight_budget_bytes)));
+    // The embedding cache serve carves beside an admitted encoder (`with_media_headroom`).
+    let media_cache = if [report.encoder.as_ref(), report.audio_encoder.as_ref()].into_iter().flatten()
+        .any(|encoder| encoder.kind != super::super::encoder::EncoderKind::Off) {
+        let total = super::recipe_host_memory(options).map_or(0, |host| host.0);
+        options.media_cache_bytes.unwrap_or((8u64 << 30).min(total / 20))
+    } else { 0 };
     let selected = media_admission.map_err(anyhow::Error::from).and_then(|()|
-        apply_resolved(input, options, &mut devices, &loaded_media, spark_ranks, concurrency, context, manifest));
+        apply_resolved(input, options, &mut devices, &loaded_media, media_cache, spark_ranks, concurrency, context, manifest));
     match selected {
-        Ok((placement, working)) => {
+        Ok((placement, working, ledger, host)) => {
+            report.phase_ledger = Some(ledger);
+            report.host_budget_bytes = host.host_budget_bytes;
+            report.host_ledger = Some(host);
             report.prefill_span_rows = Some(external_span);
             report.prefill_transports = Some(u64::from(spark_ranks > 0));
             report.prefill_unit_rows = options.prefill_unit_rows;
@@ -130,7 +140,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 "Supply matching generated BF16-input expert and workspace manifests, or select a fitting Spark layout/pool.");
         }
     }
-    if options.mimo_prefix_draft && checkpoint.snapshot.join("dflash/config.json").is_file() {
+    if options.mimo_prefix_draft && mimo_dflash_dir(checkpoint, options).is_some_and(|dir| dir.join("config.json").is_file()) {
         let slots = draft_representation::mimo_draft_context_slots(options.mimo_draft_sequences().max(concurrency),
             options.mimo_rings(), options.draft_context_slots);
         notes.push(format!("MiMo DFlash context slots {slots}"));
@@ -229,6 +239,13 @@ fn spark_experts(input: &super::super::PlanInput, _options: &LayoutOptions,
     Ok(())
 }
 
+/// The bundled DFlash drafter directory, only when this launch serves it.
+pub(super) fn mimo_dflash_dir(checkpoint: &super::super::Checkpoint, options: &LayoutOptions)
+    -> Option<std::path::PathBuf> {
+    let dir = checkpoint.snapshot.join("dflash");
+    (!options.mimo_drafter_disabled && dir.is_dir()).then_some(dir)
+}
+
 fn use_host_embedding(checkpoint: &super::super::Checkpoint, options: &LayoutOptions) -> bool {
     (options.host_embedding || (!options.force_gpu_embedding && options.rtx_bytes[0] <= 32 * GIB))
         && checkpoint.require_untied_embedding("model.embed_tokens.weight").is_ok()
@@ -238,22 +255,23 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     ranks: usize, spark_ranks: usize, rows: u64, concurrency: u64, context: u64,
     manifest: Option<&serde_json::Value>) -> Result<MimoCapacityProfiles> {
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
+    let mtp = selected_mtp(checkpoint, options);
     let qualified = default_policy(checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
     let source = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
         .map(|t| if t.meta.dtype == cuteafd_core::DType::Bf16 && !qualified { R::Bf16 } else { R::Fp8 });
-    let output_formats: std::collections::BTreeMap<_, _> = (0..cfg.layers).filter_map(|layer| {
-        let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
-        source(&name).map(|r| (name, r))
-    }).collect();
+    let output_formats: std::collections::BTreeMap<_, _> = checkpoint.tensors.iter()
+        .filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight"))
+        .filter_map(|tensor| source(&tensor.meta.name).map(|format| (tensor.meta.name.clone(), format)))
+        .collect();
     let fp8_output = output_formats.values().any(|&r| r == R::Fp8);
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
     let rings = options.mimo_rings();
-    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
-    let dir = checkpoint.snapshot.join("dflash");
-    let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
+    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, selected_mtp(checkpoint, options))?;
+    let dir = mimo_dflash_dir(checkpoint, options).unwrap_or_default();
+    let draft = if mimo_dflash_dir(checkpoint, options).is_some() && dir.join("dflash_draft_model.safetensors").is_file() {
         Some(draft_config::DflashConfig::read(&dir)?)
     } else { None };
-    let draft_mark = if options.mimo_prefix_draft {
+    let draft_mark = if options.mimo_prefix_draft && mimo_dflash_dir(checkpoint, options).is_some() {
         if let Some(draft) = &draft { draft_representation::mimo_draft_mark_bytes(draft.layers as u64, draft.kv_heads as u64, draft.head_dim as u64, options.draft_kv_cache)? }
         else if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
@@ -289,7 +307,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
             additional.extend(draft_prefix_reservations(options.mimo_prefix_draft, draft_mark, marks, rings)?);
         }
         let workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
-            lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0,
+            lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp,
             if options.full_prefill_logits { MimoPrefillOutput::AllRows } else { MimoPrefillOutput::LastRow },
             fp8_output, |name| {
                 let Some(manifest) = manifest else { return Ok(0); };
@@ -309,12 +327,65 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     let host_embedding = use_host_embedding(checkpoint, options);
     Ok(mimo_capacity_profiles(checkpoint, &cfg, MimoResidentOptions {
         layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: checkpoint_tp(&checkpoint.snapshot)?,
-        native_mtp_layers: 0, gpu_embedding: !host_embedding, head_format: source("lm_head.weight").unwrap_or(R::Bf16), output_formats,
+        native_mtp_layers: mtp, gpu_embedding: !host_embedding, head_format: source("lm_head.weight").unwrap_or(R::Bf16), output_formats,
     }, &MimoCapacityOptions { checkpoint_max_context_tokens:
         crate::serving_capacity::checkpoint_context_limit(&checkpoint.config)?
             .context("MiMo checkpoint lacks max_position_embeddings")?,
         max_context_tokens: context, rings, mark_slots: marks, kv_cache: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv },
         ranks: runtime, host_prefix_bytes: 0 })?)
+}
+
+fn selected_mtp(checkpoint: &super::super::Checkpoint, options: &LayoutOptions) -> usize {
+    let available = checkpoint.tensors.iter().filter_map(|tensor|
+        tensor.meta.name.strip_prefix("model.mtp.layers.")?.split('.').next()?.parse::<usize>().ok())
+        .max().map_or(0, |stage| stage + 1);
+    options.native_mtp_layers.min(available)
+}
+
+fn offline_draft_packing(checkpoint: &super::super::Checkpoint, options: &LayoutOptions)
+    -> Result<Vec<cuteafd_core::serving_capacity::MemoryReservation>> {
+    let Some(dir) = mimo_dflash_dir(checkpoint, options)
+        .filter(|dir| dir.join("dflash_draft_model.safetensors").is_file()) else { return Ok(vec![]); };
+    let draft = draft_config::DflashConfig::read(&dir)?;
+    let sequences = options.mimo_draft_sequences().max(options.resolved_concurrency("mimo_v2"));
+    let slots = draft_representation::mimo_draft_context_slots(sequences, options.mimo_rings(), options.draft_context_slots);
+    let mut capacity = draft_representation::MimoDraftCapacity::new(slots as usize, sequences as usize, draft.block)?;
+    capacity.kv_cache = options.draft_kv_cache;
+    Ok(draft_reservations_with(&draft, &crate::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?,
+        if options.mimo_draft_bf16 { draft_representation::MimoDraftRepresentation::Bf16Only }
+            else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity,
+        |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
+            crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?.packing)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn offline_host(checkpoint: &super::super::Checkpoint, options: &LayoutOptions, cfg: &MimoV2Config,
+    ranks: usize, rows: u64, concurrency: u64, context: u64, media_cache: u64)
+    -> Result<crate::placement::families::mimo_v2::admission::HostOwners> {
+    let cache = crate::serving_capacity::mimo_cache_geometry(cfg, cfg.layers, ranks,
+        MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, selected_mtp(checkpoint, options))?;
+    let mut mark_bytes = cache.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>();
+    if let Some(dir) = mimo_dflash_dir(checkpoint, options).filter(|_| options.mimo_prefix_draft) {
+        if dir.join("config.json").is_file() {
+            let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+            mark_bytes += super::mimo_draft_prefix_bytes(&config, 1, options.mimo_rings(), options.draft_kv_cache)
+                .map_err(anyhow::Error::msg)?.0;
+        }
+    }
+    let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: cache.logical_unit_rows,
+        page_bytes: cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum(), mark_bytes, draft_bytes: 0 };
+    let host = super::recipe_host_memory(options)?;
+    let prefix_bytes = if options.prefix_entries("mimo_v2") == 0 || options.host_cache_bytes == Some(0) { 0 }
+        else { geometry.resolve(options.host_cache_bytes, context, concurrency, host.0, geometry.chunk_bytes())
+            .context("invalid MiMo host prefix geometry or quota")? };
+    Ok(crate::placement::families::mimo_v2::admission::HostOwners {
+        expert_input: options.mimo_expert_input,
+        output: if options.full_prefill_logits { MimoPrefillOutput::AllRows } else { MimoPrefillOutput::LastRow },
+        serving: true, scoring_rows: if options.full_prefill_logits { options.prefill_span_rows.unwrap_or(rows) as usize } else { 64 },
+        diagnostic_rows: rows.min(256) as usize, prefix_bytes, media_bytes: 0,
+        // Serve adds the media quota to the base headroom (`with_media_headroom`).
+        headroom: (8u64 << 30).max(host.0 / 10).checked_add(media_cache).context("MiMo media headroom overflow")?,
+    })
 }
 
 fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
@@ -390,11 +461,12 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
 #[allow(clippy::too_many_arguments)]
 fn apply_resolved(input: &super::super::PlanInput, options: &mut LayoutOptions,
     devices: &mut Vec<DeviceLayout>, media_weights: &[crate::placement::ResidentWeights],
-    spark_ranks: usize, concurrency: u64,
+    media_cache: u64, spark_ranks: usize, concurrency: u64,
     context: u64, manifest: Option<&serde_json::Value>)
-    -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet)> {
+    -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet,
+        crate::plan::SolvedPhaseLedger, cuteafd_core::memory_layout::HostLayout)> {
     let rows = options.prefill_unit_rows.context("MiMo prefill shape must be resolved before admission")?;
-    apply_selected(input, options, devices, media_weights, spark_ranks, rows, concurrency, context, manifest)
+    apply_selected(input, options, devices, media_weights, media_cache, spark_ranks, rows, concurrency, context, manifest)
 }
 
 #[cfg(test)]
@@ -402,17 +474,21 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
     devices: &mut [DeviceLayout], spark_ranks: usize, rows: u64, concurrency: u64,
     context: u64, manifest: Option<&serde_json::Value>) -> Result<crate::placement::Placement> {
     let media = vec![crate::placement::ResidentWeights::default(); devices.len()];
-    apply_selected(input, options, devices, &media, spark_ranks, rows, concurrency, context, manifest).map(|(placement, _)| placement)
+    apply_selected(input, options, devices, &media, 0, spark_ranks, rows, concurrency, context, manifest).map(|(placement, ..)| placement)
 }
 
 /// [`apply`], also returning the working set the solve selected (the Spark
 /// layers, ranks and prefill lanes whose I/O the workers allocate).
 #[allow(clippy::too_many_arguments)]
 fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
-    devices: &mut [DeviceLayout], media_weights: &[crate::placement::ResidentWeights],
+    devices: &mut [DeviceLayout], media_weights: &[crate::placement::ResidentWeights], media_cache: u64,
     spark_ranks: usize, rows: u64, concurrency: u64,
     context: u64, manifest: Option<&serde_json::Value>)
-    -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet)> {
+    -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet,
+        crate::plan::SolvedPhaseLedger, cuteafd_core::memory_layout::HostLayout)> {
+    use crate::placement::families::mimo_v2::admission::{self, ProductionInput};
+    use crate::placement::planner::{Baseline, EmbeddingHome, Operation, PrefillShape};
+    use crate::placement::ResidentWeights;
     let checkpoint = input.checkpoint();
     let profiles = profile(checkpoint, options, devices.len(), spark_ranks, rows, concurrency, context, manifest)?;
     let no_spark = if spark_ranks == 0 { profiles.clone() }
@@ -429,27 +505,43 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         .map(|(&target, &media)| target.checked_add(media)).collect::<Result<Vec<_>, _>>()?;
     let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
-    let inputs = crate::placement::families::mimo_v2::MimoInputs {
-        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), automatic_context: options.context_tokens == 0,
-        cfg: &cfg, resident_weights, profile: &profiles.steady, layers: cfg.layers,
-        kv: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp_stages: 0,
-        gpus: devices.iter().enumerate().map(|(rank, device)| (options.rtx_bytes[rank],
-            crate::placement::Baseline::Planned { context_bytes: 0,
-                loaded_bytes: device.used_bytes() })).collect(),
-        headroom_floor: options.headroom_bytes, spark_ranks, startup_probe_bytes: probe,
-        context, requested_pool: options.pool_tokens,
-        pool_ceiling_at_target: options.pool_ceiling_at_target, onboard,
-        experts, expert_workspace, tp2_workspace, rows, lanes: lanes as u64,
-    };
-    let solution = match crate::placement::families::mimo_v2::solve_working_set(&inputs, &no_spark.steady) {
-        Ok(solution) => solution,
+    let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv };
+    let maximum_pool_tokens = admission::maximum_pool_tokens(&options.rtx_bytes[..ranks], context,
+        options.pool_tokens, profiles.steady.pool_unit_rows, spark_ranks == 0);
+    let prefill = PrefillShape { rows, waves: lanes as u64 };
+    let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
+    let embedding = if use_host_embedding(checkpoint, options) { EmbeddingHome::HostPinned }
+        else { EmbeddingHome::Device(0) };
+    let budgets = admission::production_budgets(
+        &options.rtx_bytes[..ranks].iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
+        &(0..ranks).map(|rank| admission::device_headroom(options.rtx_bytes[rank], rank,
+            probe, options.headroom_bytes)).collect::<Vec<_>>(),
+        devices.iter().map(|device| Baseline::Forecast { occupied: device.used_bytes(),
+            source: "retained checkpoint and media owners before the shared MiMo contract".into(),
+            assumed: false }).collect(),
+        super::recipe_host_memory(options)?,
+        options.spark_bytes, spark_ranks)?;
+    let request = admission::production_request(context, options.pool_tokens, onboard, prefill,
+        operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
+    let prepared = ProductionInput {
+        cfg: &cfg, layers: cfg.layers, kv, mtp_stages: selected_mtp(checkpoint, options), context, maximum_pool_tokens,
+        prefill, lanes: lanes as u64, embedding, gpus: ranks, spark_ranks,
+        experts, expert_workspace, tp2_workspace,
+        spark: profiles.clone(), no_spark: no_spark.clone(),
+        post_kv_additional: vec![vec![]; ranks], draft_packing: offline_draft_packing(checkpoint, options)?,
+        host: offline_host(checkpoint, options, &cfg, ranks, rows, concurrency, context, media_cache)?,
+        spark_reply_formats: options.spark_reply_formats,
+        resident_weights, operation, budgets,
+    }.prepare()?;
+    let admitted = match prepared.admit(request) {
+        Ok(admitted) => admitted,
         Err(error) => {
             // Failed plans still name the full fixed contract, not fictitious
             // free space left by returning before its storage was described.
-            for (rank, (device, costs)) in devices.iter_mut().zip(&profiles.steady.devices).enumerate() {
-                device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(headroom_bytes(
-                    options.rtx_bytes[rank], rank == 0 && probe > 0).max(options.headroom_bytes));
-                for cost in &costs.reservations {
+            for (rank, device) in devices.iter_mut().enumerate() {
+                device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(
+                    admission::device_headroom(options.rtx_bytes[rank], rank, probe, options.headroom_bytes));
+                for cost in &profiles.steady.devices[rank].reservations {
                     device.items.push(Item::new(reservation_category(&cost.name),
                         crate::placement::families::mimo_v2::reservation_group(&cost.name), "", cost.bytes, Basis::Formula));
                 }
@@ -457,30 +549,41 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
             return Err(error.into());
         }
     };
-    let selected = inputs.selected(&no_spark.steady, &solution.working_set);
-    let placement = solution.placement;
-    let working = solution.working_set;
-    for (rank, (device, costs)) in devices.iter_mut().zip(&selected.profile.devices).enumerate() {
-        device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(solution.request.inventory.gpus[rank].headroom_bytes);
-        for cost in &costs.reservations {
-            device.items.push(Item::new(reservation_category(&cost.name),
-                crate::placement::families::mimo_v2::reservation_group(&cost.name), "", cost.bytes, Basis::Formula));
-        }
-    }
-    let unit = selected.profile.pool_unit_rows;
-    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks,
-        MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
-    for ((device, rank), storage) in devices.iter_mut().zip(&selected.profile.devices).zip(&cache.ranks) {
-        let units = placement.pool_tokens / unit;
-        let kv_unit = storage.persistent_unit_bytes + storage.pool_metadata_unit_bytes;
-        device.items.push(Item::new(Category::Kv, "records", "", units * kv_unit, Basis::Formula));
-        device.items.push(Item::new(Category::Workspace, "pool page tables", "", units * (rank.pool_unit_bytes - kv_unit), Basis::Formula));
+
+    let ledger = crate::plan::SolvedPhaseLedger::from(&admitted.solved);
+    let host = host_view(&admitted.solved, options, media_cache)?;
+    let placement = admitted.placement;
+    let working = admitted.spark;
+    for (rank, device) in devices.iter_mut().enumerate() {
+        device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(
+            admission::device_headroom(options.rtx_bytes[rank], rank, probe, options.headroom_bytes));
+        device.items.extend(placement.items[rank].iter().cloned());
         device.kv_tokens = placement.pool_tokens;
     }
-    for (rank, device) in devices.iter_mut().enumerate() {
-        device.items.extend(crate::placement::families::mimo_v2::expert_items(&selected, &placement, rank)?);
+    Ok((placement, working, ledger, host))
+}
+
+/// The admitted host owners as the report's host ledger: a view of the one
+/// solve, never a second admission. Serve carves the media cache from headroom.
+fn host_view(solved: &crate::placement::planner::ResolvedPlan, options: &LayoutOptions, media_cache: u64)
+    -> Result<cuteafd_core::memory_layout::HostLayout> {
+    use crate::placement::planner::Location;
+    use cuteafd_core::memory_layout::ItemLifetime;
+    let mut items = solved.items(Location::PINNED).map_err(anyhow::Error::from)?.into_iter()
+        .filter(|item| item.category != Category::Prefix)
+        .map(|item| item.with_lifetime(ItemLifetime::PostReadyReserve)).collect::<Vec<_>>();
+    if media_cache > 0 {
+        items.push(Item::new(Category::Embedding, "media/embedding-cache", "host quota", media_cache, Basis::Formula)
+            .with_lifetime(ItemLifetime::PostReadyReserve));
     }
-    Ok((placement, working))
+    let prefix = solved.items(Location::PINNED).map_err(anyhow::Error::from)?.iter()
+        .filter(|item| item.category == Category::Prefix).map(|item| item.bytes).sum::<u64>();
+    let (total, available) = super::recipe_host_memory(options)?;
+    let budget = solved.budgets.iter().find(|budget| budget.locations.contains(&Location::PINNED))
+        .context("MiMo host budget")?;
+    let reserve = budget.headroom.saturating_sub(media_cache);
+    cuteafd_core::memory_layout::HostLayout::new(total, available, reserve, prefix, items)
+        .context("MiMo host ledger overflow")
 }
 
 use crate::placement::families::mimo_v2::reservation_category;
@@ -507,7 +610,7 @@ mod tests {
                     for (graphs, expert_input) in [false, true].into_iter().flat_map(|graphs|
                         [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode]
                             .map(|input| (graphs, input))) {
-                        let opts = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
+                        let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
                             pool_tokens: Some(32768), mimo_decode_graphs: graphs, mimo_swa_kv: swa,
                             mimo_expert_input: expert_input, ..Default::default() };
                         let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
@@ -552,7 +655,8 @@ mod tests {
                         }
                         for rank in 0..ranks {
                             let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
-                                + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes;
+                                + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes
+                                + crate::placement::families::mimo_v2::admission::FIRST_USE_RUNTIME_BYTES;
                             assert_eq!(devices[rank].used_bytes(), total, "mapped planner items equal admission total");
                             assert_eq!(planned.steady.devices[rank].reservations, admitted.steady.devices[rank].reservations,
                                 "pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
@@ -570,18 +674,18 @@ mod tests {
         write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
         let input = PlanInput::from_checkpoint(Checkpoint::open(dir.path()).unwrap());
         for rows in [1024, 2048, 2752] {
-            let mut options = LayoutOptions { rtx_bytes: vec![95 * GIB], pool_tokens: Some(32768),
-                prefill_rows: rows, prefill_unit_rows: Some(rows), prefill_waves: 3, prefill_lanes: 3,
+            let mut options = LayoutOptions { native_mtp_layers: 0, rtx_bytes: vec![95 * GIB], pool_tokens: Some(32768),
+                host_memory: Some((128 << 30, 128 << 30)), prefill_rows: rows, prefill_unit_rows: Some(rows), prefill_waves: 3, prefill_lanes: 3,
                 concurrency: 4, ..Default::default() };
             let initial = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
                 capacity_bytes: 95 * GIB, worker_budget_bytes: 0, items: vec![], kv_tokens: 0 }];
             let mut expected = initial.clone();
             let media = vec![crate::placement::ResidentWeights::default()];
-            let (placement, working) = apply_selected(&input, &options, &mut expected,
-                &media, 4, rows, 4, 32768, None).unwrap();
+            let (placement, working, ..) = apply_selected(&input, &options, &mut expected,
+                &media, 0, 4, rows, 4, 32768, None).unwrap();
             let mut actual = initial;
             let selected = apply_resolved(&input, &mut options, &mut actual,
-                &media, 4, 4, 32768, None).unwrap();
+                &media, 0, 4, 4, 32768, None).unwrap();
             assert_eq!(selected.0, placement);
             assert_eq!(selected.1, working);
             assert_eq!((options.prefill_unit_rows, options.prefill_waves), (Some(rows), 3));
@@ -601,7 +705,7 @@ mod tests {
         for (total, baseline) in [(101_973_491_712u64, 586_416_128u64),
             (101_970_345_984, 586_416_128), (34_144_990_003, 596_901_888)] {
             let baseline = baseline + 35_651_584;
-            let opts = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![total], headroom_bytes: 0, concurrency: 4, ..Default::default() };
+            let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![total], headroom_bytes: 0, concurrency: 4, ..Default::default() };
             let mut profile = profile(&checkpoint, &opts, 1, 2, 4096, 4, 1 << 20, None).unwrap();
             let cublas = crate::placement::inventory::ArchContext::for_device("sm_120", total).cublas_bytes;
             profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
@@ -621,184 +725,6 @@ mod tests {
         }
     }
 
-    fn shipped_mimo(pro: bool) -> (serde_json::Value, Vec<Tensor>) {
-        let mut config = if pro { mimo_pro_config() } else { mimo_flash_mopd_config() };
-        let layers = if pro { 70 } else { 48 };
-        let full: &[usize] = if pro { &[0, 7, 15, 23, 31, 39, 47, 55, 62, 69] }
-            else { &[0, 5, 11, 17, 23, 29, 35, 41, 47] };
-        config["num_hidden_layers"] = serde_json::json!(layers);
-        config["vocab_size"] = serde_json::json!(152576);
-        config["hybrid_layer_pattern"] = serde_json::json!((0..layers)
-            .map(|layer| usize::from(!full.contains(&layer))).collect::<Vec<_>>());
-        config["moe_layer_freq"] = serde_json::json!((0..layers)
-            .map(|layer| usize::from(layer > 0)).collect::<Vec<_>>());
-        let template = if pro { mimo_pro_tensors() } else { mimo_flash_mopd_tensors() };
-        let mut tensors = Vec::new();
-        for (name, dtype, shape) in template.iter().filter(|(name, ..)| !name.starts_with("model.layers.")) {
-            let mut shape = shape.clone();
-            if name == "lm_head.weight" || name == "model.embed_tokens.weight" { shape[0] = 152576; }
-            tensors.push((name.clone(), *dtype, shape));
-        }
-        for layer in 0..layers {
-            for (name, dtype, shape) in template.iter().filter(|(name, ..)| name.starts_with("model.layers.")) {
-                let source = name.split('.').nth(2).unwrap().parse::<usize>().unwrap();
-                let is_mlp = name.contains(".mlp.");
-                let selected = if is_mlp { usize::from(layer > 0) } else { usize::from(!full.contains(&layer)) };
-                if source == selected {
-                    tensors.push((name.replacen(&format!("model.layers.{source}."),
-                        &format!("model.layers.{layer}."), 1), *dtype, shape.clone()));
-                }
-            }
-        }
-        (config, tensors)
-    }
-
-    #[test]
-    fn planner_equals_runtime_mimo() {
-        use crate::placement::{Baseline, ExpertHome, Onboard};
-        use crate::placement::families::mimo_v2::{MimoInputs, solve_working_set, resolved_capacity};
-        // Measured Pro min/max post-module inventories from the 2026-10-09
-        // MOPD smoke logs. Reused physical inventory for Flash, not a Flash
-        // ready measurement. Exported BF16 scratch is SM188/170-identical.
-        for pro in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let (config, tensors) = shipped_mimo(pro);
-            write_snapshot(dir.path(), &config, &tensors, Some(if pro { 8 } else { 4 }));
-            let checkpoint = Checkpoint::open(dir.path()).unwrap();
-            let input = PlanInput::from_checkpoint(checkpoint);
-            let checkpoint = input.checkpoint();
-            let cfg = MimoV2Config::from_hf(&config).unwrap();
-            for sliding in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
-                let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
-                for ranks in [1, 2] {
-                    // Native CPU scratch sizing from the pinned SM120 package;
-                    // TP1 and TP2 retain different intermediate workspaces.
-                    let scratch = match (pro, ranks) {
-                        (true, 1) => 805_573_632, (true, _) => 604_247_040,
-                        (false, 1) => 671_354_880, (false, _) => 470_028_288,
-                    };
-                    let totals = [101_973_491_712, 101_970_345_984][..ranks].to_vec();
-                    let baseline = [586_416_128, 596_901_888];
-                    let package = dir.path().join(format!("tp{ranks}-manifest.json"));
-                    let layout = format!("tp{ranks}");
-                    std::fs::write(&package, serde_json::to_vec(&serde_json::json!({"layouts": {layout: {
-                        "input": "bf16", "tp": ranks, "hidden": cfg.hidden, "experts": cfg.experts,
-                        "top_k": cfg.topk, "intermediate": cfg.moe_intermediate,
-                        "slice": cfg.moe_intermediate / ranks, "weights": "mxfp4",
-                        "capacities": [{"capacity": 4096, "scratch_bytes": scratch}]
-                    }}})).unwrap()).unwrap();
-                    let context = 256 << 10;
-                    let sparks = if pro { 6 } else if ranks == 1 { 2 } else { 4 };
-                    let opts = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: totals.clone(), head_split: ranks == 2, mimo_swa_kv: sliding,
-                        pool_tokens: Some(2 << 20), concurrency: 16, host_cache_bytes: Some(0), mimo_expert_manifest: Some(package),
-                        ..Default::default() };
-                    let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
-                    let (experts, expert_workspace, tp2_workspace, onboard) =
-                        expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
-                    let lanes = prefill_shape(6, None).unwrap().waves as usize;
-                    let inputs = MimoInputs {
-        resident_weight_limit: Some(crate::placement::ResidentWeights(opts.weight_budget_bytes)), automatic_context: opts.context_tokens == 0, cfg: &cfg, resident_weights: costs.resident_weights.clone(), profile: &costs.steady, layers: cfg.layers,
-                        kv, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
-                            (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
-                        headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,
-                        context, requested_pool: opts.pool_tokens, pool_ceiling_at_target: false, onboard, experts, expert_workspace,
-                        tp2_workspace, rows: 4096, lanes: lanes as u64 };
-                    let no_spark = profile(&checkpoint, &opts, ranks, 0, 4096, 16, context, None).unwrap();
-                    let solution = solve_working_set(&inputs, &no_spark.steady).unwrap();
-                    let selected = inputs.selected(&no_spark.steady, &solution.working_set);
-                    let runtime_request = &solution.request;
-                    let runtime = &solution.placement;
-                    assert_eq!(solution.working_set.spark_ranks, sparks);
-                    assert_eq!(solution.working_set.spark_layers,
-                        runtime.layers.iter().enumerate().filter_map(|(layer, assignment)|
-                            (assignment.experts == ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>());
-                    if ranks == 1 {
-                        let cost = runtime_request.layers.iter().find_map(|layer| layer.experts).unwrap();
-                        assert!(cost.whole.resident > 0 && !cost.tp2, "single RTX offers whole TP1 experts");
-                        let fixed = costs.steady.devices[0].reservations.iter().map(|r| r.bytes).sum::<u64>();
-                        let pool = (runtime.pool_tokens / costs.steady.pool_unit_rows) * costs.steady.devices[0].pool_unit_bytes;
-                        let remaining = runtime_request.inventory.gpus[0].available() - fixed - pool;
-                        println!("mimo pro={pro} TP1 offered: whole={} workspace={} remaining={remaining}",
-                            cost.whole.resident, runtime_request.expert_workspace);
-                        if pro {
-                            match sliding {
-                                MimoKvCache::Bf16 => {
-                                    let (_, options) = workspace_options(&cfg, ranks, 0, 4096, context as usize,
-                                        lanes, true, opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow,
-                                        true, |_| Ok(0)).unwrap().remove(0);
-                                    let current = MimoWorkspaceLayout::new(&cfg, options).unwrap().device_bytes().unwrap();
-                                    let mut shadow = crate::families::mimo_v2::workspace::MimoPrefillKvShadowPlan::default();
-                                    let legacy = (0..lanes).map(|lane| {
-                                        let options = MimoWorkspaceOptions { waves: 1, with_head: lane < 2, ..options };
-                                        let layout = MimoWorkspaceLayout::new(&cfg, options).unwrap();
-                                        shadow.workspace_reservations(&format!("legacy{lane}"), &layout, options)
-                                            .unwrap().iter().map(|r| r.bytes).sum::<u64>()
-                                    }).sum::<u64>() + shadow.reservation().map_or(0, |r| r.bytes);
-                                    let old_remaining = remaining - (legacy - current);
-                                    println!("BF16 Pro TP1 free before -> after: {old_remaining} -> {remaining}; complete layer threshold {}",
-                                        cost.whole.resident + runtime_request.expert_workspace);
-                                    assert!(old_remaining < cost.whole.resident,
-                                        "legacy duplicate workspaces did not fit even weights alone");
-                                    assert!(remaining >= cost.whole.resident,
-                                        "unit workspaces now admit weights alone, not the complete expert allocation");
-                                    assert!(remaining < cost.whole.resident + runtime_request.expert_workspace,
-                                        "BF16 Pro min cannot fit one complete TP1 layer including scratch");
-                                },
-                                MimoKvCache::Int8 | MimoKvCache::Fp8 => assert!(
-                                    remaining >= cost.whole.resident + runtime_request.expert_workspace,
-                                    "compact Pro min fits one TP1 layer including scratch"),
-                            }
-                        }
-                    }
-                    let capacity = resolved_capacity(&selected, runtime_request, runtime, 16, 16).unwrap();
-                    let mut devices = totals.iter().enumerate().map(|(rank, &total)| DeviceLayout {
-                        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, worker_budget_bytes: 0, kv_tokens: 0,
-                        items: vec![Item::new(Category::Runtime, "context+modules", "measured post-module",
-                            baseline[rank], Basis::Calibrated)],
-                    }).collect::<Vec<_>>();
-                    let planned = apply(&input, &opts, &mut devices, sparks, 4096, 16, context, None).unwrap();
-                    assert_eq!(&planned, runtime, "pro={pro}, ranks={ranks}");
-                    assert_eq!(planned.pool_tokens, 2 << 20);
-                    assert_eq!(capacity.active_max_context_sequences, 8);
-                    for rank in 0..ranks {
-                        let admitted = &capacity.devices[rank];
-                        assert_eq!(devices[rank].used_bytes(), baseline[rank] + admitted.reserved_bytes + admitted.pool_bytes);
-                        let categories = [Category::Embedding, Category::Weights, Category::Drafter, Category::Experts,
-                            Category::Workspace, Category::Transport, Category::Prefix, Category::Kv, Category::Runtime];
-                        for category in categories {
-                            let planned = devices[rank].items.iter().filter(|item| item.category == category)
-                                .map(|item| item.bytes).sum::<u64>();
-                            let runtime = admitted.reservations.iter().filter(|item|
-                                reservation_category(&item.name) == category).map(|item| item.bytes).sum::<u64>();
-                            let pool = devices[rank].items.iter().filter(|item| item.category == category
-                                && (item.group == "records" || item.group == "pool page tables"))
-                                .map(|item| item.bytes).sum::<u64>();
-                            assert_eq!(planned, runtime + pool + if category == Category::Runtime { baseline[rank] } else { 0 });
-                        }
-                        println!("mimo pro={pro} ranks={ranks} rank={rank}: pool={} experts={} reserved={} pool_bytes={} baseline={}",
-                            planned.pool_tokens, planned.onboard_layers, admitted.reserved_bytes, admitted.pool_bytes, baseline[rank]);
-                    }
-                    if ranks == 2 {
-                        assert!(runtime.onboard_layers > 0);
-                        assert!(runtime.expert_ranges.iter().all(|range| range.layers == 0));
-                        assert!(runtime.layers.iter().all(|layer| !matches!(layer.experts, ExpertHome::RtxWhole { .. })));
-                    }
-                    // Auto with no package must retain the automatic pool bound,
-                    // and cannot charge routes/arena that runtime never allocates.
-                    let fallback = MimoInputs { requested_pool: None, onboard: Onboard::Auto,
-                        expert_workspace: 0, tp2_workspace: [0; 2], ..inputs };
-                    let fallback_solution = solve_working_set(&fallback, &no_spark.steady).unwrap();
-                    let fallback_selected = fallback.selected(&no_spark.steady, &fallback_solution.working_set);
-                    assert_eq!(fallback_solution.request.pool.ceiling, 2 << 20);
-                    assert_eq!(fallback_solution.placement.pool_tokens, 2 << 20);
-                    assert_eq!(fallback_solution.placement.onboard_layers, 0);
-                    assert!(crate::placement::families::mimo_v2::expert_items(&fallback_selected,
-                        &fallback_solution.placement, 0).unwrap().is_empty());
-                }
-            }
-        }
-    }
-
     #[test]
     fn spark_residency_uses_the_worker_package_slice_policy() {
         use crate::placement::families::mimo_v2::expert_layer_bytes;
@@ -809,7 +735,7 @@ mod tests {
         let checkpoint = input.checkpoint();
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot).unwrap();
         let tensors = catalog.fp8().unwrap();
-        let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), workspace_manifest: Some(dir.path().join("share/PROGRAMS.json")),
+        let options = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), workspace_manifest: Some(dir.path().join("share/PROGRAMS.json")),
             ..Default::default() };
         assert!(!crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).exists());
         let recipe = super::super::super::experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
@@ -856,7 +782,7 @@ mod tests {
             let cfg = MimoV2Config::from_hf(&config).unwrap();
             for ranks in [1, 2] {
                 let manifest = dir.path().join(format!("spark-free-tp{ranks}.json"));
-                let mut options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 * GIB; ranks],
+                let mut options = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 * GIB; ranks],
                     head_split: ranks == 2, concurrency: 4,
                     mimo_expert_manifest: Some(manifest.clone()), ..Default::default() };
                 let devices = || (0..ranks).map(|rank| DeviceLayout {
@@ -890,6 +816,59 @@ mod tests {
                     "Mandatory experts or the agentic pool floor must not silently shrink away");
             }
         }
+    }
+
+    #[test]
+    fn native_mtp_charges_weights_rings_and_load_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = mimo_flash_config();
+        let mut tensors = mimo_flash_tensors();
+        let mut mtp = tensors.iter().filter(|(name, ..)| name.starts_with("model.layers.0."))
+            .cloned().map(|(name, dtype, shape)| (name.replace("model.layers.0.", "model.mtp.layers.0.")
+                .replace("post_attention_layernorm", "pre_mlp_layernorm"), dtype, shape)).collect::<Vec<_>>();
+        // MTP uses sliding attention's KV head count and sink, with a dense FFN.
+        mtp.retain(|(name, ..)| !name.contains(".self_attn.k_proj.") && !name.contains(".self_attn.v_proj."));
+        mtp.extend(tensors.iter().filter(|(name, ..)| name.starts_with("model.layers.1.self_attn.k_proj.")
+            || name.starts_with("model.layers.1.self_attn.v_proj.") || name.ends_with("attention_sink_bias"))
+            .cloned().map(|(name, dtype, shape)| (name.replace("model.layers.1.", "model.mtp.layers.0."), dtype, shape)));
+        mtp.push(t("model.mtp.layers.0.eh_proj.weight", "BF16", &[4096, 8192]));
+        for norm in ["enorm", "hnorm", "final_layernorm"] {
+            mtp.push(t(format!("model.mtp.layers.0.{norm}.weight"), "BF16", &[4096]));
+        }
+        tensors.extend(mtp);
+        write_snapshot(dir.path(), &cfg, &tensors, Some(1));
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let mut options = LayoutOptions { native_mtp_layers: 0, mimo_drafter_disabled: true,
+            host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+        let target = profile(&checkpoint, &options, 1, 4, 2752, 4, 32768, None).unwrap();
+        options.native_mtp_layers = 1;
+        let native = profile(&checkpoint, &options, 1, 4, 2752, 4, 32768, None).unwrap();
+        assert!(native.resident_weights[0].0 > target.resident_weights[0].0);
+        assert!(native.loading[0].reservations.iter().any(|owner| owner.name == "loading.mtp_state_before_target_kv"));
+        let state = |profile: &MimoCapacityProfiles| profile.steady.devices[0].reservations.iter()
+            .filter(|owner| owner.name == "state.active_rings").map(|owner| owner.bytes).sum::<u64>();
+        assert!(state(&native) > state(&target));
+    }
+
+    #[test]
+    fn flash_min_baseline_uses_rounded_measured_smoke_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+        let report = crate::plan::plan(dir.path(), &crate::plan::PlanOptions {
+            placement: crate::plan::ExpertPlacement::Sparks { ranks: 2 },
+            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+            ..Default::default() }).unwrap();
+        let ledger = report.phase_ledger.unwrap();
+        let baseline = &ledger.budgets.iter().find(|b| b.id == "rtx0").unwrap().baseline;
+        let crate::placement::planner::Baseline::Forecast { occupied, .. } = baseline else { panic!("forecast") };
+        assert_eq!(*occupied, 1_179_648_000);
+        let ready = ledger.phases.iter().find(|row| row.budget == "rtx0"
+            && row.phase == crate::placement::planner::Phase::Ready).unwrap();
+        assert_eq!(ready.opaque, 32 << 20);
+        let measured_owned = 94_563_217_152u64;
+        let measured_baseline = 1_179_189_248u64;
+        let corrected_peak = 95_762_907_136u64;
+        assert!(measured_owned + measured_baseline + ready.opaque >= corrected_peak);
     }
 
     #[test]

@@ -136,6 +136,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     Ok(options)
 }
 
+fn resolve_mimo_drafter(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, speculator: &str) {
+    layout.mimo_drafter_disabled = speculator != "dflash2";
+}
+
 fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
     layout.prefix_slots = args.prefix_slots.or(Some(cuteafd_core::prefix::mark_slots_with_host(0, args.prefix_cache_entries.unwrap_or_else(|| cuteafd_core::concurrency::prefix_entries(layout.resolved_concurrency("deepseek_v41"))), 1, u64::MAX, layout.host_cache_bytes != Some(0))));
     // Workers must cover both prefill and the 256-row replay bucket.
@@ -292,6 +296,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
+        resolve_mimo_drafter(layout, &args.speculator);
         if family == "qwen3_5" { layout.dense_qwen_mtp = args.speculator == "mtp"; }
         if family == "qwen3_5" && args.speculator == "dspark" {
             let resolved = file_args(args.clone(), &snapshot)?;
@@ -1052,6 +1057,33 @@ mod tests {
         attach_snapshots(&mut manifest, &[coordinator], &args).unwrap();
         assert_eq!(manifest.additional_snapshots.len(), 1);
         assert!(manifest.additional_snapshots[0].files.iter().any(|f| f.path == "model-00001-of-00001.safetensors"));
+    }
+
+    #[test]
+    fn mimo_external_drafter_is_owned_only_by_dflash2() {
+        let snapshot = tempfile::tempdir().unwrap();
+        write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+        // A bad bundled config must be irrelevant to both off and native MTP.
+        std::fs::create_dir(snapshot.path().join("dflash")).unwrap();
+        std::fs::write(snapshot.path().join("dflash/config.json"), "{}").unwrap();
+        std::fs::write(snapshot.path().join("dflash/dflash_draft_model.safetensors"), "").unwrap();
+        for speculator in ["off", "mtp", "dflash2"] {
+            let mut layout = cuteafd_loader::plan::layout::LayoutOptions {
+                host_memory: Some((128 << 30, 128 << 30)), native_mtp_layers: 0,
+                host_cache_bytes: Some(0), ..Default::default() };
+            resolve_mimo_drafter(&mut layout, speculator);
+            assert_eq!(layout.mimo_drafter_disabled, speculator != "dflash2");
+            let report = plan(snapshot.path(), &cuteafd_loader::plan::PlanOptions {
+                layout: Some(layout), placement: cuteafd_loader::plan::ExpertPlacement::Sparks { ranks: 4 },
+                ..Default::default() }).unwrap();
+            if speculator == "dflash2" {
+                assert!(!report.placement_supported, "the selected drafter's invalid geometry must refuse");
+            } else {
+                assert!(report.placement_supported, "{speculator}: {:?}", report.hints);
+                assert!(!report.memory_layout.unwrap().devices[0].items.iter()
+                    .any(|item| item.category == cuteafd_core::memory_layout::Category::Drafter));
+            }
+        }
     }
 
     #[test]
@@ -1933,11 +1965,11 @@ mod tests {
         let inventory = plan(snapshot.path(), &weight_only).unwrap();
         assert!(!inventory.fits && !inventory.placement_supported && !inventory.executable());
         assert!(inventory.hints.iter().any(|h| h.what.contains("MiMo placement")
-            && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", inventory.hints);
+            && h.what.contains("memory budget 'rtx0'")), "{:?}", inventory.hints);
         let report = plan(snapshot.path(), &options(&tiny).unwrap()).unwrap();
         assert!(!report.fits && !report.executable());
         assert!(report.hints.iter().any(|h| h.what.contains("MiMo placement")
-            && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", report.hints);
+            && h.what.contains("memory budget 'rtx0'")), "{:?}", report.hints);
         let error = run_plan(tiny).unwrap_err();
         assert!(error.to_string().contains("is not servable"), "{error:#}");
     }

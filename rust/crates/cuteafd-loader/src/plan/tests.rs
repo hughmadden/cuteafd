@@ -356,7 +356,8 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
         assert_eq!(report.host_budget_bytes, expected << 30);
         assert_eq!(host.host_budget_bytes, report.host_budget_bytes);
         assert!(host.items.iter().all(|i| i.lifetime == ItemLifetime::PostReadyReserve));
-        for owner in ["mimo/owner-0/prefill.ordered-tables", "scoring/full-logits"] {
+        // This directly exercises the legacy ledger, not MiMo's Recipe route.
+        for owner in ["staging/tables-and-sync", "scoring/full-logits"] {
             assert!(host.items.iter().any(|i| i.group == owner && i.bytes > 0), "{owner}");
         }
         assert!(host.host_budget_bytes + host.deferred_bytes + host.reserve_bytes <= host.total_bytes);
@@ -1182,14 +1183,15 @@ fn real_layout_charges_host_and_names_unsupported_snapshot_geometry() {
         host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
     }), ..sparks(4) };
     let report = plan(dir.path(), &options).unwrap();
-    assert!(report.spec.is_some() && report.host_ledger.is_some());
+    assert!(report.spec.is_some() && report.host_ledger.is_none());
     assert!(!report.fits && !report.placement_supported);
-    assert!(report.hints.iter().any(|h| h.what.contains("mimo_v2 host prefix cache unsupported")
-        && h.what.contains("auto bytes") && h.what.contains("context 0")), "{}", render(&report));
+    assert!(report.hints.iter().any(|h| h.what.contains("MiMo placement")
+        && h.what.contains("max_position_embeddings")), "{}", render(&report));
     options.layout.as_mut().unwrap().host_cache_bytes = Some(1234567);
     let explicit = plan(dir.path(), &options).unwrap();
-    assert_eq!(explicit.host_budget_bytes, 1234567);
-    assert_eq!(explicit.host_ledger.as_ref().unwrap().host_budget_bytes, 1234567);
+    assert!(!explicit.fits && explicit.host_ledger.is_none());
+    assert_eq!(explicit.hints[0].what, report.hints[0].what,
+        "an explicit host quota must not replace the first context refusal");
 }
 
 #[test]
@@ -4116,7 +4118,9 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
     let mut options = PlanOptions {
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true,
-            context_tokens: 256 << 10, ..Default::default() }),
+            // One page below the freed embedding's worth of KV: the GPU plan
+            // misses the context floor, the host plan clears it.
+            context_tokens: 4096, ..Default::default() }),
         ..sparks(6)
     };
     let probe = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -4128,10 +4132,14 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
             - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
             + bytes + options.layout.as_ref().unwrap().headroom_bytes
                 .max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
-    let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(gpu.devices[1].by_category().get(&Category::Embedding), None);
+    let gpu_report = plan(dir.path(), &options).unwrap();
+    assert!(!gpu_report.fits, "the GPU plan cannot reach the context floor");
+    assert_eq!(gpu_report.memory_layout.as_ref().unwrap().devices[1].by_category()
+        .get(&Category::Embedding), None);
     options.layout.as_mut().unwrap().host_embedding = true;
     let report = plan(dir.path(), &options).unwrap();
+    assert!(report.fits, "{:?}", report.hints);
+    let gpu = gpu_report.memory_layout.unwrap();
     let host = report.memory_layout.unwrap();
     assert!(!host.devices.iter().any(|d| d.by_category().contains_key(&Category::Embedding)));
     assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={} host_notes={:?} gpu_notes={:?}",
@@ -4931,7 +4939,7 @@ fn mimo_local_media_weights_share_the_native_cap_without_charging_scratch() {
     let target = owners.ranks[0].iter().map(|owner| owner.bytes).sum::<u64>();
     let options = PlanOptions { vision: MediaMode::Rtx(Some(0)),
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-            pool_tokens: Some(32768), concurrency: 4,
+            pool_tokens: Some(32768), context_tokens: 32768, concurrency: 4,
             onboard: Some(OnboardSetting::Layers(0)), ..Default::default() }), ..sparks(4) };
     let roomy = plan(dir.path(), &options).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));
@@ -5002,7 +5010,8 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(config, &tensors, Some(4));
     let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: Some(budget),
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), concurrency: 4,
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768),
+            context_tokens: 32768, concurrency: 4,
             spark_allocation_budget_bytes: Some(budget),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }), ..sparks(4) };
     let roomy = plan(dir.path(), &options(100 << 30)).unwrap();
@@ -5151,7 +5160,7 @@ fn explicit_encoder_failure_and_small_pool_admission() {
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(cfg, &tensors, Some(1));
     let options = PlanOptions { vision: MediaMode::Rtx(Some(0)), layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        rtx_bytes: vec![32<<30], pool_tokens: Some(32768), ..Default::default()
+        rtx_bytes: vec![32<<30], context_tokens: 32768, pool_tokens: Some(32768), ..Default::default()
     }), ..Default::default() };
     let local = plan(dir.path(), &options).unwrap();
     assert_eq!(local.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu:0 });
@@ -5649,4 +5658,38 @@ fn qwen_auto_pool_normalization_keeps_one_admission_and_its_refusal() {
     assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")
             && hint.what.contains("cannot hold selected context")), "{}", render(&refused));
     assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}
+
+#[test]
+fn mimo_auto_pool_and_count_admission_preserve_one_recipe() {
+    let dir = snapshot_tp(mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536,
+        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        ..Default::default()
+    }), ..sparks(4) };
+    let unset = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
+    assert!(unset.wip_launchable(), "{}", render(&unset));
+    let automatic_pool = unset.memory_layout.as_ref().unwrap().pool_tokens;
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens, automatic_pool);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    assert_eq!(automatic.prefill_waves, unset.prefill_waves);
+    let direct = plan(dir.path(), &options).unwrap();
+    assert_eq!(direct.memory_layout.as_ref().unwrap().pool_tokens, automatic_pool);
+    // An explicit pool that cannot hold the selected context is one typed
+    // refusal at every candidate count, never a silent context clamp.
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let refused = plan(dir.path(), &zero).unwrap();
+    assert!(!refused.fits);
+    let typed = refused.hints.iter().find(|hint|
+        hint.what.contains("pool 64 cannot hold selected context 65536"))
+        .unwrap_or_else(|| panic!("{}", render(&refused))).what.clone();
+    assert!(typed.contains("pass a lower explicit context"), "{typed}");
+    let counted = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert!(!counted.wip_launchable());
+    assert!(counted.hints.iter().any(|hint| hint.what == typed), "{}", render(&counted));
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }

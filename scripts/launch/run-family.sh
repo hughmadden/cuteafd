@@ -2386,6 +2386,12 @@ audio_encoder_hash=""
     if [[ "$(get MIMO_PREFIX_DRAFT off)" == on ]]; then
       plan_draft_args+=(--mimo-prefix-draft)
     fi
+    # Plan the native MTP depth serve-mimo receives (its --mtp, default 0).
+    mimo_plan_mtp=0
+    for ((i=0; i<${#family_args[@]}; i++)); do
+      [[ "${family_args[i]}" != --mtp ]] || mimo_plan_mtp="${family_args[i+1]}"
+    done
+    plan_draft_args+=(--native-mtp-layers "$mimo_plan_mtp")
   fi
   # Rust resolves recurrent storage and prefix defaults from the same concurrency.
   if [[ "$family" == glm5_flash ]]; then
