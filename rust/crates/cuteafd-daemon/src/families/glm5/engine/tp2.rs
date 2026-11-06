@@ -133,6 +133,7 @@ impl<'a> GlmEngine<'a> {
         }
         if let Some(exchange) = &self.exchange { exchange.require_live()?; }
         if let Some(pair) = &self.tp2 { pair.routes.require_live()?; }
+        if let Some(drafter) = &self.drafter { drafter.require_live()?; }
         Ok(())
     }
 
@@ -148,6 +149,9 @@ impl<'a> GlmEngine<'a> {
                     state => Err(crate::shared::peer_split::TerminalPeerError::Closed(state).into()),
                 };
                 if let Err(error) = result { failures.push(format!("{error:#}")); }
+            }
+            if let Some(drafter) = &self.drafter {
+                if let Err(error) = drafter.publish_abort() { failures.push(format!("draft bridge: {error:#}")); }
             }
             ensure!(failures.is_empty(), "GLM abort publication: {}", failures.join("; "));
             Ok(())
@@ -170,6 +174,7 @@ impl<'a> GlmEngine<'a> {
                     unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
                 }
                 if let Some(pair) = &self.tp2 { pair.routes.drain_compute()?; }
+                if let Some(drafter) = &self.drafter { drafter.synchronize()?; }
                 Ok(())
             },
             // The engine owns no terminal Spark links: prefill waves run on the
@@ -192,6 +197,7 @@ impl<'a> GlmEngine<'a> {
                 for exchange in self.exchange.iter().chain(self.tp2.iter().map(|pair| &pair.routes)) {
                     exchange.finish_terminal(drained);
                 }
+                if let Some(drafter) = &self.drafter { drafter.finish_terminal(drained); }
             },
         });
         result

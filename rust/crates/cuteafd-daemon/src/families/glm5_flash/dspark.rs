@@ -89,7 +89,7 @@ impl DraftRead {
 /// engine (taps), the serve loop and glmf-golden use.
 pub(crate) enum Drafter<'a> {
     Dflash2(crate::shared::speculation::dflash::DflashDrafter<'a>),
-    RemoteDflash(super::remote_dflash::RemoteDflash<'a>),
+    RemoteDflash(crate::shared::draft::remote_dflash::RemoteDflash<'a>),
     Dspark(DsparkDrafter<'a>),
 }
 

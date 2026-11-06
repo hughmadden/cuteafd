@@ -445,6 +445,8 @@ pub enum MovableId {
     /// dSpark stage experts (V4); loaded into the GPU's local expert arena.
     DsparkExperts,
     Drafter,
+    Head,
+    SparkIntake,
     Vision,
     Audio,
 }

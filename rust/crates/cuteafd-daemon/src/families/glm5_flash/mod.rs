@@ -1,7 +1,6 @@
 //! GLM 5.3 Flash (glm5_next) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod dspark;
-mod remote_dflash;
 #[cfg(test)]
 mod draft_push_tests;
 pub(crate) use crate::shared::draft::resource as draft_binding;
@@ -2224,7 +2223,7 @@ impl Opened {
             Some(crate::shared::draft::remote::Prepared::new(&self.library,
                 crate::shared::peer_split::RankDevice { device: args.device, stream },
                 crate::shared::peer_split::RankDevice { device, stream: peer_stream },
-                0, remote_dflash::IDENTITY, crate::shared::draft::remote::decode_extent(
+                0, "glmf-remote-dflash:taps,input,hidden,logits", crate::shared::draft::remote::decode_extent(
                     capacity.block_rows, draft.hidden, draft.vocab, 0)?)?)
         } else { None };
         probe("admission-programs")?;
@@ -2780,7 +2779,7 @@ impl Opened {
             let draft = crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
                 device.own(|| DflashDrafter::load(&self.library, programs, snapshot, file, prepared.stream.raw,
                     slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache)))?;
-            dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
+            dspark::Drafter::RemoteDflash(crate::shared::draft::remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
             let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
             crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
