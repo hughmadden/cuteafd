@@ -35,6 +35,7 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub draft: Option<super::draft::Options>,
     /// Exact speculative verify widths given startup graphs; 0 = the drafter's block.
     pub verify_rows: usize,
+    pub prefix: Option<&'a crate::shared::prefix::PrefixArgs>,
 }
 
 pub(crate) struct Loaded<'a> {
@@ -176,8 +177,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             rank, pending, arch.cublas_bytes, 1, RANKS)?);
     }
     let gpus = inventory.gpus.iter().map(|sample| {
-        let capacity = cuteafd_ffi::coordinator_gpu_budget().map_or(sample.total_bytes, |b| b.0.min(sample.total_bytes));
-        GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+        GpuBudget { capacity_bytes: sample.total_bytes, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let mut admitted = admission::admit(admission::Inputs { cfg, core,
@@ -187,7 +187,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         unit_rows: options.prefill_rows, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
             (0..RANKS).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
-        spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows })?;
+        spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
     let graph_set = admitted.graph_set.take();
     if let Some(expected) = options.hosted_layers.as_ref() {
         ensure!(admitted.working_set().spark_layers == *expected,

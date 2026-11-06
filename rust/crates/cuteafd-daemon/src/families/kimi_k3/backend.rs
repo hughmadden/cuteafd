@@ -52,12 +52,12 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn message_starts(&self) -> &[&str] { &["<|open|>"] }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.engine.library() }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)> {
+    fn prefix_cache(&self, args: &PrefixArgs, _lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)> {
         ensure!(args.prefix_partial == Toggle::Off, "Kimi restores exact KDA/MLA snapshots only");
         let args = args.with_scoring(self.geometry.decode_rows, self.geometry.prefill_rows, self.geometry.vocab_size)?;
         let family = self.engine.prefix_family()?;
         let layout = family.layout();
-        let host = args.host_config(layout, self.geometry.max_context, lanes)?.map(|config|
+        let host = self.engine.host_prefix.clone().map(|config|
             CudaCopyEngine::registered_retained(self.library(), family.snapshot_owners(), family.snapshot_retained()).map(|copy| (config, copy)))
             .transpose()?;
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
@@ -644,7 +644,7 @@ mod tests {
                 pool_tokens: args.pool_tokens, graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
                 hosted_layers: None, draft: Some(super::super::draft::Options {
                     snapshot: args.draft.clone().context("native packing gate requires --draft")?,
-                    fp8: args.draft_fp8, cache_format: args.kv_cache }), verify_rows: 0 })?;
+                    fp8: args.draft_fp8, cache_format: args.kv_cache }), verify_rows: 0, prefix: Some(&args.prefix) })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;
         library.cuda_set_device(peer)?;

@@ -68,7 +68,8 @@ impl Drop for RoutedLane<'_> {
 impl<'a> RoutedLane<'a> {
     pub(super) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>,
         local: &LocalLane<'a>, placement: &Placement, world: SparkWorld,
-        peers: Vec<SocketAddr>, config: TcpTransportConfig, waves: usize, unit: usize) -> Result<Self> {
+        peers: Vec<SocketAddr>, config: TcpTransportConfig, waves: usize, unit: usize,
+        admitted: cuteafd_loader::placement::PreparedSparkLink) -> Result<Self> {
         ensure!(std::ptr::eq(library_owner.as_ref(), local.stream().device.library),
             "Kimi Spark library owner differs from admitted device");
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3,
@@ -88,8 +89,7 @@ impl<'a> RoutedLane<'a> {
         let mut link = stream.device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(ranks as u32)?;
             // `waves` return slots of `unit` rows per rank.
-            let mut link = SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config, LATENT * 2,
-                waves, u32::try_from(unit)?)?;
+            let mut link = SparkLink::prepared(library, world, &peers, config, admitted)?;
             link.enable_terminal_ownership(Arc::clone(library_owner))?;
             Ok(link)
         })?;
