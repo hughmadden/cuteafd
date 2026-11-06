@@ -114,6 +114,33 @@ def refresh_replay_provenance(directory, lock):
             path.write_text(json.dumps(data, indent=2) + "\n")
 
 
+def verified_metadata_bytes(path, lock):
+    data = json.loads(path.read_text())
+    if isinstance(data, dict) and "sparkinfer_revision" in data:
+        data["sparkinfer_revision"] = lock.get("revision")
+        if "source_tree_sha256" in data:
+            data["source_tree_sha256"] = lock.get("source_tree_sha256")
+    if path.name == "comparison-context.json":
+        for key in ("seconds", "backend_reuse", "execution_stats"):
+            data.pop(key, None)
+    # Route-manifest checksums change when only pin provenance changes. Compare
+    # the referenced manifest's complete normalized content instead of that hash.
+    if path.name == "v41_exl3.json" and data.get("route_preparation"):
+        route = data["route_preparation"]
+        route["sha256"] = compare.sha(verified_metadata_bytes(path.parent / route["manifest"], lock))
+    return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+
+
+def verify_job_metadata(previous, current, lock, name):
+    old = {path.relative_to(previous): path for path in previous.rglob("*.json")}
+    new = {path.relative_to(current): path for path in current.rglob("*.json")}
+    changed = sorted(str(path) for path in old.keys() | new.keys()
+                     if path not in old or path not in new
+                     or verified_metadata_bytes(old[path], lock) != verified_metadata_bytes(new[path], lock))
+    if changed:
+        raise ValueError(f"--verify-skips changed IR or placement metadata in skipped job {name}: {changed}")
+
+
 def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verify_skips=False):
     name, exporter, extra = job
     output = staging / name
@@ -149,11 +176,7 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
                         "--_worker", json.dumps(payload)], env=env, stdout=log,
                        stderr=subprocess.STDOUT, check=True, timeout=timeout)
     if skipped:
-        old_records = json.loads((prior_directory / "program-records.json").read_text())
-        new_records = json.loads((output / "program-records.json").read_text())
-        if ({key: record["ir_sha256"] for key, record in old_records.items()}
-                != {key: record["ir_sha256"] for key, record in new_records.items()}):
-            raise ValueError(f"--verify-skips changed IR in skipped job {name}")
+        verify_job_metadata(prior_directory, output, lock, name)
     summary = json.loads((output / "comparison-context.json").read_text())
     reuse = summary.get("backend_reuse", {})
     summary["execution_stats"] = {"stage0_skipped": skipped, "verified_skip": skipped and verify_skips,

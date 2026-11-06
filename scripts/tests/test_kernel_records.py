@@ -171,6 +171,73 @@ def test_job_replay_checksums_and_verify_skips_reject_ir_drift(tmp_path, monkeyp
         publisher.verified_job_files(previous, "programs")
 
 
+def test_export_policy_environment_changes_invalidate_identity(monkeypatch):
+    monkeypatch.delenv("CUTEAFD_BUILD_KIND", raising=False)
+    monkeypatch.delenv("CUTEAFD_EXL3_ROUTE_BLOCKS", raising=False)
+    before = records.export_environment()
+    monkeypatch.setenv("CUTEAFD_BUILD_KIND", "release")
+    assert records.export_environment() != before
+    monkeypatch.delenv("CUTEAFD_BUILD_KIND")
+    monkeypatch.setenv("CUTEAFD_EXL3_ROUTE_BLOCKS", "glmf=16")
+    assert records.export_environment() != before
+
+
+def test_export_environment_covers_every_source_read(monkeypatch):
+    import ast
+    paths = [*sorted((ROOT / "python/tools/aot").glob("*.py")),
+             *sorted((ROOT / "python/tools/lib").glob("*.py")),
+             ROOT / "scripts/build/compare-sm-exports.py",
+             ROOT / "scripts/build/export-placement-inputs.py"]
+    names = set()
+    for path in paths:
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                owner = ast.unparse(node.func.value)
+                if ((owner == "os.environ" and node.func.attr in ("get", "setdefault"))
+                        or (owner == "os" and node.func.attr == "getenv")
+                        or (owner == "env" and node.func.attr == "get")):
+                    assert node.args and isinstance(node.args[0], ast.Constant), (path, node.lineno)
+                    names.add(node.args[0].value)
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+                if ast.unparse(node.value) in ("os.environ", "env"):
+                    if isinstance(node.slice, ast.Constant):
+                        names.add(node.slice.value)
+                    else:
+                        # The comparison context uses this fixed two-name loop.
+                        assert (path.name == "compare-sm-exports.py"
+                                and ast.unparse(node.slice) == "key"), (path, node.lineno)
+    assert names <= records.EXPORT_ENVIRONMENT_NAMES
+    assert names <= records.export_environment().keys()
+    for name in names - {"CUTEAFD_SOURCE_ROOT", "CUTEAFD_SPARKINFER_SOURCE_DIR",
+                          "CUTEAFD_SPARKINFER_LOCK_FILE", "TRITON_CACHE_DIR",
+                          "CUDA_VISIBLE_DEVICES", "B12X_COMPILE_DISK_CACHE",
+                          "B12X_COMPILE_MEMORY_CACHE", "CUTEAFD_EXPORT_NARROW_AOT",
+                          "CUTEAFD_EXPORT_HC_LAGGED"}:
+        before = records.export_environment()
+        with monkeypatch.context() as patch:
+            patch.setenv(name, "environment-coverage-sentinel")
+            assert records.export_environment() != before, name
+
+
+@pytest.mark.parametrize("filename", ["comparison-plans.json", "program-records.json", "manifest.json"])
+def test_verify_skips_rejects_same_ir_metadata_drift(tmp_path, filename):
+    spec = importlib.util.spec_from_file_location("metadata_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    previous, current = tmp_path / "previous", tmp_path / "current"
+    previous.mkdir()
+    current.mkdir()
+    metadata = {"ir_sha256": "same", "scratch_bytes": 64, "abi": ["ptr", "i32"],
+                "geometry": {"rows": 80}, "params": {"tile": 128}}
+    (previous / filename).write_text(json.dumps(metadata))
+    (current / filename).write_text(json.dumps(metadata))
+    publisher.verify_job_metadata(previous, current, {}, "test")
+    (current / filename).write_text(json.dumps({**metadata, "scratch_bytes": 128}))
+    with pytest.raises(ValueError, match="placement metadata"):
+        publisher.verify_job_metadata(previous, current, {}, "test")
+
+
 def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})

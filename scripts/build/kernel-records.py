@@ -105,6 +105,36 @@ def elf_resources(blob):
     return {name: kernels[name] for name in sorted(kernels)}
 
 
+# Keep explicit absent values too; the source-scan regression guards new reads.
+EXPORT_ENVIRONMENT_NAMES = frozenset("""
+B12X_COMPILE_DISK_CACHE B12X_COMPILE_MEMORY_CACHE CUDA_VISIBLE_DEVICES TRITON_CACHE_DIR
+CUTEAFD_BUILD_KIND CUTEAFD_CUTE_HOST_TARGET CUTEAFD_EXL3_ROUTE_BLOCKS
+CUTEAFD_EXPORT_NARROW_AOT CUTEAFD_EXPORT_HC_LAGGED CUTEAFD_EXPORT_IMAGE_ID
+CUTEAFD_SOURCE_ROOT CUTEAFD_SPARKINFER_SOURCE_DIR CUTEAFD_SPARKINFER_LOCK_FILE
+CUTEAFD_EXPORT_HOST_CLASS CUTEAFD_EXPORT_HOST_CONTEXTS CUTEAFD_EXPORT_HOST_WORKERS
+CUTEAFD_EXPORT_JOBS CUTEAFD_EXPORT_SLOT_DIR CUTEAFD_EXPORT_HOST_SLOT_DIR
+CUTEAFD_EXPORT_GPU_SLOT_DIR CUTEAFD_EXPORT_GPU_BUDGET_MIB
+CUTEAFD_EXPORT_WORKER_GPU_MIB CUTEAFD_EXPORT_WORKER_RAM_MIB
+CUTEAFD_EXPORT_CONTEXT_SPACING_S HF_HUB_CACHE HF_HOME XDG_CACHE_HOME
+""".split())
+
+
+def export_environment():
+    values = {name: os.environ.get(name) for name in sorted(EXPORT_ENVIRONMENT_NAMES)}
+    values.update({name: value for name, value in sorted(os.environ.items())
+                   if name.startswith("CUTEAFD_")})
+    # These are forced by the offline worker, not inherited policy. Paths name
+    # verified sources or disposable compiler storage rather than semantic inputs.
+    values.update(CUTEAFD_BUILD_KIND=os.environ.get("CUTEAFD_BUILD_KIND", "development"),
+                  CUTEAFD_EXPORT_NARROW_AOT="1", CUTEAFD_EXPORT_HC_LAGGED="1",
+                  B12X_COMPILE_DISK_CACHE="0", B12X_COMPILE_MEMORY_CACHE="0",
+                  CUDA_VISIBLE_DEVICES="", TRITON_CACHE_DIR="<worker-cache>",
+                  CUTEAFD_SOURCE_ROOT="<verified-source>",
+                  CUTEAFD_SPARKINFER_SOURCE_DIR="<verified-fork>",
+                  CUTEAFD_SPARKINFER_LOCK_FILE="<verified-lock>")
+    return values
+
+
 def compiler_identity(root, payload, capability):
     """An immutable compiler image is mandatory; unknown identity disables reuse."""
     from b12x._lib import compiler
@@ -116,9 +146,7 @@ def compiler_identity(root, payload, capability):
     exporter = Path(root) / "python/tools/aot" / payload["exporter"]
     return {"schema": 1, "image_id": image, "runtime": compiler._runtime_toolchain_key(),
             "environment": compiler._compile_environment_key(),
-            "export_environment": {**{name: value for name, value in sorted(os.environ.items())
-                                      if name.startswith("CUTEAFD_EXPORT_") and name != "CUTEAFD_EXPORT_IMAGE_ID"},
-                                   "CUTEAFD_EXPORT_NARROW_AOT": "1", "CUTEAFD_EXPORT_HC_LAGGED": "1"},
+            "export_environment": export_environment(),
             "ptxas_version": version,
             "ptxas_sha256": digest(Path(ptxas).read_bytes()), "sms": payload["sms"],
             "capability": list(capability), "exporter": payload["exporter"], "args": payload["args"],
@@ -183,6 +211,8 @@ class BackendCache:
             return None
         options = {kind.__module__ + "." + kind.__qualname__: option.value
                    for kind, option in dsl.compile_options.options.items()}
+        if any(value for name, value in options.items() if name.endswith(".LinkLibraries")):
+            return None  # External bitcode contents are not yet fingerprinted.
         inputs = {"schema": 1, "ir_sha256": ir_hash, "identity": self.identity,
                   "options": options, "pipeline": values.get("pipeline"),
                   "function_name": values["function_name"], "signature": str(values["sig"]),
