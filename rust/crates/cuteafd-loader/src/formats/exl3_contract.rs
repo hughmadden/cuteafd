@@ -214,6 +214,8 @@ struct AttentionViewDeclaration {
     mode: String,
     views: AttentionViews,
     native_modules: String,
+    #[serde(default)]
+    index_aliases: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]

@@ -65,8 +65,10 @@ fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     #[arg(long)]
-    snapshot: PathBuf,
+    pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]

@@ -42,9 +42,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
     if args.encoder_only || args.audio_encoder_only {
         return tokio::task::spawn_blocking(move || -> Result<()> {
             let view = args.attention.select(&args.snapshot)?;
-            let inventory = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
-            let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
-            args.attention.validate_family(family)?;
+            args.attention.validate_view(&view)?;
             let (_vision, _audio, _) = crate::shared::vision::worker::start_encoders(encoder.as_ref(), audio_encoder.as_ref(),
                 &view, args.native_lib, args.device_budget_bytes as u64)?;
             loop { thread::park(); }

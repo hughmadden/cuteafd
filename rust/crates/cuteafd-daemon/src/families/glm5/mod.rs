@@ -28,6 +28,8 @@ pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillAc
 /// What every GLM command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     /// Shared GQA drafter-ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
