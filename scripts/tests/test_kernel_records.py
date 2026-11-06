@@ -276,6 +276,56 @@ def test_sm170_recompiles_only_changed_routed_objects(tmp_path, monkeypatch):
     assert "sm170_object_sha256" not in output["same.o"]
 
 
+def test_verify_metadata_normalizes_only_pin_and_route_checksum(tmp_path):
+    spec = importlib.util.spec_from_file_location("pin_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    old, new = tmp_path / "old", tmp_path / "new"
+    lock = {"revision": "new-pin", "source_tree_sha256": "new-tree"}
+    for directory, revision in ((old, "old-pin"), (new, "new-pin")):
+        directory.mkdir()
+        route = {"sparkinfer_revision": revision, "source_tree_sha256": revision + "-tree", "scratch": 64}
+        (directory / "routes.json").write_text(json.dumps(route))
+        manifest = {"sparkinfer_revision": revision,
+                    "route_preparation": {"manifest": "routes.json", "sha256": records.digest(json.dumps(route).encode())}}
+        (directory / "v41_exl3.json").write_text(json.dumps(manifest))
+    publisher.verify_job_metadata(old, new, lock, "exl3")
+    (new / "routes.json").write_text(json.dumps({"sparkinfer_revision": "new-pin", "scratch": 128}))
+    with pytest.raises(ValueError, match="routes.json"):
+        publisher.verify_job_metadata(old, new, lock, "exl3")
+
+
+def test_publisher_writes_sm170_report_before_failing(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("mismatch_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    job = ("programs", "export_b12x_dsv4_aot.py", [])
+    monkeypatch.setattr(publisher, "export_jobs", lambda: [job])
+    monkeypatch.setattr(publisher, "source_hashes", lambda: {})
+    lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
+    def worker(job, staging, *args):
+        directory = staging / "programs"
+        directory.mkdir()
+        (directory / "dsv4_programs.json").write_text('{"programs": []}')
+        (directory / "program-records.json").write_text(json.dumps({"kernel.o": {
+            "object_sha256": "188", "sm170_object_sha256": "170"}}))
+        return {"sparkinfer_revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"],
+                "cuda_initialized": False}
+    monkeypatch.setattr(publisher, "compile_job", worker)
+    original_load = publisher.compare.load_file
+    def load(name, path):
+        if name == "placement_filesystem":
+            import types
+            return types.SimpleNamespace(check_path=lambda path: None)
+        return original_load(name, path)
+    monkeypatch.setattr(publisher.compare, "load_file", load)
+    destination = tmp_path / "output"
+    with pytest.raises(ValueError, match="SM 170 / 188 OBJECT MISMATCH"):
+        publisher.publish(destination, tmp_path / "staging", 1, 1)
+    assert json.loads((destination / "CHANGES.json").read_text())["sm170_mismatches"] == ["programs/kernel.o"]
+    assert "HARD FAILURE" in (destination / "CHANGES.md").read_text()
+
+
 def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
