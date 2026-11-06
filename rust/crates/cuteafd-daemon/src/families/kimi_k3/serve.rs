@@ -16,7 +16,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0)] pub device: i32,
     /// Optional distinct physical peer; absent serves the full model on --device.
     #[arg(long)] pub split_device: Option<i32>,
-    /// MLA ownership; KDA remains head-split on two devices. Auto retains layers.
+    /// MLA auto uses context on two devices, whole ownership on one; KDA stays head-split on a pair.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
         value_parser = ["auto", "heads", "context", "layers"])]
     pub attention_placement: String,

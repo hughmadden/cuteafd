@@ -52,8 +52,9 @@ pub(crate) fn preflight(manifest: &Path, native_lib: &Path) -> Result<()> {
 pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     programs: &'a cuteafd_ffi::programs::Programs<'a>,
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
-    cfg: &KimiK3Config, options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
+    cfg: &KimiK3Config, mut options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
+    if RANKS == 2 { options.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(options.attention, RANKS)); }
     check_attention(options.attention, RANKS, options.graphs)?;
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
@@ -202,6 +203,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         prefix_marks = admitted.mark_selection.slots, marks = %admitted.mark_selection.summary(),
         spark_budget_gib, reserve = "estimated until W9 census",
         "Kimi admitted TP2 expert ownership");
+    cuteafd_bench::context::set_resolved("attention-placement", &admitted.placement.attention_summary());
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())

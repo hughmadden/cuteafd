@@ -258,14 +258,14 @@ GLM Flash, MiMo, Qwen4 and Muse carry their own towers.
 
 ## Family support: option values
 
-Attention placement (`ATTENTION_PLACEMENT`; the default is the planner's
-`ExecutorModes::attention` for the family):
+Attention placement (`ATTENTION_PLACEMENT`; `auto` resolves through the
+family's planner and runtime policy):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ heads² | ✓ layers | ✓ layers | ✓ heads |
+| `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ heads² | ✓ context⁴ | ✓ layers | ✓ heads |
 | `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✗ | ✗ |
-| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ (explicit; auto stays layers) | ✗ | ✗ |
+| `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ |
 | `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✗ | ✓ | ✗ | ✗ |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the
@@ -277,8 +277,9 @@ to `heads`, and an explicit `heads` is refused until a multi-GPU executor is
 qualified. ³ Native GLM 5.3 EXLR8 runs `context` (the auto default) and
 explicit `heads` or two-GPU `layers` (#1305, #1308); the planner refuses a
 mode whose image lacks its programs. ⁴ Kimi K3 accepts explicit `heads`,
-`context` and `layers` for MLA layers; `auto` stays `layers`. KDA stays
-head-split on two GPUs, independent of the MLA placement.
+`context` and `layers` for MLA layers on two GPUs; `auto` selects `context`
+on two GPUs and retains whole-owned layers on one. KDA stays head-split on
+two GPUs, independent of the MLA placement.
 
 Speculator (`SPECULATOR`):
 

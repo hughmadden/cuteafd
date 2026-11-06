@@ -15,7 +15,7 @@ fn snapshot(all: bool) -> tempfile::TempDir {
 }
 
 fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
-    PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
+    PlanOptions { attention_placement: Some(crate::placement::AttentionPlacement::Layers), placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
             // The text card retains device snapshots; host spilling is disabled.
             host_cache_bytes: Some(0), spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
@@ -102,6 +102,7 @@ fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(110 << 30));
+    options.attention_placement = None;
     // This BF16 geometry fixture needs an explicit weight cap above the native text owners.
     options.coordinator_budget_bytes = 192 << 30;
     let layout = options.layout.as_mut().unwrap();
@@ -124,6 +125,7 @@ fn single_owner_header_plan_refuses_mandatory_weights_above_default_cap() {
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(110 << 30));
+    options.attention_placement = None;
     assert_eq!(options.coordinator_budget_bytes, ResidentWeights::DEFAULT_LIMIT.0);
     let layout = options.layout.as_mut().unwrap();
     layout.rtx_bytes = vec![192 << 30];
@@ -318,7 +320,7 @@ fn planned_headers_supply_range_geometry_without_claiming_fit() {
 }
 
 #[test]
-fn context_refuses_missing_programs_but_auto_stays_layers() {
+fn auto_pair_requires_context_programs_but_explicit_layers_does_not() {
     let dir = snapshot(false);
     let mut options = with_layout(6, None);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
@@ -327,6 +329,10 @@ fn context_refuses_missing_programs_but_auto_stays_layers() {
     assert!(report.hints.iter().any(|h| h.what.contains("Kimi context program admission refused")
         && h.how.contains("kimik3_mla_partial") && h.how.contains("kimik3_lse_combine2")), "{:?}", report.hints);
     options.attention_placement = None;
+    let report = testing::plan(dir.path(), &options).unwrap();
+    assert_eq!(report.attention_placement, crate::placement::AttentionPlacement::Context);
+    assert!(report.hints.iter().any(|h| h.what.contains("context program")));
+    options.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
     let report = testing::plan(dir.path(), &options).unwrap();
     assert_eq!(report.attention_placement, crate::placement::AttentionPlacement::Layers);
     assert!(!report.hints.iter().any(|h| h.what.contains("context program")));
@@ -520,6 +526,8 @@ fn cache_geometry_preserves_actual_physical_owners_and_mla_copies() {
     }
     let context = model.cache_geometry(CacheOptions { coordinator_ranks: 2,
         attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).unwrap().unwrap();
+    let auto = model.cache_geometry(CacheOptions { coordinator_ranks: 2, ..Default::default() }).unwrap().unwrap();
+    assert_eq!(auto, context);
     assert_eq!(context.placement, KvPlacement::PartitionedContext);
     assert_eq!(context.ranks[0].persistent_unit_bytes, single.ranks[0].persistent_unit_bytes / 2);
     assert_eq!(context.ranks[0], context.ranks[1]);
@@ -744,12 +752,18 @@ fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Resul
     layout.target_pool_tokens = 2_097_152;
     layout.mla_kv = MlaCacheFormat::Fp8;
     layout.prefix_slots = Some(1);
+    options.attention_placement = None;
+    let auto = input.plan(&options)?;
+    assert_eq!(auto.attention_placement, AttentionPlacement::Context);
+    options.attention_placement = Some(AttentionPlacement::Layers);
     let layers = input.plan(&options)?;
     assert_eq!(layers.attention_placement, AttentionPlacement::Layers);
     options.attention_placement = Some(AttentionPlacement::Context);
     let report = input.plan(&options)?;
     let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
     assert_eq!(report.attention_placement, AttentionPlacement::Context);
+    assert_eq!(report.memory_layout, auto.memory_layout);
+    assert_eq!(report.solver_placement, auto.solver_placement);
     assert_eq!(placed.pool_tokens, layers.solver_placement.as_ref().unwrap().pool_tokens);
     assert_eq!(placed.pool_tokens, 2_097_152);
     assert!(placed.onboard_layers > 0);

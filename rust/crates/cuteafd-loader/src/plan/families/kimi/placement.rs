@@ -32,7 +32,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
     ] };
     report.bytes_by_owner.clear();
-    report.attention_placement = report.requested_attention.unwrap_or(AttentionPlacement::Layers);
+    let attention = crate::families::kimi_k3::resolve_attention(report.requested_attention, gpus);
+    report.attention_placement = attention;
     let context = if opts.context_tokens == 0 { crate::families::kimi_k3::default_context(&model.core) as u64 } else { opts.context_tokens };
     memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
     if context > COMPILED_CAPACITY {
@@ -40,7 +41,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Lower --context-tokens to at most 1M; the pool must cover the selected context extent.");
         return memory;
     }
-    let context_split = report.requested_attention == Some(AttentionPlacement::Context);
+    let context_split = attention == AttentionPlacement::Context;
     if !model.complete {
         report.refuse_placement("Kimi K3 placement cannot infer fit from missing safetensors headers".into(),
             "Place every shard's header locally (nest replicate) or plan from a complete snapshot.");
@@ -95,7 +96,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             Ok(layout) => Some(layout),
             Err(error) => {
                 report.refuse_placement(format!("Kimi context program admission refused: {error:#}"),
-                    &format!("Install PROGRAMS.json with {}; auto remains layers.",
+                    &format!("Install PROGRAMS.json with {}.",
                         crate::families::kimi_k3::context::program_names(opts.mla_kv).join(", ")));
                 return memory;
             }
@@ -158,7 +159,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
                 .transpose()?.unwrap_or(0);
             let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
-                usize::try_from(slots)?, verify, &model.core, matches!(report.requested_attention, Some(AttentionPlacement::Heads | AttentionPlacement::Context)),
+                usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
                 ranks, gpus, opts.resolved_spark_reply_format(false))?;
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
@@ -302,7 +303,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
             spark_ranks: ranks, peer_access: gpus == 2 },
-        attention_placement: report.requested_attention, context_buffers, layers_first_gpu: 0,
+        // The single-owner solver uses auto/Heads with Whole-only physical modes.
+        attention_placement: if gpus == 2 { Some(attention) } else { report.requested_attention }, context_buffers, layers_first_gpu: 0,
         pool: PoolPolicy { compiled_context: context,
             requested: requested_pool, target: target_pool, floor: context,
             ceiling: target_pool.max(requested_pool.unwrap_or(0)), unit_rows: PAGE },
