@@ -732,7 +732,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         kinds: request.layers.iter().map(|layer| layer.kind).fold(Vec::new(), |mut kinds, kind| {
             if !kinds.contains(&kind) { kinds.push(kind); } kinds
         }),
-        experts: Some(ExpertProfile { layers: routed, destination: (0..RANKS as u8).collect(), counts,
+        experts: (!routed.is_empty()).then_some(ExpertProfile { layers: routed, destination: (0..RANKS as u8).collect(), counts,
             rank_sets: vec![(0..spark_ranks as u8).collect()] }),
         arenas, spark,
         draft: draft.as_ref().map(|layout| kimi::draft_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
@@ -782,6 +782,8 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             else { Default::default() },
     }, usize::try_from(request.pool.compiled_context)?, graph_slots)).transpose()?.flatten();
     recipe.owners.push(kimi::host_prefix_owner(host_prefix.as_ref().map_or(0, |config| config.bytes), maximum_pages));
+    let scoring_bytes = kimi::host_scoring_bytes(lane_layouts[0][0].rows().min(64), lane_layouts[0][0].rows(), cfg.vocab_size)?;
+    recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     budgets.push(kimi::host_budget(host_total, host_available));
     let admitted = recipe.admit(kimi::request(request.pool.compiled_context, request.pool.requested, request.onboard,
         recipe.prefill, contract::Operation::Serving, request.resident_weight_limit.unwrap_or(ResidentWeights::DEFAULT_LIMIT),
@@ -1794,10 +1796,10 @@ pub(super) mod tests {
                 assert_eq!(admitted?.placement.pool_tokens, 262144);
             } else {
                 let live_error = admitted.err().context("live admission must refuse the cap")?;
-                let mut typed = live_error.downcast_ref::<PlacementError>().context("typed live refusal")?;
-                while let PlacementError::OwnerCandidates { source, .. }
-                    | PlacementError::PrefixMarks { source, .. } = typed { typed = source; }
-                assert_eq!(*typed, PlacementError::ResidentWeightLimit { gpu: 0, required: expected, limit: gib << 30 });
+                let typed = live_error.downcast_ref::<cuteafd_loader::placement::planner::Refusal>()
+                    .context("typed live refusal")?;
+                assert_eq!(*typed, cuteafd_loader::placement::planner::Refusal::ResidentWeightLimit {
+                    gpu: 0, required: expected, limit: gib << 30 });
                 let plan_error = planned.expect_err("plan command must refuse the same cap");
                 assert!(plan_error.to_string().contains(&typed.to_string()), "{plan_error:#}; {live_error:#}");
             }
@@ -1931,17 +1933,16 @@ pub(super) mod tests {
                 Err(error) => {
                     assert!(!report.fits && !report.placement_supported,
                         "planner admitted a shape refused by runtime: {error:#}");
-                    let mut typed = error.downcast_ref::<PlacementError>()
+                    use cuteafd_loader::placement::planner::Refusal;
+                    let typed = error.downcast_ref::<Refusal>()
                         .context("explicit Kimi capacity refusal must remain typed")?;
-                    while let PlacementError::OwnerCandidates { source, .. }
-                        | PlacementError::PrefixMarks { source, .. } = typed {
-                        typed = source;
-                    }
                     match typed {
-                        PlacementError::BelowFloor { floor, pool, .. } =>
-                            assert!(*floor == context as u64 && *pool < *floor, "{typed}"),
-                        PlacementError::PoolDoesNotFit { requested, fit, .. } =>
-                            assert!(requested_pool == Some(*requested) && *fit < *requested, "{typed}"),
+                        Refusal::FullContextShortfall { context: floor, tokens, .. } =>
+                            assert!(*floor == context as u64 && *tokens < *floor, "{typed}"),
+                        Refusal::Capacity { required, available, .. } =>
+                            assert!(required > available, "{typed}"),
+                        Refusal::PoolBelowContext { tokens, context: floor } =>
+                            assert!(*tokens < *floor, "{typed}"),
                         _ => panic!("unexpected Kimi capacity refusal: {typed}"),
                     }
                     assert!(report.hints.iter().any(|hint| hint.what.contains(&typed.to_string())),

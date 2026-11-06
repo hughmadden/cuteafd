@@ -451,6 +451,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Err(error) => { report.refuse_placement(format!("Kimi host prefix refused: {error:#}"), "Disable host retention or supply a supported quota."); return memory; }
     };
     recipe.owners.push(kimi::host_prefix_owner(host_quota, maximum_pages));
+    let scoring_bytes = match kimi::host_scoring_bytes(rows.min(64), rows, cfg.vocab_size) {
+        Ok(bytes) => bytes,
+        Err(error) => { report.refuse_placement(error.to_string(), "Use supported scoring dimensions."); return memory; }
+    };
+    recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     let mut budgets = match kimi::budgets(&opts.rtx_bytes.iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
         opts.headroom_bytes, &occupied, &sparks) {
         Ok(value) => value,
@@ -460,7 +465,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     budgets.push(kimi::host_budget(host_total, host_available));
     report.host_budget_bytes = host_quota;
     report.host_ledger = cuteafd_core::memory_layout::HostLayout::new(host_total, host_available,
-        (8 << 30).max(host_total / 10), host_quota, vec![]);
+        (8 << 30).max(host_total / 10), host_quota,
+        vec![cuteafd_core::memory_layout::host_table_item("Kimi host scoring logits", scoring_bytes)]);
     let resolved = recipe.admit(kimi::request(context, requested_pool, onboard, prefill,
         crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
     let onboarded = match resolved {

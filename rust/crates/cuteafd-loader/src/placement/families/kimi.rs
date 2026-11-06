@@ -679,6 +679,19 @@ pub fn host_budget(total: u64, available: u64) -> Budget {
         headroom: (8 << 30).max(total / 10) }
 }
 
+pub fn host_scoring_bytes(decode_rows: usize, prefill_rows: usize, vocab: usize) -> Result<u64, Refusal> {
+    cuteafd_core::memory_layout::host_logits_bytes(decode_rows as u64, prefill_rows as u64, vocab as u64)
+        .ok_or(Refusal::Overflow("Kimi host scoring logits"))
+}
+
+pub fn host_scoring_owner(bytes: u64, maximum: u64) -> Component {
+    Component::allocation(
+        Allocation::buffer("kimi.host.scoring", Location::HOST, bytes,
+            Lifetime { first: Phase::Ready, last: Phase::Growth }, Category::Staging, "Kimi host scoring logits"),
+        ByteCurve::fixed(bytes, maximum), true, maximum,
+    )
+}
+
 pub fn host_prefix_owner(bytes: u64, maximum: u64) -> Component {
     Component::allocation(Allocation::buffer("kimi.host.prefix", Location::HOST, bytes,
         Lifetime::RESIDENT, Category::Prefix, "Kimi retained host prefix quota"),
@@ -749,6 +762,25 @@ mod tests {
             fixed: vec![FixedOwner { rank: 0, category: Category::Prefix, group: "Kimi exact KDA marks".into(),
                 bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT }],
         }
+    }
+
+    #[test]
+    fn host_retention_and_scoring_share_one_physical_budget() {
+        let mut recipe = recipe();
+        let scoring = host_scoring_bytes(64, 1024, 100).unwrap();
+        assert_eq!(scoring, 64 * 100 * 4);
+        recipe.owners.push(host_prefix_owner(1024, recipe.maximum_pages));
+        recipe.owners.push(host_scoring_owner(scoring, recipe.maximum_pages));
+        let mut budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[]).unwrap();
+        let mut host = host_budget(1 << 30, 1 << 30);
+        host.headroom = 0;
+        host.logical_bytes = 1024 + scoring;
+        budgets.push(host);
+        let admitted = recipe.admit(single(), budgets.clone()).unwrap();
+        assert_eq!(admitted.solved.remaining("host", Phase::Ready), Some(0));
+        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(scoring));
+        budgets.last_mut().unwrap().logical_bytes -= 1;
+        assert!(recipe.admit(single(), budgets).is_err());
     }
 
     #[test]
