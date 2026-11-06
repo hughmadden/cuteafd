@@ -460,13 +460,9 @@ fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &Gl
     let serving = ServingOwners { selector: SelectorOwners { location: Location::coordinator(0),
         capacity: 64, vocab: cfg.vocab_size, device_sampling: true },
         prefix: HostPrefixOwners { quota_bytes: quota, chunk_bytes: geometry.chunk_bytes().min(quota) } };
-    let mut owners = serving.components(maximum_pages)?;
-    if mark_slots > 0 && mark_bytes > 0 {
-        let bytes = mark_slots.checked_mul(mark_bytes).context("GLM draft mark extent overflow")?;
-        let owner = Allocation::buffer("glm.draft.window_marks", Location::coordinator(0), bytes,
-            Lifetime::TARGET, Category::Prefix, "GLM draft window marks");
-        owners.push(crate::placement::planner::Component::allocation(owner, ByteCurve::fixed(bytes, maximum_pages), false, maximum_pages));
-    }
+    let owners = serving.components(maximum_pages)?;
+    // Window marks snapshot the drafter's rings and live beside them.
+    let draft = draft.with_window_marks(mark_slots.checked_mul(mark_bytes).context("GLM draft mark extent overflow")?);
     Ok((draft, owners, quota))
 }
 
@@ -902,12 +898,9 @@ mod tests {
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
         off.host_memory = Some((128 << 30, 128 << 30));
         let mark_owner = |options: &LayoutOptions, attention, gpus| {
-            let (_, owners, _) = production_serving(options, &checkpoint, &cfg, 1 << 20, attention, gpus, 32768).unwrap();
-            owners.into_iter().filter_map(|component| match component.kind {
-                crate::placement::planner::ComponentKind::Allocation { template, .. }
-                    if template.id == "glm.draft.window_marks" => Some(template.bytes),
-                _ => None,
-            }).sum::<u64>()
+            let (draft, _, _) = production_serving(options, &checkpoint, &cfg, 1 << 20, attention, gpus, 32768).unwrap();
+            draft.owners().iter().filter(|owner| owner.id == "glm.draft.window_marks")
+                .map(|owner| owner.bytes).sum::<u64>()
         };
         let cold = mark_owner(&off, crate::placement::AttentionPlacement::Heads, 1);
         let mut on = off.clone();
