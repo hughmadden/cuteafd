@@ -1,6 +1,6 @@
 {
   "glm5_flash": true,
-  "glm5": false,
+  "glm5": true,
   "mistral_large4": false,
   "kimi_k3": false,
   "step5": false,
