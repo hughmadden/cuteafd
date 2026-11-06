@@ -802,10 +802,27 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                     result = subprocess.run(["./run.sh", *args], cwd=ROOT, capture_output=True, text=True, env=env)
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn(message, result.stderr)
+            # A valid override must reach model resolution, which comes after the
+            # launcher's tool and image checks. Stub those two so the answer does
+            # not depend on the host (WSL2 keeps nvidia-smi outside /usr/bin, and
+            # a build host need not hold the release images), and point the
+            # namespace and HF_HOME at empty directories so the missing snapshot
+            # is the same everywhere.
+            stub_bin = Path(home) / "bin"
+            stub_bin.mkdir()
+            for tool in ("docker", "nvidia-smi"):
+                stub = stub_bin / tool
+                stub.write_text("#!/bin/sh\nexit 0\n")
+                stub.chmod(0o755)
+            empty_namespace, empty_hf = Path(home) / "namespace", Path(home) / "hf"
+            empty_namespace.mkdir()
+            empty_hf.mkdir()
+            resolved_env = {**env, "PATH": f"{stub_bin}:/usr/bin:/bin", "HF_HOME": str(empty_hf),
+                            "CUTEAFD_NAMESPACE_ROOT": str(empty_namespace)}
             for override in ["CONCURRENCY=17", "CONCURRENCY=64", "PREFIX_CACHE_ENTRIES=129"]:
                 with self.subTest(override=override):
                     result = subprocess.run(["./run.sh", "--set", override], cwd=ROOT,
-                                            capture_output=True, text=True, env=env)
+                                            capture_output=True, text=True, env=resolved_env)
                     self.assertNotIn("CONCURRENCY must", result.stderr)
                     self.assertNotIn("PREFIX_CACHE_ENTRIES must", result.stderr)
                     self.assertIn("model snapshot is missing", result.stderr)

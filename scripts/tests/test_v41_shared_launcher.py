@@ -99,8 +99,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             expected_options.append("--init")
         assert after["options"] == sorted(expected_options), where
         # shared_thermal_args also mounts the host power governor's state read-only
-        # when gpu-powerd runs on this host (#114).
-        governor = ["/run/gpu-powerd:/run/gpu-powerd:ro"] if role == "coordinator" and os.path.isdir("/run/gpu-powerd") else []
+        # when gpu-powerd runs on the host (#114); the capture seeds that directory.
+        governor = ["/run/gpu-powerd:/run/gpu-powerd:ro"] if role == "coordinator" else []
         # The coordinator also shares the host fidelity reference cache with the dashboard.
         fidelity = [f"<root>/hosts/{old['host']}/.cache/cuteafd/fidelity:/run/cuteafd/fidelity"] \
             if role == "coordinator" else []

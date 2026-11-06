@@ -210,13 +210,17 @@ esac
 # (temperature, T.Limit headroom, power and limit, SM clock, clock-event reasons and their
 # cumulative throttle seconds) for /v1/stats, /v1/thermal, the console and every bench
 # report's per-phase throttle summary; off disables it. A host power governor's state file
-# (gpu-powerd's /run/gpu-powerd, when present) is mounted read-only so the report carries it.
+# (gpu-powerd's /run/gpu-powerd, when present) is mounted read-only at the daemon's own
+# state path so the report carries it. CUTEAFD_GPU_POWERD_DIR names the host directory the
+# governor publishes in (a real host leaves it unset); script tests point it at a fixture
+# directory so a launch line does not depend on which host runs the test.
 # Spark workers sample their own GPU too (shared_worker_env_args).
 shared_thermal_args() {
 thermal="$(get THERMAL on)"
 case "$thermal" in on|off) ;; *) echo "THERMAL must be on or off" >&2; exit 2 ;; esac
 thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
-[[ ! -d /run/gpu-powerd ]] || thermal_args+=(-v /run/gpu-powerd:/run/gpu-powerd:ro)
+powerd_dir="${CUTEAFD_GPU_POWERD_DIR:-/run/gpu-powerd}"
+[[ ! -d "$powerd_dir" ]] || thermal_args+=(-v "$powerd_dir:/run/gpu-powerd:ro")
 }
 # The coordinator environment every family reads:
 # SPARK_INTAKE: how routed partials reach the coordinator GPU (auto, gpu, pinned
