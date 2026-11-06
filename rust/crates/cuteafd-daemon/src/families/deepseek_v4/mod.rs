@@ -368,6 +368,8 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
         Some("dsv4p") => "dsv4p",
         other => anyhow::bail!("not a DeepSeek V4 checkpoint (expert family {other:?})"),
     };
+    crate::shared::experts::rtx::native::register_stage_inventory(
+        &["dsv4f", "dsv4p"], catalog.routed_experts().draft_stages)?;
     let cfg = DeepseekV4Config::read(&args.snapshot, 1)?;
     cuteafd_bench::context::set_family(cfg.family_id());
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
