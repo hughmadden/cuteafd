@@ -18,6 +18,20 @@ pub use nest_push::{client::{JoinArgs, Poll, Conn, Listener}, plan, proto, slot}
 pub mod builder;
 pub mod native;
 
+/// Header-bound dense receive, boundary windows and transform scratch. Source
+/// reads are windowed, so a large selected tensor never charges its full size.
+pub fn admitted_push_envelope(largest_selected_dense_bytes: u64, slots: usize, slot_bytes: u64)
+    -> Result<u64, crate::placement::planner::Refusal> {
+    use crate::placement::planner::Refusal;
+    let overflow = || Refusal::Overflow("dense push envelope");
+    let slots = u64::try_from(slots).map_err(|_| overflow())?;
+    let largest = largest_selected_dense_bytes.min(crate::shared::dense_read::STEP_BYTES as u64);
+    let windows = slots.checked_mul(2).and_then(|n| n.checked_add(1)).ok_or_else(overflow)?;
+    largest.checked_mul(windows).and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(slots.checked_mul(slot_bytes)?))
+        .and_then(|n| n.checked_add(largest.checked_mul(10)?)).ok_or_else(overflow)
+}
+
 /// Header-derived concurrent coordinator receive owners, admitted by the
 /// caller's complete recipe before any push allocation or group handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]

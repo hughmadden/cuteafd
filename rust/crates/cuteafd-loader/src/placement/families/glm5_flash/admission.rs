@@ -262,21 +262,13 @@ pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, cfg: &GlmNextCon
     ensure!((1..=2).contains(&ranks), "Flash push rank count");
     let slots = cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64;
     let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
-    let step = crate::shared::dense_read::STEP_BYTES as u64;
     let mut largest = checkpoint.tensors.iter().filter(|tensor|
         !tensor.meta.name.contains(".experts.")).map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
     if let Some((facts, _)) = native {
         largest = largest.max(facts.records.iter().flat_map(|record| &record.components)
             .map(|component| component.source.bytes as u64).max().unwrap_or(0));
     }
-    // A transform is split into <=32 MiB windows. Two uses of a source
-    // (ordinary and absorbed operands) can straddle every outstanding slot;
-    // include both boundary windows and the worst residual/table workspace.
-    // This is deliberately an assumed bound until the chosen records exist.
-    let largest = largest.min(step);
-    let dense = largest.checked_mul(2 * slots + 1).and_then(|n| n.checked_mul(2))
-        .and_then(|n| n.checked_add(slots * slot))
-        .and_then(|n| n.checked_add(10 * largest)).context("Flash dense push estimate overflow")?;
+    let dense = crate::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
     let mut expert = vec![0u64; ranks];
     let mut retained = vec![0u64; ranks];
     for rank in 0..ranks {

@@ -4,6 +4,20 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use std::{cell::Cell, fs::File, os::fd::AsRawFd, sync::mpsc, thread};
 use tempfile::{NamedTempFile, TempDir};
 
+#[test]
+fn admitted_push_envelope_matches_flash_bytes() {
+    let step = crate::shared::dense_read::STEP_BYTES as u64;
+    for largest in [0, 1, 256, step - 1, step, step + 1, u64::MAX] {
+        for slots in [1usize, 2, cuteafd_ffi::push_ring::DEFAULT_SLOTS] {
+            let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
+            let capped = largest.min(step);
+            let flash = capped * (2 * slots as u64 + 1) * 2 + slots as u64 * slot + 10 * capped;
+            assert_eq!(admitted_push_envelope(largest, slots, slot).unwrap(), flash);
+        }
+    }
+    assert!(admitted_push_envelope(step, usize::MAX, u64::MAX).is_err());
+}
+
 struct Server {
     _directory: TempDir,
     client: PushClient,
