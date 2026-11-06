@@ -1063,7 +1063,9 @@ mod tests {
         });
         let client = Client::new(&base, None, Arc::new(AtomicBool::new(false)));
         let mut run = Run { client: &client, info: &ServerInfo::default(), progress: &Progress::default(),
-            max_context: 32768, baseline: Baseline::default() };
+            max_context: 32768, baseline: Baseline { fingerprint: String::new(), run_id: String::new(),
+                created: now_rfc3339(), card: BasicCard::default(), quality: Quality::default(),
+                seconds: 0.0, thermal: None, fabric: vec![] } };
         decode_content(&mut run).unwrap();
         server.join().unwrap();
         assert_eq!(run.baseline.card.decode.len(), CONTENT.len());
