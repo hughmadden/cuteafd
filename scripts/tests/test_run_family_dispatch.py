@@ -113,6 +113,27 @@ def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, f
                 assert "--compact-attention" not in line and "--fp8-compact-attention" not in line
 
 
+def test_attention_variant_table_matches_launcher_and_distinguishes_ml4(tmp_path):
+    reader = ROOT / "scripts/lib/checkpoint-family.py"
+    variants = json.loads(reader.with_name("attention-variants.json").read_text())
+    assert variants == {"glm5_flash": True, "glm5": False, "mistral_large4": False,
+                        "kimi_k3": False, "step5": False, "muse_spark": False}
+    for family, enabled in [*variants.items(), ("unknown", False)]:
+        result = subprocess.run(["python3", str(reader), "--attention-variant", family],
+                                capture_output=True, text=True, timeout=10)
+        assert (result.returncode == 0) == enabled, family
+    # The launcher checks selected checkpoint metadata, never the shared glm5 engine name.
+    config = {"model_type": "mistral_large4",
+              "architectures": ["MistralLarge4ForConditionalGeneration"],
+              "text_config": {"model_type": "mistral_large4_text",
+                              "num_hidden_layers": 72, "first_k_dense_replace": 1}}
+    result = _family_launch_result(tmp_path, config, "test/ml4-variant",
+        "ATTENTION_MODE=fp8-compact\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        extra_args=("--family", "glm5"))
+    assert result.returncode != 0
+    assert "checkpoint variant mistral_large4" in result.stderr
+
+
 @pytest.mark.parametrize("mode", ["compact", "fp8-compact", "unknown"])
 def test_attention_bundle_refuses_unsupported_modes_and_families(tmp_path, mode):
     config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}

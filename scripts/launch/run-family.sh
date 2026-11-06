@@ -1278,7 +1278,8 @@ attention_mode_args=()
 case "$attention_mode" in
   hqa) ;;
   compact|fp8-compact)
-    [[ "$family" == glm5_flash ]] || release_die "unsupported ATTENTION_MODE=$attention_mode for $family; only glm5_flash supports alternate attention bundles"
+    python3 "$repo_root/scripts/lib/checkpoint-family.py" --attention-variant "$detected_family" ||
+      release_die "unsupported ATTENTION_MODE=$attention_mode for checkpoint variant $detected_family"
     if [[ "$attention_mode" == compact ]]; then attention_mode_args=(--compact-attention)
     else attention_mode_args=(--fp8-compact-attention); fi
     ;;
