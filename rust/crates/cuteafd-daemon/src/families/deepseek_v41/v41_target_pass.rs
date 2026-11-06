@@ -230,6 +230,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     pub fn install_attention_plan(&mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Result<()> {
         self.resources.lane.install_attention_plan(plan)
     }
+    pub(crate) fn install_expert_usage(&mut self, usage: Option<std::rc::Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>) {
+        self.resources.lane.install_expert_usage(usage);
+    }
     pub fn set_attention_decode(&mut self, decode: bool) { self.resources.lane.set_attention_decode(decode); }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         self.resources.lane.reserve_sparse_decode_rows(rows)

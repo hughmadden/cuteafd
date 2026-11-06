@@ -674,6 +674,7 @@ pub fn production_request(
 /// Physical subrecipes prepared from headers and program tables. This builder
 /// selects neither the pool nor an expert prefix; the shared planner does.
 pub struct V41Recipe<'a> {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub config: &'a serde_json::Value,
     pub context: u64,
     pub page_tokens: u64,
@@ -850,6 +851,7 @@ impl V41Recipe<'_> {
 }
 
 pub struct ProductionInput<'a> {
+    pub expert_usage: bool,
     pub config: &'a serde_json::Value,
     pub gpus: usize,
     /// Smallest pool the layout admits, in page tokens.
@@ -892,9 +894,24 @@ pub struct PreparedV41<'a> {
 }
 
 pub struct AdmittedV41 {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub placement: crate::placement::Placement,
     pub spark: crate::placement::SparkWorkingSet,
     pub solved: ResolvedPlan,
+}
+
+/// The backbone router emits full top-k on its attention owner, not on TP peers.
+pub fn expert_usage_geometry(config: &serde_json::Value) -> Result<cuteafd_core::expert_usage::Geometry, Refusal> {
+    let config = config.get("text_config").unwrap_or(config);
+    let field = |key| config.get(key).and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok()).ok_or_else(|| invalid("missing expert usage geometry"));
+    let layers = field("num_hidden_layers")?;
+    let geometry = cuteafd_core::expert_usage::Geometry {
+        layers, experts: field("n_routed_experts")?, topk: field("num_experts_per_tok")?,
+        routed_layers: (0..layers).collect(),
+    };
+    if !geometry.validate() || layers != 40 { return Err(invalid("invalid V4.1 expert usage geometry")); }
+    Ok(geometry)
 }
 
 impl<'a> ProductionInput<'a> {
@@ -961,7 +978,9 @@ impl<'a> ProductionInput<'a> {
         for count in 0..=routed {
             arenas.push(arena(count, self.gpus, &self.experts, self.workspace)?);
         }
+        let expert_usage = self.expert_usage.then(|| expert_usage_geometry(self.config)).transpose()?;
         let mut recipe = V41Recipe {
+            expert_usage,
             config: self.config,
             context: self.context,
             page_tokens: 512,
@@ -1084,7 +1103,7 @@ impl PreparedV41<'_> {
             return Err(invalid("mandatory V4.1 expert prefix does not fit"));
         }
         let (placement, spark) = self.recipe.execution(&solved)?;
-        Ok(AdmittedV41 { placement, spark, solved })
+        Ok(AdmittedV41 { expert_usage: self.recipe.expert_usage, placement, spark, solved })
     }
 }
 
@@ -1251,6 +1270,10 @@ impl Recipe for V41Recipe<'_> {
         };
         for case in &self.owners {
             domains.append(&mut contract, &case.when, case.value.clone())?;
+        }
+        if let Some(geometry) = &self.expert_usage {
+            contract.components.extend(crate::placement::expert_usage::components(
+                geometry, &(0..self.gpus as u8).collect::<Vec<_>>(), self.maximum_pages)?);
         }
         // Opaque reserves are unconditional and price only the post-ready phases.
         contract

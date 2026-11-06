@@ -218,6 +218,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         options.weight_budget_bytes, options.spark_reply_formats);
     let media_cache_bytes = options.media_cache_bytes.unwrap_or(0);
     let mut prepared = ProductionInput {
+        expert_usage: options.expert_usage,
         config: &checkpoint.config,
         gpus: ranks,
         context,
@@ -398,6 +399,7 @@ mod tests {
             let cards = vec![(96 * gib, 96 * gib); 2];
             let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
             let input = ProductionInput {
+            expert_usage: false,
                 config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
                 prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
                 replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
@@ -438,6 +440,7 @@ mod tests {
         let cards = vec![(96 * gib, 96 * gib); 2];
         let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
         let input = ProductionInput {
+            expert_usage: false,
             config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
             prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,

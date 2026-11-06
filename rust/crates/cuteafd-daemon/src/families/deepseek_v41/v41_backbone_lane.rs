@@ -301,7 +301,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
         let lane = self.lane.take().unwrap();
         let input = unsafe { lane.block.complete_queued_ffn(self.values.unwrap())? };
         lane.phase = Phase::Ffn;
-        Ok(LaneFfn { input, cooperative: true, shared: &mut lane.shared, router: &mut lane.router,
+        Ok(LaneFfn { input, usage_phase: lane.usage_phase, cooperative: true, shared: &mut lane.shared, router: &mut lane.router,
             library: lane.weights.library, phase: &mut lane.phase,
             route_capture: if lane.capture_routes { Some(&mut lane.route_capture) } else { None },
             ffn_split: if lane.capture_timing { Some(&mut lane.ffn_split) } else { None },
@@ -327,6 +327,7 @@ impl Drop for PendingLaneFfn<'_, '_, '_> {
 /// RTX. Both consume the same preserved normalized rows and execution identity.
 pub(crate) struct LaneFfn<'s, 'w, 'a> {
     pub input: FfnInput<'s>,
+    usage_phase: cuteafd_ffi::expert_usage::UsagePhase,
     cooperative: bool,
     shared: &'s mut Option<BackboneSharedWave<'w, 'a>>,
     router: &'s mut BackboneRouterWave<'w, 'a>,
@@ -401,13 +402,13 @@ impl LaneFfn<'_, '_, '_> {
         let mut cancelled = 0;
         for local_mode in [false, true] {
             self.router.set_local_mode(local_mode)?;
-            let routed = unsafe { self.router.execute_ffn(&self.input, image_mask)? };
+            let routed = unsafe { self.router.execute_ffn(&self.input, image_mask, self.usage_phase)? };
             let reference = read(&[routed.ids, routed.routing, routed.expert_input])?;
             self.router.clear_graph()?;
-            cancelled += cancel_once(unsafe { self.router.execute_ffn_cooperative(&self.input, image_mask) }).await as usize;
+            cancelled += cancel_once(unsafe { self.router.execute_ffn_cooperative(&self.input, image_mask, self.usage_phase) }).await as usize;
             for evict in [true, false, true, false] {
                 if evict { self.router.clear_graph()?; }
-                let routed = unsafe { self.router.execute_ffn_cooperative(&self.input, image_mask).await? };
+                let routed = unsafe { self.router.execute_ffn_cooperative(&self.input, image_mask, self.usage_phase).await? };
                 assert_eq!(read(&[routed.ids, routed.routing, routed.expert_input])?, reference);
                 let mut ids = Vec::new();
                 unsafe { routed.capture_route_ids(lib, &mut ids)?; }
@@ -448,6 +449,7 @@ impl LaneFfn<'_, '_, '_> {
     ) -> Result<NativeFfnOutput<'t>> {
         let cooperative = self.cooperative;
         let input = &self.input;
+        let usage_phase = self.usage_phase;
         let router = &mut self.router;
         let shared = &mut self.shared;
         let library = self.library;
@@ -464,8 +466,8 @@ impl LaneFfn<'_, '_, '_> {
             let timing = std::time::Instant::now();
             router.set_local_mode(transport.has_local_layer(input.layer))?;
             let ring = router.ring_capture();
-            let routed = unsafe { if cooperative { router.execute_ffn_cooperative(input, image_mask).await? }
-                else { router.execute_ffn(input, image_mask)? } };
+            let routed = unsafe { if cooperative { router.execute_ffn_cooperative(input, image_mask, usage_phase).await? }
+                else { router.execute_ffn(input, image_mask, usage_phase)? } };
             if transport.has_local_layer(input.layer) {
                 ensure!(!(ring && tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG)),
                     "route policy tracing reads host routes; device-ordered passes keep local routes in the ring");
@@ -588,8 +590,8 @@ impl LaneFfn<'_, '_, '_> {
         let started = std::time::Instant::now();
         self.router.set_local_mode(false)?;
         let ring = self.router.ring_capture();
-        let routed = unsafe { if self.cooperative { self.router.execute_ffn_cooperative(&self.input, image_mask).await? }
-            else { self.router.execute_ffn(&self.input, image_mask)? } };
+        let routed = unsafe { if self.cooperative { self.router.execute_ffn_cooperative(&self.input, image_mask, self.usage_phase).await? }
+            else { self.router.execute_ffn(&self.input, image_mask, self.usage_phase)? } };
         if let Some(capture) = self.route_capture.as_deref_mut().filter(|_| !ring) {
             unsafe { routed.capture_route_ids(self.library, &mut capture[self.input.layer])?; }
         }
@@ -740,6 +742,7 @@ pub(crate) struct BackboneLane<'w, 'a> {
     router: BackboneRouterWave<'w, 'a>,
     layer: usize,
     phase: Phase,
+    usage_phase: cuteafd_ffi::expert_usage::UsagePhase,
     capture_routes: bool,
     /// Layer clock marks and the FFN stage split (routes or a live console).
     capture_timing: bool,
@@ -893,6 +896,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             router: first.router.wave(capacity, sizes[5])?,
             layer: first_layer,
             phase: Phase::Idle,
+            usage_phase: cuteafd_ffi::expert_usage::UsagePhase::Prefill,
             capture_routes: false,
             capture_timing: false,
             retain_small_shapes: false,
@@ -917,7 +921,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             shared: first.shared.as_ref().zip(storage.shared.as_ref()).map(|(w,s)| w.on_storage(s.clone())).transpose()?,
             sparse: Some(SparseAttentionWave::on_storage(storage.sparse.clone())?), dual_sparse: None,
             capacity: storage.unit as usize, router: first.router.on_storage(storage.router.clone())?,
-            layer: storage.first_layer, phase: Phase::Idle, capture_routes: false, capture_timing: false,
+            layer: storage.first_layer, phase: Phase::Idle, usage_phase: cuteafd_ffi::expert_usage::UsagePhase::Prefill, capture_routes: false, capture_timing: false,
             retain_small_shapes: false, route_capture: Vec::new(), ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?, l2: None,
         })
@@ -1154,7 +1158,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         ensure!(self.phase == Phase::Ffn, "backbone lane FFN unavailable");
         let input = self.block.ffn_input(binding)?;
         Ok(LaneFfn {
-            input, cooperative, shared: &mut self.shared, router: &mut self.router,
+            input, usage_phase: self.usage_phase, cooperative, shared: &mut self.shared, router: &mut self.router,
             library: self.weights.library, phase: &mut self.phase,
             route_capture: if self.capture_routes { Some(&mut self.route_capture) } else { None },
             ffn_split: if self.capture_timing { Some(&mut self.ffn_split) } else { None },
@@ -1221,6 +1225,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.phase = Phase::Ffn;
         Ok(LaneFfn {
             input,
+            usage_phase: self.usage_phase,
             cooperative: false,
             shared: &mut self.shared,
             router: &mut self.router,
@@ -1448,7 +1453,12 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if let Some(dual) = &mut self.dual_sparse { dual.install_attention_plan(plan) }
         else { self.sparse.as_mut().context("attention wave absent")?.install_attention_plan(plan) }
     }
+    pub(crate) fn install_expert_usage(&mut self, usage: Option<std::rc::Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>) {
+        self.router.install_expert_usage(usage);
+    }
     pub fn set_attention_decode(&mut self, decode: bool) {
+        self.usage_phase = if decode { cuteafd_ffi::expert_usage::UsagePhase::Decode }
+            else { cuteafd_ffi::expert_usage::UsagePhase::Prefill };
         if let Some(dual) = &mut self.dual_sparse { dual.set_decode(decode); }
         else if let Some(sparse) = &mut self.sparse { sparse.set_decode(decode); }
         // Prefill never prefetches: its own work fills the exchange.

@@ -719,7 +719,7 @@ esac
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 # Pass loader-resolved values: the planner's plain config parser does not parse
 # shell quoting/comments or supply the loader's default Spark inventory.
-count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" DSPARK_DRAFT_LIMIT "$dspark_draft_limit"
+count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" DSPARK_DRAFT_LIMIT "$dspark_draft_limit" EXPERT_USAGE "$(get EXPERT_USAGE off)"
   for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
     host_key="SPARK_${rank}_HOST"
     printf '%s=%s\n' "$host_key" "${!host_key}"
@@ -1089,6 +1089,11 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+case "$(get EXPERT_USAGE off)" in
+  on) args+=(--expert-usage) ;;
+  off) ;;
+  *) release_die "EXPERT_USAGE must be on or off" ;;
+esac
 release_kv_reserve_args v41_kv_args
 args+=("${v41_kv_args[@]}")
 # Loop abort (boot-time only): unset keeps the daemon's shipped defaults.

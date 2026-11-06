@@ -71,6 +71,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     })?;
     memory_checkpoint("after native preload")?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    let usage = super::expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
     // Dense owners allocate exactly as through the mount; with coordinator push
     // possible their bytes are recorded and arrive in the Spark push group.
     let pushing = super::coordinator_push::wanted(&args, &catalog)?;
@@ -257,6 +258,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    pass.install_expert_usage(usage.clone());
+    second.install_expert_usage(usage.clone());
     memory_checkpoint("decode lanes")?;
     // The prefill slots: one storage set per GPU (row planes at the reserve,
     // scratch at the unit cap), each slot's host objects on it.
@@ -315,6 +318,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             Duration::from_secs(120),
         )
     }).collect::<Result<Vec<_>>>().context("constructing distributed prefill slots")?;
+    for pass in &mut slot_passes { pass.install_expert_usage(usage.clone()); }
     // The slots hold their components' storage; the set itself owns nothing
     // more (WP7: a held LaneStorage would keep the replaced sparse arena alive).
     drop((lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage,

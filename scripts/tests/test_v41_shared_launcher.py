@@ -186,7 +186,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         draft_limit = command[command.index("--dspark-draft-limit") + 1] if "--dspark-draft-limit" in command else ""
         available = int(expected[expected.index("--available-sparks") + 1])
         normalized = (f"TP2_DSPARK_EXPERTS={'on' if enabled else 'off'}\nSPECULATOR=dspark\n"
-                      f"DSPARK_DRAFT_LIMIT={draft_limit}\n"
+                      f"DSPARK_DRAFT_LIMIT={draft_limit}\nEXPERT_USAGE=off\n"
                       + ''.join(f"SPARK_{rank}_HOST={host}\n" for rank, host in enumerate(HOSTS[:available])))
         digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
         mount_index = expected.index("-v") + 2

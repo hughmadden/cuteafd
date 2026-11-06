@@ -395,6 +395,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         Ok(())
     }
+    pub(crate) fn install_expert_usage(&mut self, usage: Option<std::rc::Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>) {
+        for lane in &mut self.resources.lanes { lane.get_mut().install_expert_usage(usage.clone()); }
+    }
     pub fn set_attention_decode(&mut self, decode: bool) {
         for lane in &mut self.resources.lanes { lane.get_mut().set_attention_decode(decode); }
     }
