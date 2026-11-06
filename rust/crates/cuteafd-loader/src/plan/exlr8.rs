@@ -259,6 +259,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
     let mut memory = memory;
     append_spark_devices(&mut memory, layout, &residents);
+    append_spark_encoder(&mut memory, report.encoder.as_ref())?;
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
     if !model.contract_admission() {
@@ -296,6 +297,21 @@ fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
         items: vec![Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact)],
         kv_tokens: 0,
     }));
+}
+
+fn append_spark_encoder(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
+    encoder: Option<&super::encoder::EncoderPlacement>) -> Result<()> {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, Item};
+    if let Some(encoder) = encoder {
+        for rank in encoder.spark_ranks() {
+            let device = memory.devices.iter_mut().find(|device|
+                device.kind == DeviceKind::Spark && device.index as usize == rank)
+                .with_context(|| format!("EXLR8 vision owner Spark{rank} has no device ledger"))?;
+            device.items.push(Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact));
+            device.items.push(Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula));
+        }
+    }
+    Ok(())
 }
 
 fn served_routed_layers(input: &residency::MetadataInput, layers: &[usize]) -> Result<()> {
@@ -1286,6 +1302,27 @@ mod tests {
         let body = include_str!("exlr8.rs").split("pub(super) fn native_plan_of(").nth(1).unwrap()
             .split("fn append_spark_devices(").next().unwrap();
         assert!(body.contains("append_spark_devices(&mut memory, layout, &residents)"));
+    }
+
+    #[test]
+    fn native_min_vision_weights_and_scratch_are_on_spark_zero() {
+        use cuteafd_core::memory_layout::{Category, DeviceKind, MemoryLayout};
+        let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 2097152,
+            waste: Vec::new(), notes: Vec::new() };
+        let encoder = super::super::encoder::EncoderPlacement {
+            kind: super::super::encoder::EncoderKind::Spark { rank: 0 },
+            weights: 1_128_026_176, scratch: 791_907_584, replicas: Vec::new(),
+            reason: "bundled tower".into(), shortfall: 0,
+        };
+        append_spark_devices(&mut memory, &Default::default(), &[105_213_559_040]);
+        append_spark_encoder(&mut memory, Some(&encoder)).unwrap();
+        let device = &memory.devices[0];
+        assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
+        assert_eq!(device.items.len(), 3);
+        assert_eq!((device.items[1].category, device.items[1].bytes), (Category::Weights, encoder.weights));
+        assert_eq!((device.items[2].category, device.items[2].bytes), (Category::Workspace, encoder.scratch));
+        assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), 107_133_492_800);
+        assert_eq!(memory.pool_tokens, 2097152);
     }
 
     fn write(path: &Path, metadata: Value, tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)>) {
