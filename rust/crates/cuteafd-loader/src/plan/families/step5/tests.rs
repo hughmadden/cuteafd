@@ -2025,3 +2025,102 @@ fn hqa_modes_bind_distinct_identities_and_compact_needs_no_native_shard() -> any
     assert!(CheckpointView::select(fixture.path(), AttentionMode::Compact).is_err());
     Ok(())
 }
+
+#[test]
+fn hqa_preweight_selection_is_exact_and_refuses_changed_native_owners() -> anyhow::Result<()> {
+    use crate::{placement::inventory::{ProgramsManifest, ProgramSet}, plan::checkpoint::{AttentionMode, CheckpointView}};
+    use cuteafd_ffi::draft_projection::ProjectionOutput;
+    let fixture = hqa_snapshot();
+    let checkpoint = Checkpoint::open_view(&CheckpointView::select(fixture.path(), AttentionMode::Hqa)?)?;
+    let cfg = Config::parse(&checkpoint)?;
+    let contract = coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+    let entry = |k: usize, output: ProjectionOutput| serde_json::json!({
+        "name":output.program_name(k, 4096), "capacity_rows":4096,
+        "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
+        "scalars":[{"type":"int32"}], "scratch_bytes_at_capacity":{},
+        "geometry":{"width":k,"outputs":4096,"output_dtype":output.torch_dtype(),
+            "reduction":"ordered_k16","tiles_by_rows":[[1,16,32,2]]}});
+    let manifest = serde_json::json!({"programs":[entry(12288, ProjectionOutput::Bf16),
+        entry(6144, ProjectionOutput::F32), {"name":"step5_hidden_norm"}]});
+    let typed = ProgramsManifest::from_manifest(&manifest)?;
+    let selection = native::NativeSelection::resolve(&contract, &cfg, 2, 3, 2048, Some(&typed))?;
+    assert_eq!(selection.requirements.len(), 95);
+    assert_eq!(selection.resolved.programs, ["draft_bf16_k12288_n4096", "draft_bf16_k6144_n4096_f32"]);
+    assert_eq!(selection.resolved.fp8_scratch_bytes, 0);
+    assert!(native::NativeSelection::resolve(&contract, &cfg, 2, 3, 2048,
+        Some(&ProgramsManifest::default())).is_err());
+    let mut programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
+    selection.augment_programs(&mut programs);
+    assert_eq!(programs.names.len(), 3);
+    let modes = (0..cfg.layers).map(|layer| if cfg.full[layer] {
+        crate::placement::LayerMode::Whole { gpu: u8::from(layer >= 44), ffn: crate::placement::FfnMode::Owner }
+    } else { crate::placement::LayerMode::HeadSplit }).collect::<Vec<_>>();
+    let owners = ownership::ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0))?;
+    for rank in 0..2 {
+        let layout = coordinator::RankWeightLayout::from_contract(&contract, &cfg, rank, 2, Some(&owners))?;
+        selection.validate_layout(&layout, 2048)?;
+        let name = "model.layers.0.self_attn.o_proj.weight";
+        for change in 0..5 {
+            let mut bad = layout.clone();
+            let at = bad.operands.iter().position(|operand| operand.name == name).unwrap();
+            match change {
+                0 => bad.operands[at].shape[1] += 128,
+                1 => bad.operands[at].dtype = DType::F32,
+                2 => bad.operands[at].slice = coordinator::WeightSlice::Replicated,
+                3 => bad.operands[at].allocation_bytes += 256,
+                _ => { bad.operands.remove(at); }
+            }
+            let error = selection.validate_layout(&bad, 2048).unwrap_err();
+            assert!(error.downcast_ref::<native::NativeOwnerMismatch>().is_some(), "{error:#}");
+        }
+        assert!(selection.validate_layout(&layout, 2049).unwrap_err()
+            .downcast_ref::<native::NativeOwnerMismatch>().is_some());
+    }
+    let mtp = coordinator::RankWeightLayout::mtp_from_contract(&checkpoint, &contract, 3)?;
+    selection.validate_layout(&mtp, 2048)?;
+    let tp1 = native::NativeSelection::resolve(&contract, &cfg, 1, 0, 64, Some(&typed))?;
+    assert_eq!(tp1.requirements.len(), 92);
+    assert_eq!(tp1.resolved.programs, ["draft_bf16_k12288_n4096"]);
+    Ok(())
+}
+
+#[test]
+fn hqa_compact_and_legacy_code_allowance_matches_old_formula_on_same_manifest() -> anyhow::Result<()> {
+    use crate::{placement::inventory::{self, ArchContext, ProgramSet}, plan::checkpoint::{AttentionMode, CheckpointView}};
+    let hqa = hqa_snapshot();
+    let legacy = snapshot("fp8");
+    let checkpoints = [Checkpoint::open_view(&CheckpointView::select(hqa.path(), AttentionMode::Compact)?)?,
+        Checkpoint::open(legacy.path())?];
+    for checkpoint in checkpoints {
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+        for ranks in [1, 2] {
+            let selection = native::NativeSelection::resolve(&contract, &cfg, ranks, 3, 2048, None)?;
+            assert!(selection.requirements.is_empty());
+            assert!(selection.resolved.programs.is_empty());
+            for count in [15, 16, 17, 31, 32, 33] {
+                let mut entries = (0..count).map(|n| serde_json::json!({"name":format!("step5_op{n}")}))
+                    .collect::<Vec<_>>();
+                entries.extend((0..17).map(|n| serde_json::json!({"name":format!("step52_op{n}")})));
+                entries.extend((0..65).map(|n| serde_json::json!({"name":format!("draft_bf16_unselected_{n}")})));
+                let manifest = serde_json::json!({"programs":entries});
+                let prefixes = native::program_prefixes(ranks == 2);
+                let old = ProgramSet::from_manifest(&manifest, prefixes);
+                let mut selected = old.clone();
+                selection.augment_programs(&mut selected);
+                assert_eq!(selected.names, old.names);
+                for rank in 0..ranks {
+                    let arch = ArchContext::coordinator(inventory::PRO_TOTAL_BYTES, None);
+                    let before = inventory::loaded_code_allowance("step5", "exl3-step5-k46", ranks == 2,
+                        rank as u8, &arch, Some(&old));
+                    let after = inventory::loaded_code_allowance("step5", "exl3-step5-k46", ranks == 2,
+                        rank as u8, &arch, Some(&selected));
+                    assert_eq!(after.bytes, before.bytes);
+                    assert_eq!(after.pending(arch.context_bytes, arch.context_bytes),
+                        before.pending(arch.context_bytes, arch.context_bytes));
+                }
+            }
+        }
+    }
+    Ok(())
+}

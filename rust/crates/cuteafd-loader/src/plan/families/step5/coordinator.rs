@@ -22,7 +22,7 @@ pub struct CoordinatorContract {
     pub rope_tables: crate::plan::rope::Tables,
     pub router: SigmoidRouter,
     pub layers: Vec<LayerContract>,
-    mtp_declarations: Vec<(String, Vec<usize>, DType)>,
+    pub(super) mtp_declarations: Vec<(String, Vec<usize>, DType)>,
 }
 
 /// Official target norms all receive config.rms_norm_eps, including the

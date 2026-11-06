@@ -35,6 +35,7 @@ fn draft_homes(ownership: &ExecutionOwnership, catalog: &cuteafd_loader::Officia
 pub(super) struct NativePlan {
     pub(super) contract: Rc<CoordinatorContract>,
     pub(super) layouts: Vec<RankWeightLayout>,
+    pub(super) native_selection: Option<Rc<cuteafd_loader::plan::families::step5::native::NativeSelection>>,
 }
 impl NativePlan {
     pub(super) fn new(checkpoint: &Checkpoint, ownership: &ExecutionOwnership,
@@ -43,7 +44,16 @@ impl NativePlan {
         let layouts = (0..ownership.ranks()).map(|rank|
             RankWeightLayout::from_contract(&contract, &cfg, rank, ownership.ranks(), Some(ownership)))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { contract, layouts })
+        Ok(Self { contract, layouts, native_selection: None })
+    }
+
+    pub(super) fn with_selection(mut self, checkpoint: &Checkpoint, depth: usize, rows: usize,
+        selection: Rc<cuteafd_loader::plan::families::step5::native::NativeSelection>) -> Result<Self> {
+        for layout in &self.layouts { selection.validate_layout(layout, rows)?; }
+        let mtp = RankWeightLayout::mtp_from_contract(checkpoint, &self.contract, depth)?;
+        selection.validate_layout(&mtp, rows)?;
+        self.native_selection = Some(selection);
+        Ok(self)
     }
 
     fn layer(&self, rank: usize, layer: usize) -> Result<(&CoordinatorContract, &RankWeightLayout)> {

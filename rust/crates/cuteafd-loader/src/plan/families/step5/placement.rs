@@ -94,16 +94,19 @@ pub(super) fn layout(
         .workspace_manifest
         .as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(path)
-            .context("Step-5 native admission requires its matching PROGRAMS.json")?,
-    )?;
+    let manifest = input.manifest(path)
+        .context("Step-5 native admission requires its matching PROGRAMS.json")?;
+    let typed_manifest = input.programs_manifest(path)?;
+    let contract = super::coordinator::CoordinatorContract::from_model(input.checkpoint(), model)?;
+    let native_selection = super::native::NativeSelection::resolve(&contract, &model.cfg, coordinators,
+        opts.native_mtp_layers, checked_rows, Some(&typed_manifest))?;
     ensure!(
         manifest["capacities"]["max_context"] == model.cfg.max_context,
         "Step-5 exports require the checkpoint's 1M compiled extent"
     );
     let prefixes = super::native::program_prefixes(coordinators == 2);
-    let programs = ProgramSet::from_manifest(&manifest, prefixes);
+    let mut programs = ProgramSet::from_manifest(&manifest, prefixes);
+    native_selection.augment_programs(&mut programs);
     let entries = manifest["programs"]
         .as_array()
         .context("Step-5 program manifest lacks entries")?;
@@ -180,7 +183,6 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let contract = super::coordinator::CoordinatorContract::from_model(input.checkpoint(), model)?;
     let inputs = RuntimeInputs { host: super::admission::HostInputs {
             memory: crate::plan::layout::recipe_host_memory(opts)?, cache_bytes: opts.host_cache_bytes,
             headroom: 8 << 30,
@@ -208,6 +210,14 @@ pub(super) fn layout(
             checked_rows, coordinators, waves, opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto))?,
     };
     let admitted = admission::admit_mtp_with_contract(input.checkpoint(), &inputs, opts.native_mtp_layers, &contract)?;
+    for rank in 0..coordinators {
+        let layout = super::coordinator::RankWeightLayout::from_contract(&contract, &model.cfg, rank,
+            coordinators, Some(&admitted.ownership))?;
+        native_selection.validate_layout(&layout, checked_rows)?;
+    }
+    let mtp = super::coordinator::RankWeightLayout::mtp_from_contract(input.checkpoint(), &contract,
+        opts.native_mtp_layers)?;
+    native_selection.validate_layout(&mtp, checked_rows)?;
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     let mut host_items: Vec<_> = [planner::Location::HOST, planner::Location::PINNED].into_iter()
         .map(|location| admitted.solved.items(location)).collect::<Result<Vec<_>, _>>()?

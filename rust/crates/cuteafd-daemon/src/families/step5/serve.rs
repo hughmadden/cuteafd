@@ -286,8 +286,14 @@ fn with_backend<T>(args: &ServeArgs,
         args.prefill_packing, args.prefill_rows as usize)?;
     let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
         family: "step5", split_family: args.split_device.map(|_| "step52") };
+    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
+    let specs = programs.names().map(|name| programs.spec(name)).collect::<Result<Vec<_>>>()?;
+    let manifest = cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?;
+    let native_selection = std::rc::Rc::new(cuteafd_loader::plan::families::step5::native::NativeSelection::resolve(
+        &contract, &cfg, ids.len(), usize::from(args.mtp), args.prefill_rows as usize, Some(&manifest))?);
     let measured = RuntimeInventory::measure(&library, &ids, InventoryPhase::PreWeight, |id| {
-        programs.load_matching(|name| selected.contains(name))?;
+        programs.load_matching(|name| selected.contains(name)
+            || native_selection.resolved.programs.iter().any(|selected| selected == name))?;
         if let Some(other) = ids.iter().copied().find(|&other| other != id) {
             library.cuda_enable_peer(other)?;
             library.tp2_native_initialize()?;
@@ -299,8 +305,9 @@ fn with_backend<T>(args: &ServeArgs,
         }
         Ok(())
     })?;
-    let selected_programs = ProgramSet::from_names(
+    let mut selected_programs = ProgramSet::from_names(
         cuteafd_loader::plan::families::step5::native::program_prefixes(ids.len() == 2), programs.names());
+    native_selection.augment_programs(&mut selected_programs);
     let pending_code = ids.iter().enumerate().map(|(rank, &id)| crate::shared::inventory::pending_code(
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
@@ -317,7 +324,6 @@ fn with_backend<T>(args: &ServeArgs,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
-    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
     inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs {
         memory: cuteafd_loader::formats::mapped_preload::host_memory()?,
         cache_bytes: match args.prefix.host_cache_bytes {
@@ -332,7 +338,7 @@ fn with_backend<T>(args: &ServeArgs,
     let planning = std::time::Instant::now();
     // One admission: the contract prices every retained owner, and native ABIs
     // are validated against the ownership it selected.
-    let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract)?;
+    let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract, native_selection)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
     cuteafd_bench::context::set_resolved("max-context", &args.max_context.to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
