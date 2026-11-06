@@ -2670,6 +2670,9 @@ else: raise ValueError("idle-host launch needs an explicit inventory")
       vision_peers+=("$(get "SPARK_${encoder_rank}_LANE_A"):$encoder_port")
     done
     family_args+=(--vision-peers "$(IFS=,; printf '%s' "${vision_peers[*]}")" --encoder-plan-hash "$encoder_hash" --encoder-revision "$revision")
+    if [[ "$family" == glm5_flash ]]; then
+      family_args+=(--vision-peer-ranks "$(IFS=,; printf '%s' "${encoder_ranks[*]}")")
+    fi
   fi
   if [[ "$audio" != off ]]; then
     selected_audio="$(python3 -c '

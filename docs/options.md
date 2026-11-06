@@ -192,7 +192,7 @@ the launcher derives from them.
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower. `spark[:rank]` may use a media-only Spark when every expert layer is on RTX (include it in `SPARK_COUNT`); that rank starts only the tower, not expert transport. |
+| `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower. `spark[:rank]` may use a media-only Spark when every expert layer is on RTX (include it in `SPARK_COUNT`); that rank starts only the tower, not expert transport. GLM Flash passes physical tower ranks independently of expert peers, including sparse ranks and replicas. |
 | `AUDIO` | `auto` | `auto`, `off` | Bundled audio tower. |
 | `VISION_REPLICAS` | `1` | 1–8 | Vision replicas. |
 | `MEDIA_CACHE_BYTES` | engine | byte size | Media cache. |

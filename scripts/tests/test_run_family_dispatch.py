@@ -5166,3 +5166,29 @@ def test_expert_world_excludes_rank_two_media_worker(tmp_path, family):
     coordinator = next(shlex.split(line) for line in result.stderr.splitlines()
                        if "docker run -d" in line and "--max-output-tokens" in line)
     assert coordinator[coordinator.index("--peers") + 1] == "10.0.0.1:19441,10.0.0.2:19441"
+
+
+@pytest.mark.parametrize("vision_ranks", [(0,), (2,), (0, 2)])
+def test_glmf_expertless_vision_handoff_preserves_physical_ranks(tmp_path, vision_ranks):
+    placement = {"kind": {"kind": "spark", "rank": vision_ranks[0]},
+                 "replicas": list(vision_ranks[1:])}
+    roles = [dict(rank=rank, experts=False, layers=[], encoder=placement,
+                  audio_encoder=None, drafter=None) for rank in vision_ranks]
+    result = _family_launch_result(tmp_path, GLMF_VISION, "test/model",
+        "RTX_GPUS=1\nSPARK_COUNT=3\nSPECULATOR=off\nVISION=auto\nAUDIO=off\n",
+        extra_args=("--wip", "tower-ranks"), execute_workers=True,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_expert_world": 0,
+                      "spark_roles": roles, "encoder": placement, "encoder_plan_hash": "ab" * 32})
+    assert result.returncode == 0, result.stderr
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "cuteafd serve-glmf --snapshot" in line)
+    assert serve[serve.index("--vision-peer-ranks") + 1] == ",".join(map(str, vision_ranks))
+    assert serve[serve.index("--vision-peers") + 1] == ",".join(
+        f"10.0.0.{rank + 1}:19442" for rank in vision_ranks)
+    assert serve[serve.index("--vision") + 1] == f"spark:{vision_ranks[0]}"
+    assert "--local-experts" in serve
+    assert "--peers" not in serve
+    workers = [shlex.split(line) for line in result.stderr.splitlines()
+               if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    assert {int(worker[worker.index("--rank") + 1]) for worker in workers} == set(vision_ranks)
+    assert all("--encoder-only" in worker and "--world" not in worker for worker in workers)
