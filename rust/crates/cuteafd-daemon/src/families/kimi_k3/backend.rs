@@ -493,8 +493,7 @@ mod tests {
                 ensure!(sequences.iter().map(|s| s.tokens.len()).sum::<usize>() > 64,
                     "Kimi golden pack must cross the total-row arithmetic boundary");
                 if packed {
-                    self.engine.usage_phase(cuteafd_ffi::expert_usage::UsagePhase::Prefill);
-        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+                    let segments = crate::shared::prefill_packing::plan(&sequences.iter()
                         .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &backend.engine.packed_limits()?)?;
                     let starts = sequences.iter().map(|s| s.start).collect::<Vec<_>>();
                     let mut target = sequences.iter_mut().map(|s| (&mut *s.placement, s.tokens)).collect::<Vec<_>>();

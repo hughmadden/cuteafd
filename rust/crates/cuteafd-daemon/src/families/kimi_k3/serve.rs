@@ -12,7 +12,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "fp8")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,
     /// Aggregate executed routed-expert selections on each canonical producer GPU.
-    #[arg(long)] pub expert_usage: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
     #[arg(skip)] pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
@@ -233,7 +235,8 @@ mod tests {
 
     #[test]
     fn expert_usage_off_and_skip_have_no_reader_or_native_owners() -> Result<()> {
-        let off = args(&[])?;
+        assert!(args(&[])?.expert_usage);
+        let off = args(&["--expert-usage=false"])?;
         assert!(!off.expert_usage);
         assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
         assert!(args(&["--expert-usage"])?.expert_usage);
