@@ -455,6 +455,92 @@ mod tests {
     }
 
     #[test]
+    fn native_layouts_cover_mla_ownership_and_only_physical_kda_shards() -> Result<()> {
+        use crate::families::glm5_flash::core::NativeProjection;
+        let mla = "language_model.model.layers.3.self_attn";
+        let kda = "language_model.model.layers.0.self_attn";
+        let qa = format!("{mla}.q_a_proj");
+        let core = CoreInventory { projections: BTreeMap::from([(qa.clone(), CoreProjection {
+            stem: qa, shape: [1536, 7168], stored_outputs: 1536, bits: 6,
+            codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
+            split: CoreSplit::Whole, source_bytes: 0 })]),
+            native: BTreeMap::from([
+                (format!("{mla}.q_b_proj"), NativeProjection { shape: [18432, 1536], fp8: false, split: CoreSplit::Output }),
+                (format!("{mla}.o_proj"), NativeProjection { shape: [7168, 12288], fp8: false, split: CoreSplit::Input }),
+                (format!("{kda}.o_proj"), NativeProjection { shape: [7168, 12288], fp8: false, split: CoreSplit::Input }),
+            ]), ..Default::default() };
+        for ranks in [1, 2] {
+            let layouts = core.native_layouts(ranks)?;
+            assert_eq!(layouts.len(), if ranks == 1 { 3 } else { 5 });
+            for layout in &layouts {
+                assert_eq!(layout.rank, 0);
+                assert!(!layout.fp8);
+                let whole = layout.ranks == 1;
+                let qb = layout.stem.ends_with(".q_b_proj");
+                assert_eq!(layout.shape, if qb {
+                    [if whole { 18432 } else { 9216 }, 1536]
+                } else { [7168, if whole { 12288 } else { 6144 }] });
+                if layout.stem.starts_with(kda) { assert_eq!(layout.ranks, ranks); }
+            }
+            let shapes = core.native_geometries(ranks)?;
+            assert_eq!(shapes.len(), if ranks == 1 { 2 } else { 4 });
+            assert!(shapes.iter().all(|(_, _, fp8, _)| !fp8));
+            assert_eq!(shapes.iter().filter(|(_, _, _, partial)| *partial).count(), usize::from(ranks == 2));
+        }
+        assert!(core.native_layouts(3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_stages_validate_selected_capacity_precision_and_exact_scratch() -> Result<()> {
+        use crate::families::glm5_flash::core::NativeProjection;
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        for fp8 in [false, true] { for ranks in [1, 2] { for unit in [64, 2752] {
+            let core = CoreInventory { native: BTreeMap::from([
+                ("language_model.model.layers.0.self_attn.o_proj".into(),
+                    NativeProjection { shape: [7168, 12288], fp8, split: CoreSplit::Input }),
+                ("language_model.model.layers.3.self_attn.q_b_proj".into(),
+                    NativeProjection { shape: [18432, 1536], fp8, split: CoreSplit::Output }),
+            ]), ..Default::default() };
+            let entries = core.native_geometries(ranks)?.into_iter().map(|(k, n, _, partial)| {
+                let output = if partial { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 };
+                if fp8 {
+                    let capacity = if unit <= 64 { 64 } else { 4096 };
+                    let suffix = if partial { "_f32" } else { "" };
+                    serde_json::json!({"name":format!("native_attention_n{n}_k{k}_m{capacity}{suffix}"),
+                        "capacity_rows":capacity, "pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                        "scalars":[{"type":"int32"}], "scratch_bytes_at_capacity":{"scratch":8192},
+                        "geometry":{"input_features":k,"output_features":n,"output_dtype":output.torch_dtype(),
+                            "max_rows":capacity,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                            "reduction":"canonical_fp8_gemv64_w8a16"}})
+                } else {
+                    serde_json::json!({"name":output.program_name(k,n),"capacity_rows":4096,
+                        "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],"scalars":[{"type":"int32"}],
+                        "scratch_bytes_at_capacity":{},"geometry":{"width":k,"outputs":n,
+                            "output_dtype":output.torch_dtype(),"reduction":"ordered_k16",
+                            "tiles_by_rows":[[4096,1,4,16,64,6]]}})
+                }
+            }).collect::<Vec<_>>();
+            let manifest = serde_json::json!({"programs":entries});
+            let stages = core.native_package_stages(&manifest, 8256, unit, ranks)?;
+            assert_eq!(stages.get("native attention FP8 scratch").copied().unwrap_or(0), if fp8 { 8192 } else { 0 });
+            assert_eq!(stages.get("native attention F32 partial").copied().unwrap_or(0),
+                if ranks == 2 { 8256 * 7168 * 4 } else { 0 });
+            let mut missing = manifest.clone();
+            missing["programs"].as_array_mut().unwrap().pop();
+            assert!(core.native_package_stages(&missing, 8256, unit, ranks).is_err());
+            let mut wrong = manifest.clone();
+            wrong["programs"][0]["geometry"]["output_dtype"] = serde_json::json!("torch.float16");
+            assert!(core.native_package_stages(&wrong, 8256, unit, ranks).is_err());
+            if fp8 {
+                let other = if unit <= 64 { 2752 } else { 64 };
+                assert!(core.native_package_stages(&manifest, 8256, other, ranks).is_err());
+            }
+        } } }
+        Ok(())
+    }
+
+    #[test]
     fn runtime_groups_allow_bf16_kda_fallback_but_name_partial_groups() -> Result<()> {
         let cfg=KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config())?;
         let mut core=CoreInventory::default();
