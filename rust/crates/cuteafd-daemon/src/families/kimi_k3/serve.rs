@@ -8,6 +8,8 @@ use cuteafd_loader::families::kimi_k3::{COMPILED_CONTEXT, DEFAULT_CONTEXT};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     /// Target and drafter share the exact selected MLA record.
     #[arg(long, default_value = "fp8")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,

@@ -66,15 +66,40 @@ fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
     }
 }
 
+/// Every qualified serve/golden entry stores the bundle before media or engine setup.
+fn command_attention(command: &mut Commands) -> Option<(&std::path::Path, &mut cli::AttentionArgs)> {
+    match command {
+        Commands::ServeGlmf(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::GlmfGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::ServeGlm(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::GlmGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::ServeKimi(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::KimiGolden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::ServeStep5(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::Step5Golden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::ServeMuse(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::MuseGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        _ => None,
+    }
+}
+
+fn select_command_attention(command: &mut Commands,
+    selected: Option<cuteafd_loader::plan::checkpoint::CheckpointView>) -> Result<()> {
+    if let Some((snapshot, attention)) = command_attention(command) {
+        let view = selected.map(Ok).unwrap_or_else(|| attention.select(snapshot))?;
+        attention.validate_view(&view)?;
+        attention.selected_view = Some(view);
+    }
+    Ok(())
+}
+
 fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::MediaMode,
     audio: cuteafd_loader::plan::MediaMode) -> Result<(cuteafd_loader::plan::MediaMode, cuteafd_loader::plan::MediaMode)> {
     use cuteafd_loader::plan::MediaMode;
     // Once selected, a missing view is an error, never permission to reopen defaults.
-    let selected = match &*command {
-        Commands::ServeGlmf(args) => Some(args.engine.selected_view.as_ref()
-            .context("GLM Flash media requires its selected checkpoint view")?.config()?),
-        _ => None,
-    };
+    let selected = command_attention(command).map(|(_, attention)| {
+        attention.selected_view.as_ref().context("media requires its selected checkpoint view")?.config()
+    }).transpose()?;
     let Some(options) = serve_media(command) else {
         anyhow::ensure!(matches!(audio, MediaMode::Auto | MediaMode::Off),
             "explicit audio placement requires a media-capable serve command");
@@ -176,10 +201,24 @@ mod media_defaults_tests {
         use clap::Parser;
         let mut command = super::cli::Cli::try_parse_from(["cuteafd", name, "--snapshot", snapshot.to_str().unwrap(),
             "--native-lib", "/native.so"]).unwrap().command;
-        if let super::Commands::ServeGlmf(args) = &mut command {
-            args.engine.selected_view = Some(args.engine.attention.select(snapshot).unwrap());
-        }
+        super::select_command_attention(&mut command, None).unwrap();
         command
+    }
+
+    #[test]
+    fn attention_qualification_is_per_checkpoint_variant() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#)?;
+        std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}")?;
+        for model in ["glm5_next", "glm_moe_dsa", "mistral_large4_text", "kimi_k3", "step5", "muse_spark_text", "unknown"] {
+            std::fs::write(root.path().join("config.compact-attention.json"),
+                serde_json::json!({"text_config":{"model_type":model}}).to_string())?;
+            let view = CheckpointView::select(root.path(), AttentionMode::Compact)?;
+            let attention = super::cli::AttentionArgs { compact_attention: true, ..Default::default() };
+            assert_eq!(attention.validate_view(&view).is_ok(), model == "glm5_next", "{model}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -196,7 +235,7 @@ mod media_defaults_tests {
         let super::Commands::ServeGlmf(args) = &mut command else { unreachable!() };
         let view = args.engine.attention.select(root.path())?;
         let fingerprint = view.fingerprint().to_owned();
-        args.engine.selected_view = Some(view.clone());
+        args.engine.attention.selected_view = Some(view.clone());
         std::fs::remove_file(root.path().join("config.compact-attention.json"))?;
         assert_eq!(super::resolve_serve_media(&mut command, MediaMode::Auto, MediaMode::Auto)?,
             (MediaMode::Auto, MediaMode::Off));
@@ -320,19 +359,21 @@ async fn run() -> Result<()> {
     for replacement in cli::deprecated_budget_flags(std::env::args()) {
         eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
     }
+    let mut selected_view = None;
     // `serve` and `golden` pick the family and stand for its own command.
     let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget) = match command {
-        Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
-            Some(argv) => parse(Cli::command().get_matches_from(argv)),
+        Commands::Serve(args) => match commands::family::resolve(commands::family::Kind::Serve, args)? {
+            Some(resolved) => { selected_view = resolved.view; parse(Cli::command().get_matches_from(resolved.argv)) },
             None => return Ok(()),
         },
-        Commands::Golden(args) => match commands::family::argv(commands::family::Kind::Golden, args)? {
-            Some(argv) => parse(Cli::command().get_matches_from(argv)),
+        Commands::Golden(args) => match commands::family::resolve(commands::family::Kind::Golden, args)? {
+            Some(resolved) => { selected_view = resolved.view; parse(Cli::command().get_matches_from(resolved.argv)) },
             None => return Ok(()),
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
             initial_wait, initial_reply, initial_weight_budget),
     };
+    select_command_attention(&mut command, selected_view)?;
     cuteafd_core::spark_reply::set_requested(cuteafd_core::spark_reply::SparkReplyFormats {
         prefill: family_reply.prefill.or(initial_reply.prefill),
         decode: family_reply.decode.or(initial_reply.decode),
@@ -353,11 +394,10 @@ async fn run() -> Result<()> {
     // mark images. Planner-resolved peers are an explicit placement and keep serving's refusal.
     let vision = match &mut command {
         Commands::ServeGlmf(args) => {
-            let view = args.engine.attention.select(&args.engine.snapshot)?;
+            let view = args.engine.attention.selected_view.as_ref().context("selected Flash view")?;
             let (vision, note) = if args.vision_peers.is_none() {
                 families::glm5_flash::serve::auto_vision_view(vision, &view, args.chat_template_from.as_deref())?
             } else { (vision, None) };
-            args.engine.selected_view = Some(view);
             if let Some(note) = note { tracing::warn!("{note}"); }
             vision
         }

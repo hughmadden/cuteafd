@@ -49,7 +49,7 @@ fn metadata_bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn check_references(value: &Value, quant_names: &[String], index: &str) -> Result<()> {
+fn check_references(value: &Value, quant_names: &[String], index: &str, aliases: &[String]) -> Result<()> {
     match value {
         Value::Object(object) => for (key, value) in object {
             if key == "per_module_metadata" {
@@ -59,14 +59,47 @@ fn check_references(value: &Value, quant_names: &[String], index: &str) -> Resul
                     "attention bundle references unselected quantization metadata {reference}");
             }
             if key == "transformers_weights" && !value.is_null() {
-                ensure!(value.as_str() == Some(index), "attention bundle references unselected index {value}");
+                ensure!(value.as_str().is_some_and(|name| name == index || aliases.iter().any(|alias| alias == name)), "attention bundle references unselected index {value}");
             }
-            check_references(value, quant_names, index)?;
+            check_references(value, quant_names, index, aliases)?;
         },
-        Value::Array(values) => for value in values { check_references(value, quant_names, index)?; },
+        Value::Array(values) => for value in values { check_references(value, quant_names, index, aliases)?; },
         _ => (),
     }
     Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("attention index alias {alias}: {reason}")]
+pub struct InvalidIndexAlias { pub alias: String, pub reason: &'static str }
+
+fn index_aliases(snapshot: &Path, config: &Value, mode: AttentionMode, canonical: &str) -> Result<Vec<String>> {
+    let declaration = config.pointer("/quantization_config/attention_view");
+    // Compact metadata intentionally omits the HQA declaration; consult only its
+    // small default config when an alternate index name needs authorization.
+    let default_config;
+    let declared = super::index_name_from_config(config)?;
+    let declaration = if declaration.is_none() && mode == AttentionMode::Compact && declared != canonical {
+        default_config = serde_json::from_slice::<Value>(&metadata_bytes(&snapshot.join("config.json"))?)?;
+        default_config.pointer("/quantization_config/attention_view")
+    } else { declaration };
+    let key = if mode == AttentionMode::Compact { "compact-attention" } else { "hqa" };
+    let aliases: Vec<String> = declaration.and_then(|v| v.get("index_aliases")).and_then(|v| v.get(key))
+        .map(|v| serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
+    for alias in &aliases {
+        if !alias.ends_with(".index.json") || alias.starts_with('.') || alias.contains(['/', '\\']) {
+            return Err(InvalidIndexAlias { alias: alias.clone(), reason: "invalid index filename" }.into());
+        }
+        let read_map = |name: &str| -> Result<Value> {
+            let value: Value = serde_json::from_slice(&metadata_bytes(&snapshot.join(name))?)?;
+            let map = value.get("weight_map").filter(|v| v.is_object()).context("index requires weight_map")?;
+            Ok(map.clone())
+        };
+        if read_map(alias)? != read_map(canonical)? {
+            return Err(InvalidIndexAlias { alias: alias.clone(), reason: "weight map differs from canonical index" }.into());
+        }
+    }
+    Ok(aliases)
 }
 
 impl CheckpointView {
@@ -80,7 +113,9 @@ impl CheckpointView {
             .with_context(|| format!("selecting {mode:?} attention bundle: {config_name}"))?;
         let config: Value = serde_json::from_slice(&config_bytes)?;
         let index_name = if mode == AttentionMode::Compact { COMPACT_INDEX.to_owned() }
+            else if config.pointer("/quantization_config/attention_view").is_some() { super::HF_INDEX.to_owned() }
             else { super::index_name_from_config(&config)? };
+        let aliases = index_aliases(snapshot, &config, mode, &index_name)?;
         let quant_names: Vec<String> = if mode == AttentionMode::Compact {
             for name in [COMPACT_INDEX, COMPACT_QUANT] {
                 ensure!(snapshot.join(name).is_file(), "incomplete compact attention bundle: missing {name}");
@@ -93,7 +128,7 @@ impl CheckpointView {
         let allowed_quant = if mode == AttentionMode::Compact { quant_names.clone() } else {
             ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"].map(str::to_owned).to_vec()
         };
-        check_references(&config, &allowed_quant, &index_name)?;
+        check_references(&config, &allowed_quant, &index_name, &aliases)?;
         let mut hash = Sha256::new();
         hash.update(b"cuteafd-attention-view-v1\0");
         hash.update(match mode { AttentionMode::Hqa => b"hqa".as_slice(),
@@ -109,7 +144,7 @@ impl CheckpointView {
             let value = if name == config_name { config.clone() } else {
                 crate::formats::exl3_storage::parse_storage_metadata(&path, &bytes, None)?
             };
-            check_references(&value, &allowed_quant, &index_name)?;
+            check_references(&value, &allowed_quant, &index_name, &aliases)?;
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
             metadata_digests.insert(name.to_owned(), Sha256::digest(&bytes).into());
@@ -185,6 +220,29 @@ mod tests {
             "per_module_metadata": format!("{quant}:tensor_storage")}}).to_string()).unwrap();
         std::fs::write(root.join(index), json!({"weight_map": {"a.weight": "a.safetensors"}}).to_string()).unwrap();
         std::fs::write(root.join(quant), "{}").unwrap();
+    }
+
+    #[test]
+    fn compact_aliases_require_declared_identical_maps_and_keep_canonical_identity() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        bundle(root.path(), true);
+        let alias = "consolidated.compact-attention.safetensors.index.json";
+        let mut config: Value = serde_json::from_slice(&std::fs::read(root.path().join(COMPACT_CONFIG))?)?;
+        config["transformers_weights"] = alias.into();
+        std::fs::write(root.path().join(COMPACT_CONFIG), config.to_string())?;
+        std::fs::write(root.path().join("config.json"), json!({"quantization_config":{"attention_view":{
+            "index_aliases":{"compact-attention":[alias]}}}}).to_string())?;
+        std::fs::copy(root.path().join(COMPACT_INDEX), root.path().join(alias))?;
+        let view = CheckpointView::select(root.path(), AttentionMode::Compact)?;
+        assert_eq!(view.index_name(), COMPACT_INDEX);
+        // Formatting and non-map metadata of an alias are not a second identity.
+        std::fs::write(root.path().join(alias), json!({"metadata":{},"weight_map":{"a.weight":"a.safetensors"}}).to_string())?;
+        assert_eq!(CheckpointView::select(root.path(), AttentionMode::Compact)?.fingerprint(), view.fingerprint());
+        std::fs::write(root.path().join(alias), r#"{"weight_map":{"a.weight":"wrong.safetensors"}}"#)?;
+        assert!(CheckpointView::select(root.path(), AttentionMode::Compact).unwrap_err().downcast_ref::<InvalidIndexAlias>().is_some());
+        std::fs::write(root.path().join("config.json"), "{}")?;
+        assert!(CheckpointView::select(root.path(), AttentionMode::Compact).is_err());
+        Ok(())
     }
 
     #[test]

@@ -166,9 +166,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     args.prefix.resolve_entries(max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let selected_view = args.engine.selected_view.clone().map(Ok)
+    let selected_view = args.engine.attention.selected_view.clone().map(Ok)
         .unwrap_or_else(|| args.engine.attention.select(&snapshot))?;
-    args.engine.selected_view = Some(selected_view.clone());
+    args.engine.attention.selected_view = Some(selected_view.clone());
     let encoding = if super::media::vision_config_view(args.vision, &selected_view)?.is_none() {
         GlmEncoding::from_snapshot_with_config(&snapshot, &selected_view.config()?)?
     } else {

@@ -230,6 +230,8 @@ pub(crate) fn exlr8_prefill_activations_parser()
 /// Model-lifetime attention bundle shared by planner, serve and golden commands.
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct AttentionArgs {
+    #[arg(skip)]
+    pub selected_view: Option<cuteafd_loader::plan::checkpoint::CheckpointView>,
     /// Load the parent's compact attention bundle instead of default native HQA attention.
     #[arg(long, conflicts_with = "fp8_compact_attention", env = "CUTEAFD_COMPACT_ATTENTION")]
     pub compact_attention: bool,
@@ -244,15 +246,29 @@ impl AttentionArgs {
         else if self.fp8_compact_attention { AttentionMode::Fp8Compact }
         else { AttentionMode::Hqa }
     }
-    pub fn validate_family(&self, family: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(self.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Hqa || family == "glm5_flash",
-            "alternate attention modes are unsupported for {family}; only glm5_flash is implemented");
+    pub fn validate_view(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> anyhow::Result<()> {
+        if self.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Hqa { return Ok(()); }
+        let config = view.config()?;
+        let text = config.get("text_config").filter(|v| v.is_object()).unwrap_or(&config);
+        let model_type = text["model_type"].as_str().unwrap_or("");
+        let supported = ATTENTION_VARIANTS.iter().any(|(models, enabled)| *enabled && models.contains(&model_type));
+        anyhow::ensure!(supported, "alternate attention modes are unsupported for checkpoint model_type={model_type}");
         Ok(())
     }
     pub fn select(&self, snapshot: &std::path::Path) -> anyhow::Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
         cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot, self.mode())
     }
 }
+
+// Qualification is per checkpoint variant, not daemon family: ML4 shares the GLM5 engine.
+const ATTENTION_VARIANTS: &[(&[&str], bool)] = &[
+    (&["glm5_next"], true),
+    (&["glm_moe_dsa"], false),
+    (&["mistral_large4", "mistral_large4_text"], false),
+    (&["kimi_k3"], false),
+    (&["step5", "step5_vl"], false),
+    (&["muse_spark", "muse_spark_text"], false),
+];
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {

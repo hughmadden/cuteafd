@@ -22,13 +22,15 @@ const SOURCE: [(&str, &str); 3] = [
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct GoldenArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     #[arg(long, default_value = "fp8")] kv_cache: cuteafd_core::MlaCacheFormat,
     /// Prefill unit rows for scoring chunks; unset keeps whole chunks as one unit.
     #[arg(long)] prefill_rows: Option<usize>,
     /// Prefill units in flight while scoring (N=1 against N=2 at the same
     /// units is byte-identical).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: u8,
-    #[arg(long)] snapshot: PathBuf,
+    #[arg(long)] pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
     /// Read-only cuteafd.kimi.layer-state/1 export, never a qualified reference panel.

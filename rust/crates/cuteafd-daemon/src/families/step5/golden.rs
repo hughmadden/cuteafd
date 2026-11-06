@@ -39,11 +39,13 @@ const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     /// Same immutable target KV storage as serving.
     #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long)]
-    snapshot: PathBuf,
+    pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]

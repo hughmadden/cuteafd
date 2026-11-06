@@ -13,6 +13,8 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,

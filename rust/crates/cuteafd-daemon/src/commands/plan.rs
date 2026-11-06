@@ -317,7 +317,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         &inventory
     };
     let family = cuteafd_loader::plan::family::detect(checkpoint).map_or("", |family| family.id());
-    args.attention.validate_family(family)?;
+    args.attention.validate_view(&view)?;
     validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
