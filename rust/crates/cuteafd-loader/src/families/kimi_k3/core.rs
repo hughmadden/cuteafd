@@ -673,9 +673,32 @@ mod tests {
         let expected = testing::kimi_k3_tensors(false).into_iter().map(|(n, _, s)| (n, s)).collect();
         let mut charges = Vec::new();
         for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
-            let checkpoint = Checkpoint::open_view(&CheckpointView::select(dir.path(), mode)?)?;
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let checkpoint = Checkpoint::open_view(&view)?;
             let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
             let core = CoreInventory::from_checkpoint(&cfg, &checkpoint, &expected)?;
+            // Worker role selection opens the mixed core before ordinary headers
+            // load; declared native headers must coexist with K6 discovery.
+            let inventory = Checkpoint::inventory_view(&view)?;
+            let eager = CoreInventory::from_checkpoint(&cfg, &inventory, &expected)?;
+            assert!(!eager.projections.is_empty());
+            assert_eq!(eager.projections.keys().collect::<Vec<_>>(), core.projections.keys().collect::<Vec<_>>());
+            assert_eq!(eager.native, core.native);
+            for role in [crate::plan::files::ReadRole::Coordinator { local_experts: false, speculator: false },
+                crate::plan::files::ReadRole::Spark { rank: 0, world: 6 }] {
+                let selected = crate::plan::files::required_tensors(&inventory, role)?;
+                let opened = crate::plan::files::open_role_view(&view, role)?;
+                assert!(!selected.is_empty());
+                for (name, _, _) in &restored {
+                    assert!(inventory.has_header(name));
+                    assert_eq!(selected.contains(name), matches!(role,
+                        crate::plan::files::ReadRole::Coordinator { .. }));
+                    if selected.contains(name) {
+                        let stem = name.strip_suffix(".weight").unwrap();
+                        assert_eq!(inventory.projection(stem)?.storage, opened.projection(stem)?.storage);
+                    }
+                }
+            }
             assert_eq!(core.native.len(), restored.len());
             assert!(core.native.values().all(|p| p.fp8 == (mode == AttentionMode::Fp8Compact)));
             let largest = checkpoint.tensors.iter().filter(|tensor| checkpoint.contains_tensor(&tensor.meta.name)
