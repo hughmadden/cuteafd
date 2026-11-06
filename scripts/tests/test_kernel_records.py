@@ -145,6 +145,32 @@ def test_stage0_candidates_require_globals_and_all_recorded_reads(tmp_path):
     assert records.job_candidates(tmp_path, {"stage0_inputs": inputs}, inputs) == ["missing-recorded-reads"]
 
 
+def test_job_replay_checksums_and_verify_skips_reject_ir_drift(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("replay_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    previous = tmp_path / "previous"
+    directory = previous / ".workers/programs"
+    directory.mkdir(parents=True)
+    context = {"stage0_inputs": {"global": "same"}, "source_reads_sha256": {"kernel.py": "unused"}}
+    (directory / "comparison-context.json").write_text(json.dumps(context))
+    (directory / "program-records.json").write_text(json.dumps({"kernel.o": {"ir_sha256": "old"}}))
+    files = {str(path.relative_to(previous)): records.digest(path.read_bytes()) for path in directory.iterdir()}
+    (previous / "INPUTS.json").write_text(json.dumps({"files": files}))
+    assert publisher.verified_job_files(previous, "programs")[0] == directory
+    monkeypatch.setattr(publisher.kernel_records, "stage0_inputs", lambda *args: context["stage0_inputs"])
+    monkeypatch.setattr(publisher.kernel_records, "job_candidates", lambda *args: [])
+    def compile_worker(command, **kwargs):
+        output = Path(json.loads(command[-1])["output"])
+        (output / "program-records.json").write_text(json.dumps({"kernel.o": {"ir_sha256": "changed"}}))
+    monkeypatch.setattr(publisher.subprocess, "run", compile_worker)
+    with pytest.raises(ValueError, match="--verify-skips changed IR"):
+        publisher.compile_job(("programs", "x.py", []), tmp_path / "staging", previous, {}, 1, verify_skips=True)
+    (directory / "program-records.json").write_text("{}")
+    with pytest.raises(ValueError, match="corrupt replay"):
+        publisher.verified_job_files(previous, "programs")
+
+
 def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
