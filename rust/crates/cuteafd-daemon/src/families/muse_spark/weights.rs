@@ -6,7 +6,9 @@
 //! o_proj columns; everything else is whole. The residual gates are packed as
 //! F32 (alpha, beta) from the contract's host function, so the device kernel
 //! only applies them.
-use crate::shared::{dense_trellis::{CoreWeightLayout, CoreWeights}, memory::device::{Allocation, Device}};
+use crate::shared::{dense_trellis::{CoreWeightLayout, CoreWeights},
+    memory::{device::{Allocation, Device, DeviceOwner}, DeviceAllocation},
+    native_attention::{attention_records, AttentionRecord, NativeAttentionWeights}};
 use anyhow::{ensure, Context, Result};
 use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step};
 use cuteafd_core::DType;
@@ -185,10 +187,18 @@ pub(crate) struct LayerWeights<'a> {
     native: BTreeMap<&'static str, NativeWeights<'a>>,
 }
 
-pub(crate) struct NativeWeights<'a> {
-    pub layout: cuteafd_loader::families::muse_spark::core::NativeLayout,
-    pub values: Allocation<'a>,
-    pub scales: Option<Allocation<'a>>,
+pub(crate) type NativeWeights<'a> = DeviceOwner<'a, NativeAttentionWeights<'a>>;
+
+fn allocate_native<'a>(device: Device<'a>, layout: &cuteafd_loader::formats::native_attention::NativeLayout)
+    -> Result<NativeWeights<'a>> {
+    device.own(|| {
+        let _scope = cuteafd_ffi::memory_ledger::scope("weights/muse native attention");
+        let [n, k] = layout.shape;
+        let values = DeviceAllocation::new(device.library, n * k * if layout.fp8 { 1 } else { 2 })?;
+        let scales = layout.fp8.then(|| DeviceAllocation::new(device.library,
+            n.div_ceil(128) * k.div_ceil(128) * 4)).transpose()?;
+        Ok(NativeAttentionWeights { layout: layout.clone(), values, scales })
+    })
 }
 
 impl<'a> LayerWeights<'a> {
@@ -222,20 +232,17 @@ impl<'a> LayerWeights<'a> {
         ensure!(operands.len() == layout.operands.len() && operands.iter().all(|(name, allocation)|
             layout.operands.get(name) == Some(&allocation.buffer.bytes)), "Muse recorded operand inventory");
         let native = layout.native.iter().map(|(&name, layout)| {
-            use super::super::glm5_flash::weights::{attention_records, AttentionRecord};
-            let [n, k] = layout.shape;
-            let values = allocate(device, n * k * if layout.fp8 { 1 } else { 2 })?;
-            let scales = layout.fp8.then(|| allocate(device, n.div_ceil(128) * k.div_ceil(128) * 4)).transpose()?;
+            let weights = allocate_native(device, layout)?;
             let selected = checkpoint.projection(&layout.stem)?;
             for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.attention_mode(), layout,
-                crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
-                scales.as_ref().map(|scales| scales.buffer))? {
+                crate::shared::fp8_linear::Fp8Scales::Amax, weights.values.buffer,
+                weights.scales.as_ref().map(|scales| scales.buffer))? {
                 match record {
                     AttentionRecord::Operand(operand) => native_load.operand(operand)?,
                     AttentionRecord::Step(step) => native_load.step(step, std::ptr::null_mut())?,
                 }
             }
-            Ok((name, NativeWeights { layout: layout.clone(), values, scales }))
+            Ok((name, weights))
         }).collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self { operands, core, native })
     }
@@ -351,10 +358,35 @@ mod tests {
     }
 
     #[test]
+    fn shared_native_tp2_owners_destroy_values_and_scales_on_their_device() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::formats::{native_attention::NativeLayout, trellis_core::CoreSplit};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.strict_device_free(&library, true)?;
+        for fp8 in [false, true] {
+            let owners = (0..2).map(|rank| allocate_native(Device { library: &library, id: rank },
+                &NativeLayout { stem: format!("o.{rank}"), shape: [128, 128], fp8,
+                    rank: rank as usize, ranks: 2, split: CoreSplit::Input }))
+                .collect::<Result<Vec<_>>>()?;
+            for owner in owners {
+                let rank = owner.device.id;
+                assert_eq!(owner.values.buffer.device_id, rank);
+                assert_eq!(owner.scales.as_ref().map(|scales| scales.buffer.device_id), fp8.then_some(rank));
+                library.cuda_set_device(1 - rank)?;
+                drop(owner);
+                assert_eq!(library.cuda_get_device()?, 1 - rank);
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        Ok(())
+    }
+
+    #[test]
     fn native_attention_records_match_mode_residency_and_admitted_load() -> Result<()> {
         use cuteafd_loader::{families::muse_spark::core::{CoreSplit, NativeLayout},
             plan::{checkpoint::{AttentionMode, CheckpointView}, testing, Checkpoint}};
-        use super::super::super::glm5_flash::weights::{attention_records, AttentionRecord};
+        use crate::shared::native_attention::{attention_records, AttentionRecord};
         let dir = tempfile::tempdir()?;
         let stem = format!("{PREFIX}0.self_attn.o_proj");
         let mut config = testing::muse_spark_config();

@@ -150,7 +150,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         "Muse Spark keeps its embedding on the entry GPU");
     cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MUSE_SPARK)
         .map_err(|_| anyhow::anyhow!("Muse Spark serving needs an isolated process"))?;
-    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     cuteafd_bench::context::set_family(cfg.family_id());
@@ -158,7 +161,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let device_ids = args.devices();
     let gpus = device_ids.len();
     let manifest = startup::preflight(&args.manifest, gpus)?;
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     // SAFETY: every native owner drops on this worker before the library.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
     let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
@@ -229,9 +232,9 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
     let sequences = usize::from(args.max_sequences);
     let spark = super::admission::spark_plan(placement, prefill, cutoff, sequences, args.peers.len())?;
-    let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
+    let admission_plan = crate::shared::placement::SparkAdmission::plan_view(&view,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
-        spark.model.clone())?;
+        spark.model.clone(), None)?;
     let context = args.max_context.unwrap_or(cfg.max_position as u64);
     // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over
     // peer access), filled in the background while the layers load.
@@ -256,10 +259,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement,
             gpus, &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
         if admission_plan.coordinator_pushes() {
-            let (push, streams, ranks) = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), gpus, experts, built.push.clone())?;
+            let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(&view, Some(&catalog), gpus, experts, built.push.clone())?;
             Ok((push, Some((streams, ranks)), args.peers.len()))
         } else {
-            Ok((CoordinatorPush::prepare_alone_admitted(&args.snapshot, Some(&catalog), gpus, experts, built.push.clone())?, None, 0))
+            Ok((CoordinatorPush::prepare_alone_view_admitted(&view, Some(&catalog), gpus, experts, built.push.clone())?, None, 0))
         }
     })?;
     let (push, coordinator, push_sparks) = match prepared {
@@ -381,6 +384,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{chat::muse::MuseEncoding, ModelEncoding, ModelProfile};
     args.validate()?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    args.attention.selected_view = Some(view);
     args.prefix.resolve_entries(usize::from(args.max_sequences));
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();

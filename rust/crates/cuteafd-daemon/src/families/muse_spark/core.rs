@@ -263,9 +263,12 @@ mod tests {
             let registry = NativePrograms::load(&programs, device, &admitted)?;
             assert_eq!(registry.scratch.as_ref().unwrap().buffer.bytes, 2048);
             for owner in &owners {
-                let weight = super::super::weights::NativeWeights { layout: owner.layout.clone(),
-                    values: Allocation::new(device, 128 * 128 * if owner.layout.fp8 {1} else {2})?,
-                    scales: owner.layout.fp8.then(|| Allocation::new(device, 4)).transpose()? };
+                let weight = device.own(|| {
+                    use crate::shared::{memory::DeviceAllocation, native_attention::NativeAttentionWeights};
+                    Ok(NativeAttentionWeights { layout: owner.layout.clone(),
+                        values: DeviceAllocation::new(&library, 128 * 128 * if owner.layout.fp8 {1} else {2})?,
+                        scales: owner.layout.fp8.then(|| DeviceAllocation::new(&library, 4)).transpose()? })
+                })?;
                 let input = Allocation::new(device, (ceiling + 1) * 128 * 2)?;
                 device.run(|| library.copy_h2d(input.buffer, &7u32.to_ne_bytes()))?;
                 let output_bytes = if owner.output == ProjectionOutput::F32 {4} else {2};

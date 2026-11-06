@@ -7,7 +7,7 @@ use super::config::MuseSparkConfig;
 use crate::{formats::trellis_core::{read_projections, CoreContract}, plan::Checkpoint};
 pub use crate::formats::trellis_core::{CoreProjection, CoreSplit};
 use anyhow::{ensure, Context, Result};
-pub use crate::families::glm5_flash::core::{NativeLayout, NativeProjection};
+pub use crate::formats::native_attention::{NativeLayout, NativeProjection};
 use std::collections::BTreeMap;
 
 pub const PREFIX: &str = "model.language_model.layers.";
@@ -73,7 +73,8 @@ impl CoreInventory {
             native_checkpoint = Checkpoint::open_view_for_role(checkpoint.view.as_ref()
                 .context("Muse native attention requires a selected checkpoint view")?,
                 "Muse native attention", |name| missing.contains(name)
-                    || name.strip_suffix("_scale_inv").is_some_and(|weight| missing.contains(weight)))?;
+                    || [".weight_scale_inv", ".qscale_weight"].iter().any(|suffix| name.strip_suffix(suffix)
+                        .is_some_and(|stem| missing.contains(&format!("{stem}.weight")))))?;
             &native_checkpoint
         };
         for (name, shape) in expected(cfg) {
@@ -81,20 +82,21 @@ impl CoreInventory {
             if !stem.contains(".self_attn.") || stem.ends_with(".gate_proj")
                 || !checkpoint.contains_tensor(&name) { continue; }
             let selected = native_source.projection(stem)?;
-            let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape: actual } = selected.storage else { continue; };
-            ensure!(actual == shape, "{stem}: native Muse attention shape {actual:?}, expected {shape:?}");
+            let crate::plan::checkpoint::ProjectionStorage::Native { ref dtype, shape: ref actual } = selected.storage else { continue; };
+            ensure!(*actual == shape, "{stem}: native Muse attention shape {actual:?}, expected {shape:?}");
             ensure!(matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
                 "{stem}: native Muse attention requires BF16 or block E4M3");
-            if dtype == cuteafd_core::DType::F8E4M3 {
-                let scale = selected.tensors.iter().find(|t| t.meta.name == format!("{name}_scale_inv"))
-                    .context("native Muse FP8 attention lacks block scales")?;
-                ensure!(scale.meta.dtype == cuteafd_core::DType::F32
-                    && scale.meta.shape == [shape[0].div_ceil(128), shape[1].div_ceil(128)],
-                    "{stem}: native Muse FP8 requires F32 128x128 block scales");
+            if *dtype == cuteafd_core::DType::F8E4M3 {
+                if checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact {
+                    return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
+                        tensor: name.clone(), found: "E4M3".into(),
+                    }.into());
+                }
+                crate::formats::native_attention::fp8_scale(&selected, stem)?;
             }
             inventory.native.insert(stem.into(), NativeProjection {
                 shape: [shape[0], shape[1]], split: split(cfg, stem).context("Muse attention split")?,
-                fp8: dtype == cuteafd_core::DType::F8E4M3
+                fp8: *dtype == cuteafd_core::DType::F8E4M3
                     || checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact,
             });
         }
