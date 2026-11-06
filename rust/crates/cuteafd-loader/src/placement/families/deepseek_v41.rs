@@ -554,6 +554,30 @@ mod tests {
     }
 
     #[test]
+    fn all_onboarded_experts_allow_a_budgeted_spark_tower() {
+        use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+        let config = config();
+        let input = ProductionInput {
+            expert_usage: false, config: &config, gpus: 2, context: 32768, maximum_pool_tokens: 32768,
+            prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
+            replicated: false, spark_ranks: 1, onboard_minimum: 0, onboard_counts: None,
+            experts: vec![cost(2); 40], workspace: 0, owners: vec![], startup: vec![], allowances: vec![],
+            draft: None, encoders: vec![EncoderPlacement { kind: EncoderKind::Spark { rank: 0 },
+                weights: 123456, scratch: 654321, replicas: vec![], reason: "tower only".into(), shortfall: 0 }],
+            media_cache_bytes: 0, resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+            operation: Operation::Serving,
+            budgets: admission::live_budgets(&[(96 << 30, 96 << 30, 96 << 30); 2], &[64 << 30]).unwrap(),
+        };
+        let request = production_request(32768, Some(32768), Onboard::Layers(40),
+            PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
+        let admitted = input.prepare().unwrap().admit(request).unwrap();
+        assert!(admitted.spark.spark_layers.is_empty());
+        let owners = admitted.solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("v41.encoder.")).collect::<Vec<_>>();
+        assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), 123456 + 654321);
+        assert!(owners.iter().all(|owner| owner.location.device == crate::placement::planner::Device::Spark(0)));
+    }
+
+    #[test]
     fn growth_reserves_are_post_ready_allowances_on_every_card() {
         for total in [32 << 30, 96 << 30] {
             for ranks in [1, 2] {

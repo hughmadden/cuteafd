@@ -1691,8 +1691,7 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
 
 /// A Spark wave of `layer`: `rows` rows of E4M3 input with a UE8M0 scale per 32 values
 /// (`hidden + hidden / 32` bytes each) and `topk` routes per row, answered with compact BF16
-/// partials. Serving waves (`spark_dispatch`) and the start-up warm-up ([`spark_warmup_request`])
-/// both take this format.
+/// partials. Session negotiation reserves this format without constructing a request.
 fn spark_request(hidden: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
     wire: Vec<u8>, kind: ExpertV2SourceKind, bf16: bool) -> Result<ExpertProtocolV2Request> {
     spark_request_bytes(hidden, topk, layer, rows, routes, wire.into(), kind, bf16)
@@ -1714,19 +1713,13 @@ fn spark_request_bytes(hidden: usize, topk: usize, layer: usize, rows: usize, ro
     Ok(request)
 }
 
-/// The wave that warms a Spark transport at start-up (as GLM-5, MiMo and DeepSeek V4 warm theirs):
-/// `rows` zero rows of prefill at the first selected Spark layer, every gate zero and the experts in turn. Each
-/// rank's session sizes its rings for the request that opens it, and the transport drops and
-/// reconnects a rank whose rings a later request outgrows, so a transport warmed with the most rows
-/// any of its waves carries never reconnects while serving.
-pub(crate) fn spark_warmup_request(cfg: &GlmNextConfig, rows: usize, layer: usize, bf16: bool) -> Result<ExpertProtocolV2Request> {
-    ensure!(layer < cfg.layers && cfg.dense.get(layer) == Some(&false),
-        "Spark transport warmup layer {layer} is not a routed layer");
-    let (h, topk) = (cfg.hidden, cfg.topk);
-    let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
-        row_index: (i / topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.0,
-    }).collect();
-    spark_request(h, topk, layer, rows, routes, vec![0; rows * (if bf16 { h * 2 } else { h + h / 32 })], ExpertV2SourceKind::Prefill, bf16)
+/// Reserve a full lane without selecting a layer or executing expert work.
+pub(crate) fn spark_session_shape(cfg: &GlmNextConfig, rows: usize, bf16: bool) -> Result<cuteafd_transport::SparkSessionShape> {
+    let mut shape = cuteafd_transport::SparkSessionShape::new(u32::try_from(rows)?,
+        u32::try_from(cfg.hidden)?, u32::try_from(cfg.topk)?,
+        if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 })?;
+    shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(shape)
 }
 
 fn validate_attention_shares(plan: &cuteafd_loader::placement::LayerExecutionPlan,
@@ -6603,101 +6596,33 @@ mod replay_record_tests {
 }
 
 #[cfg(test)]
-mod spark_warmup_tests {
-    use super::{spark_request, spark_warmup_request,
-        DECODE_ROWS, MAX_PREFILL_WAVES};
-    use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
-    use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-    use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind,
-        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
-    use std::collections::BTreeSet;
-
-    /// GLM 5.3 Flash: 45 layers (0-2 dense), 288 routed experts, top-8, hidden 4096.
-    fn glm53_flash() -> GlmNextConfig {
-        GlmNextConfig { vocab_size: 154880, hidden: 4096, layers: 45,
-            attention: (0..45).map(|i| if i % 4 == 3 { GlmNextAttention::Mla } else { GlmNextAttention::Kda }).collect(),
-            dense: (0..45).map(|i| i < 3).collect(), dense_intermediate: 12288, experts: 288, topk: 8,
-            moe_intermediate: 2048, routed_scale: 2.5, swiglu_limit: 10.0, rms_norm_eps: 1e-5, hc_mult: 4,
-            kda_heads: 64, kda_head_dim: 128, heads: 64, q_lora_rank: 1536, kv_lora_rank: 512, qk_nope_dim: 256,
-            v_head_dim: 256, index_topk: 2048, index_kpool: 4, eos: vec![] }
-    }
-
-    /// The answer bytes a rank's session reserves for `request` (the transport's
-    /// `verbs_host_expected_response_wire_bytes` without a reduced-precision answer): the header,
-    /// then a row index and a partial row at least BF16-wide per row.
-    fn response_bytes(request: &ExpertProtocolV2Request) -> usize {
-        let header = &request.header;
-        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + header.row_count as usize
-            * (4 + (header.hidden_row_stride_bytes as usize).max(2 * header.hidden_dim as usize))
-    }
-
-    /// A serving wave of `t` rows at the first MoE layer, as `spark_dispatch` builds one.
-    fn wave(cfg: &GlmNextConfig, t: usize, kind: ExpertV2SourceKind) -> ExpertProtocolV2Request {
-        let routes = (0..t * cfg.topk).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / cfg.topk) as u32,
-            expert_id: (7 * i % cfg.experts) as u32, gate_weight: 0.125 }).collect();
-        spark_request(cfg.hidden, cfg.topk, 3, t, routes, vec![0x38; t * (cfg.hidden + cfg.hidden / 32)], kind, false).unwrap()
-    }
-
-    /// The warm-up is a full lane of prefill in the serving format: 4,096 zero rows at the first MoE
-    /// layer (3), every gate zero, all 288 experts routed, eight distinct a row. Each rank's session
-    /// then keeps 17,858,656 request and 33,570,912 answer bytes a slot: at the transport's default
-    /// eight 4 KiB-aligned slots, 411,500,544 B of rings, what the coordinator's `transport/rdma-rings`
-    /// ledger held per session once a 4,096-row lane had opened it (3,292,004,352 B for two lanes of
-    /// four ranks).
-    #[test]
-    fn the_warmup_is_a_full_lane_of_zero_gates_in_the_serving_format() {
-        let cfg = glm53_flash();
-        let warm = spark_warmup_request(&cfg, 4096, 3, false).unwrap();
-        let serving = wave(&cfg, 4096, ExpertV2SourceKind::Prefill);
-        assert_eq!((&warm.header, &warm.rows), (&serving.header, &serving.rows));
-        assert_eq!((warm.header.layer_id, warm.header.row_count, warm.header.hidden_dtype, warm.header.flags),
-            (3, 4096, ExpertV2Dtype::Fp8E4m3Ue8m0K32, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16));
-        assert!(warm.rows.iter().all(|row| row.source_kind == ExpertV2SourceKind::Prefill));
-        assert!(warm.routes.iter().all(|route| route.gate_weight == 0.0));
-        assert!(warm.routes.chunks(8).enumerate().all(|(row, routes)| routes.iter().all(|r| r.row_index == row as u32)
-            && routes.iter().map(|r| r.expert_id).collect::<BTreeSet<_>>().len() == 8));
-        assert_eq!(warm.routes.iter().map(|r| r.expert_id).collect::<BTreeSet<_>>(), (0..288).collect());
-        assert!(warm.hidden_payload.len() == 4096 * (4096 + 128) && warm.hidden_payload.iter().all(|&b| b == 0));
-        let (request, answer) = (warm.wire_stats().wire_bytes, response_bytes(&warm));
-        assert_eq!((request, answer), (17_858_656, 33_570_912));
-        assert_eq!(8 * (request.next_multiple_of(4096) + answer.next_multiple_of(4096)), 411_500_544);
-    }
+mod spark_session_tests {
+    use super::{spark_request, spark_session_shape, DECODE_ROWS};
+    use cuteafd_loader::families::glm5_flash::GlmNextConfig;
+    use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertV2SourceKind, SparkSessionShape};
 
     #[test]
-    fn warmup_targets_the_first_selected_remote_layer_not_the_first_moe() {
-        let cfg = glm53_flash();
-        let initial = spark_warmup_request(&cfg, 64, 3, false).unwrap();
-        let selected = spark_warmup_request(&cfg, 64, 24, false).unwrap();
-        assert_eq!(selected.header.layer_id, 24);
-        assert_eq!(selected.hidden_payload, initial.hidden_payload);
-        assert_eq!(selected.routes, initial.routes);
-        assert_eq!(selected.wire_stats().wire_bytes, initial.wire_stats().wire_bytes);
-        for layer in [0, 2, 45] { assert!(spark_warmup_request(&cfg, 64, layer, false).is_err()); }
-    }
-
-    /// No wave of a warmed transport is larger than its warm-up: decode and verify steps and prefill
-    /// lanes or serial chunks of up to the warmed rows fit the slots it opened, so `post` never drops
-    /// and reconnects a warmed rank while serving.
-    #[test]
-    fn no_wave_outgrows_a_warmed_session() {
-        let cfg = glm53_flash();
+    fn every_serving_wave_fits_the_layer_free_session() -> anyhow::Result<()> {
+        let cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(8))?;
         for rows in [2048, 4096] {
-            let warm = spark_warmup_request(&cfg, rows, 3, false).unwrap();
-            let (request, answer) = (warm.wire_stats().wire_bytes, response_bytes(&warm));
-            for t in [1, 2, DECODE_ROWS - 1, DECODE_ROWS, 128, 1023, 1024, 2048, 2072, 2109, 2176, 4095, 4096]
-                .into_iter().filter(|&t| t <= rows) {
-                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
-                    let serving = wave(&cfg, t, kind);
-                    assert!(serving.wire_stats().wire_bytes <= request && response_bytes(&serving) <= answer,
-                        "{t} rows of {kind:?} after a {rows}-row warm-up");
+            for bf16 in [false, true] {
+                let session = spark_session_shape(&cfg, rows, bf16)?;
+                for t in [1, 2, DECODE_ROWS, 128, 1024, 2048, 2072, 4095, 4096].into_iter().filter(|&t| t <= rows) {
+                    for layer in [3, 6] {
+                        let routes = (0..t * cfg.topk).map(|i| ExpertProtocolV2RouteEntry {
+                            row_index: (i / cfg.topk) as u32, expert_id: (i % cfg.experts) as u32, gate_weight: 0.125 }).collect();
+                        let request = spark_request(cfg.hidden, cfg.topk, layer, t, routes,
+                            vec![0; t * if bf16 { cfg.hidden * 2 } else { cfg.hidden + cfg.hidden / 32 }],
+                            ExpertV2SourceKind::Prefill, bf16)?;
+                        let serving = SparkSessionShape::from_request(&request)?;
+                        assert!(serving.request_wire_bytes <= session.request_wire_bytes);
+                        assert!(serving.response_wire_bytes <= session.response_wire_bytes);
+                    }
                 }
             }
-            let largest = wave(&cfg, rows, ExpertV2SourceKind::Prefill);
-            assert_eq!((largest.wire_stats().wire_bytes, response_bytes(&largest)), (request, answer));
         }
+        Ok(())
     }
-
-
 }
 
 #[cfg(test)]

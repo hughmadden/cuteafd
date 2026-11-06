@@ -207,8 +207,7 @@ impl<'r, 'a: 'r> MuseEngine<'r, 'a> {
         let world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let config = cuteafd_transport::TcpTransportConfig { max_frame_bytes: link.spark.max_frame_bytes,
             timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
-        let path = super::spark::MuseSparkPath::connect(library_owner, Rc::clone(&streams[0]), world, peers, config, link.cutoff, link.unit_rows, link.waves, link.intake_row_bytes,
-            link.spark.first_spark_layer)?;
+        let path = super::spark::MuseSparkPath::connect(library_owner, Rc::clone(&streams[0]), world, peers, config, link.cutoff, link.unit_rows, link.waves, link.intake_row_bytes)?;
         Ok(Self { link: path, peer, streams, ranks })
     }
 }

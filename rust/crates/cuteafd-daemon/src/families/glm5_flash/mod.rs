@@ -979,7 +979,7 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn expert_capacity_warms_every_route_and_charges_wider_intake() -> Result<()> {
+    fn expert_capacity_reserves_layer_free_sessions_and_charges_wider_intake() -> Result<()> {
         let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(8))?;
         cfg.dense = (0..8).map(|layer| layer < 3).collect();
         cfg.hidden = 64;
@@ -990,15 +990,11 @@ mod draft_cli_tests {
             args.prefill_waves = 3;
             assert_eq!(args.expert_rows(), capacity);
             for bf16 in [false, true] {
-                let request = engine::spark_warmup_request(&cfg, args.expert_rows(), 6, bf16)?;
+                let shape = engine::spark_session_shape(&cfg, args.expert_rows(), bf16)?;
                 let stride = if bf16 { cfg.hidden * 2 } else { cfg.hidden + cfg.hidden / 32 };
-                assert_eq!((request.header.row_count as usize, request.rows.len()), (capacity, capacity));
-                assert_eq!(request.header.layer_id, 6);
-                assert_eq!(request.routes.len(), capacity * cfg.topk);
-                assert_eq!(request.hidden_payload.len(), capacity * stride);
-                for (row, routes) in request.routes.chunks_exact(cfg.topk).enumerate() {
-                    assert!(routes.iter().all(|route| route.row_index as usize == row));
-                }
+                assert_eq!(shape.row_count as usize, capacity);
+                assert_eq!(shape.route_count as usize, capacity * cfg.topk);
+                assert_eq!(shape.hidden_payload_bytes as usize, capacity * stride);
             }
             for ranks in [1u64, 4] {
                 use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
@@ -1997,7 +1993,6 @@ impl Opened {
             process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);
         }
         let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
-        admitted.validate_spark_topology(spark_ranks)?;
         tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
             "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
@@ -2915,12 +2910,7 @@ impl Opened {
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
             args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
         transport.enable_terminal_ownership(self.library.clone())?;
-        let warm_rows = args.expert_rows();
-        let dtype = if self.checkpoint.spark_input_is_bf16() { cuteafd_transport::ExpertV2Dtype::Bf16 }
-            else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
-        let mut shape = cuteafd_transport::SparkSessionShape::new(warm_rows as u32,
-            self.cfg.hidden as u32, self.cfg.topk as u32, dtype)?;
-        shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let shape = engine::spark_session_shape(&self.cfg, args.expert_rows(), self.checkpoint.spark_input_is_bf16())?;
         transport.bootstrap(&shape)?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport) }))
     }

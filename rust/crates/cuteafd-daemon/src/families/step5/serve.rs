@@ -416,12 +416,17 @@ fn with_backend<T>(args: &ServeArgs,
             let package = budget.package(&format, &args.native_lib)?;
             Some(budget.push_plan(&catalog, &package, ownership.onboarded_layers(), inputs.unit_rows(), devices.len())?)
         };
-        let prepared = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), devices.len(), experts,
-            inputs.host.push.clone().context("Step-5 admitted push host envelope")?)?;
+        let envelope = inputs.host.push.clone().context("Step-5 admitted push host envelope")?;
+        let prepared = if expert_world == 0 {
+            (CoordinatorPush::prepare_alone_admitted(&args.snapshot, Some(&catalog), devices.len(), experts, envelope)?, None)
+        } else {
+            let (push, streams, ranks) = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), devices.len(), experts, envelope)?;
+            (push, Some((streams, ranks)))
+        };
         Ok((prepared, loaded, records, dense))
     })?;
     let (coordinator, ranks) = match planned {
-        Some(((push, streams, ranks), loaded, records, dense)) => (Some((push, loaded, records, dense)), Some((streams, ranks))),
+        Some(((push, ranks), loaded, records, dense)) => (Some((push, loaded, records, dense)), ranks),
         None => (None, None),
     };
     tracing::info!(elapsed_s = native_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),

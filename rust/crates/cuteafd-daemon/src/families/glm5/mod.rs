@@ -1630,8 +1630,7 @@ impl Opened {
             let mut link = SparkLink::prepared(&self.library, world, &peers, config.clone(),
                 admitted.decode_link.clone().context("admitted decode transport")?)?;
             // The bootstrap opens every rank before any wave does, so the
-            // installed grouping is readable from here on. The warm-up below
-            // then reuses these sessions.
+            // installed grouping is readable from here on, without executing experts.
             link.bootstrap(&session_shape(engine::DECODE_ROWS)?)?;
             Ok(link)
         }).transpose()?;

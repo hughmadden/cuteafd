@@ -48,10 +48,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         args.peers.len(),
         "serve-native",
     )?;
-    let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
-    crate::shared::spark_topology::require_world(spark_world, &catalog,
-        &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
-    lib.v41_compact_reducer()?.require_rank_count(spark_world.topology().world_size() as u32)?;
+
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();
     // Sum resident storage plus the largest transient loading excess.
@@ -72,6 +69,15 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("after native preload")?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
     let usage = super::expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
+    let remote_experts = pool.placement.onboard_layers < catalog.routed_experts().layers;
+    let expert_world = if remote_experts { args.peers.len() } else { 0 };
+    let spark_world = if remote_experts {
+        let world = crate::shared::spark_topology::world(topology, expert_world)?;
+        crate::shared::spark_topology::require_world(world, &catalog,
+            &(pool.placement.onboard_layers..catalog.routed_experts().layers).collect::<Vec<_>>())?;
+        lib.v41_compact_reducer()?.require_rank_count(world.topology().world_size() as u32)?;
+        Some(world)
+    } else { None };
     // Dense owners allocate exactly as through the mount; with coordinator push
     // possible their bytes are recorded and arrive in the Spark push group.
     let pushing = super::coordinator_push::wanted(&args, &catalog)?;
@@ -376,9 +382,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         slots, prefill_reserve, ffn_arenas as u64)?;
     // Both Spark transport lanes live on GPU1 and reserve one wave each; a
     // six-rank replicated layout needs its own larger per-wave buffer count.
-    let spark_ranks = args.peers.len();
+    let spark_ranks = expert_world;
     // Decode lanes' links at their own width (P3); the prefill link at the unit.
-    let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)?;
+    let wave_bytes = if remote_experts { NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)? } else { 0 };
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
     // The loaders re-check the admitted load phase (their own conservative
     // peak is part of it); retained owners are the Movable's exact bytes.
@@ -416,14 +422,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // Coordinator ranks join only a pushing group, planned before membership:
     // a planning error leaves them out (the Sparks still push).
     let coordinator = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&args.snapshot)?.plan(|| {
-        ensure!(spark_plan.as_ref().is_some_and(|spark| spark.coordinator_pushes()),
+        ensure!(spark_plan.as_ref().is_none_or(|spark| spark.coordinator_pushes()),
             "V4.1 Spark admission did not select required push");
         let records = records.as_ref().context("V4.1 required dense push records")?;
         super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets, draft_expert_bytes,
-            args.peers.len(), pool.host.push.clone())
+            expert_world, pool.host.push.clone())
     })?;
     let (coordinator, ranks) = match coordinator {
-        Some((planned, streams, ranks)) => (Some(planned), Some((streams, ranks))),
+        Some((planned, ranks)) => (Some(planned), ranks),
         None => (None, None),
     };
     let spark_admission = spark_plan.map(|plan| plan.start_with(&args.peers, ranks)).transpose()?;
@@ -491,18 +497,21 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // Decode lanes own a link each at decode width; prefill slot 0 holds the
     // one prefill link (endpoint after the lanes'), every slot's units send on it.
     let mut decode_transport = |lane: usize| -> Result<_> {
-        let mut transport = devices[1].own(|| NativeTp4Wave::new(&lib, super::spark_transport(&args.peers, decode_rows,
-            timing, spark_world, u32::try_from(lane)?)?, wave_bytes))?;
+        let mut transport = devices[1].own(|| match spark_world {
+            Some(world) => NativeTp4Wave::new(&lib, super::spark_transport(&args.peers, decode_rows,
+                timing, world, u32::try_from(lane)?)?, wave_bytes),
+            None => NativeTp4Wave::unlinked(&lib, decode_rows),
+        })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, decode_rows,
             [None, None])?)?;
         Ok(transport)
     };
     let [mut transport, mut second_transport] = lanes.try_map(|lane| decode_transport(lane.index()))?;
-    let mut prefill_link = Some(devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
-        super::spark_transport(&args.peers, capacity, timing, spark_world, 2)?, slots, capacity))?);
+    let mut prefill_link = spark_world.map(|world| devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+        super::spark_transport(&args.peers, capacity, timing, world, 2)?, slots, capacity))).transpose()?;
     let slot_transports = (0..slots).map(|slot| -> Result<_> {
         let mut transport = match slot {
-            0 => devices[1].own(|| NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?.into_inner()))?,
+            0 if remote_experts => devices[1].own(|| NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?.into_inner()))?,
             _ => devices[1].own(|| NativeTp4Wave::unlinked(&lib, capacity))?,
         };
         transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?;
@@ -511,7 +520,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     drop(ffn_storage);
     if expert_layers < 40 {
         // The workers serve their layers: open the sessions and start each
-        // link's exchange worker (the first remote layer sizes the rings).
+        // link's exchange worker using its admitted geometry.
         for transport in [&mut transport, &mut second_transport] {
             devices[1].run(|| transport.get_mut().bootstrap(catalog.nvfp4().is_some()))?;
         }

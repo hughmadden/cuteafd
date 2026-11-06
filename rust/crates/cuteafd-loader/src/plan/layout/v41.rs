@@ -256,9 +256,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             .filter(|bytes| *bytes > 0).min().unwrap_or(0);
         tracing::warn!(reason = %encoder.reason, shortfall_bytes = encoder.shortfall, "bundled vision disabled by shared admission");
     }
-    ensure!(!admitted.spark.spark_layers.is_empty()
-        || !matches!(encoder.kind, crate::plan::encoder::EncoderKind::Spark { .. }),
-        "encoder requires an active Spark worker");
     if encoder.kind == crate::plan::encoder::EncoderKind::Off {
         if let Some(component) = report.components.iter_mut().find(|c| c.component == Component::Vision)
             .filter(|c| c.status != Status::Unused) {
@@ -279,6 +276,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
     if working.spark_layers.is_empty() { sparks.clear(); }
     for rank in encoder.spark_ranks() {
+        ensure_tower_spark(&mut sparks, rank, options);
         let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) else { continue };
         let overhead = crate::plan::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES;
         device.items.push(Item::new(Category::Weights, "vision tower", "", encoder.weights, Basis::Exact));
@@ -465,6 +463,7 @@ fn update_sparks(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
     if catalog.exl3().is_none() && catalog.nvfp4().is_none() { return Ok(()); }
     let shape = catalog.routed_experts();
     for device in devices {
+        if !working.selected_ranks().contains(&(device.index as usize)) { continue; }
         let bytes = if let Some(exl3) = catalog.exl3() {
             working.spark_layers.iter().try_fold(0u64, |sum, &layer| -> Result<u64> {
                 sum.checked_add(exl3.balanced_residency(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks,

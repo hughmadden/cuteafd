@@ -5242,6 +5242,16 @@ mod persistent_tests {
 
 
     #[test]
+    fn layer_free_sessions_refuse_old_persistent_control_versions() {
+        for version in [serde_json::Value::Null, serde_json::json!(8)] {
+            let error = decode_persistent_control::<serde_json::Value>(serde_json::json!({"wire_version": version}))
+                .unwrap_err().to_string();
+            assert!(error.contains("bootstrap version mismatch") && error.contains("rebuild coordinator and workers together"));
+        }
+        assert!(decode_persistent_control::<serde_json::Value>(serde_json::json!({"wire_version": 9})).is_ok());
+    }
+
+    #[test]
     fn rdma_device_map_selects_device_by_control_destination_ip() {
         let raw = "10.55.0.2=rocep1s0f0,10.55.0.252=roceP2p1s0f0";
 

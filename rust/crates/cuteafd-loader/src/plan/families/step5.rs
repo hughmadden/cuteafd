@@ -603,7 +603,9 @@ impl FamilyModel for Model {
         Some(ExpertContract {
             package: package.into(), block: 128,
             spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.intermediate),
-            local: Err("Step-5 coordinator-local routed experts are not qualified".into()),
+            local: if package == "step5:bf16" {
+                Err("missing RTX expert export step5:bf16 (rtx-tp1/rtx-tp2)".into())
+            } else { Ok(format!("Step-5 native RTX expert package {package} (rtx-tp1/rtx-tp2)")) },
         })
     }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,

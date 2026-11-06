@@ -341,21 +341,6 @@ pub struct AdmittedGlmf {
     pub encoder: Option<crate::plan::encoder::EncoderPlacement>,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum TopologyRefusal {
-    #[error("all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")]
-    IdleSparks,
-}
-
-impl AdmittedGlmf {
-    pub fn validate_spark_topology(&self, requested: usize) -> Result<(), TopologyRefusal> {
-        if requested > 0 && self.working.spark_ranks == 0 {
-            return Err(TopologyRefusal::IdleSparks);
-        }
-        Ok(())
-    }
-}
-
 fn invalid(error: impl std::fmt::Display) -> p::Refusal {
     p::Refusal::InvalidFact(error.to_string())
 }
@@ -530,17 +515,13 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             }
         }
         for (option, encoder) in process.encoders.iter().enumerate() {
-            let when = p::Choice { variable, option };
             let locations = match &encoder.kind {
                 EncoderKind::Off => vec![],
                 EncoderKind::Rtx { gpu } if *gpu < gpus => vec![p::Location::coordinator(*gpu as u8)],
-                EncoderKind::Spark { .. } if !routed.is_empty() && i.spark_ranks > 0 => {
+                EncoderKind::Spark { .. } if i.spark_ranks > 0 => {
                     if encoder.spark_ranks().iter().any(|&rank| rank >= i.spark_ranks) {
                         return Err(invalid("Flash encoder Spark rank absent"));
                     }
-                    contract.requires.push(p::Requires { when, any_of: counts.iter().enumerate()
-                        .filter(|(_, count)| **count < routed.len())
-                        .map(|(option, _)| p::Choice { variable: onboard_variable, option }).collect() });
                     encoder.spark_ranks().into_iter().map(|rank| p::Location {
                         device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }).collect()
                 }

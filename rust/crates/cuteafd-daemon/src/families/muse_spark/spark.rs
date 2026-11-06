@@ -87,7 +87,7 @@ impl<'a> MuseSparkPath<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, stream: Rc<Stream<'a>>,
         world: SparkWorld, peers: Vec<SocketAddr>, config: TcpTransportConfig,
-        cutoff: Cutoff, unit: usize, waves: usize, intake_row_bytes: usize, _first_spark_layer: usize) -> Result<Self> {
+        cutoff: Cutoff, unit: usize, waves: usize, intake_row_bytes: usize) -> Result<Self> {
         ensure!(std::ptr::eq(library_owner.as_ref(), stream.device.library),
             "Muse Spark library owner differs from the lane device");
         ensure!(cuteafd_core::expert_geometry() == cuteafd_core::ExpertGeometry::MUSE_SPARK,

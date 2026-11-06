@@ -417,7 +417,7 @@ impl FamilyModel for Model {
             package: PACKAGE.into(),
             block: 128,
             spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, moe.intermediate),
-            local: Err("Mistral Large 4 routed experts (about 479 GiB at K4) cannot all be resident on the coordinators".into()),
+            local: Ok("Mistral Large 4 EXL3 RTX expert onboarding package".into()),
         })
     }
 }

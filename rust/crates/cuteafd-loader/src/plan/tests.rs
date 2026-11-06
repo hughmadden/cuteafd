@@ -5218,7 +5218,7 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
 }
 
 #[test]
-fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
+fn glm_flash_all_onboarded_preserves_tower_only_spark() {
     use super::encoder::EncoderKind;
     let mut cfg = glm5_flash_config(2);
     cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
@@ -5234,49 +5234,30 @@ fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
         drafter_bytes: 256 << 20, context_tokens: 32768,
         onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default()
     }), ..sparks(4) };
-    let sentence = "GLM Flash pool-first placement:";
-    for vision in [MediaMode::Spark(None), MediaMode::Spark(Some(0))] {
-        let report = plan(dir.path(), &PlanOptions { vision, ..base.clone() }).unwrap();
-        assert!(!report.placement_supported, "{vision:?}");
-        assert!(!report.executable(), "{vision:?}");
+    for rank in [0, 2] {
+        let report = plan(dir.path(), &PlanOptions { vision: MediaMode::Spark(Some(rank)), ..base.clone() }).unwrap();
+        assert!(report.executable(), "{}", render(&report));
+        let placement = report.solver_placement.as_ref().unwrap();
+        assert!(placement.layers.iter().all(|layer| layer.experts != crate::placement::ExpertHome::Spark));
         let encoder = report.encoder.as_ref().unwrap();
-        assert_eq!(encoder.kind, EncoderKind::Off, "{vision:?}");
-        assert!(encoder.reason.contains(sentence), "{vision:?}: {}", encoder.reason);
-        assert_eq!(encoder.shortfall, 0, "{vision:?}");
-        assert_eq!(encoder.admitted_bytes(), 0);
-        assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
-            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).count(), 0);
-        assert!(report.hints.iter().any(|hint| hint.what.contains(sentence)), "{:?}", report.hints);
-        assert_ne!(component(&report, Component::Vision).status, Status::Disabled);
-        assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note| note.contains(sentence)));
+        assert_eq!(encoder.kind, EncoderKind::Spark { rank });
+        let device = report.memory_layout.as_ref().unwrap().devices.iter().find(|device|
+            device.kind == cuteafd_core::memory_layout::DeviceKind::Spark && device.index as usize == rank).unwrap();
+        assert_eq!(device.items.iter().filter(|item| item.group.starts_with("vision")).map(|item| item.bytes).sum::<u64>(),
+            encoder.admitted_bytes());
+        let options = super::deployment::DeploymentOptions { rtx_gpus: 2, ..Default::default() };
+        let deployment = super::deployment::DeploymentSpec::from_report(&report, &options).unwrap();
+        assert_eq!((deployment.spark_ranks, deployment.spark_expert_world), (1, 0));
+        assert_eq!(deployment.spark_roles[0].rank, rank);
+        assert!(!deployment.spark_roles[0].experts && deployment.peers.is_empty());
+        assert_eq!(deployment.spark_roles[0].encoder.as_ref(), Some(encoder));
     }
-    let idle = plan(dir.path(), &base).unwrap();
-    assert!(!idle.executable() && idle.solver_placement.is_none() && idle.phase_ledger.is_none());
-    assert!(idle.hints.iter().any(|hint| hint.what.contains(
-        "all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")), "{}", render(&idle));
-    assert_eq!(idle.encoder.as_ref().unwrap().admitted_bytes(), 0);
-    // The same all-local selection admits automatic vision on the last RTX.
-    let auto = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..base.clone() }).unwrap();
-    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 1 }, "{}", render(&auto));
-    assert!(auto.executable(), "{}", render(&auto));
-
-    let explicit = plan_spark_count(dir.path(), &PlanOptions {
-        vision: MediaMode::Spark(None), ..base.clone()
-    }, 4, Some(4)).unwrap();
-    assert!(!explicit.executable());
-    assert!(explicit.spark_count_warning.is_none());
-    let refusal = &explicit.hints.last().unwrap().what;
-    assert!(refusal.contains(sentence), "{refusal}");
-    assert!(refusal.contains("Spark count 4 refused:"), "{refusal}");
-    assert!(refusal.contains("counts that work: []"), "{refusal}");
-
-    // An unspecified count must not adopt a vision-only Spark either.
-    let open = plan_spark_count(dir.path(), &PlanOptions {
-        vision: MediaMode::Spark(None), ..base
-    }, 4, None).unwrap();
-    assert!(!open.executable());
-    assert!(open.spark_count_warning.is_none());
-    assert!(open.hints.last().unwrap().what.contains("counts that work: []"));
+    let idle = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..base }).unwrap();
+    assert!(idle.executable(), "{}", render(&idle));
+    let options = super::deployment::DeploymentOptions { rtx_gpus: 2, ..Default::default() };
+    let deployment = super::deployment::DeploymentSpec::from_report(&idle, &options).unwrap();
+    assert_eq!((deployment.spark_ranks, deployment.spark_expert_world), (0, 0));
+    assert!(deployment.spark_roles.is_empty() && deployment.roles.is_empty() && deployment.peers.is_empty());
 }
 
 #[test]

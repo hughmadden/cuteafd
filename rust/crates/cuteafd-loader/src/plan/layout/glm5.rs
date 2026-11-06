@@ -132,6 +132,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             if working.spark_layers.is_empty() { sparks.clear(); }
             if let Some(encoder) = &report.encoder {
                 for rank in encoder.spark_ranks() {
+                    ensure_tower_spark(&mut sparks, rank, options);
                     if let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) {
                         device.items.push(Item::new(Category::Weights, "vision tower", "", encoder.weights, Basis::Exact));
                         device.items.push(Item::new(Category::Workspace, "vision scratch", "", encoder.scratch, Basis::Exact));
@@ -589,8 +590,6 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         encoder.shortfall = admitted.solved.encoder_diagnostics.iter().map(|(_, bytes)| *bytes).filter(|bytes| *bytes > 0).min().unwrap_or(0);
         tracing::warn!(reason = %encoder.reason, shortfall_bytes = encoder.shortfall, "bundled vision disabled by shared admission");
     }
-    anyhow::ensure!(!admitted.spark.spark_layers.is_empty() || !matches!(encoder.kind, EncoderKind::Spark { .. }),
-        "encoder requires an active Spark worker");
     Ok((admitted, prefix_quota, encoder))
 }
 

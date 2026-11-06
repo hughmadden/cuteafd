@@ -240,6 +240,33 @@ mod tests {
     }
 
     #[test]
+    fn all_onboarded_experts_keep_only_sparse_media_roles() {
+        use super::super::encoder::{EncoderKind, EncoderPlacement};
+        let (_dir, mut report) = fixture(2, 4);
+        for layer in &mut report.solver_placement.as_mut().unwrap().layers {
+            if layer.experts == crate::placement::ExpertHome::Spark {
+                layer.experts = crate::placement::ExpertHome::RtxTp2;
+            }
+        }
+        let options = DeploymentOptions { rtx_gpus: 2, peers: vec!["worker:9200".into(); 4], ..Default::default() };
+        let local = DeploymentSpec::from_report(&report, &options).unwrap();
+        assert_eq!((local.spark_ranks, local.spark_expert_world), (0, 0));
+        assert!(local.spark_roles.is_empty() && local.peers.is_empty() && local.roles.is_empty());
+        report.encoder = Some(EncoderPlacement { kind: EncoderKind::Spark { rank: 2 },
+            weights: 128, scratch: 256, replicas: vec![], reason: "tower only".into(), shortfall: 0 });
+        report.audio_encoder = Some(EncoderPlacement { kind: EncoderKind::Spark { rank: 2 },
+            weights: 64, scratch: 512, replicas: vec![], reason: "audio only".into(), shortfall: 0 });
+        let media = DeploymentSpec::from_report(&report, &options).unwrap();
+        assert_eq!((media.spark_ranks, media.spark_expert_world), (1, 0));
+        assert_eq!(media.spark_roles.len(), 1);
+        assert_eq!(media.spark_roles[0].rank, 2);
+        assert!(!media.spark_roles[0].experts && media.spark_roles[0].layers.is_empty());
+        assert_eq!(media.spark_roles[0].encoder, report.encoder);
+        assert_eq!(media.spark_roles[0].audio_encoder, report.audio_encoder);
+        assert!(media.peers.is_empty() && media.roles.is_empty());
+    }
+
+    #[test]
     fn deployment_preserves_solver_and_marks_live_boundary_unresolved() {
         for (gpus, ranks) in [(1, 3), (2, 4)] {
             let (_dir, report) = fixture(gpus, ranks);

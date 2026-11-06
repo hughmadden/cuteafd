@@ -361,7 +361,6 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             process.native_load = Some(glmf::admission::NativeLoad::from_plans(&body, &vocabulary, &shared)?);
         }
         let selected = glmf::admission::prepare(&inputs, sms as usize, available.is_some(), process)?.admit()?;
-        selected.validate_spark_topology(spark_ranks)?;
         report.encoder = selected.encoder.clone();
         if report.encoder.as_ref().is_some_and(|encoder| encoder.kind == EncoderKind::Off) {
             if let Some(component) = report.components.iter_mut().find(|component|
@@ -430,8 +429,6 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 Some(placement::PlacementError::MissingContextPrograms { .. })) {
                 "Rebuild the GLM Flash coordinator programs with the context-split kernels \
                     (CUTEAFD_CONTEXT_SPLIT_AOT), or request `heads` explicitly.".into()
-            } else if error.downcast_ref::<glmf::admission::TopologyRefusal>().is_some() {
-                "Set SPARK_COUNT=0; the selected placement needs no Spark workers.".into()
             } else {
                 "Change the reported pool, replay-records or placement constraint.".into()
             };
@@ -476,6 +473,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     }
     if let Some(encoder) = &report.encoder {
         for rank in encoder.spark_ranks() {
+            ensure_tower_spark(&mut devices, rank, options);
             if let Some(device) = devices.iter_mut().find(|device|
                 device.kind == DeviceKind::Spark && device.index as usize == rank) {
                 device.items.push(Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact));
