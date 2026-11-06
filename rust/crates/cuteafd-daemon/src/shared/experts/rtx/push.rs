@@ -30,7 +30,7 @@ pub(crate) fn load_alone_admitted<'a, T>(snapshot: &std::path::Path,
         let (owners, records) = dense::recording(load)?;
         let (operands, steps) = (records.operands.len(), records.steps.len());
         let dense = dense::plan_records(snapshot, records, devices, 0)?;
-        let push = CoordinatorPush::prepare_alone_with_host(snapshot, None, devices.len(), None, None, envelope)?;
+        let push = CoordinatorPush::prepare_alone_with_host(snapshot, None, devices.len(), None, None, envelope, None)?;
         Ok((owners, push, dense, operands, steps))
     }).context("standalone coordinator dense push planning")?
         .context("required dense group was not planned")?;
