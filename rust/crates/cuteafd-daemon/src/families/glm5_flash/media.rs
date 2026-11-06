@@ -4,10 +4,21 @@ use cuteafd_api::openai::{media::MediaPreparer, NativeRequest};
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
 use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander}, plan::MediaMode};
 use std::sync::Arc;
+use cuteafd_loader::plan::checkpoint::CheckpointView;
+#[cfg(test)]
+use cuteafd_loader::plan::checkpoint::AttentionMode;
 
 pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
     if mode == MediaMode::Off { return Ok(None); }
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+    let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+    vision_config_view(mode, &view)
+}
+
+pub(super) fn vision_config_view(mode: MediaMode, view: &cuteafd_loader::plan::checkpoint::CheckpointView)
+    -> Result<Option<serde_json::Value>> {
+    if mode == MediaMode::Off { return Ok(None); }
+    let config = view.config()?;
     Ok(config.get("vision_config").is_some().then_some(config))
 }
 
@@ -22,6 +33,7 @@ pub(crate) struct RemoteVision {
     addresses: Vec<std::net::SocketAddr>,
     plan_hash: [u8; 32],
     revision: String,
+    physical_ranks: Option<Vec<usize>>,
 }
 impl RemoteVision {
     pub(crate) fn revision(&self) -> &str { &self.revision }
@@ -32,7 +44,34 @@ impl RemoteVision {
             std::time::Duration::from_secs(60))?))
     }
     pub fn from_args(args: &super::serve::ServeArgs) -> Result<Option<Self>> {
-        Self::from_parts(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())
+        let mut remote = Self::from_parts(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
+        if let Some(ranks) = args.vision_peer_ranks.as_deref() {
+            let remote = remote.as_mut().context("--vision-peer-ranks requires --vision-peers")?;
+            let ranks = ranks.split(',').map(|rank| rank.trim().parse::<usize>()
+                .context("vision peer rank must be a physical Spark index")).collect::<Result<Vec<_>>>()?;
+            anyhow::ensure!(ranks.len() == remote.addresses.len(), "vision peer rank/endpoint counts differ");
+            let unique = ranks.iter().copied().collect::<std::collections::BTreeSet<_>>();
+            anyhow::ensure!(unique.len() == ranks.len() && ranks.iter().all(|&rank| rank < 8),
+                "vision peer ranks must be distinct physical indices in 0..8");
+            if let MediaMode::Spark(Some(primary)) = args.vision {
+                anyhow::ensure!(ranks[0] == primary, "vision primary differs from the first physical peer rank");
+            }
+            remote.physical_ranks = Some(ranks);
+        }
+        Ok(remote)
+    }
+    fn placement(&self, mode: MediaMode) -> Result<(cuteafd_loader::plan::encoder::EncoderKind, Vec<usize>)> {
+        use cuteafd_loader::plan::encoder::EncoderKind;
+        if let Some(ranks) = &self.physical_ranks {
+            return Ok((EncoderKind::Spark { rank: ranks[0] }, ranks[1..].to_vec()));
+        }
+        // A single resolved tower needs no expert world; replica indices must be explicit.
+        let MediaMode::Spark(Some(rank)) = mode else {
+            anyhow::bail!("remote Flash encoder requires planner-resolved physical Spark ranks");
+        };
+        anyhow::ensure!(rank < 8 && self.addresses.len() == 1,
+            "remote Flash encoder replicas require --vision-peer-ranks");
+        Ok((EncoderKind::Spark { rank }, vec![]))
     }
     /// The planner-resolved Spark encoder endpoints from their CLI values (any serve family).
     pub(crate) fn from_parts(vision: MediaMode, peers: Option<&str>, plan_hash: Option<&str>, revision: Option<&str>)
@@ -51,7 +90,7 @@ impl RemoteVision {
             .context("--vision-peers requires --encoder-plan-hash")?)?;
         let revision = revision.context("--vision-peers requires --encoder-revision")?.to_owned();
         anyhow::ensure!(!revision.is_empty(), "encoder revision must not be empty");
-        Ok(Some(Self { addresses, plan_hash, revision }))
+        Ok(Some(Self { addresses, plan_hash, revision, physical_ranks: None }))
     }
 }
 
@@ -62,19 +101,15 @@ pub(super) struct ReadyVision {
     pub cache_bytes: usize,
 }
 impl ReadyVision {
-    pub fn plan(args: &super::EngineArgs, mode: MediaMode, remote: Option<&RemoteVision>)
+    pub fn plan(args: &super::EngineArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        mode: MediaMode, remote: Option<&RemoteVision>)
         -> Result<Option<cuteafd_loader::plan::encoder::EncoderPlacement>> {
         use cuteafd_loader::plan::encoder::{EncoderKind, EncoderPlacement};
-        if vision_config(mode, &args.snapshot)?.is_none() { return Ok(None); }
-        let spec = crate::shared::vision::TowerSpec::glm_flash(&args.snapshot, 4096)?;
+        if vision_config_view(mode, view)?.is_none() { return Ok(None); }
+        let spec = crate::shared::vision::TowerSpec::glm_flash_view(view, 4096)?;
         let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
         let (kind, replicas) = if let Some(remote) = remote {
-            let peers = args.peers.as_deref().context("remote Flash encoder needs active Spark workers")?
-                .split(',').map(|peer| peer.parse::<std::net::SocketAddr>()).collect::<std::result::Result<Vec<_>, _>>()?;
-            let ranks = remote.addresses.iter().map(|address| peers.iter().position(|peer| peer.ip() == address.ip())
-                .context("remote Flash encoder is not an admitted expert worker"))
-                .collect::<Result<Vec<_>>>()?;
-            (EncoderKind::Spark { rank: ranks[0] }, ranks[1..].to_vec())
+            remote.placement(mode)?
         } else {
             anyhow::ensure!(!matches!(mode, MediaMode::Spark(_)), "Spark vision requires planner-resolved peers");
             let device = local_vision_gpu(mode, args.device, args.split_device)?;
@@ -87,13 +122,14 @@ impl ReadyVision {
             replicas, reason: "launcher-resolved bundled encoder".into(), shortfall: 0 }))
     }
 
-    pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
+    pub fn load(args: &super::EngineArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
         cache_bytes: usize, remote: Option<RemoteVision>) -> Result<Option<Self>> {
-        let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok(None); };
+        let Some(config) = vision_config_view(mode, view)? else { return Ok(None); };
         let admitted = args.serving_encoder.as_ref().context("Flash vision lacks admitted physical owners")?;
         let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::GlmFlash)?;
         // Header-only on the coordinator: remote tower payload stays on its Spark.
-        let spec = crate::shared::vision::TowerSpec::glm_flash(&args.snapshot, 4096)?;
+        let spec = crate::shared::vision::TowerSpec::glm_flash_view(view, 4096)?;
         let width = config["text_config"]["hidden_size"].as_u64().context("GLM Flash hidden_size")? as usize;
         if let Some(remote) = remote {
             anyhow::ensure!(matches!(mode, MediaMode::Auto | MediaMode::Spark(_)),
@@ -212,12 +248,14 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
     Ok((Prompt { job, tokens, keys }, media, jobs))
 }
 
-fn snapshot_identity(snapshot: &std::path::Path) -> Result<serde_json::Value> {
+fn snapshot_identity(view: &CheckpointView) -> Result<serde_json::Value> {
+    let snapshot = view.snapshot();
     use sha2::{Digest, Sha256};
     let mut identity = serde_json::json!({"snapshot_revision": snapshot.file_name().and_then(|s| s.to_str())
         .context("snapshot revision")?});
-    for (key, file) in [("config", "config.json"), ("tokenizer", "tokenizer.json"),
-        ("preprocessor", "processor_config.json"), ("index", "model.safetensors.index.json")] {
+    identity["config_sha256"] = view.metadata_sha256(view.config_name())?.into();
+    identity["index_sha256"] = view.metadata_sha256(view.index_name())?.into();
+    for (key, file) in [("tokenizer", "tokenizer.json"), ("preprocessor", "processor_config.json")] {
         identity[format!("{key}_sha256")] = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join(file))?)).into();
     }
     // Compile the actual locked transformer module into the diagnostic identity;
@@ -236,14 +274,14 @@ use crate::shared::probe::features::feature_payload;
 /// Strict paired-G4 hook. Only scoring probes bypass the encoder; ordinary
 /// generation remains native. Separate cache identities cannot warm native images.
 pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
-    cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &std::path::Path) -> Result<()> {
+    cache: &mut cuteafd_engine::media::EmbeddingCache, view: &CheckpointView) -> Result<()> {
     let Some(probe) = prompt.job.probe.as_ref().filter(|p| p.spec.score_from.is_some() && !p.spec.media.is_empty()) else {
         return Ok(());
     };
     let Some(root) = std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR") else { return Ok(()); };
     anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation, "feature probes require explicit cold/no_speculation");
     probe.spec.validate_media()?;
-    apply_probe_features(prompt, media, cache, &std::path::PathBuf::from(root), &snapshot_identity(snapshot)?)
+    apply_probe_features(prompt, media, cache, &std::path::PathBuf::from(root), &snapshot_identity(view)?)
 }
 
 fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
@@ -302,6 +340,44 @@ mod tests {
         assert!(matches!(failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
             cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
     }
+    #[test]
+    fn remote_encoder_uses_physical_media_roles_without_expert_peers() {
+        use clap::Parser;
+        use cuteafd_loader::plan::encoder::EncoderKind;
+        let parse = |mode, ranks: Option<&str>, endpoints: &str| {
+            let mut argv = vec!["cuteafd".to_owned(), "serve-glmf".into(), "--snapshot".into(), "/not-read".into(),
+                "--native-lib".into(), "/not-read.so".into(), "--local-experts".into(),
+                "--vision-peers".into(), endpoints.into(), "--encoder-plan-hash".into(), "ab".repeat(32),
+                "--encoder-revision".into(), "revision".into()];
+            if let Some(ranks) = ranks { argv.extend(["--vision-peer-ranks".into(), ranks.into()]); }
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Commands::ServeGlmf(mut args) = cli.command else { panic!("GLM Flash command") };
+            args.vision = mode;
+            assert!(args.engine.peers.is_none()); // Expert world is zero, not a media-role inventory.
+            args
+        };
+        for (rank, explicit) in [(0, None), (0, Some("0")), (2, Some("2"))] {
+            let mode = MediaMode::Spark(Some(rank));
+            let args = parse(mode, explicit, "127.0.0.1:1234");
+            let remote = RemoteVision::from_args(&args).unwrap().unwrap();
+            assert_eq!(remote.placement(mode).unwrap(), (EncoderKind::Spark { rank }, vec![]));
+        }
+        let mode = MediaMode::Spark(Some(2));
+        let endpoints = "127.0.0.1:1234,127.0.0.2:1234";
+        for replica in [0, 5] {
+            let ranks = format!("2,{replica}");
+            let args = parse(mode, Some(&ranks), endpoints);
+            assert_eq!(RemoteVision::from_args(&args).unwrap().unwrap().placement(mode).unwrap(),
+                (EncoderKind::Spark { rank: 2 }, vec![replica]));
+        }
+        for ranks in ["2", "2,2", "2,8", "0,2", "5,2", "2,no"] {
+            assert!(RemoteVision::from_args(&parse(mode, Some(ranks), endpoints)).is_err(), "{ranks}");
+        }
+        assert!(RemoteVision::from_args(&parse(mode, None, endpoints)).unwrap().unwrap().placement(mode).is_err());
+        assert!(RemoteVision::from_args(&parse(MediaMode::Auto, None, "127.0.0.1:1234"))
+            .unwrap().unwrap().placement(MediaMode::Auto).is_err());
+    }
+
     #[test]
     fn pending_backpressure_is_retryable_but_invalid_features_are_not() {
         use cuteafd_api::openai::NativeFailure;
@@ -452,28 +528,41 @@ mod tests {
         assert!(feature_payload(&path, 16, &hash, Some(&cached)).is_err());
     }
     #[test]
-    fn snapshot_identity_binds_actual_snapshot_files() {
-        use sha2::{Digest, Sha256};
+    fn snapshot_identity_binds_selected_metadata_and_live_media_files() {
+        const COMPACT_CONFIG: &str = "config.compact-attention.json";
+        const COMPACT_INDEX: &str = "model.compact-attention.safetensors.index.json";
+        const COMPACT_QUANT: &str = "quantize_config.compact-attention.json";
         let root = tempfile::tempdir().unwrap();
-        for file in ["config.json", "tokenizer.json", "processor_config.json", "model.safetensors.index.json"] {
+        std::fs::write(root.path().join(COMPACT_CONFIG), "{}").unwrap();
+        std::fs::write(root.path().join(COMPACT_INDEX), r#"{"weight_map":{}}"#).unwrap();
+        std::fs::write(root.path().join(COMPACT_QUANT), "{}").unwrap();
+        for file in ["tokenizer.json", "processor_config.json"] {
             std::fs::write(root.path().join(file), file).unwrap();
         }
-        let before = snapshot_identity(root.path()).unwrap();
-        assert_eq!(before["config_sha256"], format!("{:x}", Sha256::digest(b"config.json")));
+        let view = CheckpointView::select(root.path(), AttentionMode::Compact).unwrap();
+        let before = snapshot_identity(&view).unwrap();
+        assert_eq!(before["config_sha256"], view.metadata_sha256(COMPACT_CONFIG).unwrap());
+        std::fs::remove_file(root.path().join(COMPACT_CONFIG)).unwrap();
+        std::fs::remove_file(root.path().join(COMPACT_INDEX)).unwrap();
+        assert_eq!(snapshot_identity(&view).unwrap(), before);
         std::fs::write(root.path().join("processor_config.json"), "changed").unwrap();
-        assert_ne!(snapshot_identity(root.path()).unwrap(), before);
+        assert_ne!(snapshot_identity(&view).unwrap(), before);
         std::fs::remove_file(root.path().join("tokenizer.json")).unwrap();
-        assert!(snapshot_identity(root.path()).is_err());
+        assert!(snapshot_identity(&view).is_err());
     }
     #[test]
     fn ordinary_and_generation_requests_never_consult_feature_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), "{}").unwrap();
+        let view = CheckpointView::select(root.path(), AttentionMode::Hqa).unwrap();
+        std::fs::remove_file(root.path().join("config.json")).unwrap();
         let (mut prompt, mut media, _) = feature_request(); prompt.job.probe = None;
         let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);
-        probe_features(&prompt, &mut media, &mut cache, std::path::Path::new("/does/not/exist")).unwrap();
+        probe_features(&prompt, &mut media, &mut cache, &view).unwrap();
         let (mut prompt, mut media, _) = feature_request();
         let mut spec = prompt.job.probe.as_ref().unwrap().spec.clone(); spec.score_from = None;
         prompt.job.probe = Some(cuteafd_api::openai::probe::Probe::new(spec));
-        probe_features(&prompt, &mut media, &mut cache, std::path::Path::new("/does/not/exist")).unwrap();
+        probe_features(&prompt, &mut media, &mut cache, &view).unwrap();
         assert_eq!(cache.bytes(), 0);
     }
     #[test]

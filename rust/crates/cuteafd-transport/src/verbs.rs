@@ -145,7 +145,7 @@ impl TransportAllocationCensus {
     }
 }
 
-const PERSISTENT_CONTROL_VERSION: u32 = 8;
+const PERSISTENT_CONTROL_VERSION: u32 = 9;
 const PERSISTENT_CONTROL_LIMIT: usize = 64 * 1024;
 
 fn decode_persistent_control<T: DeserializeOwned>(value: serde_json::Value) -> Result<T> {
@@ -2294,17 +2294,17 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, 0, None, None)
+        Self::connect_impl(addr, config, &crate::SparkSessionShape::from_request(request)?, execution_lane, cq_harvester, false, None, false, None, 0, None, None)
     }
 
     /// `flow_label`: both QPs' RoCE v2 flow label (0: the kernel's own).
     #[allow(clippy::too_many_arguments)]
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
-                     request: &ExpertProtocolV2Request, execution_lane: u32, landing: Option<DeviceLanding>,
+                     shape: &crate::SparkSessionShape, execution_lane: u32, landing: Option<DeviceLanding>,
                      egress: Option<&Arc<egress::EgressBuffer>>,
                      terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>,
                      model_endpoint: Option<u32>) -> Result<Self> {
-        let mut session = Self::connect_impl(addr, config, request, execution_lane, None, true, landing, egress.is_some(),
+        let mut session = Self::connect_impl(addr, config, shape, execution_lane, None, true, landing, egress.is_some(),
             terminal_owner, flow_label, capacity, model_endpoint)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
@@ -2321,22 +2321,22 @@ impl VerbsHostProtocolV2PersistentClientSession {
 
     #[allow(clippy::too_many_arguments)]
     fn connect_impl(addr: SocketAddr, config: &TcpTransportConfig,
-                    request: &ExpertProtocolV2Request, execution_lane: u32,
+                    shape: &crate::SparkSessionShape, execution_lane: u32,
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
                     retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
                     terminal_owner: Option<Arc<AtomicBool>>,
                     flow_label: u32, capacity: Option<u32>, model_endpoint: Option<u32>) -> Result<Self> {
-        let admitted = crate::worker_selection::reserve_peer_endpoint(addr, &request.header, capacity, model_endpoint)?;
+        let admitted = crate::worker_selection::reserve_peer_endpoint(addr, shape, capacity, model_endpoint)?;
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
             "native library not found; set CUTEAFD_NATIVE_LIB or build native/libcuteafd_native.so with RDMA",
         )?;
         let library = Arc::new(unsafe { NativeLibrary::load(&native_path) }?);
-        let request_wire_bytes = request.wire_stats().wire_bytes;
-        let expected_response_wire_bytes = verbs_host_expected_response_wire_bytes(request)?;
+        let request_wire_bytes = shape.request_wire_bytes;
+        let expected_response_wire_bytes = shape.response_wire_bytes;
         let (request_wire_bytes, expected_response_wire_bytes) = match capacity {
             Some(rows) => {
-                let ingress = if request.header.hidden_dtype == ExpertV2Dtype::Bf16 {
+                let ingress = if shape.hidden_dtype == ExpertV2Dtype::Bf16 {
                     cuteafd_core::SparkIngress::Bf16
                 } else {
                     cuteafd_core::SparkIngress::Fp8K32
@@ -4627,7 +4627,7 @@ fn verbs_host_expected_response_for_request(
     })
 }
 
-fn verbs_host_expected_response_wire_bytes(request: &ExpertProtocolV2Request) -> Result<usize> {
+pub(crate) fn verbs_host_expected_response_wire_bytes(request: &ExpertProtocolV2Request) -> Result<usize> {
     if let Some(plan) = &request.partial {
         // A partial reply is its header and the request's own region payload, never row-indexed.
         let rows = request.header.row_count as usize;
@@ -5240,6 +5240,16 @@ mod persistent_tests {
     use super::*;
     use crate::{ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
 
+
+    #[test]
+    fn layer_free_sessions_refuse_old_persistent_control_versions() {
+        for version in [serde_json::Value::Null, serde_json::json!(8)] {
+            let error = decode_persistent_control::<serde_json::Value>(serde_json::json!({"wire_version": version}))
+                .unwrap_err().to_string();
+            assert!(error.contains("bootstrap version mismatch") && error.contains("rebuild coordinator and workers together"));
+        }
+        assert!(decode_persistent_control::<serde_json::Value>(serde_json::json!({"wire_version": 9})).is_ok());
+    }
 
     #[test]
     fn rdma_device_map_selects_device_by_control_destination_ip() {

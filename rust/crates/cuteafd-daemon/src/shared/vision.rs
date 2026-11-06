@@ -49,7 +49,7 @@ pub enum VisionError {
     #[error("vision encoding cancelled")]
     Cancelled,
 }
-type Result<T> = std::result::Result<T, VisionError>;
+pub(crate) type Result<T> = std::result::Result<T, VisionError>;
 
 #[derive(Clone, Debug, Deserialize)]
 struct MimoConfig {
@@ -141,6 +141,14 @@ pub struct TowerSpec {
     pub native: VisionSpec,
     reads: Vec<TensorRead>,
 }
+impl TowerSpec {
+    /// Header-only staged source windows of this tower's pushed contribution:
+    /// BF16 vectors widen in the same windows `push::Contribution` records.
+    pub(crate) fn staged_rects(&self) -> Vec<crate::shared::experts::rtx::dense::Rect> {
+        self.reads.iter().filter(|read| read.vector)
+            .flat_map(|read| push::widen_windows(&read.path, &read.metadata)).collect()
+    }
+}
 fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
     let mut files = BTreeSet::new();
     let index_path = snapshot.join("model.safetensors.index.json");
@@ -195,6 +203,15 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
 }
 
 impl TowerSpec {
+    pub fn from_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView, max_tokens: usize) -> Result<Self> {
+        let cfg = view.config().map_err(|error| VisionError::Unsupported(error.to_string()))?;
+        if cfg["model_type"] == "glm5_next" {
+            Self::glm_flash_view(view, max_tokens)
+        } else {
+            Self::from_snapshot(view.snapshot(), max_tokens)
+        }
+    }
+
     pub fn from_snapshot(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         match cfg["model_type"].as_str() {

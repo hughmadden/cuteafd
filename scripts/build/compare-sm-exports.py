@@ -121,6 +121,15 @@ def jobs(scope):
     result.append(("draft-bf16", "export_b12x_dsv4_aot.py",
                    ["--geometry", "qwen38", "--only", ",".join(
                        f"k{k}_n{n}" for k, n in sorted(drafter.draft_bf16_shapes()))]))
+    native_bf16 = {(k, n) for family, shapes in drafter.native_attention_shapes().items()
+                   if family != "ml4" for n, k in shapes}
+    native_names = [f"k{k}_n{n}" for k, n in sorted(native_bf16)]
+    native_names += [f"k{k}_n{n}_f32" for n, k in sorted(drafter.native_attention_bf16_f32_shapes())]
+    result.append(("native-attention-bf16", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "muse", "--only", ",".join(native_names)]))
+    result.append(("native-attention-fp8", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "native_attention", "--only", ",".join(
+                       item[0] for item in drafter.native_attention_programs())]))
     # Small-row top-k deliberately exercises the fused persistent route, which
     # the production m64 table does not select.
     for geometry in ("flash", "pro", "glm", "glmf"):

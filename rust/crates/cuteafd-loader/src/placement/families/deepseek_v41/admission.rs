@@ -1341,17 +1341,6 @@ impl Recipe for V41Recipe<'_> {
                         vec![Location::coordinator(*gpu as u8)]
                     }
                     EncoderKind::Spark { .. } => {
-                        let active = self
-                            .counts
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, &count)| count < self.layers.len())
-                            .map(|(option, _)| Choice { variable: onboard, option })
-                            .collect::<Vec<_>>();
-                        if active.is_empty() {
-                            return Err(invalid("Spark encoder without an onboarded layout"));
-                        }
-                        contract.requires.push(Requires { when, any_of: active });
                         encoder
                             .spark_ranks()
                             .into_iter()

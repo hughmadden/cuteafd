@@ -492,7 +492,7 @@ impl FamilyModel for DeepSeekModel {
             block: 128,
             // Native packages remain bounded independently of transport capacity.
             spark_worlds: crate::plan::experts::spark_worlds(&format!("{geometry}:{format}"), self.spec().moe.as_ref()?.intermediate),
-            local: Err(format!("{serve} requires a checkpoint-qualified Spark expert recipe; local expert layers only supplement remote ranks")),
+            local: Ok(format!("{serve} native RTX whole-layer or TP2 expert package")),
         })
     }
 }

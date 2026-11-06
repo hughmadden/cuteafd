@@ -24,9 +24,9 @@ def v41_source() -> str:
 class NativeReleaseLauncherTest(unittest.TestCase):
     def test_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
         text = FAMILY.read_text()
-        start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 ]]; then')
+        start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 ]]; then')
         block = text[start:text.index('\nfi', start) + 3]
-        for family in ['deepseek_v4', 'mimo_v2', 'glm5']:
+        for family in ['deepseek_v4', 'mimo_v2', 'glm5', 'kimi_k3']:
             for setting, expected in [('', '--expert-usage'), ('off', '--expert-usage=false'), ('on', '--expert-usage'), ('invalid', None)]:
                 with self.subTest(family=family, setting=setting):
                     script = '''set -euo pipefail
@@ -48,7 +48,7 @@ release_die() { echo "$*" >&2; exit 2; }
         text = FAMILY.read_text()
         start = text.index('case "$(get EXPERT_USAGE on)" in', text.index('family_args=(--embedding-placement'))
         block = text[start:text.index('\nfi', start) + 3]
-        for family in ['kimi_k3', 'glm5_flash', 'muse_spark', 'step5', 'qwen4', 'qwen3_5']:
+        for family in ['glm5_flash', 'muse_spark', 'step5', 'qwen4', 'qwen3_5']:
             for setting in ['', 'on', 'off', 'invalid']:
                 with self.subTest(family=family, setting=setting):
                     script = '''set -euo pipefail
@@ -339,7 +339,8 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         self.assertEqual(FAMILY.read_text().count('-v "$USAGE_DIR:/run/cuteafd/usage"'), 1)
         self.assertIn('shared_api_state', v41_source())
         v41 = v41_source().split("<<'REMOTE' &", 1)[1].split('\nREMOTE', 1)[0]
-        self.assertIn('release_serving_docker_args\ncuteafd_cdi_gpu_args all || exit 2\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', v41)
+        self.assertLess(v41.index('release_serving_docker_args\ncuteafd_cdi_gpu_args all || exit 2'),
+                        v41.index('docker run -d "${RELEASE_SERVING_ARGS[@]}"'))
 
     def test_v41_worker_capacity_covers_every_coordinator_chunk_and_replay(self) -> None:
         chunks = list(range(80, 4097))
@@ -357,12 +358,13 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         self.assertIn('encoder_plan="$count_plan"', source)
         self.assertNotIn('--prefill-rows "$expert_capacity"', source)
 
-    def test_count_fallback_precedes_bf16_package_preflight(self) -> None:
+    def test_role_selection_precedes_bf16_package_preflight(self) -> None:
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         selection = source.index('selected_ranks="')
-        reexec = source.index('exec bash "$repo_root/scripts/launch/run-family.sh"', selection)
+        roles = source.index('release_deployment_spark_roles "$deployment_json"', selection)
         package = source.index('printf -v preflight_command')
-        self.assertLess(reexec, package)
+        self.assertLess(roles, package)
+        self.assertNotIn('exec bash "$repo_root/scripts/launch/run-family.sh"', source)
         self.assertLess(package, source.index('if [[ "$restart" == 1 ]];'))
 
     def test_v41_capacity_registry_rejects_invalid_chunks_and_syntax_drift(self) -> None:
@@ -598,7 +600,23 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         native = v41_source()
         generic = (ROOT / 'scripts/launch/run-family.sh').read_text()
         self.assertIn('--embedding-placement "$EMBEDDING"', native)
-        self.assertIn('family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")', generic)
+        from test_run_family_dispatch import _family_launch_result
+        for extra_args, expected in [((), 'gpu'), (('--embedding-placement', 'host'), 'host')]:
+            with self.subTest(embedding=expected), tempfile.TemporaryDirectory() as temporary:
+                launched = _family_launch_result(
+                    Path(temporary),
+                    {'model_type': 'glm_moe_dsa', 'num_hidden_layers': 4,
+                     'first_k_dense_replace': 3},
+                    'test/embedding',
+                    'EXLR8_MANIFEST=up1\nSPARK_COUNT=4\nRTX_GPUS=1\n'
+                    'SPECULATOR=off\nVISION=off\nAUDIO=off\n',
+                    extra_args=extra_args)
+                self.assertEqual(launched.returncode, 0, launched.stderr)
+                commands = [shlex.split(line) for line in launched.stderr.splitlines()
+                            if 'cuteafd serve-glm --snapshot' in line]
+                self.assertTrue(commands, launched.stderr)
+                for argv in commands:
+                    self.assertEqual(argv[argv.index('--embedding-placement') + 1], expected)
         self.assertIn('cfg_overrides[EMBEDDING]="$embedding_override"', generic)
 
     def test_small_card_embedding_default_and_explicit_overrides(self) -> None:

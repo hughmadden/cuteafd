@@ -13,6 +13,8 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
@@ -80,11 +82,13 @@ impl ServeArgs {
 
     pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
+        let plan = prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
             &cuteafd_loader::plan::families::muse_spark::MUSE_SPARK), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None, reserve_rows: None,
-        })?)
+        })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(plan).publish();
+        Ok(plan)
     }
 
     fn spark_budget_bytes(&self) -> u64 {
@@ -102,7 +106,7 @@ impl ServeArgs {
         let distinct = self.peers.iter().collect::<std::collections::HashSet<_>>().len();
         // Every Spark world the shared package range data gives the checkpoint's width.
         let worlds = cuteafd_loader::plan::experts::spark_worlds(cuteafd_loader::plan::families::muse_spark::PACKAGE, 4096);
-        ensure!(worlds.contains(&self.peers.len()) && distinct == self.peers.len(),
+        ensure!((self.peers.is_empty() || worlds.contains(&self.peers.len())) && distinct == self.peers.len(),
             "Muse Spark serves its EXL3 TP experts on {worlds:?} distinct Spark endpoints, not {}", self.peers.len());
         ensure!(self.max_context.is_none_or(|context| (1..=1 << 20).contains(&context)),
             "Muse Spark context exceeds the checkpoint's 1M extent");
@@ -196,6 +200,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
     let placement = &built.placement;
+    cuteafd_bench::context::ResolvedSettings::placement(placement).publish();
+    cuteafd_bench::context::set_resolved("max-context", &args.max_context.unwrap_or(cfg.max_position as u64).to_string());
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
@@ -690,7 +696,7 @@ mod tests {
 
     #[test]
     fn unsupported_layouts_refuse_before_any_device_access() -> Result<()> {
-        assert!(args(&[])?.validate().is_err(), "experts need Spark ranks");
+        args(&[])?.validate()?;
         let nine = (1..=9).map(|n| format!("127.0.0.1:{n}")).collect::<Vec<_>>().join(",");
         // Worlds 5, 7 and 8 come from the shared range data (#941).
         for world in [5, 7, 8] {

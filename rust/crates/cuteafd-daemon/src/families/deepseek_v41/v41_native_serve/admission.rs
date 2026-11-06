@@ -31,6 +31,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     -> Result<Option<crate::shared::placement::SparkAdmission>> {
     let geometry = catalog.routed_experts().geometry()?;
     ensure!(local_layers <= geometry.layers as usize, "V4.1 local boundary exceeds checkpoint");
+    if local_layers == geometry.layers as usize { return Ok(None); }
     if args.peers.is_empty() {
         ensure!(local_layers == geometry.layers as usize, "V4.1 remote layers require Spark peers");
         return Ok(None);
@@ -123,11 +124,16 @@ pub(super) fn embedding_placement(
     explicit: Option<crate::shared::memory::EmbedPlacement>,
     total: usize,
 ) -> crate::shared::memory::EmbedPlacement {
-    explicit.unwrap_or(if total <= 32usize << 30 {
+    let placement = explicit.unwrap_or(if total <= 32usize << 30 {
         crate::shared::memory::EmbedPlacement::Host
     } else {
         crate::shared::memory::EmbedPlacement::Gpu
-    })
+    });
+    cuteafd_bench::context::set_resolved("embedding-placement", match placement {
+        crate::shared::memory::EmbedPlacement::Host => "host",
+        crate::shared::memory::EmbedPlacement::Gpu => "gpu",
+    });
+    placement
 }
 
 pub(super) fn measured_pool_memory(lib: &cuteafd_ffi::NativeLibrary) -> Result<(usize, usize)> {
@@ -691,6 +697,7 @@ pub(super) fn resolve_with_owners(
     let admitted = input.prepare()?.admit(request)?;
     let host_ledger = admitted.host_ledger(host.prefix_bytes)?;
     let placement = admitted.placement;
+    cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     let groups = usize::try_from(placement.pool_tokens.div_ceil(512) + tails)?;
     let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
         &config,
@@ -710,6 +717,7 @@ pub(super) fn resolve_with_owners(
             "shared V4.1 cache demand differs from allocator"
         );
     }
+    cuteafd_bench::context::set_resolved("kv-pool-size", &(groups * (5 * 256 * 356)).to_string());
     Ok(Admitted {
         expert_usage: admitted.expert_usage,
         host, host_ledger,
@@ -935,13 +943,23 @@ mod admission_tests {
                     let mut args = args(dir.path());
                     args.peers = vec![args.peers[0].clone(); 4];
                     args.rtx_gpus = ranks as u32;
+                    // Match the synthetic target owners' 256-row, two-wave prefill arena.
+                    args.prefill_batch_tokens = 256;
+                    args.prefill_waves = 2;
+                    args.prefill_reserve_rows = 512;
                     args.max_context_tokens = 262_144;
                     args.pool_tokens = pool_tokens;
                     args.concurrency = concurrency;
                     args.prefix_cache_entries = turns;
                     args.rtx_expert_layers = onboard;
-                    let admitted = resolve_with_owners(&args, &memory, experts.clone(), workspace,
-                        &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], None)?;
+                    let admitted = crate::commands::bench::assert_resolved_family_seam("deepseek_v41", &[], || {
+                        super::super::normalize_serving(&mut args)?;
+                        super::super::AdmittedPrefill::resolve(&args)?;
+                        super::super::attention_plan(&args)?;
+                        embedding_placement(args.embedding_placement, memory[0].1);
+                        resolve_with_owners(&args, &memory, experts.clone(), workspace,
+                            &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], None)
+                    })?;
                     assert!(admitted.placement.pool_tokens >= 262_144);
                     if let Some(pool) = pool_tokens.filter(|&n| n > 0) {
                         assert_eq!(admitted.placement.pool_tokens, pool);

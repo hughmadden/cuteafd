@@ -535,6 +535,8 @@ impl GlmModel {
 impl FamilyModel for GlmModel {
     fn contract_admission(&self) -> bool { true }
 
+    fn admits_expert_packages(&self) -> bool { self.id == "glm5_flash" }
+
     fn spec(&self) -> &ModelSpec {
         &self.spec
     }

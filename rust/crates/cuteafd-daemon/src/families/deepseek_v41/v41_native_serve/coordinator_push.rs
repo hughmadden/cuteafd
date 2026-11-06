@@ -12,7 +12,7 @@ use cuteafd_loader::OfficialV41Catalog;
 pub(super) fn wanted(args: &crate::cli::NativeServeArgs, catalog: &OfficialV41Catalog) -> Result<bool> {
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
     policy.plan(|| {
-        anyhow::ensure!(!args.peers.is_empty() && catalog.exl3().is_none() && catalog.nvfp4().is_none()
+        anyhow::ensure!(catalog.exl3().is_none() && catalog.nvfp4().is_none()
             && catalog.fp8().is_none() && !args.tp2_query_projection && !args.tp2_output_projection, "V4.1 coordinator push does not support this weight placement yet");
         Ok(())
     }).map(|planned| planned.is_some()).map_err(Into::into)
@@ -30,7 +30,7 @@ pub(super) struct Planned<'a> {
 #[allow(clippy::type_complexity)]
 pub(super) fn plan<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Catalog, devices: [Device<'a>; 2],
     records: &Records, tp2_layers: usize, tp2_budgets: [usize; 2], draft_expert_bytes: usize, sparks: usize, envelope: cuteafd_loader::push_load::PushHostEnvelope)
-    -> Result<(Planned<'a>, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
+    -> Result<(Planned<'a>, Option<(Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)>)> {
     let dense = dense::plan_records(snapshot, records.clone(), &devices, sparks)?;
     use crate::shared::experts::{layer::ExpertLayer, rtx::push::{CoordinatorExperts, WholeOwner}};
     let owners = (0..2).map(|rank| {
@@ -39,9 +39,14 @@ pub(super) fn plan<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Catalog,
         Ok(WholeOwner { rank, selections, budget: tp2_budgets[rank].checked_add(draft_expert_bytes)
             .context("V4.1 mixed expert admission overflow")? })
     }).collect::<Result<Vec<_>>>()?;
-    let (push, streams, ranks) = CoordinatorPush::prepare_admitted(snapshot, Some(catalog), 2,
-        (tp2_layers > 0 || draft_expert_bytes > 0).then_some(CoordinatorExperts::Native { owners }), envelope)?;
-    Ok((Planned { push, dense: Some(dense), sparks }, streams, ranks))
+    let experts = (tp2_layers > 0 || draft_expert_bytes > 0).then_some(CoordinatorExperts::Native { owners });
+    let (push, ranks) = if sparks == 0 {
+        (CoordinatorPush::prepare_alone_admitted(snapshot, Some(catalog), 2, experts, envelope)?, None)
+    } else {
+        let (push, streams, ranks) = CoordinatorPush::prepare_admitted(snapshot, Some(catalog), 2, experts, envelope)?;
+        (push, Some((streams, ranks)))
+    };
+    Ok((Planned { push, dense: Some(dense), sparks }, ranks))
 }
 
 impl<'a> Planned<'a> {

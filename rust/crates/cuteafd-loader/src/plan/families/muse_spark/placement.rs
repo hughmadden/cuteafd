@@ -58,11 +58,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             model.expert_formats), "Serve the EXL3 K4 + Core-K6 snapshot.");
         return memory;
     }
-    if ranks == 0 {
-        report.refuse_placement("Muse Spark routed experts (~400 GB at K4) need Spark ranks".into(),
-            "Use --spark-ranks 4..8.");
-        return memory;
-    }
     if !(1..=2).contains(&gpus) || (gpus == 2 && !opts.head_split) {
         report.refuse_placement("Muse Spark runs on one RTX or a head-split RTX pair".into(), "Use --rtx 1 or 2.");
         return memory;

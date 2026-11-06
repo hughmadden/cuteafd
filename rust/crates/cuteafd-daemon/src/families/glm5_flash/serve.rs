@@ -98,6 +98,9 @@ pub(crate) struct ServeArgs {
     /// Admitted resident Spark encoder endpoints, in replica order.
     #[arg(long)]
     pub vision_peers: Option<String>,
+    /// Physical Spark ranks from the solved media roles, in endpoint order.
+    #[arg(long, requires = "vision_peers")]
+    pub vision_peer_ranks: Option<String>,
     /// Shared planner admission hash (required with --vision-peers).
     #[arg(long, requires = "vision_peers")]
     pub encoder_plan_hash: Option<String>,
@@ -140,11 +143,36 @@ pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std:
     if mode != MediaMode::Auto || template_from.is_some() || super::media::vision_config(mode, snapshot)?.is_none() {
         return Ok((mode, None));
     }
-    Ok(match GlmEncoding::vision_template_gap(snapshot)? {
+    let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+    auto_vision_view(mode, &view, template_from)
+}
+
+pub(crate) fn auto_vision_view(mode: cuteafd_loader::plan::MediaMode,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView, template_from: Option<&str>)
+    -> Result<(cuteafd_loader::plan::MediaMode, Option<String>)> {
+    use cuteafd_loader::plan::MediaMode;
+    if mode != MediaMode::Auto || template_from.is_some() || super::media::vision_config_view(mode, view)?.is_none() {
+        return Ok((mode, None));
+    }
+    Ok(match GlmEncoding::vision_template_gap_with_config(view.snapshot(), &view.config()?)? {
         Some(gap) => (MediaMode::Off, Some(format!("VISION=auto serves text only (vision off): {gap}; \
             set CHAT_TEMPLATE_FROM=<HF id or snapshot> to the vendor template to serve images"))),
         None => (mode, None),
     })
+}
+
+pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_sequences: usize) {
+    engine_args.slots = cuteafd_core::concurrency::state_slots(max_sequences as u64) as usize;
+    (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(max_sequences,
+        engine_args.draft_sequences, engine_args.draft_context_slots);
+    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
+    cuteafd_bench::context::set_resolved("draft-fp8", if engine_args.draft.is_some() {
+        if engine_args.draft_fp8 == Some(false) { "false" } else { "true" }
+    } else { "unused" });
+    cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
+    cuteafd_bench::context::set_resolved("draft-sequences", &engine_args.draft_sequences.to_string());
+    cuteafd_bench::context::set_resolved("draft-context-slots", &engine_args.draft_context_slots.unwrap_or(0).to_string());
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
@@ -154,10 +182,13 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     args.prefix.resolve_entries(max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
-        GlmEncoding::from_snapshot(&snapshot)?
+    let selected_view = args.engine.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.engine.attention.select(&snapshot))?;
+    args.engine.attention.selected_view = Some(selected_view.clone());
+    let encoding = if super::media::vision_config_view(args.vision, &selected_view)?.is_none() {
+        GlmEncoding::from_snapshot_with_config(&snapshot, &selected_view.config()?)?
     } else {
-        GlmEncoding::from_snapshot_for_vision(&snapshot, args.chat_template_from.as_deref(), None)?
+        GlmEncoding::from_snapshot_for_vision_with_config(&snapshot, &selected_view.config()?, args.chat_template_from.as_deref(), None)?
     }.with_thinking_off(args.thinking_off);
     if let Some(provenance) = encoding.template_provenance() {
         tracing::info!(chat_template = %serde_json::to_string(provenance)?, "GLM Flash chat template selected");
@@ -170,15 +201,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.slots = cuteafd_core::concurrency::state_slots(max_sequences as u64) as usize;
-    (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(max_sequences,
-        engine_args.draft_sequences, engine_args.draft_context_slots);
-    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
-    cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
-    cuteafd_bench::context::set_resolved("draft-sequences", &engine_args.draft_sequences.to_string());
-    if let Some(slots) = engine_args.draft_context_slots {
-        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
-    }
+    resolve_serving_capacity(&mut engine_args, max_sequences);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), max_sequences, args.decode_share);
     let policy = Policy { fixed: args.draft_fixed, batch: args.prefill_batch };
     let prefix = args.prefix.clone();
@@ -261,6 +284,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         tracing::info!("GLM 5.3 Flash prefix cache off (no entries): no prefix marks, no reserved unit");
         args.prefix_marks = marks;
     }
+    cuteafd_bench::context::set_resolved("prefix-marks", match args.prefix_marks { PrefixMarks::Arena => "arena", PrefixMarks::Pool => "pool" });
     // Either KV admission reserves the mark arena `prefix_cache` will allocate (none: marks in pool units),
     // counted once the engine's layout is known (`with_engine`).
     args.mark_arena = match args.prefix_marks {
@@ -274,7 +298,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
-    args.serving_encoder = match super::media::ReadyVision::plan(&args, vision, remote.as_ref()) {
+    args.serving_encoder = match super::media::ReadyVision::plan(&args, &opened.view, vision, remote.as_ref()) {
         Ok(encoder) => encoder,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
@@ -287,7 +311,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let prepared = std::cell::RefCell::new(None);
     let mut ready = Some(ready);
     let result = opened.with_engine_media(&args, || {
-        let vision = super::media::ReadyVision::load(&args, &opened.library, vision, bytes, remote)?;
+        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote)?;
         let records = vision.as_ref().map(|vision| vision.push.records()).unwrap_or_default();
         *prepared.borrow_mut() = vision;
         Ok(records)
@@ -930,7 +954,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+    let config = opened.view.config()?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots()).rev().collect());
     // Admissions that found no drafter ring (must stay 0: one ring per sequence the scheduler holds).
@@ -1014,7 +1038,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                                 prompt.tokens.len(), engine.max_context))));
                             continue;
                         }
-                        if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, snapshot) {
+                        if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, &opened.view) {
                             if let Some(probe) = &prompt.job.probe { probe.fail(format!("reference features: {error:#}")); }
                             let _ = events.send(Err(NativeFailure::BadRequest(format!("reference features: {error:#}"))));
                             drop(request_media); media.cache.prune_reservations();

@@ -216,11 +216,11 @@ RUN_STATEMENTS = {
         'already exists; use --restart"\n',
     ),
     "exit-cleanup-loop": (
-        'for i in "${!hosts[@]}"; do release_ssh',
+        'for i in "${spark_worker_ranks[@]}"; do release_ssh',
         '|| true; done\n',
     ),
     "expert-launch": (
-        'remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i"',
+        'worker_budget="$(release_spark_role_budget "$count_plan" "$i")" || exit 1',
         '\nREMOTE\n',
     ),
     "readiness-poll": (
@@ -234,6 +234,7 @@ RUN_STATEMENTS = {
 }
 
 RUN_VARS = """
+source scripts/lib/family-keys.sh
 shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
 hosts=(seed0 seed1)
 i=0
@@ -260,6 +261,14 @@ spark_tp=2
 spark_ep=2
 wip_slot=
 encoder_rank=-1
+spark_expert_world=2
+spark_worker_ranks=(0 1)
+spark_vision_ranks=()
+encoder_port=19541
+encoder_hash=
+RELEASE_MODEL_REVISION=revision
+ready_marker='worker bootstrap ready'
+count_plan='{"spark_roles":[{"rank":0,"experts":true},{"rank":1,"experts":true}],"memory_layout":{"devices":[{"kind":"spark","index":0,"worker_budget_bytes":107374182400},{"kind":"spark","index":1,"worker_budget_bytes":107374182400}]}}'
 """
 
 BATCH = ["-o", "BatchMode=yes"]
@@ -387,7 +396,7 @@ class TestRunShLifecycle:
         assert "BatchMode" in usage
         assert "Include ~/.ssh/config" in usage
 
-    def test_cleanup_loop_reaches_every_configured_host(self, tmp_path):
+    def test_cleanup_loop_reaches_every_active_host(self, tmp_path):
         result, invocations = self._run(tmp_path, _slice("exit-cleanup-loop"))
         assert result.returncode == 0, result.stderr
         assert [call[2] for call in invocations] == ["seed0", "seed1"], invocations
@@ -415,7 +424,7 @@ class TestRunShLifecycle:
 
     def test_launch_passes_its_contract_positionally(self, tmp_path):
         """The worker argument contract is positional: an option set change must
-        not shift a single one of the fifteen values the remote script decodes."""
+        not shift a single one of the twenty values the remote script decodes."""
         result, invocations = self._run(tmp_path, _slice("expert-launch"))
         assert result.returncode == 0, result.stderr
         call = invocations[0]
@@ -424,6 +433,7 @@ class TestRunShLifecycle:
             "cuteafd-spark-expert:v10", "cuteafd-spark-expert-seed0-19441", "0",
             "107374182400", "19441", "hub/models--x--M/snapshots/rev",
             "fp", "2", "explicit", "2", "2", "", "", "info", "__none__",
+            "-1", "19541", "", "revision", "1",
             # Docker options follow the positionals behind one sentinel.
             "--profile-args", "-e", "CUTEAFD_FP8_EXPERT_PREFILL=auto", "-e", "CUTEAFD_THERMAL=on",
         ], payload
@@ -438,7 +448,7 @@ class TestRunShLifecycle:
         payload = _remote_payload(invocations[0])
         assert payload[11:13] == ["/dev/infiniband", ""], payload
         assert payload[13:15] == ["info", "__none__"], payload
-        assert payload.index("--profile-args") == 15, payload
+        assert payload.index("--profile-args") == 20, payload
 
 
 

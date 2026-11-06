@@ -1,7 +1,7 @@
 //! Pre-allocation descriptions shared with MiMo's allocation path. CUDA
 //! manifest queries read shape/scratch metadata before loading any weights.
 use anyhow::{ensure, Context, Result};
-use cuteafd_loader::families::mimo_v2::admission::{tensor_bytes, draft_prefix_reservations, prefill_shape, workspace_scratch, draft_reservations_with, DraftReservations, DraftScratch};
+use cuteafd_loader::families::mimo_v2::admission::{tensor_bytes, draft_prefix_reservations, prefill_shape, workspace_scratch, draft_reservations_with, draft_rank_reservations_with, DraftReservations, DraftScratch};
 
 use cuteafd_core::serving_capacity::MemoryReservation;
 use cuteafd_ffi::programs::Programs;
@@ -257,6 +257,8 @@ fn preflight_shape(
     );
     let devices: Vec<i32> = std::iter::once(args.device).chain(split_device).collect();
     let ranks = devices.len();
+    ensure!(!args.tp2_dflash || (ranks == 2 && args.draft.is_some()),
+        "TP2 DFlash requires a drafter and two target GPUs");
     let concurrency = serving.map_or(1, |(_, c)| c);
     ensure!(
         (1..=super::engine::DECODE_ROWS).contains(&concurrency) && concurrency <= args.rings,
@@ -269,7 +271,7 @@ fn preflight_shape(
     let draft_mark_bytes = args.draft.as_deref().filter(|_| prefix_draft).map(super::dflash::drafter_dir)
         .map(|dir| -> Result<u64> {
             let draft = super::dflash::DflashConfig::read(&dir)?;
-            Ok(cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(draft.layers as u64, draft.kv_heads as u64, draft.head_dim as u64, args.draft_kv_cache)?)
+            draft.mark_bytes(if args.tp2_dflash { 2 } else { 1 }, args.draft_kv_cache)
         }).transpose()?.unwrap_or(0);
     let target_mark_bytes = cache
         .ranks
@@ -371,7 +373,7 @@ fn preflight_shape(
     let mut runtime = Vec::with_capacity(ranks);
     let mut memory = Vec::with_capacity(ranks);
     let mut post_kv_loading_additional = Vec::with_capacity(ranks);
-    let mut draft_packing = Vec::new();
+    let mut draft_packing = vec![vec![]; ranks];
     for (rank, &device) in devices.iter().enumerate() {
         let device_id = u32::try_from(device).context("negative CUDA device id")?;
         let (free, total) =
@@ -404,6 +406,13 @@ fn preflight_shape(
             if serving.is_some() {
                 additional.extend(cuteafd_loader::families::mimo_v2::admission::sampling_reservations(cfg.vocab_size)?);
             }
+            if backend == ExpertBackend::Local && args.expert_window.is_some() {
+                let (reservations, weights) = local_expert_reservations(opened, args, layers)?;
+                additional.extend(reservations);
+                resident_weights = resident_weights.checked_add(weights)?;
+            }
+        }
+        if rank == 0 || args.tp2_dflash {
             if let Some(dir) = args.draft.as_deref().map(super::dflash::drafter_dir) {
                 let draft = super::dflash::DflashConfig::read(&dir)?;
                 ensure!(
@@ -412,23 +421,24 @@ fn preflight_shape(
                         && draft.taps.iter().all(|&l| l < layers),
                     "DFlash geometry or taps do not fit the selected target layers"
                 );
-                let reservations = draft_reservations(
+                let reservations = draft_rank_reservations(
                     library,
                     &dir,
                     &draft,
                     opened.weight_formats.draft,
                     args.draft_capacity(draft.block)?,
+                    rank,
+                    if args.tp2_dflash { 2 } else { 1 },
                 )?;
                 resident_weights = resident_weights.checked_add(reservations.resident_weights)?;
                 additional.extend(reservations.steady);
-                additional.extend(draft_prefix_reservations(prefix_draft, draft_mark_bytes, mark_slots,
-                    args.rings as u64)?);
-                draft_packing = reservations.packing;
-            }
-            if backend == ExpertBackend::Local && args.expert_window.is_some() {
-                let (reservations, weights) = local_expert_reservations(opened, args, layers)?;
-                additional.extend(reservations);
-                resident_weights = resident_weights.checked_add(weights)?;
+                let local = draft.for_tp(if args.tp2_dflash { 2 } else { 1 })?;
+                let mark = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(
+                    local.layers as u64, local.kv_heads as u64, local.head_dim as u64, args.draft_kv_cache)?;
+                additional.extend(draft_prefix_reservations(prefix_draft,
+                    if rank == 0 { mark } else { mark - 8 }, mark_slots,
+                    if rank == 0 { args.rings as u64 } else { 0 })?);
+                draft_packing[rank] = reservations.packing;
             }
         }
         additional.extend(graph_reservations[rank].iter().cloned());
@@ -806,10 +816,22 @@ pub(super) fn draft_reservations(
     mode: cuteafd_loader::families::mimo_v2::draft_representation::MimoDraftRepresentation,
     capacity: cuteafd_loader::families::mimo_v2::draft_representation::MimoDraftCapacity,
 ) -> Result<DraftReservations> {
+    draft_rank_reservations(library, directory, cfg, mode, capacity, 0, 1)
+}
+
+pub(super) fn draft_rank_reservations(
+    library: &cuteafd_ffi::NativeLibrary,
+    directory: &std::path::Path,
+    cfg: &super::dflash::DflashConfig,
+    mode: cuteafd_loader::families::mimo_v2::draft_representation::MimoDraftRepresentation,
+    capacity: cuteafd_loader::families::mimo_v2::draft_representation::MimoDraftCapacity,
+    rank: usize,
+    ranks: usize,
+) -> Result<DraftReservations> {
     let headers = cuteafd_loader::read_safetensors_metadata(
         &directory.join("dflash_draft_model.safetensors"),
     )?;
-    draft_reservations_with(cfg, &headers, mode, capacity, |shape| match shape {
+    draft_rank_reservations_with(cfg, &headers, mode, capacity, rank, ranks, |shape| match shape {
         DraftScratch::Fp8 { rows, k, n } => library.fp8_w8a16_workspace(rows, k, n),
         DraftScratch::Attention {
             sequences,
@@ -1106,6 +1128,71 @@ mod tests {
             .iter()
             .any(|cost| cost.name.contains("ring") || cost.name.contains("workspace")));
         assert!(!costs.iter().any(|cost| cost.name.starts_with("loading.")));
+    }
+
+    #[test]
+    fn tp2_draft_admission_validates_full_sources_and_charges_local_owners() {
+        use cuteafd_loader::families::{mimo_v2::draft_representation::{MimoDraftCapacity,
+            MimoDraftRepresentation, mimo_draft_mark_bytes}, qwen4::Qwen4KvCache};
+        let (mut cfg, mut headers) = draft_fixture();
+        cfg.heads = 4;
+        cfg.kv_heads = 2;
+        cfg.intermediate = 256;
+        for header in &mut headers {
+            let name = header.name.as_str();
+            header.shape = if name.ends_with("attention_sink_bias") { vec![4] }
+                else if name.ends_with("q_proj.weight") { vec![512, 128] }
+                else if name.ends_with("k_proj.weight") || name.ends_with("v_proj.weight") { vec![256, 128] }
+                else if name.ends_with("o_proj.weight") { vec![128, 512] }
+                else if name.ends_with("gate_proj.weight") || name.ends_with("up_proj.weight") { vec![256, 128] }
+                else if name.ends_with("down_proj.weight") { vec![128, 256] }
+                else { header.shape.clone() };
+            header.byte_length = 2 * header.shape.iter().product::<usize>() as u64;
+        }
+        for mode in [MimoDraftRepresentation::Bf16Only, MimoDraftRepresentation::Fp8Only] {
+            for kv in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+                let capacity = MimoDraftCapacity { kv_cache: kv,
+                    ..MimoDraftCapacity::new(20, 16, cfg.block).unwrap() };
+                let whole = draft_reservations_with(&cfg, &headers, mode, capacity, |_| Ok(2048)).unwrap();
+                let local = draft_rank_reservations_with(&cfg, &headers, mode, capacity, 0, 2, |shape| {
+                    if let DraftScratch::Attention { heads, kv_heads, .. } = shape {
+                        assert_eq!((heads, kv_heads), (2, 1));
+                    }
+                    Ok(2048)
+                }).unwrap();
+                let bytes = |owners: &[cuteafd_core::serving_capacity::MemoryReservation], name: &str|
+                    owners.iter().find(|owner| owner.name == name).unwrap().bytes;
+                for ring in ["draft.layer0.k_ring", "draft.layer0.v_ring"] {
+                    let local_record = kv.plane_record_bytes(1, 128) as u64;
+                    assert_eq!(bytes(&local.steady, ring), 20 * 1024 * local_record);
+                    if kv == Qwen4KvCache::Bf16 {
+                        assert_eq!(2 * bytes(&local.steady, ring), bytes(&whole.steady, ring));
+                    }
+                }
+                for owner in ["draft.taps", "draft.fused", "draft.fused_norm", "draft.workspace.h",
+                    "draft.workspace.n", "draft.workspace.logits", "draft.workspace.head_workspace"] {
+                    assert_eq!(bytes(&local.steady, owner), bytes(&whole.steady, owner), "{owner}");
+                }
+                assert_eq!(bytes(&local.steady, "draft.workspace.reduced"), capacity.block_rows as u64 * 128 * 2);
+                let peer = draft_rank_reservations_with(&cfg, &headers, mode, capacity, 1, 2,
+                    |shape| { assert!(!matches!(shape, DraftScratch::Topk { .. })); Ok(2048) }).unwrap();
+                for name in ["head_workspace", "logits", "unary", "candidates", "topk_workspace"] {
+                    assert!(!peer.steady.iter().any(|owner| owner.name == format!("draft.workspace.{name}")));
+                }
+                assert_eq!(peer.resident_weights.0, local.resident_weights.0);
+                assert_eq!(local.resident_weights.0, cfg.for_tp(2).unwrap().runtime_layout(mode, capacity)
+                    .unwrap().weights.resident_bytes().unwrap());
+                assert!(local.packing.iter().all(|owner| !owner.name.contains("ring") && !owner.name.contains("workspace")));
+                let whole_mark = mimo_draft_mark_bytes(1, 2, 128, kv).unwrap();
+                let local_mark = mimo_draft_mark_bytes(1, 1, 128, kv).unwrap();
+                assert_eq!(cfg.mark_bytes(2, kv).unwrap(), 2 * local_mark - 8);
+                if kv == Qwen4KvCache::Bf16 { assert_eq!(whole_mark, 2 * local_mark - 8); }
+                else { assert!(cfg.mark_bytes(2, kv).unwrap() > whole_mark); }
+            }
+        }
+        headers.iter_mut().find(|t| t.name.ends_with("q_proj.weight")).unwrap().shape[0] /= 2;
+        assert!(draft_rank_reservations_with(&cfg, &headers, MimoDraftRepresentation::Bf16Only,
+            MimoDraftCapacity::new(20, 16, cfg.block).unwrap(), 0, 2, |_| panic!("native query before source validation")).is_err());
     }
 
     #[test]

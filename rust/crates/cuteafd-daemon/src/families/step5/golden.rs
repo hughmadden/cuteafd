@@ -39,11 +39,13 @@ const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     /// Same immutable target KV storage as serving.
     #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long)]
-    snapshot: PathBuf,
+    pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -504,7 +506,7 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
 
 fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
     let (world, config, format) = expert_admission(args, rows, layers)?;
-    let warm = super::execution::bootstrap_request(rows, 17, &format, layers)?;
+    let warm = super::execution::bootstrap_shape(rows, &format)?;
     // The widest wave sizes every rank's rings and the exchange staging.
     let mut link = SparkLink::new_waves(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2, 1, u32::try_from(rows)?)?;
     link.bootstrap(&warm)?;
@@ -856,7 +858,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         let mut link = SparkLink::new_waves(&library, world, &args.peers, unit as u32,
             config, H * 2, waves, unit as u32)?;
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(unit, 17, &format, layers)?)?;
+        link.bootstrap(&super::execution::bootstrap_shape(unit, &format)?)?;
         Ok(link)
     })?;
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;
@@ -1464,6 +1466,7 @@ mod tests {
             .collect::<Vec<_>>();
         std::fs::write(folder.join("layer87.bin"), &bytes)?;
         let mut args = GoldenArgs {
+            attention: Default::default(),
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             snapshot: root.path().into(),
             native_lib: None,
@@ -1529,6 +1532,7 @@ mod tests {
             .flat_map(f32::to_le_bytes).collect::<Vec<_>>();
         std::fs::write(folder.join("logits.bin"), &logits)?;
         let mut args = GoldenArgs {
+            attention: Default::default(),
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
             peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None,  poison_scratch: false, check_headers: true, nll: true, prefix_state: false,

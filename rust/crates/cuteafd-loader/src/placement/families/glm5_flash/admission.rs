@@ -9,7 +9,12 @@ pub struct ProcessOwners {
     pub host_headroom: u64,
     pub allocations: Vec<p::Allocation>,
     pub links: Vec<PreparedSparkLink>,
+    /// Physical media ranks remain available when their expert package is absent.
+    pub remote_experts: bool,
+    /// Additional admitted media hosts, independent of expert peers.
+    pub physical_sparks: usize,
     pub native_load: Option<NativeLoad>,
+    pub mount_load: Option<crate::shared::dense_read::MountLoad>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
     pub auto_vision: bool,
     pub media_cache_bytes: u64,
@@ -178,7 +183,7 @@ impl NativeLoad {
 
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
-        Self { host, host_headroom, allocations: vec![], links: vec![], native_load: None,
+        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
             draft_push: None }
     }
@@ -229,6 +234,15 @@ pub fn host_geometry(i: &GlmfInputs<'_>) -> Result<cuteafd_core::prefix::HostCac
             * if i.attention.mode == AttentionPlacement::Context { 2 } else { 1 }
             + rank.glmf_pool_mark_backing_unit_bytes(i.pool_marks)).sum(),
         mark_bytes: geometry.ranks.iter().map(|rank| rank.retained_mark_bytes).sum(), draft_bytes: 0 })
+}
+
+/// One reused legacy dense reader; routed experts have independent owners.
+pub fn mount_load(checkpoint: &crate::plan::Checkpoint, ranks: usize)
+    -> anyhow::Result<crate::shared::dense_read::MountLoad> {
+    anyhow::ensure!((1..=2).contains(&ranks), "Flash mount rank count");
+    crate::shared::dense_read::MountLoad::from_headers(checkpoint.tensors.iter()
+        .filter(|tensor| !tensor.meta.name.contains(".experts."))
+        .map(|tensor| &tensor.meta), ranks)
 }
 
 /// Header-only estimate shared by offline planning and live startup. Exact
@@ -313,6 +327,7 @@ pub struct PreparedGlmf<'a> {
     arena: Vec<Vec<u64>>,
     sms: usize,
     native_load: Option<NativeLoad>,
+    mount_load: Option<crate::shared::dense_read::MountLoad>,
     push_host: Option<crate::push_load::PushHostEnvelope>,
     encoders: Vec<crate::plan::encoder::EncoderPlacement>,
 }
@@ -325,23 +340,9 @@ pub struct AdmittedGlmf {
     /// Unused estimate-minus-selected bytes; selection is never rerun to reclaim them.
     pub graph_slack: Vec<u64>,
     pub native_load: Option<NativeLoad>,
+    pub mount_load: Option<crate::shared::dense_read::MountLoad>,
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
     pub encoder: Option<crate::plan::encoder::EncoderPlacement>,
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum TopologyRefusal {
-    #[error("all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")]
-    IdleSparks,
-}
-
-impl AdmittedGlmf {
-    pub fn validate_spark_topology(&self, requested: usize) -> Result<(), TopologyRefusal> {
-        if requested > 0 && self.working.spark_ranks == 0 {
-            return Err(TopologyRefusal::IdleSparks);
-        }
-        Ok(())
-    }
 }
 
 fn invalid(error: impl std::fmt::Display) -> p::Refusal {
@@ -445,6 +446,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     }
     let facts = facts(i).map_err(invalid)?;
     let gpus = i.gpus.len();
+    let physical_sparks = i.spark_ranks.max(process.physical_sparks);
+    if physical_sparks > 8 { return Err(invalid("Flash encoder Spark rank outside transport inventory")); }
     if i.max_context == 0 || i.spark_ranks > 8
         || i.graphs.ranks.iter().any(|rank| rank.margin > rank.bytes)
         || i.gpus.iter().any(|(total, baseline)| *total == 0
@@ -479,7 +482,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     let counts = if i.spark_ranks == 0 { vec![routed.len()] }
         else if let Some(n) = i.onboard.layers(routed.len()) { vec![n] }
         else if rtx_experts { (0..=routed.len()).collect() } else { vec![0] };
-    if counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
+    let counts = counts.into_iter().filter(|&count| process.remote_experts || count == routed.len()).collect::<Vec<_>>();
+    if counts.is_empty() || counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
         return Err(p::Refusal::Unsupported);
     }
     let mut contract = p::Contract::fixed(256, maximum, gpus, p::Facts {
@@ -518,17 +522,13 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             }
         }
         for (option, encoder) in process.encoders.iter().enumerate() {
-            let when = p::Choice { variable, option };
             let locations = match &encoder.kind {
                 EncoderKind::Off => vec![],
                 EncoderKind::Rtx { gpu } if *gpu < gpus => vec![p::Location::coordinator(*gpu as u8)],
-                EncoderKind::Spark { .. } if !routed.is_empty() && i.spark_ranks > 0 => {
-                    if encoder.spark_ranks().iter().any(|&rank| rank >= i.spark_ranks) {
+                EncoderKind::Spark { .. } => {
+                    if encoder.spark_ranks().iter().any(|&rank| rank >= physical_sparks) {
                         return Err(invalid("Flash encoder Spark rank absent"));
                     }
-                    contract.requires.push(p::Requires { when, any_of: counts.iter().enumerate()
-                        .filter(|(_, count)| **count < routed.len())
-                        .map(|(option, _)| p::Choice { variable: onboard_variable, option }).collect() });
                     encoder.spark_ranks().into_iter().map(|rank| p::Location {
                         device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }).collect()
                 }
@@ -584,7 +584,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         physical_bytes: host.0, logical_bytes: host.0, headroom: process.host_headroom,
         baseline: p::Baseline::Sampled { free: host.1, phase: p::Phase::Load,
             source: "MemAvailable plus process anonymous RSS".into() } });
-    for rank in 0..i.spark_ranks {
+    for rank in 0..physical_sparks {
         budgets.push(p::Budget { id: format!("spark{rank}"), locations: vec![p::Location {
             device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }],
             physical_bytes: 121 << 30, logical_bytes: 121 << 30, headroom: 0,
@@ -592,7 +592,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 source: "Spark worker physical capacity; worker owners supplied by caller".into(), assumed: true } });
     }
     for owner in process.allocations.iter().cloned().chain(process.native_load.iter()
-        .flat_map(|load| load.allocations(process.push_host.is_some()))) {
+        .flat_map(|load| load.allocations(process.push_host.is_some())))
+        .chain(process.mount_load.iter().flat_map(|load| load.allocations("glmf.load.mount"))) {
         let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
         contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
     }
@@ -756,7 +757,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         resident_weight_limit: i.resident_weight_limit,
         spark_reply_formats: contract.spark_reply_formats.unwrap_or_default() };
     Ok(PreparedGlmf { started: std::time::Instant::now(), input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena, sms,
-        native_load: process.native_load, push_host: process.push_host, encoders: process.encoders })
+        native_load: process.native_load, mount_load: process.mount_load, push_host: process.push_host, encoders: process.encoders })
 }
 
 fn hop_spec(i: &GlmfInputs<'_>) -> HopSpec {
@@ -825,7 +826,7 @@ impl PreparedGlmf<'_> {
         let encoder = solved.decisions.encoder.map(|index| self.encoders[index].clone());
         tracing::debug!(target: "cuteafd::planner", complete_solve_us = self.started.elapsed().as_micros() as u64,
             graph_slack = ?graph_slack, "Flash recipe preparation, search and exact reconciliation completed");
-        Ok(AdmittedGlmf { placement, graphs, working, solved, graph_slack, native_load: self.native_load, push_host: self.push_host, encoder })
+        Ok(AdmittedGlmf { placement, graphs, working, solved, graph_slack, native_load: self.native_load, mount_load: self.mount_load, push_host: self.push_host, encoder })
     }
 }
 

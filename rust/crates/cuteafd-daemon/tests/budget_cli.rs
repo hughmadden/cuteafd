@@ -30,12 +30,16 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
 
 #[test]
 fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_input() {
+    // GLM Flash selects its immutable metadata view before resolving concurrency.
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
+    std::fs::write(snapshot.path().join("model.safetensors.index.json"), r#"{"weight_map":{}}"#).unwrap();
     for family in ["serve-glmf", "serve-glm", "serve-mimo"] {
         for gib in [30u64, 32, 96] {
             let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
             for explicit in [None, Some(expected), Some(4)] {
                 let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
-                command.args([family, "--snapshot", "/direct-cli-missing-snapshot", "--native-lib", "/unused",
+                command.args([family, "--snapshot", snapshot.path().to_str().unwrap(), "--native-lib", "/unused",
                     "--coordinator-gpu-budget-gib", &gib.to_string(), "--vision", "off", "--audio", "off"]);
                 if let Some(value) = explicit { command.args(["--max-sequences", &value.to_string()]); }
                 let output = command.env("RUST_LOG", "info")
@@ -595,6 +599,78 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     assert!(admitted <= lead["capacity_bytes"].as_u64().unwrap());
 }
 
+fn assert_unique_deployment_devices(deployment: &serde_json::Value, name: &str) {
+    let devices = deployment["memory_layout"]["devices"].as_array().expect("device ledger");
+    let mut identities = std::collections::BTreeSet::new();
+    for device in devices {
+        let identity = (device["kind"].as_str().unwrap(), device["index"].as_u64().unwrap());
+        assert!(identities.insert(identity), "{name}: duplicate device ledger {identity:?}");
+    }
+    let report = &deployment["report"];
+    let admitted = report["fits"] == true && report["placement_supported"] == true
+        && deployment["wip_launchable"] == true;
+    if !admitted {
+        assert!(devices.is_empty(), "{name}: refused deployment retains device allocations");
+        assert_eq!(report["fits"], false, "{name}: non-admitted deployment is not a refusal");
+        assert!(report["hints"].as_array().is_some_and(|hints| hints.iter().any(|hint|
+            hint["what"].as_str().is_some_and(|what| !what.trim().is_empty()))),
+            "{name}: refused deployment has no diagnostic hint");
+        return;
+    }
+    for role in deployment["spark_roles"].as_array().expect("solved Spark roles") {
+        let rank = role["rank"].as_u64().unwrap();
+        let device = devices.iter().find(|device| device["kind"] == "spark" && device["index"] == rank)
+            .unwrap_or_else(|| panic!("{name}: Spark role {rank} has no device ledger"));
+        assert!(device["worker_budget_bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+            "{name}: Spark role {rank} has no allocation ceiling");
+    }
+}
+
+#[test]
+fn deployment_device_audit_rejects_duplicate_physical_sparks() {
+    let device = serde_json::json!({"kind": "spark", "index": 0, "worker_budget_bytes": 1024});
+    let mut deployment = serde_json::json!({"memory_layout": {"devices": [device.clone()]},
+        "report": {"fits": true, "placement_supported": true}, "wip_launchable": true,
+        "spark_roles": [{"rank": 0, "experts": true}]});
+    assert_unique_deployment_devices(&deployment, "unique");
+    deployment["memory_layout"]["devices"].as_array_mut().unwrap().push(device);
+    assert!(std::panic::catch_unwind(|| assert_unique_deployment_devices(&deployment, "duplicate")).is_err());
+}
+
+#[test]
+fn deployment_device_audit_rejects_admitted_role_without_ledger() {
+    let deployment = serde_json::json!({"memory_layout": {"devices": []},
+        "report": {"fits": true, "placement_supported": true}, "wip_launchable": true,
+        "spark_roles": [{"rank": 0, "experts": true}]});
+    assert!(std::panic::catch_unwind(|| assert_unique_deployment_devices(&deployment, "missing")).is_err());
+}
+
+#[test]
+fn deployment_device_audit_accepts_real_v41_missing_export_refusal() {
+    // Audit-field projection of the installed V4.1 FP8-reply plan with the
+    // immutable e3f6 inputs, which intentionally omit release-only V41_FP8_AOT.
+    let deployment: serde_json::Value = serde_json::from_str(
+        include_str!("v41-fp8-reply-refused-deployment.json")).unwrap();
+    assert_eq!(deployment["family"], "deepseek_v41");
+    assert_eq!(deployment["spark_roles"].as_array().unwrap().len(), 6);
+    assert_eq!(deployment["report"]["placement_supported"], false);
+    assert_eq!(deployment["wip_launchable"], false);
+    assert!(deployment["report"]["hints"].as_array().unwrap().iter().any(|hint|
+        hint["what"].as_str().is_some_and(|what| what.contains("missing V4.1 native FP8 allocation manifest"))));
+    assert_unique_deployment_devices(&deployment, "real V4.1 missing export");
+    for field in ["devices", "fits", "hints"] {
+        let mut invalid = deployment.clone();
+        match field {
+            "devices" => invalid["memory_layout"][field] = serde_json::json!([
+                {"kind": "spark", "index": 0, "worker_budget_bytes": 1024}]),
+            "fits" => invalid["report"][field] = serde_json::json!(true),
+            "hints" => invalid["report"][field] = serde_json::json!([]),
+            _ => unreachable!(),
+        }
+        assert!(std::panic::catch_unwind(|| assert_unique_deployment_devices(&invalid, field)).is_err());
+    }
+}
+
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
     root: &std::path::Path) {
@@ -711,6 +787,7 @@ capture_qwen4_real_planner_launch(*map(Path, sys.argv[2:]))
         assert!(output.status.success(), "{name}: {stderr}");
         assert!(elapsed < std::time::Duration::from_secs(30), "{name}: plan took {elapsed:?}");
         let deployment = release_accepts_prefill(&output.stdout);
+        assert_unique_deployment_devices(&deployment, name);
         tested += 1;
         families.insert(deployment["family"].as_str().unwrap().to_owned());
         eprintln!("{name}: {} unit_rows={} waves={} slots={} span_rows={}", deployment["family"],

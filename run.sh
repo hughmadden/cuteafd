@@ -17,9 +17,9 @@ FULL_PREFILL_LOGITS=on (off by default) admits probe-only all-row prefill logits
 at launch for these five families (--full-prefill-logits in the daemon). Fidelity
 score_path=prefill requires this option; ordinary serving still uses last-row logits.
 The CPU planner counts this workspace with plan --layout --full-prefill-logits.
-Unspecified Spark count uses all configured hosts, or warns once and selects
-its widest executable count. SPARK_COUNT or SPARK_HOSTS is exact: the planner
-honors it or refuses with a reason and the counts that work, on every card size.
+Unspecified Spark count makes all configured hosts available to the planner.
+SPARK_COUNT or SPARK_HOSTS bounds the available Sparks; the plan may use fewer,
+including 0, and refuses only when the requested deployment cannot fit.
 An optional expert-group topology is selected in the configuration with
 SPARK_TP and SPARK_EP (all-or-none, native checkpoint only); at SPARK_COUNT=3
 the explicit SPARK_TP=3 SPARK_EP=1 form is one unreplicated three-rank group.
@@ -69,6 +69,7 @@ EOF
 
 config="$repo_root/cuteafd.config"
 family_args=()
+attention_override=""
 # The former DeepSeek V4.1 options, as the configuration keys they set.
 legacy_key() {
   case "$1" in
@@ -85,7 +86,10 @@ legacy_key() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?$1 requires FILE}"; shift 2 ;;
-    --set) family_args+=(--set "${2:?$1 requires KEY=VALUE}"); shift 2 ;;
+    --set)
+      family_args+=(--set "${2:?$1 requires KEY=VALUE}")
+      [[ "$2" != ATTENTION_MODE=* ]] || attention_override="${2#*=}"
+      shift 2 ;;
     --embedding-placement) family_args+=(--embedding-placement "${2:?$1 requires host or gpu}"); shift 2 ;;
     --wip) family_args+=(--wip "${2:?$1 requires SLOT}"); shift 2 ;;
     --rotate-console-secret) exec "$repo_root/scripts/launch/console-secret.sh" rotate ;;
@@ -105,5 +109,5 @@ done
 if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" && -d "$CUTEAFD_NAMESPACE_ROOT/hf-home" ]]; then
   export HF_HOME="$(readlink -f "$CUTEAFD_NAMESPACE_ROOT")/hf-home"
 fi
-family="$(release_config_family "$config")"
+family="$(release_config_family "$config" "$attention_override")"
 exec "$repo_root/scripts/launch/run-family.sh" --config "$config" --family "$family" ${family_args[@]+"${family_args[@]}"}

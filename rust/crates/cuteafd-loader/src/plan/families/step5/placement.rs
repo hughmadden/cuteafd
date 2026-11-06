@@ -43,7 +43,7 @@ pub(super) fn layout(
     if spark_ranks > 0 {
         crate::plan::experts::spark_recipe(&package, 1536, spark_ranks)?;
     }
-    if let Some(refusal) = crate::plan::experts::frozen_refusal(&package, spark_ranks) {
+    if let Some(refusal) = (spark_ranks > 0).then(|| crate::plan::experts::frozen_refusal(&package, spark_ranks)).flatten() {
         anyhow::bail!("Step-5 layout is unqualified: {refusal}");
     }
     ensure!(
@@ -52,7 +52,7 @@ pub(super) fn layout(
     );
     ensure!(
         matches!(coordinators, 1 | 2) && opts.rtx_bytes.len() == coordinators
-            && worlds.contains(&spark_ranks)
+            && (spark_ranks == 0 || worlds.contains(&spark_ranks))
             && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
         Unqualified("coordinator/Spark count or 5090")
     );
@@ -301,14 +301,11 @@ pub(super) fn layout(
         slot_bytes: 8 << 20,
         alignment: 4096,
     };
-    let recipe = crate::plan::experts::checkpoint_spark_recipe(
-        input.checkpoint(),
-        spark_ranks,
-        &working.spark_layers,
-    )?;
-    for rank in 0..spark_ranks {
+    let recipe = (!working.spark_layers.is_empty()).then(|| crate::plan::experts::checkpoint_spark_recipe(
+        input.checkpoint(), spark_ranks, &working.spark_layers)).transpose()?;
+    for rank in 0..if working.spark_layers.is_empty() { 0 } else { spark_ranks } {
         let layout = if exl3 { SparkResidentLayout::Exl3 { world: spark_ranks, rank } }
-            else { SparkResidentLayout::Fp8 { world: spark_ranks, rank, slicing: recipe.slicing } };
+            else { SparkResidentLayout::Fp8 { world: spark_ranks, rank, slicing: recipe.as_ref().context("remote Step-5 package")?.slicing } };
         let assignment = SparkAssignment::from_catalog(&catalog, &working, rank, layout, &endpoints, rings)?;
         ensure!(
             assignment.resident_bytes

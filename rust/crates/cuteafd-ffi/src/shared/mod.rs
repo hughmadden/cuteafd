@@ -9,6 +9,7 @@ pub mod expert_usage;
 pub mod programs;
 pub mod mla_draft;
 pub mod draft_projection;
+pub mod native_attention;
 pub mod native_dense;
 pub mod native_dense_glue;
 pub mod glm_stage;

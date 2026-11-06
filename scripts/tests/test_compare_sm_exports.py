@@ -63,10 +63,65 @@ def test_two_target_counts():
 
 def test_draft_bf16_group_matches_exported_shapes():
     exporter = compare_sm.load_file("test_draft_bf16_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    assert exporter.hqa_bf16_shapes() == {(1536,16384),(1536,8192),
+                                          (16384,4096),(8192,4096),(4096,4096)}
+    assert exporter.hqa_bf16_shapes() <= exporter.draft_bf16_shapes().keys()
     expected = ",".join(f"k{k}_n{n}" for k, n in sorted(exporter.draft_bf16_shapes()))
     for scope in ("all", "suspects"):
         job, = (job for job in compare_sm.jobs(scope) if job[0] == "draft-bf16")
         assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only", expected])
+
+
+def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
+    exporter = compare_sm.load_file("test_native_attention_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    shapes = exporter.native_attention_shapes()
+    assert shapes == {
+        "glm": {(16384,2048),(8192,2048),(6144,16384),(6144,8192)},
+        "kimik3": {(18432,1536),(9216,1536),(7168,12288),(7168,6144)},
+        "step5": {(4096,12288),(4096,6144)},
+        "muse": {(8192,8192),(8192,4096)},
+        "ml4": {(8192,6144),(4096,6144),(6144,8192),(6144,4096)},
+    }
+    assert exporter.native_attention_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192),(6144,4096)}
+    assert exporter.native_attention_bf16_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192)}
+    programs = exporter.native_attention_programs()
+    expected = {f"n{n}_k{k}_m{rows}{suffix}"
+                for n,k in set().union(*shapes.values()) for rows in (64,4096)
+                for suffix in (("", "_f32") if (n,k) in exporter.native_attention_f32_shapes() else ("",))}
+    assert len(programs) == len(expected) and {p[0] for p in programs} == expected
+    jobs = {job[0]: job[1:] for job in compare_sm.jobs("all")}
+    assert jobs["native-attention-fp8"] == ("export_b12x_dsv4_aot.py",
+        ["--geometry", "native_attention", "--only", ",".join(p[0] for p in programs)])
+    stems = {f"k{k}_n{n}" for family, family_shapes in shapes.items() if family != "ml4"
+             for n,k in family_shapes}
+    stems |= {f"k{k}_n{n}_f32" for n,k in exporter.native_attention_bf16_f32_shapes()}
+    args = jobs["native-attention-bf16"][1]
+    assert args[:2] == ["--geometry", "muse"] and set(args[3].split(",")) == stems
+    source = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
+    assert "rows, Int32(64), Int64(scratch.toint()), stream" in source
+    assert "canonical_fp8_gemv64_w8a16" in source
+    oracle_source = (ROOT / "native/tests/draft_bf16_projection_selftest.py").read_text()
+    tree = ast.parse(oracle_source)
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "shapes"
+             or isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "F32_SHAPES"
+                                                    for target in node.targets)]
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "projection_oracle_inventory", "exec"), namespace)
+    native_bf16 = {(k,n) for family, family_shapes in shapes.items() if family != "ml4"
+                   for n,k in family_shapes}
+    assert native_bf16 <= namespace["shapes"]().keys()
+    assert namespace["F32_SHAPES"] == {(k,n) for n,k in exporter.native_attention_bf16_f32_shapes()}
+
+
+@pytest.mark.parametrize("hidden,heads", [(6144, 128), (4096, 64)])
+def test_mimo_tp2_draft_exports_cover_local_projection_shapes(hidden, heads):
+    exporter = compare_sm.load_file("test_mimo_tp2_draft_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    shapes = exporter.draft_bf16_shapes()
+    family = f"dflash-mimo-{'pro' if hidden == 6144 else 'flash'}-tp2"
+    expected = {(hidden * 5, hidden), (hidden, (heads // 2 + 8) * 128),
+                (hidden, 1024), (heads // 2 * 128, hidden),
+                (hidden, 16384), (8192, hidden)}
+    assert {shape for shape, families in shapes.items() if family in families} == expected
 
 
 def test_kimi_context_group_covers_both_tiles_formats_and_shared_primitives():

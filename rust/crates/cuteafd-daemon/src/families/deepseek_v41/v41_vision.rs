@@ -416,3 +416,62 @@ impl<'a> VisionRuntime<'a> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use anyhow::Context;
+
+    /// The coordinator-local tower's serving constructor recorded (as its owner
+    /// thread does under push) and replayed through one committed coordinator
+    /// rank must land byte-identical owners to the mount, without a payload read.
+    #[test]
+    #[ignore = "requires CUTEAFD_PUSH_V41 (SparkNest V4.1 snapshot), CUTEAFD_NATIVE_LIB and an RTX GPU"]
+    fn installed_vision_tower_push_matches_mount_byte_for_byte() -> Result<()> {
+        use crate::shared::{experts::rtx::dense, memory::device::Device};
+        let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_V41").map(std::path::PathBuf::from) else { return Ok(()) };
+        // SAFETY: the slot's native library, loaded once for this test process.
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let names: std::collections::HashSet<String> = VisionRuntime::names().into_iter().collect();
+        let catalog = cuteafd_loader::read_official_v41_role_catalog(&snapshot, "vision", |name| names.contains(name))?;
+        let (root, _) = cuteafd_loader::push_load::namespace(&snapshot).context("V4.1 outside SparkNest")?;
+        let capacity = 1024;
+        let bytes = VisionRuntime::device_bytes(&catalog, capacity)?;
+        let mounted = VisionRuntime::new(&lib, &catalog, capacity, bytes)?;
+        let (pushed, records) = dense::recording(|| VisionRuntime::new(&lib, &catalog, capacity, bytes))?;
+        anyhow::ensure!(records.steps.is_empty() && records.finishes.is_empty() && !records.operands.is_empty(),
+            "the tower records only direct BF16 operands");
+        let staging = dense::RankLayout::new(records.operands.clone(), Vec::new(), 0)?.host_staging;
+        anyhow::ensure!(staging.bytes()? == 0, "the tower adds no dense pinned staging");
+        // Through the same address-only hand-off the owner thread uses.
+        let sent = crate::shared::vision::push::Contribution::send_records(records.clone())?;
+        let (contribution, _owner) = crate::shared::vision::push::Contribution::recorded(sent, std::sync::mpsc::channel().0,
+            std::sync::mpsc::sync_channel(1).1, std::thread::spawn(|| ()))?;
+        let replayed = contribution.records();
+        anyhow::ensure!(replayed.operands.len() == records.operands.len(), "hand-off lost operands");
+        drop(contribution);
+        let sockets = tempfile::tempdir()?;
+        crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &lib, id: 0 }, None, &root,
+            sockets.path(), &replayed, None, 0, 0)?;
+        let digest = |runtime: &VisionRuntime<'_>| -> Result<Vec<(String, Vec<u8>)>> {
+            let mut out = Vec::new();
+            let mut error = None;
+            runtime.weights.visit("", &mut |name, buffer| {
+                let mut bytes = vec![0u8; buffer.bytes];
+                match lib.copy_d2h(&mut bytes, buffer) { Ok(()) => out.push((name, bytes)), Err(e) => error = Some(e) }
+            });
+            error.map_or(Ok(out), Err)
+        };
+        let (expected, actual) = (digest(&mounted)?, digest(&pushed)?);
+        anyhow::ensure!(expected.len() == actual.len() && expected.len() == names.len(), "tower owner inventories differ");
+        let mut identical = 0usize;
+        for ((name, mount), (other, push)) in expected.iter().zip(&actual) {
+            anyhow::ensure!(name == other && mount == push, "pushed {name} differs from the mount");
+            identical += mount.len();
+        }
+        eprintln!("V4.1 vision: {} operands, {} owners, {identical} B byte-identical; dense staging 0 B",
+            records.operands.len(), expected.len());
+        Ok(())
+    }
+}

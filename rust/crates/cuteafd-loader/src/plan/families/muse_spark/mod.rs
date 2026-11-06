@@ -297,7 +297,7 @@ impl FamilyModel for Model {
             package: PACKAGE.into(),
             block: 128,
             spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, self.cfg.moe_intermediate),
-            local: Err("Muse Spark routed experts (~400 GB at K4) cannot all be resident on the coordinators".into()),
+            local: Ok("Muse EXL3 RTX expert onboarding package".into()),
         })
     }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,

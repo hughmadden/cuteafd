@@ -8,9 +8,16 @@ use cuteafd_loader::families::kimi_k3::{COMPILED_CONTEXT, DEFAULT_CONTEXT};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     /// Target and drafter share the exact selected MLA record.
     #[arg(long, default_value = "fp8")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,
+    /// Aggregate executed routed-expert selections on each canonical producer GPU.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)] pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)] pub device: i32,
@@ -38,6 +45,8 @@ pub(crate) struct ServeArgs {
     /// Opt in to a checkpoint-native MLA DFlash2 drafter.
     #[arg(long)] pub draft: Option<PathBuf>,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub draft_fp8: bool,
+    /// Split DFlash over the target pair (pending Context draft exports).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
     pub draft_fixed: Option<u8>,
@@ -70,17 +79,20 @@ impl ServeArgs {
 
     pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
+        let plan = prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None, reserve_rows: None,
-        })?)
+        })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(plan).publish();
+        Ok(plan)
     }
 
     fn validate(&self) -> Result<()> {
+        ensure!(!self.tp2_dflash, "Kimi TP2 DFlash requires draft Context attention exports");
         ensure!(self.device >= 0 && self.split_device.is_none_or(|peer| peer >= 0 && peer != self.device),
             "Kimi serving requires one device or two distinct coordinator devices");
-        ensure!((1..=8).contains(&self.peers.len()) && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
-            "Kimi serving requires 1..8 distinct real Spark endpoints");
+        ensure!(self.peers.len() <= 8 && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
+            "Kimi serving accepts at most eight distinct Spark endpoints");
         ensure!(self.max_context.is_none_or(|context| (1..=COMPILED_CONTEXT).contains(&context)),
             "Kimi context exceeds the compiled 1M extent");
         ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
@@ -103,6 +115,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
         snapshot: snapshot.clone(), fp8: args.draft_fp8, cache_format: args.kv_cache });
     startup::load(library, programs, checkpoint, cfg, cfg, startup::Options {
+        expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
@@ -127,7 +140,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         let (organization, model) = name.split_once("--")?;
         Some(format!("{organization}/{model}"))
     })).context("Kimi serving requires --model-id for a snapshot without HF identity")?;
-    let profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
+    let mut profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
+    profile.expert_usage = args.expert_usage_reader.clone();
     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
@@ -224,6 +238,18 @@ mod tests {
         let cli = crate::cli::Cli::try_parse_from(argv)?;
         let crate::cli::Commands::ServeKimi(args) = cli.command else { panic!("Kimi command") };
         Ok(args)
+    }
+
+    #[test]
+    fn expert_usage_off_and_skip_have_no_reader_or_native_owners() -> Result<()> {
+        assert!(args(&[])?.expert_usage);
+        let off = args(&["--expert-usage=false"])?;
+        assert!(!off.expert_usage);
+        assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
+        assert!(args(&["--expert-usage"])?.expert_usage);
+        assert!(!off.expert_usage_reader.configure(true, true).map_err(anyhow::Error::msg)?);
+        assert!(off.expert_usage_reader.require_enabled().is_err());
+        Ok(())
     }
 
     #[test]
@@ -355,7 +381,7 @@ mod tests {
         for budget in ["0", "NaN", "inf"] {
             assert!(args(&["--peers", peers, "--spark-budget-gib", budget])?.validate().is_err());
         }
-        assert!(args(&[])?.validate().is_err());
+        args(&[])?.validate()?;
         for extra in [["--split-device", "0"], ["--max-context", "1048577"],
             ["--embedding-placement", "host"], ["--prefix-partial", "on"]] {
             assert!(args(&["--peers", peers, extra[0], extra[1]])?.validate().is_err());

@@ -257,20 +257,11 @@
     0,
     1
    ],
-   "sparks": [
-    "ostrich",
-    "dodo",
-    "emu",
-    "kiwi"
-   ],
+   "sparks": [],
    "set": {
     "ADDR": "0.0.0.0:8704",
     "EXPERT_PORT": "19804",
-    "SPARK_COUNT": "4",
-    "SPARK_0_HOST": "ostrich",
-    "SPARK_1_HOST": "dodo",
-    "SPARK_2_HOST": "emu",
-    "SPARK_3_HOST": "kiwi"
+    "SPARK_COUNT": "0"
    }
   },
   {

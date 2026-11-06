@@ -260,6 +260,8 @@ impl EngineArgs {
             "Qwen prefill units need Spark experts or shared-only diagnostics");
         ensure!(self.split_device.is_none() || self.prefill_units.is_none(),
             "Qwen dual-owner execution does not admit diagnostic unit cuts");
+        cuteafd_bench::context::ResolvedSettings::prefill(shape)
+            .value("prefill-rows", shape.span_rows).value("prefill-units", shape.unit_rows).publish();
         Ok(shape)
     }
 
@@ -309,8 +311,10 @@ fn attention_plan(args: &EngineArgs, loaded_mtp: bool)
     -> std::result::Result<cuteafd_core::coordinator_programs::AttentionReductionPlan,
         cuteafd_core::coordinator_programs::AttentionPlanError>
 {
-    cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)
+    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)?;
+    cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -362,7 +366,13 @@ mod weight_representation_tests {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
-            let shape = parsed.prefill_shape()?.unwrap();
+            let shape = crate::commands::bench::assert_resolved_family_seam("qwen4",
+                &["max-context", "pool-tokens", "slots", "mtp", "rtx-expert-layers", "attention-plan-rows"], || {
+                    crate::commands::bench::fixture_prefix().resolve_entries(16);
+                    let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
+                    let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
+                    Ok(inputs.prefill_shape)
+                })?.unwrap();
             assert_eq!((shape.unit_rows, shape.waves), (rows, waves));
             assert_eq!(parsed.prefill_rows, 0);
         }
@@ -589,8 +599,7 @@ impl Opened {
             (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 256, false)
             .with_automatic_context(automatic_context).validate_explicit()?;
         if let Some(peer) = args.split_device {
-            ensure!(media.operands.is_empty() && media.steps.is_empty(), "Qwen dual media push requires its dense coordinator group");
-            return self.with_dual_engine(args, peer, automatic_context, body);
+            return self.with_dual_engine(args, peer, automatic_context, media, body);
         }
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
@@ -611,7 +620,7 @@ impl Opened {
             Ok(())
         })?;
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        if let Some(peers) = args.peers.as_deref() {
+        if let Some(peers) = args.peers.as_deref().filter(|_| !args.local_experts) {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let working = cuteafd_loader::placement::SparkWorkingSet {
@@ -635,6 +644,8 @@ impl Opened {
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let source = self.embed_source()?;
         let with_mtp = args.mtp > 0 && layers == self.cfg.layers;
+        cuteafd_bench::context::set_resolved("mtp", &if with_mtp { args.mtp.min(engine::DECODE_ROWS - 1) } else { 0 }.to_string());
+        if args.peers.is_none() { cuteafd_bench::context::set_rtx_expert_layers(if args.local_experts { layers } else { 0 }); }
         let admitted_target = admission::single_weights(args, &self.checkpoint, &self.cfg, layers, with_mtp)?;
         // The coordinator's dense records push in a group of this GPU alone when
         // the checkpoint is SparkNest's; records are planned from headers first,
@@ -905,7 +916,7 @@ impl Opened {
         // the widest wave this transport can carry: the draft planner prices the
         // workers before any serving step opens a session, and the sessions this
         // opens are the ones every step after it reuses.
-        transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_wave_rows(),
+        transport.bootstrap(&engine::spark_session_shape(&self.cfg, args.prefill_wave_rows(),
             self.checkpoint.spark_input_is_bf16())?)?;
         crate::shared::memory_report::release_load_staging(&self.library)?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), mtp }))

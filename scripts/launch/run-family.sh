@@ -593,10 +593,6 @@ case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2"
 [[ -z "$KV_POOL_SIZE" || "$KV_POOL_SIZE" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "KV_POOL_SIZE has an invalid unit"
 [[ -z "$MEMORY_RESERVATION" || "$MEMORY_RESERVATION" =~ ^[0-9]+([.][0-9]{1,6})?((B|MB|GB|MiB|GiB)|%)$ ]] || release_die "MEMORY_RESERVATION has an invalid unit"
 ((restart == 0 || dry_run == 0)) || release_die "--restart and --dry-run are mutually exclusive"
-if ((SPARK_COUNT == 0)); then
-  [[ "$RTX_EXPERT_LAYERS" == 40 && "$RTX_GPUS" != 1 ]] ||
-    release_die "SPARK_COUNT=0 requires two RTX GPUs and RTX_EXPERT_LAYERS=40 (or all)"
-fi
 
 # Resolve the one SSH option set used by every remote step below: preflight reads,
 # expert launch, readiness polling and the EXIT cleanup. Placed after argument,
@@ -679,7 +675,6 @@ gpu_selection="$(python3 "$repo_root/scripts/lib/coordinator-gpus.py" select \
   "${compact_selection_args[@]}" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"})" || exit 2
 RELEASE_RTX_GPUS="$(jq -r '.count' <<<"$gpu_selection")"
 release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
-((SPARK_COUNT != 0 || RELEASE_RTX_GPUS == 2)) || release_die "SPARK_COUNT=0 requires two selected RTX GPUs"
 if release_tp2_enabled; then
   ((RELEASE_RTX_GPUS == 2)) || release_die "TP2 options require two selected RTX GPUs; use --rtx-gpus 2"
 fi
@@ -773,16 +768,17 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES" \
   "${v41_budget_args[@]}")"
 release_validate_deployment "$count_plan" deepseek_v41
+release_deployment_spark_roles "$count_plan" "$SPARK_COUNT"
 release_admit_coordinator_gpus "$gpu_uuid_csv" "$count_plan" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
 resolved_decode_lanes="$(jq -er ' .decode_lanes | select(. == 2)' <<<"$count_plan")" ||
   release_die "DeepSeek V4.1 deployment requires two decode lanes"
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
 if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
-  [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"
+  ((selected_count <= SPARK_COUNT)) || release_die "planner requested more Spark ranks than configured: $selected_count > $SPARK_COUNT"
+  [[ "$selected_count" == "$SPARK_COUNT" ]] || echo "Spark roles use $selected_count of $SPARK_COUNT configured ranks"
 fi
-SPARK_COUNT="$selected_count"
-if ((SPARK_COUNT > 0)); then
-  SPARK_DEVICE_BUDGET_BYTES="$(release_spark_worker_budget "$count_plan" "$SPARK_COUNT")" || exit 1
+if ((spark_expert_world > 0)); then
+  SPARK_DEVICE_BUDGET_BYTES="$(release_spark_worker_budget "$count_plan" "$spark_expert_world")" || exit 1
 fi
 release_prefill_shape "$count_plan" deepseek_v41
 PREFILL_BATCH_TOKENS="$PREFILL_ROWS"
@@ -802,7 +798,7 @@ case "$spark_wire" in
     ;;
   *) release_die "unsupported planner Spark wire: $spark_wire" ;;
 esac
-release_validate_spark_topology
+(SPARK_COUNT="$spark_expert_world"; release_validate_spark_topology)
 spark_tp_roles_required="$(jq -r '.artifact_requirements.spark_tp_role // ""' <<<"$count_plan")"
 SPECULATOR="$(jq -er '.speculator' <<<"$count_plan")"
 KV_POOL_SIZE="$(jq -r '.admission.kv_pool_size // ""' <<<"$count_plan")"
@@ -813,7 +809,8 @@ expert_capacity="$(release_v41_expert_capacity "$PREFILL_BATCH_TOKENS")" ||
   release_die "cannot resolve expert row capacity"
 mapfile -t hosts < <(release_spark_values HOST)
 mapfile -t lanes < <(release_spark_values LANE_A)
-for host in "${hosts[@]}"; do
+for i in "${spark_worker_ranks[@]}"; do
+  host="${hosts[$i]}"
   spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" "$hf_home" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
@@ -892,7 +889,8 @@ done
 # service is stopped or replaced.
 spark_advertised_roles=""
 if [[ -n "$spark_tp_roles_required" ]]; then
-  for host in "${hosts[@]}"; do
+  for i in "${spark_expert_ranks[@]}"; do
+    host="${hosts[$i]}"
     if [[ -n "${wip_slot:-}" ]]; then
       # Slots overlay a toolchain image: its label cannot describe their exports.
       advertised_roles="$(release_ssh -o ConnectTimeout=10 "$host" \
@@ -953,13 +951,7 @@ assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdiges
   done
 fi
 
-# Zero-Spark deployments hold every routed layer on the RTX pair; the daemon
-# still requires four peer addresses but never connects to them.
-if ((SPARK_COUNT == 0)); then
-  peers="127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"
-else
-  peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
-fi
+peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
 fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
@@ -996,6 +988,7 @@ if ((dry_run)); then
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]] || echo "  RDMA device map: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" ]] || echo "  RDMA execution lanes: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"
   echo "  release identity: $fingerprint"
+  printf '%s\n' "$count_plan"
   exit 0
 fi
 shared_api_state "$COORDINATOR_DOCKER_INFERENCE" "${INSTANCE:-default}"
@@ -1004,7 +997,7 @@ if ((restart)); then
   ((restart_all == 0)) || release_stop_all_worker_containers
 else
   docker inspect "$coordinator" >/dev/null 2>&1 && release_die "$coordinator already exists; use --restart"
-  for i in "${!hosts[@]}"; do
+  for i in "${spark_worker_ranks[@]}"; do
     remote="${spark_prefix}-${hosts[$i]}-${EXPERT_PORT}"
     release_ssh "${hosts[$i]}" "! docker inspect '$remote' >/dev/null 2>&1" || release_die "$remote already exists; use --restart"
   done
@@ -1012,15 +1005,17 @@ fi
 
 ss -ltn "sport = :${ADDR##*:}" 2>/dev/null | tail -n +2 | grep -q . &&
   release_die "API port ${ADDR##*:} is already in use"
-for i in "${!hosts[@]}"; do
+for i in "${spark_worker_ranks[@]}"; do
+  worker_port="$EXPERT_PORT"
+  release_spark_role_has_experts "$count_plan" "$i" || worker_port=$((EXPERT_PORT + 100))
   release_ssh "${hosts[$i]}" \
-    "! ss -ltn 'sport = :$EXPERT_PORT' 2>/dev/null | tail -n +2 | grep -q ." ||
-    release_die "${hosts[$i]}:$EXPERT_PORT is already in use; stop the development worker first"
+    "! ss -ltn 'sport = :$worker_port' 2>/dev/null | tail -n +2 | grep -q ." ||
+    release_die "${hosts[$i]}:$worker_port is already in use; stop the development worker first"
 done
 
 cleanup() {
   docker rm -f "$coordinator" >/dev/null 2>&1 || true
-  for i in "${!hosts[@]}"; do release_ssh "${hosts[$i]}" "docker rm -f '${spark_prefix}-${hosts[$i]}-${EXPERT_PORT}' >/dev/null 2>&1 || true" || true; done
+  for i in "${spark_worker_ranks[@]}"; do release_ssh "${hosts[$i]}" "docker rm -f '${spark_prefix}-${hosts[$i]}-${EXPERT_PORT}' >/dev/null 2>&1 || true" || true; done
 }
 trap cleanup EXIT
 
@@ -1076,7 +1071,9 @@ if [[ "$VISION" != off ]]; then
     spark)
       encoder_rank="$(jq -er '.encoder.kind.rank' <<<"$encoder_plan")"
       encoder_host="${hosts[$encoder_rank]}"
-      encoder_peer="${lanes[$encoder_rank]}:$encoder_port"
+      encoder_peers=()
+      for vision_rank in "${spark_vision_ranks[@]}"; do encoder_peers+=("${lanes[$vision_rank]}:$encoder_port"); done
+      encoder_peer="$(IFS=,; echo "${encoder_peers[*]}")"
       vision_args=(--vision-peers "$encoder_peer" --encoder-plan-hash "$encoder_hash" --encoder-revision "$RELEASE_MODEL_REVISION") ;;
     rtx)
       [[ "$(jq -er '.encoder.kind.gpu' <<<"$encoder_plan")" == 0 ]] ||
@@ -1149,14 +1146,18 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
 echo "== starting native Spark experts =="
 pids=()
-for i in "${!hosts[@]}"; do
+for i in "${spark_worker_ranks[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
-  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
-  if ((encoder_rank >= 0)); then
-    remote_args+=("$encoder_rank" "$encoder_port" "$encoder_hash" "$RELEASE_MODEL_REVISION")
-  fi
+  worker_budget="$(release_spark_role_budget "$count_plan" "$i")" || exit 1
+  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$worker_budget" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_expert_world" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
+  worker_encoder_rank=-1
+  for vision_rank in "${spark_vision_ranks[@]}"; do
+    [[ "$vision_rank" != "$i" ]] || worker_encoder_rank="$i"
+  done
+  remote_args+=("$worker_encoder_rank" "$encoder_port" "$encoder_hash" "$RELEASE_MODEL_REVISION")
+  if release_spark_role_has_experts "$count_plan" "$i"; then remote_args+=(1); else remote_args+=(0); fi
   # Docker options for this worker follow a sentinel, after every positional argument:
   # PROFILE switches (absent unless set), the shared worker environment and a
   # PROFILE_SPARK rank's stop options; its profiler argv follows --profile-wrapper.
@@ -1184,7 +1185,9 @@ wip_slot="${15:-__none__}"
 wip_layout_slot="$wip_slot"
 encoder_args=()
 if [[ "$rank" == "${16:--1}" ]]; then
-  encoder_args=(--encoder --encoder-listen "0.0.0.0:${17}" --encoder-plan-hash "${18}" --encoder-revision "${19}" --encoder-max-tokens 1024)
+  encoder_flag=--encoder
+  [[ "${20}" == 1 ]] || encoder_flag=--encoder-only
+  encoder_args=("$encoder_flag" --encoder-listen "0.0.0.0:${17}" --encoder-plan-hash "${18}" --encoder-revision "${19}" --encoder-max-tokens 1024)
 fi
 wip_args=()
 if [[ "$wip_slot" != __none__ ]]; then
@@ -1223,16 +1226,19 @@ worker_mounts=("${RELEASE_HUB_MOUNTS[@]}")
 # positional argument, so the worker argument contract is unchanged.
 release_serving_docker_args
 cuteafd_cdi_gpu_args all || exit 2
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} "${worker_mounts[@]}" "$image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd expertd-native --snapshot "$worker_snapshot" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
+expert_args=(--rank "$rank" --device-budget-bytes "$budget")
+[[ "${20}" != 1 ]] || expert_args=(--rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}")
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} "${worker_mounts[@]}" "$image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd expertd-native --snapshot "$worker_snapshot" --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${expert_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done
 for pid in "${pids[@]}"; do wait "$pid"; done
 
-for i in "${!hosts[@]}"; do
+for i in "${spark_worker_ranks[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
+  ready_marker="$(release_spark_role_ready_marker "$count_plan" "$i")"
   # A connect-and-close probe is an invalid selection frame and kills the worker.
-  until release_ssh "$host" "test \"\$(docker inspect -f '{{.State.Status}}' '$remote' 2>/dev/null)\" = running && docker logs '$remote' 2>&1 | grep -q 'native worker bootstrap ready'" 2>/dev/null; do
+  until release_ssh "$host" "test \"\$(docker inspect -f '{{.State.Status}}' '$remote' 2>/dev/null)\" = running && docker logs '$remote' 2>&1 | grep -q '$ready_marker'" 2>/dev/null; do
     ((SECONDS < deadline)) || { release_ssh "$host" "docker logs --tail 100 '$remote'" >&2 || true; release_die "$host native expert did not become ready"; }
     sleep 1
   done
@@ -1258,8 +1264,28 @@ echo "  context/output: $MAX_CONTEXT_TOKENS/$MAX_OUTPUT_TOKENS; dSpark: $SPECULA
 }
 
 # The family: run.sh passes --family; a direct call reads the checkpoint's own config.json.
-detected_family="$(release_config_family "$config")"
+attention_mode="$(get ATTENTION_MODE hqa)"
+case "$attention_mode" in
+  hqa|compact|fp8-compact) ;;
+  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
+esac
+selected_config=config.json
+[[ "$attention_mode" != compact ]] || selected_config=config.compact-attention.json
+detected_family="$(release_config_family "$config" "$attention_mode")"
 [[ -n "$family" ]] || family="$detected_family"
+attention_mode="$(get ATTENTION_MODE hqa)"
+attention_mode_args=()
+case "$attention_mode" in
+  hqa) ;;
+  compact|fp8-compact)
+    python3 "$repo_root/scripts/lib/checkpoint-family.py" --attention-variant "$detected_family" ||
+      release_die "unsupported ATTENTION_MODE=$attention_mode for checkpoint variant $detected_family"
+    if [[ "$attention_mode" == compact ]]; then attention_mode_args=(--compact-attention)
+    else attention_mode_args=(--fp8-compact-attention); fi
+    ;;
+  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
+esac
+
 [[ "$family" == deepseek_v41 || "$family" == deepseek_v4 || "$(get TP2_DSPARK_EXPERTS off)" != on ]] ||
   release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark"
 if [[ "$family" == deepseek_v41 ]]; then
@@ -1288,7 +1314,7 @@ snapshot_rel="hub/models--${model//\//--}/snapshots/$revision"
 release_hub_mounts "$namespace_root" "$site_hub" "$hf_home" "$snapshot_rel"
 generic_worker_mounts=("${RELEASE_HUB_MOUNTS[@]}")
 # Family, the serving command and the layers with routed experts.
-described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$root/snapshots/$revision/config.json")" || exit 2
+described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$root/snapshots/$revision/$selected_config")" || exit 2
 read -r detected model_type first_layer last_layer <<<"$described"
 [[ -z "$family" || "$family" == "$detected" ]] ||
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
@@ -1359,7 +1385,7 @@ fi
 release_validate_verbs_device_map
 audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
-# An explicit count or host list is exact. Unspecified means the entire inventory.
+# An explicit count or host list bounds the available inventory.
 available_sparks=0
 for rank in {0..7}; do
   [[ -n "$(get "SPARK_${rank}_HOST")" ]] || break
@@ -1405,8 +1431,6 @@ fi
 if [[ "$family" == step5 ]]; then
   step5_kv_cache="$(get KV_CACHE fp8)"
   case "$step5_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
-  [[ "$backend" != local && "$ranks" != 0 ]] ||
-    release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (the planner checks format, width coverage and memory)"
 fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from
@@ -1455,7 +1479,7 @@ if [[ "$family" == qwen4 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
   case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   # NVFP4: a ModelOpt publication with 4-bit weight groups (nvidia/Qwen3.8-Flash-Next-NVFP4).
-  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
+  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/$selected_config")"
   read -r qwen_exl3 qwen_nvfp4 qwen_mtp <<<"$qwen_features"
 fi
 # Docker options only the Spark expert workers take (their environment and mounts).
@@ -1472,6 +1496,7 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   readlink -f "$dir/snapshots/$rev"
 }
+spark_worker_args+=" ${attention_mode_args[*]}"
 exlr8_manifest="$(get EXLR8_MANIFEST)"
 exlr8_prefill_activations="$(get EXLR8_PREFILL_ACTIVATIONS)"
 if [[ -n "$exlr8_prefill_activations" ]]; then
@@ -1483,8 +1508,7 @@ if [[ -n "$exlr8_manifest" ]]; then
   [[ "$exlr8_manifest" != *[!a-zA-Z0-9_-]* ]] || release_die "EXLR8_MANIFEST must be a published name, not a path"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
   [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) &&
-     ( ( "$ranks" -ge 1 && "$ranks" -le 8 ) ||
-       ( "$family" == glm5_flash && "$exlr8_gpu_count" == 2 && "$ranks" == 0 ) ) ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks (Flash TP2 also supports 0 Sparks)"
+     "$ranks" -ge 0 && "$ranks" -le 8 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 0..8 Spark ranks"
   [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
   if [[ "$family" != glm5_flash ]]; then
     [[ "$attention_placement" == auto || "$attention_placement" == heads ||
@@ -1533,7 +1557,7 @@ mimo_flash_mopd=0 mimo_bundled_dflash=0
 # dspark_block_size in config.json); one without it serves without speculation.
 dsv4_dspark=0
 if [[ $family == deepseek_v4 ]]; then
-  dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/config.json")"
+  dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/$selected_config")"
 fi
 speculator="$(get SPECULATOR)"
 default_drafter=""
@@ -1563,7 +1587,7 @@ if [[ -z "$speculator" ]]; then
     echo "note: DeepSeek V4 drafts with its bundled dSpark; SPECULATOR=off disables it" >&2
   fi
   if [[ $speculator == off && $family == qwen3_5 ]] &&
-      python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(c.get("text_config",c).get("hidden_size") != 5120)' "$root/snapshots/$revision/config.json"; then
+      python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(c.get("text_config",c).get("hidden_size") != 5120)' "$root/snapshots/$revision/$selected_config"; then
     speculator=dspark default_drafter=RadixArk/Qwen3.8-27B-DSpark
   fi
   if [[ $speculator == off && $family == muse_spark ]]; then
@@ -1629,17 +1653,30 @@ decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
-family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
+family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}")
 case "$(get EXPERT_USAGE on)" in
   on|off) ;;
   *) release_die "EXPERT_USAGE must be on or off" ;;
 esac
-if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 ]]; then
+if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 ]]; then
   case "$(get EXPERT_USAGE on)" in
     on) family_args+=(--expert-usage) ;;
     off) family_args+=(--expert-usage=false) ;;
     *) release_die "EXPERT_USAGE must be on or off" ;;
   esac
+fi
+tp2_dflash_default=off
+if [[ "$family" == mimo_v2 && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
+  tp2_dflash_default=on
+fi
+tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
+case "$tp2_dflash" in on|off) ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
+[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
+  release_die "TP2_DFLASH requires MiMo/Kimi, two selected RTX GPUs and DFlash2"
+if [[ "$family" == mimo_v2 || "$family" == kimi_k3 ]]; then
+  # Forward false as well: an explicit off must survive future default changes.
+  tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"
+  family_args+=(--tp2-dflash "$tp2_dflash_bool")
 fi
 # Loop abort (boot-time only): unset keeps the daemon's shipped defaults.
 for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-copies' \
@@ -2013,8 +2050,8 @@ split_opt_in=""
 case "$family:$model_type" in
   deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*) ;;
   qwen4:*)
-    if [[ "$ranks" == 0 ]]; then
-      : # Qualified Spark-free pairs default to native TP2 and whole-layer ownership.
+    if [[ "$ranks" == 0 || "$explicit_split" == 1 ]]; then
+      : # The planner checks expert ownership; inventory may contain only media.
     else
       split_hint="Qwen dual requires a Spark-free local TP2 layout"
     fi ;;
@@ -2047,6 +2084,8 @@ if [[ -n "$second" && "$split" != off ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
 fi
+[[ "$tp2_dflash" != on || "$head_split" == 1 ]] ||
+  release_die "TP2_DFLASH requires an active two-GPU target split"
 if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
   release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
 fi
@@ -2310,16 +2349,7 @@ fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
 # cuteafd-coordinator-INSTANCE; empty keeps the one cuteafd-coordinator.
-# SPARK_COUNT=0: routed experts fit the selected coordinator GPUs. GLM 5.3
-# uses solver-selected TP2 (--rtx-expert-layers); the other families use
-# --local-experts.
-if [[ "$ranks" == 0 ]]; then
-  case "$family" in
-    glm5|qwen3_5) ;;
-    glm5_flash|mimo_v2|qwen4) family_args+=(--local-experts) ;;
-    *) echo "SPARK_COUNT=0 serves GLM 5.3, GLM 5.3 Flash, MiMo V2 and Qwen 3.8, not $family" >&2; exit 2 ;;
-  esac
-fi
+# Local-expert argv follows deployment admission, not the physical Spark count.
 # Match persistent connections owned by the selected family's transport, not
 # the Spark world size. Forward the resolved lane policy to the coordinator.
 lane_env_args=()
@@ -2375,6 +2405,9 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t,b=map(float,sys.argv[1:]);print(max(0,b-(t-f)/1024))' "$free_mib" "$total_mib" "$profile_gib")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 ]]; then
+    plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
+  fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
@@ -2541,7 +2574,7 @@ audio_encoder_hash=""
   # Keep checkpoint paths unchanged inside the full namespace mount.
   plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
-    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
+    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()
@@ -2550,17 +2583,23 @@ audio_encoder_hash=""
     ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
   selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
   if ((count_explicit)) || [[ "$backend" == local ]]; then
-    [[ "$selected_ranks" == "$ranks" ]] || release_die "planner changed exact Spark count $ranks to $selected_ranks"
-  elif [[ "$selected_ranks" != "$ranks" ]]; then
-    # Re-resolve count-dependent MTP, ingress and local flags before launching.
-    export SPARK_COUNT="$selected_ranks"
-    exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
+    ((selected_ranks <= ranks)) || release_die "planner requested more Spark ranks than configured: $selected_ranks > $ranks"
+    [[ "$selected_ranks" == "$ranks" ]] || echo "Spark roles use $selected_ranks of $ranks configured ranks"
   fi
   deployment_peer_csv="$(jq -er '.peers | join(",")' <<<"$plan_json")"
   [[ "$(jq -r '.speculator' <<<"$plan_json")" == "$speculator" ]] || release_die "deployment changed resolved speculator"
   # Media still reads the complete report's capability diagnostics. Launch roles,
   # admission policy and endpoints come from the typed deployment above.
   deployment_json="$plan_json"
+  release_deployment_spark_roles "$deployment_json" "$ranks"
+  if [[ "$family" == qwen4 && "$head_split" == 1 && "$spark_expert_world" != 0 ]]; then
+    release_die "Qwen dual requires a Spark-free local TP2 layout"
+  fi
+  if ((spark_expert_world == 0)); then
+    case "$family" in
+      glm5_flash|mimo_v2|qwen4) family_args+=(--local-experts) ;;
+    esac
+  fi
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
   release_prefill_shape "$deployment_json" "$family"
   resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$deployment_json")" ||
@@ -2576,19 +2615,19 @@ audio_encoder_hash=""
   if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
     family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")
   fi
-  if ((ranks > 0)); then
-    budget="$(release_spark_worker_budget "$deployment_json" "$ranks")" || exit 1
+  if ((spark_expert_world > 0)); then
+    budget="$(release_spark_worker_budget "$deployment_json" "$spark_expert_world")" || exit 1
   fi
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.
 if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
-  [[ "$ranks" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
-  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
+  [[ "$spark_expert_world" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
+  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/$selected_config")"
   case "$store_dtype" in
     fp8) expert_geometry=mimo ;;
     mxfp4)
-      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/config.json")"
+      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/$selected_config")"
       case "$hidden" in
         4096) expert_geometry=mimof ;;
         6144) expert_geometry=mimop ;;
@@ -2596,8 +2635,8 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
       esac ;;
     *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
   esac
-  printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
-  for ((rank = 0; rank < ranks; rank++)); do
+  printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$spark_expert_world" 4096
+  for rank in "${spark_expert_ranks[@]}"; do
     host="$(get "SPARK_${rank}_HOST")"
     if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
       echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
@@ -2607,7 +2646,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
 fi
 if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash
           || "$family" == muse_spark || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
-   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
+   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/$selected_config"; } ||
    [[ "$audio" != off ]]; then
   selected="$(python3 -c '
 import json,sys
@@ -2619,12 +2658,12 @@ assert type(cap) is int and 1<=cap<=4096, "invalid encoder image cap"
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid encoder plan hash"
 if kind=="spark":
     ranks=[k["rank"]]+e["replicas"]
-    assert len(ranks)==len(set(ranks)) and all(0<=r<p["spark_ranks"] for r in ranks)
+    assert len(ranks)==len(set(ranks)) and all(r in json.loads(sys.argv[2]) for r in ranks)
     print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)),cap)
 elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-",cap)
 elif kind=="off": print("off",h,"-",cap)
 else: raise ValueError("idle-host launch needs an explicit inventory")
-' "$family" <<<"$plan_json")"
+' "$family" "$(printf '%s\n' "${spark_vision_ranks[@]}" | jq -sc '[.[] | select(. != null)]')" <<<"$plan_json")"
   read -r vision encoder_hash rank_csv encoder_max_tokens <<<"$selected"
   if [[ "$vision" == spark:* ]]; then
     IFS=, read -r -a encoder_ranks <<<"$rank_csv"
@@ -2632,6 +2671,10 @@ else: raise ValueError("idle-host launch needs an explicit inventory")
       vision_peers+=("$(get "SPARK_${encoder_rank}_LANE_A"):$encoder_port")
     done
     family_args+=(--vision-peers "$(IFS=,; printf '%s' "${vision_peers[*]}")" --encoder-plan-hash "$encoder_hash" --encoder-revision "$revision")
+    if [[ "$family" == glm5_flash ]]; then
+      # Internal plan-derived physical identities, never a user configuration key.
+      family_args+=(--vision-peer-ranks "$(IFS=,; printf '%s' "${encoder_ranks[*]}")")
+    fi
   fi
   if [[ "$audio" != off ]]; then
     selected_audio="$(python3 -c '
@@ -2641,17 +2684,17 @@ k=e["kind"] if e else {"kind":"off"}; kind=k["kind"]; h=p["encoder_plan_hash"]
 assert len(h)==64 and all(c in "0123456789abcdef" for c in h), "invalid audio plan hash"
 if kind=="spark":
     ranks=[k["rank"]]+e["replicas"]
-    assert len(ranks)==len(set(ranks)) and all(0<=r<p["spark_ranks"] for r in ranks)
+    assert len(ranks)==len(set(ranks)) and all(r in json.loads(sys.argv[2]) for r in ranks)
     print("spark:"+str(k["rank"]),h,",".join(map(str,ranks)))
 elif kind=="rtx": print("rtx:"+str(k["gpu"]),h,"-")
 elif kind=="off" and sys.argv[1]=="auto":
     if e and e.get("shortfall",0): print("audio auto disabled: "+e["reason"],file=sys.stderr)
     print("off",h,"-")
 else: raise ValueError("enabled audio has no launchable admitted owner")
-' "$audio" <<<"$plan_json")"
+' "$audio" "$(printf '%s\n' "${spark_audio_ranks[@]}" | jq -sc '[.[] | select(. != null)]')" <<<"$plan_json")"
     read -r audio audio_encoder_hash audio_rank_csv <<<"$selected_audio"
     if [[ "$audio" == spark:* ]]; then
-      IFS=, read -r -a audio_encoder_ranks <<<"$audio_rank_csv"
+      audio_encoder_ranks=("${spark_audio_ranks[@]}")
       for audio_rank in "${audio_encoder_ranks[@]}"; do
         audio_peers+=("$(get "SPARK_${audio_rank}_LANE_A"):$audio_encoder_port")
       done
@@ -2697,9 +2740,9 @@ if [[ "$restart" == 1 ]]; then
       done
     done
   fi
-  cleanup_ranks="$ranks"
-  ((restart_all == 0)) || cleanup_ranks="$configured_ranks"
-  for ((rank = 0; rank < cleanup_ranks; rank++)); do
+  cleanup_ranks=("${spark_worker_ranks[@]}")
+  if ((restart_all)); then mapfile -t cleanup_ranks < <(seq 0 $((configured_ranks - 1))); fi
+  for rank in "${cleanup_ranks[@]}"; do
     host="$(get "SPARK_${rank}_HOST")"
     if ((restart_all)); then
       ssh "$host" 'ids=$(docker ps -a --format "{{.Names}}" --filter "name=^cuteafd-spark-expert-.+-[0-9]+$" | grep -vE "^cuteafd-spark-expert-wip($|-)"); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
@@ -2727,7 +2770,7 @@ if [[ -n "$wip_slot" ]]; then
   # carry the SparkInfer revision this checkout pins.
   pinned_sparkinfer="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" \
     --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
-  for ((rank = 0; rank < ranks; rank++)); do
+  for rank in "${spark_worker_ranks[@]}"; do
     host="$(get "SPARK_${rank}_HOST")"
     ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'STAGE' ||
 set -euo pipefail
@@ -2767,17 +2810,25 @@ STAGE
   done
 fi
 worker_pids=()
-for ((rank = 0; rank < ranks; rank++)); do
+for rank in "${spark_worker_ranks[@]}"; do
   host="$(get "SPARK_${rank}_HOST")"
   encoder_args=""
+  encoder_flag=--encoder audio_encoder_flag=--audio-encoder
+  worker_budget="$(release_spark_role_budget "$deployment_json" "$rank")" || exit 1
+  expert_args="--rank $rank --device-budget-bytes $worker_budget"
+  if release_spark_role_has_experts "$deployment_json" "$rank"; then
+    expert_args="--rank $rank --world $spark_expert_world --device-budget-bytes $worker_budget $spark_worker_args --listen 0.0.0.0:$port"
+  else
+    encoder_flag=--encoder-only audio_encoder_flag=--audio-encoder-only
+  fi
   for encoder_rank in "${encoder_ranks[@]}"; do
     if [[ "$rank" == "$encoder_rank" ]]; then
-      encoder_args="--encoder --encoder-listen 0.0.0.0:$encoder_port --encoder-plan-hash $encoder_hash --encoder-revision $revision --encoder-max-tokens $encoder_max_tokens"
+      encoder_args="$encoder_flag --encoder-listen 0.0.0.0:$encoder_port --encoder-plan-hash $encoder_hash --encoder-revision $revision --encoder-max-tokens $encoder_max_tokens"
     fi
   done
   for audio_rank in "${audio_encoder_ranks[@]}"; do
     if [[ "$rank" == "$audio_rank" ]]; then
-      encoder_args+=" --audio-encoder --audio-encoder-listen 0.0.0.0:$audio_encoder_port --audio-encoder-plan-hash $audio_encoder_hash --audio-encoder-revision $revision"
+      encoder_args+=" $audio_encoder_flag --audio-encoder-listen 0.0.0.0:$audio_encoder_port --audio-encoder-plan-hash $audio_encoder_hash --audio-encoder-revision $revision"
     fi
   done
   release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$host" "$(get PROFILE_SPARK)"
@@ -2791,16 +2842,15 @@ for ((rank = 0; rank < ranks; rank++)); do
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
     \"\${RELEASE_HUB_MOUNTS[@]}\" '$spark_image' \
     ${worker_wrapper}cuteafd expertd-native --snapshot \"\$RELEASE_HUB_SNAPSHOT\" --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
-    --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
-    --listen 0.0.0.0:$port $encoder_args >/dev/null" &
+    $expert_args $encoder_args >/dev/null" &
   worker_pids+=("$!")
 done
 for pid in "${worker_pids[@]}"; do wait "$pid"; done
-for ((rank = 0; rank < ranks; rank++)); do
+for rank in "${spark_worker_ranks[@]}"; do
   host="$(get "SPARK_${rank}_HOST")"
   # A placement worker bootstraps after media admission and waits for the
   # coordinator solve before expert weights load.
-  ready_marker='worker bootstrap ready'
+  ready_marker="$(release_spark_role_ready_marker "$deployment_json" "$rank")"
   ready_deadline=$((SECONDS + 900))
   until ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1 | grep -q '$ready_marker'"; do
     ((SECONDS < ready_deadline)) || { echo "$host readiness timed out" >&2; exit 1; }

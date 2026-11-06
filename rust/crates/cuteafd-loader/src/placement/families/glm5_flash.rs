@@ -648,6 +648,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mount_load_adds_only_host_load_owners_without_changing_device_plan() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for ranks in [1, 2] {
+            let input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            let before = contract(&input).unwrap();
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let receipt = crate::shared::dense_read::MountLoad { pinned_source: 32 << 20,
+                full_row_cache: 64 << 20, pinned_tables: 1 << 20 };
+            process.mount_load = Some(receipt);
+            let after = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
+            assert_eq!(before.solved.decisions, after.solved.decisions);
+            assert_eq!(before.solved.pool_tokens, after.solved.pool_tokens);
+            assert_eq!(before.placement.items, after.placement.items);
+            let existing = after.solved.facts.allocations.iter()
+                .filter(|owner| !owner.id.starts_with("glmf.load.mount.")).cloned().collect::<Vec<_>>();
+            assert_eq!(before.solved.facts.allocations, existing);
+            assert_eq!(after.mount_load, Some(receipt));
+            let added = after.solved.facts.allocations.iter()
+                .filter(|owner| owner.id.starts_with("glmf.load.mount.")).collect::<Vec<_>>();
+            assert_eq!(added.iter().map(|owner| owner.bytes).sum::<u64>(), 97 << 20);
+            assert!(added.iter().all(|owner| owner.lifetime.last == planner::Phase::Load));
+        }
+    }
+
+    #[test]
     fn contract_graph_bound_covers_exact_selected_shapes_without_pool_walk() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         for context in [2048, 2051, 4096, 65_536, 131_072, 262_144, 1_048_576] {
@@ -686,8 +711,7 @@ pub(crate) mod tests {
             input.spark_ranks = 0;
             input.requested_pool = Some(262_144);
             let admitted = contract(&input).unwrap();
-            assert_eq!(admitted.validate_spark_topology(4), Err(admission::TopologyRefusal::IdleSparks));
-            admitted.validate_spark_topology(0).unwrap();
+            assert!(admitted.working.spark_layers.is_empty());
             for gpu in 0..2 {
                 let ready = admitted.solved.facts.allocations.iter()
                     .find(|owner| owner.id == format!("glmf.graphs.{gpu}.ready")).unwrap();
@@ -744,7 +768,6 @@ pub(crate) mod tests {
                 let expected = if matches!(kind, EncoderKind::Rtx { .. }) { planner::Location::coordinator(1) }
                     else { planner::Location { device: planner::Device::Spark(2), domain: planner::Domain::Managed } };
                 assert!(owners.iter().all(|owner| owner.location == expected && owner.lifetime == planner::Lifetime::RESIDENT));
-                if matches!(kind, EncoderKind::Spark { .. }) { assert!(!admitted.working.spark_layers.is_empty()); }
             }
         }
         for kind in [EncoderKind::Rtx { gpu: 2 }, EncoderKind::Spark { rank: 4 }] {
@@ -753,9 +776,15 @@ pub(crate) mod tests {
             assert!(matches!(admission::prepare(&input, 188, true, process), Err(planner::Refusal::InvalidFact(_))));
         }
         input.onboard = Onboard::Layers(input.experts.len());
+        input.spark_ranks = 0;
         let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
         process.encoders = vec![encoder(EncoderKind::Spark { rank: 0 })];
-        assert!(admission::prepare(&input, 188, true, process).and_then(|prepared| prepared.admit()).is_err());
+        process.physical_sparks = 1;
+        let admitted = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
+        assert!(admitted.working.spark_layers.is_empty());
+        assert!(admitted.solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("glmf.encoder."))
+            .all(|owner| owner.location.device == planner::Device::Spark(0)));
+        assert_eq!(admitted.encoder.unwrap().kind, EncoderKind::Spark { rank: 0 });
         let mut process = admission::ProcessOwners::new((1 << 30, 1 << 30), 0);
         for (id, location) in [("host", planner::Location::HOST), ("pinned", planner::Location::PINNED)] {
             process.allocations.push(planner::Allocation::buffer(id, location, 600 << 20,

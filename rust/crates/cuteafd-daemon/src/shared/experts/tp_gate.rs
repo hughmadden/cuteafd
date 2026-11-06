@@ -286,7 +286,7 @@ fn native_tp_rank_sum() -> Result<()> {
     let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, output_row_bytes)?;
     link.enable_terminal_ownership(library.clone())?;
     let result = (|| -> Result<()> {
-        link.bootstrap(&requests.build(geometry, layers[0], 16, dtype)?)?;
+        link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&requests.build(geometry, layers[0], 16, dtype)?)?)?;
         let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
         let mut metrics = Vec::new();
         for &layer in &layers {

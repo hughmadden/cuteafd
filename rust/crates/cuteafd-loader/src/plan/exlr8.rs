@@ -291,12 +291,16 @@ pub(super) fn bundled_vision_component(checkpoint: &super::Checkpoint) -> Result
 fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
     layout: &super::layout::LayoutOptions, residents: &[u64]) {
     use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item};
-    memory.devices.extend(residents.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
-        kind: DeviceKind::Spark, index: rank as u32,
-        capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
-        items: vec![Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact)],
-        kv_tokens: 0,
-    }));
+    for (rank, &bytes) in residents.iter().enumerate() {
+        if !memory.devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) {
+            memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
+                capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
+                items: Vec::new(), kv_tokens: 0 });
+        }
+        let device = memory.devices.iter_mut().find(|device|
+            device.kind == DeviceKind::Spark && device.index as usize == rank).expect("Spark ledger exists");
+        device.items.push(Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact));
+    }
 }
 
 fn append_spark_encoder(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
@@ -307,8 +311,20 @@ fn append_spark_encoder(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
             let device = memory.devices.iter_mut().find(|device|
                 device.kind == DeviceKind::Spark && device.index as usize == rank)
                 .with_context(|| format!("EXLR8 vision owner Spark{rank} has no device ledger"))?;
-            device.items.push(Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact));
-            device.items.push(Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula));
+            // Flash's joint admission already publishes its tower ledger; GLM's
+            // native adapter leaves these charges to this shared finalization.
+            for (category, group, bytes, basis) in [
+                (Category::Weights, "vision weights", encoder.weights, Basis::Exact),
+                (Category::Workspace, "vision scratch", encoder.scratch, Basis::Formula),
+            ] {
+                let existing = device.items.iter().filter(|item| item.category == category && item.group == group)
+                    .collect::<Vec<_>>();
+                ensure!(existing.is_empty() || (existing.len() == 1 && existing[0].bytes == bytes),
+                    "EXLR8 vision owner Spark{rank} has inconsistent {group} charges");
+                if existing.is_empty() {
+                    device.items.push(Item::new(category, group, "bundled encoder", bytes, basis));
+                }
+            }
         }
     }
     Ok(())
@@ -501,7 +517,7 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
         }
     }
     tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-    Ok(Checkpoint { snapshot: snapshot.to_path_buf(), config, quantize_config: None,
+    Ok(Checkpoint { view: None, snapshot: snapshot.to_path_buf(), config, quantize_config: None,
         weight_map, tensors, missing_shards: Vec::new(), shard_bytes })
 }
 
@@ -1322,6 +1338,40 @@ mod tests {
         assert_eq!((device.items[1].category, device.items[1].bytes), (Category::Weights, encoder.weights));
         assert_eq!((device.items[2].category, device.items[2].bytes), (Category::Workspace, encoder.scratch));
         assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), 107_133_492_800);
+        assert_eq!(memory.pool_tokens, 2097152);
+    }
+
+    #[test]
+    fn native_flash_k4_min_merges_tower_and_experts_on_spark_zero() {
+        use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
+        let layout = super::super::layout::LayoutOptions::default();
+        let encoder = super::super::encoder::EncoderPlacement {
+            kind: super::super::encoder::EncoderKind::Spark { rank: 0 },
+            weights: 1_128_026_176, scratch: 791_907_584, replicas: Vec::new(),
+            reason: "bundled tower".into(), shortfall: 0,
+        };
+        // The Flash native adapter returns the admitted tower before EXLR8's
+        // shared finalization adds exact routed-expert residency.
+        let runtime = 512 << 20;
+        let experts = 105_213_559_040;
+        let mut memory = MemoryLayout { devices: vec![DeviceLayout {
+            kind: DeviceKind::Spark, index: 0, capacity_bytes: layout.spark_bytes,
+            worker_budget_bytes: layout.spark_bytes, kv_tokens: 0,
+            items: vec![Item::new(Category::Runtime, "context+modules", "tower only", runtime, Basis::Calibrated),
+                Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact),
+                Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula)],
+        }], pool_tokens: 2097152, waste: Vec::new(), notes: Vec::new() };
+        append_spark_devices(&mut memory, &layout, &[experts]);
+        append_spark_encoder(&mut memory, Some(&encoder)).unwrap();
+        assert_eq!(memory.devices.len(), 1);
+        let device = &memory.devices[0];
+        assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
+        assert_eq!(device.worker_budget_bytes, layout.spark_bytes);
+        assert_eq!(device.items.len(), 4);
+        assert_eq!(device.items.iter().filter(|item| item.category == Category::Experts)
+            .map(|item| item.bytes).sum::<u64>(), experts);
+        assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(),
+            runtime + encoder.weights + encoder.scratch + experts);
         assert_eq!(memory.pool_tokens, 2097152);
     }
 

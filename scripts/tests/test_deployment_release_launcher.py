@@ -60,6 +60,11 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                         f'cuteafd-spark-expert-worker-{rank}-{old}',
                         f'cuteafd-spark-expert-worker-{rank}-{new}')
     golden = json.loads(golden_text)
+    if entry["name"] == "v4-flash-max":
+        # The RTX pair now owns all 43 expert layers; retain the historical
+        # coordinator contract, deliberately retiring its four Spark workers.
+        assert [run["host"] for run in golden] == ["coordinator", *[f"worker-{i}" for i in range(4)]]
+        golden = golden[:1]
     selected = release_entry(entry)
     compact_draft = entry["family"] in {"glm5", "glm5_flash", "mimo_v2"}
     if compact_draft:
@@ -98,12 +103,18 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
-            if entry["family"] in {"deepseek_v4", "mimo_v2", "glm5"}:
+            if entry["family"] in {"deepseek_v4", "mimo_v2", "kimi_k3", "glm5"}:
                 # Telemetry defaults on in adapted families; historical captures
                 # predate it. This is the first family-specific serve argument.
                 position = before["command"].index("--embedding-placement") + 2
                 before["command"][position:position] = ["--expert-usage"]
             if entry["family"] == "mimo_v2":
+                # MiMo defaults to the qualified TP2 drafter on split pairs.
+                tp2_dflash = ("true" if "--split-device" in before["command"]
+                              and "--draft" in before["command"] else "false")
+                # The launcher emits it after the telemetry switch.
+                position = before["command"].index("--embedding-placement") + 3
+                before["command"][position:position] = ["--tp2-dflash", tp2_dflash]
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
@@ -124,6 +135,12 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                                     ("--prefill-span-rows", unit * waves)]:
                     before["command"][before["command"].index(flag) + 1] = str(value)
             if entry["family"] == "deepseek_v4":
+                if entry["name"] == "v4-flash-max":
+                    position = before["command"].index("--peers")
+                    assert before["command"][position + 1] == ",".join(
+                        f"192.0.2.{i + 1}:19905" for i in range(4))
+                    del before["command"][position:position + 2]
+                    assert "--peers" not in after["command"]
                 # V4 forwards the planner's resolved unit and wave defaults.
                 anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
                 position = before["command"].index(anchor) + 2
@@ -131,6 +148,13 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 if "--split-device" in before["command"] and "--dspark" in before["command"]:
                     before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
             if entry["family"] == "glm5_flash":
+                if "--vision-peers" in before["command"]:
+                    endpoints = before["command"][before["command"].index("--vision-peers") + 1].split(",")
+                    # Historical endpoint lanes encode the physical rank, not expert-world order.
+                    physical = ",".join(str(int(peer.split(":")[0].rsplit(".", 1)[1]) - 1)
+                                        for peer in endpoints)
+                    position = before["command"].index("--encoder-revision") + 2
+                    before["command"][position:position] = ["--vision-peer-ranks", physical]
                 # The span is exactly the live rows (no old 16384 span).
                 position = before["command"].index("--console-secret-file")
                 before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves),
@@ -301,7 +325,7 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
     ({"RTX_GPUS": "3"}, "RTX GPUs"),
     ({"RTX_GPUS": "1"}, "heads or two-GPU context/layers attention"),
     ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads or two-GPU context/layers attention"),
-    ({"SPARK_COUNT": "9"}, "canonical Spark ranks"),
+    ({"SPARK_COUNT": "9"}, "0..8 Spark ranks"),
     ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
 ])
 def test_exlr8_launcher_refuses_unsupported_route(overrides: dict, reason: str) -> None:

@@ -51,3 +51,5 @@ pub(crate) mod wave_geometry;
 pub(crate) mod target_head;
 pub(crate) mod thermal;
 pub(crate) mod vision;
+
+pub(crate) mod native_attention;

@@ -58,7 +58,13 @@ fn snapshot_arg(args: &[String]) -> Option<&str> {
 
 /// The family id of the checkpoint at `snapshot`.
 pub(crate) fn detect(snapshot: &Path) -> Result<&'static str> {
-    let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)
+    detect_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?)
+}
+
+fn detect_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<&'static str> {
+    let snapshot = view.snapshot();
+    let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(view)
         .with_context(|| format!("reading {}", snapshot.display()))?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint)
         .with_context(|| format!("{}: no supported family (run `cuteafd plan` on it)", snapshot.display()))?;
@@ -67,11 +73,29 @@ pub(crate) fn detect(snapshot: &Path) -> Result<&'static str> {
 
 /// The argv of the family command this `serve`/`golden` invocation stands for,
 /// or None after printing help.
-pub(crate) fn argv(kind: Kind, args: FamilyArgs) -> Result<Option<Vec<String>>> {
+pub(crate) struct ResolvedFamily {
+    pub argv: Vec<String>,
+    pub view: Option<cuteafd_loader::plan::checkpoint::CheckpointView>,
+}
+
+pub(crate) fn resolve(kind: Kind, args: FamilyArgs) -> Result<Option<ResolvedFamily>> {
+    let attention = crate::cli::AttentionArgs {
+        compact_attention: args.args.iter().any(|arg| arg == "--compact-attention")
+            || std::env::var("CUTEAFD_COMPACT_ATTENTION").is_ok_and(|value| value == "true"),
+        fp8_compact_attention: args.args.iter().any(|arg| arg == "--fp8-compact-attention")
+            || std::env::var("CUTEAFD_FP8_COMPACT_ATTENTION").is_ok_and(|value| value == "true"),
+        ..Default::default()
+    };
+    anyhow::ensure!(!(attention.compact_attention && attention.fp8_compact_attention),
+        "--compact-attention conflicts with --fp8-compact-attention");
     let wants_help = args.args.iter().any(|a| a == "--help" || a == "-h");
+    // Detection and the eventual family command consume this same immutable bundle.
+    let view = snapshot_arg(&args.args).filter(|_| args.family.is_none())
+        .map(|snapshot| attention.select(Path::new(snapshot))).transpose()?;
+    if let Some(view) = &view { attention.validate_view(view)?; }
     let family = match (&args.family, snapshot_arg(&args.args)) {
         (Some(family), _) => family.clone(),
-        (None, Some(snapshot)) => detect(Path::new(snapshot))?.to_string(),
+        (None, Some(_)) => detect_view(view.as_ref().context("checkpoint view required for family detection")?)?.to_string(),
         (None, None) if wants_help || args.args.is_empty() => {
             let mut cli = crate::cli::Cli::command();
             cli.find_subcommand_mut(kind.name()).expect("subcommand").print_long_help()?;
@@ -98,7 +122,12 @@ pub(crate) fn argv(kind: Kind, args: FamilyArgs) -> Result<Option<Vec<String>>> 
         Kind::Golden => golden.with_context(|| format!("family {family} has no golden comparison"))?,
     };
     tracing::info!(family, command, "cuteafd {}", kind.name());
-    Ok(Some(["cuteafd", command].into_iter().map(String::from).chain(args.args).collect()))
+    Ok(Some(ResolvedFamily { argv: ["cuteafd", command].into_iter().map(String::from).chain(args.args).collect(), view }))
+}
+
+#[cfg(test)]
+fn argv(kind: Kind, args: FamilyArgs) -> Result<Option<Vec<String>>> {
+    resolve(kind, args).map(|result| result.map(|resolved| resolved.argv))
 }
 
 #[cfg(test)]
@@ -111,8 +140,8 @@ mod tests {
 
     #[test]
     fn family_flag_selects_the_command_and_forwards_everything_else() {
-        let argv = argv(Kind::Serve, args(Some("glm5_flash"), &["--snapshot", "/m", "--port", "9"])).unwrap().unwrap();
-        assert_eq!(argv, ["cuteafd", "serve-glmf", "--snapshot", "/m", "--port", "9"]);
+        let argv = argv(Kind::Serve, args(Some("glm5_flash"), &["--port", "9"])).unwrap().unwrap();
+        assert_eq!(argv, ["cuteafd", "serve-glmf", "--port", "9"]);
         let argv = argv_golden("qwen4");
         assert_eq!(argv[1], "qwen4-golden");
         assert_eq!(argv_golden("deepseek_v41")[1], "v41-golden");

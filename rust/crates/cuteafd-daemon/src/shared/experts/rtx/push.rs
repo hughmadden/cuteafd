@@ -30,7 +30,7 @@ pub(crate) fn load_alone_admitted<'a, T>(snapshot: &std::path::Path,
         let (owners, records) = dense::recording(load)?;
         let (operands, steps) = (records.operands.len(), records.steps.len());
         let dense = dense::plan_records(snapshot, records, devices, 0)?;
-        let push = CoordinatorPush::prepare_alone_with_host(snapshot, None, devices.len(), None, None, envelope)?;
+        let push = CoordinatorPush::prepare_alone_with_host(snapshot, None, devices.len(), None, None, envelope, None)?;
         Ok((owners, push, dense, operands, steps))
     }).context("standalone coordinator dense push planning")?
         .context("required dense group was not planned")?;
@@ -500,6 +500,16 @@ fn client(socket: Option<String>) -> Result<cuteafd_loader::push_load::PushClien
 /// Group rank of coordinator GPU `gpu` after `sparks` Spark ranks.
 fn group_rank(sparks: usize, gpu: usize) -> usize { sparks + gpu }
 
+fn validate_selected_catalog(view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    catalog: Option<&OfficialV41Catalog>) -> Result<()> {
+    if let Some(catalog) = catalog {
+        let selected = catalog.selected_view().context("selected-view push requires a selected-view expert catalog")?;
+        ensure!(selected.snapshot() == view.snapshot() && selected.fingerprint() == view.fingerprint(),
+            "push expert catalog differs from selected attention view");
+    }
+    Ok(())
+}
+
 impl CoordinatorPush {
     /// Metadata only, before any allocation: `gpus` coordinator ranks, with each
     /// GPU's admitted TP2 halves when `tp2` is (layers, per-GPU resident budgets).
@@ -514,6 +524,16 @@ impl CoordinatorPush {
         gpus: usize, experts: Option<CoordinatorExperts>, envelope: PushHostEnvelope)
         -> Result<(Self, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
         Self::prepare_with_host(snapshot, catalog, gpus, experts, Some(envelope))
+    }
+
+    /// Multi-peer preparation bound to the same selected catalog as the dense records.
+    /// Records still come from the family's selected inventory; no default view is reopened.
+    pub(crate) fn prepare_view_admitted(view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        catalog: Option<&OfficialV41Catalog>, gpus: usize, experts: Option<CoordinatorExperts>,
+        envelope: PushHostEnvelope)
+        -> Result<(Self, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
+        validate_selected_catalog(view, catalog)?;
+        Self::prepare_with_host(view.snapshot(), catalog, gpus, experts, Some(envelope))
     }
 
     fn prepare_with_host(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
@@ -581,16 +601,24 @@ impl CoordinatorPush {
     /// [`Self::prepare_alone`] on push endpoint `socket` (None: the configured one).
     pub(crate) fn prepare_alone_at(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
         experts: Option<CoordinatorExperts>, socket: Option<String>) -> Result<Self> {
-        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, socket, None)
+        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, socket, None, None)
     }
 
     pub(crate) fn prepare_alone_admitted(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>,
         gpus: usize, experts: Option<CoordinatorExperts>, envelope: PushHostEnvelope) -> Result<Self> {
-        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, None, Some(envelope))
+        Self::prepare_alone_with_host(snapshot, catalog, gpus, experts, None, Some(envelope), None)
+    }
+
+    pub(crate) fn prepare_alone_view_admitted(view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        catalog: Option<&OfficialV41Catalog>, gpus: usize, experts: Option<CoordinatorExperts>,
+        envelope: PushHostEnvelope) -> Result<Self> {
+        validate_selected_catalog(view, catalog)?;
+        Self::prepare_alone_with_host(view.snapshot(), catalog, gpus, experts, None, Some(envelope), Some(view.clone()))
     }
 
     fn prepare_alone_with_host(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
-        experts: Option<CoordinatorExperts>, socket: Option<String>, host_envelope: Option<PushHostEnvelope>) -> Result<Self> {
+        experts: Option<CoordinatorExperts>, socket: Option<String>, host_envelope: Option<PushHostEnvelope>,
+        view: Option<cuteafd_loader::plan::checkpoint::CheckpointView>) -> Result<Self> {
         let has_experts = experts.is_some();
         let (mut push, streams, ranks) = Self::prepare_with_host(snapshot, catalog, gpus, experts, host_envelope)?;
         push.socket = socket.clone();
@@ -600,7 +628,10 @@ impl CoordinatorPush {
             let mut streams = streams;
             cuteafd_transport::worker_selection::push::coordinate(&mut streams, |offers| {
                 // As the Spark driver: the expert catalog is reopened on this thread.
-                let catalog = has_experts.then(|| cuteafd_loader::read_expert_catalog(&snapshot)).transpose()?;
+                let catalog = has_experts.then(|| match &view {
+                    Some(view) => cuteafd_loader::read_expert_catalog_view(view),
+                    None => cuteafd_loader::read_expert_catalog(&snapshot),
+                }).transpose()?;
                 crate::shared::memory::push_exl3::prepare_coordinator(&snapshot, catalog.as_ref(), offers, &ranks,
                     &client(socket.clone())?)
             })

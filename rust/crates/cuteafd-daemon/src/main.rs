@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches};
 use serde::Serialize;
 use std::io::IsTerminal;
@@ -66,16 +66,52 @@ fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
     }
 }
 
+/// Every qualified serve/golden entry stores the bundle before media or engine setup.
+fn command_attention(command: &mut Commands) -> Option<(&std::path::Path, &mut cli::AttentionArgs)> {
+    match command {
+        Commands::ServeGlmf(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::GlmfGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::ServeGlm(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::GlmGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        Commands::ServeKimi(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::KimiGolden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::ServeStep5(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::Step5Golden(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::ServeMuse(args) => Some((&args.snapshot, &mut args.attention)),
+        Commands::MuseGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
+        _ => None,
+    }
+}
+
+fn select_command_attention(command: &mut Commands,
+    selected: Option<cuteafd_loader::plan::checkpoint::CheckpointView>) -> Result<()> {
+    if let Some((snapshot, attention)) = command_attention(command) {
+        let view = selected.map(Ok).unwrap_or_else(|| attention.select(snapshot))?;
+        attention.validate_view(&view)?;
+        attention.selected_view = Some(view);
+    }
+    Ok(())
+}
+
 fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::MediaMode,
     audio: cuteafd_loader::plan::MediaMode) -> Result<(cuteafd_loader::plan::MediaMode, cuteafd_loader::plan::MediaMode)> {
     use cuteafd_loader::plan::MediaMode;
+    // Once selected, a missing view is an error, never permission to reopen defaults.
+    let selected = command_attention(command).map(|(_, attention)| {
+        attention.selected_view.as_ref().context("media requires its selected checkpoint view")?.config()
+    }).transpose()?;
     let Some(options) = serve_media(command) else {
         anyhow::ensure!(matches!(audio, MediaMode::Auto | MediaMode::Off),
             "explicit audio placement requires a media-capable serve command");
         return Ok((vision, MediaMode::Off));
     };
+    let config = match selected {
+        Some(config) => config,
+        None if vision != MediaMode::Off || audio != MediaMode::Off =>
+            cuteafd_loader::read_json_file(&options.snapshot.join("config.json"))?,
+        None => serde_json::Value::Null,
+    };
     let vision = if vision == MediaMode::Off { vision } else {
-        let config: serde_json::Value = cuteafd_loader::read_json_file(&options.snapshot.join("config.json"))?;
         match config.get("vision_config").filter(|value| !value.is_null()) {
             Some(config) => {
                 anyhow::ensure!(config.is_object(), "vision_config must be an object");
@@ -85,7 +121,7 @@ fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::Med
             None => anyhow::bail!("checkpoint has no bundled vision tower"),
         }
     };
-    let audio = cuteafd_loader::plan::resolve_audio(audio, options.snapshot)?;
+    let audio = cuteafd_loader::plan::resolve_audio_config(audio, options.snapshot, &config)?;
     anyhow::ensure!(options.audio.is_some() || audio == MediaMode::Off,
         "this serve command has no bundled audio execution owner");
     *options.vision = vision;
@@ -163,8 +199,77 @@ mod media_defaults_tests {
 
     fn media_command(name: &str, snapshot: &std::path::Path) -> super::Commands {
         use clap::Parser;
-        super::cli::Cli::try_parse_from(["cuteafd", name, "--snapshot", snapshot.to_str().unwrap(),
-            "--native-lib", "/native.so"]).unwrap().command
+        let mut command = super::cli::Cli::try_parse_from(["cuteafd", name, "--snapshot", snapshot.to_str().unwrap(),
+            "--native-lib", "/native.so"]).unwrap().command;
+        super::select_command_attention(&mut command, None).unwrap();
+        command
+    }
+
+    #[test]
+    fn attention_qualification_is_per_checkpoint_variant() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#)?;
+        std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}")?;
+        let fixtures = [
+            ("glm5_flash", serde_json::json!({"model_type":"glm5_next",
+                "architectures":["Glm5NextForConditionalGeneration"]})),
+            ("glm5", serde_json::json!({"model_type":"glm_moe_dsa",
+                "architectures":["GlmMoeDsaForCausalLM"]})),
+            ("mistral_large4", serde_json::json!({"model_type":"mistral_large4",
+                "architectures":["MistralLarge4ForConditionalGeneration"],
+                "text_config":{"model_type":"mistral_large4_text"}})),
+            ("kimi_k3", serde_json::json!({"model_type":"kimi_k3",
+                "architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{"model_type":"kimi_linear"}})),
+            ("step5", serde_json::json!({"model_type":"step5_vl",
+                "architectures":["Step5ForConditionalGeneration"],"text_config":{"model_type":"step5"}})),
+            ("muse_spark", serde_json::json!({"model_type":"muse_spark",
+                "architectures":["MuseSparkForConditionalGeneration"],
+                "text_config":{"model_type":"muse_spark_text"}})),
+            ("unknown", serde_json::json!({"model_type":"unknown", "text_config":{"model_type":"glm5_next"}})),
+        ];
+        for (expected, mut config) in fixtures {
+            config["transformers_weights"] = serde_json::json!("model.compact-attention.safetensors.index.json");
+            std::fs::write(root.path().join("config.compact-attention.json"), config.to_string())?;
+            let view = CheckpointView::select(root.path(), AttentionMode::Compact)?;
+            let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
+            let family = cuteafd_loader::plan::family::detect(&checkpoint).map(|family| family.id()).unwrap_or("unknown");
+            assert_eq!(family, expected);
+            let attention = super::cli::AttentionArgs { compact_attention: true, ..Default::default() };
+            let result = attention.validate_view(&view);
+            assert_eq!(result.is_ok(), expected == "glm5_flash", "{expected}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains(&format!("family={expected}")), "{error}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_consumers_require_and_reuse_selected_view() -> anyhow::Result<()> {
+        use clap::Parser;
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("config.compact-attention.json"),
+            r#"{"model_type":"glm5_next","architectures":["Glm5NextForConditionalGeneration"],"transformers_weights":"model.compact-attention.safetensors.index.json","vision_config":{},"max_position_embeddings":65536}"#)?;
+        std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#)?;
+        std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}")?;
+        let mut command = super::cli::Cli::try_parse_from(["cuteafd", "serve-glmf", "--snapshot",
+            root.path().to_str().unwrap(), "--native-lib", "/native.so", "--compact-attention"])?.command;
+        assert!(super::resolve_serve_media(&mut command, MediaMode::Auto, MediaMode::Auto).is_err());
+        let super::Commands::ServeGlmf(args) = &mut command else { unreachable!() };
+        let view = args.engine.attention.select(root.path())?;
+        let fingerprint = view.fingerprint().to_owned();
+        args.engine.attention.selected_view = Some(view.clone());
+        std::fs::remove_file(root.path().join("config.compact-attention.json"))?;
+        assert_eq!(super::resolve_serve_media(&mut command, MediaMode::Auto, MediaMode::Auto)?,
+            (MediaMode::Auto, MediaMode::Off));
+        let manifest = root.path().join("programs.json");
+        std::fs::write(&manifest, r#"{"capacities":{"max_context":131072}}"#)?;
+        assert_eq!(super::shared::context::checkpoint_context_config(&view.config()?, &manifest,
+            "glm5_flash", 0)?, 65536);
+        assert_eq!(view.fingerprint(), fingerprint);
+        Ok(())
     }
 
     #[test]
@@ -263,11 +368,14 @@ async fn run() -> Result<()> {
     let parse = |matches: clap::ArgMatches| {
 
         match Cli::from_arg_matches(&matches) {
-            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
-                cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
-                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
-                        prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
-                cli.coordinator_weight_budget_gib),
+            Ok(mut cli) => {
+                cli::resolve_tp2_dflash(&mut cli.command, &matches);
+                (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
+                    cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
+                        idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
+                            prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
+                    cli.coordinator_weight_budget_gib)
+            },
             Err(error) => error.exit(),
         }
     };
@@ -276,19 +384,21 @@ async fn run() -> Result<()> {
     for replacement in cli::deprecated_budget_flags(std::env::args()) {
         eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
     }
+    let mut selected_view = None;
     // `serve` and `golden` pick the family and stand for its own command.
     let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget) = match command {
-        Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
-            Some(argv) => parse(Cli::command().get_matches_from(argv)),
+        Commands::Serve(args) => match commands::family::resolve(commands::family::Kind::Serve, args)? {
+            Some(resolved) => { selected_view = resolved.view; parse(Cli::command().get_matches_from(resolved.argv)) },
             None => return Ok(()),
         },
-        Commands::Golden(args) => match commands::family::argv(commands::family::Kind::Golden, args)? {
-            Some(argv) => parse(Cli::command().get_matches_from(argv)),
+        Commands::Golden(args) => match commands::family::resolve(commands::family::Kind::Golden, args)? {
+            Some(resolved) => { selected_view = resolved.view; parse(Cli::command().get_matches_from(resolved.argv)) },
             None => return Ok(()),
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
             initial_wait, initial_reply, initial_weight_budget),
     };
+    select_command_attention(&mut command, selected_view)?;
     cuteafd_core::spark_reply::set_requested(cuteafd_core::spark_reply::SparkReplyFormats {
         prefill: family_reply.prefill.or(initial_reply.prefill),
         decode: family_reply.decode.or(initial_reply.decode),
@@ -307,10 +417,12 @@ async fn run() -> Result<()> {
     };
     // GLM 5.3 Flash: automatic vision serves text when the checkpoint's own chat template cannot
     // mark images. Planner-resolved peers are an explicit placement and keep serving's refusal.
-    let vision = match &command {
-        Commands::ServeGlmf(args) if args.vision_peers.is_none() => {
-            let (vision, note) = families::glm5_flash::serve::auto_vision(vision, &args.engine.snapshot,
-                args.chat_template_from.as_deref())?;
+    let vision = match &mut command {
+        Commands::ServeGlmf(args) => {
+            let view = args.engine.attention.selected_view.as_ref().context("selected Flash view")?;
+            let (vision, note) = if args.vision_peers.is_none() {
+                families::glm5_flash::serve::auto_vision_view(vision, &view, args.chat_template_from.as_deref())?
+            } else { (vision, None) };
             if let Some(note) = note { tracing::warn!("{note}"); }
             vision
         }

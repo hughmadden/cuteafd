@@ -12,6 +12,8 @@ use std::{net::SocketAddr, path::Path, rc::Rc, sync::Arc};
 const HIDDEN: usize = 7168;
 
 pub(crate) struct Options<'a, const RANKS: usize = 2> {
+    pub expert_usage: bool,
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     pub cache_format: cuteafd_core::MlaCacheFormat,
     pub devices: [i32; RANKS],
     pub attention: Option<cuteafd_loader::placement::AttentionPlacement>,
@@ -60,8 +62,10 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
     let spark_ranks = options.peers.len();
-    ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&spark_ranks),
-        "Kimi startup requires 1..8 Spark peers");
+    if spark_ranks == 0 {
+        return Err(cuteafd_loader::placement::families::kimi::LOCAL_ONLY_REFUSAL.into());
+    }
+    ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
     if RANKS == 2 {
@@ -180,7 +184,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         GpuBudget { capacity_bytes: sample.total_bytes, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
-    let mut admitted = admission::admit(admission::Inputs { cfg, core,
+    let mut admitted = admission::admit(admission::Inputs { expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
@@ -203,7 +207,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         prefix_marks = admitted.mark_selection.slots, marks = %admitted.mark_selection.summary(),
         spark_budget_gib, reserve = "estimated until W9 census",
         "Kimi admitted TP2 expert ownership");
-    cuteafd_bench::context::set_resolved("attention-placement", &admitted.placement.attention_summary());
+    cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
+    cuteafd_bench::context::set_resolved("max-context", &options.max_context.to_string());
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())
@@ -229,7 +234,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
         super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout)).transpose()?;
     let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
-    let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, checkpoint, native, context_programs, peer, hops,
+    let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?;
     if let Some(set) = graph_set {
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;

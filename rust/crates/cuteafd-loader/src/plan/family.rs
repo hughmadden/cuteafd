@@ -61,6 +61,9 @@ pub trait FamilyModel: Send + Sync {
     /// One contract owns host admission and prefill selection, including refusals.
     fn contract_admission(&self) -> bool { false }
 
+    /// The joint recipe excludes unavailable remote packages before choosing expert homes.
+    fn admits_expert_packages(&self) -> bool { false }
+
     /// Placement accounts for executable runtime owners, not only checkpoint inventory.
     fn native_serving_admission(&self) -> bool { false }
 

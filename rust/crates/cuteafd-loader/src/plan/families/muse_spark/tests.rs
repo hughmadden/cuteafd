@@ -33,6 +33,16 @@ fn with_package(rtx: usize, ranks: usize, dir: &std::path::Path) -> PlanOptions 
 }
 
 #[test]
+fn zero_spark_is_a_typed_planner_result_not_a_launcher_restriction() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let report = input.plan(&with_package(2, 0, dir.path())).unwrap();
+    assert!(!report.executable() && !report.wip_launchable());
+    assert!(report.solver_placement.is_none());
+    assert!(report.hints.iter().any(|hint| hint.what.contains("joint admission refused")), "{:?}", report.hints);
+}
+
+#[test]
 fn detects_the_checkpoint_and_classifies_every_text_tensor() {
     let dir = snapshot(&[0]);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();

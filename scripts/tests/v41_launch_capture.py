@@ -155,7 +155,7 @@ if tool == "docker":
             if family == "mimo_v2":
                 report["prefill_lanes"] = response["prefill_waves"]
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and int(ranks) not in (0, 4)
-            response.update(version=1, family=family, executable=True, wip_launchable=True,
+            response.update(spark_expert_world=int(ranks), spark_roles=[dict(rank=i, experts=True, layers=[], encoder=response.get("encoder") if i == 0 else None, audio_encoder=None, drafter=None) for i in range(int(ranks))], version=1, family=family, executable=True, wip_launchable=True,
                 report=report, spark_admission="coordinator_authoritative",
                 launch={"family": family, "first_expert_layer": int(os.environ.get("CAPTURE_FIRST_LAYER", "0")),
                         "last_expert_layer": json.loads(os.environ.get("CAPTURE_LAST_LAYER", "null"))},
@@ -230,6 +230,7 @@ if tool == "docker":
         sys.exit(0)
     if args and args[0] == "logs":
         print("native worker bootstrap ready")
+        print("vision encoder ready")
         sys.exit(0)
     if args and args[0] in ("info", "top", "pull", "rm", "stop", "ps"):
         sys.exit(0)

@@ -26,14 +26,14 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
 }
 
 #[test]
-fn shared_catalog_rejects_the_same_unindexed_headers_as_standalone() {
+fn shared_catalog_rejects_the_same_missing_indexed_headers_as_standalone() {
     let dir = snapshot(false);
     let path = dir.path().join("model-00000.safetensors");
     testing::write_safetensors(&path, &[t("unindexed.weight", "BF16", &[2])]);
     let input = PlanInput::open(dir.path()).unwrap();
     let cached = format!("{:#}", input.expert_catalog().unwrap_err());
     let standalone = format!("{:#}", crate::read_expert_catalog(dir.path()).unwrap_err());
-    assert!(cached.contains("index/header tensor count mismatch"), "{cached}");
+    assert!(cached.contains("missing from shard"), "{cached}");
     assert_eq!(cached, standalone);
 }
 
@@ -94,6 +94,18 @@ fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
     assert!(!report.placement_supported);
     assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal.to_string())),
         "{:?}", report.hints);
+}
+
+#[test]
+fn zero_spark_reports_the_missing_local_executor_without_slicing_world_zero() {
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let report = input.plan(&with_layout(0, None)).unwrap();
+    assert!(!report.executable() && !report.wip_launchable());
+    assert!(report.solver_placement.is_none());
+    let refusal = crate::placement::families::kimi::LOCAL_ONLY_REFUSAL.to_string();
+    assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)), "{:?}", report.hints);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{:?}", report.hints);
 }
 
 #[test]

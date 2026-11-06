@@ -33,6 +33,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         "Kimi K3 header lower bound: coordinator workspaces/graphs not charged; NOT serving admission".into(),
         "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
     ] };
+    if opts.tp2_dflash {
+        report.refuse_placement("Kimi TP2 DFlash requires draft Context attention exports".into(),
+            "Disable --tp2-dflash until the draft window/noncausal Context kernel is installed.");
+        return memory;
+    }
     report.bytes_by_owner.clear();
     // One owner runs whole MLA layers, so its convention is Heads; a pair
     // resolves auto to Context.
@@ -206,6 +211,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     let inventory = (|| -> anyhow::Result<_> {
         let catalog = input.expert_catalog()?;
+        if ranks == 0 { return Err(kimi::LOCAL_ONLY_REFUSAL.into()); }
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
             .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: ranks, prefill_lanes: LANES };
         let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
@@ -410,6 +416,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Supply supported Spark endpoint geometry."); return memory; }
     };
     let mut recipe = KimiRecipe {
+        expert_usage: kimi::usage_geometry(cfg, opts.expert_usage),
         context, gpus, placement: attention, attention: modes,
         prefill, lanes: LANES, spark_links: ranks > 0,
         hop_spec: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2,

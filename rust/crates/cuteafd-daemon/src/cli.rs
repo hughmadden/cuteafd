@@ -4,6 +4,23 @@ use std::path::PathBuf;
 
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
+pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
+    family == "mimo_v2" && split && draft
+}
+
+/// Resolve the topology-dependent bool once, without losing an explicit false.
+pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatches) {
+    let engine = match command {
+        Commands::ServeMimo(args) => &mut args.engine,
+        Commands::MimoGolden(args) => &mut args.engine,
+        _ => return,
+    };
+    let Some((_, sub)) = matches.subcommand() else { return };
+    if sub.value_source("tp2_dflash") != Some(clap::parser::ValueSource::CommandLine) {
+        engine.tp2_dflash = tp2_dflash_default("mimo_v2", engine.split_device.is_some(), engine.draft.is_some());
+    }
+}
+
 /// Inspect original argv: clap normalizes aliases before exposing matches.
 pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<&'static str> {
     let mut replacements = Vec::new();
@@ -210,8 +227,63 @@ pub(crate) fn exlr8_prefill_activations_parser()
         .map(|name| name.parse().expect("clap admits only the listed values"))
 }
 
+/// Model-lifetime attention bundle shared by planner, serve and golden commands.
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct AttentionArgs {
+    #[arg(skip)]
+    pub selected_view: Option<cuteafd_loader::plan::checkpoint::CheckpointView>,
+    /// Load the parent's compact attention bundle instead of default native HQA attention.
+    #[arg(long, conflicts_with = "fp8_compact_attention", env = "CUTEAFD_COMPACT_ATTENTION")]
+    pub compact_attention: bool,
+    /// Load default HQA attention and quantize its BF16 projections to FP8 during load/push.
+    #[arg(long, conflicts_with = "compact_attention", env = "CUTEAFD_FP8_COMPACT_ATTENTION")]
+    pub fp8_compact_attention: bool,
+}
+impl AttentionArgs {
+    pub fn mode(&self) -> cuteafd_loader::plan::checkpoint::AttentionMode {
+        use cuteafd_loader::plan::checkpoint::AttentionMode;
+        if self.compact_attention { AttentionMode::Compact }
+        else if self.fp8_compact_attention { AttentionMode::Fp8Compact }
+        else { AttentionMode::Hqa }
+    }
+    pub fn validate_view(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> anyhow::Result<()> {
+        if self.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Hqa { return Ok(()); }
+        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(view)?;
+        let family = cuteafd_loader::plan::family::detect(&checkpoint)
+            .map(|family| family.id()).unwrap_or("unknown");
+        let supported = attention_variants().get(family).copied().unwrap_or(false);
+        anyhow::ensure!(supported, "alternate attention modes are unsupported for checkpoint family={family}");
+        Ok(())
+    }
+    pub fn select(&self, snapshot: &std::path::Path) -> anyhow::Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
+        cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot, self.mode())
+    }
+}
+
+// Qualification uses loader family IDs, not engine IDs: ML4 shares the GLM5 engine.
+const ATTENTION_VARIANTS: &str = include_str!("../../../../scripts/lib/attention-variants.json");
+fn attention_variants() -> &'static std::collections::BTreeMap<String, bool> {
+    static VARIANTS: std::sync::OnceLock<std::collections::BTreeMap<String, bool>> = std::sync::OnceLock::new();
+    VARIANTS.get_or_init(|| serde_json::from_str(ATTENTION_VARIANTS).expect("checked attention qualification table"))
+}
+
+#[cfg(test)]
+#[test]
+fn attention_variants_match_launcher_rows() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..").join("scripts/lib/attention-variants.json");
+    let launcher: std::collections::BTreeMap<String, bool> =
+        serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+    assert_eq!(&launcher, attention_variants());
+    assert_eq!(launcher.len(), 6);
+    assert_eq!(launcher.iter().filter(|(_, enabled)| **enabled).map(|(family, _)| family.as_str())
+        .collect::<Vec<_>>(), ["glm5_flash"]);
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    #[command(flatten)]
+    pub attention: AttentionArgs,
     /// Published EXLR8 manifest name (defaults to bit325).
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
@@ -449,6 +521,9 @@ pub(crate) struct PlanArgs {
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
+    /// Split MiMo/Kimi DFlash over both target GPUs (explicit false wins over config).
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) tp2_dflash: Option<bool>,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) state_slots: Option<u64>,
@@ -542,6 +617,8 @@ pub(crate) struct DoctorArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeExpertDaemonArgs {
+    #[command(flatten)]
+    pub attention: AttentionArgs,
     /// Load the checkpoint vision tower in this expert process.
     #[arg(long, conflicts_with = "encoder_only")]
     pub(crate) encoder: bool,
@@ -1067,6 +1144,19 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn tp2_dflash_deployment_accepts_explicit_on_and_off_without_layout() {
+        for mode in ["--deployment", "--layout", "--spark-range"] {
+            for (value, expected) in [("false", false), ("true", true)] {
+                let Commands::Plan(args) = Cli::try_parse_from([
+                    "cuteafd", "plan", "model", mode, "--rtx", "2",
+                    "--speculator", "dflash2", "--tp2-dflash", value,
+                ]).unwrap().command else { panic!("expected plan command"); };
+                assert_eq!(args.tp2_dflash, Some(expected));
+            }
+        }
+    }
 
     #[test]
     fn mimo_layout_swa_default_and_explicit_formats_match_serving() {

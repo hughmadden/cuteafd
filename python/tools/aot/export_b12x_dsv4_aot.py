@@ -82,6 +82,82 @@ def exl3_reply_programs(max_rows):
             for width, topk in shapes for format in (1, 2)]
 
 
+def hqa_bf16_shapes():
+    # GLM Flash q_b and MLA/KDA o, whole and ordinary TP2 slices (K, N).
+    return {(1536, 16384), (1536, 8192), (16384, 4096),
+            (8192, 4096), (4096, 4096)}
+
+
+def native_attention_shapes():
+    """Native HQA projection [N,K] shapes from the published tensor headers."""
+    return {
+        "glm": {(16384, 2048), (8192, 2048), (6144, 16384), (6144, 8192)},
+        "kimik3": {(18432, 1536), (9216, 1536), (7168, 12288), (7168, 6144)},
+        "step5": {(4096, 12288), (4096, 6144)},
+        "muse": {(8192, 8192), (8192, 4096)},
+        "ml4": {(8192, 6144), (4096, 6144), (6144, 8192), (6144, 4096)},
+    }
+
+
+def native_attention_f32_shapes():
+    return {(7168, 6144), (4096, 6144), (8192, 4096), (6144, 8192), (6144, 4096)}
+
+
+def native_attention_bf16_f32_shapes():
+    # ML4's checkpoint attention weights are already FP8; no BF16 fallback export.
+    return native_attention_f32_shapes() - {(6144, 4096)}
+
+
+def compile_native_attention_projection(n, k, max_rows, output="bf16"):
+    # CuTe resolves deferred JIT annotations in module globals, not this factory's locals.
+    global cute, cuda, Int32, Int64
+    import torch
+    import cutlass
+    import cutlass.cute as cute
+    import cuda.bindings.driver as cuda
+    from cutlass import Int32, Int64
+    from b12x.integration.cuteafd._fp8_weights import Fp8Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    if output not in ("bf16", "f32") or max_rows not in (64, 4096):
+        raise ValueError("native attention requires BF16/F32 output and capacity 64/4096")
+    dtype = torch.bfloat16 if output == "bf16" else torch.float32
+    cute_dtype = cutlass.BFloat16 if output == "bf16" else cutlass.Float32
+
+    class Projection:
+        def __init__(self):
+            self.projection = Fp8Projection(n, k, decode_rows=64, out_dtype=cute_dtype)
+
+        @cute.jit
+        def __call__(self, x: cute.Pointer, weight: cute.Pointer, scales: cute.Pointer,
+                     out: cute.Pointer, scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+            self.projection(x, weight, scales, out, rows, Int32(64), Int64(scratch.toint()), stream)
+
+    launch = Projection()
+    return compile_program(launch, name="native_attention_projection", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("weight", torch.uint8, f"[{n},{k}]"),
+        Operand("scales", torch.float32, f"[{n//128},{k//128}]"),
+        Operand("out", dtype, f"[rows,{n}]", "out"),
+        Operand("scratch", torch.uint8, "[projection_scratch]", "scratch")),
+        scalars=(Scalar("rows"),), key=(n, k, max_rows, output, launch.projection.key()),
+        scratch={"scratch": lambda rows: max(256, launch.projection.prefill_scratch_bytes(rows))},
+        geometry=dict(input_features=k, output_features=n, output_dtype=str(dtype),
+            max_rows=max_rows, scale_block=128, storage="row_major_e4m3", decode_rows=64,
+            reduction="canonical_fp8_gemv64_w8a16"))
+
+
+def native_attention_programs():
+    from functools import partial
+    out = []
+    for n, k in sorted(set().union(*native_attention_shapes().values())):
+        for output in (("bf16", "f32") if (n, k) in native_attention_f32_shapes() else ("bf16",)):
+            for rows in (64, 4096):
+                suffix = "_f32" if output == "f32" else ""
+                out.append((f"n{n}_k{k}_m{rows}{suffix}", "attention_projection",
+                    dict(max_rows=rows), partial(compile_native_attention_projection, n, k, rows, output)))
+    return out
+
+
 def draft_bf16_shapes():
     # hidden, query heads, KV heads, head width, MLP width, tap count
     families = {
@@ -97,6 +173,9 @@ def draft_bf16_shapes():
         "dflash2-muse-radix": (8192, 64, 8, 128, 28672, 5),
         "dflash2-muse-nvidia": (8192, 128, 16, 64, 24576, 5),
     }
+    for family in ("dflash-mimo-pro", "dflash-mimo-flash"):
+        h, heads, kv, d, inter, taps = families[family]
+        families[f"{family}-tp2"] = (h, heads // 2, kv // 2, d, inter // 2, taps)
     result = {}
     for family, (h, heads, kv, d, inter, taps) in families.items():
         for k, n in ((h * taps, h), (h, (heads + 2 * kv) * d),
@@ -111,21 +190,34 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    for shape in hqa_bf16_shapes():
+        result.setdefault(shape, []).append("hqa-glmf")
+    for n, k in set().union(*(shapes for family, shapes in native_attention_shapes().items() if family != "ml4")):
+        result.setdefault((k, n), []).append("hqa-native")
     return result
 
 
-def compile_draft_bf16_projection(k, n):
+def compile_draft_bf16_projection(k, n, output="bf16"):
+
     import torch
     from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
-    tiles = ((16, 1, 4, 16, 64, 6),)
-    launch = TmaBf16Projection(n, k, tiles_by_rows=tiles)
+    import cutlass
+    from b12x.gemm.bf16_gemv._skinny import DECODE_TMA_TILES
+    if output not in ("bf16", "f32"):
+        raise ValueError("projection output is bf16 or f32")
+    dtype = torch.bfloat16 if output == "bf16" else torch.float32
+    native_shapes = {(k, n) for family, shapes in native_attention_shapes().items()
+                     if family != "ml4" for n, k in shapes}
+    tiles = DECODE_TMA_TILES.get((n, k), ()) if (k, n) in native_shapes else ((16, 1, 4, 16, 64, 6),)
+    launch = TmaBf16Projection(n, k, out_dtype=cutlass.BFloat16 if output == "bf16" else cutlass.Float32,
+                               tiles_by_rows=tiles)
     return compile_program(launch, name="draft_bf16_projection", operands=(
         Operand("x", torch.bfloat16, f"[rows,{k}]"),
         Operand("w", torch.bfloat16, f"[{n},{k}]"),
-        Operand("out", torch.bfloat16, f"[rows,{n}]", "out")),
-        scalars=(Scalar("rows"),), key=launch.key(), geometry=dict(
-            width=k, outputs=n, output_dtype="torch.bfloat16",
+        Operand("out", dtype, f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"),), key=(output, launch.key()) if output != "bf16" else launch.key(), geometry=dict(
+            width=k, outputs=n, output_dtype=str(dtype),
             reduction="ordered_k16", tiles_by_rows=tiles))
 
 
@@ -287,7 +379,8 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     from b12x.integration.cuteafd.glmf_split import (
         compile_glmf_kda_core_aot, compile_glmf_stage_aot,
         compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
-        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot)
+        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot,
+        compile_glmf_fp8_linear_aot)
     out = []
     # Wide decode still selects the narrow stage for batches of at most 64 rows.
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
@@ -321,6 +414,15 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
         params = dict(max_rows=rows)
         out.append((f"index_projected_keys_m{rows}", "index_producer", params,
                     partial(compile_glmf_projected_index_keys_aot, g, **params)))
+    # Append standalone seams; never reorder the existing fused exports.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        shapes = {(g.q_lora_rank, g.heads*g.qk_nope_dim), (g.heads*g.v_head_dim, g.hidden),
+                  (g.hidden, g.kda_width), (g.kda_width, g.hidden),
+                  (g.hidden, g.q_lora_rank), (g.hidden, g.kv_lora_rank)}
+        for k, n in sorted(shapes):
+            params = dict(input_features=k, output_features=n, max_rows=rows, decode=rows in decode_caps)
+            out.append((f"fp8_linear_k{k}_n{n}_m{rows}", "attention_projection", params,
+                        partial(compile_glmf_fp8_linear_aot, **params)))
     return out
 
 
@@ -1177,7 +1279,8 @@ def main() -> None:
                              "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
                              "glm_stage/glm2_stage (full/TP2 GLM primitive boundaries), "
                              "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
-                             "dense_trellis_k6 (native K6 core projections)")
+                             "dense_trellis_k6 (native K6 core projections), "
+                             "native_attention (block-128 FP8 projection stages)")
     parser.add_argument("--dense-trellis-families",
                         help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4 "
                              "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
@@ -1221,9 +1324,9 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3 and/or native_attention")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
@@ -1249,6 +1352,10 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name == "native_attention":
+            manifest["families"][name] = {"scale_block": 128, "decode_rows": 64}
+            work += [(name, *item) for item in native_attention_programs()]
+            continue
         if name in ("glmf_stage", "glmf2_stage"):
             g = GLM53_FLASH
             if name == "glmf2_stage":
@@ -1454,10 +1561,18 @@ def main() -> None:
                                            "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
             work += [(family, *item) for item in exlr8_work]
     # Append shared drafter exports after all existing objects: table indices stay stable.
-    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
-        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},
+    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2", "step5", "step52")):
+        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection",
+                  {"max_rows": 4096 if (k, n) in hqa_bf16_shapes()
+                      or "hqa-native" in draft_bf16_shapes()[(k, n)] else 2048},
                   lambda k=k, n=n: compile_draft_bf16_projection(k, n))
                  for k, n in sorted(draft_bf16_shapes())]
+        work += [("draft_bf16", f"k{k}_n{n}_f32", "bf16_projection", {"max_rows": 4096},
+                  lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32"))
+                 for n, k in sorted(native_attention_bf16_f32_shapes())]
+    if "native_attention" not in geometries and any(name in geometries for name in
+            ("glm", "glm2", "kimik3", "step5", "step52", "muse", "muse2", "ml4")):
+        work += [("native_attention", *item) for item in native_attention_programs()]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue

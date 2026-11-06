@@ -308,8 +308,8 @@ impl<'a> ProductionInput<'a> {
             .any(|location| matches!(location.device, Device::Coordinator(_)))).count();
         let spark_ranks = budgets.iter().filter(|budget| budget.locations.iter()
             .any(|location| matches!(location.device, Device::Spark(_)))).count();
-        if !(1..=2).contains(&coordinator) || !(1..=8).contains(&spark_ranks) {
-            return Err(invalid("Muse Spark runs on one or two RTX with one to eight Spark ranks"));
+        if !(1..=2).contains(&coordinator) || spark_ranks > 8 {
+            return Err(invalid("Muse Spark runs on one or two RTX with at most eight Spark ranks"));
         }
         if maximum_pool_tokens < context {
             return Err(Refusal::PoolBelowContext { tokens: maximum_pool_tokens, context });
@@ -488,9 +488,13 @@ impl<'a> ProductionInput<'a> {
         let spark_bytes = budgets.iter().find(|budget| budget.locations.iter()
             .any(|location| matches!(location.device, Device::Spark(0))))
             .map_or(0, |budget| budget.physical_bytes);
-        let spark_budget = SparkBudgetInventory::exl3(catalog, &working, &[endpoint], spark_rings, spark_bytes,
-            spark_reserve_bytes(spark_ranks, prefill.waves, prefill.unit_rows).map_err(anyhow_refusal)?)
-            .map_err(anyhow_refusal)?;
+        let spark_budget = if spark_ranks == 0 {
+            SparkBudgetInventory { layers: working.spark_layers.clone(), resident: vec![], overhead: vec![], budget: 0 }
+        } else {
+            SparkBudgetInventory::exl3(catalog, &working, &[endpoint], spark_rings, spark_bytes,
+                spark_reserve_bytes(spark_ranks, prefill.waves, prefill.unit_rows).map_err(anyhow_refusal)?)
+                .map_err(anyhow_refusal)?
+        };
         let mut peaks = vec![[0u64; 2]; cfg.layers + 1];
         let mut expert_cases = Vec::with_capacity(cfg.layers + 1);
         // Count zero is a case too: with every routed layer on the Sparks, the
@@ -765,7 +769,7 @@ impl Recipe for MuseRecipe<'_> {
             || self.prefill.rows == 0
             || self.prefill.waves == 0
             || self.attention.len() != self.cfg.layers
-            || !(1..=8).contains(&self.spark_ranks)
+            || self.spark_ranks > 8
             || self.encoders.is_empty()
             || self.peaks.len() != self.cfg.layers + 1
         {
@@ -805,6 +809,11 @@ impl Recipe for MuseRecipe<'_> {
             destination: (0..self.gpus as u8).collect(),
             counts: (0..=self.cfg.layers).collect(),
         });
+        if self.spark_ranks == 0 {
+            for option in 0..self.cfg.layers {
+                contract.requires.push(Requires { when: Choice { variable: onboard, option }, any_of: vec![] });
+            }
+        }
         let encoder = contract.variables.len();
         contract.variables.push(Variable::Encoder((0..self.encoders.len()).collect()));
         // The DFlash2 drafter reads the target head, its embedding and its
@@ -844,6 +853,11 @@ impl Recipe for MuseRecipe<'_> {
     }
 }
 
+/// The linked expert path remains required until local-only startup is qualified.
+pub const LOCAL_ONLY_REFUSAL: Refusal = Refusal::MissingExecutor {
+    family: "Muse Spark", executor: "coordinator-only routed experts", issue: 1395,
+};
+
 impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
@@ -853,6 +867,7 @@ impl PreparedMuse<'_> {
         let solved = solve(request, budgets, &recipe)?;
         let solve_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         let (placement, spark) = recipe.execution(&solved)?;
+        if spark.spark_layers.is_empty() { return Err(LOCAL_ONLY_REFUSAL); }
         let push = push.get(placement.onboard_layers).ok_or_else(|| invalid("push onboarding extent"))?.clone();
         let media = recipe.media(&solved)?;
         if media.vision.admitted_bytes() == 0 && media.audio.admitted_bytes() == 0 { host.media_bytes = 0; }

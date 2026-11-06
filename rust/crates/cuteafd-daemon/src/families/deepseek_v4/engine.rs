@@ -1751,25 +1751,12 @@ impl<'a> Engine<'a> {
         spark_request(self.cfg.dim, self.cfg.n_activated_experts, layer, rows, routes, wire, kind)
     }
 
-    /// Zero-valued wave at the link's live row capacity. Decode and prefill
-    /// bootstrap independently because their registered reply planes differ.
-    pub fn warm_request(&self, rows: usize, kind: ExpertV2SourceKind) -> Result<ExpertProtocolV2Request> {
-        let (h, experts, topk) = (self.cfg.dim, self.cfg.n_routed_experts, self.cfg.n_activated_experts);
-        let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
-        }).collect();
-        self.expert_request(self.cfg.n_layers - 1, rows, routes, vec![0u8; rows * (h + h / 32)].into(),
-            kind)
-    }
-
-    /// Warm a link without exceeding its own return-plane capacity.
-    pub fn warm_transport(&self, transport: &mut SparkLink<'_>, rows: usize, kind: ExpertV2SourceKind) -> Result<()> {
-        let request = self.warm_request(rows, kind)?;
-        let exchange = transport.exchange()?;
-        let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
-        let ticket = exchange.send_request(request, payload_bytes)?;
-        exchange.land_drained(ticket, self.stream)?;
-        self.sync()
+    /// Widest session geometry; opening reply planes never runs an expert layer.
+    pub fn session_shape(&self, rows: usize) -> Result<cuteafd_transport::SparkSessionShape> {
+        let mut shape = cuteafd_transport::SparkSessionShape::new(u32::try_from(rows)?, self.cfg.dim as u32,
+            self.cfg.n_activated_experts as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+        shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        Ok(shape)
     }
 
     pub(crate) fn local_layers(&self) -> usize {
@@ -2085,4 +2072,32 @@ mod coverage_tests {
         assert_eq!(segments(super::GraphKey { previous: 0, ..tail }, 0, true, false, false), vec![(0, "head")]);
     }
 
+}
+
+#[cfg(test)]
+mod session_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn session_covers_widest_real_decode_and_prefill_wave() -> Result<()> {
+        for geometry in [cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO] {
+            for rows in [64, 640, 2048, 4096] {
+                let mut session = cuteafd_transport::SparkSessionShape::new(rows, geometry.hidden,
+                    geometry.topk, ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+                session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
+                    let routes = (0..rows * geometry.topk).map(|i| ExpertProtocolV2RouteEntry {
+                        row_index: i / geometry.topk, expert_id: i % geometry.experts, gate_weight: 0.0,
+                    }).collect();
+                    let real = spark_request(geometry.hidden as usize, geometry.topk as usize, 24,
+                        rows as usize, routes, vec![0; rows as usize * (geometry.hidden as usize * 33 / 32)].into(), kind)?;
+                    let actual = cuteafd_transport::SparkSessionShape::from_request(&real)?;
+                    assert_eq!(actual.request_wire_bytes, session.request_wire_bytes);
+                    assert!(actual.response_wire_bytes <= session.response_wire_bytes);
+                }
+            }
+        }
+        Ok(())
+    }
 }

@@ -1569,10 +1569,6 @@ impl Recipe for GlmRecipe<'_> {
                     EncoderKind::Off => vec![],
                     EncoderKind::Rtx { gpu } if *gpu < self.gpus => vec![Location::coordinator(*gpu as u8)],
                     EncoderKind::Spark { .. } => {
-                        let (onboard_var, profile) = onboard.ok_or_else(|| invalid("encoder Spark without experts"))?;
-                        let active = profile.counts.iter().enumerate().filter_map(|(option, &count)|
-                            (count < profile.layers.len()).then_some(Choice { variable: onboard_var, option })).collect();
-                        contract.requires.push(Requires { when, any_of: active });
                         encoder.spark_ranks().into_iter().map(|rank| Location {
                             device: Device::Spark(rank as u8), domain: Domain::Managed }).collect()
                     }

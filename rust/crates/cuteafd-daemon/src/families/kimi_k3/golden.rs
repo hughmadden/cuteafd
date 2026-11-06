@@ -22,13 +22,15 @@ const SOURCE: [(&str, &str); 3] = [
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct GoldenArgs {
+    #[command(flatten)]
+    pub(crate) attention: crate::cli::AttentionArgs,
     #[arg(long, default_value = "fp8")] kv_cache: cuteafd_core::MlaCacheFormat,
     /// Prefill unit rows for scoring chunks; unset keeps whole chunks as one unit.
     #[arg(long)] prefill_rows: Option<usize>,
     /// Prefill units in flight while scoring (N=1 against N=2 at the same
     /// units is byte-identical).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: u8,
-    #[arg(long)] snapshot: PathBuf,
+    #[arg(long)] pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
     /// Read-only cuteafd.kimi.layer-state/1 export, never a qualified reference panel.
@@ -428,7 +430,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
     full: &KimiK3Config, cfg: &KimiK3Config, devices: [i32; RANKS],
     prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan, graphs: bool, verify: usize)
     -> Result<super::startup::Loaded<'a>> {
-    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options {
+    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
         cache_format: args.kv_cache, devices,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         native_lib: args.native_lib.as_deref().context("--native-lib required")?,
@@ -867,7 +869,7 @@ mod tests {
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, rows as u64)?)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots, 0)?;
-        let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(),
+        let admitted = admission::admit(admission::Inputs { expert_usage: false, cfg: &cfg, core: Default::default(),
             resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],

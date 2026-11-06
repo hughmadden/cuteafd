@@ -93,6 +93,8 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
         if cfg.attention[layer] == GlmNextAttention::Mla { mla_owner ^= 1; }
         let native = core.layer_weights(cfg, layer, ranks, owned.then_some(owner as u8)
             .filter(|_| cfg.attention[layer] == GlmNextAttention::Mla)).map_err(|e| e.to_string())?;
+        let native_attention = core.layer_native(cfg, layer, ranks, owned.then_some(owner as u8)
+            .filter(|_| cfg.attention[layer] == GlmNextAttention::Mla)).map_err(|e| e.to_string())?;
         let p = format!("model.language_model.layers.{layer}");
         let a = |s: &str| format!("{p}.self_attn.{s}");
         let one = |s: &str| -> Result<u64, String> { Ok(tensor(s)?.meta.byte_length.max(256)) };
@@ -101,14 +103,15 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             Ok((n * 4 / if split { ranks as u64 } else { 1 }).max(256))
         };
         for rank in 0..ranks {
-            let mut bytes = 0;
+            let mut bytes = native_attention[rank].values().try_fold(0u64, |bytes, layout|
+                layout.bytes().map(|n| bytes + n)).map_err(|e| e.to_string())?;
             for site in ["attn", "ffn"] {
                 for suffix in ["fn", "scale", "base"] { bytes += f32(&[format!("{p}.hc_{site}_{suffix}")], false)?; }
             }
             bytes += one(&format!("{p}.input_layernorm.weight"))? + one(&format!("{p}.post_attention_layernorm.weight"))?;
             match cfg.attention[layer] {
                 GlmNextAttention::Kda => {
-                    if core.get_weight(&a("q_proj")).is_some() {
+                    if core.get_weight(&a("q_proj")).is_some() || core.native.contains_key(&a("q_proj")) {
                         bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
                             .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
                         let aux = elements(&a("f_a_proj.weight"))? + elements(&a("g_a_proj.weight"))?
@@ -138,7 +141,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
                         bytes += one(&a("q_a_layernorm.weight"))? + one(&a("kv_a_layernorm.weight"))?;
                         bytes += (cfg.heads * cfg.qk_nope_dim * cfg.kv_lora_rank * 2 / parts) as u64;
                         bytes += (cfg.heads * cfg.v_head_dim * cfg.kv_lora_rank * 2 / parts) as u64;
-                        if core.get_weight(&a("q_a_proj")).is_some() {
+                        if core.get_weight(&a("q_a_proj")).is_some() || core.native.contains_key(&a("q_a_proj")) {
                             bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
                                 .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
                         } else {
@@ -211,7 +214,7 @@ mod tests {
             .into_iter().map(|(name, shape)| CheckpointTensor { shard: "fixture".into(),
                 meta: crate::SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
                     byte_length: shape.iter().product::<usize>() as u64 * 2, shape, byte_offset: 0 } }).collect();
-        let checkpoint = Checkpoint { snapshot: "fixture".into(), config, quantize_config: None,
+        let checkpoint = Checkpoint { view: None, snapshot: "fixture".into(), config, quantize_config: None,
             weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
         // Zero target layers isolates the head representation and ownership contract.
         let single = resident_weights(&checkpoint, &cfg, 0, 1, Default::default()).unwrap();

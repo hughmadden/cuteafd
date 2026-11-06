@@ -183,7 +183,9 @@ def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 report = json.loads(REPORT)
 family, first, last = FAMILY, FIRST, LAST
-print(json.dumps(dict(report, version=1, family=family, executable=True, report=report,
+print(json.dumps(dict(report, spark_expert_world=report["spark_ranks"],
+    spark_roles=[dict(rank=i, experts=True, layers=[], encoder=report.get("encoder") if i == 0 else None,
+                      audio_encoder=None, drafter=None) for i in range(report["spark_ranks"])], version=1, family=family, executable=True, report=report,
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
     spark_admission="coordinator_authoritative", decode_lanes=1,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
@@ -302,6 +304,20 @@ def test_glm_k6_core_cards_preserve_native_checkpoint_and_topology() -> None:
         baseline = entries[f"glm53-exl3-{size}"]
         assert entry["sparks"] == baseline["sparks"]
         assert entry["family"] == baseline["family"] == "glm5"
+
+
+def test_v4_flash_max_keeps_all_experts_on_the_rtx_pair() -> None:
+    config = keys(EXAMPLES / "deepseek-v4-flash-mxfp4-max.config")
+    assert config["RTX_GPUS"] == "2" and config["SPARK_COUNT"] == "0"
+    assert config["EXPERT_BACKEND"] == "auto"
+    assert not any(re.fullmatch(r"SPARK_\d+_(HOST|LANE_A|LANE_B)", key) for key in config)
+    for path in ("scripts/bench/release-smoke.example.json", "scripts/bench/kits/gate/matrix-gate.json"):
+        matrix = json.loads((ROOT / path).read_text())
+        entry = next(entry for entry in matrix["entries"] if entry["name"] == "v4-flash-max")
+        assert entry["gpus"] == [0, 1] and entry["sparks"] == []
+        assert entry["set"]["SPARK_COUNT"] == "0"
+        assert not any(re.fullmatch(r"SPARK_\d+_(HOST|LANE_A|LANE_B)", key) for key in entry["set"])
+
 
 
 def test_v41_max_uses_six_sparks_and_keeps_tp4_reference() -> None:

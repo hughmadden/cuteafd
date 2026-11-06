@@ -301,11 +301,13 @@ impl EngineArgs {
         let ranks = if self.skip_routed_experts { 0 } else {
             self.peers.split(',').filter(|peer| !peer.is_empty()).count()
         };
-        prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
+        let shape = prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
             max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES }, ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
             PrefillOverrides { unit_rows: self.prefill_rows.map(|rows| rows as u64),
                 waves: self.prefill_waves.map(|waves| waves as u64), span_rows,
-                reserve_rows: None })
+                reserve_rows: None })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
+        Ok(shape)
     }
 
     /// The resolved `--rtx-expert-layers`. Pool
@@ -478,7 +480,7 @@ pub(crate) fn with_engine<T>(
         .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
     if skip {
         tracing::warn!("--skip-routed-experts: MoE layers run the shared expert alone (outputs do not match the model)");
-    } else {
+    } else if !peers.is_empty() {
         ensure!((1..=8).contains(&peers.len()), "DeepSeek V4 Spark transport requires 1..=8 peers, got {}", peers.len());
         loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
     }
@@ -561,11 +563,11 @@ pub(crate) fn with_engine<T>(
                     matches!(home.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer)).collect(),
                 spark_ranks: peers.len(), prefill_lanes: 1,
             };
-            crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
+            if !peers.is_empty() { crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
                 peers.len(), None, admission::spark_model(
                     cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&loaded.catalog)?,
-                    decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?;
+                    decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?; }
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         if crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&loaded.snapshot)?
@@ -732,6 +734,8 @@ pub(crate) fn with_engine<T>(
         // the drafter's local stage experts are installed. Freeze it before capture.
         if context_mode.is_some() {
             engine.attach_context(context_extent, &loaded.manifest, args.attention_plan_rows.0)?;
+        } else {
+            cuteafd_bench::context::set_resolved("attention-plan-rows", "unused (heads)");
         }
         tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
@@ -739,7 +743,9 @@ pub(crate) fn with_engine<T>(
         let spark_world = (!peers.is_empty()).then(|| cuteafd_transport::expert::SparkWorld::canonical(peers.len())).transpose()?;
         // Decode graphs retain fixed reply pointers; prefill alone rotates N
         // FIFO return slots on its separate connection set.
-        if !skip {
+        let remote_experts = !skip && placement.layers.iter().any(|layer|
+            layer.experts == cuteafd_loader::placement::ExpertHome::Spark);
+        if remote_experts {
             transports.push(SparkLink::new(&loaded.library,
                 spark_world.context("Spark transport needs a declared world")?, &peers, engine.decode_rows as u32,
                 TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
@@ -750,23 +756,22 @@ pub(crate) fn with_engine<T>(
                 loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows as u32)?);
         }
         for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
-        // Every rank's persistent bootstrap runs before the warm-up wave does,
-        // so the workers' installed grouping is readable at any later point.
-        let warm_shape = |index| if index == 0 {
-            (engine.decode_rows, cuteafd_transport::ExpertV2SourceKind::Decode)
-        } else { (engine.prefill_rows, cuteafd_transport::ExpertV2SourceKind::Prefill) };
         for (index, transport) in transports.iter_mut().enumerate() {
-            let (rows, kind) = warm_shape(index);
-            transport.bootstrap(&engine.warm_request(rows, kind)?)?;
+            let rows = if index == 0 { engine.decode_rows } else { engine.prefill_rows };
+            transport.bootstrap(&engine.session_shape(rows)?)?;
         }
         crate::shared::memory_report::release_load_staging(&loaded.library)?;
         let started = Instant::now();
-        let identity = if skip { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
+        let identity = if !remote_experts { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
             &loaded.snapshot, loaded.catalog.routed_experts().geometry()?, spark_world.context("worker identity needs a declared world")?)?) };
         let mut installed = None;
         for (index, transport) in transports.iter_mut().enumerate() {
-            let (rows, kind) = warm_shape(index);
-            engine.warm_transport(transport, rows, kind)?;
+            let layer = placement.layers.iter().position(|home|
+                home.experts == cuteafd_loader::placement::ExpertHome::Spark).context("remote V4 layer")?;
+            let rows = if index == 0 { engine.decode_rows } else { engine.prefill_rows };
+            let kind = if index == 0 { cuteafd_transport::ExpertV2SourceKind::Decode }
+                else { cuteafd_transport::ExpertV2SourceKind::Prefill };
+            transport.warm_experts(&engine.session_shape(rows)?, layer, loaded.cfg.n_routed_experts, kind)?;
             let reports = transport.installed_grouping()?;
             for (rank, report) in reports.iter().enumerate() {
                 report.validate_for(identity.as_ref().context("Spark worker identity")?, rank,
@@ -776,7 +781,7 @@ pub(crate) fn with_engine<T>(
                 ensure!(previous == &reports, "Spark transports report different installed expert packages");
             } else { installed = Some(reports); }
         }
-        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
+        if remote_experts { tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm"); }
         engine.prepare_workspaces()?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;

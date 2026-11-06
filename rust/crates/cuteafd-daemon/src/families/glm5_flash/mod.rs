@@ -46,6 +46,7 @@ fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = usize::try_from(shape.waves)?;
     args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
     Ok(())
 }
 
@@ -60,6 +61,8 @@ use std::time::Instant;
 /// What every GLM 5.3 Flash command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    #[command(flatten)]
+    pub attention: crate::cli::AttentionArgs,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
@@ -523,6 +526,25 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn resolved_flash_capacity_and_native_flags_are_runtime_facts() {
+        let mut args = Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l"]).unwrap().engine;
+        crate::commands::bench::assert_resolved_family_seam("glm5_flash",
+            &["max-context", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device", "attention-plan-rows"], || {
+                crate::commands::bench::fixture_prefix().resolve_entries(16);
+                serve::resolve_serving_capacity(&mut args, 16);
+                native::normalize(&mut args);
+                native::publish_resolved(&args);
+                resolve_prefill(&mut args, true)?;
+                served_index_cache(args.index_cache, false,
+                    cuteafd_loader::placement::AttentionPlacement::Heads);
+                Ok(())
+            }).unwrap();
+        assert_eq!(args.slots, 16);
+        assert_eq!(served_index_cache(engine::IndexCache::Keys, true,
+            cuteafd_loader::placement::AttentionPlacement::Context), engine::IndexCache::Compact);
+    }
+
+    #[test]
     fn index_cache_defaults_to_keys_and_takes_compact() {
         let parse_cache = |extra: &[&str]| Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib",
             "/native"].into_iter().chain(extra.iter().copied())).map(|p| p.engine.index_cache);
@@ -737,7 +759,7 @@ mod draft_cli_tests {
                 offset += byte_length;
                 tensor
             }).collect();
-        let mut checkpoint = Checkpoint { snapshot: "fixture".into(), config, quantize_config: None,
+        let mut checkpoint = Checkpoint { view: None, snapshot: "fixture".into(), config, quantize_config: None,
             weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
         for ranks in [1, 2] {
             for fp8_head in [false, true] {
@@ -975,7 +997,7 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn expert_capacity_warms_every_route_and_charges_wider_intake() -> Result<()> {
+    fn expert_capacity_reserves_layer_free_sessions_and_charges_wider_intake() -> Result<()> {
         let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(8))?;
         cfg.dense = (0..8).map(|layer| layer < 3).collect();
         cfg.hidden = 64;
@@ -986,15 +1008,11 @@ mod draft_cli_tests {
             args.prefill_waves = 3;
             assert_eq!(args.expert_rows(), capacity);
             for bf16 in [false, true] {
-                let request = engine::spark_warmup_request(&cfg, args.expert_rows(), 6, bf16)?;
+                let shape = engine::spark_session_shape(&cfg, args.expert_rows(), bf16)?;
                 let stride = if bf16 { cfg.hidden * 2 } else { cfg.hidden + cfg.hidden / 32 };
-                assert_eq!((request.header.row_count as usize, request.rows.len()), (capacity, capacity));
-                assert_eq!(request.header.layer_id, 6);
-                assert_eq!(request.routes.len(), capacity * cfg.topk);
-                assert_eq!(request.hidden_payload.len(), capacity * stride);
-                for (row, routes) in request.routes.chunks_exact(cfg.topk).enumerate() {
-                    assert!(routes.iter().all(|route| route.row_index as usize == row));
-                }
+                assert_eq!(shape.row_count as usize, capacity);
+                assert_eq!(shape.route_count as usize, capacity * cfg.topk);
+                assert_eq!(shape.hidden_payload_bytes as usize, capacity * stride);
             }
             for ranks in [1u64, 4] {
                 use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
@@ -1643,6 +1661,8 @@ fn admitted_step_experts(cfg: &GlmNextConfig, placement: &cuteafd_loader::placem
 
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
+    pub view: cuteafd_loader::plan::checkpoint::CheckpointView,
+    pub expert_view: cuteafd_loader::plan::checkpoint::CheckpointView,
     pub checkpoint: Checkpoint,
     pub cfg: GlmNextConfig,
     pub library: std::sync::Arc<NativeLibrary>,
@@ -1658,21 +1678,21 @@ impl Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    let format = cuteafd_loader::plan::checkpoint::CheckpointFormat::detect(&args.snapshot)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    let format = cuteafd_loader::plan::checkpoint::CheckpointFormat::detect_view(&view)?;
     let native = format == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     let mut resolved = args.clone();
     if native {
         native::normalize(&mut resolved);
-        for (name, value) in native::resolved_settings(&resolved) {
-            cuteafd_bench::context::set_resolved(name, &value);
-        }
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
+    native::publish_resolved(&resolved);
     let args = &resolved;
     check_options(args)?;
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
-    let cfg = GlmNextConfig::read(&args.snapshot)?;
+    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
+    let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
     cuteafd_bench::context::set_family(cfg.family_id());
     native::validate_headers(format, || {
         header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
@@ -1701,9 +1721,13 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         && geometry.topk as usize == cfg.topk && geometry.intermediate as usize == cfg.moe_intermediate,
         "checkpoint experts do not match the GLM 5.3 Flash geometry");
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
+    let expert_view = match args.experts_snapshot.as_deref() {
+        Some(source) if source != args.snapshot => args.attention.select(source)?,
+        _ => view.clone(),
+    };
     let experts = if args.layers.unwrap_or(cfg.layers) > cfg.dense.iter().take_while(|&&d| d).count() {
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
-        let mut catalog = cuteafd_loader::read_expert_catalog(source)?;
+        let mut catalog = cuteafd_loader::read_expert_catalog_view(&expert_view)?;
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
         ensure!(catalog.fp8().is_some() || catalog.exl3().is_some()
             || catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8,
@@ -1715,7 +1739,21 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     // SAFETY: the library is the cuteafd native shim built for this engine.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
-    Ok(Opened { checkpoint, cfg, library, experts, native })
+    let mode = match view.mode() {
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa => "hqa",
+        cuteafd_loader::plan::checkpoint::AttentionMode::Compact => "compact",
+        cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact => "fp8-compact",
+    };
+    cuteafd_bench::context::set_resolved("attention-mode", mode);
+    cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
+    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact {
+        cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
+    } else { "none" };
+    cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
+    let active_bytes: u64 = checkpoint.tensors.iter().map(|tensor| tensor.meta.byte_length).sum();
+    tracing::info!(attention_mode = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+        active_dense_source_bytes = active_bytes, "selected immutable attention bundle");
+    Ok(Opened { view, expert_view, checkpoint, cfg, library, experts, native })
 }
 
 /// Heads on two GPUs needs token keys; context needs compact pools. Whole MLA
@@ -1723,11 +1761,14 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 pub(crate) fn served_index_cache(requested: engine::IndexCache, split: bool,
     attention: cuteafd_loader::placement::AttentionPlacement) -> engine::IndexCache {
     use cuteafd_loader::placement::AttentionPlacement;
-    match attention {
+    let cache = match attention {
         AttentionPlacement::Context => engine::IndexCache::Compact,
         AttentionPlacement::Heads if split => engine::IndexCache::Keys,
         _ => requested,
-    }
+    };
+    cuteafd_bench::context::set_resolved("index-cache", match cache {
+        engine::IndexCache::Keys => "keys", engine::IndexCache::Compact => "compact" });
+    cache
 }
 
 /// The MLA placement an engine serves (`glm5_flash::resolve_attention` over the requested mode and
@@ -1749,7 +1790,7 @@ impl Opened {
         attention: engine::GlmfAttention) -> Result<Option<cuteafd_loader::families::glm5_flash::core_admission::CoreCharges>> {
         use cuteafd_loader::families::glm5_flash::{core::CoreInventory, core_admission::CoreCharges, GlmNextAttention};
         if self.native { return Ok(None); }
-        let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
+        let headers = Checkpoint::coordinator_view(&self.view, false, false)?;
         let core = CoreInventory::from_checkpoint(&self.cfg, &headers)?;
         if core.projections.is_empty() { return Ok(None); }
         ensure!(args.kda_state == engine::KdaState::F32, "native K6 requires F32 KDA state programs");
@@ -1780,7 +1821,8 @@ impl Opened {
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet,
             Option<cuteafd_hostcache::config::Config>,
             Option<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad>,
-            Option<cuteafd_loader::push_load::PushHostEnvelope>)> {
+            Option<cuteafd_loader::push_load::PushHostEnvelope>,
+            Option<cuteafd_loader::shared::dense_read::MountLoad>)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
         use cuteafd_loader::serving_capacity::{glmf_core_step_scratch, glmf_table_pages,
@@ -1819,7 +1861,7 @@ impl Opened {
                 split, rank as u8, arch, Some(&program_set));
             code.pending(sample.context_bytes, arch.context_bytes)
         }).collect();
-        let headers = Checkpoint::coordinator(&args.snapshot, false, false)?;
+        let headers = Checkpoint::coordinator_view(&self.view, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
             fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
         let resident = if let Some(native) = native_admission { native.resident.clone() } else {
@@ -1957,6 +1999,8 @@ impl Opened {
                 .context("host embedding tensor missing")?.meta.byte_length
         } else { 0 };
         process.encoders = args.serving_encoder.iter().cloned().collect();
+        process.physical_sparks = process.encoders.iter().flat_map(|encoder| encoder.spark_ranks())
+            .max().map_or(0, |rank| rank + 1);
         process.media_cache_bytes = args.serving_media_bytes;
         process.serving(&inputs, host_config.as_ref().map_or(0, |c| c.bytes),
             host_config.as_ref().map_or(0, |c| c.chunk_bytes), host_embedding, 0)?;
@@ -1966,8 +2010,10 @@ impl Opened {
             self.experts.as_ref(),
             native_admission.map(|native| (&native.facts, &native.metadata)))?;
         process.draft_push = self.draft_push(args)?;
+        if native_admission.is_none() && process.push_host.is_none() {
+            process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);
+        }
         let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
-        admitted.validate_spark_topology(spark_ranks)?;
         tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
             "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
@@ -1990,7 +2036,7 @@ impl Opened {
             "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
         }), "GLM Flash startup plan");
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
-        Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host))
+        Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host, admitted.mount_load))
     }
 
     /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
@@ -2031,12 +2077,14 @@ impl Opened {
             resolved.kda_prefill_expanded = false;
         }
         probe("peer-enabled")?;
+        native::publish_resolved(&resolved);
+        cuteafd_bench::context::set_resolved("split-device", &resolved.split_device.map_or_else(|| "none".into(), |device| device.to_string()));
         let args = &resolved;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
         resolve_prefill(&mut context_args, args.layers.is_none_or(|n| n == self.cfg.layers))?;
-        context_args.max_context = crate::shared::context::checkpoint_context(
-            &args.snapshot, &args.manifest, "glm5_flash", args.max_context)?;
+        context_args.max_context = crate::shared::context::checkpoint_context_config(
+            &self.checkpoint.config, &args.manifest, "glm5_flash", args.max_context)?;
         let args = &context_args;
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let active_drafts = args.draft.as_deref().map(|path| -> Result<usize> {
@@ -2198,8 +2246,9 @@ impl Opened {
             cuteafd_loader::plan::families::glm::GLM5_FLASH.exlr8_execution()
                 .check(1 + usize::from(split_device.is_some()), false)?;
         }
-        let (placement, admitted_graphs, working, admitted_host, admitted_native_load, admitted_push_host) = self.admit(args, &programs, layers, index_cache, mark_slots,
+        let (placement, admitted_graphs, working, admitted_host, admitted_native_load, admitted_push_host, admitted_mount_load) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context, remote_draft, attention, native_admission.as_ref())?;
+        if let Some(receipt) = admitted_mount_load { loader.dense.admit_mount(receipt)?; }
         let media = prepare_media()?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
         if native_admission.is_some() {
@@ -2229,6 +2278,8 @@ impl Opened {
         probe("admission-programs")?;
         let mut selected_args = args.clone();
         selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;
+        cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
+        cuteafd_bench::context::set_resolved("prefill-waves", &selected_args.prefill_waves.to_string());
         let args = &selected_args;
 
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
@@ -2390,14 +2441,13 @@ impl Opened {
         };
         let mut native_push = None;
         let mut coordinator_push = None;
-        let admission = if args.peers.is_some() {
+        let admission = if !working.spark_layers.is_empty() && args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
                 else { cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
                     experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
                     intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? } };
-            let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
             let capacity = u32::try_from(args.expert_rows())?;
             let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
                 else { cuteafd_core::SparkIngress::Fp8K32 };
@@ -2408,7 +2458,8 @@ impl Opened {
             let model = cuteafd_transport::worker_selection::ModelAdmission::new(
                 vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress, partial_reply_bytes: None }],
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
-            let admission = crate::shared::placement::SparkAdmission::plan_manifest(source, geometry, self.experts.as_ref(),
+            let source_view = &self.expert_view;
+            let admission = crate::shared::placement::SparkAdmission::plan_view(&source_view, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model, args.exlr8_manifest.as_deref())?;
             let native_ranks = if native_admission.is_some() {
                 push_policy.plan(|| {
@@ -2440,8 +2491,8 @@ impl Opened {
             if native_admission.is_some() {
                 native_push = push_policy.plan(|| {
                     let planned = plan_native(0)?;
-                    let push = CoordinatorPush::prepare_alone_admitted(
-                        &args.snapshot, self.experts.as_ref(), gpus, native_push_experts()?,
+                    let push = CoordinatorPush::prepare_alone_view_admitted(
+                        &self.view, self.experts.as_ref(), gpus, native_push_experts()?,
                         admitted_push_host.clone().context("Flash push host receipt")?)?;
                     Ok((push, 0, planned))
                 })?;
@@ -2450,7 +2501,7 @@ impl Opened {
                 coordinator_push = push_policy.plan(|| {
                     let experts = expert_plan()?;
                     let planned = plan_dense(0)?;
-                    let push = CoordinatorPush::prepare_alone_admitted(&args.snapshot, self.experts.as_ref(), gpus, experts,
+                    let push = CoordinatorPush::prepare_alone_view_admitted(&self.view, self.experts.as_ref(), gpus, experts,
                         admitted_push_host.clone().context("Flash push host receipt")?)?;
                     Ok((push, 0, devices.clone(), planned))
                 })?;
@@ -2568,7 +2619,7 @@ impl Opened {
         let single = model.check_single_residency(args.kda_fp8, args.fp8_head)?;
         // Header-only resident inventory uses the actual loader flags, not launcher defaults.
         if native_admission.is_none() && args.kda_nvfp4_gate.is_none() {
-            let headers = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+            let headers = cuteafd_loader::plan::Checkpoint::coordinator_view(&self.view, false, false)?;
             let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
                 &headers, &self.cfg, layers, 1 + usize::from(peer_stream.is_some()),
                 cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
@@ -2707,6 +2758,7 @@ impl Opened {
             engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
             engine.bind_draft_core_head()?;
             engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
+            cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
             tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
                 "GLM Flash immutable attention reduction plan");
             if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {
@@ -2875,7 +2927,7 @@ impl Opened {
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
-        let remote = selected;
+        if selected.is_empty() { return Ok(None); }
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         // One link retains independent intake planes for every outstanding unit wave.
@@ -2884,23 +2936,11 @@ impl Opened {
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
             args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
         transport.enable_terminal_ownership(self.library.clone())?;
-        let warm_rows = args.expert_rows();
-        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
-        // Publish grouping before the draft planner prices the installed workers.
-        transport.bootstrap(&warm)?;
-        let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
-            .get("transport/rdma-rings").copied().unwrap_or(0);
-        let (started, before) = (Instant::now(), rings());
-        let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
-        let exchange = transport.exchange()?;
-        let payload_bytes = exchange.compact_payload(warm.header.row_count as usize);
-        let wave = exchange.send_request(warm, payload_bytes)?;
-        exchange.land_drained(wave, warm_stream.raw())
-            .with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
-        warm_stream.finish()?;
-        tracing::info!(waves = args.prefill_waves, ranks = peers.len(), rows = warm_rows,
-            ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
-            "Spark expert transport warm");
+        let shape = engine::spark_session_shape(&self.cfg, args.expert_rows(), self.checkpoint.spark_input_is_bf16())?;
+        transport.bootstrap(&shape)?;
+        let started = Instant::now();
+        transport.warm_experts(&shape, selected[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport) }))
     }
 }
@@ -3239,6 +3279,12 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
         std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        std::fs::write(dir.join("attention.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "mode": opened.view.mode(), "bundle_fingerprint": opened.view.fingerprint(),
+            "config": opened.view.config_name(), "index": opened.view.index_name(),
+            "fp8_recipe": (opened.view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact)
+                .then_some(cuteafd_loader::plan::checkpoint::view::FP8_RECIPE),
+        }))?)?;
     }
     if let (Some(logits), false) = (&logits, args.golden.join("logits.bin").exists()) {
         if args.nll {

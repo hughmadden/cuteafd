@@ -109,7 +109,7 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
     link.enable_terminal_ownership(library.clone())?;
     let result = (|| -> Result<()> {
         let mut id = 1;
-        link.bootstrap(&request(geometry, layers[0], 0, 0, MAX_ROWS, id)?)?;
+        link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&request(geometry, layers[0], 0, 0, MAX_ROWS, id)?)?)?;
         let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
         let mut checked = 0usize;
         for (seed, &layer) in layers.iter().enumerate() {

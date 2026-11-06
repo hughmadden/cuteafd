@@ -7,12 +7,14 @@ use cuteafd_loader::placement::{families::qwen4, GpuBudget, LayerMode, Onboard};
 
 impl Opened {
     pub(super) fn with_dual_engine<T>(&self, args: &EngineArgs, peer: i32, automatic_context: bool,
+        media: crate::shared::experts::rtx::dense::Records,
         body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>) -> Result<T> {
         ensure!(args.local_experts && args.peers.is_none() && !args.shared_only && args.expert_window.is_none(),
             "Qwen dual requires Spark-free resident local experts");
         ensure!(peer != args.device, "Qwen dual devices must differ");
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let mtp = args.mtp > 0 && layers == self.cfg.layers;
+        cuteafd_bench::context::set_resolved("mtp", &if mtp { args.mtp.min(engine::DECODE_ROWS - 1) } else { 0 }.to_string());
         let devices = [args.device, peer].map(|id| Device { library: &self.library, id });
         let _entry = devices[0].enter()?;
         for rank in 0..2 { devices[rank].run(|| self.library.cuda_enable_peer(devices[1-rank].id))?; }
@@ -72,8 +74,19 @@ impl Opened {
         let baselines = inventory.baselines(&[]);
         let enabled = engine::startup_graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
             std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
+        // Namespace identity alone selects push: both GPUs' dense records (and a
+        // coordinator tower's) form one standalone group, admitted from headers here.
+        use crate::shared::experts::rtx::push::{CoordinatorPush, PushPolicy};
+        let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
+        let dense_envelope = push_policy.plan(|| {
+            let owners = qwen4::dual_owners(layers);
+            let staging = admission::dual_dense_staging(&self.checkpoint, &self.cfg, &owners, mtp,
+                args.fp8_decode, args.mtp_fp8_head, &media, [args.device, peer])?;
+            admission::dual_push_envelope(staging)
+        }).context("Qwen dual coordinator push admission")?;
         let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, 0, false,
-            ple_info.map(|(row_bytes, _)| row_bytes), Vec::new())?;
+            ple_info.map(|(row_bytes, _)| row_bytes),
+            dense_envelope.iter().map(|envelope| ("qwen.host.push.dual", envelope.clone())).collect())?;
         let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs {
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), automatic_context: automatic_context,
             owner_manifests: manifests.each_ref().map(Some),
@@ -92,7 +105,7 @@ impl Opened {
         tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
             "Qwen dual admitted phase ledger");
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
+        cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
             "Qwen dual shared solver admission before allocation");
         let owners = placement.layers.iter().map(|layer| match layer.mode {
@@ -104,11 +117,42 @@ impl Opened {
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream: streams[0].raw,
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let ranks = [(devices[0], streams[0].raw), (devices[1], streams[1].raw)];
-        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || {
-                let _scope = cuteafd_ffi::memory_ledger::scope("weights");
-                loader.model_placed(&self.cfg, &owners, &ranks, mtp, args.mtp_fp8_head)
-            })?;
+        let (embedding, model) = match dense_envelope {
+            Some(envelope) => {
+                let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
+                let planning = weights::Qwen4Loader { dense: load.clone(), ..loader.clone() };
+                let model = {
+                    let _scope = cuteafd_ffi::memory_ledger::scope("weights");
+                    planning.model_placed(&self.cfg, &owners, &ranks, mtp, args.mtp_fp8_head)?
+                };
+                let mut records = load.sink.as_ref().context("push sink")?.take_all();
+                records.extend(media);
+                let (landed, operands, staged, steps, largest, finishes) = records.summary();
+                tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
+                    "Qwen dual coordinator dense records planned");
+                let planned = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records, &devices, 0);
+                let push = CoordinatorPush::prepare_alone_admitted(&args.snapshot, None, 2, None, envelope)
+                    .map_err(crate::shared::experts::rtx::push::PushStartupError::Planning)?;
+                let split = crate::shared::memory::load_timing::Split::start();
+                let (pushed, embedding) = push.receive_with(devices.to_vec(), None, 0, Some(planned), ||
+                    crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+                        args.token_io.embed_placement, || Ok(())));
+                let pushed = push_policy.committed(pushed).context("Qwen dual coordinator push delivery")?;
+                let (embedding, ()) = embedding?;
+                tracing::info!(pushed = pushed.is_some(), "Qwen dual coordinator dense operands landed");
+                split.log("qwen4 dual dense push");
+                (embedding, model)
+            }
+            None => {
+                anyhow::ensure!(media.operands.is_empty() && media.steps.is_empty(),
+                    "Qwen dual media records exist only under a push namespace");
+                crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+                    args.token_io.embed_placement, || {
+                        let _scope = cuteafd_ffi::memory_ledger::scope("weights");
+                        loader.model_placed(&self.cfg, &owners, &ranks, mtp, args.mtp_fp8_head)
+                    })?
+            }
+        };
         let (projections, head) = model.check_single_residency(args.fp8_decode, args.mtp_fp8_head)?;
         let expected = cuteafd_loader::families::qwen4::resident::resident_bytes(&self.cfg, layers, mtp,
             cuteafd_loader::families::qwen4::resident::Qwen4Representation {

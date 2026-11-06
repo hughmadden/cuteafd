@@ -3,6 +3,7 @@ use super::{normalization_lut, remote::{EncoderHandshake, EncoderServer}, Encode
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::vision::NativeVision;
 use cuteafd_loader::media::ProcessorConfig;
+use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
 use std::{path::{Path, PathBuf}, time::Duration};
 
 #[derive(Clone, Debug)]
@@ -36,7 +37,13 @@ pub(crate) fn architecture(library: &Path) -> Result<u32> {
 /// Returns a server only after the tower owner has reported ready. The caller
 /// subtracts this exact ledger before any expert weight/workspace admission.
 pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
-    let spec = TowerSpec::from_snapshot(snapshot, config.max_tokens)?;
+    let view = CheckpointView::select(snapshot, AttentionMode::Hqa)?;
+    start_view(config, &view, library, budget)
+}
+
+fn start_view(config: &EncoderWorkerConfig, view: &CheckpointView, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
+    let snapshot = view.snapshot();
+    let spec = TowerSpec::from_view(view, config.max_tokens)?;
     let sm = architecture(&library)?;
     let id = spec.encoder_id(&config.revision, sm);
     let ledger = NativeVision::required(&library, &spec.native)?;
@@ -59,9 +66,10 @@ pub struct AudioWorkerConfig {
 
 /// Admit both towers before either owner allocates; ports remain independent.
 pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&AudioWorkerConfig>,
-    snapshot: &Path, library: PathBuf, budget: u64) -> Result<(Option<EncoderServer>, Option<EncoderServer>, u64)> {
+    view: &CheckpointView, library: PathBuf, budget: u64) -> Result<(Option<EncoderServer>, Option<EncoderServer>, u64)> {
     if vision.is_none() && audio.is_none() { return Ok((None, None, 0)); }
-    let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
+    let snapshot = view.snapshot();
+    let config = view.config()?;
     if config["model_type"].as_str() == Some("deepseek_v41") {
         ensure!(audio.is_none(), "V4.1 audio encoder is unsupported");
         return match vision {
@@ -74,7 +82,7 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
         ensure!(vision.listen != audio.listen, "image/audio encoder listen addresses must differ");
     }
     let vision_bytes = vision.map(|config| -> Result<_> {
-        let spec = TowerSpec::from_snapshot(snapshot, config.max_tokens)?;
+        let spec = TowerSpec::from_view(view, config.max_tokens)?;
         Ok(NativeVision::required(&library, &spec.native)?.total_bytes())
     }).transpose()?.unwrap_or(0);
     let audio_bytes = audio.map(|_| -> Result<_> {
@@ -94,7 +102,7 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
     if let (Some(image_config), Some(audio_config)) = (vision, audio) {
         let sm = architecture(&library)?;
         ensure!(sm == 121, "Spark audio worker requires SM121, got SM{sm}");
-        let image_spec = TowerSpec::from_snapshot(snapshot, image_config.max_tokens)?;
+        let image_spec = TowerSpec::from_view(view, image_config.max_tokens)?;
         let processor = ProcessorConfig::from_snapshot(snapshot, image_spec.image_family())?;
         let image_handshake = image_handshake(&image_spec, &processor,
             image_spec.encoder_id(&image_config.revision, sm), image_config.plan_hash);
@@ -113,7 +121,7 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
             reserved_bytes = reserved, backend = %backend, "audio encoder ready");
         return Ok((Some(image), Some(audio), reserved));
     }
-    let image = vision.map(|config| start(config, snapshot, library.clone(), budget).map(|(server, _)| server)).transpose()?;
+    let image = vision.map(|config| start_view(config, view, library.clone(), budget).map(|(server, _)| server)).transpose()?;
     let audio = audio.map(|config| start_audio(config, snapshot, library.clone(), budget).map(|(server, _)| server)).transpose()?;
     Ok((image, audio, reserved))
 }
@@ -127,7 +135,7 @@ pub(crate) fn check_cuda_room(library: &Path, device: i32, required: u64) -> Res
 }
 
 /// Cancellation may follow a failed receiver drain; media owns its allocations independently.
-pub(super) fn drain_external_weights(library: &Path, device: i32) -> Result<()> {
+pub(crate) fn drain_external_weights(library: &Path, device: i32) -> Result<()> {
     // SAFETY: the same architecture-matching library already owns these media arenas.
     let native = unsafe { cuteafd_ffi::NativeLibrary::load(library) }?;
     native.cuda_set_device(device)?;

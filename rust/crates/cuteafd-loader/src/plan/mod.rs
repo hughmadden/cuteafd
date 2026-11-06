@@ -61,7 +61,7 @@ pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, Plan
     resolve_audio_config(mode, snapshot, &config)
 }
 
-pub(crate) fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value)
+pub fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value)
     -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
     let kind = crate::media::AudioTowerKind::from_config(config)
@@ -659,8 +659,12 @@ struct ComponentCensus {
 
 impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
+        Self::open_view(&checkpoint::CheckpointView::select(snapshot, checkpoint::AttentionMode::Hqa)?)
+    }
+
+    pub fn open_view(view: &checkpoint::CheckpointView) -> anyhow::Result<Self> {
         let start = Instant::now();
-        let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
+        let (checkpoint, validation) = Checkpoint::open_view_with_header_validation(view)?;
         Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(), manifests: ManifestCache::default(),
             open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
             native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
@@ -692,7 +696,10 @@ impl PlanInput {
             if let Some(validation) = &self.header_validation {
                 crate::families::deepseek_v41::v41_catalog::expert_catalog_from_checkpoint(&self.checkpoint, validation)
             } else {
-                crate::read_expert_catalog(&self.checkpoint.snapshot)
+                match &self.checkpoint.view {
+                    Some(view) => crate::read_expert_catalog_view(view),
+                    None => crate::read_expert_catalog(&self.checkpoint.snapshot),
+                }
             }
         }) {
             Ok(catalog) => Ok(catalog),
@@ -1438,6 +1445,11 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             (_, None) => {} // the routed-expert component already reports its missing kernel
             (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
                 report.spark_rank_share = share(ranks).unwrap_or(0.0);
+                // Joint admission, not the available host count, chooses expert ownership.
+                if model.admits_expert_packages() && options.layout.is_some() {
+                    report.experts = Some(contract.clone());
+                    return;
+                }
                 if let Some(worlds) = experts::frozen_refusal(&contract.package, ranks) {
                     // Frozen formats admit only the worlds they shipped on, for every family.
                     report.placement_supported = false;

@@ -15,7 +15,10 @@
 //! (SGLang's DFlash path for MiMo). Drafts only steer speculation; verify
 //! steps keep output identical to plain greedy decoding.
 use crate::shared::fp8_linear;
-use crate::shared::speculation::weights::{Load, Weight as DraftWeight};
+use crate::shared::speculation::weights::{Load, ShardAxis, Weight as DraftWeight};
+use crate::shared::memory::device::{Device, DeviceOwner};
+use crate::shared::peer_split::{PeerExchange, DIRECT};
+use std::rc::Rc;
 use crate::shared::experts::rtx::dense::{DenseLoad, Operand, Rect};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
@@ -80,19 +83,23 @@ struct Workspace<'a> {
     v: Dev<'a>,
     attn: Dev<'a>,
     delta: Dev<'a>,
+    reduced: Option<Dev<'a>>,
     gate_up: Dev<'a>,
     act: Dev<'a>,
-    logits: Dev<'a>,
-    unary: Dev<'a>,
-    candidates: Dev<'a>,
-    /// Pinned landing of `unary` then `candidates`: both download behind the
-    /// round's one host wait.
-    landing: crate::shared::memory::HostAllocation<'a>,
+    output: Option<DraftOutput<'a>>,
     positions: Dev<'a>,
     tables: Dev<'a>,
     /// Token ids of the block rows (anchors; the mask rows' sentinel).
     ids: Dev<'a>,
     attention_workspace: Dev<'a>,
+}
+
+/// Only the rank borrowing the target head allocates sampling/output storage.
+struct DraftOutput<'a> {
+    logits: Dev<'a>,
+    unary: Dev<'a>,
+    candidates: Dev<'a>,
+    landing: crate::shared::memory::HostAllocation<'a>,
     topk_workspace: Dev<'a>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
@@ -162,6 +169,10 @@ pub(crate) struct MimoDrafter<'a> {
 
     confidence_directory: std::path::PathBuf,
     confidence_scales: fp8_linear::Fp8Scales,
+    rank: usize,
+    ranks: usize,
+    peer: Option<DeviceOwner<'a, Box<MimoDrafter<'a>>>>,
+    exchange: Option<Rc<PeerExchange<'a>>>,
 }
 
 /// The block rows' mask id: past every table, so the gather takes the mask row.
@@ -527,9 +538,29 @@ impl<'a> MimoDrafter<'a> {
     /// to `max_sequences` sequences. The trained mask keeps its host fallback row.
     pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, representation: MimoDraftRepresentation,
-        scales: fp8_linear::Fp8Scales, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
+        scales: fp8_linear::Fp8Scales, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        exchange: Option<Rc<PeerExchange<'a>>>) -> Result<Self> {
+        let ranks = if exchange.is_some() { 2 } else { 1 };
+        let mut lead = Self::load_rank(library, programs, dir, Some(file), stream, slots, max_sequences,
+            representation, scales, kv_cache, 0, ranks)?;
+        if let Some(exchange) = exchange {
+            let device = Device { library, id: exchange.device(1) };
+            let peer = device.own(|| Self::load_rank(library, programs, dir, None, exchange.stream(1),
+                slots, max_sequences, representation, scales, kv_cache, 1, ranks).map(Box::new))?;
+            lead.peer = Some(peer);
+            lead.exchange = Some(exchange);
+        }
+        Ok(lead)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_rank(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        dir: &Path, file: Option<Vec<u8>>, stream: *mut c_void, slots: usize, max_sequences: usize,
+        representation: MimoDraftRepresentation, scales: fp8_linear::Fp8Scales,
+        kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, rank: usize, ranks: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
-        let cfg = DflashConfig::read(dir)?;
+        let source_cfg = DflashConfig::read(dir)?;
+        let cfg = source_cfg.for_tp(ranks)?;
         let h = cfg.hidden;
         let shapes = [(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * cfg.kv_heads * cfg.head_dim),
             (cfg.heads * cfg.head_dim, h), (h, 2 * cfg.intermediate), (cfg.intermediate, h)];
@@ -545,35 +576,42 @@ impl<'a> MimoDrafter<'a> {
         let runtime_layout = cfg.runtime_layout(representation, capacity)?;
         let weight_layout = runtime_layout.weights;
         let (mask_row, mask_source) = mask_source(dir, cfg.hidden)?;
-        let checkpoint = Load::with_prefetched_file(library, &dir.join(WEIGHTS), file)?;
-        checkpoint.validate(tensor_shapes(&cfg))?;
+        let checkpoint = match file {
+            Some(file) => Load::with_prefetched_file(library, &dir.join(WEIGHTS), file)?,
+            None => Load::open_file(library, &dir.join(WEIGHTS))?,
+        };
+        checkpoint.validate(tensor_shapes(&source_cfg))?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
-        let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
+        let (h, kv) = (cfg.hidden, cfg.kv_width());
         let fp8_workspace = if representation == MimoDraftRepresentation::Fp8Only {
             draft_fp8_scratch(library, &runtime_layout)?
         } else { None };
         let tensor = |name: &str, shape: &[usize]| checkpoint.tensor(name, shape);
         let matrix = |parts: &[(&str, usize)], cols: usize| checkpoint.matrix(parts, cols,
             representation == MimoDraftRepresentation::Fp8Only, scales, stream);
+        let sharded = |parts: &[(&str, usize)], cols: usize, axis| checkpoint.matrix_shard(parts, cols,
+            axis, rank, ranks, representation == MimoDraftRepresentation::Fp8Only, scales, stream);
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
             let a = format!("{p}.self_attn");
             Ok(DraftLayer {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                qkv: matrix(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
-                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?,
+                qkv: sharded(&[(&format!("{a}.q_proj.weight"), source_cfg.heads * cfg.head_dim),
+                    (&format!("{a}.k_proj.weight"), source_cfg.kv_width()),
+                    (&format!("{a}.v_proj.weight"), source_cfg.kv_width())], h, ShardAxis::Rows)?,
                 q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                 k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                sinks: if cfg.sinks { Some(tensor(&format!("{a}.attention_sink_bias"), &[cfg.heads])?) } else { None },
-                o: matrix(&[(&format!("{a}.o_proj.weight"), h)], cfg.heads * cfg.head_dim)?,
-                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
-                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], inter)?,
+                sinks: if cfg.sinks { Some(checkpoint.tensor_shard(&format!("{a}.attention_sink_bias"),
+                    &[source_cfg.heads], ShardAxis::Columns, rank, ranks)?) } else { None },
+                o: sharded(&[(&format!("{a}.o_proj.weight"), h)], source_cfg.heads * cfg.head_dim, ShardAxis::Columns)?,
+                gate_up: sharded(&[(&format!("{p}.mlp.gate_proj.weight"), source_cfg.intermediate),
+                    (&format!("{p}.mlp.up_proj.weight"), source_cfg.intermediate)], h, ShardAxis::Rows)?,
+                down: sharded(&[(&format!("{p}.mlp.down_proj.weight"), h)], source_cfg.intermediate, ShardAxis::Columns)?,
                 k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
                 v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
             })
@@ -613,6 +651,7 @@ impl<'a> MimoDrafter<'a> {
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mimo-dflash")?,
             cfg,
+            rank, ranks, peer: None, exchange: None,
         })
     }
 
@@ -676,13 +715,33 @@ impl<'a> MimoDrafter<'a> {
         unsafe { Ok(self.projections.launch(x, at(bf16, first * k * 2), out, rows, k, n, self.stream)?) }
     }
 
-    pub fn context_rings(&self) -> Vec<CuteafdDeviceBuffer> {
-        self.layers.iter().flat_map(|layer| [layer.k_ring.buffer, layer.v_ring.buffer]).collect()
+    pub fn context_rings(&self) -> Vec<(usize, CuteafdDeviceBuffer)> {
+        let mut rings: Vec<_> = self.layers.iter().flat_map(|layer|
+            [(self.rank, layer.k_ring.buffer), (self.rank, layer.v_ring.buffer)]).collect();
+        if let Some(peer) = &self.peer { rings.extend(peer.context_rings()); }
+        rings
     }
 
     /// Writes the context K/V of committed tapped rows.
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
-        self.update_from(&self.taps, rows)
+        if rows.is_empty() { return Ok(()); }
+        if let (Some(peer), Some(exchange)) = (&self.peer, &self.exchange) {
+            // The completion acknowledgement protects peer taps from the next
+            // target commit; both updates use each rank's local KV projections.
+            let first = rows.iter().map(|row| row.tap_row).min().context("draft tap span")?;
+            let last = rows.iter().map(|row| row.tap_row).max().context("draft tap span")?;
+            ensure!(last < TAP_ROWS, "draft tap span exceeds its admitted rows");
+            let row_bytes = self.cfg.taps.len() * self.cfg.hidden * 2;
+            exchange.push_to(0, DIRECT, at(&self.taps, first * row_bytes),
+                at(&peer.taps, first * row_bytes), (last - first + 1) * row_bytes)?;
+            exchange.wait(1, DIRECT)?;
+            peer.device.run(|| peer.update_from(&peer.taps, rows))?;
+            exchange.signal(1, DIRECT)?;
+            self.update_from(&self.taps, rows)?;
+            exchange.wait(0, DIRECT)
+        } else {
+            self.update_from(&self.taps, rows)
+        }
     }
 
 
@@ -738,7 +797,6 @@ impl<'a> MimoDrafter<'a> {
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();
         let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
-        let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
         Ok(Workspace {
             sequences,
             h: alloc(rows * c.hidden * 2)?,
@@ -749,22 +807,28 @@ impl<'a> MimoDrafter<'a> {
             v: alloc(rows * c.kv_width() * 2)?,
             attn: alloc(rows * c.heads * c.head_dim * 2)?,
             delta: alloc(rows * c.hidden * 2)?,
+            reduced: (self.ranks == 2).then(|| alloc(rows * c.hidden * 2)).transpose()?,
             gate_up: alloc(rows * 2 * c.intermediate * 2)?,
             act: alloc(rows * c.intermediate * 2)?,
-            logits: alloc(rows * c.vocab * 4)?,
-            unary: alloc(drafted * 16 * 4)?,
-            candidates: alloc(drafted * 16 * 4)?,
-            landing: crate::shared::memory::HostAllocation::new(self.library, 2 * drafted * 16 * 4)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             ids: alloc(rows * 4)?,
             attention_workspace: alloc(self.library.mimo_dflash_attention_workspace(sequences, c.heads, c.kv_heads,
                 c.block, RING + c.block)?)?,
-            topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
-            // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                rows as u32, c.vocab as u32)? },
-            _head_workspace: head_workspace,
+            output: (self.rank == 0).then(|| -> Result<_> {
+                let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
+                Ok(DraftOutput {
+                    logits: alloc(rows * c.vocab * 4)?,
+                    unary: alloc(drafted * 16 * 4)?,
+                    candidates: alloc(drafted * 16 * 4)?,
+                    landing: crate::shared::memory::HostAllocation::new(self.library, 2 * drafted * 16 * 4)?,
+                    topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
+                    // SAFETY: the workspace outlives this head's plan and uses the lead device.
+                    head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
+                        rows as u32, c.vocab as u32)? },
+                    _head_workspace: head_workspace,
+                })
+            }).transpose()?,
         })
     }
 
@@ -842,64 +906,77 @@ impl<'a> MimoDrafter<'a> {
         }
         self.put(&w.positions, bytes_of(&positions))?;
         self.put(&w.tables, bytes_of(&tables))?;
-        let (s, l, eps, inter) = (self.stream, self.library, c.eps, c.intermediate);
-        let attention_width = c.heads * c.head_dim;
+        let (s, l) = (self.stream, self.library);
         let forward_span = self.timing.begin("forward", None, rows, s)?;
-        // SAFETY: every workspace buffer holds `rows` rows of its width and the
-        // weights their checkpoint shapes; the stream orders the chain.
-        unsafe {
-            l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
-            for (index, layer) in self.layers.iter().enumerate() {
+        if let (Some(peer), Some(exchange)) = (&self.peer, &self.exchange) {
+            let mut peer_slot = peer.workspace.borrow_mut();
+            if peer_slot.as_ref().is_none_or(|w| w.sequences < s_count) {
+                *peer_slot = None;
+                *peer_slot = Some(peer.device.run(|| peer.workspace(peer.max_sequences))?);
+            }
+            let pw = peer_slot.as_ref().context("peer draft workspace")?;
+            peer.device.run(|| {
+                peer.put(&pw.positions, bytes_of(&positions))?;
+                peer.put(&pw.tables, bytes_of(&tables))
+            })?;
+            exchange.push_to(0, DIRECT, w.h.buffer.ptr, pw.h.buffer.ptr, rows * h * 2)?;
+            exchange.wait(1, DIRECT)?;
+            self.begin_forward(w, rows)?;
+            peer.device.run(|| peer.begin_forward(pw, rows))?;
+            for index in 0..self.layers.len() {
+                self.attention_partial(w, index, s_count, max_keys)?;
+                peer.device.run(|| peer.attention_partial(pw, index, s_count, max_keys))?;
+                Self::reduce(exchange, [w, pw], rows * h)?;
+                self.ffn_partial(w, index, rows)?;
+                peer.device.run(|| peer.ffn_partial(pw, index, rows))?;
+                Self::reduce(exchange, [w, pw], rows * h)?;
+                self.finish_layer(w, index, rows)?;
+                peer.device.run(|| peer.finish_layer(pw, index, rows))?;
+            }
+            // Fence peer residual/norm readers before a subsequent target or
+            // context-update operation reuses any of the shared exchange slots.
+            exchange.signal(1, DIRECT)?;
+            exchange.wait(0, DIRECT)?;
+        } else {
+            self.begin_forward(w, rows)?;
+            for index in 0..self.layers.len() {
                 let layer_span = self.timing.begin("layer", Some(index), rows, s)?;
-                self.linear(w.n.buffer.ptr, &layer.qkv, 0, w.qkv.buffer.ptr, rows, h,
-                    c.qkv_width())?;
-                l.mimo_dflash_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
-                    w.positions.buffer.ptr, std::ptr::null(), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
-                    c.heads, c.kv_heads, c.rope_dim, c.theta, eps, c.v_scale, false, s)?;
-                l.mimo_dflash_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
-                    layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4),
-                    at(&w.tables, 2 * s_count * 4), layer.sinks.as_ref().map_or(std::ptr::null(), |t| t.buffer.ptr),
-                    w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    max_keys, c.window, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
-                self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
-                    attention_width, h)?;
-                l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr, w.n.buffer.ptr,
-                    rows, h, eps, s)?;
-                self.linear(w.n.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr,
-                    rows, h, 2 * inter)?;
-                l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
-                self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows,
-                    inter, h)?;
-                let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
-                l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, next, w.n.buffer.ptr, rows, h, eps, s)?;
+                self.attention_partial(w, index, s_count, max_keys)?;
+                self.ffn_partial(w, index, rows)?;
+                self.finish_layer(w, index, rows)?;
                 self.timing.end(layer_span, s)?;
             }
-            self.timing.end(forward_span, s)?;
+        }
+        self.timing.end(forward_span, s)?;
+        let output = w.output.as_ref().context("only the lead drafter can sample")?;
+        // SAFETY: only rank0 owns the borrowed target head, and its full hidden
+        // rows are reduced/normalized before the stream reaches this launch.
+        unsafe {
             let head_span = self.timing.begin("head_topk", None, rows, s)?;
-            head(&w.head, w.n.buffer, w.logits.buffer, rows)?;
-            l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
-                w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
+            head(&output.head, w.n.buffer, output.logits.buffer, rows)?;
+            l.glm_dflash_topk(output.logits.buffer.ptr, output.unary.buffer.ptr, output.candidates.buffer.ptr,
+                output.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             self.timing.end(head_span, s)?;
         }
         let drafted = s_count * c.drafts();
         let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
             // SAFETY: both halves stay inside the 2 x drafted x 64-byte landing.
-            ptr: unsafe { w.landing.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes: drafted * 64, ..w.landing.buffer };
+            ptr: unsafe { output.landing.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes: drafted * 64, ..output.landing.buffer };
         // The round's results download on its stream, then one host wait
         // covers the round and both copies (no second, synchronous drain).
         // SAFETY: the device buffers hold `drafted` 64-byte rows; the landing
         // is pinned, owned by the workspace, and read only after the wait.
         unsafe {
-            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: drafted * 64, ..w.unary.buffer },
+            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: drafted * 64, ..output.unary.buffer },
                 drafted * 64, s)?;
             l.copy_d2h_host_buffer_async(landing(drafted * 64),
-                CuteafdDeviceBuffer { bytes: drafted * 64, ..w.candidates.buffer }, drafted * 64, s)?;
+                CuteafdDeviceBuffer { bytes: drafted * 64, ..output.candidates.buffer }, drafted * 64, s)?;
             self.round.borrow_mut().wait(s)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let confidence_span = self.timing.host_span();
-        let (unary, candidates) = w.landing.bytes()[..2 * drafted * 64].split_at(drafted * 64);
+        let (unary, candidates) = output.landing.bytes()[..2 * drafted * 64].split_at(drafted * 64);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..s_count).map(|i| {
             let rows = (0..c.drafts()).map(|j| i * c.drafts() + j);
@@ -913,6 +990,80 @@ impl<'a> MimoDrafter<'a> {
         }).collect();
         self.timing.publish_host("download_confidence", rows, confidence_span)?;
         Ok(drafts)
+    }
+
+    fn begin_forward(&self, w: &Workspace<'_>, rows: usize) -> Result<()> {
+        // SAFETY: local full-hidden activations and replicated norm are live on this stream.
+        unsafe { self.library.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr,
+            w.n.buffer.ptr, rows, self.cfg.hidden, self.cfg.eps, self.stream) }
+    }
+
+    fn attention_partial(&self, w: &Workspace<'_>, index: usize, sequences: usize, max_keys: usize) -> Result<()> {
+        let (c, l, s) = (&self.cfg, self.library, self.stream);
+        let rows = sequences * c.block;
+        let layer = &self.layers[index];
+        // SAFETY: rank-local Q/K/V, rings and O columns use this rank's geometry;
+        // all producers and consumers are ordered on its target stream.
+        unsafe {
+            self.linear(w.n.buffer.ptr, &layer.qkv, 0, w.qkv.buffer.ptr, rows, c.hidden, c.qkv_width())?;
+            l.mimo_dflash_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
+                w.positions.buffer.ptr, std::ptr::null(), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr,
+                rows, c.heads, c.kv_heads, c.rope_dim, c.theta, c.eps, c.v_scale, false, s)?;
+            l.mimo_dflash_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
+                layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, sequences * 4),
+                at(&w.tables, 2 * sequences * 4), layer.sinks.as_ref().map_or(std::ptr::null(), |v| v.buffer.ptr),
+                w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, sequences, c.block, c.heads, c.kv_heads,
+                RING, max_keys, c.window, 1.0 / (c.head_dim as f32).sqrt(),
+                self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+            self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows, c.heads * c.head_dim, c.hidden)
+        }
+    }
+
+    fn delta<'w>(&self, w: &'w Workspace<'_>) -> *mut c_void {
+        w.reduced.as_ref().map_or(w.delta.buffer.ptr, |r| r.buffer.ptr)
+    }
+
+    fn ffn_partial(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
+        let (c, l, s) = (&self.cfg, self.library, self.stream);
+        let layer = &self.layers[index];
+        // SAFETY: reduced full-hidden delta precedes this replicated residual;
+        // the local gate/up rows and down columns form one disjoint FFN partial.
+        unsafe {
+            l.mimo_dflash_add_norm(w.h.buffer.ptr, self.delta(w), layer.post_norm.buffer.ptr, w.n.buffer.ptr,
+                rows, c.hidden, c.eps, s)?;
+            self.linear(w.n.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr, rows, c.hidden, 2 * c.intermediate)?;
+            l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, c.intermediate, s)?;
+            self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows, c.intermediate, c.hidden)
+        }
+    }
+
+    fn finish_layer(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
+        let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
+        // SAFETY: full-hidden reduced FFN delta and replicated residual/norm have matching extents.
+        unsafe { self.library.mimo_dflash_add_norm(w.h.buffer.ptr, self.delta(w), next,
+            w.n.buffer.ptr, rows, self.cfg.hidden, self.cfg.eps, self.stream) }
+    }
+
+    fn reduce(exchange: &PeerExchange<'_>, work: [&Workspace<'_>; 2], elements: usize) -> Result<()> {
+        // Draft blocks can exceed the target's 64-row decode slot. Reuse the
+        // existing bounded slot in windows, acknowledging both readers each time.
+        let window = exchange.slot_bytes() / 2;
+        ensure!(window > 0, "empty TP2 draft exchange window");
+        for first in (0..elements).step_by(window) {
+            let count = window.min(elements - first);
+            for (rank, w) in work.iter().enumerate() {
+                exchange.push(rank, 0, at(&w.delta, first * 2), count * 2)?;
+            }
+            for (rank, w) in work.iter().enumerate() {
+                exchange.wait(rank, 0)?;
+                exchange.add(rank, at(&w.delta, first * 2), exchange.recv(rank, 0)?,
+                    at(w.reduced.as_ref().context("TP2 draft reduction was not admitted")?, first * 2), count)?;
+            }
+            // Publication alone does not authorize receive-slot reuse.
+            for rank in 0..2 { exchange.signal(rank, DIRECT)?; }
+            for rank in 0..2 { exchange.wait(rank, DIRECT)?; }
+        }
+        Ok(())
     }
 
     /// The last draft step's final-norm rows [sequences * block, hidden] BF16.
