@@ -1527,9 +1527,10 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
     names = {name for name, _, _ in jobs}
     assert {'exl3/exl3-glm-k45', 'exl3/exl3-glmf-k34', 'exl3/exl3-kimik3-k23',
             'exl3/exl3-step5-k46', 'exl3/exl3-muse-k45', 'exl3/exl3-ml4-k45',
-            'exl3/exl3-qwen4-k45', 'fp8/fp8-step5-bf16-weights', 'fp8/fp8-step5',
-            'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
+            'exl3/exl3-qwen4-k45', 'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
     assert not any('nvfp4' in name for name in names)
+    # Step-5 FP8 is retired for v5 (TJ 2026-10-31), so its packages are not exported.
+    assert not any(name.startswith('fp8/fp8-step5') for name in names)
     args = jobs[0][2]
     geometry = set(args[args.index('--geometry') + 1].split(','))
     assert {'flash', 'pro', 'glm', 'glmf', 'muse', 'ml4', 'qwen35', 'qwen38',

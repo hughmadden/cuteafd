@@ -449,6 +449,7 @@ impl Recipe for Step5Recipe<'_> {
             return Err(Refusal::InvalidFact("Step-5 invalid contract extent".into()));
         }
         let mut contract = Contract {
+            floor_fallback: None,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: None,
             resident_weight_limit: request.resident_weight_limit,
