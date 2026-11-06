@@ -52,6 +52,12 @@ impl Activation {
 
 #[derive(Debug, Clone)]
 pub enum Variable {
+    /// A small family-declared list of correlated attention assignments.
+    /// Avoid independent binary decisions for contiguous boundaries.
+    AttentionProfiles {
+        layers: Vec<usize>,
+        values: Vec<Vec<LayerMode>>,
+    },
     Attention {
         layer: usize,
         values: Vec<LayerMode>,
@@ -82,6 +88,7 @@ pub enum Variable {
 impl Variable {
     pub(super) fn len(&self) -> usize {
         match self {
+            Self::AttentionProfiles { values, .. } => values.len(),
             Self::Attention { values, .. } => values.len(),
             Self::Prefill(values) => values.len(),
             Self::Lanes(values) => values.len(),
@@ -273,6 +280,9 @@ pub struct Contract {
     pub maximum_pages: u64,
     pub gpus: usize,
     pub variables: Vec<Variable>,
+    /// Permit this option only when the alternatives cannot meet the pool floor.
+    /// This preference precedes pool maximization within the same search.
+    pub floor_fallback: Option<Choice>,
     pub requires: Vec<Requires>,
     pub components: Vec<Component>,
 }
@@ -325,6 +335,7 @@ impl Contract {
             maximum_pages,
             gpus,
             variables: vec![],
+            floor_fallback: None,
             requires: vec![],
             components,
         }
@@ -426,6 +437,11 @@ impl Contract {
         let mut encoder = None;
         for (variable, &option) in self.variables.iter().zip(selected) {
             match variable {
+                Variable::AttentionProfiles { layers, values } => {
+                    for (&layer, &mode) in layers.iter().zip(&values[option]) {
+                        attention.insert(layer, mode);
+                    }
+                }
                 Variable::Attention { layer, values } => {
                     attention.insert(*layer, values[option]);
                 }
@@ -557,6 +573,17 @@ impl Contract {
                 return Err(Refusal::Unsupported);
             }
             match variable {
+                Variable::AttentionProfiles { layers, values } => {
+                    if layers.is_empty() || layers.iter().any(|&layer| !attention.insert(layer))
+                        || values.iter().enumerate().any(|(index, modes)| {
+                            modes.len() != layers.len() || values[..index].contains(modes)
+                                || modes.iter().any(|mode| matches!(mode,
+                                    LayerMode::Whole { gpu, .. } if usize::from(*gpu) >= self.gpus))
+                        })
+                    {
+                        return Err(Refusal::InvalidFact("invalid attention profile domain".into()));
+                    }
+                }
                 Variable::Attention { layer, values } => {
                     if !attention.insert(*layer)
                         || values.iter().any(|v| {

@@ -779,6 +779,7 @@ impl Recipe for MuseRecipe<'_> {
             return Err(invalid("layer mode outside the Muse executor"));
         }
         let mut contract = Contract {
+            floor_fallback: None,
             resident_weight_limit: request.resident_weight_limit,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: Some(SparkReplyFormats {

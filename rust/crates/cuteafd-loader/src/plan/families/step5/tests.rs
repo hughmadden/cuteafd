@@ -144,7 +144,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let arch = ArchContext::coordinator(capacity, None);
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
-        let inputs = RuntimeInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+        let inputs = RuntimeInputs { host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             kv_format,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
@@ -154,7 +154,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
-            peer_diagnostics: false, startup: vec![], onboard: None,
+            peer_diagnostics: false, onboard: None,
         };
         for depth in [0, 1, 3].into_iter().filter(|&depth| depth != 3
             || kv_format == crate::families::qwen4::Qwen4KvCache::Bf16) {
@@ -164,6 +164,12 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             assert_eq!(admitted.marks, 2);
             assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
             assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
+            let planes = native::mtp_metadata_planes(inputs.unit_rows())?;
+            let uploads = admitted.solved.facts.allocations.iter()
+                .filter(|owner| owner.id == "step5.host.mtp.uploads")
+                .map(|owner| owner.bytes).sum::<u64>();
+            let per_stage = planes[..4].iter().sum::<usize>() + planes[2] + 8;
+            assert_eq!(uploads, (depth * (per_stage + 8)) as u64);
             let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
             for rank in 0..2 {
                 let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
@@ -191,6 +197,10 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 }), ..Default::default()
             })?;
             assert!(planned.wip_launchable(), "depth {depth}: {:?}", planned.hints);
+            let host = planned.host_ledger.as_ref().expect("admitted Step-5 host owners");
+            assert_eq!(host.deferred_bytes, 64 * Config::parse(&cp)?.vocab as u64 * 4);
+            assert_eq!(host.items.iter().filter(|item| item.group == "Step-5 MTP host uploads")
+                .map(|item| item.bytes).sum::<u64>(), uploads);
             let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
             assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
             for rank in 0..2 {
@@ -1447,6 +1457,8 @@ fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<(
     use crate::formats::dense_trellis::TrellisSide;
     let fixture = exl3_snapshot();
     let cp = Checkpoint::open(fixture.path())?;
+    let contract = coordinator::CoordinatorContract::from_checkpoint(&cp)?;
+    assert_eq!(contract.retained_sync_h2d_bytes()?, 128896 * 4096 * 6 / 8);
     let whole = coordinator::RankWeightLayout::from_checkpoint(&cp, 0, 1)?;
     // 92 target layers x 7 + lm_head; no BF16 operand duplicates a native one.
     assert_eq!(whole.core.len(), 645);

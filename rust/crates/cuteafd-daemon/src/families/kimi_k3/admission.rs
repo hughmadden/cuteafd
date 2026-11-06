@@ -746,15 +746,16 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         fixed, owners: Vec::new(),
     };
     let modes = recipe.resolved_attention();
-    let graph_set = graph_reserve.then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
+    let prepared_graph_set = (graph_reserve && (RANKS != 2 || placement_mode != AttentionPlacement::Layers)).then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
         graph_slots, graph_verify, RANKS,
         |rank, layer| !matches!(modes[layer], LayerMode::Whole { gpu, .. } if usize::from(gpu) != rank),
         |layer| modes[layer] == LayerMode::ContextSplit,
         context.as_ref().map(|layout| layout.decode()))).transpose()?;
     recipe.fixed.retain(|owner| owner.group != super::graphs::RESERVE);
-    if let Some(graphs) = &graph_set {
+    if let Some(graphs) = &prepared_graph_set {
         recipe.fixed.extend((0..RANKS).map(|rank| FixedOwner::ready(&super::graphs::demand(&graphs.inventory, rank))));
     }
+    if graph_reserve { recipe.balance_graphs(cfg, graph_slots, graph_verify)?; }
     for demand in &request.startup {
         if draft.as_ref().is_some_and(|layout| layout.demands((RANKS - 1) as u8).is_ok_and(|(_, peak)| peak.group == demand.group)) { continue; }
         let mut owner = FixedOwner::ready(demand);
@@ -805,6 +806,12 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let mark_selection = MarkSelection { legacy_slots: legacy_marks as u64, slots: legacy_marks as u64, reduction_reason: None };
     let pool_tokens = usize::try_from(placement.pool_tokens)?;
     let draft = draft.map(|layout| layout.with_pool_tokens(pool_tokens)).transpose()?;
+    let graph_set = if graph_reserve && RANKS == 2 && placement_mode == AttentionPlacement::Layers {
+        Some(super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows, graph_slots,
+            graph_verify, RANKS,
+            |rank, layer| !matches!(placement.layers[layer].mode, LayerMode::Whole { gpu, .. } if usize::from(gpu) != rank),
+            |_| false, None)?)
+    } else { prepared_graph_set };
     if let Some(graphs) = &graph_set { super::graphs::check_placement_for_ranks(cfg, &placement, &graphs.keys, RANKS)?; }
     if let Some(budget) = &spark_budget {
         for rank in 0..budget.resident.len() {
@@ -2008,6 +2015,36 @@ pub(super) mod tests {
             assert!(admitted.placement.pool_tokens >= context as u64);
         }
         assert!(refused > 0, "the explicit-shape matrix must exercise a real capacity refusal");
+        Ok(())
+    }
+
+    #[test]
+    fn layers_graphs_and_native_owners_follow_the_admitted_uneven_split() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let mut i = inputs(&cfg);
+        i.attention = Some(AttentionPlacement::Layers);
+        let graphs = super::super::graphs::owned_inventory(&cfg, i.lanes, i.rows, i.state_slots, 0)?;
+        i.startup = (0..2).map(|rank| super::super::graphs::demand(&graphs.inventory, rank)).collect();
+        // A fixed asymmetric owner makes equal layer counts the wrong balance.
+        let whole = LayerLayout::pair(&cfg, 3,
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Split })?[0].attention_bytes()? as u64;
+        i.fixed.push(Demand::new(1, Category::Runtime, "asymmetric runtime owner",
+            3 * (whole + (2_097_152 * i.cache_format.record_bytes()) as u64), Basis::Exact));
+        let admitted = admit(i)?;
+        let owners = [0, 1].map(|rank| admitted.placement.layers.iter().filter(|layer|
+            matches!(layer.mode, LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank)).count());
+        assert!(owners[0] > owners[1], "{owners:?}");
+        let graphs = admitted.graph_set.as_ref().context("admitted graph set")?;
+        super::super::graphs::check_placement(&cfg, &admitted.placement, &graphs.keys)?;
+        for rank in 0..2 {
+            let bytes = admitted.placement.items[rank].iter().filter(|item| item.group == super::super::graphs::RESERVE)
+                .map(|item| item.bytes).sum::<u64>();
+            assert_eq!(bytes, graphs.inventory.bytes(rank));
+            for (layer, assignment) in admitted.placement.layers.iter().enumerate() {
+                let layouts = LayerLayout::pair(&cfg, layer, assignment.mode)?;
+                assert_eq!(admitted.layouts[layer][rank].bytes()?, layouts[rank].bytes()?);
+            }
+        }
         Ok(())
     }
 

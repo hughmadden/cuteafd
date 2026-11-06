@@ -1,7 +1,9 @@
 //! Target-only shared admission; offline and live differ only in inventory samples.
 use super::{native::RankAdmission, ownership::ExecutionOwnership, Config};
 use crate::{
-    placement::*, plan::checkpoint::Checkpoint, serving_capacity::step5::Step5CacheLayout,
+    placement::{planner::{solve, Refusal}, *},
+    plan::checkpoint::Checkpoint,
+    serving_capacity::step5::Step5CacheLayout,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
@@ -162,6 +164,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// All demands are future to the pre-weight inventory. Startup phases are
 /// absolute additional peaks above that same sample, not steady-state deltas.
 pub struct RuntimeInputs {
+    pub host: HostInputs,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
@@ -182,7 +185,6 @@ pub struct RuntimeInputs {
     pub marks: MarkRule,
     pub peer_diagnostics: bool,
     pub pending_code: Vec<u64>,
-    pub startup: Vec<Demand>,
     /// RTX expert onboarding (every routed format; pool-first `Auto` by
     /// default); `None` only when onboarding is explicitly off.
     pub onboard: Option<OnboardInputs>,
@@ -205,6 +207,36 @@ impl Tp2Exchange {
     pub fn input_row_bytes(self, hidden: usize) -> usize {
         match self { Self::Exl3 => hidden + hidden / 32, Self::Fp8 => hidden * 2 }
     }
+}
+
+/// Host inventory is sampled once, before the single admission.
+#[derive(Debug, Clone)]
+pub struct HostInputs {
+    pub memory: (u64, u64),
+    pub cache_bytes: Option<u64>,
+    pub headroom: u64,
+    pub retained_sync_h2d_bytes: u64,
+    pub push: Option<crate::push_load::PushHostEnvelope>,
+}
+impl Default for HostInputs {
+    fn default() -> Self {
+        Self { memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30,
+            retained_sync_h2d_bytes: 0, push: None }
+    }
+}
+
+/// Header-derived upper bound for dense transforms and expert validation.
+/// Estimated staging until a Step-5 census supplies a tighter per-rank bound.
+pub fn push_host_envelope(contract: &super::coordinator::CoordinatorContract, cfg: &Config,
+    gpus: usize) -> Result<crate::push_load::PushHostEnvelope> {
+    let (target, draft) = contract.core.bytes(cfg.layers);
+    let dense = checked_sum([contract.weights.resident_bytes, target, draft])?
+        .checked_mul(2).and_then(|n| n.checked_add(64 << 20))
+        .context("Step-5 dense push host bound overflow")?;
+    let validation = (cfg.layers as u64).checked_mul(cfg.experts as u64)
+        .and_then(|n| n.checked_mul(3 * 4)).context("Step-5 expert validation overflow")?;
+    Ok(crate::push_load::PushHostEnvelope::new(vec![validation.max(4 << 20); gpus],
+        vec![dense; gpus], 128, 1 << 20)?)
 }
 
 /// One rank's Step TP2 onboarding exchange planes beside the package arena:
@@ -277,15 +309,7 @@ impl OnboardInputs {
     }
 }
 
-pub struct Admission {
-    pub placement: Placement,
-    pub ownership: ExecutionOwnership,
-    pub cache: Step5CacheLayout,
-    pub marks: usize,
-    pub reservations: Vec<Reservation>,
-    /// Exact fixed demands; residual receive slots are charged by solve itself.
-    pub fixed: Vec<Demand>,
-}
+pub use crate::placement::families::step5::Admission;
 
 fn checked_sum(values: impl IntoIterator<Item = u64>) -> Result<u64> {
     values
@@ -342,18 +366,23 @@ impl RuntimeInputs {
                 .is_none_or(|n| n >= FLOOR && n % 64 == 0),
             "Step-5 explicit pool must be page-aligned and at least 256K tokens"
         );
+        // An explicit pool below the request context is refused, never clamped.
+        PoolPolicy::resolve(
+            &self.inventory.gpus.iter().map(|g| g.capacity_bytes).collect::<Vec<_>>(),
+            self.context,
+            self.requested_pool,
+            64,
+            false,
+        )
+        .validate_explicit()?;
         ensure!(
             self.pending_code.len() == ranks && self.marks.lanes == self.sequences,
             "Step-5 code or prefix sequence inventory differs"
         );
-        ensure!(
-            self.startup.iter().all(|d| usize::from(d.gpu) < ranks),
-            "Step-5 startup phase names an absent GPU"
-        );
         Ok(())
     }
 
-    fn hops(&self) -> HopSpec {
+    pub fn hops(&self) -> HopSpec {
         HopSpec {
             storage: HopStorage::ReceiveSlots,
             row_bytes: 4096 * 4,
@@ -393,35 +422,7 @@ impl RuntimeInputs {
                 }
             })
             .collect::<Vec<_>>();
-        let spec = self.hops();
-        let placement = Placement {
-            pool_tokens: 0,
-            pool_limits: PoolLimits(vec![]),
-            attention_placement: AttentionPlacement::Heads,
-            attention_by_kind: vec![],
-            peer_row_bytes: 0,
-            onboard_layers: 0,
-            max_pool_tokens_no_onboard: None,
-            layers: modes
-                .iter()
-                .enumerate()
-                .map(|(layer, &mode)| LayerAssignment {
-                    mode,
-                    experts: if cfg.moe[layer] {
-                        ExpertHome::Spark
-                    } else {
-                        ExpertHome::Dense
-                    },
-                })
-                .collect(),
-            movables: vec![],
-            expert_ranges: vec![],
-            residual: residual_homes(&modes, &spec)?,
-            hops: plan_hops(&modes, &spec)?,
-            tp2: None,
-            items: vec![],
-        };
-        ExecutionOwnership::new(cfg, ranks, LayerExecutionPlan::new(&placement, spec)?)
+        ExecutionOwnership::for_modes(cfg, ranks, &modes, self.hops())
     }
 }
 
@@ -493,300 +494,25 @@ fn admit_depth_with(
     cfg: &Config,
     inputs: &RuntimeInputs,
     depth: usize,
-    mut native: impl FnMut(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
+    native: impl FnMut(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
 ) -> Result<Admission> {
+    use crate::placement::families::step5 as family;
     ensure!(depth <= cfg.mtp, "Step-5 forecast predictor depth exceeds checkpoint");
     inputs.validate(cfg)?;
-    let ranks = inputs.inventory.gpus.len();
-    let groups = cfg.full[..cfg.layers].iter().map(|&full| (ranks == 2 && full, None))
-        .collect::<Vec<_>>();
-    let policy = if ranks == 2 { attention::LayerOwnership::Ranges }
-        else { attention::LayerOwnership::Alternating };
-    attention::solve_owners(&groups, policy, 0, |owners| -> Result<_> {
-        let ownership = inputs.ownership_for(cfg, owners)?;
-        let native = native(&ownership)?;
-        let admitted = admit_frozen(cfg, inputs, depth, &ownership, &native)?;
-        Ok((admitted.placement.clone(), admitted))
-    }).map(|(_, admitted)| admitted)
-}
-
-fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
-    ownership: &ExecutionOwnership, native: &[RankAdmission]) -> Result<Admission> {
-    let ranks = ownership.ranks();
-    ensure!(
-        native.len() == ranks,
-        "Step-5 native admission rank inventory"
-    );
-    let mut pool = PoolPolicy::resolve(
-        &inputs
-            .inventory
-            .gpus
-            .iter()
-            .map(|g| g.capacity_bytes)
-            .collect::<Vec<_>>(),
-        inputs.context,
-        inputs.requested_pool,
-        64,
-        false,
-    );
-    // Request context may descend with an automatic aggregate pool, but never
-    // below the agentic floor. It is not the compiled kernel extent.
-    pool.floor = pool.requested.unwrap_or(FLOOR);
-    let initial = pool.requested.unwrap_or(pool.target);
-    settle_pool(
-        (initial, inputs.context.min(initial)),
-        |tokens, &context| {
-            let cache =
-                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.unit_rows() as u64,
-                    inputs.rows as u64, inputs.kv_format)?;
-            let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.bytes))?)?;
-            let marks = inputs.marks.slots(mark_bytes);
-            let mut fixed = Vec::new();
-            let mut reservations = Vec::new();
-            for rank in 0..ranks {
-                let reservation = Reservation::new(
-                    &cache,
-                    rank,
-                    inputs.sequences as u64,
-                    marks as u64,
-                    1,
-                    usize::MAX,
-                )?;
-                fixed.push(Demand::new(rank as u8, Category::Weights,
-                    "Step-5 native target and head", native[rank].immutable, Basis::Exact)
-                    .with_resident_weights(native[rank].resident_weights));
-                if rank == 0 {
-                    let bytes = scaled(4096 * 2, cfg.vocab)?;
-                    fixed.push(Demand::new(0, Category::Embedding, "Step-5 GPU embedding", bytes, Basis::Exact)
-                        .with_resident_weights(ResidentWeights(bytes)));
-                }
-                let mut add = |category, group, bytes| {
-                    fixed.push(Demand::new(
-                        rank as u8,
-                        category,
-                        group,
-                        bytes,
-                        Basis::Exact,
-                    ))
-                };
-                add(
-                    Category::Workspace,
-                    "Step-5 native workspace",
-                    native[rank].workspace,
-                );
-                add(
-                    Category::Kv,
-                    "Step-5 active sequence state",
-                    reservation.active as u64,
-                );
-                add(
-                    Category::Prefix,
-                    "Step-5 exact retained marks",
-                    reservation.marks as u64,
-                );
-                add(
-                    Category::Workspace,
-                    "Step-5 private transaction staging",
-                    staging_bytes(&cache, rank, inputs.sequences)? as u64,
-                );
-                add(
-                    Category::Runtime,
-                    "Step-5 pending code",
-                    inputs.pending_code[rank],
-                );
-                if rank == 0 {
-                    add(
-                        Category::Workspace,
-                        "Step-5 input",
-                        input_bytes(inputs.rows)?,
-                    );
-                    let capacity = inputs.rows.min(64);
-                    add(
-                        Category::Workspace,
-                        "Step-5 selector and device sampler",
-                        checked_sum([
-                            scaled(12, capacity)?,
-                            cuteafd_core::target_sampler_device_bytes(capacity, cfg.vocab) as u64,
-                        ])?,
-                    );
-                }
-                if rank == usize::from(ownership.execution().spec().entry_gpu) {
-                    add(
-                        Category::Transport,
-                        "Step-5 Spark intake planes",
-                        // One reserve range per rank every admitted depth is cut from (#762).
-                        crate::serving_capacity::prefill_return_bytes_with_format(1, inputs.rows as u64,
-                            inputs.inventory.spark_ranks as u64, 4096, inputs.spark_reply_format)?
-                            .max(256 * inputs.inventory.spark_ranks as u64),
-                    );
-                    add(Category::Workspace, "Step-5 routed reply", (inputs.rows as u64 * 4096 * 2).max(256));
-                }
-                if ranks == 2 {
-                    let progress = if inputs.peer_diagnostics {
-                        (9 * 48).max(256) as u64
-                    } else {
-                        0
-                    };
-                    // Eight peer receive slots, peer control, abort word and one
-                    // private hop control plane. solve adds hop receives separately.
-                    add(
-                        Category::Transport,
-                        "Step-5 private peer and hop control",
-                        checked_sum([
-                                8 * (inputs.unit_rows() as u64 * 4096 * 4).max(256),
-                                256,
-                                256,
-                                256,
-                                progress,
-                            ])?,
-                    );
-                }
-                reservations.push(reservation);
+    let recipe = family::Step5Recipe::new(cfg, inputs, depth, native)?;
+    let budgets = family::budgets(inputs).map_err(anyhow::Error::from)?;
+    let solved = solve(recipe.request(), budgets, &recipe)
+        .map_err(|error| {
+            let clamped = matches!(error, Refusal::Capacity { .. }
+                | Refusal::FullContextShortfall { .. });
+            let error = anyhow::Error::from(error);
+            if !inputs.marks.host && recipe.marks > 0 && clamped {
+                anyhow::anyhow!("{error}; Step-5 device-only prefix retention with HOST_CACHE_BYTES=0 does not fit at request context {}; enable --host-cache-bytes auto (HOST_CACHE_BYTES=auto), or lower --max-context/--context-tokens (MAX_CONTEXT_TOKENS), for example to 262144", inputs.context)
+            } else {
+                error
             }
-            let layers = ownership
-                .execution()
-                .modes()
-                .iter()
-                .enumerate()
-                .map(|(layer, &mode)| LayerDemand {
-                    kind: if cfg.full[layer] {
-                        AttentionClass::Csa
-                    } else {
-                        AttentionClass::Swa
-                    },
-                    weights: ModeBytes::default(),
-                    kv_unit: KvDemand::default(),
-                    fixed_bytes: ModeBytes::default(),
-                    extra: vec![],
-                    context_indexer: false,
-                    colocate: None,
-                    experts: cfg.moe[layer].then(|| inputs.onboard.as_ref()
-                        .and_then(|onboard| onboard.costs.get(layer - 3).copied())
-                        .unwrap_or(ExpertCost {
-                            whole: Bytes2::default(),
-                            half: [Bytes2::default(); 2],
-                            tp2: false,
-                            whole_supported: true, spark_ok: true,
-                        })),
-                    modes: vec![mode],
-                })
-                .collect();
-            let mut trial_pool = pool;
-            if trial_pool.requested.is_none() {
-                trial_pool.target = tokens;
-            }
-            let request = PlacementRequest {
-                resident_weight_limit: inputs.resident_weight_limit,
-                inventory: inputs.inventory.clone(),
-                attention_placement: None,
-                context_buffers: ContextBuffers::default(),
-                layers_first_gpu: 0,
-                pool: trial_pool,
-                layers,
-                pool_overhead: cache
-                    .geometry
-                    .ranks
-                    .iter()
-                    .map(|r| r.persistent_unit_bytes)
-                    .collect(),
-                pool_bounded: vec![],
-                fixed: fixed.clone(),
-                startup: inputs.startup.clone(),
-                movables: vec![],
-                expert_workspace: inputs.onboard.as_ref().map_or(0, |o| o.workspace),
-                tp2_workspace: inputs.onboard.as_ref().map_or([0; 2], |o| o.tp2_workspace),
-                onboard: inputs.onboard.as_ref().map_or(Onboard::Auto, |o| o.mode),
-                // One GPU holds whole layers; two split every onboarded layer
-                // TP2 (the solver's TP2 prefix takes its cap from GPU 0's).
-                expert_gpus: usize::from(inputs.onboard.is_some()),
-                minimum_expert_layers: 0,
-                policy: LayerPolicy {
-                    attention: if ranks == 2 {
-                        vec![
-                            (AttentionClass::Csa, AttentionPlacement::Layers),
-                            (AttentionClass::Swa, AttentionPlacement::Heads),
-                        ]
-                    } else {
-                        vec![]
-                    },
-                    ..Default::default()
-                },
-                hops: inputs.hops(),
-                executor: EXECUTOR,
-            };
-            let retention_guidance = |error: anyhow::Error| {
-                if !inputs.marks.host && marks > 0 {
-                    anyhow::anyhow!("{error}; Step-5 device-only prefix retention with HOST_CACHE_BYTES=0 does not fit at request context {context}; enable --host-cache-bytes auto (HOST_CACHE_BYTES=auto), or lower --max-context/--context-tokens (MAX_CONTEXT_TOKENS), for example to 262144")
-                } else {
-                    error
-                }
-            };
-            let placement = solve(&request).map_err(|error| {
-                if matches!(&error, PlacementError::Mandatory { .. }
-                    | PlacementError::PoolDoesNotFit { .. } | PlacementError::BelowFloor { .. }) {
-                    retention_guidance(error.into())
-                } else {
-                    error.into()
-                }
-            })?;
-            if placement.pool_tokens < FLOOR {
-                return Err(retention_guidance(anyhow::anyhow!(
-                    "Step-5 aggregate pool is below the 256K agentic floor"
-                )));
-            }
-            EXECUTOR.check(&placement)?;
-            ensure!(
-                placement.layers.iter().map(|l| l.mode).eq(ownership
-                    .execution()
-                    .modes()
-                    .iter()
-                    .copied()),
-                "Step-5 solver ownership differs from native allocation owners"
-            );
-            let checked_ownership = ExecutionOwnership::new(
-                cfg,
-                ranks,
-                LayerExecutionPlan::new(&placement, inputs.hops())?,
-            )?;
-            let onboarded = placement.layers.iter().enumerate()
-                .filter(|(_, l)| matches!(l.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2))
-                .map(|(layer, l)| {
-                    ensure!(l.experts == if ranks == 2 { ExpertHome::RtxTp2 }
-                        else { ExpertHome::RtxWhole { gpu: inputs.hops().entry_gpu } },
-                        "Step-5 onboarded layer {layer}: whole on one GPU, TP2 over two");
-                    Ok(layer)
-                }).collect::<Result<Vec<_>>>()?;
-            let checked_ownership = checked_ownership.with_onboarded(onboarded)?;
-            let next_context = context.min(placement.pool_tokens);
-            let pages = placement.pool_tokens / 64;
-            ensure!(
-                pages <= u32::MAX as u64,
-                "Step-5 pool page identifiers overflow"
-            );
-            for rank in 0..ranks {
-                reservations[rank] = Reservation::new(
-                    &cache,
-                    rank,
-                    inputs.sequences as u64,
-                    marks as u64,
-                    pages,
-                    usize::MAX,
-                )?;
-            }
-            Ok((
-                placement.pool_tokens,
-                next_context,
-                Admission {
-                    placement,
-                    ownership: checked_ownership,
-                    cache,
-                    marks,
-                    reservations,
-                    fixed,
-                },
-            ))
-        },
-    )
+        })?;
+    recipe.execution(&solved)
 }
 
 #[cfg(test)]
@@ -822,7 +548,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+        RuntimeInputs { host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             full_prefill_logits: false, waves: 1, unit: 0,
             inventory: Inventory {
@@ -851,7 +577,7 @@ mod tests {
             },
             peer_diagnostics: false,
             pending_code: vec![1 << 20; ranks],
-            startup: vec![], onboard: None,
+            onboard: None,
         }
     }
     fn run(inputs: &RuntimeInputs) -> Result<Admission> {
@@ -1008,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_search_scores_predictor_complete_inventory_and_keeps_winning_layout() -> Result<()> {
+    fn predictor_owners_on_the_head_gpu_move_csa_off_it() -> Result<()> {
         let cfg = config();
         for format in [crate::families::qwen4::Qwen4KvCache::Bf16,
             crate::families::qwen4::Qwen4KvCache::Fp8] {
@@ -1016,48 +742,22 @@ mod tests {
             inputs.kv_format = format;
             inputs.requested_pool = None;
             inputs.marks.host = true;
-            let native = |ownership: &ExecutionOwnership, predictor: bool| -> Result<Vec<RankAdmission>> {
-                Ok((0..2).map(|rank| RankAdmission {
+            let native = |predictor: bool| -> Vec<RankAdmission> {
+                (0..2).map(|rank| RankAdmission {
                     resident_weights: ResidentWeights((1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 }),
-                    // Cross a whole-CSA boundary in both cache formats, not just consume its slack.
                     immutable: (1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 },
                     workspace: if rank == 0 && predictor { 512 << 20 } else { 1 << 20 },
-                }).take(ownership.ranks()).collect())
+                }).collect()
             };
-            let base = admit_depth_with(&cfg, &inputs, 0, |o| native(o, false))?;
-            let without_weights = admit_depth_with(&cfg, &inputs, 3, |o| native(o, false))?;
-            let candidate = admit_depth_with(&cfg, &inputs, 3, |o| native(o, true))?;
-            let old_pressure = admit_depth_with(&cfg, &inputs, 3, |o| {
-                let mut inventory = native(o, true)?;
-                inventory[0].immutable -= 20 << 30;
-                Ok(inventory)
-            })?;
+            let base = admit_depth_with(&cfg, &inputs, 0, |_| Ok(native(false)))?;
+            let candidate = admit_depth_with(&cfg, &inputs, 3, |_| Ok(native(true)))?;
             let count = |a: &Admission| a.placement.layers.iter().enumerate().filter(|(layer, item)|
                 cfg.full[*layer] && item.mode == WHOLE0).count();
-            assert!(count(&candidate) < count(&base), "{format:?}: predictor pressure must move CSA off the head GPU: base={} candidate={}, scores {:?} -> {:?}",
-                count(&base), count(&candidate), attention::owner_score(&base.placement),
-                attention::owner_score(&candidate.placement));
-            // At 12 GiB the neighboring 10/13 cut is still slightly worse:
-            // BF16 38,284 vs 38,338 pages; FP8 75,409 vs 75,631 pages.
-            assert_eq!(count(&old_pressure), 11);
-            assert!(attention::owner_score(&old_pressure.placement)
-                < attention::owner_score(&without_weights.placement));
-            eprintln!("{format:?}: omitted weights cut={}, 12 GiB cut={}, physical scores {:?} -> {:?}",
-                count(&without_weights), count(&old_pressure),
-                attention::owner_score(&without_weights.placement),
-                attention::owner_score(&old_pressure.placement));
-            assert_eq!(count(&without_weights), 11);
-            assert_eq!((count(&base), count(&candidate)), (11, 9),
-                "{format:?}: complete predictor costs must select the expected CSA cut");
-            let alternating = inputs.ownership(&cfg)?;
-            let old = admit_frozen(&cfg, &inputs, 3, &alternating, &native(&alternating, true)?)?;
-            eprintln!("{format:?}: CSA owners base={}/{}, MTP={}/{}, pool alternating={} solved={}, scores {:?} -> {:?}",
-                count(&base), 23 - count(&base), count(&candidate), 23 - count(&candidate),
-                old.placement.pool_tokens, candidate.placement.pool_tokens,
-                attention::owner_score(&old.placement),
-                attention::owner_score(&candidate.placement));
-            assert!(attention::owner_score(&candidate.placement)
-                > attention::owner_score(&old.placement));
+            // The 32 GiB predictor on rank 0 outweighs one CSA layer's pool
+            // records, so the fixed boundary keeps fewer CSA layers there.
+            assert!(count(&candidate) < count(&base),
+                "{format:?}: predictor pressure must move CSA off the head GPU: {} vs {}",
+                count(&base), count(&candidate));
             assert_eq!(candidate.marks, 2);
             assert_eq!(candidate.cache.ranks[0].mtp_lengths.len(), 3);
             assert!(candidate.cache.ranks[1].mtp_lengths.is_empty());
@@ -1110,6 +810,11 @@ mod tests {
             assert!(refusal.contains(message), "{refusal}");
         }
         inputs.marks.host = true;
+        // Host retention moves the marks off the device, but the full 1M
+        // context still does not fit in 50 GiB: the old planner silently
+        // clamped the pool below the request; the contract refuses instead.
+        assert!(run(&inputs).is_err());
+        inputs.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 96 << 30 };
         run(&inputs)?;
         inputs.marks.host = false;
         inputs.context = FLOOR;
@@ -1207,23 +912,12 @@ mod tests {
                 9 * 48 as u64
             );
         }
-        inputs.startup.push(Demand::new(
-            0,
-            Category::Workspace,
-            "load phase",
-            96 << 30,
-            Basis::Exact,
-        ));
-        run(&inputs)?;
-        inputs.startup[0].bytes += 1;
-        assert!(run(&inputs).is_err());
-        inputs.startup.clear();
         assert!(admit_with(&config(), &inputs, |_| Ok(vec![])).is_err());
         Ok(())
     }
 
     #[test]
-    fn automatic_pool_descends_without_confusing_context_and_compiled_extent() -> Result<()> {
+    fn automatic_pool_refuses_rather_than_lowering_the_request_context() -> Result<()> {
         let mut inputs = inputs(1);
         inputs.requested_pool = None;
         inputs.context = EXTENT;
@@ -1233,13 +927,83 @@ mod tests {
         inputs.inventory.gpus[0].baseline = Baseline::Measured {
             free_bytes: 40 << 30,
         };
+        // A 40 GiB device cannot hold the 1M request context: refuse with the
+        // attainable pool instead of silently serving a shorter context.
+        let error = run(&inputs).expect_err("40 GiB cannot hold a 1M context");
+        assert!(format!("{error:#}").contains("cannot fit"), "{error:#}");
+        // The same device admits the 256K floor, at the request context.
+        inputs.context = FLOOR;
         let admission = run(&inputs)?;
-        assert!((FLOOR..EXTENT).contains(&admission.placement.pool_tokens));
-        assert_eq!(admission.cache.context, admission.placement.pool_tokens);
-        assert_eq!(config().max_context, EXTENT);
-        let initial =
-            Step5CacheLayout::for_execution(&config(), &admission.ownership, EXTENT, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16)?;
-        assert!(initial.ranks[0].bytes > admission.cache.ranks[0].bytes);
+        assert!((FLOOR..=EXTENT).contains(&admission.placement.pool_tokens));
+        assert_eq!(admission.cache.context, FLOOR);
         Ok(())
     }
+    #[test]
+    fn host_quota_and_push_share_one_capacity_before_allocation() -> Result<()> {
+        let mut inputs = inputs(1);
+        inputs.marks.host = true;
+        inputs.host.cache_bytes = Some(64 << 30);
+        inputs.host.memory = (1 << 30, 1 << 30);
+        let error = run(&inputs).expect_err("host quota must be admitted");
+        assert!(error.downcast_ref::<crate::placement::planner::Refusal>().is_some(), "{error:#}");
+        assert!(format!("{error:#}").contains("host"), "{error:#}");
+        inputs.host.memory = (128 << 30, 128 << 30);
+        inputs.host.push = Some(crate::push_load::PushHostEnvelope::new(vec![1024], vec![2048], 128, 1 << 20)?);
+        let admitted = run(&inputs)?;
+        assert_eq!(admitted.host_cache_bytes, 64 << 30);
+        let load = admitted.solved.phases.iter().find(|row| row.budget == "host"
+            && row.phase == crate::placement::planner::Phase::Load).unwrap();
+        assert!(load.owned >= inputs.host.push.as_ref().unwrap().bytes()?);
+        Ok(())
+    }
+
+    #[test]
+    fn synchronous_h2d_staging_remains_owned_through_ready_and_growth() -> Result<()> {
+        let mut inputs = inputs(1);
+        inputs.host.retained_sync_h2d_bytes = 395_968_512;
+        let admitted = run(&inputs)?;
+        let owner = admitted.solved.facts.allocations.iter()
+            .find(|owner| owner.id == "step5.host.sync_h2d").unwrap();
+        assert_eq!(owner.bytes, 395_968_512);
+        assert_eq!(owner.location, crate::placement::planner::Location::PINNED);
+        assert_eq!(owner.lifetime, crate::placement::planner::Lifetime::RESIDENT);
+        Ok(())
+    }
+
+    #[test]
+    fn full_prefill_host_logits_include_the_scoring_tensor_and_decode_lane() -> Result<()> {
+        let mut inputs = inputs(1);
+        inputs.rows = 256;
+        inputs.unit = 256;
+        let decode = run(&inputs)?;
+        inputs.full_prefill_logits = true;
+        let scoring = run(&inputs)?;
+        let logits = |admitted: &Admission| admitted.solved.facts.deferred.iter()
+            .find(|owner| owner.id == "step5.host.logits").unwrap().bytes;
+        assert_eq!(logits(&decode), 64 * config().vocab as u64 * 4);
+        assert_eq!(logits(&scoring), (256 + 64) * config().vocab as u64 * 4);
+        Ok(())
+    }
+
+    #[test]
+    fn full_onboard_option_charges_its_expert_arena() -> Result<()> {
+        let mut inputs = inputs(2);
+        let routed = config().moe[..92].iter().filter(|&&moe| moe).count();
+        inputs.onboard = Some(OnboardInputs {
+            costs: vec![ExpertCost { whole: Bytes2 { resident: 1024, staging: 0 },
+                half: [Bytes2 { resident: 512, staging: 0 }; 2], tp2: true,
+                whole_supported: true, spark_ok: true }; routed],
+            workspace: 12345, tp2_workspace: [23456, 34567], mode: Onboard::Layers(routed),
+        });
+        let admitted = run(&inputs)?;
+        assert_eq!(admitted.placement.onboard_layers, routed);
+        for rank in 0..2 {
+            let arena = admitted.placement.items[rank].iter()
+                .filter(|item| item.group == "Step-5 RTX expert arena").map(|item| item.bytes).sum::<u64>();
+            assert_eq!(arena, inputs.onboard.as_ref().unwrap().tp2_workspace[rank]);
+            assert_eq!(admitted.placement.tp2.as_ref().unwrap().peak_bytes[rank], arena + routed as u64 * 512);
+        }
+        Ok(())
+    }
+
 }

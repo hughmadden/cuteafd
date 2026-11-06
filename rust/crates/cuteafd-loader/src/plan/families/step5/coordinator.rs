@@ -93,6 +93,35 @@ impl LayerContract {
 }
 
 impl CoordinatorContract {
+    /// `copy_h2d` retains its largest pinned source until the library drops.
+    /// Whole source extents conservatively cover TP shards; embedding uses the
+    /// separate dense loader, not this reusable synchronous upload owner.
+    pub fn retained_sync_h2d_bytes(&self) -> Result<u64> {
+        let mut maximum = self.weights.tensors.iter()
+            .filter(|tensor| tensor.meta.name != "model.embed_tokens.weight")
+            .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0);
+        for (_, shape, dtype) in &self.mtp_declarations {
+            let element = match dtype {
+                DType::Bf16 => 2u64, DType::F32 => 4, DType::F8E4M3 => 1,
+                _ => anyhow::bail!("unsupported Step-5 retained upload dtype {dtype:?}"),
+            };
+            let bytes = shape.iter().try_fold(element, |bytes, &dim| bytes.checked_mul(dim as u64))
+                .ok_or_else(|| anyhow::anyhow!("Step-5 retained upload extent overflow"))?;
+            maximum = maximum.max(bytes);
+        }
+        for projection in self.core.projections.values() {
+            let n = projection.stored_outputs as u64;
+            let k = projection.shape[1] as u64;
+            let payload = n.checked_mul(k).and_then(|bytes| bytes.checked_mul(projection.bits as u64))
+                .ok_or_else(|| anyhow::anyhow!("Step-5 retained core upload overflow"))? / 8;
+            maximum = maximum.max(payload).max(n * 2).max(k * 2);
+        }
+        for recipe in &self.rope_tables.recipes {
+            maximum = maximum.max(recipe.allocation_bytes(self.rope_tables.extent)? / 2);
+        }
+        Ok(maximum.max(256))
+    }
+
     /// Requires every selected native target header. Routed experts, vision
     /// and independently owned MTP stages are not charged as target weights.
     /// Full tensors are conservatively replicated; no unimplemented TP packing

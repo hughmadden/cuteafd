@@ -180,7 +180,13 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let inputs = RuntimeInputs { resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
+    let host_contract = super::coordinator::CoordinatorContract::from_checkpoint(input.checkpoint())?;
+    let inputs = RuntimeInputs { host: super::admission::HostInputs {
+            memory: crate::plan::layout::recipe_host_memory(opts)?, cache_bytes: opts.host_cache_bytes,
+            headroom: 8 << 30,
+            retained_sync_h2d_bytes: host_contract.retained_sync_h2d_bytes()?,
+            push: Some(super::admission::push_host_envelope(&host_contract, &model.cfg, coordinators)?),
+        }, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
                 kv_format: opts.step5_kv,
         inventory,
         rows: usize::try_from(shape.span_rows)?,
@@ -198,11 +204,24 @@ pub(super) fn layout(
         },
         peer_diagnostics: false,
         pending_code: code,
-        startup: vec![],
         onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
             checked_rows, coordinators, waves, opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto))?,
     };
     let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
+    report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
+    let mut host_items: Vec<_> = [planner::Location::HOST, planner::Location::PINNED].into_iter()
+        .map(|location| admitted.solved.items(location)).collect::<Result<Vec<_>, _>>()?
+        .into_iter().flatten().filter(|item| item.category != Category::Prefix).collect();
+    host_items.extend(admitted.solved.facts.deferred.iter().filter(|owner|
+        [planner::Location::HOST, planner::Location::PINNED].contains(&owner.location)
+            && owner.view.is_none() && owner.category != Category::Prefix
+            && owner.lifetime.contains(planner::Phase::Ready, admitted.solved.facts.phase_order))
+        .map(|owner| Item::new(owner.category, &owner.group, "", owner.bytes, Basis::Exact)
+            .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve)));
+    report.host_budget_bytes = admitted.host_cache_bytes;
+    report.host_ledger = Some(cuteafd_core::memory_layout::HostLayout::new(inputs.host.memory.0,
+        inputs.host.memory.1, inputs.host.headroom.max(inputs.host.memory.0 / 10),
+        admitted.host_cache_bytes, host_items).context("Step-5 admitted host ledger overflow")?);
     report.attention_placement = admitted.placement.attention_placement;
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert(

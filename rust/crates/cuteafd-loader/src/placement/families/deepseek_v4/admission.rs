@@ -1036,7 +1036,7 @@ impl Recipe for PreparedV4<'_> {
             owners.components.extend(super::host::components(inputs, host, self.prefix.owners, self.page_rows,
                 self.attention == AttentionPlacement::Context, self.maximum_pages)?);
         }
-        Ok(Contract {
+        Ok(Contract { floor_fallback: None,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: None,
             resident_weight_limit: request.resident_weight_limit,

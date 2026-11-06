@@ -2427,6 +2427,35 @@ fn analytical_weight_cap_rejects_alias_duplicate_unknown_home_and_overflow() {
 }
 
 #[test]
+fn floor_fallback_preserves_optional_owner_before_maximizing_pool() {
+    struct Optional;
+    impl Recipe for Optional {
+        fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
+            let mut base = Linear::new();
+            base.maximum = 256;
+            let mut contract = base.prepare(request)?;
+            let variable = contract.variables.len();
+            contract.variables.push(Variable::Encoder(vec![0, 1]));
+            contract.floor_fallback = Some(Choice { variable, option: 1 });
+            let mut tower = Component::allocation(allocation("tower", 64),
+                ByteCurve::fixed(64, 4), false, 4);
+            tower.activation = Activation::choice(variable, 0);
+            contract.components.push(tower);
+            Ok(contract)
+        }
+    }
+    let on = solve(request(), vec![budget(256)], &Optional).unwrap();
+    assert_eq!((on.pool_tokens, on.decisions.encoder), (192, Some(0)));
+    let off = solve(request(), vec![budget(64)], &Optional).unwrap();
+    assert_eq!((off.pool_tokens, off.decisions.encoder), (64, Some(1)));
+    let exact = solve(Request { pool: Pin::Exact(256), ..request() },
+        vec![budget(256)], &Optional).unwrap();
+    assert_eq!((exact.pool_tokens, exact.decisions.encoder), (256, Some(1)));
+    assert!(matches!(solve(request(), vec![budget(32)], &Optional),
+        Err(Refusal::FullContextShortfall { .. })));
+}
+
+#[test]
 fn encoder_priority_follows_pool_and_onboarding_before_slack() {
     struct WithEncoder;
     impl Recipe for WithEncoder {

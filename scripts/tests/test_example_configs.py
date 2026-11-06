@@ -761,7 +761,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
                    for other in v4["entries"]) == 1
     assert not any(name.startswith("qwen38-nvfp4") for name in entries)
     retired = v4["retired"]
-    assert len(retired) == 20
+    assert len(retired) == 21
     assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
     assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
     assert retired == json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]

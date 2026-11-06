@@ -1374,7 +1374,7 @@ impl Recipe for GlmRecipe<'_> {
         {
             return Err(invalid("attention ownership or context page quantum"));
         }
-        let mut contract = Contract {
+        let mut contract = Contract { floor_fallback: None,
             resident_weight_limit: request.resident_weight_limit,
             phase_order: crate::placement::planner::PhaseOrder::DRAFT_THEN_TARGET,
             spark_reply_formats: self.spark_links.then(|| SparkReplyFormats {

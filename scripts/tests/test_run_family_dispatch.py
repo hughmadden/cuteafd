@@ -897,6 +897,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                   json.loads((ROOT / "rust/crates/cuteafd-daemon/src/families/muse_spark/fixtures"
                               "/drafters/nvidia.json").read_text()),
                   "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6")
+    if family_config.get("model_type") == "glm5_next" and (extra_env or {}).get("STUB_REAL_PLANNER"):
+        _snapshot(hf, "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     audio_backend = ("pcm-bf16-aot-v1" if family_config.get("model_type") == "muse_spark" else
@@ -1153,6 +1155,40 @@ def capture_glm_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     _, deployment = _capture_real_planner_launch(snapshot, example, binary, programs, hf_home,
         temporary, "test/glm-real-plan", "glm5")
     assert deployment["prefill_unit_rows"] == 2752 and deployment["prefill_waves"] == 3, deployment
+
+
+def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                          programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Flash's local/Spark layouts through its actual launcher and contract."""
+    _, deployment = _capture_real_planner_launch(snapshot, example, binary, programs, hf_home,
+        temporary, "test/glmf-real-plan", "glm5_flash")
+    local = deployment["spark_ranks"] == 0
+    assert deployment["prefill_unit_rows"] == (4096 if local else 2752), deployment
+    assert deployment["prefill_waves"] == (1 if local else 3), deployment
+    assert deployment["report"]["phase_ledger"], deployment
+    if example.name == "glm53f-exl3-k4-core-k6-max.config":
+        assert deployment["report"]["encoder"]["kind"]["kind"] != "off", deployment
+        strict_dir = temporary / "vision-on"
+        strict_dir.mkdir()
+        strict_output = strict_dir / "real-deployment.json"
+        raw = example.read_text()
+        config = dict(line.split("=", 1) for line in raw.splitlines()
+                      if line and not line.startswith("#") and "=" in line)
+        keys = "\n".join(line for line in raw.splitlines()
+                          if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+        gpus = int(config["RTX_GPUS"])
+        strict_keys = "\n".join(line for line in keys.splitlines()
+                                if not line.startswith("VISION=")) + "\nVISION=rtx\n"
+        strict = _family_launch_result(strict_dir, json.loads((snapshot / "config.json").read_text()),
+            "test/glm-real-plan", strict_keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+            extra_args=("--wip", "real-planner-test"), extra_env={
+                "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+                "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+                "STUB_REAL_PLAN_OUTPUT": str(strict_output), "CUTEAFD_CDI_CHECK": "off"})
+        assert strict.returncode == 0, strict.stderr
+        vision_on = json.loads(strict_output.read_text())
+        assert deployment["memory_layout"]["pool_tokens"] == vision_on["memory_layout"]["pool_tokens"]
+        assert deployment["report"]["onboard_layers"] == 42
 
 
 def capture_muse_real_planner_launch(snapshot: Path, example: Path, binary: Path,
@@ -4743,4 +4779,37 @@ def test_dry_run_total_capacity_ignores_foreign_gpu_memory_and_preserves_live_la
     assert "memory.free" in live_smi_log.read_text()
     live_plan = shlex.split(next(line for line in live.stderr.splitlines() if "cuteafd plan" in line))
     assert float(live_plan[live_plan.index("--coordinator-gpu-budget-gib") + 1]) == expected_gib - 6.0
+
+
+
+def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                      programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Exercise shipped config -> real launcher argv -> real CPU Recipe admission."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    # Fake only hardware and execution. The planner reads the actual snapshot,
+    # drafter and exporter metadata, not a canned deployment response.
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/step5-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    deployment = json.loads(output.read_text())
+    assert deployment["family"] == "step5", deployment
+    assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
+    assert deployment["memory_layout"]["pool_tokens"] >= 262144, deployment
+    assert deployment["prefill_unit_rows"] == 2752 and deployment["prefill_waves"] == 3, deployment
+    assert deployment["prefill_span_rows"] == 8256, deployment
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if "cuteafd plan " in line and "--deployment" in line]
+    assert len(plans) == 1, result.stderr
+    assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    assert "prefill reserve does not fit" not in result.stderr
 
