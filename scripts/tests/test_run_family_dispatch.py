@@ -1218,6 +1218,40 @@ def capture_qwen_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert "prefill reserve does not fit" not in result.stderr
 
 
+def capture_mimo_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                     programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Exercise shipped config -> real launcher argv -> real CPU Recipe admission."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    sparks = int(config["SPARK_COUNT"])
+    # Fake only hardware and execution. The planner reads the actual snapshot
+    # and exporter metadata, not a canned deployment response.
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/mimo-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    deployment = json.loads(output.read_text())
+    assert deployment["family"] == "mimo_v2", deployment
+    assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
+    assert deployment["rtx_gpus"] == gpus, deployment
+    assert deployment["spark_ranks"] == sparks, deployment
+    assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
+    assert deployment["prefill_waves"] == 3, deployment
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if "cuteafd plan " in line and "--deployment" in line]
+    assert len(plans) == 1, result.stderr
+    assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    assert "prefill reserve does not fit" not in result.stderr
+
+
 def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
     """Inspect actual launcher validation for declared native coordinator worlds."""
     deployment = json.loads(deployment_path.read_text())

@@ -101,9 +101,6 @@ pub struct LayoutOptions {
     pub pool_tokens: Option<u64>,
     /// Upper bound for an automatically sized pool.
     pub target_pool_tokens: u64,
-    /// An automatic pool under a fixed onboard stops at its target instead of
-    /// growing to all free memory (it still shrinks to fit, down to its floor).
-    pub pool_ceiling_at_target: bool,
     /// Explicit checkpoint-resident drafter weights; no inferred runtime storage.
     pub drafter_bytes: u64,
     pub dense_qwen_drafter_snapshot: Option<std::path::PathBuf>,
@@ -272,7 +269,6 @@ impl Default for LayoutOptions {
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
-            pool_ceiling_at_target: false,
             drafter_bytes: 0,
             dense_qwen_drafter_snapshot: None,
             dense_qwen_mtp: false,
@@ -1570,6 +1566,22 @@ pub(crate) fn engram_row_bytes(checkpoint: &super::Checkpoint) -> anyhow::Result
     anyhow::ensure!(bytes > 0, "V4.1 checkpoint has no engram table headers");
     layer.context("V4.1 checkpoint has no engram layer")?;
     Ok(bytes)
+}
+
+/// Host capacity for a whole-process recipe: the caller's sample, or one read
+/// before this process claims memory. Inventory-only plans synthesize their
+/// options, so tests take the same 128 GiB convention every planner fixture
+/// injects instead of live memory, keeping repeated plans identical.
+pub(crate) fn recipe_host_memory(options: &LayoutOptions) -> anyhow::Result<(u64, u64)> {
+    match options.host_memory {
+        Some(memory) => Ok(memory),
+        None => {
+            #[cfg(test)]
+            { Ok((128 << 30, 128 << 30)) }
+            #[cfg(not(test))]
+            { crate::formats::mapped_preload::host_memory_before_process() }
+        }
+    }
 }
 
 pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, input: &super::PlanInput, native: bool) -> anyhow::Result<()> {

@@ -5650,3 +5650,37 @@ fn qwen_auto_pool_normalization_keeps_one_admission_and_its_refusal() {
             && hint.what.contains("cannot hold selected context")), "{}", render(&refused));
     assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }
+
+#[test]
+fn mimo_auto_pool_and_count_admission_preserve_one_recipe() {
+    let dir = snapshot_tp(mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536,
+        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        ..Default::default()
+    }), ..sparks(4) };
+    let unset = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
+    assert!(unset.wip_launchable(), "{}", render(&unset));
+    let automatic_pool = unset.memory_layout.as_ref().unwrap().pool_tokens;
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens, automatic_pool);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    assert_eq!(automatic.prefill_waves, unset.prefill_waves);
+    let direct = plan(dir.path(), &options).unwrap();
+    assert_eq!(direct.memory_layout.as_ref().unwrap().pool_tokens, automatic_pool);
+    // An explicit pool that cannot hold the selected context is one typed
+    // refusal at every candidate count, never a silent context clamp.
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let refused = plan(dir.path(), &zero).unwrap();
+    assert!(!refused.fits);
+    let typed = refused.hints.iter().find(|hint|
+        hint.what.contains("pool 64 cannot hold selected context 65536"))
+        .unwrap_or_else(|| panic!("{}", render(&refused))).what.clone();
+    assert!(typed.contains("pass a lower explicit context"), "{typed}");
+    let counted = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert!(!counted.wip_launchable());
+    assert!(counted.hints.iter().any(|hint| hint.what == typed), "{}", render(&counted));
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}

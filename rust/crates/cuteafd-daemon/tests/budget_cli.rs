@@ -593,6 +593,8 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
               "glm53-exlr8-min.config", "glm53-exlr8-max.config"][..], "capture_glm_real_planner_launch"),
             (&["qwen35-9b-bf16-min.config", "qwen38-27b-bf16-min.config",
               "qwen38-27b-fp8-min.config"][..], "capture_qwen_real_planner_launch"),
+            (&["mimo-v26-flash-mxfp4-min.config", "mimo-v26-flash-mxfp4-max.config",
+              "mimo-v26-pro-mxfp4-min.config", "mimo-v26-pro-mxfp4-max.config"][..], "capture_mimo_real_planner_launch"),
         ].into_iter().find_map(|(names, capture)| names.contains(&name).then_some(capture));
         if let Some(capture) = capture {
             installed_real_planner_launch(root, capture, &snapshot, &example, &programs, &hf_home);
