@@ -23,10 +23,10 @@ addresses): [max](../../examples/configs/kimi-k3-exl3-k6-max.config).
 Set `MODEL_ID` to this checkpoint and `MODEL_REVISION` to
 `46b802d31c737bc64b4251ad158b9b3ffc4e04f6` when adapting the starting config.
 The default HQA view retains native BF16 attention output and MLA query
-projections alongside the K6 core. `COMPACT_ATTENTION=on` selects the bundled
-parent K6 attention; `FP8_COMPACT_ATTENTION=on` instead converts the selected
-native BF16 projections to block-scaled FP8, with BF16 activations. These
-options are mutually exclusive.
+projections alongside the K6 core. `ATTENTION_MODE=compact` selects the bundled
+parent K6 attention; `ATTENTION_MODE=fp8-compact` instead converts the selected
+native BF16 projections to block-scaled FP8, with BF16 activations. The default
+is `ATTENTION_MODE=hqa`, and only one mode applies to the model lifetime.
 
 The corresponding CLI flags are `--compact-attention` and
 `--fp8-compact-attention`. Plan, inspect, serve and golden select the complete
