@@ -1,4 +1,4 @@
-"""Qualify generic drafter BF16 projection row invariance and warm timing.
+"""Qualify generic BF16-weight projection row invariance and BF16/F32 output.
 
 Run inside the coordinator dev container with a task-owned native library:
   python native/tests/draft_bf16_projection_selftest.py LIB [--shape K,N ...]
@@ -43,12 +43,21 @@ def shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    for k, n in ((2048, 16384), (2048, 8192), (16384, 6144), (8192, 6144),
+                 (1536, 18432), (1536, 9216), (12288, 7168), (6144, 7168),
+                 (12288, 4096), (6144, 4096), (8192, 8192), (4096, 8192),
+                 (8192, 4096)):
+        result.setdefault((k, n), []).append("hqa-native")
     return result
+
+
+F32_SHAPES = {(6144, 7168), (6144, 4096), (4096, 8192), (8192, 6144)}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library")
+    parser.add_argument("--out-dtype", choices=("bf16", "f32"), default="bf16")
     parser.add_argument("--shape", action="append", help="restrict to K,N; repeatable")
     parser.add_argument("--support-library", help="load native dependencies for isolated translation-unit iteration")
     parser.add_argument("--screen", action="store_true", help="compare fixed-Lt, padding and existing row-local TMA")
@@ -56,6 +65,10 @@ def main():
                         help="compare canonical TMA with row-retiled M16 tensor-core arms")
     args = parser.parse_args()
     assert not (args.screen and args.skinny_screen), "select one screen"
+    assert args.out_dtype == "bf16" or not (args.screen or args.skinny_screen), "screens require BF16 output"
+    output_dtype = torch.bfloat16 if args.out_dtype == "bf16" else torch.float32
+    bits_dtype = torch.int16 if args.out_dtype == "bf16" else torch.int32
+    poison = 0x7FFF if args.out_dtype == "bf16" else 0x7FFFFFFF
     # Empty captures invalidate both the replay proof and event timings.
     warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
     support = ct.CDLL(args.support_library, mode=ct.RTLD_GLOBAL) if args.support_library else None
@@ -92,11 +105,15 @@ def main():
                 assert (info.pointers, info.scalars, info.scalar_kinds) == (3, 1, b"i")
                 indices[info.name.decode()] = index
     inventory = shapes()
+    if args.out_dtype == "f32":
+        inventory = {shape: inventory[shape] for shape in sorted(F32_SHAPES)}
     if args.shape:
         requested = {tuple(map(int, value.split(","))) for value in args.shape}
         inventory = {shape: inventory.get(shape, ["explicit"]) for shape in sorted(requested)}
     torch.manual_seed(1045)
     qualified = []
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
     try:
         for (k, n), families in sorted(inventory.items()):
             x = (torch.randn(2048, k, device="cuda") * .1).bfloat16()
@@ -105,9 +122,11 @@ def main():
             for offset in offsets:
                 x[offset].copy_(row)
             w = (torch.randn(n, k, device="cuda") * .02).bfloat16()
+            oracle = x.float() @ w.float().T
 
             if not (args.screen or args.skinny_screen):
-                program_index = indices[f"draft_bf16_k{k}_n{n}"]
+                suffix = "_f32" if args.out_dtype == "f32" else ""
+                program_index = indices[f"draft_bf16_k{k}_n{n}{suffix}"]
                 assert library.cuteafd_dsv4_program_load(program_index) == 0
 
             def run(input_, output):
@@ -126,7 +145,7 @@ def main():
                 assert blas.cublasSetStream_v2(handle, torch.cuda.current_stream().cuda_stream) == 0
                 status = blas.cublasGemmEx(handle, 1, 0, n, input_.shape[0], k,
                     ct.byref(alpha), w.data_ptr(), 14, k, input_.data_ptr(), 14, k,
-                    ct.byref(beta), output.data_ptr(), 14, n, 68, 99)
+                    ct.byref(beta), output.data_ptr(), 14 if args.out_dtype == "bf16" else 0, n, 68, 99)
                 assert status == 0, (k, n, status)
 
             arms = {"default": default, "candidate": run}
@@ -178,24 +197,32 @@ def main():
 
             results = {}
             canonical_outputs = {}
-            row_counts = (1, 4, 8, 16, 64, 128, 140, 2048)
+            row_counts = (1, 4, 8, 16, 17, 32, 64, 128, 140, 2048)
             for arm, operation in arms.items():
                 outputs, timing = {}, {}
                 graph_exact = True
                 for rows in row_counts:
-                    out = torch.empty((rows, n), dtype=torch.bfloat16, device="cuda")
+                    storage = torch.empty((2049, n), dtype=output_dtype, device="cuda")
+                    storage.view(bits_dtype).fill_(poison)
+                    out = storage[:rows]
                     operation(x[:rows], out)
                     torch.cuda.synchronize()
+                    assert torch.all(storage[rows:].view(bits_dtype) == poison), (k, n, arm, rows, "eager tail")
+                    assert torch.isfinite(out).all(), (k, n, arm, rows, "nonfinite output")
+                    torch.testing.assert_close(out.float(), oracle[:rows],
+                        rtol=1e-2 if args.out_dtype == "bf16" else 5e-5,
+                        atol=2e-3 if args.out_dtype == "bf16" else 5e-5)
                     expected = out.clone()
                     outputs[rows] = expected
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
                         operation(x[:rows], out)
                     # A replay must overwrite poison; checking stale eager output proves nothing.
-                    out.fill_(float("nan"))
+                    storage.view(bits_dtype).fill_(poison)
                     graph.replay()
                     torch.cuda.synchronize()
-                    exact = torch.equal(out.view(torch.int16), expected.view(torch.int16))
+                    assert torch.all(storage[rows:].view(bits_dtype) == poison), (k, n, arm, rows, "graph tail")
+                    exact = torch.equal(out.view(bits_dtype), expected.view(bits_dtype))
                     graph_exact = graph_exact and exact
                     assert exact, (k, n, arm, rows, "graph replay did not reproduce eager bytes")
                     for _ in range(5):
@@ -208,18 +235,18 @@ def main():
                     end.synchronize()
                     timing[f"n{rows}_us"] = start.elapsed_time(end) * 1000 / 30
                 mismatches = []
-                if not torch.equal(outputs[140].view(torch.int16), outputs[2048][:140].view(torch.int16)):
+                if not torch.equal(outputs[140].view(bits_dtype), outputs[2048][:140].view(bits_dtype)):
                     mismatches.append("n140/n2048")
                 for rows, out in outputs.items():
                     for offset in offsets:
-                        if offset < rows and not torch.equal(outputs[1][0].view(torch.int16), out[offset].view(torch.int16)):
+                        if offset < rows and not torch.equal(outputs[1][0].view(bits_dtype), out[offset].view(bits_dtype)):
                             mismatches.append(f"n{rows}/offset{offset}")
                 canonical_exact = None
                 if arm == "tma":
                     canonical_outputs = outputs
                 elif arm.startswith("tma_m16_"):
-                    canonical_exact = all(torch.equal(out.view(torch.int16),
-                        canonical_outputs[rows].view(torch.int16)) for rows, out in outputs.items())
+                    canonical_exact = all(torch.equal(out.view(bits_dtype),
+                        canonical_outputs[rows].view(bits_dtype)) for rows, out in outputs.items())
                     assert canonical_exact, (k, n, arm, "retile changed canonical TMA bytes")
                 results[arm] = dict(row_invariant=not mismatches, mismatches=mismatches,
                                     graph_exact=graph_exact, canonical_exact=canonical_exact, timing=timing)
@@ -228,10 +255,11 @@ def main():
                                      if arm.startswith("tma")))
             else:
                 qualified.append(results["tma" if args.screen else "candidate"]["row_invariant"])
-            print(json.dumps(dict(k=k, n=n, families=families, offsets=offsets, arms=results)), flush=True)
+            print(json.dumps(dict(k=k, n=n, families=families, output_dtype=args.out_dtype, offsets=offsets, arms=results)), flush=True)
         assert all(qualified), "selected row-local/candidate arm failed row invariance"
         print(f"PASS: {len(inventory)} projection shapes, rows={row_counts}, offsets and nonempty graphs", flush=True)
     finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
         assert blas.cublasDestroy_v2(handle) == 0
 
 

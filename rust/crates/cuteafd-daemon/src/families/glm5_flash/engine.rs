@@ -5794,7 +5794,9 @@ mod prefill_lane_tests {
             // glmf/glmf2 SM188/170 exports remain byte-identical (88/88 objects and SASS).
             // Router-only row tiles do not change RoutedBf16Projection or its default kernels.
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
-            ("gemm/bf16_gemv/_skinny.py", 0xf2bb7e72f51a9d1b_u64),
+            // Fork #257/#258 add ordered-K16 native HQA tiles at non-Flash shapes;
+            // no existing Flash tile, threshold or accumulation order changes.
+            ("gemm/bf16_gemv/_skinny.py", 0x09c1666707b3a730_u64),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
