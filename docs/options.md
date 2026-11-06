@@ -54,6 +54,13 @@ keys below onto, and `cuteafd serve --family ID --help` lists a family's serve
 flags. Users set keys, not these flags or the `CUTEAFD_*` environment variables
 the launcher derives from them.
 
+`cuteafd kimi-golden --rtx-expert-layers auto|all|N` defaults to `auto`, using
+startup's real-device admission rather than forcing zero coordinator layers.
+Golden's expert-layer hint must cover the planner-selected Spark layers under
+`auto`; explicit `all` or `N` requires an exact list. Only the admitted list is
+sent to workers and loaded. Golden receipts record the chosen coordinator count,
+Spark layer IDs and inactive hinted/loaded counts.
+
 ## Identity and instance
 
 | Key | Default | Values | Notes |

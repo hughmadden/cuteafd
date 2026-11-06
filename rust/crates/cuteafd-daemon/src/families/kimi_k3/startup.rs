@@ -44,6 +44,28 @@ pub(crate) struct Loaded<'a> {
     pub engine: Engine<'a>,
     pub admission_free: Vec<u64>,
     pub admitted_bytes: Vec<u64>,
+    pub ownership: Ownership,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Ownership {
+    pub rtx_expert_layers: usize,
+    pub spark_layers: Vec<usize>,
+    pub inactive_seeded_layers: usize,
+    pub inactive_loaded_layers: usize,
+}
+
+pub(super) fn check_hosted_layers(setting: cuteafd_loader::placement::OnboardSetting,
+    selected: &[usize], seeded: &[usize]) -> Result<usize> {
+    ensure!(seeded.windows(2).all(|pair| pair[0] < pair[1]),
+        "Kimi worker layer subset must be sorted and unique");
+    if setting == cuteafd_loader::placement::OnboardSetting::Auto {
+        ensure!(selected.iter().all(|layer| seeded.binary_search(layer).is_ok()),
+            "Kimi worker layer subset is missing shared placement layers");
+    } else {
+        ensure!(selected == seeded, "Kimi worker layer subset differs from shared placement");
+    }
+    Ok(seeded.len() - selected.len())
 }
 
 /// Run before loading native programs, whose card selection can query the GPU.
@@ -215,10 +237,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             (0..RANKS).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
         spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
     let graph_set = admitted.graph_set.take();
-    if let Some(expected) = options.hosted_layers.as_ref() {
-        ensure!(admitted.working_set().spark_layers == *expected,
-            "Kimi worker layer subset differs from shared placement");
-    }
+    let spark_layers = admitted.working_set().spark_layers;
+    let inactive_seeded_layers = options.hosted_layers.as_ref().map(|expected|
+        check_hosted_layers(options.rtx_expert_layers, &spark_layers, expected)).transpose()?.unwrap_or(0);
+    // Golden's seed list is only a coverage hint. WorkerSelection loads exactly
+    // the admitted working set, never the inactive hinted layers.
+    let ownership = Ownership { rtx_expert_layers: admitted.placement.onboard_layers,
+        spark_layers, inactive_seeded_layers, inactive_loaded_layers: 0 };
     if let Some(set) = &graph_set {
         super::graphs::check_placement_for_ranks(cfg, &admitted.placement, &set.keys, RANKS)?;
         tracing::info!(executables = set.keys.len(), bytes = ?(0..RANKS)
@@ -226,6 +251,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             reserve = "estimated", "Kimi startup graph inventory");
     }
     tracing::info!(placement = %admitted.placement.summary(), rtx_expert_layers = admitted.placement.onboard_layers,
+        inactive_seeded_layers, inactive_loaded_layers = ownership.inactive_loaded_layers,
         prefix_marks = admitted.mark_selection.slots, marks = %admitted.mark_selection.summary(),
         spark_budget_gib, reserve = "estimated until W9 census",
         "Kimi admitted TP2 expert ownership");
@@ -275,7 +301,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             ensure!(bytes <= set.inventory.bytes(rank), "Kimi startup graphs exceed admitted reserve");
         }
     }
-    Ok(Loaded { engine, admission_free, admitted_bytes })
+    Ok(Loaded { engine, admission_free, admitted_bytes, ownership })
 }
 
 fn check_attention(attention: Option<cuteafd_loader::placement::AttentionPlacement>, ranks: usize, graphs: bool) -> Result<()> {
@@ -302,6 +328,19 @@ pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Dem
 mod tests {
     use super::*;
     use cuteafd_loader::families::kimi_k3::core::{CoreInventory,CoreProjection,CoreSplit};
+
+    #[test]
+    fn automatic_hosted_hint_may_cover_but_never_omit_selected_layers() -> Result<()> {
+        use cuteafd_loader::placement::OnboardSetting::{Auto, All, Layers};
+        assert_eq!(check_hosted_layers(Auto, &[3, 4], &[2, 3, 4])?, 1);
+        assert!(check_hosted_layers(Auto, &[3, 4], &[2, 3]).is_err());
+        for setting in [Layers(1), All] {
+            assert!(check_hosted_layers(setting, &[3, 4], &[2, 3, 4]).is_err());
+            assert_eq!(check_hosted_layers(setting, &[3, 4], &[3, 4])?, 0);
+        }
+        assert!(check_hosted_layers(Auto, &[3, 4], &[3, 3, 4]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn context_cannot_fall_back_to_single_rank_or_eager_decode() {

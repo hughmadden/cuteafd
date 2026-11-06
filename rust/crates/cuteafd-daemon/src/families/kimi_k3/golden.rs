@@ -52,8 +52,8 @@ pub(crate) struct GoldenArgs {
     #[arg(long, env = "CUTEAFD_ATTENTION_PLACEMENT", default_value = "auto",
         value_parser = ["auto", "heads", "context", "layers"])] attention_placement: String,
     #[arg(long)] check_headers: bool,
-    /// Routed layers split across both coordinator GPUs (rtx-tp2).
-    #[arg(long, default_value_t = 0)] rtx_expert_layers: usize,
+    /// Routed layers on coordinator GPUs: auto (startup planner), all or N.
+    #[arg(long, default_value = "auto")] rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     /// Complete per-rank allocation ceiling; still an offline estimate.
     #[arg(long)] spark_budget_gib: Option<f64>,
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
@@ -92,7 +92,7 @@ impl GoldenArgs {
     fn provenance(&self) -> Value {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
-            "rtx_expert_layers":self.rtx_expert_layers, "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
+            "rtx_expert_layers":self.rtx_expert_layers.to_string(), "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
             "resolved_attention_placement": self.resolved_attention(),
             "verify_rows": self.verify_rows, "graphs": (self.verify_rows.is_some() || self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context).then_some(&self.graphs), "grouped_kda": self.grouped_kda,
             "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
@@ -105,6 +105,13 @@ impl GoldenArgs {
         provenance["attention_bundle_fingerprint"] = serde_json::json!(view.fingerprint());
         provenance["attention_fp8_recipe"] = serde_json::json!(
             if view.mode() == AttentionMode::Fp8Compact { FP8_RECIPE } else { "none" });
+        provenance
+    }
+
+    fn loaded_provenance(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        ownership: &super::startup::Ownership) -> Value {
+        let mut provenance = self.selected_provenance(view);
+        provenance["resolved_ownership"] = serde_json::json!(ownership);
         provenance
     }
 
@@ -198,6 +205,22 @@ fn hosted_layers(value: &str) -> Result<Vec<usize>> {
     value.split(',').map(|s| s.parse::<usize>().context("Kimi hosted layer ID")).collect()
 }
 
+fn check_hosted_hint(setting: cuteafd_loader::placement::OnboardSetting,
+    cfg: &KimiK3Config, hosted: &[usize]) -> Result<()> {
+    let routed = cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer))
+        .collect::<Vec<_>>();
+    ensure!(hosted.iter().all(|layer| routed.binary_search(layer).is_ok()),
+        "Kimi worker layer hint includes a non-routed layer");
+    if let cuteafd_loader::placement::Onboard::Layers(count) = setting.resolve(routed.len()) {
+        ensure!(count <= routed.len(), "Kimi onboarding exceeds routed layer count");
+        super::startup::check_hosted_layers(setting, &routed[count..], hosted)?;
+    } else {
+        ensure!(hosted.windows(2).all(|pair| pair[0] < pair[1]),
+            "Kimi worker layer hint must be sorted and unique");
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     on_engine_thread(move || run(args)).await
 }
@@ -224,8 +247,8 @@ fn run(args: GoldenArgs) -> Result<()> {
     full.release_geometry()?;
     let cfg = admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
-    ensure!((1..=8).contains(&args.peers.len()) && hosted == cfg.dense.iter().enumerate()
-        .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
+    check_hosted_hint(args.rtx_expert_layers, &cfg, &hosted)?;
+    ensure!((1..=8).contains(&args.peers.len()),
         "Kimi diagnostic needs exactly the selected routed layers on the selected real ranks");
     if args.check_headers {
         println!("Kimi diagnostic reference/header binding valid: layers=0..{} rows={}; no numerical qualification",
@@ -265,8 +288,8 @@ fn full_run(args: GoldenArgs) -> Result<()> {
     let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
-    ensure!((1..=8).contains(&args.peers.len()) && hosted == cfg.dense.iter().enumerate()
-        .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
+    check_hosted_hint(args.rtx_expert_layers, &cfg, &hosted)?;
+    ensure!((1..=8).contains(&args.peers.len()),
         "Kimi full-forward needs the planned Spark routed subset on the selected real ranks");
     println!("Kimi all-layer run provenance: {}", args.selected_provenance(checkpoint.view.as_ref()
         .context("Kimi golden requires the immutable selected checkpoint view")?));
@@ -289,7 +312,7 @@ fn forward_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<
 }
 
 fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
-    windows: &[cuteafd_bench::reference::Window], capacity: usize) -> Result<()> {
+    windows: &[cuteafd_bench::reference::Window], capacity: usize, ownership: &super::startup::Ownership) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     use cuteafd_bench::{fidelity_rows, reference::Fidelity};
     use std::io::Write;
@@ -308,7 +331,7 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
             top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path("prefill");
-        probe.provenance(args.selected_provenance(engine.target_view()));
+        probe.provenance(args.loaded_provenance(engine.target_view(), ownership));
         for chunk in chunks {
             let (first, end) = (chunk.start, chunk.end);
             let sequences = vec![vec![super::device::SequenceRows {
@@ -349,7 +372,7 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
         "reference_config":cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG,
         "reference_revision":cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
         "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
-        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":args.selected_provenance(engine.target_view()),"score":score}))?;
+        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":args.loaded_provenance(engine.target_view(), ownership),"score":score}))?;
     Ok(())
 }
 
@@ -359,7 +382,8 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
 /// startup graphs on, every exact width up to `verify` replays; the final
 /// shorter cycle uses its own exact width.
 fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
-    windows: &[cuteafd_bench::reference::Window], capacity: usize, verify: usize, graphs: bool) -> Result<()> {
+    windows: &[cuteafd_bench::reference::Window], capacity: usize, verify: usize, graphs: bool,
+    ownership: &super::startup::Ownership) -> Result<()> {
     use cuteafd_api::openai::probe::{Probe, ProbeSpec};
     use cuteafd_bench::{fidelity_rows, reference::Fidelity};
     use cuteafd_engine::prefix::PrefixFamily;
@@ -384,7 +408,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
             top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path(if graphs { "verify-graphs" } else { "verify-eager" });
-        probe.provenance(args.selected_provenance(engine.target_view()));
+        probe.provenance(args.loaded_provenance(engine.target_view(), ownership));
         // Prompt prefix: rows 0..score_from-1, chunked at the lane capacity.
         let prefix = window.score_from - 1;
         for first in (0..prefix).step_by(capacity) {
@@ -438,7 +462,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
         "reference_config":cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG,
         "reference_revision":cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
         "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
-        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":args.selected_provenance(engine.target_view()),
+        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":args.loaded_provenance(engine.target_view(), ownership),
         "graph_replays":replays,"score":score}))?;
     Ok(())
 }
@@ -452,7 +476,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         cache_format: args.kv_cache, devices,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         native_lib: args.native_lib.as_deref().context("--native-lib required")?,
-        peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(args.rtx_expert_layers),
+        peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
         spark_budget_gib: args.spark_budget_gib,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
@@ -481,7 +505,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let graphs = args.startup_graphs()?;
     ensure!(args.device >= 0 && args.split_device.is_none_or(|peer| peer >= 0 && peer != args.device),
         "Kimi golden devices must name distinct physical owners");
-    let super::startup::Loaded { engine, admission_free, admitted_bytes } = match args.split_device {
+    let super::startup::Loaded { engine, admission_free, admitted_bytes, ownership } = match args.split_device {
         Some(peer) => load_target(args, &library, &programs, checkpoint, full, cfg,
             [args.device, peer], prefill, graphs, verify.unwrap_or(0))?,
         None => load_target(args, &library, &programs, checkpoint, full, cfg,
@@ -502,9 +526,9 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let mut pool = super::prefix::diagnostic_pool(layout);
     let actual = if let Some(windows) = scoring {
         if let Some(verify) = verify {
-            score_verify(args, &engine, &mut pool, windows, rows, verify, graphs)?;
+            score_verify(args, &engine, &mut pool, windows, rows, verify, graphs, &ownership)?;
         } else {
-            score_windows(args, &engine, &mut pool, windows, rows)?;
+            score_windows(args, &engine, &mut pool, windows, rows, &ownership)?;
         }
         None
     } else {
@@ -619,6 +643,15 @@ mod tests {
         assert_eq!(parsed.last_layer, Some(3));
         assert_eq!(parsed.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
         assert_eq!(parsed.split_device, None);
+        use cuteafd_loader::placement::OnboardSetting;
+        assert_eq!(parsed.rtx_expert_layers, OnboardSetting::Auto);
+        for (value, expected) in [("auto", OnboardSetting::Auto), ("all", OnboardSetting::All),
+            ("0", OnboardSetting::Layers(0)), ("5", OnboardSetting::Layers(5))] {
+            let crate::cli::Commands::KimiGolden(selected) = crate::cli::Cli::try_parse_from(
+                args.into_iter().chain(["--rtx-expert-layers", value]))?.command else { panic!("Kimi command"); };
+            assert_eq!(selected.rtx_expert_layers, expected);
+            assert_eq!(selected.provenance()["rtx_expert_layers"], value);
+        }
         let crate::cli::Commands::KimiGolden(pair) = crate::cli::Cli::try_parse_from(
             args.into_iter().chain(["--device", "0", "--split-device", "1"]))?.command else { panic!("Kimi command"); };
         assert_eq!((pair.device, pair.split_device), (0, Some(1)));

@@ -1867,7 +1867,7 @@ mod packing_inventory_tests {
             "kimik3_mla_draft_lse_combine2"];
         let core = serde_json::json!({"row_policies": []});
         for metadata in [None, Some(&core)] {
-            let catalogue = packing_inventory(metadata)?;
+            let catalogue = packing_inventory(metadata, &[])?;
             let inventory = classify_packing_inventory(draft, &catalogue)?;
             assert_eq!(inventory.len(), draft.len());
             for (name, role) in inventory {
