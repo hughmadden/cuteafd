@@ -246,7 +246,9 @@ class Recorder:
             path = self.frame_paths[filename]
             if path:
                 self.frames.add(path)
-                self.functions.add((path, frame.f_code.co_qualname))
+                if not (path == "scripts/build/kernel-records.py"
+                        and frame.f_code.co_qualname.startswith("BackendCache.")):
+                    self.functions.add((path, frame.f_code.co_qualname))
                 # Active callers can hold function-local package imports that
                 # do not execute again inside the measured constructor.
                 names = (*frame.f_code.co_names, *frame.f_code.co_varnames, *frame.f_code.co_freevars)

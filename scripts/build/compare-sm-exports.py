@@ -676,6 +676,10 @@ def worker(payload):
     AotProgram.export_to_c = export_with_plan
     recorder = None
     if payload.get("program_records"):
+        # The ordinary cache fingerprints the package, not frontend semantics.
+        # Warm that bookkeeping before observing actual recipe dependencies.
+        from b12x._lib.compiler import b12x_package_fingerprint
+        b12x_package_fingerprint()
         records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
         backend_cache = None
         if payload.get("backend_cache"):
