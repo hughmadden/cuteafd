@@ -201,6 +201,10 @@ mod tests {
         assert_ne!(hqa.fingerprint(), compact.fingerprint());
         assert_ne!(hqa.fingerprint(), fp8.fingerprint());
         assert_ne!(compact.fingerprint(), fp8.fingerprint());
+        let identities = [&hqa, &compact, &fp8].into_iter().map(|view|
+            crate::plan::checkpoint::identity::CheckpointIdentity::from_view(view, None)
+                .map(|identity| identity.fingerprint)).collect::<Result<std::collections::BTreeSet<_>>>()?;
+        assert_eq!(identities.len(), 3, "bootstrap identities must separate every attention mode");
         std::fs::remove_file(dir.path().join("hqa.safetensors"))?;
         let checkpoint = Checkpoint::open_view(&compact)?;
         assert!(checkpoint.missing_shards.is_empty());
