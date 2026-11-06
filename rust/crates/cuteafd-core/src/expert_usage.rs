@@ -248,7 +248,7 @@ impl Reader {
         unchanged: impl FnOnce(u64) -> bool,
     ) -> Result<Selected, SelectionError> {
         let guard = self.0.read().unwrap_or_else(|e| e.into_inner());
-        let Some(history) = guard.as_ref() else {
+        let Some(history) = guard.history.as_ref() else {
             return Ok(Selected::Disabled);
         };
         let latest = history.samples.back().unwrap();
