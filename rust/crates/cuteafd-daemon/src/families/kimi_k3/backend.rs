@@ -113,6 +113,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+        self.engine.usage_phase(cuteafd_ffi::expert_usage::UsagePhase::Prefill);
         self.engine.step_device(&mut [(placement, tokens)], pool, logit_rows.max(1), true)
             .map(|logits| (logit_rows > 0).then_some(logits))
     }
@@ -122,6 +123,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Placement, DraftState>],
         pool: &RefPagePool, on_logits: &mut dyn FnMut(usize, DeviceLogits)
             -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
+        self.engine.usage_phase(cuteafd_ffi::expert_usage::UsagePhase::Prefill);
         let segments = crate::shared::prefill_packing::plan(&sequences.iter()
             .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &self.engine.packed_limits()?)?;
         let mut target = Vec::with_capacity(sequences.len());
@@ -150,12 +152,17 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+        self.engine.usage_phase(cuteafd_ffi::expert_usage::UsagePhase::Decode);
         if speculative { return self.engine.verify_device(sequences, pool, true).map(Some); }
         let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         self.engine.step_device(sequences, pool, rows, true).map(Some)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        _kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+        kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+        self.engine.usage_phase(match kind {
+            scheduler::UngraphedKind::Scoring => cuteafd_ffi::expert_usage::UsagePhase::Prefill,
+            scheduler::UngraphedKind::Decode => cuteafd_ffi::expert_usage::UsagePhase::Decode,
+        });
         if speculative { return self.engine.verify_device(sequences, pool, false).map(Some); }
         let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         self.engine.step_device(sequences, pool, rows, false).map(Some)
@@ -486,7 +493,8 @@ mod tests {
                 ensure!(sequences.iter().map(|s| s.tokens.len()).sum::<usize>() > 64,
                     "Kimi golden pack must cross the total-row arithmetic boundary");
                 if packed {
-                    let segments = crate::shared::prefill_packing::plan(&sequences.iter()
+                    self.engine.usage_phase(cuteafd_ffi::expert_usage::UsagePhase::Prefill);
+        let segments = crate::shared::prefill_packing::plan(&sequences.iter()
                         .map(|s| (s.start, s.tokens.len())).collect::<Vec<_>>(), &backend.engine.packed_limits()?)?;
                     let starts = sequences.iter().map(|s| s.start).collect::<Vec<_>>();
                     let mut target = sequences.iter_mut().map(|s| (&mut *s.placement, s.tokens)).collect::<Vec<_>>();
@@ -634,7 +642,7 @@ mod tests {
         let prefill = args.prefill()?;
         let peer = args.split_device.context("two-GPU packing gate requires --split-device")?;
         let loaded = super::super::startup::load(&library, &programs, &checkpoint, &cfg, &cfg,
-            super::super::startup::Options { cache_format: args.kv_cache, devices: [args.device, peer],
+            super::super::startup::Options { expert_usage: false, expert_usage_reader: Default::default(), cache_format: args.kv_cache, devices: [args.device, peer],
                 attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
                 native_lib: &args.native_lib, peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
                 spark_budget_gib: args.spark_budget_gib, rows: usize::try_from(prefill.span_rows)?,

@@ -159,6 +159,7 @@ impl<'a> Engine<'a> {
         mut draft: Option<super::draft::NativeDraft<'a>>,
         draft_records: crate::shared::experts::rtx::dense::Records,
         mut admission: super::admission::Admission<'a>,
+        usage_reader: cuteafd_core::expert_usage::Reader,
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; RANKS],
         context_programs: [Option<Rc<super::context::Programs<'a>>>; RANKS],
@@ -172,6 +173,13 @@ impl<'a> Engine<'a> {
             "Kimi startup needs process latent geometry and 1..8 real expert ranks");
         let coordinator_packing_cap = programs.iter().map(|programs| programs.packing_cap).min().unwrap_or(0);
         let plan = admission.execution_plan()?;
+        let expert_usage = admission.expert_usage.take().map(|geometry| {
+            let devices = cuteafd_loader::placement::families::kimi::usage_devices(&geometry, RANKS)
+                .into_iter().map(|logical| cuteafd_ffi::expert_usage::UsageDevice {
+                    logical, cuda: programs[usize::from(logical)].device.id }).collect::<Vec<_>>();
+            cuteafd_ffi::expert_usage::ExpertUsage::new(library, geometry, &devices, usage_reader)
+                .map(Rc::new)
+        }).transpose()?;
         cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
         ensure!(matches!(RANKS, 1 | 2), "Kimi startup physical rank count");
         let devices = programs.each_ref().map(|programs| programs.device);
@@ -258,6 +266,7 @@ impl<'a> Engine<'a> {
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
         let mut engine = Self::bind(exchange_streams.into(), plan, peer, hops,
             local, routed, io, experts, prefill, coordinator_packing_cap)?;
+        engine.execution.expert_usage = expert_usage;
         engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
         engine.host_prefix = admission.host_prefix.take();
         engine.draft = draft.map(Rc::new);
@@ -485,6 +494,10 @@ impl<'a> Engine<'a> {
     pub(crate) fn set_grouped_kda(&self, enabled: bool) -> Result<()> {
         for local in self.lanes.try_borrow()?.local.iter().flatten() { local.set_grouped_kda(enabled)?; }
         Ok(())
+    }
+
+    pub(crate) fn usage_phase(&self, phase: cuteafd_ffi::expert_usage::UsagePhase) {
+        self.execution.usage_phase.set(phase);
     }
 
     pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key]) -> Result<()> {

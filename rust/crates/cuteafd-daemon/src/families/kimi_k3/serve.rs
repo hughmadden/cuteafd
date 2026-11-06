@@ -11,6 +11,9 @@ pub(crate) struct ServeArgs {
     /// Target and drafter share the exact selected MLA record.
     #[arg(long, default_value = "fp8")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,
+    /// Aggregate executed routed-expert selections on each canonical producer GPU.
+    #[arg(long)] pub expert_usage: bool,
+    #[arg(skip)] pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)] pub device: i32,
@@ -103,6 +106,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
         snapshot: snapshot.clone(), fp8: args.draft_fp8, cache_format: args.kv_cache });
     startup::load(library, programs, checkpoint, cfg, cfg, startup::Options {
+        expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
@@ -127,7 +131,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         let (organization, model) = name.split_once("--")?;
         Some(format!("{organization}/{model}"))
     })).context("Kimi serving requires --model-id for a snapshot without HF identity")?;
-    let profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
+    let mut profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
+    profile.expert_usage = args.expert_usage_reader.clone();
     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
@@ -224,6 +229,17 @@ mod tests {
         let cli = crate::cli::Cli::try_parse_from(argv)?;
         let crate::cli::Commands::ServeKimi(args) = cli.command else { panic!("Kimi command") };
         Ok(args)
+    }
+
+    #[test]
+    fn expert_usage_off_and_skip_have_no_reader_or_native_owners() -> Result<()> {
+        let off = args(&[])?;
+        assert!(!off.expert_usage);
+        assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
+        assert!(args(&["--expert-usage"])?.expert_usage);
+        assert!(!off.expert_usage_reader.configure(true, true).map_err(anyhow::Error::msg)?);
+        assert!(off.expert_usage_reader.require_enabled().is_err());
+        Ok(())
     }
 
     #[test]
