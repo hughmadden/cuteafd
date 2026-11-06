@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import shutil
+import tempfile
 
 _ROOT = None
 _TEMPLATES = {}
@@ -15,6 +16,12 @@ def configure(root):
     global _ROOT
     _ROOT = root
     _TEMPLATES.clear()
+
+
+def _template_dir():
+    """A fresh directory per template: a copy that fails partway leaves its
+    own debris, never a name the next template would reuse."""
+    return Path(tempfile.mkdtemp(prefix="template-", dir=_ROOT))
 
 
 def copy_input(source, destination):
@@ -35,7 +42,7 @@ def copy_input(source, destination):
         return shutil.copy(source, destination)
     key = source.resolve()
     if key not in _TEMPLATES:
-        cached = _ROOT / str(len(_TEMPLATES))
+        cached = _template_dir() / source.name
         shutil.copy(source, cached)
         _TEMPLATES[key] = cached
     # A shared dependency may already have been staged before an explicit copy.
@@ -102,7 +109,7 @@ def copy_tree(source, destination, **kwargs):
         return shutil.copytree(source, destination, **kwargs)
     key = ('tree', Path(source).resolve())
     if key not in _TEMPLATES:
-        cached = _ROOT / str(len(_TEMPLATES))
+        cached = _template_dir() / "tree"
         shutil.copytree(source, cached, **kwargs)
         _TEMPLATES[key] = cached
 
