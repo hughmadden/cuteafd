@@ -1802,6 +1802,8 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
     if family == "deepseek_v41":
         keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
                  "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
+    if family == "qwen4" and rtx_gpus == 2:
+        keys += "SPARK_COUNT=0\n"
     if override:
         keys += f"CONCURRENCY={4 if override == 'config' else 7}\n"
     result = _family_launch_result(tmp_path, config, model, keys, physical_gpus=tuple(range(rtx_gpus)),
