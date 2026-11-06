@@ -279,7 +279,6 @@ class Recorder:
         self.restores = []
         self.frame_paths = {}
         self.functions = set()
-        self.seen_codes = set()
         self.imported = set()
         self.construction = False
         self.latest = []
@@ -291,7 +290,7 @@ class Recorder:
         return sys.monitoring.DISABLE
 
     def start_monitoring(self):
-        for tool_id in range(6):
+        for tool_id in (3, 4):
             if sys.monitoring.get_tool(tool_id) is None:
                 sys.monitoring.use_tool_id(tool_id, "cuteafd-kernel-records")
                 self.monitoring_id = tool_id
@@ -299,6 +298,7 @@ class Recorder:
         if self.monitoring_id is None:
             raise RuntimeError("no sys.monitoring tool ID available for source recording")
         sys.monitoring.register_callback(self.monitoring_id, sys.monitoring.events.PY_START, self._start)
+        sys.monitoring.restart_events()
         sys.monitoring.set_events(self.monitoring_id, sys.monitoring.events.PY_START)
 
     def stop_monitoring(self):
@@ -341,11 +341,10 @@ class Recorder:
                     self.functions.add((path, frame.f_code.co_qualname))
                 # Active callers can hold function-local package imports that
                 # do not execute again inside the measured constructor.
-                names = (*frame.f_code.co_names, *frame.f_code.co_varnames, *frame.f_code.co_freevars)
+                names = (*frame.f_code.co_names, *frame.f_code.co_varnames,
+                         *frame.f_code.co_freevars, *frame.f_code.co_cellvars)
                 self._record_dependencies(frame.f_locals.get(name) for name in names)
-                if frame.f_code not in self.seen_codes:
-                    self.seen_codes.add(frame.f_code)
-                    self._record_dependencies(frame.f_globals.get(name) for name in frame.f_code.co_names)
+                self._record_dependencies(frame.f_globals.get(name) for name in frame.f_code.co_names)
 
     def _record_dependencies(self, values):
         for value in values:
@@ -531,7 +530,8 @@ def numeric_deltas(old, new, prefix=""):
 
 def write_report(destination, report):
     (destination / "CHANGES.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    lines = ["# Kernel Changes", "", "Program groups are the publication's export job names.", ""]
+    lines = ["# Kernel Changes", "", "Program groups are the publication's export job names.",
+             "Source observations are cumulative within each worker; Sources lists show only changed source hashes.", ""]
     if report.get("sm170_mismatches"):
         lines += ["## HARD FAILURE: SM 170 / 188 OBJECT MISMATCH", "",
                   *[f"- `{name}`" for name in report["sm170_mismatches"]], ""]
