@@ -567,3 +567,114 @@ fn auto_vision_can_disable_inside_joint_ml4_capacity_solve() {
     let explicit = input.plan(&options).unwrap();
     assert!(!explicit.placement_supported, "explicit tower must refuse at the admitted pool");
 }
+
+/// A dual-view publication with the parent's original shards untouched. The
+/// native shard is deliberately separate so Compact can lose it physically.
+fn hqa_snapshot() -> tempfile::TempDir {
+    use crate::plan::checkpoint::view::{COMPACT_CONFIG, COMPACT_INDEX, COMPACT_QUANT};
+    use serde_json::json;
+    let dir = snapshot(true, Some(EXPERT_LAYERS));
+    let root = dir.path();
+    let mut config = crate::read_json_file(&root.join("config.json")).unwrap();
+    let mut quant = crate::read_json_file(&root.join("quantize_config.json")).unwrap();
+    let mut index = crate::read_json_file(&root.join("consolidated.safetensors.index.json")).unwrap();
+    let mut compact = config.clone();
+    compact["transformers_weights"] = json!(COMPACT_INDEX);
+    compact["quantization_config"]["per_module_metadata"] = json!(format!("{COMPACT_QUANT}:tensor_storage"));
+    let mut compact_quant = quant.clone();
+    compact_quant["per_module_metadata"] = json!(format!("{COMPACT_QUANT}:tensor_storage"));
+    for (name, value) in [(COMPACT_CONFIG, &compact), (COMPACT_INDEX, &index), (COMPACT_QUANT, &compact_quant)] {
+        std::fs::write(root.join(name), value.to_string()).unwrap();
+    }
+    let restored: Vec<_> = testing::mistral_large4_tensors(Some(&[]), false).into_iter()
+        .filter(|(name, _, _)| name.strip_prefix("layers.").and_then(|tail| tail.split_once('.'))
+            .is_some_and(|(_, leaf)| ["attention.wq.", "attention.wo."].iter().any(|prefix| leaf.starts_with(prefix))))
+        .collect();
+    let shard = "hqa-attention-00001-of-00001.safetensors";
+    testing::write_safetensors(&root.join(shard), &restored);
+    let view = json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa", "views": {
+        "hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
+        "compact-attention":{"config":COMPACT_CONFIG, "index":COMPACT_INDEX, "quantize":COMPACT_QUANT}},
+        "native_modules":"quantize_config.json:native_attention"});
+    let mut native = serde_json::Map::new();
+    for (name, _, shape) in restored.iter().filter(|(name, _, _)| name.ends_with(".weight")) {
+        let stem = name.strip_suffix(".weight").unwrap();
+        index["weight_map"].as_object_mut().unwrap().retain(|name, _| !name.starts_with(&format!("{stem}.")));
+        quant["tensor_storage"].as_object_mut().unwrap().remove(stem);
+        let scale = format!("{stem}.qscale_weight");
+        native.insert(stem.into(), json!({"format":"fp8_e4m3_block_scaled", "shard":shard,
+            "compact_attention_bits":6, "tensors": {
+                name:{"dtype":"F8_E4M3", "shape":shape},
+                scale.clone():{"dtype":"F32", "shape":shape.iter().map(|n| n.div_ceil(128)).collect::<Vec<_>>()}},
+            "scale":{"tensor":scale, "dtype":"F32", "block_size":[128,128],
+                "semantics":"checkpoint-native: original FP8 weight with its original per-block FP32 scale"}}));
+    }
+    for (name, _, _) in &restored { index["weight_map"][name] = json!(shard); }
+    config["transformers_weights"] = json!("model.safetensors.index.json");
+    config["quantization_config"]["attention_view"] = view.clone();
+    quant["attention_view"] = view;
+    quant["native_attention"] = json!(native);
+    for (name, value) in [("config.json", &config), ("quantize_config.json", &quant),
+        ("model.safetensors.index.json", &index)] {
+        std::fs::write(root.join(name), value.to_string()).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn hqa_native_fp8_attention_is_complete_and_refuses_until_projection_is_available() {
+    use crate::families::mistral_large4::attention::{self, AttentionError};
+    use crate::plan::checkpoint::view::{AttentionMode, CheckpointView};
+    let dir = hqa_snapshot();
+    let view = CheckpointView::select(dir.path(), AttentionMode::Hqa).unwrap();
+    let checkpoint = Checkpoint::open_view(&view).unwrap();
+    let cfg = Ml4Config::from_hf(&checkpoint.config).unwrap();
+    assert!(matches!(attention::validate(&checkpoint, &cfg), Err(AttentionError::ProjectionPending)));
+    assert!(Model::open(&checkpoint).err().unwrap().to_string().contains("native FP8 attention projection pending"));
+    assert!(!checkpoint.contains_tensor("layers.0.attention.wq.trellis"));
+    assert_eq!(checkpoint.tensors.iter().filter(|tensor| tensor.shard.starts_with("hqa-attention-")).count(), 288);
+    for (name, dtype) in [("layers.0.attention.wq.weight", cuteafd_core::DType::Bf16),
+        ("layers.71.attention.wo.qscale_weight", cuteafd_core::DType::Bf16)] {
+        let mut bad = Checkpoint::open_view(&view).unwrap();
+        bad.tensors.iter_mut().find(|tensor| tensor.meta.name == name).unwrap().meta.dtype = dtype;
+        assert!(matches!(attention::validate(&bad, &cfg), Err(AttentionError::NativeTensor { tensor, .. }) if tensor == name));
+    }
+    let mut missing = Checkpoint::open_view(&view).unwrap();
+    missing.tensors.retain(|tensor| tensor.meta.name != "layers.39.attention.wo.qscale_weight");
+    assert!(matches!(attention::validate(&missing, &cfg), Err(AttentionError::NativeTensor { .. })));
+}
+
+#[test]
+fn compact_hqa_view_loads_without_native_shards_and_preserves_parent_owners() {
+    use crate::plan::checkpoint::view::{AttentionMode, CheckpointView};
+    let parent = snapshot(true, Some(EXPERT_LAYERS));
+    let parent = Checkpoint::open(parent.path()).unwrap();
+    let dir = hqa_snapshot();
+    std::fs::remove_file(dir.path().join("hqa-attention-00001-of-00001.safetensors")).unwrap();
+    let compact = CheckpointView::select(dir.path(), AttentionMode::Compact).unwrap();
+    let hqa = CheckpointView::select(dir.path(), AttentionMode::Hqa).unwrap();
+    assert_ne!(compact.fingerprint(), hqa.fingerprint());
+    assert!(Checkpoint::open_view(&hqa).is_err());
+    let checkpoint = Checkpoint::open_view(&compact).unwrap();
+    Model::open(&checkpoint).unwrap();
+    assert!(checkpoint.tensors.iter().all(|tensor| !tensor.shard.starts_with("hqa-attention-")));
+    assert_eq!(checkpoint.tensors.len(), parent.tensors.len());
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let owners = crate::placement::families::glm5::attention_owners(&cfg, cfg.layers).unwrap();
+    for (ranks, owners) in [(1, None), (2, None), (2, Some(owners.as_slice()))] {
+        assert_eq!(crate::plan::layout::glm5::resident_owned(&checkpoint, ranks, cfg.layers, owners).unwrap(),
+            crate::plan::layout::glm5::resident_owned(&parent, ranks, cfg.layers, owners).unwrap());
+    }
+}
+
+#[test]
+fn compact_hqa_view_refuses_incomplete_or_mixed_metadata() {
+    use crate::plan::checkpoint::view::{AttentionMode, CheckpointView, COMPACT_CONFIG, COMPACT_QUANT};
+    let dir = hqa_snapshot();
+    let quant = std::fs::read(dir.path().join(COMPACT_QUANT)).unwrap();
+    std::fs::remove_file(dir.path().join(COMPACT_QUANT)).unwrap();
+    assert!(CheckpointView::select(dir.path(), AttentionMode::Compact).is_err());
+    std::fs::write(dir.path().join(COMPACT_QUANT), quant).unwrap();
+    std::fs::copy(dir.path().join("config.json"), dir.path().join(COMPACT_CONFIG)).unwrap();
+    assert!(CheckpointView::select(dir.path(), AttentionMode::Compact).is_err());
+}

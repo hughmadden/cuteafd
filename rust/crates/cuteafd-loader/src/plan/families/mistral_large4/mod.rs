@@ -268,6 +268,7 @@ pub(crate) struct Model {
 impl Model {
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
         let cfg = Ml4Config::from_hf(&checkpoint.config)?;
+        crate::families::mistral_large4::attention::validate(checkpoint, &cfg)?;
         let expected = expected(&cfg);
         // The index names every runtime tensor; its storage form is the
         // tensor contract's verdict (`accepts`), which names recipe drift.
