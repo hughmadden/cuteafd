@@ -599,6 +599,32 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     assert!(admitted <= lead["capacity_bytes"].as_u64().unwrap());
 }
 
+fn assert_unique_deployment_devices(deployment: &serde_json::Value, name: &str) {
+    let devices = deployment["memory_layout"]["devices"].as_array().expect("device ledger");
+    let mut identities = std::collections::BTreeSet::new();
+    for device in devices {
+        let identity = (device["kind"].as_str().unwrap(), device["index"].as_u64().unwrap());
+        assert!(identities.insert(identity), "{name}: duplicate device ledger {identity:?}");
+    }
+    for role in deployment["spark_roles"].as_array().expect("solved Spark roles") {
+        let rank = role["rank"].as_u64().unwrap();
+        let device = devices.iter().find(|device| device["kind"] == "spark" && device["index"] == rank)
+            .unwrap_or_else(|| panic!("{name}: Spark role {rank} has no device ledger"));
+        assert!(device["worker_budget_bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+            "{name}: Spark role {rank} has no allocation ceiling");
+    }
+}
+
+#[test]
+fn deployment_device_audit_rejects_duplicate_physical_sparks() {
+    let device = serde_json::json!({"kind": "spark", "index": 0, "worker_budget_bytes": 1024});
+    let mut deployment = serde_json::json!({"memory_layout": {"devices": [device.clone()]},
+        "spark_roles": [{"rank": 0, "experts": true}]});
+    assert_unique_deployment_devices(&deployment, "unique");
+    deployment["memory_layout"]["devices"].as_array_mut().unwrap().push(device);
+    assert!(std::panic::catch_unwind(|| assert_unique_deployment_devices(&deployment, "duplicate")).is_err());
+}
+
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
     root: &std::path::Path) {
@@ -715,6 +741,7 @@ capture_qwen4_real_planner_launch(*map(Path, sys.argv[2:]))
         assert!(output.status.success(), "{name}: {stderr}");
         assert!(elapsed < std::time::Duration::from_secs(30), "{name}: plan took {elapsed:?}");
         let deployment = release_accepts_prefill(&output.stdout);
+        assert_unique_deployment_devices(&deployment, name);
         tested += 1;
         families.insert(deployment["family"].as_str().unwrap().to_owned());
         eprintln!("{name}: {} unit_rows={} waves={} slots={} span_rows={}", deployment["family"],
