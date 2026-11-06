@@ -139,6 +139,10 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     report.family = Some(family.id().into());
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
+    // Shared encoder admission precedes native dense/expert accounting.
+    if let Some(vision) = bundled_vision_component(checkpoint)? {
+        report.components.push(vision);
+    }
     if family.id() == "glm5" {
         super::layout::resolve_prefill(input, &mut report, &mut resolved_layout, world, family.prefill_limits())?;
     }
@@ -218,11 +222,11 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             else { layers - first_moe_layer };
         components.insert(component, (count, bytes));
     }
-    report.components = components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
+    report.components.extend(components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
         component, owner: if component == Component::RoutedExpert { super::Owner::SparkSliced }
             else { super::Owner::Rtx }, tensors, bytes, formats: BTreeMap::from([("exlr8".into(), tensors)]),
         status: Status::Ready, rejected: 0, rejections: Vec::new(),
-    }).collect();
+    }));
     if placement.onboard_layers > 0 {
         report.components.push(super::ComponentPlan { component: Component::RoutedExpert,
             owner: super::Owner::Rtx, tensors: placement.onboard_layers, bytes: local_routed,
@@ -263,6 +267,23 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     }
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
+}
+
+pub(super) fn bundled_vision_component(checkpoint: &super::Checkpoint) -> Result<Option<super::ComponentPlan>> {
+    let mut tensors = 0usize;
+    let mut bytes = 0u64;
+    let mut formats = BTreeMap::new();
+    for tensor in &checkpoint.tensors {
+        if !tensor.meta.name.starts_with("model.visual.") { continue; }
+        tensors += 1;
+        bytes = bytes.checked_add(tensor.meta.byte_length).context("EXLR8 vision bytes overflow")?;
+        *formats.entry(serde_json::to_value(&tensor.meta.dtype)?.as_str()
+            .context("EXLR8 vision dtype is not a scalar format")?.to_owned()).or_default() += 1;
+    }
+    Ok((tensors > 0).then_some(super::ComponentPlan {
+        component: super::Component::Vision, owner: super::Owner::Rtx, tensors, bytes, formats,
+        status: super::Status::Ready, rejected: 0, rejections: Vec::new(),
+    }))
 }
 
 fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,

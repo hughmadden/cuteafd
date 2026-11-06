@@ -1627,6 +1627,12 @@ mod tests {
         let checkpoint = crate::plan::exlr8::inventory(root.path(), config.clone(), |_| true).unwrap();
         assert_eq!(checkpoint.tensors.len(), 1);
         assert_eq!(checkpoint.tensors[0].meta.name, "model.visual.patch_embed.proj.weight");
+        let vision = crate::plan::exlr8::bundled_vision_component(&checkpoint).unwrap().unwrap();
+        assert_eq!(vision.component, crate::plan::Component::Vision);
+        assert_eq!((vision.tensors, vision.bytes), (1, 2));
+        assert_eq!(vision.formats.values().sum::<usize>(), 1);
+        let text_only = crate::plan::exlr8::inventory(root.path(), config.clone(), |_| false).unwrap();
+        assert!(crate::plan::exlr8::bundled_vision_component(&text_only).unwrap().is_none());
         write(&["model.visual.patch_embed.proj.weight", "model.language_model.norm.weight"]);
         assert!(matches!(DenseRecord::inventory(root.path()), Err(DenseError::NativeMetadata { path: p, .. }) if p == path));
         assert!(crate::plan::exlr8::catalog_headers(root.path()).is_err());
