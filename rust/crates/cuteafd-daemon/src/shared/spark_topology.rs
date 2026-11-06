@@ -216,6 +216,8 @@ mod tests {
                 }
                 else { None };
             let options = PlanOptions {
+                // This topology fixture publishes owned-MLA programs, not Context kernels.
+                attention_placement: (family == "kimik3").then_some(cuteafd_loader::placement::AttentionPlacement::Layers),
                 placement: ExpertPlacement::from_spark_ranks(8),
                 draft_ownership: Some(cuteafd_loader::plan::spec::DraftOwnership::None),
                 vision: cuteafd_loader::plan::MediaMode::Off, audio: cuteafd_loader::plan::MediaMode::Off,

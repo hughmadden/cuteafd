@@ -54,7 +54,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
     cfg: &KimiK3Config, mut options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
-    options.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(options.attention, RANKS));
+    if RANKS == 2 { options.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(options.attention, RANKS)); }
     check_attention(options.attention, RANKS, options.graphs)?;
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");

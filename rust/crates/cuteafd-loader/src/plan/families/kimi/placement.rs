@@ -303,7 +303,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
             headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
             spark_ranks: ranks, peer_access: gpus == 2 },
-        attention_placement: Some(attention), context_buffers, layers_first_gpu: 0,
+        // The single-owner solver uses auto/Heads with Whole-only physical modes.
+        attention_placement: if gpus == 2 { Some(attention) } else { report.requested_attention }, context_buffers, layers_first_gpu: 0,
         pool: PoolPolicy { compiled_context: context,
             requested: requested_pool, target: target_pool, floor: context,
             ceiling: target_pool.max(requested_pool.unwrap_or(0)), unit_rows: PAGE },

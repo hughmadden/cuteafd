@@ -1139,6 +1139,11 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     gpus = int(config["RTX_GPUS"])
     keys = "\n".join(line for line in raw.splitlines()
                      if not line.startswith(("MODEL_ID=", "MODEL_REVISION=", "ATTENTION_PLACEMENT="))) + "\nMODEL_REVISION=\n"
+    # Keep the actual drafter headers while the launcher uses its isolated HF root.
+    drafter = "models--" + config["SPECULATOR_MODEL_ID"].replace("/", "--")
+    hub = temporary / "hf" / "hub"
+    hub.mkdir(parents=True)
+    (hub / drafter).symlink_to((hf_home / "hub" / drafter).resolve(), target_is_directory=True)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/kimi-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
@@ -1149,7 +1154,8 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert result.returncode == 0, result.stderr
     deployment = json.loads(output.read_text())
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
-    expected = "context" if gpus == 2 else "layers"
+    # Single-owner placement retains the solver's Heads label with Whole-only modes.
+    expected = "context" if gpus == 2 else "heads"
     assert deployment["report"]["attention_placement"] == expected, deployment
     assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
     plans = [shlex.split(line) for line in result.stderr.splitlines()
@@ -1158,7 +1164,7 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
     assert plans[0][plans[0].index("--attention-placement") + 1] == "auto"
     serve = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
-    assert serve[serve.index("--pool-tokens") + 1] == "0"
+    assert "--pool-tokens" not in serve
     assert "CUTEAFD_ATTENTION_PLACEMENT=auto" in serve
     assert ("--split-device" in serve) == (gpus == 2)
     for device in deployment["memory_layout"]["devices"]:

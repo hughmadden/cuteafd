@@ -102,6 +102,7 @@ fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(110 << 30));
+    options.attention_placement = None;
     // This BF16 geometry fixture needs an explicit weight cap above the native text owners.
     options.coordinator_budget_bytes = 192 << 30;
     let layout = options.layout.as_mut().unwrap();
@@ -124,6 +125,7 @@ fn single_owner_header_plan_refuses_mandatory_weights_above_default_cap() {
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(110 << 30));
+    options.attention_placement = None;
     assert_eq!(options.coordinator_budget_bytes, ResidentWeights::DEFAULT_LIMIT.0);
     let layout = options.layout.as_mut().unwrap();
     layout.rtx_bytes = vec![192 << 30];

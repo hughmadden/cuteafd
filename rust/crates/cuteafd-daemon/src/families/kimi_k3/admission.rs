@@ -764,7 +764,7 @@ fn hop_spec_for_ranks(hidden: usize, rows: usize, lanes: usize, ranks: usize) ->
 
 fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequest> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi request physical rank count");
-    i.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(i.attention, RANKS));
+    if RANKS == 2 { i.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(i.attention, RANKS)); }
     let cfg = i.cfg;
     ensure!(cfg.layers > 0 && cfg.layers == cfg.attention.len() && cfg.layers == cfg.dense.len(),
         "Kimi admission layer inventory differs from checkpoint");
@@ -1099,7 +1099,7 @@ pub(super) mod tests {
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
         Inputs { cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
-            attention: Some(AttentionPlacement::Layers), context: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
+            attention: (RANKS == 2).then_some(AttentionPlacement::Layers), context: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 2048, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }, RANKS).unwrap()); 2],
@@ -1193,7 +1193,8 @@ pub(super) mod tests {
         let mut i = inputs_for_ranks::<1>(&cfg);
         i.attention = None;
         let single = admit(i)?;
-        assert_eq!(single.placement.attention_placement, AttentionPlacement::Layers);
+        assert_eq!(cuteafd_loader::families::kimi_k3::resolve_attention(None, 1), AttentionPlacement::Layers);
+        assert_eq!(single.placement.attention_placement, AttentionPlacement::Heads);
         assert!(single.context_layout().is_none());
         assert!(single.placement.layers.iter().all(|layer| layer.mode == WHOLE));
         Ok(())
@@ -1974,6 +1975,7 @@ pub(super) mod tests {
             assert!(request.pool.target > request.pool.floor);
             assert!(solve(&request)?.pool_tokens > request.pool.floor);
             let report = plan_input.plan(&PlanOptions {
+                attention_placement: Some(AttentionPlacement::Layers),
                 placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                     mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
