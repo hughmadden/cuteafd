@@ -88,7 +88,7 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
     let device = Device { library: &library, id: 0 };
     let socket_root = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/cuteafd/builds/glmf-draft-push-sockets");
     std::fs::create_dir_all(&socket_root)?;
-    let mut arms = 0;
+    let (mut arms, mut skipped) = (0, 0);
     for repo in ["incoai/GLM-5.3-Flash-DFlash2", "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"] {
         let snapshot = installed(repo)?;
         let (root, _) = cuteafd_loader::push_load::namespace(&snapshot).context("drafter outside SparkNest")?;
@@ -98,6 +98,12 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
         let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
         let mask = |hidden: usize| (0..hidden * 2).map(|i| (i % 251) as u8).collect::<Vec<_>>();
         for &representation in representations {
+            // BF16 dSpark projections are not exported by serving builds (dSpark serves FP8).
+            if dspark && representation == GlmDraftRepresentation::Bf16Only {
+                let cfg = crate::shared::speculation::block_dspark::DsparkConfig::read(&snapshot)?;
+                let name = format!("draft_bf16_k{}_n{}", cfg.taps.len() * cfg.hidden, cfg.hidden);
+                if !programs.contains(&name) { eprintln!("{repo} Bf16Only: skipped, build lacks {name}"); skipped += 1; continue; }
+            }
             let load = |recording: bool| -> Result<Loaded<'_>> {
                 device.run(|| Ok(if dspark {
                     let cfg = crate::shared::speculation::block_dspark::DsparkConfig::read(&snapshot)?;
@@ -153,6 +159,7 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
             arms += 1;
         }
     }
-    ensure!(arms == 2 * representations.len(), "expected every drafter/representation arm, ran {arms}");
+    ensure!(arms + skipped == 2 * representations.len() && skipped <= 1 && arms >= 2,
+        "expected every drafter/representation arm, ran {arms}, skipped {skipped}");
     Ok(())
 }
