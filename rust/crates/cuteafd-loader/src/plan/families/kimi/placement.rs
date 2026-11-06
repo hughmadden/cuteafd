@@ -425,6 +425,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             counts, rank_sets: if ranks > 0 { vec![(0..ranks as u8).collect()] } else { Vec::new() } }),
         arenas, spark, links, draft, fixed: fixed_owners, owners: Vec::new(),
     };
+    if manifest.is_some() {
+        let graph_result = (|| -> anyhow::Result<()> {
+            let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
+                crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
+                .transpose()?.unwrap_or(0);
+            recipe.balance_graphs(cfg, usize::try_from(slots)?, verify)
+        })();
+        if let Err(error) = graph_result {
+            report.refuse_placement(format!("Kimi graph inventory refused: {error:#}"), "Supply supported graph geometry.");
+            return memory;
+        }
+    }
     let occupied = vec![0u64; gpus];
     for (rank, baseline) in baseline.iter().enumerate() {
         if let crate::placement::Baseline::Planned { context_bytes, loaded_bytes } = baseline {
