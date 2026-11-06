@@ -204,6 +204,9 @@ impl Checkpoint {
         // Group once instead of scanning the complete index for every shard.
         let mut shards = BTreeMap::<&String, BTreeSet<&str>>::new();
         for (name, shard) in &weight_map {
+            ensure!(!shard.is_empty() && Path::new(shard).components().all(|component|
+                matches!(component, std::path::Component::Normal(_))),
+                "invalid checkpoint shard path {shard:?}");
             if needed(name) { shards.entry(shard).or_default().insert(name); }
         }
         let mut tensors = Vec::with_capacity(weight_map.len());
@@ -717,6 +720,20 @@ mod sliced_tests {
         std::fs::remove_file(dir.path().join("shard0.safetensors")).unwrap();
         let error = Checkpoint::open_for_role(dir.path(), "coordinator", local).unwrap_err().to_string();
         assert!(error.contains(names[0]) && error.contains("shard0.safetensors"));
+    }
+
+    #[test]
+    fn shard_paths_stay_inside_snapshot_even_for_unselected_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        for shard in ["/outside.safetensors", "../outside.safetensors", "dense/../../outside.safetensors", ""] {
+            std::fs::write(dir.path().join("model.safetensors.index.json"),
+                serde_json::to_vec(&json!({"weight_map": {"model.visual.weight": shard}})).unwrap()).unwrap();
+            for selected in [false, true] {
+                let error = Checkpoint::open_for_role(dir.path(), "vision", |_| selected).unwrap_err().to_string();
+                assert!(error.contains("invalid checkpoint shard path"), "{shard:?}: {error}");
+            }
+        }
     }
 
     #[test]

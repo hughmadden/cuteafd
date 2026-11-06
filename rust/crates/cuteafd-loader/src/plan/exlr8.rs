@@ -139,6 +139,10 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     report.family = Some(family.id().into());
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
+    // Shared encoder admission precedes native dense/expert accounting.
+    if let Some(vision) = bundled_vision_component(checkpoint)? {
+        report.components.push(vision);
+    }
     if family.id() == "glm5" {
         super::layout::resolve_prefill(input, &mut report, &mut resolved_layout, world, family.prefill_limits())?;
     }
@@ -218,11 +222,11 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
             else { layers - first_moe_layer };
         components.insert(component, (count, bytes));
     }
-    report.components = components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
+    report.components.extend(components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
         component, owner: if component == Component::RoutedExpert { super::Owner::SparkSliced }
             else { super::Owner::Rtx }, tensors, bytes, formats: BTreeMap::from([("exlr8".into(), tensors)]),
         status: Status::Ready, rejected: 0, rejections: Vec::new(),
-    }).collect();
+    }));
     if placement.onboard_layers > 0 {
         report.components.push(super::ComponentPlan { component: Component::RoutedExpert,
             owner: super::Owner::Rtx, tensors: placement.onboard_layers, bytes: local_routed,
@@ -255,14 +259,33 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
                 | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
     let mut memory = memory;
     append_spark_devices(&mut memory, layout, &residents);
+    append_spark_encoder(&mut memory, report.encoder.as_ref())?;
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
     if !model.contract_admission() {
         let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
         super::layout::charge_host(&mut report, layout, input, true)?;
     }
+    super::finalize_media_report(&mut report, checkpoint, family, model.spec())?;
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
+}
+
+pub(super) fn bundled_vision_component(checkpoint: &super::Checkpoint) -> Result<Option<super::ComponentPlan>> {
+    let mut tensors = 0usize;
+    let mut bytes = 0u64;
+    let mut formats = BTreeMap::new();
+    for tensor in &checkpoint.tensors {
+        if !tensor.meta.name.starts_with("model.visual.") { continue; }
+        tensors += 1;
+        bytes = bytes.checked_add(tensor.meta.byte_length).context("EXLR8 vision bytes overflow")?;
+        *formats.entry(serde_json::to_value(&tensor.meta.dtype)?.as_str()
+            .context("EXLR8 vision dtype is not a scalar format")?.to_owned()).or_default() += 1;
+    }
+    Ok((tensors > 0).then_some(super::ComponentPlan {
+        component: super::Component::Vision, owner: super::Owner::Rtx, tensors, bytes, formats,
+        status: super::Status::Ready, rejected: 0, rejections: Vec::new(),
+    }))
 }
 
 fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
@@ -274,6 +297,21 @@ fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
         items: vec![Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact)],
         kv_tokens: 0,
     }));
+}
+
+fn append_spark_encoder(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
+    encoder: Option<&super::encoder::EncoderPlacement>) -> Result<()> {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, Item};
+    if let Some(encoder) = encoder {
+        for rank in encoder.spark_ranks() {
+            let device = memory.devices.iter_mut().find(|device|
+                device.kind == DeviceKind::Spark && device.index as usize == rank)
+                .with_context(|| format!("EXLR8 vision owner Spark{rank} has no device ledger"))?;
+            device.items.push(Item::new(Category::Weights, "vision weights", "bundled encoder", encoder.weights, Basis::Exact));
+            device.items.push(Item::new(Category::Workspace, "vision scratch", "bundled encoder", encoder.scratch, Basis::Formula));
+        }
+    }
+    Ok(())
 }
 
 fn served_routed_layers(input: &residency::MetadataInput, layers: &[usize]) -> Result<()> {
@@ -454,7 +492,8 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
             // Local native names repeat across shards; bundled plain vision
             // keeps its qualified HF names for the shared encoder loader.
             let name = if native { format!("{shard}::{}", meta.name) } else { meta.name.clone() };
-            weight_map.insert(name.clone(), shard.clone());
+            ensure!(weight_map.insert(name.clone(), shard.clone()).is_none(),
+                "duplicate tensor {name} in native shard {shard}");
             if needed(&name) {
                 meta.name = name;
                 tensors.push(CheckpointTensor { shard: shard.clone(), meta });
@@ -1263,6 +1302,27 @@ mod tests {
         let body = include_str!("exlr8.rs").split("pub(super) fn native_plan_of(").nth(1).unwrap()
             .split("fn append_spark_devices(").next().unwrap();
         assert!(body.contains("append_spark_devices(&mut memory, layout, &residents)"));
+    }
+
+    #[test]
+    fn native_min_vision_weights_and_scratch_are_on_spark_zero() {
+        use cuteafd_core::memory_layout::{Category, DeviceKind, MemoryLayout};
+        let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 2097152,
+            waste: Vec::new(), notes: Vec::new() };
+        let encoder = super::super::encoder::EncoderPlacement {
+            kind: super::super::encoder::EncoderKind::Spark { rank: 0 },
+            weights: 1_128_026_176, scratch: 791_907_584, replicas: Vec::new(),
+            reason: "bundled tower".into(), shortfall: 0,
+        };
+        append_spark_devices(&mut memory, &Default::default(), &[105_213_559_040]);
+        append_spark_encoder(&mut memory, Some(&encoder)).unwrap();
+        let device = &memory.devices[0];
+        assert_eq!((device.kind, device.index), (DeviceKind::Spark, 0));
+        assert_eq!(device.items.len(), 3);
+        assert_eq!((device.items[1].category, device.items[1].bytes), (Category::Weights, encoder.weights));
+        assert_eq!((device.items[2].category, device.items[2].bytes), (Category::Workspace, encoder.scratch));
+        assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), 107_133_492_800);
+        assert_eq!(memory.pool_tokens, 2097152);
     }
 
     fn write(path: &Path, metadata: Value, tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)>) {

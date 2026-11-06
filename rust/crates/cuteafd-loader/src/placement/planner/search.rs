@@ -61,6 +61,7 @@ struct Group {
 }
 pub(super) struct Compiled {
     starts: Vec<u64>,
+    pool_page_multiple: u64,
     phase_order: PhaseOrder,
     groups: Vec<Group>,
     rows: usize,
@@ -112,6 +113,7 @@ impl Compiled {
         }
         Ok(Self {
             starts,
+            pool_page_multiple: contract.pool_page_multiple,
             phase_order: contract.phase_order,
             rows,
             memory_rows,
@@ -200,7 +202,8 @@ impl Compiled {
     ) -> Result<Option<u64>, Refusal> {
         let mut answer = None;
         for piece in 0..self.starts.len() - 1 {
-            let first = self.starts[piece].max(lower);
+            let first = self.starts[piece].max(lower).div_ceil(self.pool_page_multiple)
+                .checked_mul(self.pool_page_multiple).ok_or(Refusal::Overflow("pool page alignment"))?;
             let mut last = (self.starts[piece + 1] - 1).min(upper);
             if first > last {
                 continue;
@@ -218,6 +221,7 @@ impl Compiled {
                     last = last.min(first.saturating_add((available - required) / slope));
                 }
             }
+            last = last / self.pool_page_multiple * self.pool_page_multiple;
             if first <= last {
                 answer = Some(last);
             }
@@ -236,7 +240,8 @@ impl Compiled {
     ) -> Result<Option<u64>, Refusal> {
         let mut answer = None;
         for piece in 0..self.starts.len() - 1 {
-            let first = self.starts[piece].max(lower);
+            let first = self.starts[piece].max(lower).div_ceil(self.pool_page_multiple)
+                .checked_mul(self.pool_page_multiple).ok_or(Refusal::Overflow("pool page alignment"))?;
             let mut last = (self.starts[piece + 1] - 1).min(upper);
             if first > last {
                 continue;
@@ -293,6 +298,7 @@ impl Compiled {
                     last = last.min(first.saturating_add((available - required) / slope));
                 }
             }
+            last = last / self.pool_page_multiple * self.pool_page_multiple;
             if first <= last {
                 answer = Some(last);
             }
@@ -725,11 +731,13 @@ pub fn solve(
         return Err(Refusal::InvalidFact("zero context".into()));
     }
     let page = contract.page_rows;
+    let multiple = contract.pool_page_multiple;
+    let pool_rows = page.checked_mul(multiple).ok_or(Refusal::Overflow("pool row alignment"))?;
     if let Pin::Exact(tokens) = request.pool {
-        if tokens % page != 0 {
+        if tokens % pool_rows != 0 {
             return Err(Refusal::MisalignedPool {
                 tokens,
-                page_rows: page,
+                page_rows: pool_rows,
             });
         }
         if tokens < request.context {
@@ -742,7 +750,8 @@ pub fn solve(
     if matches!(request.prefill, Pin::Exact(s) if s.rows == 0 || s.waves == 0) {
         return Err(Refusal::InvalidPin("zero prefill shape"));
     }
-    let minimum = request.context.div_ceil(page);
+    let minimum = request.context.div_ceil(pool_rows).checked_mul(multiple)
+        .ok_or(Refusal::Overflow("minimum pool pages"))?;
     let small = budgets.iter().any(|b| {
         b.physical_bytes <= 34 << 30
             && b.locations
@@ -753,7 +762,9 @@ pub fn solve(
         .max(request.context)
         .div_ceil(page);
     let wanted = match request.pool {
-        Pin::Auto => target.min(contract.maximum_pages),
+        Pin::Auto => target.div_ceil(multiple).checked_mul(multiple)
+            .ok_or(Refusal::Overflow("target pool pages"))?
+            .min(contract.maximum_pages / multiple * multiple),
         Pin::Exact(n) => n / page,
     };
     if wanted < minimum || wanted > contract.maximum_pages {
@@ -808,15 +819,15 @@ pub fn solve(
         return Err(search.last);
     } else {
         let mut maximum = None;
-        if wanted > 1 {
-            search.maximum(domains.clone(), 1, wanted - 1, &mut maximum)?;
+        if wanted > multiple {
+            search.maximum(domains.clone(), multiple, wanted - multiple, &mut maximum)?;
         }
         maximum.unwrap_or(0)
     };
     if pages < minimum {
         // Reuse this search's validated facts and domains; never publish a
         // reduced-context plan or rebuild the family recipe with another context.
-        search.feasible(domains.clone(), pages + 1)?;
+        search.feasible(domains.clone(), pages + multiple)?;
         if !matches!(search.last, Refusal::Capacity { .. }) {
             return Err(search.last);
         }

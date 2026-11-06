@@ -489,6 +489,7 @@ impl Recipe for KimiRecipe {
                 decode: Some(request.spark_reply_formats.decode()),
             }),
             page_rows: self.page_rows(),
+            pool_page_multiple: 1,
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,
             variables: if self.gpus == 2 && self.placement == AttentionPlacement::Layers {

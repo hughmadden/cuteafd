@@ -852,6 +852,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn context_pool_uses_page_pairs_and_refuses_an_odd_explicit_unit_count() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        input.attention.mode = AttentionPlacement::Context;
+        input.index = cache::GlmfIndexCache::Compact;
+        input.attention.topk_scratch = 1 << 20;
+        input.attention.partial_scratch = 1 << 20;
+        let automatic = contract(&input).unwrap();
+        assert_eq!(automatic.solved.pool_tokens % 512, 0);
+        input.requested_pool = Some(automatic.solved.pool_tokens - 256);
+        assert!(matches!(contract(&input), Err(planner::Refusal::MisalignedPool { page_rows: 512, .. })));
+    }
+
     fn draft_config() -> serde_json::Value {
         serde_json::json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":5,
             "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,

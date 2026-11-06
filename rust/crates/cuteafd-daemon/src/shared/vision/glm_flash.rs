@@ -2,11 +2,9 @@
 use super::{Result, TensorRead, TowerSpec, VisionError};
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{VisionBlock, VisionSpec, NO_VISION_OFFSET};
-use cuteafd_loader::read_safetensors_metadata;
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::File,
-    path::{Component, Path},
+    collections::BTreeMap,
+    path::Path,
 };
 
 fn validate(config: &serde_json::Value, max_tokens: usize) -> Result<()> {
@@ -58,56 +56,11 @@ impl TowerSpec {
         let config: serde_json::Value =
             cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         validate(&config, max_tokens)?;
-        let index = snapshot.join("model.safetensors.index.json");
-        let mut files = BTreeSet::new();
-        if index.exists() {
-            let index: serde_json::Value = cuteafd_loader::read_json_file(&index)?;
-            let map = index["weight_map"]
-                .as_object()
-                .ok_or_else(|| VisionError::Unsupported("safetensors weight_map absent".into()))?;
-            for (name, file) in map {
-                if !name.starts_with("model.visual.") {
-                    continue;
-                }
-                let file = file
-                    .as_str()
-                    .ok_or_else(|| VisionError::Unsupported(format!("invalid shard for {name}")))?;
-                let path = Path::new(file);
-                if path.is_absolute()
-                    || path
-                        .components()
-                        .any(|c| !matches!(c, Component::Normal(_)))
-                {
-                    return Err(VisionError::Unsupported(format!(
-                        "invalid shard path {file}"
-                    )));
-                }
-                files.insert(snapshot.join(path));
-            }
-        } else {
-            for entry in std::fs::read_dir(snapshot)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|s| s == "safetensors") {
-                    files.insert(path);
-                }
-            }
-        }
-        let mut tensors = BTreeMap::new();
-        for path in files {
-            for metadata in read_safetensors_metadata(&path)
-                .map_err(|e| VisionError::Unsupported(e.to_string()))?
-            {
-                if metadata.name.starts_with("model.visual.") {
-                    let name = metadata.name.clone();
-                    if tensors
-                        .insert(name.clone(), (path.clone(), metadata))
-                        .is_some()
-                    {
-                        return Err(VisionError::Unsupported(format!("duplicate {name}")));
-                    }
-                }
-            }
-        }
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open_for_role(snapshot, "GLM Flash vision",
+            |name| name.starts_with("model.visual."))
+            .map_err(|error| VisionError::Unsupported(error.to_string()))?;
+        let tensors: BTreeMap<_, _> = checkpoint.tensors.into_iter().map(|tensor|
+            (tensor.meta.name.clone(), (snapshot.join(tensor.shard), tensor.meta))).collect();
         let mut reads = Vec::new();
         let mut cursor = 0usize;
         let mut put = |name: &str, shape: &[usize], vector: bool, align: bool| -> Result<u64> {
@@ -220,12 +173,15 @@ impl TowerSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     fn config() -> serde_json::Value {
-        serde_json::json!({"model_type":"glm5_next","text_config":{"hidden_size":4096},"vision_config":{
+        let mut config = cuteafd_loader::plan::testing::glm5_flash_config(2);
+        config["vision_config"] = serde_json::json!({
             "depth":24,"hidden_size":1024,"intermediate_size":4096,"num_heads":16,
             "out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,"spatial_merge_size":2,
             "projection_intermediate_size":10240,"in_channels":3,"attention_bias":true,
-            "hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0}})
+            "hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+        config
     }
     #[test]
     fn rejects_unknown_geometry_before_tensor_reads() {
@@ -355,5 +311,24 @@ mod tests {
             assert_eq!(spec.native.blocks[i].gate_up, gate.destination as u64);
         }
         assert!(spec.native.weight_bytes > end);
+        // Native EXLR8 keeps the same tower under dense/, without an HF index.
+        std::fs::remove_file(dir.path().join("model.safetensors.index.json")).unwrap();
+        std::fs::create_dir(dir.path().join("dense")).unwrap();
+        std::fs::create_dir(dir.path().join("experts")).unwrap();
+        std::fs::rename(dir.path().join("vision.safetensors"),
+            dir.path().join("dense/vision-bf16.safetensors")).unwrap();
+        let index = serde_json::to_vec(&serde_json::json!({"__metadata__": {
+            "format":"exlr8-v2", "scheme":"exlr8-e4m3-v2"
+        }})).unwrap();
+        let mut file = File::create(dir.path().join("experts/exlr8-layer-000.index.safetensors")).unwrap();
+        file.write_all(&(index.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&index).unwrap();
+        let native = TowerSpec::from_snapshot(dir.path(), 4096).unwrap();
+        assert_eq!(native.reads.len(), 347);
+        assert_eq!(native.native.weight_bytes, spec.native.weight_bytes);
+        assert_eq!(native.reads.iter().map(|r| r.metadata.byte_length).sum::<u64>(), 1_127_254_016);
+        assert!(native.reads.iter().all(|read|
+            read.path == dir.path().join("dense/vision-bf16.safetensors")));
+        super::super::push::tests::assert_vision_plan(dir.path(), &native);
     }
 }

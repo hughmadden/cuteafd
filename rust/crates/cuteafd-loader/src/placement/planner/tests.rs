@@ -231,6 +231,58 @@ impl Recipe for Prepared {
 }
 
 #[test]
+fn pool_page_multiple_aligns_automatic_pool_floor_extent_and_explicit_pins() {
+    let mut contract = Linear { maximum: 64 * 9, ..Linear::new() }.prepare(&request()).unwrap();
+    assert_eq!(contract.pool_page_multiple, 1);
+    assert_eq!(solve(request(), vec![budget(64 * 7)], &Prepared(contract.clone())).unwrap().pool_tokens, 64 * 7);
+    contract.pool_page_multiple = 2;
+    for (capacity, pages) in [(9, 8), (8, 8), (7, 6), (3, 2)] {
+        let result = solve(request(), vec![budget(64 * capacity)], &Prepared(contract.clone())).unwrap();
+        assert_eq!(result.pool_tokens, 64 * pages);
+        assert_eq!(result.facts.allocations.iter().find(|owner| owner.id == "kv").unwrap().bytes, 64 * pages);
+    }
+    let mut pinned = request();
+    pinned.pool = Pin::Exact(64 * 7);
+    assert!(matches!(solve(pinned, vec![budget(1024)], &Prepared(contract.clone())),
+        Err(Refusal::MisalignedPool { tokens: 448, page_rows: 128 })));
+    let mut floor = request();
+    floor.context = 64 * 3;
+    assert_eq!(solve(floor.clone(), vec![budget(64 * 5)], &Prepared(contract.clone())).unwrap().pool_tokens, 64 * 4);
+    assert!(matches!(solve(floor, vec![budget(64 * 3)], &Prepared(contract.clone())),
+        Err(Refusal::FullContextShortfall { tokens: 128, .. })));
+    for multiple in [0, u64::MAX] {
+        contract.pool_page_multiple = multiple;
+        assert!(matches!(solve(request(), vec![budget(1024)], &Prepared(contract.clone())), Err(Refusal::InvalidFact(_))));
+    }
+}
+
+#[test]
+fn strided_pool_search_matches_enumeration_across_nonmonotonic_breakpoints() {
+    let mut contract = Linear { maximum: 64 * 13, ..Linear::new() }.prepare(&request()).unwrap();
+    let curve = ByteCurve(vec![
+        BytePiece { first: 1, last: 3, bytes_at_first: 10, bytes_per_page: 10 },
+        BytePiece { first: 4, last: 6, bytes_at_first: 100, bytes_per_page: 0 },
+        BytePiece { first: 7, last: 7, bytes_at_first: 1, bytes_per_page: 0 },
+        BytePiece { first: 8, last: 11, bytes_at_first: 20, bytes_per_page: 10 },
+        BytePiece { first: 12, last: 13, bytes_at_first: 80, bytes_per_page: 5 },
+    ]);
+    contract.set_byte_extent("kv", curve.clone()).unwrap();
+    for multiple in [1, 2, 3, 4] {
+        contract.pool_page_multiple = multiple;
+        for capacity in 1..=110 {
+            let expected = (1..=13).filter(|pages| pages % multiple == 0)
+                .filter(|&pages| curve.at(pages).unwrap() <= capacity).max();
+            let result = solve(request(), vec![budget(capacity)], &Prepared(contract.clone()));
+            if let Some(pages) = expected {
+                assert_eq!(result.unwrap().pool_tokens, pages * 64, "multiple {multiple}, capacity {capacity}");
+            } else {
+                assert!(result.is_err(), "multiple {multiple}, capacity {capacity}");
+            }
+        }
+    }
+}
+
+#[test]
 fn immutable_reply_formats_flow_to_decisions_and_each_explicit_phase_conflicts() {
     use SparkReplyFormat::{Bf16, Fp8, Nvfp4};
     let mut contracts = vec![None];
