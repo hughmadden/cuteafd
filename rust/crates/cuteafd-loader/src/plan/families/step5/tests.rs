@@ -2003,6 +2003,50 @@ fn hqa_o_dispatch_and_exact_rank_charges_include_all_predictors() -> anyhow::Res
 }
 
 #[test]
+fn hqa_push_envelope_covers_native_headers_and_preserves_compact_parent() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    let parent = exl3_snapshot();
+    let hqa_view = CheckpointView::select(fixture.path(), AttentionMode::Hqa)?;
+    let compact_view = CheckpointView::select(fixture.path(), AttentionMode::Compact)?;
+    let hqa = Checkpoint::coordinator_view(&hqa_view, false, true)?;
+    let compact = Checkpoint::coordinator_view(&compact_view, false, true)?;
+    let parent = Checkpoint::coordinator(parent.path(), false, true)?;
+    let cfg = Config::parse(&hqa)?;
+    let hqa_contract = coordinator::CoordinatorContract::from_checkpoint(&hqa)?;
+    let compact_contract = coordinator::CoordinatorContract::from_checkpoint(&compact)?;
+    let parent_contract = coordinator::CoordinatorContract::from_checkpoint(&parent)?;
+    let output_bytes = 4096 * 12288 * 2u64;
+    let native_outputs = hqa_contract.weights.tensors.iter()
+        .filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight")).collect::<Vec<_>>();
+    assert_eq!(native_outputs.len(), cfg.layers);
+    assert!(native_outputs.iter().all(|tensor| tensor.meta.byte_length == output_bytes
+        && tensor.meta.dtype == DType::Bf16 && tensor.shard == "hqa-attention.safetensors"));
+    assert!(!compact_contract.weights.tensors.iter()
+        .any(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight")));
+    let (target, draft) = compact_contract.core.bytes(cfg.layers);
+    let unchanged_compact_dense = 2 * (compact_contract.weights.resident_bytes + target + draft) + (64 << 20);
+    for ranks in [1, 2] {
+        let native = super::admission::push_host_envelope(&hqa_contract, &cfg, ranks)?;
+        let compact_envelope = super::admission::push_host_envelope(&compact_contract, &cfg, ranks)?;
+        let parent_envelope = super::admission::push_host_envelope(&parent_contract, &cfg, ranks)?;
+        assert_eq!(compact_envelope, parent_envelope, "compact parent envelope changed");
+        assert_eq!(compact_envelope.dense_bytes, vec![unchanged_compact_dense; ranks]);
+        let mtp = coordinator::RankWeightLayout::mtp_from_contract(&hqa, &hqa_contract, cfg.mtp)?;
+        for rank in 0..ranks {
+            let layout = coordinator::RankWeightLayout::from_contract(&hqa_contract, &cfg, rank, ranks, None)?;
+            let native_dense = layout.operands.iter().map(|operand| operand.allocation_bytes).sum::<u64>();
+            let native_mtp = mtp.operands.iter().map(|operand| operand.allocation_bytes).sum::<u64>();
+            assert!(native.dense_bytes[rank] >= native_dense + native_mtp,
+                "HQA push undersizes native dense headers at rank {rank}/{ranks}");
+            assert!(native.dense_bytes[rank] > compact_envelope.dense_bytes[rank],
+                "native HQA envelope did not grow beyond compact at rank {rank}/{ranks}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Result<()> {
     use crate::placement::{inventory, Baseline, GpuBudget, Inventory};
     use super::admission::{self, MarkRule, RuntimeInputs};
