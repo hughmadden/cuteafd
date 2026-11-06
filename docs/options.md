@@ -153,7 +153,6 @@ the launcher derives from them.
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `SPECULATOR_DRAFTS` | engine default | positive int | Drafts per step. |
-| `TP2_DFLASH` | `off` | `on`, `off` | Kimi DFlash2 Context-split attention on two RTX GPUs; producer weights and FFN stay on GPU1. Explicit CLI false overrides config on. |
 | `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo drafter precision: `on` converts to single-copy FP8. |
 | `DSPARK_DRAFT_POLICY` | `adaptive` | `full`, `adaptive` | V4.1 dSpark policy. |
 | `DSPARK_DRAFT_LIMIT` | engine 5 | 1–7 | V4.1 dSpark draft width; requires dSpark. |
@@ -225,7 +224,7 @@ weights and scratch alongside the KV pool and routed experts.
 | `GLM5_FLASH_TARGET_HEAD` | `auto` | `auto`, `tensor`, `exact` | GLM Flash's `TARGET_HEAD` spelling. |
 | `TP2_ATTENTION`, `TP2_QUERY_PROJECTION`, `TP2_OUTPUT_PROJECTION` | `off` | `on`, `off` | V4.1 TP2 projections on the RTX pair. |
 | `TP2_DSPARK_EXPERTS` | `on` with dual RTX + dSpark, otherwise `off` | `on`, `off` | V4/V4.1 TP2 draft experts; requires two RTX GPUs and dSpark. Explicit `off` retains GPU0-only draft experts. |
-| `TP2_DFLASH` | MiMo dual-RTX: `on`; otherwise `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. Explicit `off` reaches plan and serve. Kimi remains unsupported pending draft Context attention. |
+| `TP2_DFLASH` | MiMo dual-RTX with DFlash2: `on`; Kimi and otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. Kimi splits cache and attention by Context; producer weights and FFN stay on GPU1. Explicit `off` reaches plan and serve; CLI false overrides config on. |
 
 ## Concurrency and serving
 
@@ -412,7 +411,6 @@ accept/refuse behaviour. `✓` means the family's config validation accepts it;
 | `SPECULATOR_MODEL_REVISION` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ |
 | `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |
 | `SPECULATOR_DRAFTS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
-| `TP2_DFLASH` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ |
 | `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
 | `DSPARK_DRAFT_POLICY` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DSPARK_DRAFT_LIMIT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
