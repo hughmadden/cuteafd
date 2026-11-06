@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import io
+import inspect
 import json
+import shutil
+import subprocess
 import os
 from pathlib import Path
 import struct
@@ -100,6 +104,89 @@ def elf_resources(blob):
     return {name: kernels[name] for name in sorted(kernels)}
 
 
+def compiler_identity(root, payload, capability):
+    """An immutable compiler image is mandatory; unknown identity disables reuse."""
+    from b12x._lib import compiler
+    image = os.environ.get("CUTEAFD_EXPORT_IMAGE_ID", "")
+    ptxas = shutil.which("ptxas")
+    if not image.startswith("sha256:") or not ptxas:
+        return None
+    version = subprocess.check_output([ptxas, "--version"], text=True, timeout=30)
+    exporter = Path(root) / "python/tools/aot" / payload["exporter"]
+    return {"schema": 1, "image_id": image, "runtime": compiler._runtime_toolchain_key(),
+            "environment": compiler._compile_environment_key(), "ptxas_version": version,
+            "ptxas_sha256": digest(Path(ptxas).read_bytes()), "sms": payload["sms"],
+            "capability": list(capability), "exporter": payload["exporter"], "args": payload["args"],
+            "exporter_sha256": digest(exporter.read_bytes()),
+            "scripts": {str(path.relative_to(root)): digest(path.read_bytes()) for path in (
+                Path(root) / "scripts/build/kernel-records.py",
+                Path(root) / "scripts/build/compare-sm-exports.py",
+                Path(root) / "scripts/build/export-placement-inputs.py")}}
+
+
+class BackendCache:
+    """Retain lowered MLIR, never Python executors or a guessed launch ABI."""
+
+    def __init__(self, directory, identity):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.identity = identity
+        self.hits = 0
+        self.misses = 0
+
+    def key(self, dsl, original, module, args, kwargs, ir_hash):
+        bound = inspect.signature(original).bind(dsl, module, *args, **kwargs)
+        bound.apply_defaults()
+        values = bound.arguments
+        if not self.identity or not values.get("no_jit_engine") or not values.get("no_cache"):
+            return None
+        options = {kind.__module__ + "." + kind.__qualname__: option.value
+                   for kind, option in dsl.compile_options.options.items()}
+        inputs = {"schema": 1, "ir_sha256": ir_hash, "identity": self.identity,
+                  "options": options, "pipeline": values.get("pipeline"),
+                  "function_name": values["function_name"], "signature": str(values["sig"]),
+                  "executor_type": str(values["func_type"])}
+        try:
+            return stable_hash(inputs)
+        except (TypeError, ValueError):
+            return None  # Unserializable compiler inputs are never a hit.
+
+    def compile(self, dsl, original, module, args, kwargs, ir_hash):
+        from cutlass._mlir import ir
+        key = self.key(dsl, original, module, args, kwargs, ir_hash)
+        metadata = self.directory / (str(key) + ".json")
+        bytecode = self.directory / (str(key) + ".mlirbc")
+        if key and metadata.is_file() and bytecode.is_file():
+            saved = json.loads(metadata.read_text())
+            blob = bytecode.read_bytes()
+            if saved == {"key": key, "sha256": digest(blob)}:
+                restored = ir.Module.parse(blob, context=module.context)
+                provider = dsl.compiler_provider
+                compile_method = provider.compile
+                def already_compiled(current, *unused_args, **unused_kwargs):
+                    if current is not restored:
+                        raise ValueError("backend replay received an unexpected module")
+                provider.compile = already_compiled
+                try:
+                    result = original(dsl, restored, *args, **kwargs)
+                finally:
+                    provider.compile = compile_method
+                self.hits += 1
+                return result
+        self.misses += 1
+        result = original(dsl, module, *args, **kwargs)
+        if key:
+            stream = io.BytesIO()
+            result.ir_module.operation.write_bytecode(stream)
+            blob = stream.getvalue()
+            temporary = self.directory / (key + f".{os.getpid()}.tmp")
+            temporary.write_bytes(blob)
+            temporary.replace(bytecode)
+            temporary.write_text(json.dumps({"key": key, "sha256": digest(blob)}, sort_keys=True))
+            temporary.replace(metadata)
+        return result
+
+
 class Recorder:
     """Observe the existing compiler pass; never invoke a second compilation.
 
@@ -108,7 +195,8 @@ class Recorder:
     retaining module-level constants without making eager unused imports global.
     """
 
-    def __init__(self, root, output):
+    def __init__(self, root, output, backend_cache=None):
+        self.backend_cache = backend_cache
         self.root = Path(root).resolve()
         self.output = Path(output)
         self.executors = {}
@@ -236,7 +324,8 @@ class Recorder:
                 if record is None:
                     record = {"ir_kind": "mlir", "ir_sha256": digest(str(module).encode()),
                               "source_reads_sha256": self.reads()}
-                result = original(dsl, module, *args, **kwargs)
+                result = (self.backend_cache.compile(dsl, original, module, args, kwargs, record["ir_sha256"])
+                          if self.backend_cache is not None else original(dsl, module, *args, **kwargs))
                 self.executors[id(result)] = (weakref.ref(result), record)
                 if self.construction:
                     self.latest.append(record)

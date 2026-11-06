@@ -677,7 +677,11 @@ def worker(payload):
     recorder = None
     if payload.get("program_records"):
         records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
-        recorder = records_module.Recorder(ROOT, output).install()
+        backend_cache = None
+        if payload.get("backend_cache"):
+            identity = records_module.compiler_identity(ROOT, payload, capability)
+            backend_cache = records_module.BackendCache(payload["backend_cache"], identity)
+        recorder = records_module.Recorder(ROOT, output, backend_cache).install()
         PROGRAM_RECORDER = recorder
         # runpy exporters receive a worker-local hook, not a serving dependency.
     start = time.monotonic()
@@ -724,6 +728,8 @@ def worker(payload):
     if recorder is not None:
         inspector = load_file("placement_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
         recorder.finish(inspector, summary, plans)
+        if recorder.backend_cache is not None:
+            summary["backend_reuse"] = {"hits": recorder.backend_cache.hits, "misses": recorder.backend_cache.misses}
     (Path(payload["output"]) / "comparison-context.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
