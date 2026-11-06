@@ -56,6 +56,23 @@ def test_renderer_software_webgl_flags_are_opt_in():
     assert renderer.webgl_flags(True) == ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
 
 
+def test_real_checkpoint_fixture_geometry_accepts_nested_and_flat_config(tmp_path):
+    fixture = module("expert_geometry_fixture", "scripts/usage/mock-server.py")
+    for data, expected in [
+        ({"text_config": {"num_hidden_layers": 93, "num_experts": 896, "num_experts_per_token": 16, "first_k_dense_replace": 1}}, (93, 896, 92)),
+        ({"num_hidden_layers": 48, "n_routed_experts": 256, "num_experts_per_tok": 8, "moe_layer_freq": [0] + [1] * 47}, (48, 256, 47)),
+    ]:
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(data))
+        geometry = fixture.expert_geometry(path)
+        assert (geometry["layers"], geometry["experts"], len(geometry["routed_layers"])) == expected
+        snapshot = fixture.expert_snapshot(1, geometry)
+        payload = fixture.expert_binary(snapshot, "total", "combined")
+        offset = struct.unpack_from("<I", payload, 112)[0]
+        assert payload[30] == 2
+        assert len(payload) == offset + expected[1] * expected[2] * 8
+
+
 def test_expert_fixture_auth_live_values_and_disabled_variant():
     fixture = module("expert_fixture", "scripts/usage/mock-server.py")
     server = ThreadingHTTPServer(("127.0.0.1", 0), fixture.Handler)

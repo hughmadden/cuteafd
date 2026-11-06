@@ -255,6 +255,7 @@ for session in range(8):
 
 def expert_geometry(config):
     data = json.loads(config.read_text())
+    data = data.get("text_config", data)
     layers = data["num_hidden_layers"]
     frequency = data.get("moe_layer_freq", 1)
     dense = data.get("first_k_dense_replace", 0)
