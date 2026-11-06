@@ -469,6 +469,26 @@ pub(crate) fn start_worker(
 }
 
 #[cfg(test)]
+mod push_route_tests {
+    /// Shipped VISION=spark (encoder peers) and VISION=off keep the unchanged
+    /// load path: only a coordinator-local tower under required push records.
+    #[test]
+    fn spark_and_off_vision_never_take_the_pushed_owner() {
+        let source = include_str!("v41_vision_encoder.rs");
+        let body = source.split("pub fn load_pushed(").nth(1).unwrap().split("pub fn connect(").next().unwrap();
+        let guard = body.find("if !push || !cuteafd_api::openai::vision_input_enabled() || args.vision_peers.is_some()").unwrap();
+        let unchanged = body.find("return Ok((Self::load(args, catalog)?, Default::default()));").unwrap();
+        let pushed = body.find("LocalEncoder::start_pushed(").unwrap();
+        assert!(guard < unchanged && unchanged < pushed, "peers/off/mount must return before the pushed owner");
+        for serve in [include_str!("v41_native_serve.rs"), include_str!("v41_native_serve/distributed.rs")] {
+            assert!(serve.contains("Encoder::load_pushed(\n        &args, &catalog, records.is_some())"),
+                "push only when the family's required dense recording exists");
+            assert!(serve.contains("vision_push.commit()?;"), "the tower serves only after the group commits");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
