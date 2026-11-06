@@ -510,12 +510,12 @@ mod source_format_tests {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
         let automatic = crate::commands::bench::assert_resolved_family_seam("mimo_v2",
             &["max-context", "pool-tokens", "prefill-rows", "prefill-waves", "prefill-span-rows",
-                "rtx-expert-layers", "split-device", "embedding-placement"], || {
+                "onboard", "split-device", "embedding-placement"], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
                 serve::resolve_serving_capacity(&mut args, 16, false);
                 serve::serving_queue_depth(None, 16);
                 let shape = admission::resolved_prefill_shape(4, 0, 0)?;
-                assert!(shape.rows > 0);
+                assert!(shape.unit_rows > 0);
                 resolve_weight_formats(&args, &checkpoint, &cfg)
             }).unwrap();
         assert_eq!(automatic.default_policy, MimoDefaultPolicy::Fp8);
