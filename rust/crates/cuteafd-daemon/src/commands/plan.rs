@@ -77,7 +77,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
                 full_prefill_logits: args.full_prefill_logits,
-                expert_usage: args.expert_usage,
+                expert_usage: args.expert_usage.unwrap_or(true),
                 // Lane families still read prefill_lanes until their unit ports land.
                 prefill_lanes: args.prefill_waves,
                 prefill_waves: args.prefill_waves.max(1),
@@ -135,6 +135,16 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
+}
+
+fn resolve_expert_usage(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    let configured = match cfg.get("EXPERT_USAGE").map(String::as_str) {
+        None | Some("") | Some("on") => true,
+        Some("off") => false,
+        Some(_) => anyhow::bail!("EXPERT_USAGE must be on or off"),
+    };
+    args.expert_usage = Some(args.expert_usage.unwrap_or(configured));
+    Ok(())
 }
 
 fn resolve_mimo_drafter(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, speculator: &str) {
@@ -195,6 +205,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     }
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
+        resolve_expert_usage(&mut args, &cfg)?;
         args.available_sparks = (0..8).take_while(|rank|
             cfg.get(&format!("SPARK_{rank}_HOST")).is_some_and(|host| !host.is_empty())).count();
         if args.spark_ranks.is_none() {
@@ -888,6 +899,27 @@ mod tests {
     }
 
     #[test]
+    fn expert_usage_plan_defaults_on_and_config_off_matches_explicit_cli_off() {
+        use clap::Parser;
+        for configured in [None, Some("on"), Some("off")] {
+            for requested in [None, Some(false), Some(true)] {
+                let mut argv = vec!["cuteafd", "plan", "/model", "--layout"];
+                if let Some(enabled) = requested {
+                    argv.push(if enabled { "--expert-usage" } else { "--expert-usage=false" });
+                }
+                let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+                    else { panic!("expected plan") };
+                let cfg = configured.map(|value| ("EXPERT_USAGE".into(), value.into())).into_iter().collect();
+                resolve_expert_usage(&mut request, &cfg).unwrap();
+                assert_eq!(options(&request).unwrap().layout.unwrap().expert_usage,
+                    requested.unwrap_or(configured != Some("off")));
+            }
+        }
+        let mut request = args(std::path::Path::new("/model"), 6, false);
+        assert!(resolve_expert_usage(&mut request, &[("EXPERT_USAGE".into(), "bad".into())].into()).is_err());
+    }
+
+    #[test]
     fn step5_plan_defaults_to_fp8_and_preserves_explicit_bf16() {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
         let mut args = args(std::path::Path::new("/model"), 6, false);
@@ -1008,7 +1040,7 @@ mod tests {
             attention_placement: "auto".into(),
             context_tokens: 262144,
             prefill_rows: 0,
-            full_prefill_logits: false, expert_usage: false,
+            full_prefill_logits: false, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,

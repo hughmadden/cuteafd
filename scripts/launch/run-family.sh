@@ -719,7 +719,7 @@ esac
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 # Pass loader-resolved values: the planner's plain config parser does not parse
 # shell quoting/comments or supply the loader's default Spark inventory.
-count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" DSPARK_DRAFT_LIMIT "$dspark_draft_limit" EXPERT_USAGE "$(get EXPERT_USAGE off)"
+count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" DSPARK_DRAFT_LIMIT "$dspark_draft_limit" EXPERT_USAGE "$(get EXPERT_USAGE on)"
   for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
     host_key="SPARK_${rank}_HOST"
     printf '%s=%s\n' "$host_key" "${!host_key}"
@@ -1089,9 +1089,9 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
-case "$(get EXPERT_USAGE off)" in
+case "$(get EXPERT_USAGE on)" in
   on) args+=(--expert-usage) ;;
-  off) ;;
+  off) args+=(--expert-usage=false) ;;
   *) release_die "EXPERT_USAGE must be on or off" ;;
 esac
 release_kv_reserve_args v41_kv_args
@@ -1630,10 +1630,14 @@ if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
 family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
+case "$(get EXPERT_USAGE on)" in
+  on|off) ;;
+  *) release_die "EXPERT_USAGE must be on or off" ;;
+esac
 if [[ $family == deepseek_v4 || $family == mimo_v2 ]]; then
-  case "$(get EXPERT_USAGE off)" in
+  case "$(get EXPERT_USAGE on)" in
     on) family_args+=(--expert-usage) ;;
-    off) ;;
+    off) family_args+=(--expert-usage=false) ;;
     *) release_die "EXPERT_USAGE must be on or off" ;;
   esac
 fi
@@ -2389,7 +2393,10 @@ audio_encoder_hash=""
   done
   plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
   [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
-  [[ "$(get EXPERT_USAGE off)" != on ]] || plan_draft_args+=(--expert-usage)
+  case "$(get EXPERT_USAGE on)" in
+    on) plan_draft_args+=(--expert-usage) ;;
+    off) plan_draft_args+=(--expert-usage=false) ;;
+  esac
   if [[ "$family" == qwen3_5 ]]; then
     plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --prefill-rows 4096
       --prefix-cache-entries "$effective_prefix_entries")
