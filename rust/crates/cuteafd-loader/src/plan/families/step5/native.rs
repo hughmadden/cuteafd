@@ -27,7 +27,7 @@ pub fn program_prefixes(split: bool) -> &'static [&'static str] {
 /// Concrete mixed-attention requirements survive export resolution and placement.
 #[derive(Debug, Clone)]
 pub struct NativeRequirement {
-    pub layout: crate::families::glm5_flash::core::NativeLayout,
+    pub layout: crate::formats::native_attention::NativeLayout,
     pub output: cuteafd_ffi::draft_projection::ProjectionOutput,
 }
 
@@ -48,7 +48,7 @@ pub struct NativeOwnerMismatch {
 impl NativeSelection {
     pub fn resolve(contract: &CoordinatorContract, cfg: &Config, ranks: usize, depth: usize,
         rows: usize, manifest: Option<&crate::placement::inventory::ProgramsManifest>) -> Result<Self> {
-        use crate::{families::glm5_flash::core::NativeLayout, formats::trellis_core::CoreSplit,
+        use crate::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
             placement::planner::native_attention::{NativeProgram, NativePrograms}};
         use cuteafd_ffi::draft_projection::ProjectionOutput;
         ensure!(matches!(ranks, 1 | 2) && depth <= cfg.mtp && (1..=4096).contains(&rows),

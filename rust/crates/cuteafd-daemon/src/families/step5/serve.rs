@@ -436,9 +436,9 @@ fn with_backend<T>(args: &ServeArgs,
         };
         let envelope = inputs.host.push.clone().context("Step-5 admitted push host envelope")?;
         let prepared = if expert_world == 0 {
-            (CoordinatorPush::prepare_alone_admitted(&args.snapshot, Some(&catalog), devices.len(), experts, envelope)?, None)
+            (CoordinatorPush::prepare_alone_view_admitted(&view, Some(&catalog), devices.len(), experts, envelope)?, None)
         } else {
-            let (push, streams, ranks) = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), devices.len(), experts, envelope)?;
+            let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(&view, Some(&catalog), devices.len(), experts, envelope)?;
             (push, Some((streams, ranks)))
         };
         Ok((prepared, loaded, records, dense))
@@ -602,15 +602,19 @@ mod tests {
     }
 
     #[test]
-    fn serve_retains_selected_view_through_checkpoint_catalog_and_spark_admission() {
+    fn serve_retains_selected_view_through_checkpoint_catalog_admission_and_push() {
         let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("args.attention.selected_view = Some(view)"));
         assert!(source.contains("Checkpoint::coordinator_view(&view"));
         assert!(source.contains("read_expert_catalog_view(&view)"));
         assert!(source.contains("SparkAdmission::plan_view(&view"));
+        assert!(source.contains("CoordinatorPush::prepare_alone_view_admitted(&view"));
+        assert!(source.contains("CoordinatorPush::prepare_view_admitted(&view"));
         assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
         assert!(!source.contains("read_expert_catalog(&args.snapshot"));
         assert!(!source.contains("SparkAdmission::plan(&args.snapshot"));
+        assert!(!source.contains("CoordinatorPush::prepare_alone_admitted("));
+        assert!(!source.contains("CoordinatorPush::prepare_admitted("));
     }
 
     #[test]
