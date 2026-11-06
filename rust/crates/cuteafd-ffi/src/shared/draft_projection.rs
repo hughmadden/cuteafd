@@ -1,4 +1,4 @@
-//! Preloaded BF16 drafter projections with one canonical per-row K reduction.
+//! Shared preloaded BF16 target/drafter projections with one canonical per-row K reduction.
 use crate::programs::{Program, ProgramSpec, Programs, Scalar};
 use std::{collections::BTreeMap, ffi::c_void};
 use thiserror::Error;
@@ -69,6 +69,31 @@ impl<'a> DraftProjections<'a> {
     }
 }
 
+/// Fail closed on the same ordered-K16 ABI during CPU-only placement.
+pub fn validate_package_geometry(manifest: &serde_json::Value, k: usize, n: usize, rows: usize) -> Result<String> {
+    let name = format!("draft_bf16_k{k}_n{n}");
+    let invalid = |reason: &str| ProjectionError::Shape { k, n, reason: reason.into() };
+    let entries = manifest["programs"].as_array().ok_or_else(|| invalid("program inventory"))?;
+    let mut matches = entries.iter().filter(|p| p["name"].as_str() == Some(&name));
+    let entry = matches.next().ok_or_else(|| invalid("missing ordered-K16 BF16 program"))?;
+    if matches.next().is_some() { return Err(invalid("duplicate BF16 program")); }
+    let pointers = entry["pointers"].as_array().ok_or_else(|| invalid("program pointers"))?.iter()
+        .map(|p| p["name"].as_str().map(str::to_owned).ok_or_else(|| invalid("pointer name")))
+        .collect::<Result<Vec<_>>>()?;
+    let scalars = entry["scalars"].as_array().ok_or_else(|| invalid("program scalars"))?;
+    if scalars.len() != 1 || scalars[0]["type"] != "int32" {
+        return Err(invalid("expected one int32 row scalar"));
+    }
+    let scratch = entry["scratch_bytes_at_capacity"].as_object().ok_or_else(|| invalid("program scratch"))?;
+    if !scratch.is_empty() { return Err(invalid("canonical BF16 projection has no scratch")); }
+    let capacity_rows = entry["capacity_rows"].as_u64().and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| invalid("program capacity"))?;
+    let spec = ProgramSpec { name: name.clone(), pointers, scalar_kinds: b"i".to_vec(),
+        scratch: Default::default(), capacity_rows, geometry: entry["geometry"].clone() };
+    admit(&spec, k, n, rows)?;
+    Ok(name)
+}
+
 fn admit(spec: &ProgramSpec, k: usize, n: usize, rows: usize) -> Result<()> {
     validate(spec, k, n).map_err(|reason| ProjectionError::Shape { k, n, reason })?;
     require_rows(spec, k, n, rows)
@@ -124,6 +149,25 @@ mod tests {
         let mut larger = s;
         larger.capacity_rows = 4096;
         assert!(admit(&larger, 5120, 7168, rows).is_ok());
+    }
+
+    #[test]
+    fn offline_target_admission_matches_runtime_abi() {
+        let entry = serde_json::json!({"name":"draft_bf16_k5120_n7168", "capacity_rows":4096,
+            "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}], "scalars":[{"type":"int32"}],
+            "scratch_bytes_at_capacity":{}, "geometry":spec().geometry});
+        let manifest = serde_json::json!({"programs":[entry.clone()]});
+        assert_eq!(validate_package_geometry(&manifest,5120,7168,4096).unwrap(), "draft_bf16_k5120_n7168");
+        assert!(validate_package_geometry(&manifest,5120,7168,4097).is_err());
+        assert!(validate_package_geometry(&manifest,5120,8192,1).is_err());
+        assert!(validate_package_geometry(&serde_json::json!({"programs":[entry.clone(),entry]}),5120,7168,1).is_err());
+        for (field, value) in [("geometry",serde_json::Value::Null),
+            ("capacity_rows",serde_json::json!(0)), ("pointers",serde_json::json!([])),
+            ("scalars",serde_json::json!([{"type":"float32"}])),
+            ("scratch_bytes_at_capacity",serde_json::json!({"scratch":256}))] {
+            let mut broken=manifest.clone(); broken["programs"][0][field]=value;
+            assert!(validate_package_geometry(&broken,5120,7168,1).is_err(), "{field}");
+        }
     }
 
     #[test]

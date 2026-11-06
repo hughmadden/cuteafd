@@ -82,6 +82,12 @@ def exl3_reply_programs(max_rows):
             for width, topk in shapes for format in (1, 2)]
 
 
+def hqa_bf16_shapes():
+    # GLM Flash q_b and MLA/KDA o, whole and ordinary TP2 slices (K, N).
+    return {(1536, 16384), (1536, 8192), (16384, 4096),
+            (8192, 4096), (4096, 4096)}
+
+
 def draft_bf16_shapes():
     # hidden, query heads, KV heads, head width, MLP width, tap count
     families = {
@@ -111,6 +117,8 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    for shape in hqa_bf16_shapes():
+        result.setdefault(shape, []).append("hqa-glmf")
     return result
 
 
@@ -1465,7 +1473,8 @@ def main() -> None:
             work += [(family, *item) for item in exlr8_work]
     # Append shared drafter exports after all existing objects: table indices stay stable.
     if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
-        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},
+        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection",
+                  {"max_rows": 4096 if (k, n) in hqa_bf16_shapes() else 2048},
                   lambda k=k, n=n: compile_draft_bf16_projection(k, n))
                  for k, n in sorted(draft_bf16_shapes())]
     for family, suffix, op, params, thunk in work:

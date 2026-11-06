@@ -258,8 +258,24 @@ mod tests {
                     }
                 }
             }
+            if mode == AttentionMode::Hqa {
+                assert!(CoreCharges::from_package(&cfg, &core, cfg.layers, 2,
+                    Some(&vec![0; cfg.layers]), 4096, 3, 64, None, false, &manifest).is_err(),
+                    "BF16 requires row-invariant exports before weight allocation");
+                for layout in core.layer_native(&cfg, 3, 2, Some(0))?[0].values() {
+                    let [n, k] = layout.shape;
+                    manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
+                        "name": format!("draft_bf16_k{k}_n{n}"), "capacity_rows": 4096,
+                        "pointers": [{"name":"x"},{"name":"w"},{"name":"out"}],
+                        "scalars": [{"type":"int32"}], "scratch_bytes_at_capacity": {},
+                        "geometry": {"width":k,"outputs":n,"output_dtype":"torch.bfloat16",
+                            "reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]} }));
+                }
+            }
             let charges = CoreCharges::from_package(&cfg, &core, cfg.layers, 2,
                 Some(&vec![0; cfg.layers]), 4096, 3, 64, None, false, &manifest)?;
+            assert_eq!(charges.programs.iter().filter(|n| n.starts_with("draft_bf16_")).count(),
+                if mode == AttentionMode::Hqa { 2 } else { 0 });
             for rank in 0..2 {
                 let expected = if rank == 0 && mode == AttentionMode::Fp8Compact { 16384 } else { 4096 };
                 for stage in charges.ranks[rank].stages.as_ref().unwrap() {
