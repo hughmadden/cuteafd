@@ -1,5 +1,6 @@
 //! Per-engine device counters and an independent, sleeping snapshot worker.
 use crate::*;
+use anyhow::ensure;
 use cuteafd_core::expert_usage::{Geometry, Reader, Snapshot};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
