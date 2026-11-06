@@ -23,9 +23,14 @@ pub(crate) fn native_layout(report: &mut PlanReport, model: &dyn super::super::F
 fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions,
     exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
-    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
+    let remote_experts = report.spark_ranks > 0 && (exlr8.is_some() || report.experts.as_ref().is_some_and(|contract|
+        model.spec().moe.as_ref().is_some_and(|moe|
+            super::super::experts::spark_recipe(&contract.package, moe.intermediate, report.spark_ranks).is_ok())))
+        && options.resolve_onboard(model.spec().moe_layers()) != Some(Onboard::Layers(model.spec().moe_layers()));
+    let expert_world = if remote_experts { report.spark_ranks } else { 0 };
+    let prefill = match resolve_prefill(input, report, options, expert_world,
         crate::serving_capacity::prefill_waves::PrefillLimits {
-            max_waves: if report.spark_ranks == 0 { 1 }
+            max_waves: if expert_world == 0 { 1 }
                 else if report.requested_attention == Some(placement::AttentionPlacement::Layers) {
                 placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
             ..crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5_FLASH)
@@ -300,6 +305,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let host = options.host_memory.map(Ok)
             .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
         let mut process = glmf::admission::ProcessOwners::new(host, (8 << 30).max(host.0 / 10));
+        process.remote_experts = remote_experts;
         if ranks == 2 && attention.mode == placement::AttentionPlacement::Layers && !native {
             let mut alternate = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks,
                 representation, attention.mode, (attention.first_owner ^ 1) as usize).map_err(anyhow::Error::msg)?;

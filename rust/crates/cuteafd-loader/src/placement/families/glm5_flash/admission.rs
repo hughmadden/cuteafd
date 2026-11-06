@@ -9,6 +9,8 @@ pub struct ProcessOwners {
     pub host_headroom: u64,
     pub allocations: Vec<p::Allocation>,
     pub links: Vec<PreparedSparkLink>,
+    /// Physical media ranks remain available when their expert package is absent.
+    pub remote_experts: bool,
     pub native_load: Option<NativeLoad>,
     pub mount_load: Option<crate::shared::dense_read::MountLoad>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
@@ -179,7 +181,7 @@ impl NativeLoad {
 
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
-        Self { host, host_headroom, allocations: vec![], links: vec![], native_load: None, mount_load: None,
+        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
             draft_push: None }
     }
@@ -476,7 +478,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     let counts = if i.spark_ranks == 0 { vec![routed.len()] }
         else if let Some(n) = i.onboard.layers(routed.len()) { vec![n] }
         else if rtx_experts { (0..=routed.len()).collect() } else { vec![0] };
-    if counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
+    let counts = counts.into_iter().filter(|&count| process.remote_experts || count == routed.len()).collect::<Vec<_>>();
+    if counts.is_empty() || counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
         return Err(p::Refusal::Unsupported);
     }
     let mut contract = p::Contract::fixed(256, maximum, gpus, p::Facts {

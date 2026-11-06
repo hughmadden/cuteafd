@@ -1445,6 +1445,11 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             (_, None) => {} // the routed-expert component already reports its missing kernel
             (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
                 report.spark_rank_share = share(ranks).unwrap_or(0.0);
+                // Joint admission, not the available host count, chooses expert ownership.
+                if model.admits_expert_packages() && options.layout.is_some() {
+                    report.experts = Some(contract.clone());
+                    return;
+                }
                 if let Some(worlds) = experts::frozen_refusal(&contract.package, ranks) {
                     // Frozen formats admit only the worlds they shipped on, for every family.
                     report.placement_supported = false;

@@ -5252,6 +5252,22 @@ fn glm_flash_all_onboarded_preserves_tower_only_spark() {
         assert!(!deployment.spark_roles[0].experts && deployment.peers.is_empty());
         assert_eq!(deployment.spark_roles[0].encoder.as_ref(), Some(encoder));
     }
+    let mut missing_remote = base.clone();
+    missing_remote.placement = ExpertPlacement::Sparks { ranks: 1 };
+    missing_remote.vision = MediaMode::Spark(Some(0));
+    missing_remote.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Auto);
+    let report = plan(dir.path(), &missing_remote).unwrap();
+    assert!(!report.experts.as_ref().unwrap().spark_worlds.contains(&1));
+    assert!(report.executable(), "{}", render(&report));
+    assert_eq!(report.onboard_layers, Some(1));
+    assert_eq!(report.prefill_waves, Some(1));
+    let deployment_options = super::deployment::DeploymentOptions { rtx_gpus: 2, ..Default::default() };
+    let deployment = super::deployment::DeploymentSpec::from_report(&report, &deployment_options).unwrap();
+    assert_eq!((deployment.spark_ranks, deployment.spark_expert_world), (1, 0));
+    missing_remote.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+    let refused = plan(dir.path(), &missing_remote).unwrap();
+    assert!(!refused.executable());
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("pool-first placement")));
     let idle = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..base }).unwrap();
     assert!(idle.executable(), "{}", render(&idle));
     let options = super::deployment::DeploymentOptions { rtx_gpus: 2, ..Default::default() };
