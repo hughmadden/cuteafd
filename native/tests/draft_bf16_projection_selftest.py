@@ -178,7 +178,7 @@ def main():
 
             results = {}
             canonical_outputs = {}
-            row_counts = (1, 8, 16, 128, 140, 2048)
+            row_counts = (1, 4, 8, 16, 64, 128, 140, 2048)
             for arm, operation in arms.items():
                 outputs, timing = {}, {}
                 graph_exact = True

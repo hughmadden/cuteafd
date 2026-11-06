@@ -39,6 +39,7 @@ impl Scratch<'_> {
 }
 pub(super) struct Rank<'a> {
     projections: BTreeMap<Key, Projection<'a>>,
+    bf16: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     scratch: [Option<Rc<Scratch<'a>>>; 2],
     add: Bf16F32Add<'a>,
     narrow: F32Bf16Narrow<'a>,
@@ -98,7 +99,12 @@ impl<'a> Rank<'a> {
                 .map(|(&n, &b)| Ok((n, Allocation::new(device, b)?))).collect::<Result<_>>()?;
             Ok(Some(Rc::new(Scratch { projection, stages })))
         };
-        Ok(Self { scratch: [allocate(0)?, allocate(1)?], projections, add: engine.library.bf16_f32_add()?, narrow: engine.library.f32_bf16_narrow()? })
+        let shapes = layers.iter().flat_map(|l| l.attention_native.values())
+            .filter(|w| !w.layout.fp8).map(|w| (w.layout.shape[1], w.layout.shape[0])).collect::<Vec<_>>();
+        let bf16 = cuteafd_ffi::draft_projection::DraftProjections::load(engine.programs, &shapes,
+            engine.prefill_rows.max(engine.decode_rows))?;
+        Ok(Self { scratch: [allocate(0)?, allocate(1)?], projections, bf16,
+            add: engine.library.bf16_f32_add()?, narrow: engine.library.f32_bf16_narrow()? })
     }
     fn slot(&self, engine: &GlmfEngine<'a>, rank: usize, rows: usize, decode: bool, lane: usize) -> Result<Option<Slot<'a>>> {
         let Some(scratch) = &self.scratch[usize::from(!decode)] else { return Ok(None); };
@@ -198,8 +204,9 @@ impl<'a> GlmfEngine<'a> {
                 }
                 // SAFETY: selected rank slice and retained stage buffers cover the
                 // checked BF16 geometry and remain live throughout graph replay.
-                unsafe { self.library.linear_bf16(input.ptr, weights.values.buffer.ptr, output.ptr,
-                    rows, k, n, self.stream_of(rank)) }
+                unsafe { self.core_rank(rank)?.bf16.launch(input.ptr, weights.values.buffer.ptr, output.ptr,
+                    rows, k, n, self.stream_of(rank))?; }
+                Ok(())
             });
         }
         let weights = layer.core.get(name).with_context(|| format!("Flash K6 missing {name}"))?;
