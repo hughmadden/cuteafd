@@ -116,8 +116,7 @@ def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, f
 def test_attention_variant_table_matches_launcher_and_distinguishes_ml4(tmp_path):
     reader = ROOT / "scripts/lib/checkpoint-family.py"
     variants = json.loads(reader.with_name("attention-variants.json").read_text())
-    assert variants == {"glm5_flash": True, "glm5": False, "mistral_large4": False,
-                        "kimi_k3": False, "step5": False, "muse_spark": False}
+    assert variants and all(type(enabled) is bool for enabled in variants.values())
     for family, enabled in [*variants.items(), ("unknown", False)]:
         result = subprocess.run(["python3", str(reader), "--attention-variant", family],
                                 capture_output=True, text=True, timeout=10)
@@ -127,16 +126,23 @@ def test_attention_variant_table_matches_launcher_and_distinguishes_ml4(tmp_path
               "architectures": ["MistralLarge4ForConditionalGeneration"],
               "text_config": {"model_type": "mistral_large4_text",
                               "num_hidden_layers": 72, "first_k_dense_replace": 1}}
-    result = _family_launch_result(tmp_path, config, "test/ml4-variant",
-        "ATTENTION_MODE=fp8-compact\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
-        extra_args=("--family", "glm5"))
-    assert result.returncode != 0
-    assert "checkpoint variant mistral_large4" in result.stderr
+    for enabled in [False, True]:
+        case = tmp_path / str(enabled)
+        result = _family_launch_result(case, config, "test/ml4-variant",
+            "ATTENTION_MODE=fp8-compact\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+            attention_variants={"glm5": not enabled, "mistral_large4": enabled})
+        if enabled:
+            assert result.returncode == 0, result.stderr
+            launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm --snapshot" in line)
+            assert "--fp8-compact-attention" in launch
+        else:
+            assert result.returncode != 0
+            assert "checkpoint variant mistral_large4" in result.stderr
 
 
 @pytest.mark.parametrize("mode", ["compact", "fp8-compact", "unknown"])
 def test_attention_bundle_refuses_unsupported_modes_and_families(tmp_path, mode):
-    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    config = {"model_type": "unknown", "num_hidden_layers": 4}
     result = _family_launch_result(tmp_path, config, "test/no-hqa",
                                   f"EXLR8_MANIFEST=up1\nATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     assert result.returncode != 0
@@ -896,6 +902,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           deployment_overrides: dict | None = None,
                           probe_fails: bool = False, root_launcher: bool = False,
                           checkpoint_source: Path | None = None,
+                          attention_variants: dict[str, bool] | None = None,
                           execute_workers: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch. nvidia-smi reports
@@ -910,6 +917,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     copy_input(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
+    if attention_variants is not None:
+        table = repo / "scripts/lib/attention-variants.json"
+        table.unlink()  # Sandbox inputs may share an immutable template inode.
+        table.write_text(json.dumps(attention_variants))
     from launcher_sandbox import stub_cuda_capacity
     stub_cuda_capacity(repo / "scripts/lib/release-common.sh",
                        cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20)

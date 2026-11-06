@@ -229,6 +229,8 @@ mod media_defaults_tests {
                 "text_config":{"model_type":"muse_spark_text"}})),
             ("unknown", serde_json::json!({"model_type":"unknown", "text_config":{"model_type":"glm5_next"}})),
         ];
+        let variants: std::collections::BTreeMap<String, bool> = serde_json::from_str(
+            include_str!("../../../../scripts/lib/attention-variants.json"))?;
         for (expected, mut config) in fixtures {
             config["transformers_weights"] = serde_json::json!("model.compact-attention.safetensors.index.json");
             std::fs::write(root.path().join("config.compact-attention.json"), config.to_string())?;
@@ -238,7 +240,7 @@ mod media_defaults_tests {
             assert_eq!(family, expected);
             let attention = super::cli::AttentionArgs { compact_attention: true, ..Default::default() };
             let result = attention.validate_view(&view);
-            assert_eq!(result.is_ok(), expected == "glm5_flash", "{expected}");
+            assert_eq!(result.is_ok(), variants.get(expected).copied().unwrap_or(false), "{expected}");
             if let Err(error) = result {
                 assert!(error.to_string().contains(&format!("family={expected}")), "{error}");
             }

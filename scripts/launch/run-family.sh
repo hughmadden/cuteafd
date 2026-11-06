@@ -2546,7 +2546,7 @@ audio_encoder_hash=""
       plan_draft_args+=("$flag" "$value")
     fi
   done
-  release_reject_unused_keys "$family" $(_family_allowed_keys "$family")
+  release_reject_unused_keys "$family" $(_family_allowed_keys "$family" "$detected_family")
   deployment_args=()
   deployment_peers=()
   for ((rank = 0; rank < available_sparks; rank++)); do
