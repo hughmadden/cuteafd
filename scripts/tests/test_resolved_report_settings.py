@@ -57,11 +57,17 @@ def registry():
 def rewritten_fields(code):
     """Direct/mutating writes and destructuring writes to parsed argument objects."""
     target = r'\b(?:args|engine_args|resolved|selected_args|context_args)\.(?:\w+\.)*(\w+)'
-    for match in re.finditer(target + r'\s*(?:=(?!=)|\.(?:clear|take|get_or_insert|push)\()', code):
+    for match in re.finditer(target + r'\s*(?:=(?!=|>)|\.(?:clear|take|get_or_insert|push)\()', code):
         yield match[1], match.start()
     for assignment in re.finditer(r'\(([^();]*?)\)\s*=(?!=|>)', code):
         for match in re.finditer(target, assignment[1]):
             yield match[1], assignment.start(1) + match.start()
+
+
+def test_match_arm_guards_are_not_rewrites():
+    code = "match x { Some(source) if source != args.snapshot => args.attention.select(source)?, _ => () }"
+    assert list(rewritten_fields(code)) == []
+    assert [field for field, _ in rewritten_fields("args.snapshot = source;")] == ["snapshot"]
 
 
 def test_every_rewritten_serve_argument_is_marked_derived():
