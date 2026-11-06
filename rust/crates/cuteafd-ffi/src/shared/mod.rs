@@ -5,6 +5,7 @@
 pub(crate) mod fp8_gemv;
 pub(crate) mod packed_head;
 pub mod fp8_moe;
+pub mod expert_usage;
 pub mod programs;
 pub mod mla_draft;
 pub mod draft_projection;

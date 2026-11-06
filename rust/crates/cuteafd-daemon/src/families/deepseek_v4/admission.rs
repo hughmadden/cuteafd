@@ -111,15 +111,17 @@ pub(crate) fn host_config(prefix: Option<&crate::shared::prefix::PrefixArgs>,
 /// Admit one placement from these inputs: one solve over every device and
 /// host owner, before any allocation.
 pub(crate) fn admit(inputs: &v4::V4Inputs)
-    -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::planner::serving::HostPrefixOwners)> {
+    -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::planner::serving::HostPrefixOwners,
+        Option<cuteafd_core::expert_usage::Geometry>)> {
     let prepared = v4::prepare(inputs).map_err(anyhow::Error::msg)?;
     let prefix = prepared.prefix().owners;
+    let expert_usage = prepared.expert_usage().cloned();
     for note in prepared.prefix().notes(inputs.max_context, inputs.sequences) { tracing::info!("{note}"); }
     let request = v4::production_request(inputs);
     let admitted = prepared.admit(request).map_err(anyhow::Error::msg)?;
     tracing::info!(solve_us = admitted.solve_us, admissions = 1,
         "V4 admission prepare + solve/execution (excludes checkpoint inventory)");
-    Ok((admitted.placement, prefix))
+    Ok((admitted.placement, prefix, expert_usage))
 }
 
 /// The family facts serve-dsv4 admits: the same inputs `plan --layout` builds.
@@ -202,6 +204,7 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
         cuteafd_core::memory_layout::Basis::Exact)
         .with_resident_weights(cuteafd_loader::placement::ResidentWeights(embedding_weights)));
     Ok(v4::V4Inputs {
+        expert_usage: args.expert_usage,
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), automatic_context: args.max_context == 0, cfg: cache_cfg, weights, cache_stages: inputs.cache_stages,
         gpus: baselines, headroom_floor: 0, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: shape.waves, decode_rows: decode,

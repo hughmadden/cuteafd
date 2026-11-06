@@ -23,6 +23,11 @@ use std::time::{Duration, Instant};
 /// What every DeepSeek V4 command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Count executed expert routes on device, separately for prefill and decode.
+    #[arg(long)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// Checkpoint snapshot directory.
     #[arg(long)]
     pub snapshot: PathBuf,
@@ -520,7 +525,7 @@ pub(crate) fn with_engine<T>(
             host_memory: cuteafd_loader::formats::mapped_preload::host_memory()? };
         let facts = admission::inputs(args, &inputs)?;
         // One solve over every device and host owner, before the first allocation.
-        let (placement, host_prefix) = admission::admit(&facts)
+        let (placement, host_prefix, expert_usage) = admission::admit(&facts)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
         if !skip {
@@ -587,9 +592,9 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
         cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
-        (placement, host_prefix, embedding, model, shares)
+        (placement, host_prefix, expert_usage, embedding, model, shares)
     };
-    let (placement, host_prefix, embedding, model, mut shares) = placement;
+    let (placement, host_prefix, expert_usage, embedding, model, mut shares) = placement;
     let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
         Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
             loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)
@@ -606,6 +611,7 @@ pub(crate) fn with_engine<T>(
             args.max_sequences), context_mode.is_some()),
     );
     let mut engine = engine::Engine::new(engine::EngineParts {
+        expert_usage: expert_usage.map(|geometry| (geometry, args.expert_usage_reader.clone())),
         library: &loaded.library,
         programs: &programs,
         cfg: loaded.cfg.clone(),

@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Expert Usage</title>
+<link rel="stylesheet" href="/assets/cuteafd-ui.css">
+<style>
+[hidden] { display: none !important; }
+.controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+.controls label { display: flex; gap: 8px; align-items: center; color: var(--ink-2); font: 12px var(--mono); }
+select, button { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line-2); border-radius: 5px; padding: 7px 10px; font: 12px var(--mono); }
+select:focus-visible, button:focus-visible, canvas:focus-visible { outline: 2px solid var(--target); outline-offset: 3px; }
+h1 { margin: 0; font-size: 22px; font-weight: 500; letter-spacing: -.02em; }
+p { margin: 0; color: var(--ink-2); }
+.intro { display: grid; gap: 8px; padding: 16px 2px 4px; }
+#notice { min-height: 1.5em; color: var(--ink-2); font: 12px var(--mono); }
+#sample { font: 11px var(--mono); color: var(--ink-2); }
+.summary { display: flex; gap: 24px; flex-wrap: wrap; padding: 6px 0; font: 12px var(--mono); color: var(--ink-2); }
+.summary b { color: var(--ink); font-size: 18px; font-weight: 500; }
+.plot-scroll { overflow: auto; max-width: 100%; background: var(--well); border-radius: 6px; }
+#matrix { display: block; touch-action: pan-x pan-y; }
+.plot-foot { display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; align-items: center; }
+.key { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font: 11px var(--mono); }
+#ramp { display: flex; gap: 2px; }
+#ramp i { display: block; width: 20px; height: 10px; }
+#readout { min-height: 2em; font: 12px var(--mono); color: var(--ink); }
+.hint { color: var(--ink-2); font: 11px var(--mono); }
+#tooltip { position: fixed; z-index: 10; pointer-events: none; padding: 8px 10px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--panel-2); color: var(--ink); white-space: pre-line; font: 12px/1.5 var(--mono); box-shadow: 0 5px 24px #0008; }
+.table-scroll { max-height: 360px; overflow: auto; }
+table { border-collapse: collapse; width: 100%; font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+caption { text-align: left; padding: 8px 0; color: var(--ink-2); }
+th, td { padding: 7px 12px; text-align: right; border-bottom: 1px solid var(--line); }
+th:first-child, td:first-child { text-align: left; }
+thead th { position: sticky; top: 0; background: var(--panel-2); color: var(--ink-2); }
+@media (max-width: 600px) { .app { padding: 14px 16px 24px; } .controls { gap: 10px; } .summary { gap: 16px; } h1 { font-size: 20px; } }
+</style>
+</head>
+<body>
+<main class="app" id="app">
+<header id="header"></header>
+<section class="intro">
+<h1>Where the model routes work</h1>
+<p>Layers stacked vertically. Experts across. Color shows each expert's share of its layer's routed selections.</p>
+</section>
+<section class="panel">
+<div class="controls">
+<label>Phase <select id="phase"><option value="combined">Combined</option><option value="prefill">Prefill</option><option value="decode">Decode</option></select></label>
+<label>Window <select id="window"><option value="short">Short (~5 s)</option><option value="long">Long (~60 s)</option><option value="total">Total</option></select></label>
+<label><input type="checkbox" id="texture"> Texture</label>
+<button type="button" id="pause">Pause</button>
+<span id="sample"></span>
+</div>
+<div id="notice" role="status">Connecting to expert telemetry...</div>
+<div class="summary" id="summary" hidden>
+<span><b id="touched">0</b> touched / <span id="possible">0</span></span>
+<span><b id="coverage">0%</b> coverage</span>
+<span><b id="concentration">0</b> concentration (HHI)</span>
+<span><b id="rows">0</b> layer-routed rows</span>
+</div>
+<div id="plot" hidden>
+<div class="plot-scroll"><canvas id="matrix" tabindex="0" role="img" aria-label="Expert usage matrix. Use arrow keys to inspect layers and experts." aria-describedby="readout"></canvas></div>
+<div class="plot-foot">
+<div class="key"><span>0 / untouched</span><span id="ramp" aria-hidden="true"></span><span id="peak">peak share</span></div>
+<span class="hint">Scale follows the selected window's peak. Dense layers are omitted.</span>
+</div>
+<p id="readout" aria-live="polite">Hover, tap, or use arrow keys to inspect a cell.</p>
+<p class="hint">Executed backbone rows, not committed tokens: rejected verifier rows count. Snapshot boundaries are approximate; totals include executed startup work. Concentration is the mean within-layer sum of squared shares over active layers.</p>
+</div>
+</section>
+<section class="panel" id="table-panel" hidden>
+<div class="panel-head"><h2>Inspect a layer</h2><label for="layer">Layer</label><select id="layer"></select></div>
+<div class="table-scroll"><table>
+<caption id="table-caption">Exact counts and within-layer shares for the selected view.</caption>
+<thead><tr><th scope="col">Expert</th><th scope="col">Routed selections</th><th scope="col">Layer share</th></tr></thead>
+<tbody id="table-body"></tbody>
+</table></div>
+</section>
+</main>
+<div id="tooltip" role="tooltip" hidden></div>
+<script src="/assets/cuteafd-ui.js"></script>
+<script>
+(async () => {
+'use strict';
+const $ = (id) => document.getElementById(id);
+const UI = window.CuteUI;
+const header = UI.header($('header'), { page: 'experts', subtitle: 'Expert routing' });
+if (!await UI.adminGate($('app'), 'Expert usage', 'Live device-side prefill and decode routing across every layer and expert.')) return;
+// Sequential blue ramp validated for monotone lightness on the existing dark well.
+const ramp = ['#184f95', '#256abf', '#3987e5', '#6da7ec', '#9ec5f4', '#cde2fb'];
+ramp.forEach((color) => { const swatch = document.createElement('i'); swatch.style.background = color; $('ramp').append(swatch); });
+const canvas = $('matrix'), ctx = canvas.getContext('2d');
+let snapshot = null, view = null, selected = { row: 0, expert: 0 }, paused = false;
+let layout = null, clock = null, lastChange = performance.now();
+const pct = (n) => (n * 100).toFixed(2) + '%';
+const number = (n) => UI.fmt.n0(n);
+function cell(row, expert) {
+  const layer = view.geometry.routed_layers[row];
+  const count = view.counts[layer * view.geometry.experts + expert];
+  const total = view.totals[row];
+  return { layer, expert, count, share: total > 0 ? count / total : 0 };
+}
+function description(c) { return `Layer ${c.layer} / expert ${c.expert}\n${number(c.count)} routed selections / ${pct(c.share)} of layer`; }
+function inspect(row, expert) {
+  selected = { row, expert };
+  $('readout').textContent = description(cell(row, expert)).replace('\n', ' - ');
+  draw();
+}
+function draw() {
+  if (!view) return;
+  const experts = view.geometry.experts, layers = view.geometry.routed_layers;
+  const left = 58, top = 32, cw = Math.max(5, Math.min(16, ($('plot').clientWidth - left - 12) / experts)), ch = 16;
+  const width = Math.max(320, left + experts * cw + 12), height = top + layers.length * ch + 14;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.ceil(width * dpr); canvas.height = Math.ceil(height * dpr);
+  canvas.style.width = width + 'px'; canvas.style.height = height + 'px';
+  ctx.scale(dpr, dpr);
+  layout = { left, top, cw, ch, width, height };
+  ctx.fillStyle = UI.token('well'); ctx.fillRect(0, 0, width, height);
+  ctx.font = '10px ' + UI.token('mono'); ctx.textBaseline = 'middle'; ctx.fillStyle = UI.token('ink-2');
+  const stride = Math.max(1, Math.ceil(38 / cw));
+  ctx.fillText('Layer', 5, 13);
+  for (let e = 0; e < experts; e += stride) ctx.fillText(String(e), left + e * cw, 13);
+  for (let row = 0; row < layers.length; row++) {
+    ctx.fillStyle = UI.token('ink-2'); ctx.fillText(String(layers[row]), 12, top + row * ch + ch / 2);
+    for (let expert = 0; expert < experts; expert++) {
+      const c = cell(row, expert), x = left + expert * cw, y = top + row * ch;
+      ctx.fillStyle = c.count ? ramp[Math.min(ramp.length - 1, Math.floor(c.share / view.peak * ramp.length))] : UI.token('line');
+      ctx.fillRect(x, y, cw - 2, ch - 2);
+      if ($('texture').checked && c.count) {
+        ctx.save(); ctx.beginPath(); ctx.rect(x, y, cw - 2, ch - 2); ctx.clip();
+        ctx.strokeStyle = UI.token('well'); ctx.lineWidth = 1;
+        const gap = Math.max(2, Math.round(8 - 6 * c.share / view.peak));
+        for (let p = -ch; p < cw + ch; p += gap) {
+          ctx.beginPath(); ctx.moveTo(x + p, y + ch); ctx.lineTo(x + p + ch, y); ctx.stroke();
+        }
+        ctx.restore();
+      }
+    }
+  }
+  ctx.strokeStyle = UI.token('ink'); ctx.lineWidth = 2;
+  ctx.strokeRect(left + selected.expert * cw - 1, top + selected.row * ch - 1, cw, ch);
+}
+function table() {
+  if (!view) return;
+  const row = view.geometry.routed_layers.indexOf(Number($('layer').value));
+  const index = Math.max(0, row), fragment = document.createDocumentFragment();
+  for (let expert = 0; expert < view.geometry.experts; expert++) {
+    const c = cell(index, expert), tr = document.createElement('tr');
+    for (const text of [String(expert), number(c.count), pct(c.share)]) {
+      const td = document.createElement('td'); td.textContent = text; tr.append(td);
+    }
+    fragment.append(tr);
+  }
+  $('table-caption').textContent = `Layer ${view.geometry.routed_layers[index]} - ${$('phase').selectedOptions[0].text}, ${$('window').selectedOptions[0].text}.`;
+  $('table-body').replaceChildren(fragment);
+}
+function render() {
+  if (!snapshot?.enabled) {
+    $('notice').textContent = 'Expert usage is off. Launch a supported family with EXPERT_USAGE=on.';
+    for (const id of ['summary', 'plot', 'table-panel']) $(id).hidden = true;
+    return;
+  }
+  const g = snapshot.geometry, w = snapshot.windows?.[$('window').value];
+  if (!g || !w || !Number.isInteger(g.layers) || !Number.isInteger(g.experts) || !g.routed_layers?.length) throw new Error('Invalid expert geometry');
+  const prefill = w.prefill_routed_rows, decode = w.decode_routed_rows;
+  if (prefill?.length !== g.layers * g.experts || decode?.length !== prefill.length) throw new Error('Invalid counter matrix');
+  const phase = $('phase').value;
+  const counts = prefill.map((n, i) => phase === 'prefill' ? n : phase === 'decode' ? decode[i] : n + decode[i]);
+  if (counts.some((n) => !Number.isSafeInteger(n) || n < 0)) throw new Error('Counters exceed browser exact integer range');
+  const totals = g.routed_layers.map((layer) => counts.slice(layer * g.experts, (layer + 1) * g.experts).reduce((a, b) => a + b, 0));
+  let peak = 0;
+  for (let row = 0; row < g.routed_layers.length; row++) for (let expert = 0; expert < g.experts; expert++) {
+    peak = Math.max(peak, totals[row] ? counts[g.routed_layers[row] * g.experts + expert] / totals[row] : 0);
+  }
+  const oldGeometry = view?.geometry;
+  view = { geometry: g, counts, totals, peak: peak || 1 };
+  selected.row = Math.min(selected.row, g.routed_layers.length - 1); selected.expert = Math.min(selected.expert, g.experts - 1);
+  const summary = w[phase];
+  $('touched').textContent = number(summary.touched); $('possible').textContent = number(summary.possible);
+  $('coverage').textContent = pct(summary.coverage); $('concentration').textContent = summary.concentration.toFixed(4);
+  $('rows').textContent = number(summary.routed_rows); $('peak').textContent = pct(peak) + ' peak share';
+  $('sample').textContent = `Sample t+${snapshot.sampled_s.toFixed(1)} s / window ${w.elapsed_s.toFixed(1)} s`;
+  const stalled = performance.now() - lastChange > 5000;
+  $('notice').textContent = snapshot.error ? 'Snapshot worker stopped: ' + snapshot.error : paused ? 'Paused on the last received snapshot.' : stalled ? 'No new snapshot for over 5 seconds; showing the last sample.' : 'Live - sampled about once per second. Arrow keys inspect the matrix.';
+  header.status.textContent = snapshot.error || stalled ? 'STALE' : paused ? 'PAUSED' : 'LIVE';
+  for (const id of ['summary', 'plot', 'table-panel']) $(id).hidden = false;
+  if (JSON.stringify(oldGeometry) !== JSON.stringify(g)) {
+    $('layer').replaceChildren(...g.routed_layers.map((layer) => { const o = document.createElement('option'); o.value = String(layer); o.textContent = String(layer); return o; }));
+    UI.facts(header.meta, [['layers', number(g.routed_layers.length)], ['experts', number(g.experts)], ['top-k', number(g.topk)]]);
+  }
+  draw(); table();
+}
+function hit(event) {
+  if (!layout || !view) return null;
+  const bounds = canvas.getBoundingClientRect();
+  const x = (event.clientX - bounds.left) * layout.width / bounds.width;
+  const y = (event.clientY - bounds.top) * layout.height / bounds.height;
+  const expert = Math.floor((x - layout.left) / layout.cw), row = Math.floor((y - layout.top) / layout.ch);
+  return expert >= 0 && expert < view.geometry.experts && row >= 0 && row < view.geometry.routed_layers.length ? { row, expert } : null;
+}
+canvas.addEventListener('pointermove', (event) => {
+  const point = hit(event); $('tooltip').hidden = !point;
+  if (!point) return;
+  inspect(point.row, point.expert);
+  $('tooltip').textContent = description(cell(point.row, point.expert));
+  $('tooltip').style.left = Math.max(8, Math.min(innerWidth - 290, event.clientX + 12)) + 'px';
+  $('tooltip').style.top = Math.max(8, Math.min(innerHeight - 70, event.clientY + 12)) + 'px';
+});
+canvas.addEventListener('pointerleave', () => { $('tooltip').hidden = true; });
+canvas.addEventListener('click', (event) => {
+  const point = hit(event); if (!point) return;
+  inspect(point.row, point.expert); $('layer').value = String(cell(point.row, point.expert).layer); table();
+});
+canvas.addEventListener('keydown', (event) => {
+  if (!view) return;
+  let { row, expert } = selected;
+  if (event.key === 'ArrowLeft') expert--; else if (event.key === 'ArrowRight') expert++;
+  else if (event.key === 'ArrowUp') row--; else if (event.key === 'ArrowDown') row++;
+  else if (event.key === 'Home') expert = 0; else if (event.key === 'End') expert = view.geometry.experts - 1; else return;
+  event.preventDefault();
+  inspect(Math.max(0, Math.min(row, view.geometry.routed_layers.length - 1)), Math.max(0, Math.min(expert, view.geometry.experts - 1)));
+  $('layer').value = String(cell(selected.row, selected.expert).layer); table();
+});
+for (const id of ['phase', 'window', 'texture']) $(id).addEventListener('change', render);
+$('layer').addEventListener('change', table);
+$('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; render(); };
+window.addEventListener('resize', draw);
+async function refresh() {
+  if (paused || document.hidden) return;
+  try {
+    const response = await fetch('/console/expert-usage', { credentials: 'same-origin', cache: 'no-store' });
+    if (!response.ok) throw new Error(response.status === 401 ? 'Console session locked. Reopen the admin console link.' : 'Telemetry request failed (' + response.status + ')');
+    snapshot = await response.json();
+    if (snapshot.sampled_s !== clock) { clock = snapshot.sampled_s; lastChange = performance.now(); }
+    render();
+  } catch (error) { $('notice').textContent = String(error.message || error); header.status.textContent = 'OFFLINE'; $('tooltip').hidden = true; }
+}
+await refresh();
+setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>

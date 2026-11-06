@@ -6,7 +6,7 @@
 //! draft-policy gates read). It runs in the driver's own binary, so both arms
 //! of an A/B measure the same workload whatever their server builds contain.
 use crate::client::Client;
-use crate::panels::common::{aggregate, mapped_counters, mapped_interval, median, plain, wave, Timed};
+use crate::panels::common::{aggregate, expert_usage_interval, mapped_interval, median, phase_counters, plain, wave, Timed};
 use crate::panels::speed::CONTENT;
 use crate::text::{corpus, nonce};
 use anyhow::{bail, Context, Result};
@@ -54,6 +54,9 @@ pub struct Point {
     /// Mapped-table counters over the timed wave alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapped_tables: Vec<Value>,
+    /// Approximate phase deltas from asynchronous device snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_usage: Option<Value>,
 }
 
 /// One cold prefill at a chosen length (after one untimed warm request there).
@@ -72,6 +75,9 @@ pub struct PrefillPoint {
     /// Mapped-table counters over the timed request alone (`/v1/stats` before and after).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mapped_tables: Vec<Value>,
+    /// Approximate phase deltas from asynchronous device snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_usage: Option<Value>,
 }
 
 /// Explicit cold C1 prose cells; omitted seeds retain the original corpus seed.
@@ -195,11 +201,13 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     timed(on_timed)?;
     let mark = client.thermal_mark();
     let fabric_mark = client.fabric_mark();
-    let tables = mapped_counters(client);
+    let counters = phase_counters(client);
     let before = c1.and_then(|_| client.decode_counters());
     let results = uncached(batch(&prompts.timed))?;
     let draft_counters = draft_delta(before.as_ref(), c1.and_then(|_| client.decode_counters()).as_ref());
-    let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
+    let after = phase_counters(client);
+    let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
+    let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
     let thermal = client.thermal_since(mark);
     let errors = results.iter().filter(|r| r.is_err()).count();
@@ -210,7 +218,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
     let point = Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
-        ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables,
+        ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables, expert_usage,
         context: c1.map(|x| x.0), seed: c1.map(|x| x.1),
         prompt_sha256: c1.map(|_| format!("{:x}", Sha256::digest(prompts.timed[0].as_bytes()))),
         prompt_tokens: c1.map(|_| ok[0].chat.timing.prompt_tokens),
@@ -259,15 +267,17 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         purge().with_context(|| format!("{length}-token prefill purge before the timed request"))?;
         let mark = client.thermal_mark();
         let fabric_mark = client.fabric_mark();
-        let tables = mapped_counters(client);
+        let counters = phase_counters(client);
         let chat = ask(words, timed_seed).with_context(|| format!("{length}-token prefill"))?;
-        let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
+        let after = phase_counters(client);
+        let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
+        let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
         let thermal = client.thermal_since(mark);
         let fabric = client.fabric_since(fabric_mark, &format!("prefill/{length}"), true).map(|p| serde_json::json!(p));
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
         points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
-            thermal, fabric, mapped_tables });
+            thermal, fabric, mapped_tables, expert_usage });
     }
     Ok(points)
 }

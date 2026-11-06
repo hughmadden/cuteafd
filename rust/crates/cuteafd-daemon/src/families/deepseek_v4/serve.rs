@@ -86,7 +86,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     cuteafd_core::concurrency::validate("deepseek_v4", args.engine.max_sequences as u64)?;
     args.prefix.resolve_entries(args.engine.max_sequences);
     let api = args.api.load()?;
-    let profile = ModelProfile::new(
+    let mut profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,
         ModelEncoding::DeepseekV4,
     );
@@ -95,6 +95,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     engine_args.max_context = args.max_context as usize;
+    profile.expert_usage = engine_args.expert_usage_reader.clone();
     let worker_stats = stats.clone();
     let (max_context, decode_share, prefix) =
         (args.max_context as usize, args.decode_share, args.prefix.clone());

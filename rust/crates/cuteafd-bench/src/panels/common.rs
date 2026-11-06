@@ -175,6 +175,68 @@ pub fn mapped_counters(client: &Client) -> Vec<Value> {
     client.stats().ok().and_then(|v| v["mapped_tables"].as_array().cloned()).unwrap_or_default()
 }
 
+/// One stats read at a phase boundary, shared by mapped-table and route telemetry.
+pub struct PhaseCounters {
+    pub mapped_tables: Vec<Value>,
+    pub expert_usage: Option<Value>,
+}
+pub fn phase_counters(client: &Client) -> PhaseCounters {
+    let stats = client.stats().unwrap_or(Value::Null);
+    PhaseCounters {
+        mapped_tables: stats["mapped_tables"].as_array().cloned().unwrap_or_default(),
+        expert_usage: stats.get("expert_usage").cloned(),
+    }
+}
+
+/// Differences of asynchronous total snapshots, not exact phase-isolated counts.
+pub fn expert_usage_interval(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
+    let after = after?;
+    if after["enabled"] != true { return None; }
+    let start = before.and_then(|v| v["sampled_s"].as_f64());
+    let end = after["sampled_s"].as_f64();
+    let unavailable = |reason: &str| Some(json!({"available": false, "reason": reason,
+        "boundaries": "approximate_async_snapshots", "start_sampled_s": start, "end_sampled_s": end}));
+    let Some(before) = before.filter(|v| v["enabled"] == true) else {
+        return unavailable("no enabled start sample");
+    };
+    if !before["error"].is_null() || !after["error"].is_null() {
+        return unavailable("expert usage snapshot worker failed");
+    }
+    let Some((start, end)) = start.zip(end).filter(|(a, b)| a.is_finite() && *a >= 0.0 && b.is_finite() && b >= a) else {
+        return unavailable("invalid or restarted sample clock");
+    };
+    if before["geometry"] != after["geometry"] || before["semantics"] != after["semantics"]
+        || after["semantics"] != "executed_routed_rows" {
+        return unavailable("geometry or counting semantics changed");
+    }
+    let Ok(geometry) = serde_json::from_value::<cuteafd_core::expert_usage::Geometry>(after["geometry"].clone()) else {
+        return unavailable("invalid geometry");
+    };
+    if !geometry.validate() { return unavailable("invalid geometry"); }
+    let cells = geometry.cells().unwrap();
+    let delta = |name: &str| -> Option<Vec<u64>> {
+        let old = before["windows"]["total"][name].as_array()?;
+        let new = after["windows"]["total"][name].as_array()?;
+        if old.len() != cells || new.len() != cells { return None; }
+        old.iter().zip(new).map(|(a, b)| b.as_u64()?.checked_sub(a.as_u64()?)).collect()
+    };
+    let Some(prefill) = delta("prefill_routed_rows") else { return unavailable("invalid prefill totals"); };
+    let Some(decode) = delta("decode_routed_rows") else { return unavailable("invalid decode totals"); };
+    let Some(combined) = prefill.iter().zip(&decode).map(|(a, b)| a.checked_add(*b)).collect::<Option<Vec<_>>>() else {
+        return unavailable("combined counter overflow");
+    };
+    if combined.iter().try_fold(0u64, |sum, n| sum.checked_add(*n)).is_none() {
+        return unavailable("summary counter overflow");
+    }
+    use cuteafd_core::expert_usage::summarize;
+    Some(json!({"available": true, "semantics": "executed_routed_rows", "geometry": geometry,
+        "boundaries": "approximate_async_snapshots", "start_sampled_s": start, "end_sampled_s": end,
+        "sample_elapsed_s": end - start, "same_sample": start == end,
+        "prefill_routed_rows": prefill, "decode_routed_rows": decode,
+        "prefill": summarize(&geometry, &prefill), "decode": summarize(&geometry, &decode),
+        "combined": summarize(&geometry, &combined)}))
+}
+
 /// Differences belong to this measurement; maxima remain explicitly lifetime values.
 pub fn mapped_interval(before: &[Value], after: &[Value]) -> Vec<Value> {
     after.iter().map(|table| {
@@ -237,6 +299,7 @@ pub fn doublings(from: u64, max: u64) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
     #[test]
     fn zero_tokens_omits_the_output_budget() {
         use serde_json::json;
@@ -301,6 +364,57 @@ mod tests {
         assert_eq!(delta[0]["interval"]["prefetch_unclassified_batch_histogram"], json!([0,1]));
         assert!(delta[0]["interval"].get("unclassified_batch_max_ns").is_none());
         assert_eq!(delta[0]["lifetime_maxima"]["unclassified_batch_max_ns"], 7000);
+    }
+
+    fn usage_sample(t: f64, n: u64) -> Value {
+        let reader = cuteafd_core::expert_usage::Reader::default();
+        reader.initialize(cuteafd_core::expert_usage::Geometry {
+            layers: 2, experts: 4, topk: 2, routed_layers: vec![1],
+        }).unwrap();
+        reader.publish(cuteafd_core::expert_usage::Snapshot { elapsed_s: t,
+            prefill: vec![0, 0, 0, 0, n, n, 0, 0],
+            decode: vec![0, 0, 0, 0, 0, n, n, 0] }).unwrap();
+        reader.snapshot()
+    }
+
+    #[test]
+    fn expert_usage_intervals_keep_phases_and_approximate_boundaries() {
+        let a = usage_sample(1.0, 2);
+        let b = usage_sample(3.0, 5);
+        let delta = super::expert_usage_interval(Some(&a), Some(&b)).unwrap();
+        assert_eq!(delta["boundaries"], "approximate_async_snapshots");
+        assert_eq!(delta["start_sampled_s"], 1.0);
+        assert_eq!(delta["end_sampled_s"], 3.0);
+        assert_eq!(delta["prefill_routed_rows"], json!([0,0,0,0,3,3,0,0]));
+        assert_eq!(delta["decode_routed_rows"], json!([0,0,0,0,0,3,3,0]));
+        assert_eq!(delta["prefill"]["routed_rows"], 3);
+        assert_eq!(delta["combined"]["touched"], 3);
+        assert_eq!(delta["combined"]["possible"], 4);
+        assert_eq!(delta["combined"]["concentration"], 0.375);
+        let same = super::expert_usage_interval(Some(&b), Some(&b)).unwrap();
+        assert_eq!(same["same_sample"], true);
+        assert_eq!(same["combined"]["touched"], 0);
+    }
+
+    #[test]
+    fn expert_usage_intervals_reject_missing_stale_or_changed_inputs() {
+        let a = usage_sample(1.0, 2);
+        assert!(super::expert_usage_interval(None, None).is_none());
+        assert!(super::expert_usage_interval(None, Some(&json!({"enabled": false}))).is_none());
+        assert_eq!(super::expert_usage_interval(None, Some(&a)).unwrap()["available"], false);
+        for (path, value) in [
+            (vec!["geometry", "experts"], json!(8)),
+            (vec!["sampled_s"], json!(0.5)),
+            (vec!["error"], json!("worker failed")),
+            (vec!["windows", "total", "prefill_routed_rows"], json!([0,0,0,0,1,1,0,0])),
+            (vec!["windows", "total", "decode_routed_rows"], json!([0])),
+        ] {
+            let mut b = usage_sample(2.0, 3);
+            let mut field = &mut b;
+            for key in path { field = &mut field[key]; }
+            *field = value;
+            assert_eq!(super::expert_usage_interval(Some(&a), Some(&b)).unwrap()["available"], false);
+        }
     }
 
     #[test]

@@ -1625,6 +1625,13 @@ if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
 family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
+if [[ $family == deepseek_v4 ]]; then
+  case "$(get EXPERT_USAGE off)" in
+    on) family_args+=(--expert-usage) ;;
+    off) ;;
+    *) release_die "EXPERT_USAGE must be on or off" ;;
+  esac
+fi
 # Loop abort (boot-time only): unset keeps the daemon's shipped defaults.
 for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-copies' \
   'LOOP_FAST_SPAN:--loop-fast-span' 'LOOP_FAST_COPIES:--loop-fast-copies'; do
@@ -2377,6 +2384,7 @@ audio_encoder_hash=""
   done
   plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
   [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
+  [[ "$(get EXPERT_USAGE off)" != on ]] || plan_draft_args+=(--expert-usage)
   if [[ "$family" == qwen3_5 ]]; then
     plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --prefill-rows 4096
       --prefix-cache-entries "$effective_prefix_entries")
