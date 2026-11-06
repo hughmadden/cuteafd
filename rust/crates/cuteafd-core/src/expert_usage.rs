@@ -8,6 +8,14 @@ pub const SNAPSHOTS: usize = 61;
 pub const SHORT_SECONDS: u64 = 5;
 pub const LONG_SECONDS: u64 = 60;
 pub const WORKER_STACK_BYTES: usize = 256 * 1024;
+/// Named bounds for worker/channel handles and per-device snapshot descriptors.
+/// Payloads and the explicitly sized thread stack are charged separately.
+pub const SHARED_METADATA_BYTES: usize = 4096;
+pub const DEVICE_METADATA_BYTES: usize = 512;
+
+pub fn device_owner(gpu: u8, buffer: &str) -> String {
+    format!("expert-usage.gpu{gpu}.{buffer}")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Geometry {
@@ -23,9 +31,10 @@ impl Geometry {
     pub fn table_bytes(&self) -> Option<usize> {
         self.cells()?.checked_mul(16)
     }
-    /// Bounded sample payloads (including the worker's next sample), ring
-    /// metadata, two retained geometries, and the explicitly sized worker stack.
-    pub fn host_bytes(&self) -> Option<usize> {
+    /// One merged history plus the worker's next merged sample, ring metadata,
+    /// two geometries, bounded worker/device metadata and the explicit stack.
+    /// Device samples merge directly from pinned storage, with no extra matrices.
+    pub fn host_bytes(&self, devices: usize) -> Option<usize> {
         self.table_bytes()?
             .checked_mul(SNAPSHOTS + 1)?
             .checked_add(SNAPSHOTS.checked_mul(std::mem::size_of::<Snapshot>())?)?
@@ -35,6 +44,8 @@ impl Geometry {
                     .checked_mul(2 * std::mem::size_of::<usize>())?,
             )?
             .checked_add(std::mem::size_of::<History>() + std::mem::size_of::<Geometry>())?
+            .checked_add(SHARED_METADATA_BYTES)?
+            .checked_add(devices.checked_mul(DEVICE_METADATA_BYTES)?)?
             .checked_add(WORKER_STACK_BYTES)
     }
     pub fn validate(&self) -> bool {
@@ -72,14 +83,15 @@ pub fn summarize(geometry: &Geometry, counts: &[u64]) -> Summary {
     let mut active = 0;
     for &layer in &geometry.routed_layers {
         let row = &counts[layer * geometry.experts..(layer + 1) * geometry.experts];
-        let total: u64 = row.iter().sum();
+        let total = row.iter().fold(0u64, |n, &count| n.saturating_add(count));
+        let denominator = row.iter().map(|&count| count as f64).sum::<f64>();
         touched += row.iter().filter(|&&n| n > 0).count();
-        selections += total;
+        selections = selections.saturating_add(total);
         if total > 0 {
             active += 1;
             concentration += row
                 .iter()
-                .map(|&n| (n as f64 / total as f64).powi(2))
+                .map(|&n| (n as f64 / denominator).powi(2))
                 .sum::<f64>();
         }
     }
@@ -184,7 +196,11 @@ impl Reader {
             };
             let prefill = delta(&latest.prefill, baseline.map(|p| p.prefill.as_slice()));
             let decode = delta(&latest.decode, baseline.map(|p| p.decode.as_slice()));
-            let combined: Vec<_> = prefill.iter().zip(&decode).map(|(a, b)| a + b).collect();
+            let combined: Vec<_> = prefill
+                .iter()
+                .zip(&decode)
+                .map(|(a, b)| a.saturating_add(*b))
+                .collect();
             serde_json::json!({"elapsed_s": latest.elapsed_s - baseline.map_or(0.0, |p| p.elapsed_s),
                 "prefill_routed_rows": prefill, "decode_routed_rows": decode,
                 "prefill": summarize(&history.geometry, &prefill), "decode": summarize(&history.geometry, &decode),
@@ -252,6 +268,44 @@ mod tests {
             20
         );
     }
+    #[test]
+    fn large_totals_saturate_without_distorting_concentration() {
+        let geometry = Geometry {
+            layers: 1,
+            experts: 2,
+            topk: 1,
+            routed_layers: vec![0],
+        };
+        let reader = Reader::default();
+        reader.initialize(geometry.clone()).unwrap();
+        reader
+            .publish(Snapshot {
+                elapsed_s: 1.0,
+                prefill: vec![u64::MAX; 2],
+                decode: vec![u64::MAX; 2],
+            })
+            .unwrap();
+        let value = reader.snapshot();
+        assert_eq!(
+            value["windows"]["total"]["combined"]["routed_rows"],
+            u64::MAX
+        );
+        assert_eq!(value["windows"]["total"]["combined"]["concentration"], 0.5);
+        assert_eq!(
+            value["windows"]["total"]["prefill_routed_rows"][0],
+            u64::MAX
+        );
+        reader.fail("snapshot timed out; stale".into());
+        let stale = reader.snapshot();
+        assert_eq!(stale["sampled_s"], 1.0);
+        assert_eq!(stale["windows"], value["windows"]);
+        assert!(stale["error"].as_str().unwrap().contains("stale"));
+        assert_eq!(
+            geometry.host_bytes(2).unwrap() - geometry.host_bytes(1).unwrap(),
+            DEVICE_METADATA_BYTES
+        );
+    }
+
     #[test]
     fn dense_layers_are_excluded_from_coverage() {
         let summary = summarize(&geometry(), &[0, 0, 0, 0, 2, 2, 0, 0, 4, 0, 0, 0]);

@@ -260,7 +260,7 @@ pub(crate) struct PeerParts {
 
 /// Everything an [`Engine`] needs besides its pools and workspaces.
 pub(crate) struct EngineParts<'a> {
-    pub expert_usage: Option<cuteafd_core::expert_usage::Reader>,
+    pub expert_usage: Option<(cuteafd_core::expert_usage::Geometry, cuteafd_core::expert_usage::Reader)>,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: DeepseekV4Config,
@@ -563,13 +563,12 @@ impl<'a> Engine<'a> {
         };
         ensure!(parts.context.is_none() || (split_family.is_some() && parts.shape.units % 2 == 0),
             "C4 context attention needs the head-split programs and an even unit pool, not {} units", parts.shape.units);
-        let expert_usage = parts.expert_usage.map(|reader| cuteafd_ffi::expert_usage::ExpertUsage::new(parts.library,
-            cuteafd_core::expert_usage::Geometry { layers: parts.cfg.n_layers,
-                experts: parts.cfg.n_routed_experts, topk: parts.cfg.n_activated_experts,
-                routed_layers: (0..parts.cfg.n_layers).collect() }, reader)).transpose()?;
+        let device = parts.library.cuda_get_device()?;
+        let expert_usage = parts.expert_usage.map(|(geometry, reader)| cuteafd_ffi::expert_usage::ExpertUsage::new(
+            parts.library, geometry, &[cuteafd_ffi::expert_usage::UsageDevice { logical: 0, cuda: device }], reader)).transpose()?;
         Ok(Self {
             expert_usage,
-            device: parts.library.cuda_get_device()?,
+            device,
             split_family,
             peer: None,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
@@ -1623,7 +1622,7 @@ impl<'a> Engine<'a> {
             if let Some(usage) = &self.expert_usage {
                 let phase = if decode { cuteafd_ffi::expert_usage::UsagePhase::Decode }
                     else { cuteafd_ffi::expert_usage::UsagePhase::Prefill };
-                usage.routes(layer, phase)?.record(w.route_ids.buffer.ptr, t as usize, None, u32::MAX,
+                usage.routes(self.device, layer, phase)?.record(w.route_ids.buffer.ptr, t as usize, None, u32::MAX,
                     rank == 0, self.stream_of(rank))?;
             }
             Ok(())

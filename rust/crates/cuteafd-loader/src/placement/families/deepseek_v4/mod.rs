@@ -455,6 +455,27 @@ mod default_tests {
     }
 
     #[test]
+    fn telemetry_geometry_is_shared_with_recipe_and_excludes_dense_prefix() {
+        let cfg = context_cfg();
+        let mut input = plan_inputs(&cfg);
+        input.attention = Some(AttentionPlacement::Heads);
+        input.expert_usage = true;
+        input.first_routed = 1;
+        let prepared = prepare(&input).unwrap();
+        let geometry = prepared.expert_usage().unwrap();
+        assert_eq!(geometry.routed_layers, (1..cfg.n_layers).collect::<Vec<_>>());
+        let contract = planner::Recipe::prepare(&prepared, &production_request(&input)).unwrap();
+        let expected = crate::placement::expert_usage::components(geometry, &[0], contract.maximum_pages).unwrap();
+        for component in expected {
+            let planner::ComponentKind::Allocation { template: expected, .. } = component.kind else { panic!("allocation"); };
+            assert!(contract.components.iter().any(|component| matches!(&component.kind,
+                planner::ComponentKind::Allocation { template, .. } if template == &expected)));
+        }
+        input.expert_usage = false;
+        assert!(prepare(&input).unwrap().expert_usage().is_none());
+    }
+
+    #[test]
     fn auto_requires_matching_context_programs_but_explicit_heads_always_plans() {
         for (family, hidden, heads) in [("dsv4f", 4096, 64), ("dsv4p", 7168, 128)] {
             let mut cfg = context_cfg();

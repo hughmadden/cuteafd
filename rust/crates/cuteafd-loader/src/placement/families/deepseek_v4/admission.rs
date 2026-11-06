@@ -127,6 +127,7 @@ fn sum(bytes: impl IntoIterator<Item = u64>) -> Result<u64, Refusal> {
 #[derive(Debug)]
 pub struct PreparedV4<'a> {
     inputs: &'a V4Inputs,
+    expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     budgets: Vec<Budget>,
     reserves: Vec<u64>,
     modes: Vec<LayerMode>,
@@ -364,8 +365,18 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
         None => super::HostPrefix { owners: crate::placement::planner::serving::HostPrefixOwners {
             quota_bytes: 0, chunk_bytes: 0 }, geometry: None },
     };
+    let expert_usage = inputs.expert_usage.then(|| cuteafd_core::expert_usage::Geometry {
+        layers: inputs.cfg.n_layers,
+        experts: inputs.cfg.n_routed_experts,
+        topk: inputs.cfg.n_activated_experts,
+        routed_layers: (inputs.first_routed..inputs.cfg.n_layers).collect(),
+    });
+    if expert_usage.as_ref().is_some_and(|geometry| !geometry.validate()) {
+        return Err(invalid("invalid V4 expert usage geometry"));
+    }
     Ok(PreparedV4 {
         inputs,
+        expert_usage,
         budgets,
         reserves,
         modes,
@@ -544,6 +555,11 @@ impl<'a> PreparedV4<'a> {
 
     pub fn context(&self) -> u64 {
         self.context
+    }
+
+    /// The exact geometry priced by Recipe and passed unchanged to the engine.
+    pub fn expert_usage(&self) -> Option<&cuteafd_core::expert_usage::Geometry> {
+        self.expert_usage.as_ref()
     }
 
     /// The retained host prefix quota this contract declares.
@@ -842,13 +858,8 @@ impl Recipe for PreparedV4<'_> {
             }
         }
         let mut owners = Owners::new(self.maximum_pages);
-        if inputs.expert_usage {
-            let geometry = cuteafd_core::expert_usage::Geometry {
-                layers: inputs.cfg.n_layers, experts: inputs.cfg.n_routed_experts,
-                topk: inputs.cfg.n_activated_experts,
-                routed_layers: (inputs.first_routed..inputs.cfg.n_layers).collect(),
-            };
-            owners.components.extend(crate::placement::expert_usage::components(&geometry, 0, self.maximum_pages)?);
+        if let Some(geometry) = self.expert_usage() {
+            owners.components.extend(crate::placement::expert_usage::components(geometry, &[0], self.maximum_pages)?);
         }
         let (fixed, overhead, _) = fixed_demands(inputs).map_err(invalid)?;
         for (index, demand) in fixed.iter().chain(&inputs.weights.fixed).enumerate() {

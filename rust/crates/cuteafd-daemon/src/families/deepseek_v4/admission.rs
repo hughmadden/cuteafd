@@ -111,15 +111,17 @@ pub(crate) fn host_config(prefix: Option<&crate::shared::prefix::PrefixArgs>,
 /// Admit one placement from these inputs: one solve over every device and
 /// host owner, before any allocation.
 pub(crate) fn admit(inputs: &v4::V4Inputs)
-    -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::planner::serving::HostPrefixOwners)> {
+    -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::planner::serving::HostPrefixOwners,
+        Option<cuteafd_core::expert_usage::Geometry>)> {
     let prepared = v4::prepare(inputs).map_err(anyhow::Error::msg)?;
     let prefix = prepared.prefix().owners;
+    let expert_usage = prepared.expert_usage().cloned();
     for note in prepared.prefix().notes(inputs.max_context, inputs.sequences) { tracing::info!("{note}"); }
     let request = v4::production_request(inputs);
     let admitted = prepared.admit(request).map_err(anyhow::Error::msg)?;
     tracing::info!(solve_us = admitted.solve_us, admissions = 1,
         "V4 admission prepare + solve/execution (excludes checkpoint inventory)");
-    Ok((admitted.placement, prefix))
+    Ok((admitted.placement, prefix, expert_usage))
 }
 
 /// The family facts serve-dsv4 admits: the same inputs `plan --layout` builds.
