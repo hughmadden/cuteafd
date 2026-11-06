@@ -63,25 +63,11 @@ impl CoreInventory {
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { split, bits: 6, padded_outputs: stem == HEAD }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
-        // Inventory-only planning has selected names but no native headers yet.
-        let missing = expected(cfg).keys().filter(|name| name.contains(".self_attn.")
-            && !name.contains(".gate_proj.") && checkpoint.contains_tensor(name)
-            && !checkpoint.has_header(name))
-            .cloned().collect::<std::collections::BTreeSet<_>>();
-        let native_checkpoint;
-        let native_source = if missing.is_empty() { checkpoint } else {
-            native_checkpoint = Checkpoint::open_view_for_role(checkpoint.view.as_ref()
-                .context("Muse native attention requires a selected checkpoint view")?,
-                "Muse native attention", |name| missing.contains(name)
-                    || [".weight_scale_inv", ".qscale_weight"].iter().any(|suffix| name.strip_suffix(suffix)
-                        .is_some_and(|stem| missing.contains(&format!("{stem}.weight")))))?;
-            &native_checkpoint
-        };
         for (name, shape) in expected(cfg) {
             let stem = name.strip_suffix(".weight").unwrap();
             if !stem.contains(".self_attn.") || stem.ends_with(".gate_proj")
                 || !checkpoint.contains_tensor(&name) { continue; }
-            let selected = native_source.projection(stem)?;
+            let selected = checkpoint.projection(stem)?;
             let crate::plan::checkpoint::ProjectionStorage::Native { ref dtype, shape: ref actual } = selected.storage else { continue; };
             ensure!(*actual == shape, "{stem}: native Muse attention shape {actual:?}, expected {shape:?}");
             ensure!(matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
@@ -167,8 +153,10 @@ mod tests {
         mixed(dir.path(), &[]);
         for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
             let view = CheckpointView::select(dir.path(), mode)?;
-            // Plan's inventory path has no native headers; reads remain selected-index scoped.
+            // Shared inventory hydration supplies native headers from the selected index.
             let checkpoint = Checkpoint::inventory_view(&view)?;
+            assert!((0..62).all(|layer|
+                checkpoint.has_header(&format!("{PREFIX}{layer}.self_attn.o_proj.weight"))));
             let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
             let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
             assert_eq!(core.native.len(), 62);
