@@ -432,7 +432,7 @@ mod tests {
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("config.json"), b"{}")?;
-        std::fs::write(root.path().join("model.safetensors.index.json"), b"{}")?;
+        std::fs::write(root.path().join("model.safetensors.index.json"), br#"{"weight_map":{}}"#)?;
         let identity = WorkerIdentity::from_snapshot(root.path(), cuteafd_core::ExpertGeometry::GLM5,
             cuteafd_transport::expert::SparkWorld::canonical(4)?)?;
         let loaded = WorkerSelection::new(identity, &[3])?;

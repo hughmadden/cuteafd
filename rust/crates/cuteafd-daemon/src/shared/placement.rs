@@ -415,7 +415,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         // Identity only: idle admission must not try to infer a storage recipe.
         std::fs::write(root.path().join("config.json"), b"{}")?;
-        std::fs::write(root.path().join("model.safetensors.index.json"), b"{}")?;
+        std::fs::write(root.path().join("model.safetensors.index.json"), br#"{"weight_map":{}}"#)?;
         SparkAdmission::plan(root.path(), ExpertGeometry::GLM5_FLASH, None,
             &SparkWorkingSet::default(), 2, None,
             ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: 2048, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }],

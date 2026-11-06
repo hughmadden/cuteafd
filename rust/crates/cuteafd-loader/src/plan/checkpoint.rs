@@ -314,6 +314,7 @@ impl Checkpoint {
                 }
             }
         }
+        view.check_attention_headers(tensors.iter().map(|tensor| &tensor.meta))?;
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         Ok(Self {
             view: Some(view.clone()),

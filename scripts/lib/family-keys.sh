@@ -237,6 +237,7 @@ EOF
       ;;
     glm5_flash)
       cat <<'EOF'
+ATTENTION_MODE
 L2_PREFETCH
 FP8_SCALES
 SPECULATOR_FP8
