@@ -273,6 +273,9 @@ pub struct Contract {
     pub maximum_pages: u64,
     pub gpus: usize,
     pub variables: Vec<Variable>,
+    /// Permit this option only when the alternatives cannot meet the pool floor.
+    /// This preference precedes pool maximization within the same search.
+    pub floor_fallback: Option<Choice>,
     pub requires: Vec<Requires>,
     pub components: Vec<Component>,
 }
@@ -325,6 +328,7 @@ impl Contract {
             maximum_pages,
             gpus,
             variables: vec![],
+            floor_fallback: None,
             requires: vec![],
             components,
         }

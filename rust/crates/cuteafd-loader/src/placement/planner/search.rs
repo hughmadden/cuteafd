@@ -790,6 +790,18 @@ pub fn solve(
         assignments: 0,
         last: Refusal::Unsupported,
     };
+    if let Some(fallback) = contract.floor_fallback {
+        let domain = domains.get(fallback.variable)
+            .filter(|domain| domain.contains(&fallback.option))
+            .ok_or_else(|| Refusal::InvalidFact("invalid pool-floor fallback choice".into()))?;
+        let mut preferred = domains.clone();
+        preferred[fallback.variable] = domain.iter().copied()
+            .filter(|&option| option != fallback.option).collect();
+        let floor = if matches!(request.pool, Pin::Exact(_)) { wanted } else { minimum };
+        if !preferred[fallback.variable].is_empty() && search.feasible(preferred.clone(), floor)? {
+            domains = preferred;
+        }
+    }
     let pages = if search.feasible(domains.clone(), wanted)? {
         wanted
     } else if matches!(request.pool, Pin::Exact(_)) {
