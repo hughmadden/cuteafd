@@ -78,8 +78,9 @@ fn index_aliases(snapshot: &Path, config: &Value, mode: AttentionMode, canonical
     // Compact metadata intentionally omits the HQA declaration; consult only its
     // small default config when an alternate index name needs authorization.
     let default_config;
-    let declared = super::index_name_from_config(config)?;
-    let declaration = if declaration.is_none() && mode == AttentionMode::Compact && declared != canonical {
+    let declared_alias = config.get("transformers_weights").and_then(Value::as_str)
+        .is_some_and(|name| name != canonical);
+    let declaration = if declaration.is_none() && mode == AttentionMode::Compact && declared_alias {
         default_config = serde_json::from_slice::<Value>(&metadata_bytes(&snapshot.join("config.json"))?)?;
         default_config.pointer("/quantization_config/attention_view")
     } else { declaration };
