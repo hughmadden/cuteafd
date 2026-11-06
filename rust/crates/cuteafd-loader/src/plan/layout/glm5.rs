@@ -196,6 +196,11 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
     anyhow::ensure!((1..=2).contains(&ranks), "GLM coordinator ranks");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+    if !core.native.is_empty() {
+        return crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
+            checkpoint, ranks, layers, owners, crate::families::glm5::native_bf16(), false,
+            crate::placement::planner::EmbeddingHome::Device(0))?.resident_groups();
+    }
     let trellis = !core.projections.is_empty();
     anyhow::ensure!(layers <= cfg.layers, "GLM resident layer extent exceeds checkpoint");
     anyhow::ensure!(owners.is_none_or(|owners| ranks == 2 && owners.len() == layers

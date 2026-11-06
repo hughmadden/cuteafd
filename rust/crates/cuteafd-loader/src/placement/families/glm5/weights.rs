@@ -392,12 +392,7 @@ impl WeightInventory {
                 core.get_weight(&stem).is_some() || core.native.contains_key(&stem));
             let core_attention = [Op::QA, Op::KvA, Op::QB, Op::O].into_iter()
                 .filter(|op| cfg.stem(layer, *op).is_some()).all(staged);
-            if !cfg.variant.is_glm() && !core_attention {
-                let found = [Op::KvA, Op::QB, Op::O].into_iter().filter_map(|op| cfg.weight(layer, op))
-                    .map(|name| headers.get(&name).map(|header| format!("{name} {:?}", header.dtype)))
-                    .collect::<Result<Vec<_>>>()?.join(", ");
-                crate::families::glm5::core::validate_attention_format(&cfg, layer, core_attention, found)?;
-            }
+            crate::families::glm5::core::validate_attention_format(&cfg, layer, &core)?;
             let bf16 = core_attention || native_bf16 && headers.all_bf16(&attention)?;
             let layouts =
                 core.layer_weights(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;

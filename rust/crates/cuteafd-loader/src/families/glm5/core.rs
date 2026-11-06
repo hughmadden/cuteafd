@@ -33,15 +33,22 @@ pub struct UnsupportedAttentionFormat {
     pub expected: &'static str,
 }
 
-pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, core: bool,
-    found: String) -> std::result::Result<(), UnsupportedAttentionFormat> {
-    if cfg.variant.is_glm() || core { return Ok(()); }
-    Err(UnsupportedAttentionFormat {
-        tensors: [Op::QA, Op::KvA, Op::QB, Op::O].into_iter()
-            .filter_map(|op| cfg.weight(layer, op)).collect(),
-        found,
-        expected: "Mistral Large 4 K6 core publication (EXL3 K6)",
-    })
+pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, inventory: &CoreInventory)
+    -> std::result::Result<(), UnsupportedAttentionFormat> {
+    if cfg.variant.is_glm() { return Ok(()); }
+    for op in [Op::QA, Op::KvA, Op::QB, Op::O] {
+        let Some(stem) = cfg.stem(layer, op) else { continue; };
+        if inventory.projections.contains_key(&stem)
+            || matches!(op, Op::QB | Op::O) && inventory.native.get(&stem).is_some_and(|native| native.fp8) {
+            continue;
+        }
+        return Err(UnsupportedAttentionFormat {
+            tensors: vec![format!("{stem}.weight")],
+            found: "projection not validated as EXL3 K6 or declared native F8E4M3".into(),
+            expected: "EXL3 K6, or declared native E4M3 wq/wo with F32 block-128 scales",
+        });
+    }
+    Ok(())
 }
 
 /// Validate the whole declared publication, including unused MTP projections.
@@ -189,7 +196,9 @@ impl CoreInventory {
                 let operands = core_operands(cfg, layer).into_iter()
                     .filter(|(_, op, _)| matches!(op, Op::QA | Op::KvA | Op::QB | Op::O))
                     .filter_map(|(_, op, _)| cfg.stem(layer, op)).collect::<Vec<_>>();
-                let staged = operands.iter().any(|stem| inventory.projections.contains_key(stem));
+                let staged = operands.iter().any(|stem| inventory.projections.contains_key(stem))
+                    || cfg.variant.ml4().is_some()
+                        && checkpoint.config.pointer("/quantization_config/attention_view").is_some();
                 operands.into_iter().filter(|stem| staged && !inventory.projections.contains_key(stem)).collect::<Vec<_>>()
             }).collect::<std::collections::BTreeSet<_>>();
             let missing_headers = native_stems.iter().any(|stem| !checkpoint.tensors.iter()
@@ -202,7 +211,7 @@ impl CoreInventory {
                 let operands = core_operands(cfg, layer).into_iter()
                     .filter(|(_, op, _)| matches!(op, Op::QA | Op::KvA | Op::QB | Op::O)).collect::<Vec<_>>();
                 if !operands.iter().any(|(_, op, _)| cfg.stem(layer, *op)
-                    .is_some_and(|stem| inventory.projections.contains_key(&stem))) { continue; }
+                    .is_some_and(|stem| native_stems.contains(&stem))) { continue; }
                 for (_, op, split) in operands {
                     let Some(stem) = cfg.stem(layer, op) else { continue; };
                     if inventory.projections.contains_key(&stem) { continue; }
@@ -211,8 +220,17 @@ impl CoreInventory {
                     let expected = expected(cfg).remove(&format!("{stem}.weight")).context("GLM native shape")?;
                     ensure!(shape == &expected && matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
                         "{stem}: native attention requires BF16/E4M3 shape {expected:?}, found {dtype:?} {shape:?}");
+                    if cfg.variant.ml4().is_some() {
+                        ensure!(checkpoint.config.pointer("/quantization_config/attention_view").is_some()
+                            && matches!(op, Op::QB | Op::O) && *dtype == cuteafd_core::DType::F8E4M3,
+                            "{stem}: Mistral Large 4 native attention requires declared E4M3 wq/wo");
+                    }
                     if *dtype == cuteafd_core::DType::F8E4M3 {
                         crate::formats::native_attention::fp8_scale(&selected, &stem)?;
+                        if checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact {
+                            return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
+                                tensor: format!("{stem}.weight"), found: "E4M3".into() }.into());
+                        }
                     }
                     inventory.native.insert(stem, NativeProjection { shape: [shape[0], shape[1]], split,
                         fp8: *dtype == cuteafd_core::DType::F8E4M3
@@ -564,7 +582,9 @@ mod tests {
         let mut tensors=Vec::new();
         for (name,shape) in expected(cfg) {
             let stem=name.strip_suffix(".weight").unwrap();
-            let n=if stem.ends_with(".kv_a_proj_with_mqa") {shape[0].next_multiple_of(128)} else {shape[0]};
+            let n=if split(cfg, stem).is_some() && (0..cfg.layers).any(|layer| cfg.stem(layer, Op::KvA).as_deref() == Some(stem)) {
+                shape[0].next_multiple_of(128)
+            } else {shape[0]};
             let k=shape[1];
             for (suffix,dtype,shape,width) in [("trellis",DType::I16,vec![k/16,n/16,96],2),
                 ("suh",DType::F16,vec![k],2),("svh",DType::F16,vec![n],2),("mcg",DType::I32,vec![1],4)] {
@@ -695,6 +715,72 @@ mod tests {
             checkpoint.tensors.retain(|tensor| tensor.meta.name != cfg.weight(0, Op::O).unwrap());
             checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
             assert!(CoreInventory::from_checkpoint(&cfg, &checkpoint).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ml4_selected_native_query_and_output_require_declared_e4m3_and_exact_scales() -> Result<()> {
+        use crate::plan::checkpoint::{AttentionMode, CheckpointView, CheckpointTensor};
+        use cuteafd_core::DType;
+        let config = crate::plan::testing::mistral_large4_config();
+        let cfg = GlmDsaConfig::from_hf(&config)?;
+        let mut checkpoint = checkpoint(&cfg);
+        checkpoint.config = config;
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&checkpoint.config)?)?;
+        checkpoint.view = Some(CheckpointView::select(dir.path(), AttentionMode::Hqa)?);
+        checkpoint.config["quantization_config"]["attention_view"] = serde_json::json!({});
+        for layer in 0..cfg.layers {
+            for op in [Op::QB, Op::O] {
+                let stem = cfg.stem(layer, op).unwrap();
+                checkpoint.tensors.retain(|tensor| !tensor.meta.name.starts_with(&format!("{stem}.")));
+                let shape = expected(&cfg).remove(&format!("{stem}.weight")).unwrap();
+                for (suffix, dtype, shape, width) in [
+                    ("weight", DType::F8E4M3, shape.clone(), 1),
+                    ("qscale_weight", DType::F32, shape.iter().map(|n| n.div_ceil(128)).collect(), 4),
+                ] {
+                    checkpoint.tensors.push(CheckpointTensor { shard: "native.safetensors".into(),
+                        meta: crate::SafetensorsTensorMetadata { name: format!("{stem}.{suffix}"), dtype,
+                            byte_offset: 0, byte_length: shape.iter().product::<usize>() as u64 * width, shape } });
+                }
+            }
+        }
+        let reindex = |checkpoint: &mut Checkpoint| {
+            checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
+        };
+        reindex(&mut checkpoint);
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        assert_eq!(core.native.len(), cfg.layers * 2);
+        for layer in 0..cfg.layers {
+            validate_attention_format(&cfg, layer, &core)?;
+            if let Some(stem) = cfg.stem(layer, Op::KvA) { assert!(core.projections.contains_key(&stem)); }
+            for ranks in [1, 2] {
+                let layouts = core.layer_native(&cfg, layer, ranks, None)?;
+                assert!(layouts.iter().all(|rank| rank.len() == 2 && rank.values().all(|layout| layout.fp8)));
+            }
+        }
+        assert!((0..cfg.layers).any(|layer| cfg.stem(layer, Op::KvA).is_none()), "exercise KV sharing");
+        let original = checkpoint.tensors.clone();
+        let weight = cfg.weight(0, Op::QB).unwrap();
+        let scale = format!("{}.qscale_weight", cfg.stem(0, Op::QB).unwrap());
+        for failure in ["missing", "shape", "scale_dtype", "weight_dtype", "undeclared", "conversion"] {
+            checkpoint.tensors = original.clone();
+            checkpoint.config["quantization_config"]["attention_view"] = serde_json::json!({});
+            checkpoint.view = Some(CheckpointView::select(dir.path(), if failure == "conversion" {
+                AttentionMode::Fp8Compact
+            } else { AttentionMode::Hqa })?);
+            match failure {
+                "missing" => checkpoint.tensors.retain(|tensor| tensor.meta.name != scale),
+                "shape" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == scale).unwrap().meta.shape[0] += 1,
+                "scale_dtype" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == scale).unwrap().meta.dtype = DType::Bf16,
+                "weight_dtype" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == weight).unwrap().meta.dtype = DType::Bf16,
+                "undeclared" => { checkpoint.config["quantization_config"].as_object_mut().unwrap().remove("attention_view"); },
+                "conversion" => (),
+                _ => unreachable!(),
+            }
+            reindex(&mut checkpoint);
+            assert!(CoreInventory::from_checkpoint(&cfg, &checkpoint).is_err(), "{failure}");
         }
         Ok(())
     }

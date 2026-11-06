@@ -346,20 +346,7 @@ pub(super) fn layer_routes(
     let core_attention = [Op::QA, Op::KvA, Op::QB, Op::O].into_iter()
         .filter_map(|op| cfg.stem(layer, op)).all(|stem|
             core.get_weight(&stem).is_some() || core.native.contains_key(&stem));
-    if !cfg.variant.is_glm() && !core_attention {
-        let found = [Op::KvA, Op::QB, Op::O]
-            .into_iter()
-            .filter_map(|op| cfg.weight(layer, op))
-            .map(|name| r.meta(&name).map(|meta| format!("{name} {:?}", meta.dtype)))
-            .collect::<Result<Vec<_>>>()?
-            .join(", ");
-        cuteafd_loader::families::glm5::core::validate_attention_format(
-            cfg,
-            layer,
-            core_attention,
-            found,
-        )?;
-    }
+    cuteafd_loader::families::glm5::core::validate_attention_format(cfg, layer, core)?;
     let attention = [Op::QA, Op::KvA, Op::QB, Op::KvB, Op::O]
         .into_iter()
         .filter_map(|op| cfg.weight(layer, op))
