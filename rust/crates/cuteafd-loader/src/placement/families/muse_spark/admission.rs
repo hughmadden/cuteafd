@@ -151,6 +151,8 @@ impl HostInput {
 pub struct ProductionInput<'a> {
     pub cfg: &'a MuseSparkConfig,
     pub core: &'a CoreInventory,
+    /// Preweight resolution retained unchanged through admission and owner checks.
+    pub projections: Vec<crate::families::muse_spark::weight_layout::RankProjections>,
     pub catalog: &'a crate::OfficialV41Catalog,
     /// One coordinator budget per RTX plus one managed budget per Spark rank.
     pub budgets: Vec<Budget>,
@@ -301,7 +303,7 @@ fn tower_options(media: &MediaOptions, gpus: usize, sparks: usize)
 
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
-        let ProductionInput { cfg, core, catalog, mut budgets, host, prefill, full_prefill_logits, slots, mark_slots,
+        let ProductionInput { cfg, core, projections, catalog, mut budgets, host, prefill, full_prefill_logits, slots, mark_slots,
             context, maximum_pool_tokens, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
             media } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
@@ -340,8 +342,12 @@ impl<'a> ProductionInput<'a> {
             .and_then(|planes| planes.bytes()).map_err(anyhow_refusal)? as u64;
         let tables = step_tables(unit_rows, slots_usize, context, waves).map_err(anyhow_refusal)?.bytes()
             as u64;
-        let projections = crate::families::muse_spark::weight_layout::projections(cfg, core, gpus, unit_rows)
-            .map_err(anyhow_refusal)?;
+        if projections.len() != gpus { return Err(invalid("projection rank count differs from budgets")); }
+        for (gpu, admitted) in projections.iter().enumerate() {
+            let actual = layouts.iter().flat_map(|ranks| ranks[gpu].native.values().cloned()
+                .map(crate::families::muse_spark::weight_layout::NativeRequest::new)).collect::<Vec<_>>();
+            admitted.validate_native_owners(&actual, unit_rows)?;
+        }
         let exchange = if pair { Some(tp2_exchange_bytes(cfg, unit_rows).map_err(anyhow_refusal)? as u64) }
             else { None };
         let combine = combine_tables_bytes(unit_rows) as u64 * prefill.waves;
@@ -437,6 +443,16 @@ impl<'a> ProductionInput<'a> {
                 let bytes = scratch.bytes().map_err(anyhow_refusal)? as u64;
                 components.extend(buffer(format!("muse.projections.{gpu}"), location, bytes,
                     Lifetime::RESIDENT, Category::Workspace, "Muse K6 projection scratch", maximum_pages));
+            }
+            let native = &projections[gpu].native_programs;
+            if native.fp8_scratch_bytes > 0 {
+                let group = if native.resolution == crate::placement::planner::native_attention::NativeResolution::Assumed {
+                    "Muse native FP8 projection scratch (assumed; program manifest absent)"
+                } else { "Muse native FP8 projection scratch" };
+                let owner = Allocation::buffer(format!("muse.native.scratch.{gpu}"), location,
+                    native.fp8_scratch_bytes, Lifetime::RESIDENT, Category::Workspace, group);
+                components.push(Component::allocation(owner, ByteCurve::fixed(native.fp8_scratch_bytes, maximum_pages),
+                    false, maximum_pages));
             }
             if let Some(exchange) = exchange {
                 components.extend(buffer(format!("muse.tp2_exchange.{gpu}"), location, exchange,

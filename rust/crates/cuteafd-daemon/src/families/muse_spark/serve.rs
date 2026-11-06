@@ -161,7 +161,25 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     // SAFETY: every native owner drops on this worker before the library.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
-    let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
+    let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
+        .collect::<Vec<_>>();
+    let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
+        .collect::<Result<Vec<_>>>()?;
+    let native_manifest = if core.native.is_empty() { None } else {
+        let specs = programs[0].names().map(|name| programs[0].spec(name)).collect::<Result<Vec<_>>>()?;
+        Some(cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?)
+    };
+    let projections = cuteafd_loader::families::muse_spark::weight_layout::projections_with_manifest(
+        &cfg, &core, gpus, args.prefill()?.unit_rows as usize, native_manifest.as_ref())?;
+    let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |id| {
+        let rank = device_ids.iter().position(|&device| device == id).context("Muse inventory device")?;
+        for name in &projections[rank].native_programs.programs {
+            let spec = programs[rank].spec(name)?;
+            let pointers = spec.pointers.iter().map(String::as_str).collect::<Vec<_>>();
+            programs[rank].program(name, &pointers)?;
+        }
+        Ok(())
+    })?;
     crate::shared::inventory::startup_probe(&library, &device_ids, "muse-preweight", Default::default())?;
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let built = startup::admit(startup::Options { host: cuteafd_loader::placement::families::muse_spark::HostInput {
@@ -171,7 +189,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes) },
         prefix_entries: args.prefix.prefix_cache_entries as u64, media_bytes: args.media_cache_bytes,
         device_sampling: args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device }, cfg: &cfg, core: &core, catalog: &catalog,
-        manifest: &manifest,
+        manifest: &manifest, projections,
         measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
             free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
         headroom_bytes: 2 << 30, spark_ranks: args.peers.len(), prefill: args.prefill()?,
@@ -214,10 +232,6 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
         spark.model.clone())?;
-    let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
-        .collect::<Vec<_>>();
-    let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
-        .collect::<Result<Vec<_>>>()?;
     let context = args.max_context.unwrap_or(cfg.max_position as u64);
     // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over
     // peer access), filled in the background while the layers load.

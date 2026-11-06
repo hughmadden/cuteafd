@@ -110,7 +110,21 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
-    let fixed = match planned_code(input, opts, &cards) {
+    let projections = match (|| -> anyhow::Result<_> {
+        let manifest = if model.core.native.is_empty() { None } else {
+            manifest_path.map(|path| input.programs_manifest(path)).transpose()?
+        };
+        crate::families::muse_spark::weight_layout::projections_with_manifest(cfg, &model.core, gpus,
+            prefill.unit_rows as usize, manifest.as_deref())
+    })() {
+        Ok(projections) => projections,
+        Err(error) => {
+            report.refuse_placement(format!("Muse native projection exports refused: {error:#}"),
+                "Supply the matching native attention exports in PROGRAMS.json.");
+            return memory;
+        }
+    };
+    let fixed = match planned_code(input, opts, &cards, &projections) {
         Ok(fixed) => fixed,
         Err(error) => {
             report.refuse_placement(format!("Muse Spark program manifest refused: {error:#}"), "Supply the image's PROGRAMS.json.");
@@ -158,7 +172,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             reason: format!("{mode:?} tower not admitted: joint memory contract refused") };
         if component == Component::Vision { report.encoder = Some(encoder); } else { report.audio_encoder = Some(encoder); }
     }
-    let facts = shared::ProductionInput { cfg, core: &model.core, catalog, budgets, host, prefill,
+    let facts = shared::ProductionInput { cfg, core: &model.core, projections, catalog, budgets, host, prefill,
         full_prefill_logits: opts.full_prefill_logits, slots, mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
         local, drafter, fixed, media };
@@ -269,7 +283,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
 /// Loaded code charged exactly as live startup charges it (the full allowance
 /// offline, nothing yet resident), once the image's program manifest is known.
 fn planned_code(input: &crate::plan::PlanInput, opts: &crate::plan::layout::LayoutOptions,
-    cards: &[crate::placement::CoordinatorCard]) -> anyhow::Result<Vec<Demand>> {
+    cards: &[crate::placement::CoordinatorCard],
+    projections: &[crate::families::muse_spark::weight_layout::RankProjections]) -> anyhow::Result<Vec<Demand>> {
     let gpus = cards.len();
     let path = opts.workspace_manifest.as_deref().or_else(|| {
         let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
@@ -278,6 +293,8 @@ fn planned_code(input: &crate::plan::PlanInput, opts: &crate::plan::layout::Layo
     let manifest = input.manifest(path)?;
     let programs = ProgramSet::from_manifest(&manifest, crate::placement::families::muse_spark::program_families(gpus));
     (0..gpus).map(|rank| {
+        let mut programs = programs.clone();
+        projections[rank].include_native_programs(&mut programs);
         let arch = ArchContext::for_device("sm_120", cards[rank].physical_bytes);
         let code = crate::placement::inventory::loaded_code_allowance("muse", "exl3", gpus == 2, rank as u8,
             arch, Some(&programs));

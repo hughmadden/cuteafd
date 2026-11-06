@@ -168,9 +168,18 @@ pub struct RankProjections {
     pub scratch: Option<crate::formats::trellis_core::ProjectionScratchLayout>,
     pub native: Vec<NativeRequest>,
     pub native_rows: usize,
+    pub native_programs: crate::placement::planner::native_attention::NativePrograms,
 }
 
 impl RankProjections {
+    /// Generic native exports are charged only when this rank selected them.
+    pub fn include_native_programs(&self, programs: &mut crate::placement::inventory::ProgramSet) {
+        if self.native_programs.programs.is_empty() { return; }
+        programs.names.extend(self.native_programs.programs.iter().cloned());
+        programs.names.sort();
+        programs.names.dedup();
+    }
+
     /// Check actual owners against admission without resolving programs again.
     pub fn validate_native_owners(&self, actual: &[NativeRequest], rows: usize)
         -> Result<(), crate::placement::planner::Refusal> {
@@ -197,9 +206,15 @@ impl RankProjections {
 /// the decode/verify width; wider prefill/drafter scoring uses head microbatches).
 pub fn projections(cfg: &MuseSparkConfig, core: &CoreInventory, ranks: usize, rows: usize)
     -> Result<Vec<RankProjections>> {
+    projections_with_manifest(cfg, core, ranks, rows, None)
+}
+
+pub fn projections_with_manifest(cfg: &MuseSparkConfig, core: &CoreInventory, ranks: usize, rows: usize,
+    manifest: Option<&crate::placement::inventory::ProgramsManifest>) -> Result<Vec<RankProjections>> {
+    use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
     ensure!(rows > 0 && rows <= i32::MAX as usize, "Muse projection row ceiling outside signed launch domain");
     let mut out = vec![RankProjections { programs: BTreeMap::new(), scratch: None,
-        native: Vec::new(), native_rows: rows }; ranks];
+        native: Vec::new(), native_rows: rows, native_programs: NativePrograms::resolve(&[], rows, manifest)? }; ranks];
     for layer in 0..cfg.layers {
         for (rank, layout) in LayerLayout::ranks(cfg, layer, ranks, core)?.into_iter().enumerate() {
             for weight in layout.native.values() {
@@ -217,6 +232,13 @@ pub fn projections(cfg: &MuseSparkConfig, core: &CoreInventory, ranks: usize, ro
         out[ranks - 1].programs.insert((projection_key(&head), ProjectionOutput::F32), rows.min(64));
     }
     for rank in &mut out {
+        let requests = rank.native.iter().map(|request| NativeProgram {
+            layout: &request.layout, output: match request.output {
+                ProjectionOutput::Bf16 => cuteafd_ffi::draft_projection::ProjectionOutput::Bf16,
+                ProjectionOutput::F32 => cuteafd_ffi::draft_projection::ProjectionOutput::F32,
+            },
+        }).collect::<Vec<_>>();
+        rank.native_programs = NativePrograms::resolve(&requests, rows, manifest)?;
         let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
         for (&((k, n, _, _), _), &program_rows) in &rank.programs {
             let mut layout = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, program_rows)?;
@@ -261,6 +283,46 @@ mod tests {
         }
         let global = GlobalLayout::new(&cfg, &core).unwrap();
         assert_eq!(global.head.as_ref().unwrap().shape, [202112, 8192]);
+    }
+
+    #[test]
+    fn exact_native_resolution_names_only_selected_stage_and_charges_scratch() -> Result<()> {
+        use crate::placement::{inventory::ProgramsManifest, planner::native_attention::NativeResolution};
+        let cfg = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config())?;
+        let mut core = CoreInventory::default();
+        core.native.insert(format!("{PREFIX}0.self_attn.o_proj"),
+            super::super::core::NativeProjection { shape: [8192, 8192], fp8: true, split: CoreSplit::Input });
+        for rows in [64, 2752] {
+            let stage = if rows <= 64 { 64 } else { 4096 };
+            let name = format!("native_attention_n8192_k4096_m{stage}_f32");
+            let manifest = ProgramsManifest::from_manifest(&serde_json::json!({"programs":[{
+                "name":name,"capacity_rows":stage,
+                "pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                "scalars":[{"type":"int32"}],"scratch_bytes_at_capacity":{"scratch":2048},
+                "geometry":{"input_features":4096,"output_features":8192,"output_dtype":"torch.float32",
+                    "max_rows":stage,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                    "reduction":"canonical_fp8_gemv64_w8a16"}
+            }]}))?;
+            let exact = projections_with_manifest(&cfg, &core, 2, rows, Some(&manifest))?;
+            for rank in &exact {
+                assert_eq!(rank.native_programs.programs, [name.clone()]);
+                assert_eq!(rank.native_programs.fp8_scratch_bytes, 2048);
+                assert_eq!(rank.native_programs.resolution, NativeResolution::Exact);
+                let mut programs = crate::placement::inventory::ProgramSet::from_names(&["muse"], ["muse_z", "muse_a"]);
+                rank.include_native_programs(&mut programs);
+                assert_eq!(programs.names, ["muse_a", "muse_z", name.as_str()]);
+            }
+            let assumed = projections(&cfg, &core, 2, rows)?;
+            assert_eq!(assumed[0].native_programs.fp8_scratch_bytes, 256);
+            assert!(projections_with_manifest(&cfg, &core, 2, rows,
+                Some(&ProgramsManifest::default())).is_err());
+        }
+        let compact = projections(&cfg, &CoreInventory::default(), 2, 2752)?;
+        let mut programs = crate::placement::inventory::ProgramSet::from_names(&["muse"], ["muse_z", "muse_a", "muse_z"]);
+        let old = programs.clone();
+        compact[0].include_native_programs(&mut programs);
+        assert_eq!(programs, old, "no native exports must preserve Compact program accounting verbatim");
+        Ok(())
     }
 
     #[test]
