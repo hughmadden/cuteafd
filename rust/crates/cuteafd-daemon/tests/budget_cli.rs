@@ -645,6 +645,20 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
         if name == "mimo-v26-flash-mxfp4-min.config" {
             installed_mimo_min_onboarding_matches_smoke(root, &snapshot, &example, &programs);
         }
+        if name.starts_with("deepseek-v41-") || name.starts_with("v41-flash-strided-") {
+            let temporary = tempfile::tempdir().unwrap();
+            let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
+                .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
+            let output = Command::new(interpreter).args(["-I", "-c", r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+from test_run_family_dispatch import capture_v41_real_planner_launch
+capture_v41_real_planner_launch(*map(Path, sys.argv[2:]))
+"#]).arg(root).arg(&snapshot).arg(&example).arg(env!("CARGO_BIN_EXE_cuteafd"))
+                .arg(&programs).arg(&hf_home).arg(temporary.path()).output().unwrap();
+            assert!(output.status.success(), "{name} real launcher: {}", String::from_utf8_lossy(&output.stderr));
+        }
         if name.starts_with("kimi-k3-") {
             let temporary = tempfile::tempdir().unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")

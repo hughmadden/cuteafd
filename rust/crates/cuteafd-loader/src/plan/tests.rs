@@ -4614,7 +4614,8 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // An explicit pin keeps its shape whether or not it fits.
     let pinned = PlanOptions { layout: Some(layout::LayoutOptions { prefill_rows: 1024, prefill_waves: 2, ..layout }), ..sparks(4) };
     let pinned = plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap();
-    assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_reserve_rows), (Some(1024), Some(2), None));
+    // The pinned shape reports the standard reserve the launcher forwards.
+    assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_reserve_rows), (Some(1024), Some(2), Some(8192)));
     assert!(pinned.executable(), "{}", render(&pinned));
 }
 

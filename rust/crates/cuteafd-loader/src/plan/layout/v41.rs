@@ -24,23 +24,17 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // Units, waves and span come from the shared prefill policy and the
     // descriptor (two units in flight, one target pass per slot).
     let limits = crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V41);
-    // A pinned shape has no reserve to report; the automatic shape is cut
-    // from the standard one.
-    let pinned = options.prefill_rows != 0 || options.prefill_unit_rows.is_some()
-        || options.prefill_waves > 1 || options.prefill_lanes > 0 || options.prefill_span_rows.is_some();
     let prefill = super::resolve_prefill(input, report, options, report.placement.spark_ranks(), limits)?;
     let mut shape = Shape::resolve(input, report, model, options, ShapePolicy {
         context: ContextPolicy::Checkpoint, prefill_rows: Some(prefill.unit_rows), all_native_stages: false,
     });
     shape.prefill_rows = prefill.unit_rows;
     report.prefill_span_rows = Some(prefill.span_rows);
-    // The reserve the units were cut from: explicit, else the standard one
-    // for the automatic shape.
-    report.prefill_reserve_rows = match options.prefill_reserve_rows {
-        Some(reserve) => Some(reserve),
-        None if pinned => None,
-        None => Some(crate::serving_capacity::prefill_waves::RESERVE_ROWS),
-    };
+    // The reserve the units are cut from: explicit, else the standard one.
+    // The launcher's serve argv carries it, so a pinned shape reports the
+    // standard reserve it replaced.
+    report.prefill_reserve_rows = Some(options.prefill_reserve_rows
+        .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS));
     let ranks = options.rtx_bytes.len();
     ensure!((1..=2).contains(&ranks), "V4.1 requires one or two coordinator GPUs");
     cuteafd_core::concurrency::validate("deepseek_v41", shape.concurrency)?;

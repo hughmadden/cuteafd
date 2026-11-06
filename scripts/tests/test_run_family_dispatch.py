@@ -938,7 +938,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                              'exec bash -c "$command"; fi\n')
         if tool == "ssh" and native_v41:
             with (bin_dir / tool).open("a") as stream:
-                stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp2"*) echo "${STUB_SPARK_ROLES:-tp2}" ;; *"docker container inspect"*) exit 1 ;; esac\n')
+                stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp"[1-8]*) echo "${STUB_SPARK_ROLES:-tp2}" ;; *"docker container inspect"*) exit 1 ;; esac\n')
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
             intercept = ('case "$*" in *" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; '
@@ -976,7 +976,8 @@ exec python3 -c "$code" "$@"
     gpus = [gpu for gpu in gpus if gpu["index"] in physical_gpus]
     if native_v41:
         (bin_dir / "curl").write_text(
-            '#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"object":"list","data":[{"id":"deepseek-ai/DeepSeek-V4.1-Flash"}]}\'\n')
+            '#!/usr/bin/env bash\nprintf \'{"object":"list","data":[{"id":"%s"}]}\\n\' '
+            '"${STUB_SERVED_MODEL_ID:-deepseek-ai/DeepSeek-V4.1-Flash}"\n')
     deployment_stub = tmp_path / "deployment-stub.py"
     deployment_stub.write_text("""import json, os, subprocess, sys
 args = sys.argv[1:]
@@ -1211,6 +1212,52 @@ def capture_muse_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert deployment["prefill_waves"] == 3, deployment
     assert deployment["prefill_unit_rows"] >= 1024, deployment
 
+
+def capture_v41_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                    programs: Path, hf_home: Path, temporary: Path) -> None:
+    """A shipped V4.1 config through the real launcher argv and CPU Recipe admission."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    # Fake only hardware and execution: the planner reads the actual snapshot,
+    # drafter and native export manifests, not a canned deployment response.
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/v41-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_SPARK_ROLES": f"tp{config.get('SPARK_TP', config['SPARK_COUNT'])}",
+            "STUB_SERVED_MODEL_ID": "test/v41-real-plan",
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if " plan " in line and "--deployment" in line and "--pool-tokens" in line]
+    assert len(plans) == 1, result.stderr
+    assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    assert "prefill reserve does not fit" not in result.stderr
+    if not (programs.parent / "V41_FP8_AOT.json").is_file():
+        # The CPU gate's placement inputs carry only the exporter manifest; the
+        # launcher must surface the missing native export as the typed refusal.
+        assert result.returncode != 0, result.stderr
+        assert "missing V4.1 native FP8 allocation manifest" in result.stderr, result.stderr
+        assert "invalid deployment specification" in result.stderr, result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    deployment = json.loads(output.read_text())
+    assert deployment["family"] == "deepseek_v41", deployment
+    assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
+    # One shared prefill policy sizes the reserve and cuts it into three units.
+    assert (deployment["prefill_reserve_rows"], deployment["prefill_unit_rows"],
+            deployment["prefill_waves"]) == (8192, 2752, 3), deployment
+    assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "serve-native" in line and "--snapshot" in line)
+    assert serve[serve.index("--prefill-batch-tokens") + 1] == "2752"
+    assert serve[serve.index("--prefill-waves") + 1] == "3"
+    assert serve[serve.index("--prefill-reserve-rows") + 1] == "8192"
 
 
 def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path,
