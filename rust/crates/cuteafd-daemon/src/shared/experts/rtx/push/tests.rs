@@ -1470,7 +1470,7 @@ fn selected_view_group_rejects_cross_mode_expert_catalog() -> Result<()> {
     use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
     let root = tempfile::tempdir()?;
     let (tensors, _) = qwen4_exl3(1, 4);
-    write_snapshot(root.path(), &qwen4_config(false), &tensors, Some(4));
+    write_snapshot(root.path(), &qwen4_config(1), &tensors, Some(4));
     let hqa = CheckpointView::select(root.path(), AttentionMode::Hqa)?;
     let converted = CheckpointView::select(root.path(), AttentionMode::Fp8Compact)?;
     let selected = cuteafd_loader::read_expert_catalog_view(&hqa)?;
