@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import random
+import struct
 import time
 from collections import defaultdict
 from http.cookies import SimpleCookie
@@ -252,24 +253,36 @@ for session in range(8):
         title=f"Synthetic conversation {session + 1}: inspect the parser and add a regression test", edits=1, bytes=7000))
 
 
-def expert_snapshot(tick):
-    geometry = dict(layers=12, experts=32, topk=2, routed_layers=list(range(1, 12)))
+def expert_geometry(config):
+    data = json.loads(config.read_text())
+    layers = data["num_hidden_layers"]
+    frequency = data.get("moe_layer_freq", 1)
+    dense = data.get("first_k_dense_replace", 0)
+    routed = [i for i in range(layers) if (frequency[i] if isinstance(frequency, list) else i >= dense and i % frequency == 0)]
+    return dict(layers=layers, experts=data.get("num_experts", data.get("n_routed_experts")),
+                topk=data.get("num_experts_per_token", data.get("num_experts_per_tok")), routed_layers=routed)
+
+
+def expert_snapshot(tick, geometry=None):
+    geometry = geometry or dict(layers=12, experts=32, topk=2, routed_layers=list(range(1, 12)))
+    experts = geometry["experts"]
 
     def window(scale):
-        prefill, decode = [0] * 384, [0] * 384
+        prefill, decode = [0] * (geometry["layers"] * experts), [0] * (geometry["layers"] * experts)
         for layer in geometry["routed_layers"]:
-            for expert in range(32):
-                index = layer * 32 + expert
-                prefill[index] = scale * (tick + layer) * (1 + (expert + layer) % 7) if expert < 24 else 0
+            for expert in range(experts):
+                index = layer * experts + expert
+                prefill[index] = scale * (tick + layer) * (1 + (expert + layer) % 7) if expert < experts * 3 // 4 else 0
                 decode[index] = scale * (tick + 2) * (1 + (expert * 3 + layer + tick) % 13) if (expert + tick) % 5 else 0
 
         def summarize(values):
-            layers = [values[layer * 32:(layer + 1) * 32] for layer in geometry["routed_layers"]]
+            layers = [values[layer * experts:(layer + 1) * experts] for layer in geometry["routed_layers"]]
             touched = sum(value > 0 for row in layers for value in row)
-            active = [row for row in layers if sum(row)]
-            return dict(touched=touched, possible=352, coverage=touched / 352,
+            active = [(row, sum(row)) for row in layers if any(row)]
+            possible = len(layers) * experts
+            return dict(touched=touched, possible=possible, coverage=touched / possible,
                         routed_rows=sum(values) // geometry["topk"],
-                        concentration=sum(sum((value / sum(row)) ** 2 for value in row) for row in active) / len(active))
+                        concentration=sum(sum((value / total) ** 2 for value in row) for row, total in active) / len(active))
 
         return dict(elapsed_s=min(60.0, tick * .5) * scale,
                     prefill_routed_rows=prefill, decode_routed_rows=decode,
@@ -281,16 +294,46 @@ def expert_snapshot(tick):
                 windows={name: window(scale) for name, scale in [("short", 1), ("long", 4), ("total", 12)]})
 
 
+def expert_binary(snapshot, window, phase):
+    g, w = snapshot["geometry"], snapshot["windows"][window]
+    rows, experts = g["routed_layers"], g["experts"]
+    counts, totals, peak = [], [], 0.0
+    for layer in rows:
+        values = []
+        for i in range(layer * experts, (layer + 1) * experts):
+            a, b = w["prefill_routed_rows"][i], w["decode_routed_rows"][i]
+            values.append(a if phase == "prefill" else b if phase == "decode" else a + b)
+        total = sum(values)
+        totals.append(total)
+        counts.extend(values)
+        peak = max(peak, max(values) / total if total else 0)
+    wide = window == "total"
+    totals_offset = (128 + len(rows) * 4 + 7) & ~7
+    offset = totals_offset + len(rows) * 8
+    data = bytearray(offset + len(counts) * (8 if wide else 4))
+    struct.pack_into("<4sHH5I4BddQQdQQddQI", data, 0, b"EU01", 1, 128,
+                     g["layers"], experts, len(rows), g["topk"], rows[0],
+                     ["short", "long", "total"].index(window), ["combined", "prefill", "decode"].index(phase), 2 if wide else 1, 0,
+                     snapshot["sampled_s"], w["elapsed_s"], max(counts), int(snapshot["sampled_s"] * 2), peak,
+                     w[phase]["touched"], w[phase]["possible"], w[phase]["coverage"], w[phase]["concentration"], w[phase]["routed_rows"], offset)
+    struct.pack_into(f"<{len(rows)}I", data, 128, *rows)
+    struct.pack_into(f"<{len(rows)}Q", data, totals_offset, *totals)
+    struct.pack_into(f"<{len(counts)}{'Q' if wide else 'I'}", data, offset, *counts)
+    return data
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(fmt % args, flush=True)
 
-    def send(self, body, status=200, mime="application/json"):
+    def send(self, body, status=200, mime="application/json", headers=None):
         data = json.dumps(body).encode() if mime == "application/json" else body
         self.send_response(status)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -308,10 +351,24 @@ class Handler(BaseHTTPRequestHandler):
         unlocked = cookies.get("cuteafd_console") is not None and cookies["cuteafd_console"].value == "mock-unlock"
         if path == "/console/status":
             return self.send(dict(unlocked=unlocked, link_command=None))
-        if path == "/console/expert-usage":
+        if path in ["/console/expert-usage", "/console/expert-usage.bin"]:
             if not unlocked:
                 return self.send({"error": {"type": "console_locked"}}, 401)
-            return self.send({"enabled": False} if self.server.expert_usage == "disabled" else expert_snapshot(next(self.server.expert_ticks)))
+            binary = path.endswith(".bin")
+            if self.server.expert_usage == "disabled":
+                return self.send(b"", 204, "application/octet-stream") if binary else self.send({"enabled": False})
+            if not binary:
+                return self.send(expert_snapshot(next(self.server.expert_ticks), getattr(self.server, "expert_geometry", None)))
+            window, phase = query.get("window", "short"), query.get("phase", "combined")
+            if window not in ["short", "long", "total"] or phase not in ["combined", "prefill", "decode"]:
+                raise ValueError("invalid expert selection")
+            tick = 1 + int(time.monotonic() - self.server.expert_started)
+            etag = f'"fixture-{tick}-{window}-{phase}"'
+            headers = {"ETag": etag}
+            if self.headers.get("If-None-Match") == etag:
+                return self.send(b"", 304, "application/octet-stream", headers)
+            snapshot = expert_snapshot(tick, getattr(self.server, "expert_geometry", None))
+            return self.send(expert_binary(snapshot, window, phase), mime="application/octet-stream", headers=headers)
         assets = {"/experts": "rust/crates/cuteafd-api/assets/experts.html",
                   "/usage": "rust/crates/cuteafd-usage/assets/usage.html",
                   "/": "rust/crates/cuteafd-api/assets/console.html",
@@ -484,11 +541,14 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--locked", action="store_true")
     parser.add_argument("--expert-usage", choices=["live", "disabled"], default="live")
+    parser.add_argument("--expert-config", type=Path, help="Use a real checkpoint config's geometry with synthetic counts")
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.locked = args.locked
     server.expert_usage = args.expert_usage
     server.expert_ticks = count(1)
+    server.expert_started = time.monotonic()
+    server.expert_geometry = expert_geometry(args.expert_config) if args.expert_config else None
     print(f"Synthetic usage server: http://{args.host}:{args.port}/usage", flush=True)
     server.serve_forever()
 

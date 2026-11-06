@@ -21,8 +21,16 @@ p { margin: 0; color: var(--ink-2); }
 #unavailable p { max-width: 66ch; line-height: 1.6; }
 .summary { display: flex; gap: 24px; flex-wrap: wrap; padding: 6px 0; font: 12px var(--mono); color: var(--ink-2); }
 .summary b { color: var(--ink); font-size: 18px; font-weight: 500; }
-.plot-scroll { overflow: auto; max-width: 100%; background: var(--well); border-radius: 6px; }
-#matrix { display: block; touch-action: pan-x pan-y; }
+.matrix-frame { position: relative; width: 100%; overflow: hidden; padding: 28px 8px 0 38px; box-sizing: border-box; }
+#matrix { display: block; width: 100%; touch-action: pan-y; background: var(--well); }
+#expert-axis, #layer-axis { position: absolute; color: var(--ink-2); font: 10px var(--mono); pointer-events: none; }
+#expert-axis { top: 5px; left: 38px; right: 8px; height: 16px; }
+#layer-axis { left: 0; width: 32px; top: 28px; bottom: 0; }
+#expert-axis span, #layer-axis span { position: absolute; white-space: nowrap; }
+#layer-axis span { transform: translateY(-50%); }
+#cell-marker { position: absolute; pointer-events: none; outline: 1px solid var(--ink); min-width: 1px; box-sizing: border-box; }
+#view-caption { padding: 4px 0 8px; }
+.table-pages { display: flex; gap: 12px; align-items: center; padding: 8px 0; }
 .plot-foot { display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: space-between; align-items: center; }
 .key { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font: 11px var(--mono); }
 #ramp { display: flex; gap: 2px; }
@@ -36,7 +44,7 @@ caption { text-align: left; padding: 8px 0; color: var(--ink-2); }
 th, td { padding: 7px 12px; text-align: right; border-bottom: 1px solid var(--line); }
 th:first-child, td:first-child { text-align: left; }
 thead th { position: sticky; top: 0; background: var(--panel-2); color: var(--ink-2); }
-@media (max-width: 600px) { .app { padding: 14px 16px 24px; } .controls { gap: 10px; } .summary { gap: 16px; } h1 { font-size: 20px; } }
+@media (max-width: 600px) { .app { padding: 14px 16px 24px; } .controls { gap: 10px; } .summary { gap: 16px; } h1 { font-size: 20px; } th, td { padding: 7px 6px; } }
 </style>
 </head>
 <body>
@@ -44,7 +52,7 @@ thead th { position: sticky; top: 0; background: var(--panel-2); color: var(--in
 <header id="header"></header>
 <section class="intro">
 <h1>Where the model routes work</h1>
-<p>Layers stacked vertically. Experts across. Color shows each expert's share of its layer's routed selections.</p>
+<p>Layers stacked vertically. Every expert across. Color shows each expert's share of its layer's routed selections.</p>
 </section>
 <section class="panel">
 <div class="controls">
@@ -57,8 +65,8 @@ thead th { position: sticky; top: 0; background: var(--panel-2); color: var(--in
 <div id="notice" role="status">Connecting to expert telemetry...</div>
 <div id="unavailable" hidden>
 <h2>Expert telemetry is unavailable</h2>
-<p>This model has no active expert-usage adapter, or telemetry is disabled. Launch a supported MoE family with <code>EXPERT_USAGE=on</code> to see routed expert work here.</p>
-<p>Dense-only models have no routed experts to display.</p>
+<p id="unavailable-reason"></p>
+<p>This model needs an active expert-usage adapter and <code>EXPERT_USAGE=on</code>. Dense-only models have no routed experts to display.</p>
 </div>
 <div class="summary" id="summary" hidden>
 <span><b id="touched">0</b> touched / <span id="possible">0</span></span>
@@ -67,7 +75,8 @@ thead th { position: sticky; top: 0; background: var(--panel-2); color: var(--in
 <span><b id="rows">0</b> layer-routed rows</span>
 </div>
 <div id="plot" hidden>
-<div class="plot-scroll"><canvas id="matrix" tabindex="0" role="img" aria-label="Expert usage matrix. Use arrow keys to inspect layers and experts." aria-describedby="readout"></canvas></div>
+<p class="hint" id="view-caption"></p>
+<div class="matrix-frame"><div id="expert-axis" aria-hidden="true"></div><div id="layer-axis" aria-hidden="true"></div><canvas id="matrix" tabindex="0" role="img" aria-label="Expert usage matrix. Use arrow keys to inspect layers and experts." aria-describedby="readout"></canvas><div id="cell-marker" hidden></div></div>
 <div class="plot-foot">
 <div class="key"><span>0 / untouched</span><span id="ramp" aria-hidden="true"></span><span id="peak">peak share</span></div>
 <span class="hint">Scale follows the selected window's peak. Dense layers are omitted.</span>
@@ -78,6 +87,7 @@ thead th { position: sticky; top: 0; background: var(--panel-2); color: var(--in
 </section>
 <section class="panel" id="table-panel" hidden>
 <div class="panel-head"><h2>Inspect a layer</h2><label for="layer">Layer</label><select id="layer"></select></div>
+<div class="table-pages"><button type="button" id="previous-experts">Previous</button><span class="hint" id="table-range"></span><button type="button" id="next-experts">Next</button></div>
 <div class="table-scroll"><table>
 <caption id="table-caption">Exact counts and within-layer shares for the selected view.</caption>
 <thead><tr><th scope="col">Expert</th><th scope="col">Routed selections</th><th scope="col">Layer share</th></tr></thead>
@@ -90,194 +100,249 @@ thead th { position: sticky; top: 0; background: var(--panel-2); color: var(--in
 <script>
 (async () => {
 'use strict';
-const $ = (id) => document.getElementById(id);
-const UI = window.CuteUI;
+const $ = (id) => document.getElementById(id), UI = window.CuteUI;
 const header = UI.header($('header'), { page: 'experts', subtitle: 'Expert routing' });
 if (!await UI.adminGate($('app'), 'Expert usage', 'Live device-side prefill and decode routing across every layer and expert.')) return;
-// Sequential blue ramp validated for monotone lightness on the existing dark well.
-const ramp = ['#184f95', '#256abf', '#3987e5', '#6da7ec', '#9ec5f4', '#cde2fb'];
-ramp.forEach((color) => { const swatch = document.createElement('i'); swatch.style.background = color; $('ramp').append(swatch); });
-const canvas = $('matrix'), ctx = canvas.getContext('2d');
-let snapshot = null, view = null, selected = { row: 0, expert: 0 }, paused = false;
-let layout = null, clock = null, lastChange = performance.now(), inspected = false, inFlight = false;
+const canvas = $('matrix');
+let view = null, selected = {row: 0, expert: 0}, inspected = false, layout = null;
+let paused = false, inFlight = false, controller = null, etag = null, tableStart = 0;
+let lastChange = performance.now(), currentKey = '', geometryKey = '';
 const REFRESH_MS = 500, REQUEST_TIMEOUT_MS = 5000;
-const pct = (n) => (n * 100).toFixed(2) + '%';
-const number = (n) => UI.fmt.n0(n);
+const renderSamples = []; window.expertUsageRenderSamples = renderSamples;
+const exactFormat = new Intl.NumberFormat('en-US', {maximumFractionDigits: 0});
+const pct = (n) => (n * 100).toFixed(2) + '%', number = (n) => typeof n === 'bigint' ? exactFormat.format(n) : UI.fmt.n0(n);
+function unavailable(reason) {
+  view = null; layout = null; etag = null; geometryKey = ''; inspected = false;
+  selected = {row: 0, expert: 0};
+  $('unavailable').hidden = false; $('unavailable-reason').textContent = reason;
+  $('notice').textContent = 'No active expert view.'; $('sample').textContent = '';
+  header.status.textContent = 'UNAVAILABLE'; header.meta.replaceChildren();
+  $('layer').replaceChildren(); $('table-body').replaceChildren();
+  $('tooltip').hidden = true; $('cell-marker').hidden = true;
+  $('readout').textContent = 'Hover, tap, or use arrow keys to inspect a cell.';
+  for (const id of ['summary', 'plot', 'table-panel']) $(id).hidden = true;
+}
+// A query switch provides a deterministic proof of the unsupported-browser state.
+const gl = new URLSearchParams(location.search).get('webgl') === 'off' ? null : canvas.getContext('webgl2', {antialias: false, depth: false, stencil: false, alpha: false});
+if (!gl) { unavailable('WebGL2 is unavailable in this browser'); return; }
+let renderer;
+try {
+  const shader = (type, source) => {
+    const s = gl.createShader(type); gl.shaderSource(s, source); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  const vertex = shader(gl.VERTEX_SHADER, `#version 300 es
+  void main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`);
+  const fragment = shader(gl.FRAGMENT_SHADER, `#version 300 es
+  precision highp float;
+  precision highp usampler2D;
+  uniform usampler2D counts;
+  uniform usampler2D totals;
+  uniform sampler2D ramp;
+  uniform ivec2 geometry;
+  uniform vec2 resolution;
+  uniform float peak;
+  uniform vec3 emptyColor;
+  uniform bool textureOn;
+  out vec4 color;
+  float wide(uvec2 words) { return float(words.x) + float(words.y) * 4294967296.0; }
+  void main() {
+    ivec2 cell = ivec2(min(vec2(geometry - 1), floor(vec2(gl_FragCoord.x / resolution.x, 1.0 - gl_FragCoord.y / resolution.y) * vec2(geometry))));
+    uvec2 words = texelFetch(counts, cell, 0).rg;
+    float count = wide(words), total = wide(texelFetch(totals, ivec2(0, cell.y), 0).rg);
+    float scale = total > 0.0 ? count / total / max(peak, 1e-30) : 0.0;
+    vec3 ink = texelFetch(ramp, ivec2(int(clamp(scale, 0.0, 1.0) * 255.0), 0), 0).rgb;
+    if (all(equal(words, uvec2(0)))) ink = emptyColor;
+    if (textureOn && mod(gl_FragCoord.x + gl_FragCoord.y, 10.0) < 1.2) ink *= 0.55;
+    color = vec4(ink, 1.0);
+  }`);
+  const program = gl.createProgram(); gl.attachShader(program, vertex); gl.attachShader(program, fragment); gl.linkProgram(program);
+  gl.deleteShader(vertex); gl.deleteShader(fragment);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+  const uniform = (name) => gl.getUniformLocation(program, name);
+  const texture = (unit) => {
+    const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  };
+  const countsTexture = texture(0), totalsTexture = texture(1); texture(2);
+  // The existing sequential ramp is shared by the key and the shader's 256-entry LUT.
+  const ramp = ['#184f95', '#256abf', '#3987e5', '#6da7ec', '#9ec5f4', '#cde2fb'];
+  const rgb = (hex) => hex.match(/[a-f\d]{2}/gi).map((part) => parseInt(part, 16));
+  const stops = ramp.map(rgb), lut = new Uint8Array(256 * 4);
+  ramp.forEach((color) => { const s = document.createElement('i'); s.style.background = color; $('ramp').append(s); });
+  for (let i = 0; i < 256; i++) {
+    const p = i * (stops.length - 1) / 255, a = Math.floor(p), b = Math.min(stops.length - 1, a + 1);
+    for (let c = 0; c < 3; c++) lut[i * 4 + c] = Math.round(stops[a][c] + (stops[b][c] - stops[a][c]) * (p - a));
+    lut[i * 4 + 3] = 255;
+  }
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lut);
+  gl.uniform1i(uniform('counts'), 0); gl.uniform1i(uniform('totals'), 1); gl.uniform1i(uniform('ramp'), 2);
+  gl.uniform3fv(uniform('emptyColor'), rgb(UI.token('line')).map((n) => n / 255));
+  let allocated = '';
+  renderer = {
+    upload(v) {
+      const shape = `${v.experts}/${v.layers.length}/${v.encoding}`;
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, countsTexture);
+      if (allocated !== shape) gl.texImage2D(gl.TEXTURE_2D, 0, v.encoding === 1 ? gl.R32UI : gl.RG32UI, v.experts, v.layers.length, 0, v.encoding === 1 ? gl.RED_INTEGER : gl.RG_INTEGER, gl.UNSIGNED_INT, null);
+      // Both views alias the fetched ArrayBuffer: no cell loop or upload staging copy.
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, v.experts, v.layers.length, v.encoding === 1 ? gl.RED_INTEGER : gl.RG_INTEGER, gl.UNSIGNED_INT, v.words);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, totalsTexture);
+      if (allocated !== shape) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32UI, 1, v.layers.length, 0, gl.RG_INTEGER, gl.UNSIGNED_INT, null);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, v.layers.length, gl.RG_INTEGER, gl.UNSIGNED_INT, v.totalWords);
+      allocated = shape;
+      gl.uniform2i(uniform('geometry'), v.experts, v.layers.length); gl.uniform1f(uniform('peak'), v.peak);
+    },
+    draw() {
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.uniform2f(uniform('resolution'), canvas.width, canvas.height); gl.uniform1i(uniform('textureOn'), $('texture').checked);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    },
+  };
+} catch (error) { unavailable('WebGL2 could not initialize: ' + String(error.message || error)); return; }
+canvas.addEventListener('webglcontextlost', (event) => { event.preventDefault(); controller?.abort(); unavailable('WebGL2 context was lost. Reload this page to reconnect.'); });
+function parse(buffer) {
+  const d = new DataView(buffer), u32 = (o) => d.getUint32(o, true), u64 = (o) => d.getBigUint64(o, true), f64 = (o) => d.getFloat64(o, true);
+  if (buffer.byteLength < 128 || u32(0) !== 0x31305545 || d.getUint16(4, true) !== 1 || d.getUint16(6, true) !== 128) throw new Error('Invalid expert binary header');
+  const experts = u32(12), rows = u32(16), encoding = d.getUint8(30), offset = u32(112);
+  const totalOffset = (128 + rows * 4 + 7) & ~7;
+  if (!experts || !rows || ![1, 2].includes(encoding) || offset !== totalOffset + rows * 8 || buffer.byteLength !== offset + rows * experts * (encoding === 1 ? 4 : 8)) throw new Error('Invalid expert binary dimensions');
+  if (d.getUint8(28) !== ['short', 'long', 'total'].indexOf($('window').value) || d.getUint8(29) !== ['combined', 'prefill', 'decode'].indexOf($('phase').value)) throw new Error('Mismatched expert selection');
+  const layers = new Uint32Array(buffer, 128, rows);
+  if (layers[0] !== u32(24) || layers[rows - 1] >= u32(8) || !u32(20)) throw new Error('Invalid routed layer IDs');
+  return {buffer, experts, layers, topk: u32(20), encoding, sampled: f64(32), elapsed: f64(40), maximum: u64(48), sampleId: u64(56), peak: f64(64), stale: Boolean(d.getUint8(31)), touched: u64(72), possible: u64(80), coverage: f64(88), concentration: f64(96), rows: u64(104), totals: new BigUint64Array(buffer, totalOffset, rows), totalWords: new Uint32Array(buffer, totalOffset, rows * 2), words: new Uint32Array(buffer, offset), counts: encoding === 1 ? new Uint32Array(buffer, offset) : new BigUint64Array(buffer, offset)};
+}
 function cell(row, expert) {
-  const layer = view.geometry.routed_layers[row];
-  const count = view.counts[layer * view.geometry.experts + expert];
-  const total = view.totals[row];
-  return { layer, expert, count, share: total > 0 ? count / total : 0 };
+  const count = view.counts[row * view.experts + expert], total = view.totals[row];
+  return {layer: view.layers[row], expert, count, share: total > 0n ? Number(count) / Number(total) : 0};
 }
 function description(c) { return `Layer ${c.layer} / expert ${c.expert}\n${number(c.count)} routed selections / ${pct(c.share)} of layer`; }
 function updateReadout() {
   if (!view || !inspected) return;
-  const text = description(cell(selected.row, selected.expert));
-  const readout = text.replace('\n', ' - ');
-  if ($('readout').textContent !== readout) $('readout').textContent = readout;
+  const text = description(cell(selected.row, selected.expert)); $('readout').textContent = text.replace('\n', ' - ');
   if (!$('tooltip').hidden) $('tooltip').textContent = text;
+  const marker = $('cell-marker'); marker.hidden = false;
+  marker.style.left = 38 + selected.expert * layout.cw + 'px'; marker.style.top = 28 + selected.row * layout.ch + 'px';
+  marker.style.width = layout.cw + 'px'; marker.style.height = layout.ch + 'px';
 }
-function inspect(row, expert) {
-  selected = { row, expert }; inspected = true;
-  updateReadout();
-  draw();
-}
-function draw() {
-  if (!view) return;
-  const experts = view.geometry.experts, layers = view.geometry.routed_layers;
-  const left = 58, top = 32, cw = Math.max(5, Math.min(16, ($('plot').clientWidth - left - 12) / experts)), ch = 16;
-  const width = Math.max(320, left + experts * cw + 12), height = top + layers.length * ch + 14;
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.ceil(width * dpr); canvas.height = Math.ceil(height * dpr);
-  canvas.style.width = width + 'px'; canvas.style.height = height + 'px';
-  ctx.scale(dpr, dpr);
-  layout = { left, top, cw, ch, width, height };
-  ctx.fillStyle = UI.token('well'); ctx.fillRect(0, 0, width, height);
-  ctx.font = '10px ' + UI.token('mono'); ctx.textBaseline = 'middle'; ctx.fillStyle = UI.token('ink-2');
-  const stride = Math.max(1, Math.ceil(38 / cw));
-  ctx.fillText('Layer', 5, 13);
-  for (let e = 0; e < experts; e += stride) ctx.fillText(String(e), left + e * cw, 13);
-  for (let row = 0; row < layers.length; row++) {
-    ctx.fillStyle = UI.token('ink-2'); ctx.fillText(String(layers[row]), 12, top + row * ch + ch / 2);
-    for (let expert = 0; expert < experts; expert++) {
-      const c = cell(row, expert), x = left + expert * cw, y = top + row * ch;
-      ctx.fillStyle = c.count ? ramp[Math.min(ramp.length - 1, Math.floor(c.share / view.peak * ramp.length))] : UI.token('line');
-      ctx.fillRect(x, y, cw - 2, ch - 2);
-      if ($('texture').checked && c.count) {
-        ctx.save(); ctx.beginPath(); ctx.rect(x, y, cw - 2, ch - 2); ctx.clip();
-        ctx.strokeStyle = UI.token('well'); ctx.lineWidth = 1;
-        const gap = Math.max(2, Math.round(8 - 6 * c.share / view.peak));
-        for (let p = -ch; p < cw + ch; p += gap) {
-          ctx.beginPath(); ctx.moveTo(x + p, y + ch); ctx.lineTo(x + p + ch, y); ctx.stroke();
-        }
-        ctx.restore();
-      }
-    }
+function inspect(row, expert) { selected = {row, expert}; inspected = true; updateReadout(); }
+function size() {
+  const width = Math.max(1, $('plot').clientWidth - 46), height = Math.max(view.layers.length * 3, Math.min(460, Math.max(240, innerHeight * .44)));
+  const dpr = window.devicePixelRatio || 1, w = Math.ceil(width * dpr), h = Math.ceil(height * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  canvas.style.height = height + 'px';
+  const key = `${width}/${height}/${geometryKey}`;
+  layout = {width, height, cw: width / view.experts, ch: height / view.layers.length};
+  if (size.key !== key) {
+    size.key = key;
+    const label = (value, position, axis) => { const n = document.createElement('span'); n.textContent = String(value); n.style[axis] = position + '%'; return n; };
+    const labels = [], stride = Math.max(1, Math.ceil(48 / layout.cw));
+    for (let e = 0; e < view.experts - stride; e += stride) labels.push(label(e, 100 * e / view.experts, 'left'));
+    const last = label(view.experts - 1, 100, 'left'); last.style.transform = 'translateX(-100%)'; labels.push(last);
+    $('expert-axis').replaceChildren(...labels);
+    const rows = [], step = Math.max(1, Math.ceil(16 / layout.ch));
+    for (let r = 0; r < view.layers.length; r += step) rows.push(label(view.layers[r], 100 * (r + .5) / view.layers.length, 'top'));
+    $('layer-axis').replaceChildren(...rows);
+    $('view-caption').textContent = `All ${number(view.layers.length)} routed layers / ${number(view.experts)} experts. One expert per column (${layout.cw.toFixed(2)} CSS px). Hover or tap for exact values.`;
   }
-  ctx.strokeStyle = UI.token('ink'); ctx.lineWidth = 2;
-  ctx.strokeRect(left + selected.expert * cw - 1, top + selected.row * ch - 1, cw, ch);
 }
 function table() {
   if (!view) return;
-  const row = view.geometry.routed_layers.indexOf(Number($('layer').value));
-  const index = Math.max(0, row), fragment = document.createDocumentFragment();
-  for (let expert = 0; expert < view.geometry.experts; expert++) {
-    const c = cell(index, expert), tr = document.createElement('tr');
-    for (const text of [String(expert), number(c.count), pct(c.share)]) {
-      const td = document.createElement('td'); td.textContent = text; tr.append(td);
-    }
+  const row = Math.max(0, view.layers.indexOf(Number($('layer').value))), fragment = document.createDocumentFragment();
+  tableStart = Math.min(tableStart, Math.floor((view.experts - 1) / 32) * 32);
+  const end = Math.min(view.experts, tableStart + 32);
+  for (let expert = tableStart; expert < end; expert++) {
+    const c = cell(row, expert), tr = document.createElement('tr');
+    for (const text of [String(expert), number(c.count), pct(c.share)]) { const td = document.createElement('td'); td.textContent = text; tr.append(td); }
     fragment.append(tr);
   }
-  $('table-caption').textContent = `Layer ${view.geometry.routed_layers[index]} - ${$('phase').selectedOptions[0].text}, ${$('window').selectedOptions[0].text}.`;
-  $('table-body').replaceChildren(fragment);
+  $('table-caption').textContent = `Layer ${view.layers[row]} - ${$('phase').selectedOptions[0].text}, ${$('window').selectedOptions[0].text}.`;
+  $('table-body').replaceChildren(fragment); $('table-range').textContent = `${tableStart}-${end - 1} / ${view.experts} experts`;
+  $('previous-experts').disabled = tableStart === 0; $('next-experts').disabled = end === view.experts;
 }
-function render() {
-  if (!snapshot?.enabled) {
-    view = null; layout = null; clock = null; inspected = false;
-    selected = { row: 0, expert: 0 };
-    $('notice').textContent = 'No active expert telemetry.';
-    $('unavailable').hidden = false;
-    $('sample').textContent = ''; header.status.textContent = 'UNAVAILABLE';
-    header.meta.replaceChildren(); $('layer').replaceChildren(); $('table-body').replaceChildren();
-    $('tooltip').hidden = true;
-    $('readout').textContent = 'Hover, tap, or use arrow keys to inspect a cell.';
-    for (const id of ['summary', 'plot', 'table-panel']) $(id).hidden = true;
-    return;
-  }
-  $('unavailable').hidden = true;
-  const g = snapshot.geometry, w = snapshot.windows?.[$('window').value];
-  if (!g || !w || !Number.isInteger(g.layers) || !Number.isInteger(g.experts) || !g.routed_layers?.length) throw new Error('Invalid expert geometry');
-  const prefill = w.prefill_routed_rows, decode = w.decode_routed_rows;
-  if (prefill?.length !== g.layers * g.experts || decode?.length !== prefill.length) throw new Error('Invalid counter matrix');
-  const phase = $('phase').value;
-  const counts = prefill.map((n, i) => phase === 'prefill' ? n : phase === 'decode' ? decode[i] : n + decode[i]);
-  if (counts.some((n) => !Number.isSafeInteger(n) || n < 0)) throw new Error('Counters exceed browser exact integer range');
-  const totals = g.routed_layers.map((layer) => counts.slice(layer * g.experts, (layer + 1) * g.experts).reduce((a, b) => a + b, 0));
-  let peak = 0;
-  for (let row = 0; row < g.routed_layers.length; row++) for (let expert = 0; expert < g.experts; expert++) {
-    peak = Math.max(peak, totals[row] ? counts[g.routed_layers[row] * g.experts + expert] / totals[row] : 0);
-  }
-  const oldGeometry = view?.geometry;
-  view = { geometry: g, counts, totals, peak: peak || 1 };
-  selected.row = Math.min(selected.row, g.routed_layers.length - 1); selected.expert = Math.min(selected.expert, g.experts - 1);
-  const summary = w[phase];
-  $('touched').textContent = number(summary.touched); $('possible').textContent = number(summary.possible);
-  $('coverage').textContent = pct(summary.coverage); $('concentration').textContent = summary.concentration.toFixed(4);
-  $('rows').textContent = number(summary.routed_rows); $('peak').textContent = pct(peak) + ' peak share';
-  $('sample').textContent = `Sample t+${snapshot.sampled_s.toFixed(1)} s / window ${w.elapsed_s.toFixed(1)} s`;
+function status() {
+  if (!view) return;
   const stalled = performance.now() - lastChange > 5000;
-  $('notice').textContent = snapshot.error ? 'Snapshot worker stopped: ' + snapshot.error : paused ? 'Paused on the last received snapshot.' : stalled ? 'No new snapshot for over 5 seconds; showing the last sample.' : 'Live - refreshed every 500 ms; device snapshots about once per second. Arrow keys inspect the matrix.';
-  header.status.textContent = snapshot.error || stalled ? 'STALE' : paused ? 'PAUSED' : 'LIVE';
+  $('notice').textContent = view.stale ? 'Snapshot worker stopped; showing the last sample.' : paused ? 'Paused on the last received snapshot.' : stalled ? 'No new snapshot for over 5 seconds; showing the last sample.' : 'Live - checked every 500 ms; new device snapshots about once per second. Arrow keys inspect the matrix.';
+  header.status.textContent = view.stale || stalled ? 'STALE' : paused ? 'PAUSED' : 'LIVE';
+}
+function render(next, fetchMs) {
+  const started = performance.now(); view = next; lastChange = started;
+  $('unavailable').hidden = true;
   for (const id of ['summary', 'plot', 'table-panel']) $(id).hidden = false;
-  if (JSON.stringify(oldGeometry) !== JSON.stringify(g)) {
-    $('layer').replaceChildren(...g.routed_layers.map((layer) => { const o = document.createElement('option'); o.value = String(layer); o.textContent = String(layer); return o; }));
-    UI.facts(header.meta, [['layers', number(g.routed_layers.length)], ['experts', number(g.experts)], ['top-k', number(g.topk)]]);
+  const key = `${view.experts}/${view.topk}/${view.layers.join(',')}`;
+  if (key !== geometryKey) {
+    geometryKey = key;
+    $('layer').replaceChildren(...Array.from(view.layers, (layer) => { const o = document.createElement('option'); o.value = String(layer); o.textContent = String(layer); return o; }));
+    UI.facts(header.meta, [['layers', number(view.layers.length)], ['experts', number(view.experts)], ['top-k', number(view.topk)]]);
   }
-  draw(); table(); updateReadout();
+  selected.row = Math.min(selected.row, view.layers.length - 1); selected.expert = Math.min(selected.expert, view.experts - 1);
+  size();
+  const uploadStart = performance.now(); renderer.upload(view); renderer.draw(); const drawMs = performance.now() - uploadStart;
+  $('touched').textContent = number(view.touched); $('possible').textContent = number(view.possible); $('coverage').textContent = pct(view.coverage);
+  $('concentration').textContent = view.concentration.toFixed(4); $('rows').textContent = number(view.rows); $('peak').textContent = pct(view.peak) + ' peak share';
+  $('sample').textContent = `Sample t+${view.sampled.toFixed(1)} s / window ${view.elapsed.toFixed(1)} s`;
+  status(); table(); updateReadout();
+  const timing = {layers: view.layers.length, experts: view.experts, encoding: view.encoding, payload_bytes: view.buffer.byteLength, fetch_ms: +fetchMs.toFixed(3), upload_draw_ms: +drawMs.toFixed(3), render_ms: +(performance.now() - started).toFixed(3), heap_bytes: performance.memory?.usedJSHeapSize ?? null};
+  renderSamples.push(timing); if (renderSamples.length > 120) renderSamples.shift(); console.debug('expert-usage WebGL', timing);
 }
 function hit(event) {
   if (!layout || !view) return null;
-  const bounds = canvas.getBoundingClientRect();
-  const x = (event.clientX - bounds.left) * layout.width / bounds.width;
-  const y = (event.clientY - bounds.top) * layout.height / bounds.height;
-  const expert = Math.floor((x - layout.left) / layout.cw), row = Math.floor((y - layout.top) / layout.ch);
-  return expert >= 0 && expert < view.geometry.experts && row >= 0 && row < view.geometry.routed_layers.length ? { row, expert } : null;
+  const b = canvas.getBoundingClientRect(), expert = Math.floor((event.clientX - b.left) / b.width * view.experts), row = Math.floor((event.clientY - b.top) / b.height * view.layers.length);
+  return expert >= 0 && expert < view.experts && row >= 0 && row < view.layers.length ? {row, expert} : null;
 }
 canvas.addEventListener('pointermove', (event) => {
-  const point = hit(event); $('tooltip').hidden = !point;
-  if (!point) return;
-  inspect(point.row, point.expert);
-  $('tooltip').textContent = description(cell(point.row, point.expert));
+  const point = hit(event); $('tooltip').hidden = !point; if (!point) return;
+  inspect(point.row, point.expert); $('tooltip').textContent = description(cell(point.row, point.expert));
   $('tooltip').style.left = Math.max(8, Math.min(innerWidth - 290, event.clientX + 12)) + 'px';
   $('tooltip').style.top = Math.max(8, Math.min(innerHeight - 70, event.clientY + 12)) + 'px';
 });
 canvas.addEventListener('pointerleave', () => { $('tooltip').hidden = true; });
-canvas.addEventListener('click', (event) => {
-  const point = hit(event); if (!point) return;
-  inspect(point.row, point.expert); $('layer').value = String(cell(point.row, point.expert).layer); table();
-});
+function selectTable() { $('layer').value = String(view.layers[selected.row]); tableStart = Math.floor(selected.expert / 32) * 32; table(); }
+canvas.addEventListener('click', (event) => { const point = hit(event); if (!point) return; inspect(point.row, point.expert); selectTable(); });
 canvas.addEventListener('keydown', (event) => {
-  if (!view) return;
-  let { row, expert } = selected;
+  if (!view) return; let {row, expert} = selected;
   if (event.key === 'ArrowLeft') expert--; else if (event.key === 'ArrowRight') expert++;
   else if (event.key === 'ArrowUp') row--; else if (event.key === 'ArrowDown') row++;
-  else if (event.key === 'Home') expert = 0; else if (event.key === 'End') expert = view.geometry.experts - 1; else return;
-  event.preventDefault();
-  inspect(Math.max(0, Math.min(row, view.geometry.routed_layers.length - 1)), Math.max(0, Math.min(expert, view.geometry.experts - 1)));
-  $('layer').value = String(cell(selected.row, selected.expert).layer); table();
+  else if (event.key === 'Home') expert = 0; else if (event.key === 'End') expert = view.experts - 1; else return;
+  event.preventDefault(); inspect(Math.max(0, Math.min(row, view.layers.length - 1)), Math.max(0, Math.min(expert, view.experts - 1))); selectTable();
 });
-for (const id of ['phase', 'window', 'texture']) $(id).addEventListener('change', render);
+const selectionKey = () => $('window').value + '/' + $('phase').value;
+for (const id of ['phase', 'window']) $(id).addEventListener('change', () => { etag = null; controller?.abort(); void refresh(); });
+$('texture').addEventListener('change', () => { if (view) renderer.draw(); });
 $('layer').addEventListener('change', table);
-$('pause').onclick = () => {
-  paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; render();
-  if (!paused) void refresh();
-};
-window.addEventListener('resize', draw);
+$('previous-experts').onclick = () => { tableStart = Math.max(0, tableStart - 32); table(); };
+$('next-experts').onclick = () => { if (view) tableStart = Math.min(Math.floor((view.experts - 1) / 32) * 32, tableStart + 32); table(); };
+$('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; status(); if (!paused) void refresh(); };
+window.addEventListener('resize', () => { if (view) { size(); renderer.draw(); updateReadout(); } });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(); });
 async function refresh() {
-  if (paused || document.hidden || inFlight) return;
-  inFlight = true;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  if (paused || document.hidden || inFlight || gl.isContextLost()) return;
+  inFlight = true; currentKey = selectionKey(); const requested = currentKey;
+  controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS), started = performance.now();
   try {
-    const response = await fetch('/console/expert-usage', { credentials: 'same-origin', cache: 'no-store', signal: controller.signal });
+    const response = await fetch(`/console/expert-usage.bin?window=${$('window').value}&phase=${$('phase').value}`, {credentials: 'same-origin', cache: 'no-store', headers: etag ? {'If-None-Match': etag} : {}, signal: controller.signal});
+    if (paused || document.hidden || requested !== selectionKey()) return;
+    if (response.status === 304) { status(); return; }
+    if (response.status === 204) { unavailable('This model has no active expert-usage adapter, or telemetry is disabled.'); return; }
     if (!response.ok) throw new Error(response.status === 401 ? 'Console session locked. Reopen the admin console link.' : 'Telemetry request failed (' + response.status + ')');
-    const next = await response.json();
-    // An in-flight response must not advance a paused or backgrounded view.
-    if (paused || document.hidden) return;
-    snapshot = next;
-    if (snapshot.sampled_s !== clock) { clock = snapshot.sampled_s; lastChange = performance.now(); }
-    render();
+    const buffer = await response.arrayBuffer();
+    if (paused || document.hidden || requested !== selectionKey()) return;
+    const next = parse(buffer); etag = response.headers.get('ETag');
+    render(next, performance.now() - started);
   } catch (error) {
-    if (paused || document.hidden) return;
+    if (paused || document.hidden || requested !== selectionKey()) return;
     $('notice').textContent = error.name === 'AbortError' ? 'Telemetry request timed out; showing the last sample.' : String(error.message || error);
     header.status.textContent = 'OFFLINE'; $('tooltip').hidden = true;
   } finally {
-    clearTimeout(timeout); inFlight = false;
+    clearTimeout(timeout); inFlight = false; controller = null;
+    if (requested !== selectionKey()) void refresh();
   }
 }
-void refresh();
-setInterval(refresh, REFRESH_MS);
+void refresh(); setInterval(refresh, REFRESH_MS);
 })();
 </script>
 </body>

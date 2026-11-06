@@ -130,6 +130,11 @@ def install_cookie_jar(client, path, base_url):
             raise RuntimeError("Chrome rejected cookie " + cookie.name)
 
 
+def webgl_flags(software):
+    return (["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
+            if software else ["--disable-gpu"])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", "--url", default="http://127.0.0.1:8765")
@@ -138,6 +143,7 @@ def main():
     parser.add_argument("--cookie-jar", type=Path, help="Read cookies from a local Netscape jar; keeps credentials out of argv")
     parser.add_argument("--click", action="append", default=[], help="CSS selector; repeated in order")
     parser.add_argument("--eval", action="append", default=[], help="JS expression, may return a promise; repeated in order")
+    parser.add_argument("--software-webgl", action="store_true", help="Use CPU SwiftShader WebGL2 for correctness proof, not GPU timing")
     parser.add_argument("--width", type=int, default=1440)
     parser.add_argument("--height", type=int, default=1000)
     parser.add_argument("--timeout", type=float, default=30)
@@ -152,7 +158,7 @@ def main():
     client = None
     with tempfile.TemporaryDirectory(prefix="render-", dir=args.temp_dir, ignore_cleanup_errors=True) as profile:
         try:
-            process = subprocess.Popen(["/usr/bin/google-chrome", "--headless=new", "--disable-gpu",
+            process = subprocess.Popen(["/usr/bin/google-chrome", "--headless=new", *webgl_flags(args.software_webgl),
                 "--disable-dev-shm-usage", "--disable-extensions", "--disable-background-networking", "--no-first-run", "--no-default-browser-check",
                 "--enable-automation", "--password-store=basic", "--no-proxy-server", "--remote-debugging-port=0", "--remote-allow-origins=http://localhost", "--user-data-dir=" + profile,
                 "--window-size=" + str(args.width) + "," + str(args.height), "about:blank"],

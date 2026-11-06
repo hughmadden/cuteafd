@@ -3,6 +3,8 @@ import json
 import shutil
 import subprocess
 import threading
+import time
+import struct
 from http.server import ThreadingHTTPServer
 from itertools import count
 from pathlib import Path
@@ -48,12 +50,19 @@ def test_renderer_installs_netscape_cookie_jar_without_logging_values(tmp_path, 
     assert capsys.readouterr().err == ""
 
 
+def test_renderer_software_webgl_flags_are_opt_in():
+    renderer = module("expert_webgl_renderer", "scripts/usage/render-smoke.py")
+    assert renderer.webgl_flags(False) == ["--disable-gpu"]
+    assert renderer.webgl_flags(True) == ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
+
+
 def test_expert_fixture_auth_live_values_and_disabled_variant():
     fixture = module("expert_fixture", "scripts/usage/mock-server.py")
     server = ThreadingHTTPServer(("127.0.0.1", 0), fixture.Handler)
     server.locked = True
     server.expert_usage = "live"
     server.expert_ticks = count(1)
+    server.expert_started = time.monotonic()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_port}"
@@ -76,8 +85,26 @@ def test_expert_fixture_auth_live_values_and_disabled_variant():
         assert second["sampled_s"] > first["sampled_s"]
         assert first["windows"] != second["windows"]
         assert first["geometry"]["routed_layers"] == list(range(1, 12))
+        with pytest.raises(HTTPError) as locked:
+            get("/console/expert-usage.bin")
+        assert locked.value.code == 401
+        with urlopen(Request(base + "/console/expert-usage.bin?window=short&phase=decode", headers={"Cookie": cookie}), timeout=5) as response:
+            payload = response.read()
+            tag = response.headers["ETag"]
+        assert payload[:8] == b"EU01\x01\x00\x80\x00"
+        assert payload[28:31] == bytes([0, 2, 1])
+        assert struct.unpack_from("<I", payload, 16)[0] == 11
+        offset = struct.unpack_from("<I", payload, 112)[0]
+        assert len(payload) == offset + 11 * 32 * 4
+        with pytest.raises(HTTPError) as unchanged:
+            urlopen(Request(base + "/console/expert-usage.bin?window=short&phase=decode", headers={"Cookie": cookie, "If-None-Match": tag}), timeout=5)
+        assert unchanged.value.code == 304
+        assert unchanged.value.headers["Cache-Control"] == "no-store"
         server.expert_usage = "disabled"
         assert get("/console/expert-usage", cookie) == {"enabled": False}
+        with urlopen(Request(base + "/console/expert-usage.bin", headers={"Cookie": cookie}), timeout=5) as response:
+            assert response.status == 204
+            assert response.read() == b""
     finally:
         server.shutdown()
         server.server_close()
@@ -91,68 +118,77 @@ def test_expert_dashboard_refresh_is_serial_and_updates_all_views():
     harness = r"""
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
-const elements = new Map();
-const context2d = new Proxy({}, {get: () => () => {}});
+const elements = new Map(); let uploads = 0, draws = 0;
+const gl = new Proxy({getShaderParameter: () => true, getProgramParameter: () => true, isContextLost: () => false,
+  texSubImage2D: () => uploads++, drawArrays: () => draws++}, {get: (target, key) => target[key] ?? (() => ({}))});
 class Element {
   constructor() { this.textContent = ''; this.hidden = true; this.value = ''; this.children = []; this.listeners = {}; this.style = {}; this.clientWidth = 1000; }
   append(child) { this.children.push(child); }
   replaceChildren(...children) { this.children = children; if (children[0]?.value) this.value = children[0].value; }
   addEventListener(name, handler) { this.listeners[name] = handler; }
   get selectedOptions() { return [{text: this.value}]; }
-  getContext() { return context2d; }
+  getContext(type) { assert.equal(type, 'webgl2'); return gl; }
 }
 const el = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
 el('phase').value = 'combined'; el('window').value = 'short';
 const document = {hidden: false, getElementById: el, createElement: () => new Element(), createDocumentFragment: () => new Element(), addEventListener: () => {}};
 const header = {status: new Element(), meta: new Element()};
-let interval, intervalMs, timer, calls = 0, pending;
+let interval, intervalMs, timer, calls = 0, pending, requestOptions;
 const window = {devicePixelRatio: 1, addEventListener: () => {}, CuteUI: {
   header: () => header, adminGate: async () => true, token: () => '#111111',
   fmt: {n0: String}, facts: (target, facts) => target.replaceChildren(...facts),
 }};
-const sandbox = {document, window, performance: {now: () => 0}, AbortController,
+const sandbox = {document, window, location: {search: ''}, URLSearchParams, console, Intl,
+  innerHeight: 1000, innerWidth: 1200, performance: {now: () => 0}, AbortController,
   setInterval: (f, ms) => { interval = f; intervalMs = ms; },
   setTimeout: f => {timer = f; return 1;}, clearTimeout: () => {},
-  fetch: (_url, options) => { calls++; return new Promise((resolve, reject) => {
+  fetch: (url, options) => { assert.match(url, /^\/console\/expert-usage.bin\?/); requestOptions = options; calls++; return new Promise((resolve, reject) => {
     pending = resolve;
     options.signal.addEventListener('abort', () => reject(Object.assign(new Error(), {name: 'AbortError'})));
   }); },
 };
-const tick = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
-const sample = n => {
-  const summary = {touched: n, possible: 2, coverage: n / 2, concentration: .5, routed_rows: 3*n};
-  const window = {elapsed_s: n, prefill_routed_rows: [n, 0], decode_routed_rows: [0, 2*n], combined: summary, prefill: summary, decode: summary};
-  return {enabled: true, sampled_s: n, geometry: {layers: 1, experts: 2, topk: 1, routed_layers: [0]}, windows: {short: window, long: window, total: window}};
+const tick = async () => { for (let i = 0; i < 18; i++) await Promise.resolve(); };
+const sample = (n, wide = false) => {
+  const buffer = new ArrayBuffer(wide ? 160 : 152), d = new DataView(buffer);
+  const u32 = (o, v) => d.setUint32(o, v, true), u64 = (o, v) => d.setBigUint64(o, BigInt(v), true), f64 = (o, v) => d.setFloat64(o, v, true);
+  u32(0, 0x31305545); d.setUint16(4, 1, true); d.setUint16(6, 128, true);
+  u32(8, 1); u32(12, 2); u32(16, 1); u32(20, 1);
+  d.setUint8(28, ['short', 'long', 'total'].indexOf(el('window').value));
+  d.setUint8(29, ['combined', 'prefill', 'decode'].indexOf(el('phase').value)); d.setUint8(30, wide ? 2 : 1);
+  f64(32, n); f64(40, n); u64(48, 2*n); u64(56, n); f64(64, 2/3);
+  u64(72, 2); u64(80, 2); f64(88, 1); f64(96, .5); u64(104, 3*n); u32(112, 144); u64(136, 3*n);
+  if (wide) { u64(144, 9007199254740993n); u64(152, 2*n); } else { u32(144, n); u32(148, 2*n); }
+  return buffer;
 };
-const respond = async data => { pending({ok: true, json: async () => data}); await tick(); };
+const respond = async (data, status = 200) => { pending({ok: status === 200, status, headers: {get: () => '"tag"'}, arrayBuffer: async () => data}); await tick(); };
 (async () => {
   vm.runInNewContext(SCRIPT, sandbox); await tick();
   assert.equal(intervalMs, 500);
   interval(); interval(); await tick(); assert.equal(calls, 1, 'no overlapping requests');
-  await respond(sample(1));
-  assert.equal(el('rows').textContent, '3');
+  await respond(sample(1)); assert.equal(el('rows').textContent, '3');
   el('matrix').listeners.keydown({key: 'ArrowRight', preventDefault() {}});
   assert.match(el('readout').textContent, /2 routed selections/);
-  interval(); await respond(sample(2));
-  assert.equal(el('rows').textContent, '6');
+  const initialUploads = uploads, initialDraws = draws;
+  interval(); assert.equal(requestOptions.headers['If-None-Match'], '"tag"'); await respond(null, 304);
+  assert.equal(uploads, initialUploads); assert.equal(draws, initialDraws, '304 never redraws');
+  interval(); await respond(sample(2)); assert.equal(el('rows').textContent, '6');
   assert.match(el('readout').textContent, /4 routed selections/);
   assert.equal(el('table-body').children[0].children[1].children[1].textContent, '4');
-  interval(); el('pause').onclick(); await respond(sample(3));
-  assert.equal(el('rows').textContent, '6', 'pause discards an in-flight response');
+  interval(); el('pause').onclick(); await respond(sample(3)); assert.equal(el('rows').textContent, '6', 'pause discards response');
   const before = calls; interval(); await tick(); assert.equal(calls, before);
-  el('pause').onclick(); await respond(sample(4));
-  assert.equal(el('rows').textContent, '12', 'resume immediately refreshes');
-  el('phase').value = 'prefill'; el('phase').listeners.change();
-  assert.match(el('readout').textContent, /0 routed selections/);
-  interval(); await respond({enabled: false});
+  el('pause').onclick(); await respond(sample(4)); assert.equal(el('rows').textContent, '12');
+  el('window').value = 'total'; el('window').listeners.change(); await tick(); await respond(sample(5, true));
+  el('matrix').listeners.keydown({key: 'Home', preventDefault() {}});
+  assert.match(el('readout').textContent, /9,007,199,254,740,993 routed selections/, 'u64 hover stays exact');
+  interval(); await respond(null, 204);
   for (const id of ['summary', 'plot', 'table-panel']) assert.equal(el(id).hidden, true);
-  assert.equal(el('unavailable').hidden, false);
-  assert.equal(el('sample').textContent, ''); assert.equal(header.meta.children.length, 0);
-  assert.equal(el('table-body').children.length, 0); assert.equal(header.status.textContent, 'UNAVAILABLE');
+  assert.equal(el('unavailable').hidden, false); assert.equal(header.status.textContent, 'UNAVAILABLE');
   interval(); timer(); await tick(); assert.equal(header.status.textContent, 'OFFLINE');
-  interval(); await respond(sample(5)); assert.equal(el('unavailable').hidden, true);
-  assert.equal(header.status.textContent, 'LIVE');
+  interval(); await respond(sample(6, true)); assert.equal(el('unavailable').hidden, true);
   document.hidden = true; const hiddenCalls = calls; interval(); await tick(); assert.equal(calls, hiddenCalls);
+  const count = calls; sandbox.location.search = '?webgl=off';
+  vm.runInNewContext(SCRIPT, sandbox); await tick();
+  assert.match(el('unavailable-reason').textContent, /WebGL2 is unavailable/); assert.equal(calls, count);
 })().catch(error => {console.error(error); process.exitCode = 1;});
 """
     subprocess.run([shutil.which("node"), "-e", "const SCRIPT = " + json.dumps(script) + ";\n" + harness],

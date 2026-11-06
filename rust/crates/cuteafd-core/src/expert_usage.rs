@@ -109,6 +109,54 @@ pub fn summarize(geometry: &Geometry, counts: &[u64]) -> Summary {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageWindow {
+    #[default]
+    Short,
+    Long,
+    Total,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UsagePhase {
+    #[default]
+    Combined,
+    Prefill,
+    Decode,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SelectionError {
+    #[error("expert count exceeds the short/long window u32 invariant")]
+    WindowCountOverflow,
+    #[error("expert counts or exact layer totals exceed u64")]
+    TotalOverflow,
+}
+
+/// One selected phase/window, packed by routed layer, without JSON intermediates.
+#[derive(Debug)]
+pub struct Selection {
+    pub geometry: Geometry,
+    pub sampled_s: f64,
+    pub elapsed_s: f64,
+    pub sample_id: u64,
+    pub stale: bool,
+    pub counts: Vec<u64>,
+    pub totals: Vec<u64>,
+    pub maximum: u64,
+    pub peak_share: f64,
+    pub summary: Summary,
+}
+
+#[derive(Debug)]
+pub enum Selected {
+    Disabled,
+    Unchanged,
+    Snapshot(Selection),
+}
+
 #[derive(Debug)]
 struct History {
     geometry: Geometry,
@@ -192,6 +240,108 @@ impl Reader {
             history.error = Some(error);
         }
     }
+    /// The conditional check happens before allocating or scanning a matrix.
+    pub fn selected(
+        &self,
+        window: UsageWindow,
+        phase: UsagePhase,
+        unchanged: impl FnOnce(u64) -> bool,
+    ) -> Result<Selected, SelectionError> {
+        let guard = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let Some(history) = guard.as_ref() else {
+            return Ok(Selected::Disabled);
+        };
+        let latest = history.samples.back().unwrap();
+        let stale = history.error.is_some();
+        let sample_id = latest.elapsed_s.to_bits() ^ if stale { u64::MAX } else { 0 };
+        if unchanged(sample_id) {
+            return Ok(Selected::Unchanged);
+        }
+        let seconds = match window {
+            UsageWindow::Short => Some(SHORT_SECONDS),
+            UsageWindow::Long => Some(LONG_SECONDS),
+            UsageWindow::Total => None,
+        };
+        let baseline = seconds.and_then(|seconds| {
+            let cutoff = latest.elapsed_s - seconds as f64;
+            history
+                .samples
+                .iter()
+                .rev()
+                .find(|p| p.elapsed_s <= cutoff)
+                .or_else(|| history.samples.front())
+        });
+        let geometry = &history.geometry;
+        let mut counts = Vec::with_capacity(geometry.routed_layers.len() * geometry.experts);
+        let mut totals = Vec::with_capacity(geometry.routed_layers.len());
+        let mut maximum = 0;
+        let mut touched = 0;
+        let mut selections = 0u64;
+        let mut concentration = 0.0;
+        let mut peak_share: f64 = 0.0;
+        let mut active = 0;
+        for &layer in &geometry.routed_layers {
+            let begin = counts.len();
+            let mut total = 0u64;
+            for expert in 0..geometry.experts {
+                let i = layer * geometry.experts + expert;
+                let prefill = latest.prefill[i] - baseline.map_or(0, |old| old.prefill[i]);
+                let decode = latest.decode[i] - baseline.map_or(0, |old| old.decode[i]);
+                let count = match phase {
+                    UsagePhase::Prefill => prefill,
+                    UsagePhase::Decode => decode,
+                    UsagePhase::Combined => prefill
+                        .checked_add(decode)
+                        .ok_or(SelectionError::TotalOverflow)?,
+                };
+                if window != UsageWindow::Total && u32::try_from(count).is_err() {
+                    return Err(SelectionError::WindowCountOverflow);
+                }
+                total = total
+                    .checked_add(count)
+                    .ok_or(SelectionError::TotalOverflow)?;
+                maximum = maximum.max(count);
+                touched += usize::from(count > 0);
+                counts.push(count);
+            }
+            totals.push(total);
+            selections = selections
+                .checked_add(total)
+                .ok_or(SelectionError::TotalOverflow)?;
+            if total > 0 {
+                active += 1;
+                for &count in &counts[begin..] {
+                    let share = count as f64 / total as f64;
+                    peak_share = peak_share.max(share);
+                    concentration += share * share;
+                }
+            }
+        }
+        let possible = counts.len();
+        Ok(Selected::Snapshot(Selection {
+            geometry: geometry.clone(),
+            sampled_s: latest.elapsed_s,
+            elapsed_s: latest.elapsed_s - baseline.map_or(0.0, |old| old.elapsed_s),
+            sample_id,
+            stale,
+            counts,
+            totals,
+            maximum,
+            peak_share,
+            summary: Summary {
+                touched,
+                possible,
+                coverage: touched as f64 / possible as f64,
+                concentration: if active == 0 {
+                    0.0
+                } else {
+                    concentration / active as f64
+                },
+                routed_rows: selections / geometry.topk as u64,
+            },
+        }))
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         let guard = self.0.read().unwrap_or_else(|e| e.into_inner());
         let Some(history) = guard.history.as_ref() else {
@@ -346,6 +496,97 @@ mod tests {
             geometry.host_bytes(2).unwrap() - geometry.host_bytes(1).unwrap(),
             DEVICE_METADATA_BYTES
         );
+    }
+
+    #[test]
+    fn selected_windows_are_packed_exact_and_conditional() {
+        let reader = Reader::default();
+        reader.initialize(geometry()).unwrap();
+        for n in 1..=100 {
+            reader.publish(sample(n as f64, n)).unwrap();
+        }
+        let Selected::Snapshot(selected) = reader
+            .selected(UsageWindow::Short, UsagePhase::Combined, |_| false)
+            .unwrap()
+        else {
+            panic!("missing snapshot")
+        };
+        assert_eq!(selected.counts, vec![15; 8]);
+        assert_eq!(selected.totals, vec![60; 2]);
+        assert_eq!(selected.geometry.routed_layers, vec![1, 2]);
+        assert_eq!(selected.elapsed_s, 5.0);
+        assert_eq!(selected.summary.routed_rows, 60);
+        assert_eq!(selected.peak_share, 0.25);
+        assert!(matches!(
+            reader
+                .selected(UsageWindow::Short, UsagePhase::Combined, |id| id
+                    == selected.sample_id)
+                .unwrap(),
+            Selected::Unchanged
+        ));
+        reader.fail("stopped".into());
+        assert!(matches!(
+            reader
+                .selected(UsageWindow::Short, UsagePhase::Combined, |id| id
+                    == selected.sample_id)
+                .unwrap(),
+            Selected::Snapshot(_)
+        ));
+        let Selected::Snapshot(total) = reader
+            .selected(UsageWindow::Total, UsagePhase::Decode, |_| false)
+            .unwrap()
+        else {
+            panic!("missing total")
+        };
+        assert_eq!(total.counts, vec![200; 8]);
+        assert!(total.stale);
+    }
+
+    #[test]
+    fn selected_overflow_is_typed_never_saturated() {
+        let reader = Reader::default();
+        reader
+            .initialize(Geometry {
+                layers: 1,
+                experts: 2,
+                topk: 1,
+                routed_layers: vec![0],
+            })
+            .unwrap();
+        reader
+            .publish(Snapshot {
+                elapsed_s: 1.0,
+                prefill: vec![u32::MAX as u64 + 1, 7],
+                decode: vec![0, 0],
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.selected(UsageWindow::Short, UsagePhase::Prefill, |_| false),
+            Err(SelectionError::WindowCountOverflow)
+        ));
+        assert!(matches!(
+            reader.selected(UsageWindow::Long, UsagePhase::Combined, |_| false),
+            Err(SelectionError::WindowCountOverflow)
+        ));
+        let Selected::Snapshot(total) = reader
+            .selected(UsageWindow::Total, UsagePhase::Prefill, |_| false)
+            .unwrap()
+        else {
+            panic!("missing total")
+        };
+        assert_eq!(total.counts, vec![u32::MAX as u64 + 1, 7]);
+        assert_eq!(total.totals, vec![u32::MAX as u64 + 8]);
+        reader
+            .publish(Snapshot {
+                elapsed_s: 2.0,
+                prefill: vec![u64::MAX, 7],
+                decode: vec![1, 0],
+            })
+            .unwrap();
+        assert!(matches!(
+            reader.selected(UsageWindow::Total, UsagePhase::Combined, |_| false),
+            Err(SelectionError::TotalOverflow)
+        ));
     }
 
     #[test]
