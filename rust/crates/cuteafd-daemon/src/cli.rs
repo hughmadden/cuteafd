@@ -248,11 +248,11 @@ impl AttentionArgs {
     }
     pub fn validate_view(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> anyhow::Result<()> {
         if self.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Hqa { return Ok(()); }
-        let config = view.config()?;
-        let text = config.get("text_config").filter(|v| v.is_object()).unwrap_or(&config);
-        let model_type = text["model_type"].as_str().unwrap_or("");
-        let supported = ATTENTION_VARIANTS.iter().any(|(models, enabled)| *enabled && models.contains(&model_type));
-        anyhow::ensure!(supported, "alternate attention modes are unsupported for checkpoint model_type={model_type}");
+        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(view)?;
+        let family = cuteafd_loader::plan::family::detect(&checkpoint)
+            .map(|family| family.id()).unwrap_or("unknown");
+        let supported = attention_variants().get(family).copied().unwrap_or(false);
+        anyhow::ensure!(supported, "alternate attention modes are unsupported for checkpoint family={family}");
         Ok(())
     }
     pub fn select(&self, snapshot: &std::path::Path) -> anyhow::Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
@@ -260,15 +260,25 @@ impl AttentionArgs {
     }
 }
 
-// Qualification is per checkpoint variant, not daemon family: ML4 shares the GLM5 engine.
-const ATTENTION_VARIANTS: &[(&[&str], bool)] = &[
-    (&["glm5_next"], true),
-    (&["glm_moe_dsa"], false),
-    (&["mistral_large4", "mistral_large4_text"], false),
-    (&["kimi_k3"], false),
-    (&["step5", "step5_vl"], false),
-    (&["muse_spark", "muse_spark_text"], false),
-];
+// Qualification uses loader family IDs, not engine IDs: ML4 shares the GLM5 engine.
+const ATTENTION_VARIANTS: &str = include_str!("../../../../scripts/lib/attention-variants.json");
+fn attention_variants() -> &'static std::collections::BTreeMap<String, bool> {
+    static VARIANTS: std::sync::OnceLock<std::collections::BTreeMap<String, bool>> = std::sync::OnceLock::new();
+    VARIANTS.get_or_init(|| serde_json::from_str(ATTENTION_VARIANTS).expect("checked attention qualification table"))
+}
+
+#[cfg(test)]
+#[test]
+fn attention_variants_match_launcher_rows() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..").join("scripts/lib/attention-variants.json");
+    let launcher: std::collections::BTreeMap<String, bool> =
+        serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+    assert_eq!(&launcher, attention_variants());
+    assert_eq!(launcher.len(), 6);
+    assert_eq!(launcher.iter().filter(|(_, enabled)| **enabled).map(|(family, _)| family.as_str())
+        .collect::<Vec<_>>(), ["glm5_flash"]);
+}
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {

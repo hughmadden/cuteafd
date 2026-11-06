@@ -211,12 +211,37 @@ mod media_defaults_tests {
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#)?;
         std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}")?;
-        for model in ["glm5_next", "glm_moe_dsa", "mistral_large4_text", "kimi_k3", "step5", "muse_spark_text", "unknown"] {
-            std::fs::write(root.path().join("config.compact-attention.json"),
-                serde_json::json!({"text_config":{"model_type":model}}).to_string())?;
+        let fixtures = [
+            ("glm5_flash", serde_json::json!({"model_type":"glm5_next",
+                "architectures":["Glm5NextForConditionalGeneration"]})),
+            ("glm5", serde_json::json!({"model_type":"glm_moe_dsa",
+                "architectures":["GlmMoeDsaForCausalLM"]})),
+            ("mistral_large4", serde_json::json!({"model_type":"mistral_large4",
+                "architectures":["MistralLarge4ForConditionalGeneration"],
+                "text_config":{"model_type":"mistral_large4_text"}})),
+            ("kimi_k3", serde_json::json!({"model_type":"kimi_k3",
+                "architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{"model_type":"kimi_linear"}})),
+            ("step5", serde_json::json!({"model_type":"step5_vl",
+                "architectures":["Step5ForConditionalGeneration"],"text_config":{"model_type":"step5"}})),
+            ("muse_spark", serde_json::json!({"model_type":"muse_spark",
+                "architectures":["MuseSparkForConditionalGeneration"],
+                "text_config":{"model_type":"muse_spark_text"}})),
+            ("unknown", serde_json::json!({"model_type":"unknown", "text_config":{"model_type":"glm5_next"}})),
+        ];
+        for (expected, mut config) in fixtures {
+            config["transformers_weights"] = serde_json::json!("model.compact-attention.safetensors.index.json");
+            std::fs::write(root.path().join("config.compact-attention.json"), config.to_string())?;
             let view = CheckpointView::select(root.path(), AttentionMode::Compact)?;
+            let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
+            let family = cuteafd_loader::plan::family::detect(&checkpoint).map(|family| family.id()).unwrap_or("unknown");
+            assert_eq!(family, expected);
             let attention = super::cli::AttentionArgs { compact_attention: true, ..Default::default() };
-            assert_eq!(attention.validate_view(&view).is_ok(), model == "glm5_next", "{model}");
+            let result = attention.validate_view(&view);
+            assert_eq!(result.is_ok(), expected == "glm5_flash", "{expected}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains(&format!("family={expected}")), "{error}");
+            }
         }
         Ok(())
     }
@@ -226,7 +251,7 @@ mod media_defaults_tests {
         use clap::Parser;
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("config.compact-attention.json"),
-            r#"{"model_type":"glm5_next","vision_config":{},"max_position_embeddings":65536}"#)?;
+            r#"{"model_type":"glm5_next","architectures":["Glm5NextForConditionalGeneration"],"transformers_weights":"model.compact-attention.safetensors.index.json","vision_config":{},"max_position_embeddings":65536}"#)?;
         std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#)?;
         std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}")?;
         let mut command = super::cli::Cli::try_parse_from(["cuteafd", "serve-glmf", "--snapshot",
