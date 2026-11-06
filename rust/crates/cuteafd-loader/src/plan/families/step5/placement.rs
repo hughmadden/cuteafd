@@ -208,9 +208,15 @@ pub(super) fn layout(
     };
     let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
-    let host_items = [planner::Location::HOST, planner::Location::PINNED].into_iter()
+    let mut host_items: Vec<_> = [planner::Location::HOST, planner::Location::PINNED].into_iter()
         .map(|location| admitted.solved.items(location)).collect::<Result<Vec<_>, _>>()?
         .into_iter().flatten().filter(|item| item.category != Category::Prefix).collect();
+    host_items.extend(admitted.solved.facts.deferred.iter().filter(|owner|
+        [planner::Location::HOST, planner::Location::PINNED].contains(&owner.location)
+            && owner.view.is_none() && owner.category != Category::Prefix
+            && owner.lifetime.contains(planner::Phase::Ready, admitted.solved.facts.phase_order))
+        .map(|owner| Item::new(owner.category, &owner.group, "", owner.bytes, Basis::Exact)
+            .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve)));
     report.host_budget_bytes = admitted.host_cache_bytes;
     report.host_ledger = Some(cuteafd_core::memory_layout::HostLayout::new(inputs.host.memory.0,
         inputs.host.memory.1, inputs.host.headroom.max(inputs.host.memory.0 / 10),

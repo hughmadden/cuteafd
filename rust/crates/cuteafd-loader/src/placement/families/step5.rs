@@ -525,8 +525,9 @@ impl Recipe for Step5Recipe<'_> {
             ("prefix", Location::HOST, Category::Prefix, self.host_cache_bytes,
                 Lifetime { first: Phase::Ready, last: Phase::Growth }),
             ("logits", Location::HOST, Category::Staging,
-                cuteafd_core::memory_layout::host_logits_bytes(self.inputs.rows.min(64) as u64,
+                cuteafd_core::memory_layout::host_logits_bytes(
                     if self.inputs.full_prefill_logits { self.inputs.rows as u64 } else { self.inputs.rows.min(64) as u64 },
+                    self.inputs.rows.min(64) as u64,
                     self.cfg.vocab as u64).ok_or(Refusal::Overflow("Step-5 host logits"))?,
                 Lifetime { first: Phase::Ready, last: Phase::Growth }),
         ] {
@@ -542,6 +543,21 @@ impl Recipe for Step5Recipe<'_> {
         for (kind, bytes) in ["rings", "egress", "intake"].into_iter().zip(transport) {
             let owner = Allocation::buffer(format!("step5.host.transport.{kind}"), Location::PINNED,
                 bytes, Lifetime::RESIDENT, Category::Transport, format!("Step-5 host transport {kind}"));
+            contract.components.push(Component::allocation(owner,
+                ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
+        }
+        if self.depth > 0 {
+            let planes = crate::plan::families::step5::native::mtp_metadata_planes(self.inputs.unit_rows())
+                .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+            // Each stage retains its upload sources until its own H2D event completes.
+            let per_stage = planes[..4].iter().copied().chain([planes[2], 8])
+                .try_fold(0u64, |sum, bytes| sum.checked_add(bytes as u64))
+                .ok_or(Refusal::Overflow("Step-5 MTP host uploads"))?;
+            let bytes = per_stage.checked_mul(self.depth as u64)
+                .and_then(|bytes| bytes.checked_add(self.depth as u64 * 8))
+                .ok_or(Refusal::Overflow("Step-5 MTP host uploads"))?;
+            let owner = Allocation::buffer("step5.host.mtp.uploads", Location::PINNED, bytes,
+                Lifetime::RESIDENT, Category::Staging, "Step-5 MTP host uploads");
             contract.components.push(Component::allocation(owner,
                 ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
         }

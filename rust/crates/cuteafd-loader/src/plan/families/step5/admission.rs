@@ -956,6 +956,21 @@ mod tests {
     }
 
     #[test]
+    fn full_prefill_host_logits_include_the_scoring_tensor_and_decode_lane() -> Result<()> {
+        let mut inputs = inputs(1);
+        inputs.rows = 256;
+        inputs.unit = 256;
+        let decode = run(&inputs)?;
+        inputs.full_prefill_logits = true;
+        let scoring = run(&inputs)?;
+        let logits = |admitted: &Admission| admitted.solved.facts.deferred.iter()
+            .find(|owner| owner.id == "step5.host.logits").unwrap().bytes;
+        assert_eq!(logits(&decode), 64 * config().vocab as u64 * 4);
+        assert_eq!(logits(&scoring), (256 + 64) * config().vocab as u64 * 4);
+        Ok(())
+    }
+
+    #[test]
     fn full_onboard_option_charges_its_expert_arena() -> Result<()> {
         let mut inputs = inputs(2);
         let routed = config().moe[..92].iter().filter(|&&moe| moe).count();

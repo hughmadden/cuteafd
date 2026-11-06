@@ -164,6 +164,12 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             assert_eq!(admitted.marks, 2);
             assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
             assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
+            let planes = native::mtp_metadata_planes(inputs.unit_rows())?;
+            let uploads = admitted.solved.facts.allocations.iter()
+                .filter(|owner| owner.id == "step5.host.mtp.uploads")
+                .map(|owner| owner.bytes).sum::<u64>();
+            let per_stage = planes[..4].iter().sum::<usize>() + planes[2] + 8;
+            assert_eq!(uploads, (depth * (per_stage + 8)) as u64);
             let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
             for rank in 0..2 {
                 let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
@@ -191,6 +197,10 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 }), ..Default::default()
             })?;
             assert!(planned.wip_launchable(), "depth {depth}: {:?}", planned.hints);
+            let host = planned.host_ledger.as_ref().expect("admitted Step-5 host owners");
+            assert_eq!(host.deferred_bytes, 64 * Config::parse(&cp)?.vocab as u64 * 4);
+            assert_eq!(host.items.iter().filter(|item| item.group == "Step-5 MTP host uploads")
+                .map(|item| item.bytes).sum::<u64>(), uploads);
             let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
             assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
             for rank in 0..2 {
