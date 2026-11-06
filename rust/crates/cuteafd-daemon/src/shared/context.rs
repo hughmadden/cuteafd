@@ -37,6 +37,7 @@ pub(crate) fn pool_context(family: &str, context: usize, automatic: bool, pool: 
         tracing::info!(family, checkpoint_context = context, admitted_pool = pool, max_context = supported,
             "checkpoint context exceeds admitted pool; serving reduced max_context; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
     }
+    cuteafd_bench::context::set_resolved("max-context", &supported.to_string());
     Ok(supported)
 }
 

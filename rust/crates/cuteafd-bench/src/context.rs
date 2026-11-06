@@ -16,9 +16,43 @@ pub struct ServerContext {
     pub snapshot: Option<PathBuf>,
     pub settings: Vec<Setting>,
     pub supports_thinking_off: Option<bool>,
+    /// Argument definitions whose launch values are not runtime facts.
+    pub derived: Vec<String>,
 }
 
 impl ServerContext {
+    /// Fail closed when a startup-normalized option has not been published.
+    pub fn validate_resolved(&self) -> Result<(), Vec<String>> {
+        let missing: Vec<_> = self.derived.iter().filter(|name| !self.settings.iter()
+            .any(|s| &s.name == *name && s.source == "resolved" && s.value.is_some())).cloned().collect();
+        if missing.is_empty() { Ok(()) } else { Err(missing) }
+    }
+
+    /// Require runtime evidence even for an explicitly supplied launch value.
+    pub fn require_resolved(&mut self, name: &str) {
+        if !self.derived.iter().any(|n| n == name) { self.derived.push(name.into()); }
+        for setting in self.settings.iter_mut().filter(|s| s.name == name && s.source != "resolved") {
+            setting.source = "unresolved".into();
+            setting.value = None;
+        }
+        if !self.settings.iter().any(|s| s.name == name) {
+            self.settings.push(Setting { name: name.into(), source: "unresolved".into(), ..Default::default() });
+        }
+    }
+
+    /// No report caller may substitute a launch request for missing runtime evidence.
+    pub fn report_settings(&self) -> Vec<Setting> {
+        let mut context = self.clone();
+        if let Err(missing) = context.validate_resolved() {
+            for name in missing { context.require_resolved(&name); }
+        }
+        context.settings
+    }
+
+    pub fn resolve(&mut self, name: &str, value: &str) {
+        apply_resolved(&mut self.settings, name, value);
+    }
+
     /// Publish the canonical identity from the engine's validated target configuration.
     pub fn set_family(&mut self, family: &str) {
         self.family = Some(family.to_owned());
@@ -94,7 +128,35 @@ fn apply_resolved(settings: &mut Vec<Setting>, name: &str, value: &str) {
     if !replaced { settings.push(resolved); }
 }
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static SEAM_SETTINGS: std::cell::RefCell<Option<ResolvedSettings>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Capture the production publication calls on this CPU fixture's thread.
+#[cfg(feature = "test-support")]
+pub fn capture_resolved<T>(seam: impl FnOnce() -> T) -> (T, ResolvedSettings) {
+    struct Reset;
+    impl Drop for Reset { fn drop(&mut self) { SEAM_SETTINGS.with(|slot| { slot.borrow_mut().take(); }); } }
+    SEAM_SETTINGS.with(|slot| {
+        assert!(slot.borrow().is_none(), "nested resolution capture");
+        *slot.borrow_mut() = Some(ResolvedSettings::default());
+    });
+    let _reset = Reset;
+    let result = seam();
+    let settings = SEAM_SETTINGS.with(|slot| slot.borrow_mut().take().unwrap());
+    (result, settings)
+}
+
 pub fn set_resolved(name: &str, value: &str) {
+    #[cfg(feature = "test-support")]
+    if SEAM_SETTINGS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(settings) = slot.as_mut() {
+            settings.0.push((name.into(), value.into()));
+            true
+        } else { false }
+    }) { return; }
     if let Ok(mut slot) = state().context.lock() {
         apply_resolved(&mut slot.settings, name, value);
     }
@@ -103,6 +165,44 @@ pub fn set_resolved(name: &str, value: &str) {
 /// Publish the accepted expert placement, including zero onboarded layers.
 pub fn set_rtx_expert_layers(layers: usize) {
     set_resolved("rtx-expert-layers", &layers.to_string());
+    if get().derived.iter().any(|name| name == "onboard") { set_resolved("onboard", &layers.to_string()); }
+}
+
+/// Runtime facts emitted by a normalization/admission seam. Kept local until
+/// publication so CPU fixtures can validate them without process-global state.
+#[derive(Debug, Default)]
+pub struct ResolvedSettings(pub Vec<(String, String)>);
+impl ResolvedSettings {
+    pub fn value(mut self, name: &str, value: impl ToString) -> Self {
+        self.0.push((name.into(), value.to_string()));
+        self
+    }
+    /// A seam test exercises the very records the serving path publishes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn assert_resolved(&self) {
+        let mut context = ServerContext::default();
+        for (name, _) in &self.0 { context.require_resolved(name); }
+        assert!(context.validate_resolved().is_err(), "fixture must require runtime facts");
+        self.apply(&mut context);
+        assert_eq!(context.validate_resolved(), Ok(()));
+        assert!(context.report_settings().iter().all(|setting| setting.source == "resolved"));
+    }
+
+    pub fn apply(&self, context: &mut ServerContext) {
+        for (name, value) in &self.0 { context.resolve(name, value); }
+    }
+    pub fn publish(&self) {
+        for (name, value) in &self.0 { set_resolved(name, value); }
+    }
+    pub fn prefill(plan: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan) -> Self {
+        Self::default().value("prefill-rows", plan.unit_rows).value("prefill-waves", plan.waves)
+            .value("prefill-span-rows", plan.span_rows)
+    }
+    pub fn placement(placement: &cuteafd_loader::placement::Placement) -> Self {
+        Self::default().value("pool-tokens", placement.pool_tokens)
+            .value("rtx-expert-layers", placement.onboard_layers).value("onboard", placement.onboard_layers)
+            .value("attention-placement", placement.attention_summary())
+    }
 }
 
 pub fn set_thinking_off(supported: bool) {
@@ -110,11 +210,17 @@ pub fn set_thinking_off(supported: bool) {
 }
 
 pub fn get() -> ServerContext {
-    state().context.lock().map(|c| c.clone()).unwrap_or_default()
+    let mut context = state().context.lock().map(|c| c.clone()).unwrap_or_default();
+    if let Err(missing) = context.validate_resolved() {
+        for name in missing { context.require_resolved(&name); }
+    }
+    context
 }
 
 /// The engine's resolved device KV pool (tokens, pages, record format) and host cache bytes.
 pub fn set_kv(tokens: u64, max_tokens: Option<u64>, pages: u64, format: &str, host_bytes: u64) {
+    set_resolved("pool-tokens", &tokens.to_string());
+    set_resolved("kv-format", format);
     if let Ok(mut slot) = state().kv.lock() {
         *slot = Some(KvCapacity { tokens: Some(tokens), max_tokens, pages: Some(pages), format: Some(format.to_string()),
             host_bytes: Some(host_bytes) });
@@ -141,6 +247,9 @@ pub fn phases() -> Vec<(String, f64)> {
 
 /// The API accepts requests on `listen` from now on.
 pub fn mark_ready(listen: SocketAddr) {
+    if let Err(missing) = get().validate_resolved() {
+        for setting in missing { tracing::warn!(%setting, "derived report setting was not resolved at readiness"); }
+    }
     let placement = get().settings.iter().find(|s| s.name == "attention-placement").and_then(|s| s.value.clone());
     if let Some(placement) = placement { tracing::info!(attention_placement = placement, "ready attention placement"); }
     phase("API listening");
@@ -216,6 +325,29 @@ pub const DEPLOYMENT: [&str; 16] = ["snapshot", "native-lib", "native_lib", "pee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_derived_values_fail_closed_for_every_launch_source() {
+        for source in ["default", "cli", "env", "unset"] {
+            let mut context = ServerContext { settings: vec![Setting {
+                name: "slots".into(), value: Some("8".into()), default: Some("8".into()), source: source.into(),
+            }], ..Default::default() };
+            context.require_resolved("slots");
+            context.require_resolved("index-cache");
+            assert_eq!(context.validate_resolved().unwrap_err(), ["slots", "index-cache"]);
+            let settings = context.report_settings();
+            assert!(settings.iter().all(|s| s.source == "unresolved" && s.value.is_none()));
+            ResolvedSettings::default().value("slots", 16).value("index-cache", "compact").apply(&mut context);
+            assert_eq!(context.validate_resolved(), Ok(()));
+            assert_eq!(context.settings[0].value.as_deref(), Some("16"));
+            assert_eq!(context.settings[0].default.as_deref(), Some("8"));
+        }
+    }
+
+    #[test]
+    fn configuration_panel_labels_non_derived_defaults_as_launch_defaults() {
+        assert!(include_str!("../assets/bench.html").contains("s.source === 'default' ? 'launch default' : s.source"));
+    }
 
     #[test]
     fn kv_capacity_maximum_is_optional_in_old_records() {

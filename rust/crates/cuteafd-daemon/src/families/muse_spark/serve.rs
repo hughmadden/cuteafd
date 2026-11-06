@@ -80,11 +80,13 @@ impl ServeArgs {
 
     pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
+        let plan = prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
             &cuteafd_loader::plan::families::muse_spark::MUSE_SPARK), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None, reserve_rows: None,
-        })?)
+        })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(plan).publish();
+        Ok(plan)
     }
 
     fn spark_budget_bytes(&self) -> u64 {
@@ -196,6 +198,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
     let placement = &built.placement;
+    cuteafd_bench::context::ResolvedSettings::placement(placement).publish();
+    cuteafd_bench::context::set_resolved("max-context", &args.max_context.unwrap_or(cfg.max_position as u64).to_string());
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");

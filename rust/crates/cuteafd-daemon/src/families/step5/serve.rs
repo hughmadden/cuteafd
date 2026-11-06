@@ -129,11 +129,13 @@ impl ServeArgs {
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
+        let shape = prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
             span_rows: None, reserve_rows: None,
-        })?)
+        })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
+        Ok(shape)
     }
 
     fn validate(&self) -> Result<()> {
@@ -325,7 +327,8 @@ fn with_backend<T>(args: &ServeArgs,
     // One admission: the contract prices every retained owner, and native ABIs
     // are validated against the ownership it selected.
     let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract)?;
-    cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
+    cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
+    cuteafd_bench::context::set_resolved("max-context", &args.max_context.to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup planning complete");
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
@@ -1168,11 +1171,16 @@ mod tests {
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
             args.validate()?;
-            let shape = args.shape()?;
+            let (shape, model) = crate::commands::bench::assert_resolved_family_seam("step5",
+                &["max-context", "pool-tokens", "rtx-expert-layers"], || {
+                    args.prefix.resolve_entries(args.max_sequences as usize);
+                    let shape = args.shape()?;
+                    args.prefill_rows = unit as u32;
+                    let exports = [1, 16, 80, 256, 1024, 4096];
+                    let model = spark_model(&exports, args.endpoint(SparkIngress::Native), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
+                    Ok((shape, model))
+                })?;
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
-            args.prefill_rows = unit as u32;
-            let exports = [1, 16, 80, 256, 1024, 4096];
-            let model = spark_model(&exports, args.endpoint(SparkIngress::Native), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
             // One prefill owner at the selected unit's covering export; the k units only buffer I/O.
             assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit as u32,
                 compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });

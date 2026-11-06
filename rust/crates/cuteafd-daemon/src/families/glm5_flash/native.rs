@@ -31,12 +31,18 @@ pub(super) fn normalize(args: &mut EngineArgs) {
     args.fp8_prefill.push(super::Fp8PrefillGroup::None);
 }
 
+pub(super) fn publish_resolved(args: &EngineArgs) {
+    for (name, value) in resolved_settings(args) { cuteafd_bench::context::set_resolved(name, &value); }
+}
+
 pub(super) fn resolved_settings(args: &EngineArgs) -> Vec<(&'static str, String)> {
     vec![("kda-output-shard", args.kda_output_shard.to_string()),
         ("kda-prefill-expanded", args.kda_prefill_expanded.to_string()),
         ("kda-fp32-partials", args.kda_fp32_partials.to_string()),
-        ("fp8-head", args.fp8_head.to_string()), ("kda-fp8", "off".into()),
-        ("fp8-prefill", "none".into())]
+        ("fp8-head", args.fp8_head.to_string()),
+        ("kda-fp8", match args.kda_fp8 { fp8::KdaFp8::Off => "off", fp8::KdaFp8::Channel => "channel", fp8::KdaFp8::Row128 => "row128" }.into()),
+        ("kda-nvfp4-gate", args.kda_nvfp4_gate.clone().unwrap_or_else(|| "off".into())),
+        ("fp8-prefill", { use clap::ValueEnum; args.fp8_prefill.iter().map(|value| value.to_possible_value().unwrap().get_name().to_owned()).collect::<Vec<_>>().join(",") })]
 }
 
 pub(super) fn validate_headers(format: CheckpointFormat, legacy: impl FnOnce() -> Result<()>) -> Result<()> {

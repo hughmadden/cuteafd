@@ -207,6 +207,7 @@ impl<'a> Engine<'a> {
         let plan = AttentionReductionPlan::new(self.decode_rows, (block > 0).then_some(block), plan_rows)
             .map_err(|error| anyhow::anyhow!("V4 attention reduction plan: {error:?}"))?;
         let split = V4ContextSplit::new(self, context, extent, manifest, abort, &plan)?;
+        cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
         tracing::info!(bytes = ?split.bytes(), exchange = split.exchange.bytes(), plan_rows = plan.rows(),
             partial = ?split.partial, "V4 C4 context attention buffers");
         self.context = Some(split);

@@ -857,8 +857,12 @@ mod tests {
 
     #[test]
     fn dense_defaults_to_compact_kv_without_full_prefill_arena() {
-        let parsed = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"])
+        let mut parsed = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"])
             .unwrap().serve;
+        crate::commands::bench::assert_resolved_family_seam("qwen3_5", &["pool-tokens"], || {
+            parsed.prefix.resolve_entries(parsed.max_sequences as usize);
+            Ok(())
+        }).unwrap();
         assert_eq!(parsed.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
         assert!(!parsed.full_prefill_logits);
     }
