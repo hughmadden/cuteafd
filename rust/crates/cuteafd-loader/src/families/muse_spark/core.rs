@@ -235,6 +235,17 @@ mod tests {
             })?;
             assert!(report.config_error.is_none(), "{:?}", report.config_error);
             assert!(report.components.iter().all(|component| component.rejected == 0), "{:?}", report.components);
+            let ledger = report.phase_ledger.as_ref().context("Muse selected mode phase ledger")?;
+            let host = ledger.budgets.iter().find(|budget| budget.id == "host").context("Muse host budget")?;
+            use crate::placement::planner::{Location, Phase};
+            assert!(host.locations.contains(&Location::PINNED));
+            assert!(ledger.budgets.iter().filter(|budget| budget.id.starts_with("rtx"))
+                .all(|budget| !budget.locations.contains(&Location::PINNED)));
+            let dense_bound = if mode == AttentionMode::Compact { 2 << 30 } else { 17_716_740_096 };
+            let host_load = ledger.phases.iter().find(|phase| phase.budget == "host" && phase.phase == Phase::Load)
+                .context("Muse host load demand")?;
+            assert_eq!(host_load.opaque,
+                crate::placement::families::muse_spark::HOST_RUNTIME.bytes + 2 * dense_bound);
             let placement = report.solver_placement.context("Muse selected mode placement")?;
             for rank in &placement.items {
                 let native = rank.iter().filter(|item| item.group == "Muse native attention values and block scales")
