@@ -160,6 +160,7 @@ fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = u8::try_from(shape.waves)?;
     args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
     Ok(())
 }
 
@@ -372,7 +373,14 @@ mod draft_cli_tests {
             let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--peers", peers.as_str()];
             argv.extend_from_slice(extra);
             let mut args = Parse::try_parse_from(argv).unwrap().engine;
-            resolve_prefill(&mut args).unwrap();
+            crate::commands::bench::assert_resolved_family_seam("glm5",
+                &["max-context", "pool-tokens", "rtx-expert-layers", "draft-window-marks", "attention-plan-rows"], || {
+                    crate::commands::bench::fixture_prefix().resolve_entries(16);
+                    serve::resolve_serving_capacity(&mut args, 16);
+                    resolve_prefill(&mut args)?;
+                    spark_model("glm5", SparkBackend::Fp8, usize::from(args.prefill_waves), args.prefill_rows as u32, true)?;
+                    Ok(())
+                }).unwrap();
             (args.prefill_rows, args.prefill_waves, args.prefill_span_rows)
         };
         assert_eq!(resolve(&[]), (2752, 3, 8256));
@@ -1598,12 +1606,14 @@ impl Opened {
         engine.drafter = drafter;
         engine.draft_window_marks = if engine.drafter.as_ref().is_some_and(|d| d.mla_windows_only())
             { args.draft_window_marks } else { 0 };
+        cuteafd_bench::context::set_resolved("draft-window-marks", &engine.draft_window_marks.to_string());
         engine.bind_draft_core_head()?;
         if let (Some(drafter), Some((device, stream))) = (&engine.drafter, peer_stream) {
             drafter.bind_target(crate::shared::peer_split::RankDevice { device, stream }, &engine.embedding,
                 engine.draft_target_head()?)?;
         }
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
+            cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
         tracing::info!(plan_rows = engine.attention_plan.rows(),
             active_drafts = ?engine.attention_plan.active_drafts(), "immutable attention reduction plan");
         let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, cuteafd_transport::expert::SparkWorld)> {

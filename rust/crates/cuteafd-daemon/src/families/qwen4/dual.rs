@@ -14,6 +14,7 @@ impl Opened {
         ensure!(peer != args.device, "Qwen dual devices must differ");
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let mtp = args.mtp > 0 && layers == self.cfg.layers;
+        cuteafd_bench::context::set_resolved("mtp", &if mtp { args.mtp.min(engine::DECODE_ROWS - 1) } else { 0 }.to_string());
         let devices = [args.device, peer].map(|id| Device { library: &self.library, id });
         let _entry = devices[0].enter()?;
         for rank in 0..2 { devices[rank].run(|| self.library.cuda_enable_peer(devices[1-rank].id))?; }
@@ -104,7 +105,7 @@ impl Opened {
         tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
             "Qwen dual admitted phase ledger");
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
+        cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
             "Qwen dual shared solver admission before allocation");
         let owners = placement.layers.iter().map(|layer| match layer.mode {

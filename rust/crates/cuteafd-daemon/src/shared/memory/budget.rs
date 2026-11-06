@@ -144,6 +144,7 @@ pub(crate) fn serving_concurrency(requested: Option<usize>, native_lib: &std::pa
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(native_lib) }?;
         Ok(library.cuda_device_info(device)?.total_memory_bytes)
     })?;
+    cuteafd_bench::context::set_resolved("max-sequences", &concurrency.to_string());
     tracing::info!(concurrency, "resolved boot-time serving concurrency");
     Ok(concurrency)
 }

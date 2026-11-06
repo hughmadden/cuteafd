@@ -301,11 +301,13 @@ impl EngineArgs {
         let ranks = if self.skip_routed_experts { 0 } else {
             self.peers.split(',').filter(|peer| !peer.is_empty()).count()
         };
-        prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
+        let shape = prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
             max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES }, ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
             PrefillOverrides { unit_rows: self.prefill_rows.map(|rows| rows as u64),
                 waves: self.prefill_waves.map(|waves| waves as u64), span_rows,
-                reserve_rows: None })
+                reserve_rows: None })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
+        Ok(shape)
     }
 
     /// The resolved `--rtx-expert-layers`. Pool
@@ -732,6 +734,8 @@ pub(crate) fn with_engine<T>(
         // the drafter's local stage experts are installed. Freeze it before capture.
         if context_mode.is_some() {
             engine.attach_context(context_extent, &loaded.manifest, args.attention_plan_rows.0)?;
+        } else {
+            cuteafd_bench::context::set_resolved("attention-plan-rows", "unused (heads)");
         }
         tracing::info!(tp1 = ?placement.expert_ranges, tp2 = ?placement.tp2,
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");

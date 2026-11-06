@@ -46,6 +46,7 @@ fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = usize::try_from(shape.waves)?;
     args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
     Ok(())
 }
 
@@ -524,6 +525,25 @@ mod draft_cli_tests {
         assert!(receive.contains("push_policy.committed(pushed)?"));
         assert!(!receive.contains("NoDense"));
         assert!(source.contains("native_shared.take().context(\"native shared owners missing after load\")?"));
+    }
+
+    #[test]
+    fn resolved_flash_capacity_and_native_flags_are_runtime_facts() {
+        let mut args = Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l"]).unwrap().engine;
+        crate::commands::bench::assert_resolved_family_seam("glm5_flash",
+            &["max-context", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device", "attention-plan-rows"], || {
+                crate::commands::bench::fixture_prefix().resolve_entries(16);
+                serve::resolve_serving_capacity(&mut args, 16);
+                native::normalize(&mut args);
+                native::publish_resolved(&args);
+                resolve_prefill(&mut args, true)?;
+                served_index_cache(args.index_cache, false,
+                    cuteafd_loader::placement::AttentionPlacement::Heads);
+                Ok(())
+            }).unwrap();
+        assert_eq!(args.slots, 16);
+        assert_eq!(served_index_cache(engine::IndexCache::Keys, true,
+            cuteafd_loader::placement::AttentionPlacement::Context), engine::IndexCache::Compact);
     }
 
     #[test]
@@ -1667,12 +1687,10 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let mut resolved = args.clone();
     if native {
         native::normalize(&mut resolved);
-        for (name, value) in native::resolved_settings(&resolved) {
-            cuteafd_bench::context::set_resolved(name, &value);
-        }
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
+    native::publish_resolved(&resolved);
     let args = &resolved;
     check_options(args)?;
     let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
@@ -1745,11 +1763,14 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 pub(crate) fn served_index_cache(requested: engine::IndexCache, split: bool,
     attention: cuteafd_loader::placement::AttentionPlacement) -> engine::IndexCache {
     use cuteafd_loader::placement::AttentionPlacement;
-    match attention {
+    let cache = match attention {
         AttentionPlacement::Context => engine::IndexCache::Compact,
         AttentionPlacement::Heads if split => engine::IndexCache::Keys,
         _ => requested,
-    }
+    };
+    cuteafd_bench::context::set_resolved("index-cache", match cache {
+        engine::IndexCache::Keys => "keys", engine::IndexCache::Compact => "compact" });
+    cache
 }
 
 /// The MLA placement an engine serves (`glm5_flash::resolve_attention` over the requested mode and
@@ -2058,6 +2079,8 @@ impl Opened {
             resolved.kda_prefill_expanded = false;
         }
         probe("peer-enabled")?;
+        native::publish_resolved(&resolved);
+        cuteafd_bench::context::set_resolved("split-device", &resolved.split_device.map_or_else(|| "none".into(), |device| device.to_string()));
         let args = &resolved;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
@@ -2257,6 +2280,8 @@ impl Opened {
         probe("admission-programs")?;
         let mut selected_args = args.clone();
         selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;
+        cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
+        cuteafd_bench::context::set_resolved("prefill-waves", &selected_args.prefill_waves.to_string());
         let args = &selected_args;
 
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
@@ -2735,6 +2760,7 @@ impl Opened {
             engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
             engine.bind_draft_core_head()?;
             engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
+            cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
             tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
                 "GLM Flash immutable attention reduction plan");
             if let Some(dspark::Drafter::RemoteDflash(draft)) = &engine.drafter {

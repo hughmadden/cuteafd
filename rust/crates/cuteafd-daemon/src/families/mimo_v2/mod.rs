@@ -517,7 +517,16 @@ mod source_format_tests {
     #[test]
     fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
-        let automatic = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        let automatic = crate::commands::bench::assert_resolved_family_seam("mimo_v2",
+            &["max-context", "pool-tokens", "prefill-rows", "prefill-waves", "prefill-span-rows",
+                "onboard", "split-device", "embedding-placement"], || {
+                crate::commands::bench::fixture_prefix().resolve_entries(16);
+                serve::resolve_serving_capacity(&mut args, 16, false);
+                serve::serving_queue_depth(None, 16);
+                let shape = admission::resolved_prefill_shape(4, 0, 0)?;
+                assert!(shape.unit_rows > 0);
+                resolve_weight_formats(&args, &checkpoint, &cfg)
+            }).unwrap();
         assert_eq!(automatic.default_policy, MimoDefaultPolicy::Fp8);
         assert_eq!(automatic.head, MimoProjectionRepresentation::Fp8);
         assert_eq!(automatic.draft, MimoDraftRepresentation::Fp8Only);
@@ -816,6 +825,14 @@ pub(crate) struct ResolvedWeightFormats {
 }
 
 impl ResolvedWeightFormats {
+    fn resolved_settings(&self) -> cuteafd_bench::context::ResolvedSettings {
+        cuteafd_bench::context::ResolvedSettings::default()
+            .value("fp8-head", self.head == MimoProjectionRepresentation::Fp8)
+            .value("fp8-o-proj", if self.output.values().all(|v| *v == MimoProjectionRepresentation::Fp8) { "true" }
+                else if self.any_fp8_output() { "mixed" } else { "false" })
+            .value("draft-fp8", self.draft == MimoDraftRepresentation::Fp8Only)
+            .value("draft-representation", if self.draft == MimoDraftRepresentation::Fp8Only { "fp8-only" } else { "bf16-only" })
+    }
     pub fn any_fp8_output(&self) -> bool {
         self.output.values().any(|&format| format == MimoProjectionRepresentation::Fp8)
     }
@@ -902,7 +919,9 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
             native => native,
         }
     } else { args.draft_storage()? };
-    Ok(ResolvedWeightFormats { default_policy, head, output, draft })
+    let selected = ResolvedWeightFormats { default_policy, head, output, draft };
+    selected.resolved_settings().publish();
+    Ok(selected)
 }
 
 pub(crate) struct Opened {
@@ -1005,6 +1024,7 @@ impl Opened {
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
         let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, split_device)?;
+        cuteafd_bench::context::set_resolved("split-device", &split_device.map_or_else(|| "none".into(), |device| device.to_string()));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
         self.cfg.validate_program_manifest(&manifest, if split_device.is_some() { 2 } else { 1 })?;
         if split_device.is_some() {
@@ -1063,6 +1083,11 @@ impl Opened {
         cuteafd_bench::context::set_rtx_expert_layers(preflight.placement.onboard_layers);
         resolved.prefill_rows = preflight.prefill_rows;
         resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
+        cuteafd_bench::context::ResolvedSettings::placement(&preflight.placement).publish();
+        cuteafd_bench::context::ResolvedSettings::default()
+            .value("max-context", resolved.max_context).value("prefill-rows", resolved.prefill_rows)
+            .value("prefill-waves", resolved.prefill_waves).value("prefill-span-rows", resolved.prefill_span_rows)
+            .value("embedding-placement", format!("{:?}", resolved.token_io.embed_placement.unwrap()).to_lowercase()).publish();
         let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;

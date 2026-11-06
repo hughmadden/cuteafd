@@ -147,15 +147,31 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
     Ok((send, WorkerHandle { worker_thread }))
 }
 
-/// Validate and normalize the launch, then spawn the CUDA worker thread.
-/// With `http`, the API and live console load where `serve-native` always loaded them.
-fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
+fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     args.expert_usage_enabled()?;
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
     if args.prefix_cache_entries == u32::MAX {
         args.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(u64::from(args.concurrency)) as u32;
     }
-    cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
+    cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
+    let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
+    cuteafd_bench::context::set_resolved("decode-lanes", &lanes.to_string());
+    cuteafd_bench::context::set_resolved("prefix-cache-entries", &args.prefix_cache_entries.to_string());
+    Ok(lanes)
+}
+
+fn attention_plan(args: &crate::cli::NativeServeArgs) -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
+    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
+        args.attention_plan_rows)?;
+    cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
+    Ok(plan)
+}
+
+/// Validate and normalize the launch, then spawn the CUDA worker thread.
+/// With `http`, the API and live console load where `serve-native` always loaded them.
+fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
+    let lanes = normalize_serving(&mut args)?;
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
@@ -449,6 +465,8 @@ fn worker(
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
+    cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
     let usage = expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
     let remote_experts = pool.placement.onboard_layers < catalog.routed_experts().layers;
     let expert_world = if remote_experts { args.peers.len() } else { 0 };
@@ -497,9 +515,7 @@ fn worker(
     );
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
     admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
-    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
-        args.attention_plan_rows)?;
+    let attention_plan = attention_plan(&args)?;
     let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots, &pool)?;
     let engram_weights = [0, 1]
         .map(|i| EngramLayerWeights::load(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024))
@@ -899,6 +915,8 @@ impl AdmittedPrefill {
         let shape = Self { unit_cap: usize::try_from(plan.unit_rows)?, waves: usize::try_from(plan.waves)? };
         ensure!(shape.reserve_rows() <= crate::shared::memory::row_window::MAX_RESERVE_ROWS,
             "V4.1 prefill reserve {} exceeds the row planes", shape.reserve_rows());
+        cuteafd_bench::context::ResolvedSettings::default().value("prefill-batch-tokens", shape.unit_cap)
+            .value("prefill-waves", shape.waves).value("prefill-reserve-rows", shape.reserve_rows()).publish();
         Ok(shape)
     }
     /// Rows every shared row plane spans: the slots' units.
@@ -1098,7 +1116,8 @@ mod admitted_prefill_tests {
         let crate::cli::Commands::ServeNative(args) = crate::cli::Cli::try_parse_from(argv).unwrap().command else {
             panic!("expected serve-native");
         };
-        AdmittedPrefill::resolve(&args).unwrap()
+        crate::commands::bench::assert_resolved_seam("deepseek_v41",
+            &["prefill-batch-tokens", "prefill-waves", "prefill-reserve-rows"], || AdmittedPrefill::resolve(&args)).unwrap()
     }
     /// The deployment's shape (TJ 2026-10-28: fixed 3) resolves exactly; a
     /// pinned depth keeps its own shape.

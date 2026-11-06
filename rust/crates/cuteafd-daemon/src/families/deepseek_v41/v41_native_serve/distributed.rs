@@ -68,6 +68,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     })?;
     memory_checkpoint("after native preload")?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
+    cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
     let usage = super::expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
     let remote_experts = pool.placement.onboard_layers < catalog.routed_experts().layers;
     let expert_world = if remote_experts { args.peers.len() } else { 0 };
@@ -257,9 +259,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             Duration::from_secs(120),
         )
     };
-    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
-        args.attention_plan_rows)?;
+    let attention_plan = super::attention_plan(&args)?;
     let mut pass = make_pass(decode_rows).context("constructing first distributed decode lane")?;
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
