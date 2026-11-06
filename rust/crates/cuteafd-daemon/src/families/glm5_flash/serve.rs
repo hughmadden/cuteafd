@@ -98,6 +98,9 @@ pub(crate) struct ServeArgs {
     /// Admitted resident Spark encoder endpoints, in replica order.
     #[arg(long)]
     pub vision_peers: Option<String>,
+    /// Physical Spark ranks from the solved media roles, in endpoint order.
+    #[arg(long, requires = "vision_peers")]
+    pub vision_peer_ranks: Option<String>,
     /// Shared planner admission hash (required with --vision-peers).
     #[arg(long, requires = "vision_peers")]
     pub encoder_plan_hash: Option<String>,

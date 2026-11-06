@@ -33,6 +33,7 @@ pub(crate) struct RemoteVision {
     addresses: Vec<std::net::SocketAddr>,
     plan_hash: [u8; 32],
     revision: String,
+    physical_ranks: Option<Vec<usize>>,
 }
 impl RemoteVision {
     pub(crate) fn revision(&self) -> &str { &self.revision }
@@ -43,7 +44,34 @@ impl RemoteVision {
             std::time::Duration::from_secs(60))?))
     }
     pub fn from_args(args: &super::serve::ServeArgs) -> Result<Option<Self>> {
-        Self::from_parts(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())
+        let mut remote = Self::from_parts(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
+        if let Some(ranks) = args.vision_peer_ranks.as_deref() {
+            let remote = remote.as_mut().context("--vision-peer-ranks requires --vision-peers")?;
+            let ranks = ranks.split(',').map(|rank| rank.trim().parse::<usize>()
+                .context("vision peer rank must be a physical Spark index")).collect::<Result<Vec<_>>>()?;
+            anyhow::ensure!(ranks.len() == remote.addresses.len(), "vision peer rank/endpoint counts differ");
+            let unique = ranks.iter().copied().collect::<std::collections::BTreeSet<_>>();
+            anyhow::ensure!(unique.len() == ranks.len() && ranks.iter().all(|&rank| rank < 8),
+                "vision peer ranks must be distinct physical indices in 0..8");
+            if let MediaMode::Spark(Some(primary)) = args.vision {
+                anyhow::ensure!(ranks[0] == primary, "vision primary differs from the first physical peer rank");
+            }
+            remote.physical_ranks = Some(ranks);
+        }
+        Ok(remote)
+    }
+    fn placement(&self, mode: MediaMode) -> Result<(cuteafd_loader::plan::encoder::EncoderKind, Vec<usize>)> {
+        use cuteafd_loader::plan::encoder::EncoderKind;
+        if let Some(ranks) = &self.physical_ranks {
+            return Ok((EncoderKind::Spark { rank: ranks[0] }, ranks[1..].to_vec()));
+        }
+        // A single resolved tower needs no expert world; replica indices must be explicit.
+        let MediaMode::Spark(Some(rank)) = mode else {
+            anyhow::bail!("remote Flash encoder requires planner-resolved physical Spark ranks");
+        };
+        anyhow::ensure!(rank < 8 && self.addresses.len() == 1,
+            "remote Flash encoder replicas require --vision-peer-ranks");
+        Ok((EncoderKind::Spark { rank }, vec![]))
     }
     /// The planner-resolved Spark encoder endpoints from their CLI values (any serve family).
     pub(crate) fn from_parts(vision: MediaMode, peers: Option<&str>, plan_hash: Option<&str>, revision: Option<&str>)
@@ -62,7 +90,7 @@ impl RemoteVision {
             .context("--vision-peers requires --encoder-plan-hash")?)?;
         let revision = revision.context("--vision-peers requires --encoder-revision")?.to_owned();
         anyhow::ensure!(!revision.is_empty(), "encoder revision must not be empty");
-        Ok(Some(Self { addresses, plan_hash, revision }))
+        Ok(Some(Self { addresses, plan_hash, revision, physical_ranks: None }))
     }
 }
 
@@ -81,12 +109,7 @@ impl ReadyVision {
         let spec = crate::shared::vision::TowerSpec::glm_flash_view(view, 4096)?;
         let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
         let (kind, replicas) = if let Some(remote) = remote {
-            let peers = args.peers.as_deref().context("remote Flash encoder needs active Spark workers")?
-                .split(',').map(|peer| peer.parse::<std::net::SocketAddr>()).collect::<std::result::Result<Vec<_>, _>>()?;
-            let ranks = remote.addresses.iter().map(|address| peers.iter().position(|peer| peer.ip() == address.ip())
-                .context("remote Flash encoder is not an admitted expert worker"))
-                .collect::<Result<Vec<_>>>()?;
-            (EncoderKind::Spark { rank: ranks[0] }, ranks[1..].to_vec())
+            remote.placement(mode)?
         } else {
             anyhow::ensure!(!matches!(mode, MediaMode::Spark(_)), "Spark vision requires planner-resolved peers");
             let device = local_vision_gpu(mode, args.device, args.split_device)?;
@@ -317,6 +340,41 @@ mod tests {
         assert!(matches!(failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
             cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
     }
+    #[test]
+    fn remote_encoder_uses_physical_media_roles_without_expert_peers() {
+        use clap::Parser;
+        use cuteafd_loader::plan::encoder::EncoderKind;
+        let parse = |mode, ranks: Option<&str>, endpoints: &str| {
+            let mut argv = vec!["cuteafd".to_owned(), "serve-glmf".into(), "--snapshot".into(), "/not-read".into(),
+                "--native-lib".into(), "/not-read.so".into(), "--local-experts".into(),
+                "--vision-peers".into(), endpoints.into(), "--encoder-plan-hash".into(), "ab".repeat(32),
+                "--encoder-revision".into(), "revision".into()];
+            if let Some(ranks) = ranks { argv.extend(["--vision-peer-ranks".into(), ranks.into()]); }
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Commands::ServeGlmf(mut args) = cli.command else { panic!("GLM Flash command") };
+            args.vision = mode;
+            assert!(args.engine.peers.is_none()); // Expert world is zero, not a media-role inventory.
+            args
+        };
+        for (rank, explicit) in [(0, None), (0, Some("0")), (2, Some("2"))] {
+            let mode = MediaMode::Spark(Some(rank));
+            let args = parse(mode, explicit, "127.0.0.1:1234");
+            let remote = RemoteVision::from_args(&args).unwrap().unwrap();
+            assert_eq!(remote.placement(mode).unwrap(), (EncoderKind::Spark { rank }, vec![]));
+        }
+        let mode = MediaMode::Spark(Some(2));
+        let endpoints = "127.0.0.1:1234,127.0.0.2:1234";
+        let args = parse(mode, Some("2,5"), endpoints);
+        assert_eq!(RemoteVision::from_args(&args).unwrap().unwrap().placement(mode).unwrap(),
+            (EncoderKind::Spark { rank: 2 }, vec![5]));
+        for ranks in ["2", "2,2", "2,8", "5,2", "2,no"] {
+            assert!(RemoteVision::from_args(&parse(mode, Some(ranks), endpoints)).is_err(), "{ranks}");
+        }
+        assert!(RemoteVision::from_args(&parse(mode, None, endpoints)).unwrap().unwrap().placement(mode).is_err());
+        assert!(RemoteVision::from_args(&parse(MediaMode::Auto, None, "127.0.0.1:1234"))
+            .unwrap().unwrap().placement(MediaMode::Auto).is_err());
+    }
+
     #[test]
     fn pending_backpressure_is_retryable_but_invalid_features_are_not() {
         use cuteafd_api::openai::NativeFailure;
