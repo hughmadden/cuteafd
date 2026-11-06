@@ -283,19 +283,42 @@ class Recorder:
         self.imported = set()
         self.construction = False
         self.latest = []
+        self.monitoring_id = None
+        self.observed_codes = set()
+        self.observed_sources = set()
+        self.observed_functions = set()
+        self.stack_codes = set()
+
+    def _start(self, code, offset):
+        frame = sys._getframe(1)
+        self._profile(frame, "call", None)
+        return sys.monitoring.DISABLE
+
+    def start_monitoring(self):
+        for tool_id in range(6):
+            if sys.monitoring.get_tool(tool_id) is None:
+                sys.monitoring.use_tool_id(tool_id, "cuteafd-kernel-records")
+                self.monitoring_id = tool_id
+                break
+        if self.monitoring_id is None:
+            raise RuntimeError("no sys.monitoring tool ID available for source recording")
+        sys.monitoring.register_callback(self.monitoring_id, sys.monitoring.events.PY_START, self._start)
+        sys.monitoring.set_events(self.monitoring_id, sys.monitoring.events.PY_START)
+
+    def stop_monitoring(self):
+        if self.monitoring_id is not None:
+            sys.monitoring.set_events(self.monitoring_id, 0)
+            sys.monitoring.register_callback(self.monitoring_id, sys.monitoring.events.PY_START, None)
+            sys.monitoring.free_tool_id(self.monitoring_id)
+            self.monitoring_id = None
 
     def construct(self, function, *args, **kwargs):
         """Trace the entire recipe, including launch construction and scratch."""
-        previous = sys.getprofile()
-        self.frames, self.functions, self.seen_codes, self.opened = set(), set(), set(), set()
-        self.imported = set(sys.modules)
         self.latest = []
         self.construction = True
-        sys.setprofile(self._profile)
         try:
             return function(*args, **kwargs)
         finally:
-            sys.setprofile(previous)
             reads = self.reads()
             functions = [list(pair) for pair in sorted(self.functions)]
             for record in self.latest:
@@ -363,24 +386,20 @@ class Recorder:
         from cutlass.base_dsl.dsl import BaseDSL
         from cutlass.base_dsl.jit_executor import JitCompiledFunction
         sys.addaudithook(self._audit)
+        self.imported = set(sys.modules)
         self.active = True
+        self.start_monitoring()
 
         def frontend(original):
             @functools.wraps(original)
             def wrapped(dsl, *args, **kwargs):
-                if not self.construction:
-                    self.frames, self.functions, self.seen_codes, self.opened = set(), set(), set(), set()
-                    self.imported = set(sys.modules)
                 frame = sys._getframe().f_back
                 while frame is not None:
-                    self._profile(frame, "call", None)
+                    if frame.f_code not in self.stack_codes:
+                        self.stack_codes.add(frame.f_code)
+                        self._profile(frame, "call", None)
                     frame = frame.f_back
-                previous = sys.getprofile()
-                sys.setprofile(self._profile)
-                try:
-                    result = original(dsl, *args, **kwargs)
-                finally:
-                    sys.setprofile(previous)
+                result = original(dsl, *args, **kwargs)
                 module = result[0]
                 # Do not normalize symbols or locations: both can carry semantics.
                 self.modules[id(module)] = {
@@ -425,6 +444,7 @@ class Recorder:
         return self
 
     def finish(self, inspector, context, plans):
+        self.stop_monitoring()
         self.active = False
         for cls, method, original in reversed(self.restores):
             setattr(cls, method, original)

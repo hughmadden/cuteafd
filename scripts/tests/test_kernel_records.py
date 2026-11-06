@@ -100,8 +100,12 @@ def test_construct_captures_recipe_and_scratch_callback_sources(tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     recorder = records.Recorder(tmp_path, tmp_path / "output")
-    assert recorder.construct(module.construct) == 5
-    assert "recipe.py" in recorder.reads()
+    recorder.start_monitoring()
+    try:
+        assert recorder.construct(module.construct) == 5
+        assert "recipe.py" in recorder.reads()
+    finally:
+        recorder.stop_monitoring()
 
 
 def test_local_package_policy_is_a_recorded_input(tmp_path):
