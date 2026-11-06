@@ -82,7 +82,7 @@ impl GoldenArgs {
     }
 
     fn startup_graphs(&self) -> Result<bool> {
-        let context = self.attention_placement == "context";
+        let context = self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context;
         ensure!(!context || self.graphs == "on", "Kimi context cannot score without startup decode graphs");
         Ok((context || self.verify_rows.is_some()) && self.graphs == "on")
     }
@@ -91,8 +91,15 @@ impl GoldenArgs {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
             "rtx_expert_layers":self.rtx_expert_layers, "attention_placement": self.attention_placement, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
-            "verify_rows": self.verify_rows, "graphs": (self.verify_rows.is_some() || self.attention_placement == "context").then_some(&self.graphs), "grouped_kda": self.grouped_kda,
+            "resolved_attention_placement": self.resolved_attention(),
+            "verify_rows": self.verify_rows, "graphs": (self.verify_rows.is_some() || self.resolved_attention() == cuteafd_loader::placement::AttentionPlacement::Context).then_some(&self.graphs), "grouped_kda": self.grouped_kda,
             "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
+    }
+
+    fn resolved_attention(&self) -> cuteafd_loader::placement::AttentionPlacement {
+        cuteafd_loader::families::kimi_k3::resolve_attention(
+            cuteafd_loader::placement::attention::parse(&self.attention_placement).expect("clap validated attention"),
+            if self.split_device.is_some() { 2 } else { 1 })
     }
 }
 
@@ -643,18 +650,25 @@ mod tests {
         use clap::Parser;
         let argv = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
             "--golden", "/reference", "--save-logits", "/output"];
-        for mode in ["auto", "heads", "layers", "context"] {
-            let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(argv.into_iter()
-                .chain(["--attention-placement", mode]))?.command else { panic!("Kimi command"); };
-            assert_eq!(args.startup_graphs()?, mode == "context");
-            assert_eq!(args.provenance()["graphs"], if mode == "context" { serde_json::json!("on") }
-                else { serde_json::Value::Null });
-            for graphs in ["on", "off"] {
-                let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(argv.into_iter()
-                    .chain(["--attention-placement", mode, "--verify-rows", "8", "--graphs", graphs]))?.command
-                    else { panic!("Kimi command"); };
-                if mode == "context" && graphs == "off" { assert!(args.startup_graphs().is_err()); }
-                else { assert_eq!(args.startup_graphs()?, graphs == "on"); }
+        for ranks in [1, 2] {
+            for mode in ["auto", "heads", "layers", "context"] {
+                let mut argv = argv.to_vec();
+                if ranks == 2 { argv.extend(["--split-device", "1"]); }
+                let context = mode == "context" || (mode == "auto" && ranks == 2);
+                let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(argv.iter().copied()
+                    .chain(["--attention-placement", mode]))?.command else { panic!("Kimi command"); };
+                assert_eq!(args.startup_graphs()?, context);
+                assert_eq!(args.provenance()["graphs"], if context { serde_json::json!("on") }
+                    else { serde_json::Value::Null });
+                assert_eq!(args.resolved_attention(), cuteafd_loader::families::kimi_k3::resolve_attention(
+                    cuteafd_loader::placement::attention::parse(mode).unwrap(), ranks));
+                for graphs in ["on", "off"] {
+                    let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(argv.iter().copied()
+                        .chain(["--attention-placement", mode, "--verify-rows", "8", "--graphs", graphs]))?.command
+                        else { panic!("Kimi command"); };
+                    if context && graphs == "off" { assert!(args.startup_graphs().is_err()); }
+                    else { assert_eq!(args.startup_graphs()?, graphs == "on"); }
+                }
             }
         }
         Ok(())

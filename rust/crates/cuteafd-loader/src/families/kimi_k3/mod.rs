@@ -11,6 +11,14 @@ pub mod w8;
 pub mod weight_layout;
 
 pub const COMPILED_CONTEXT: usize = 1_048_576;
+
+/// Shared MLA default for CPU planning, serving and golden startup. KDA keeps
+/// its independent head split on a pair; explicit MLA placements always win.
+pub fn resolve_attention(requested: Option<crate::placement::AttentionPlacement>, ranks: usize)
+    -> crate::placement::AttentionPlacement {
+    requested.unwrap_or(if ranks == 2 { crate::placement::AttentionPlacement::Context }
+        else { crate::placement::AttentionPlacement::Layers })
+}
 /// Default context for a BF16 (K2-class) core: one full-length conversation
 /// would leave little pool beside the BF16 core weights.
 pub const DEFAULT_CONTEXT: usize = 524_288;

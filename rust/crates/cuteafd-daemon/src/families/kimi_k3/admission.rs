@@ -762,8 +762,9 @@ fn hop_spec_for_ranks(hidden: usize, rows: usize, lanes: usize, ranks: usize) ->
         terminal: if ranks == 1 { TerminalHome::AttentionOwner } else { TerminalHome::Replicated } }
 }
 
-fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest> {
+fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequest> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi request physical rank count");
+    i.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(i.attention, RANKS));
     let cfg = i.cfg;
     ensure!(cfg.layers > 0 && cfg.layers == cfg.attention.len() && cfg.layers == cfg.dense.len(),
         "Kimi admission layer inventory differs from checkpoint");
@@ -772,7 +773,7 @@ fn request<const RANKS: usize>(i: Inputs<'_, RANKS>) -> Result<PlacementRequest>
     ensure!(i.devices.iter().all(|device| *device >= 0) && (RANKS == 1 || i.devices[0] != i.devices[1]),
         "Kimi admitted devices must be distinct CUDA ordinals");
     ensure!(i.context.is_some() == (i.attention == Some(AttentionPlacement::Context)),
-        "Kimi explicit context requires its validated native layout, and other placements must not allocate it");
+        "Kimi context requires its validated native layout, and other placements must not allocate it");
     ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&i.state_slots)
         && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&i.rows)
         && (1..=2).contains(&i.lanes), "Kimi native admission slot/prefix/row/lane geometry");
@@ -1098,7 +1099,7 @@ pub(super) mod tests {
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
         Inputs { cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
-            attention: None, context: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
+            attention: Some(AttentionPlacement::Layers), context: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 2048, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }, RANKS).unwrap()); 2],
@@ -1167,9 +1168,41 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn auto_layers_and_explicit_heads_do_not_charge_context_storage() -> Result<()> {
+    fn auto_pair_charges_exactly_explicit_context_and_single_stays_layers() -> Result<()> {
         let cfg = cfg();
-        for attention in [None, Some(AttentionPlacement::Layers), Some(AttentionPlacement::Heads)] {
+        let pair = |attention| -> Result<_> {
+            let mut i = inputs(&cfg);
+            i.attention = attention;
+            i.context = Some(context_layout(i.cache_format)?);
+            i.lanes = 1;
+            i.lane_layouts.truncate(1);
+            admit(i)
+        };
+        let auto = pair(None)?;
+        let context = pair(Some(AttentionPlacement::Context))?;
+        assert_eq!(auto.placement.attention_placement, AttentionPlacement::Context);
+        assert_eq!(auto.placement.layers, context.placement.layers);
+        assert_eq!(auto.placement.items, context.placement.items);
+        assert_eq!(auto.placement.pool_tokens, context.placement.pool_tokens);
+        assert_eq!(auto.context_layout(), context.context_layout());
+        for (layer, assignment) in auto.placement.layers.iter().enumerate() {
+            assert_eq!(assignment.mode, if cfg.attention[layer] == KimiAttention::Mla {
+                LayerMode::ContextSplit
+            } else { LayerMode::HeadSplit });
+        }
+        let mut i = inputs_for_ranks::<1>(&cfg);
+        i.attention = None;
+        let single = admit(i)?;
+        assert_eq!(single.placement.attention_placement, AttentionPlacement::Layers);
+        assert!(single.context_layout().is_none());
+        assert!(single.placement.layers.iter().all(|layer| layer.mode == WHOLE));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_layers_and_heads_do_not_charge_context_storage() -> Result<()> {
+        let cfg = cfg();
+        for attention in [Some(AttentionPlacement::Layers), Some(AttentionPlacement::Heads)] {
             let mut i = inputs(&cfg);
             i.attention = attention;
             let admitted = admit(i)?;
@@ -1697,6 +1730,7 @@ pub(super) mod tests {
         let spark_bytes = 115_964_116_992;
         use cuteafd_core::MlaCacheFormat;
         let automatic = plan_input.plan_spark_count(&PlanOptions {
+            attention_placement: Some(AttentionPlacement::Layers),
             placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![capacity; 2], concurrency: 16,
@@ -1748,7 +1782,7 @@ pub(super) mod tests {
             let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
             let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
             assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
-            let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+            let options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
@@ -1886,7 +1920,7 @@ pub(super) mod tests {
                     }
                 }
                 let admitted = admit(i)?;
-                let mut options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+                let mut options = PlanOptions { attention_placement: Some(AttentionPlacement::Layers), placement: ExpertPlacement::Sparks { ranks: 6 },
                     layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                         mla_kv: format, context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
                         host_cache_bytes: Some(0), onboard: Some(OnboardSetting::Auto), ..Default::default() }),
@@ -2028,7 +2062,7 @@ pub(super) mod tests {
         let stem="language_model.lm_head".to_owned();
         core.projections.insert(stem.clone(),CoreProjection{split:split(&stem).unwrap(),stem,bits:6,
             codebook:Exl3Codebook::Mul1,shape:[cfg.vocab_size,cfg.hidden],stored_outputs:cfg.vocab_size,source_bytes:0});
-        for attention in [None,Some(AttentionPlacement::Heads)] {
+        for attention in [Some(AttentionPlacement::Layers),Some(AttentionPlacement::Heads)] {
             let mut i=inputs(&cfg);i.core=core.clone();i.attention=attention;
             let mixed=admit(i)?;
             let mut i=inputs(&cfg);i.attention=attention;
@@ -2058,7 +2092,7 @@ pub(super) mod tests {
                     LayerLayout::pair(&cfg,layer,assignment.mode).unwrap()[rank].bytes().unwrap() as u64).sum::<u64>();
                 assert_eq!(baseline_same_placement-charge(&mixed),freed[rank] as u64);
                 assert!(freed[rank]>0);
-                if attention.is_some() {assert_eq!(charge(&original)-charge(&mixed),freed[rank] as u64);}
+                if attention == Some(AttentionPlacement::Heads) {assert_eq!(charge(&original)-charge(&mixed),freed[rank] as u64);}
             }
             // BF16 KDA fallback is selected by the inventory, with no mode flag.
             for rank in 0..2 {
@@ -2093,7 +2127,7 @@ pub(super) mod tests {
     #[test]
     fn compact_cache_admission_and_owner_ranges_use_the_same_record() -> Result<()> {
         let cfg = cfg();
-        for attention in [None, Some(AttentionPlacement::Heads)] {
+        for attention in [Some(AttentionPlacement::Layers), Some(AttentionPlacement::Heads)] {
             for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
                 let mut input = inputs(&cfg);
                 input.cache_format = format;
@@ -2101,7 +2135,7 @@ pub(super) mod tests {
                 let admitted = admit(input)?;
                 for rank in 0..2 {
                     let layout = admitted.check_mla(rank, rank as i32)?;
-                    let layers = if attention.is_some() { 2 } else { 1 };
+                    let layers = if attention == Some(AttentionPlacement::Heads) { 2 } else { 1 };
                     assert_eq!(layout.bytes(), layers * admitted.placement.pool_tokens as usize * format.record_bytes());
                     for layer in [1, 3] {
                         if let Ok((offset, bytes)) = layout.page_range(layer, 1, 17) {

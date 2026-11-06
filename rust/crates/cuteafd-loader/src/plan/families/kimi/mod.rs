@@ -325,13 +325,14 @@ impl FamilyModel for Model {
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         use crate::{placement::AttentionPlacement, serving_capacity::CacheGeometryError};
-        let context = options.attention_placement == Some(AttentionPlacement::Context);
+        let attention = crate::families::kimi_k3::resolve_attention(options.attention_placement, options.coordinator_ranks);
+        let context = attention == AttentionPlacement::Context;
         if !matches!(options.coordinator_ranks, 1 | 2) || (context && options.coordinator_ranks != 2) {
             return Err(CacheGeometryError::Unsupported { family: "kimi_k3", what: "requires one owner or TP2 owned/head-split MLA" });
         }
         let layers = self.cfg.mla_layers();
         let resident = if options.coordinator_ranks == 1 { vec![layers] }
-            else if options.attention_placement == Some(AttentionPlacement::Heads) { vec![layers; 2] }
+            else if attention == AttentionPlacement::Heads { vec![layers; 2] }
             else { vec![layers.div_ceil(2), layers / 2] };
         let mut geometry = crate::families::kimi_k3::kda::cache_geometry_for_ranks(&self.cfg, &resident, options.mla_kv)?;
         if context {
