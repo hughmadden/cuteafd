@@ -346,7 +346,8 @@ impl<'a> Admission<'a> {
                         budget: budgets[0] }] }
                 } else { CoordinatorExperts::Tp2 { layers: layers.clone(), budgets } })
             }).transpose()?;
-            let prepared = CoordinatorPush::prepare_admitted(&checkpoint.snapshot, Some(catalog), RANKS,
+            let prepared = CoordinatorPush::prepare_view_admitted(checkpoint.view.as_ref()
+                .context("Kimi push requires the immutable selected checkpoint view")?, Some(catalog), RANKS,
                 experts, self.push_host.clone())?;
             Ok((prepared, owners, records, dense))
         })?;

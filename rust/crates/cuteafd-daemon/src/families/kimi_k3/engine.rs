@@ -200,13 +200,15 @@ impl<'a> Engine<'a> {
         let rows = u32::try_from(admission.unit_rows())?;
         let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
             plan.spec().lanes as usize];
-        let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+        let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+            .context("Kimi engine requires the immutable selected checkpoint view")?)?;
         let executions = cuteafd_loader::plan::spark_executions::admit_family("kimi_k3",
             &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports(), None,
             u64::from(rows), admission.waves() as u64)?;
         let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;
         model.validate(ExpertGeometry::KIMI_K3)?;
-        let spark = SparkAdmission::plan_view(checkpoint.view.as_ref().context("Kimi Spark admission requires selected checkpoint view")?, ExpertGeometry::KIMI_K3,
+        let spark = SparkAdmission::plan_view(checkpoint.view.as_ref()
+            .context("Kimi bootstrap requires the immutable selected checkpoint view")?, ExpertGeometry::KIMI_K3,
             Some(&catalog), &admission.working_set(), peers.len(), None, model, None)?;
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).

@@ -106,7 +106,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(spark_budget_gib.is_finite() && spark_budget_gib > 0.0
         && spark_budget_gib < u64::MAX as f64 / (1u64 << 30) as f64,
         "Kimi --spark-budget-gib must be finite, positive and representable");
-    let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+        .context("Kimi startup requires the immutable selected checkpoint view")?)?;
     let routed = cfg.dense.iter().filter(|dense| !**dense).count();
     let onboard = options.rtx_expert_layers.resolve(routed);
     let model = crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?;
