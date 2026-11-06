@@ -490,6 +490,41 @@ mod tests {
         let compact_layouts = (0..compact_cfg.layers).map(|layer|
             super::super::weight_layout::LayerLayout::pair_with_core(&compact_cfg, layer, LayerMode::HeadSplit, &compact_core))
             .collect::<Result<Vec<_>>>()?;
+        let mut policies = BTreeMap::new();
+        for projection in compact_core.projections.values() {
+            for world in [1, 2] {
+                let (mut n, mut k) = (projection.stored_outputs, projection.shape[1]);
+                let side = if world == 1 || projection.split != CoreSplit::Input { 1 } else { 2 };
+                if world == 2 && projection.split != CoreSplit::Whole {
+                    if side == 1 { n /= 2; } else { k /= 2; }
+                }
+                let book = projection.codebook.marker();
+                policies.insert((k, n, side, book), serde_json::json!({"input_features":k,
+                    "output_features":n,"sharded_side":side,"codebook":book}));
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for capacity in [64, 4096] {
+            for prefix in ["kimik3_kda", "kda_fused_h96", "kda_core_h48", "kda_core_h96"] {
+                names.insert(format!("{prefix}_m{capacity}"));
+            }
+            for heads in [48, 96] {
+                let suffix = if heads == 48 { "" } else { "_h96" };
+                for prefix in ["kimik3_mla_producer", "kimik3_mla_output"] {
+                    names.insert(format!("{prefix}{suffix}_m{capacity}"));
+                }
+                for mode in ["decode", "verify", "extend"] {
+                    names.insert(format!("kimik3_dense_mla_{mode}{suffix}_m{capacity}"));
+                }
+                for stride in [576, 640] { for cache in ["", "_fp8"] {
+                    names.insert(format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"));
+                } }
+            }
+        }
+        let compact_manifest = serde_json::json!({"families":{"dense_trellis_k6":{"abi_version":1,
+            "row_policies":policies.into_values().collect::<Vec<_>>()}},
+            "programs":names.into_iter().map(|name| serde_json::json!({"name":name,
+                "scratch_bytes_at_capacity":{"scratch":256}})).collect::<Vec<_>>()});
         let compact_index = std::fs::read(dir.path().join("model.safetensors.index.json"))?;
         for (source, target) in [("config.json", "config.compact-attention.json"),
             ("model.safetensors.index.json", "model.compact-attention.safetensors.index.json"),
@@ -567,6 +602,15 @@ mod tests {
             assert!(crate::placement::families::kimi::native_load_owners(&core, ranks, 16384)?.is_empty());
             assert_eq!(crate::placement::families::kimi::selected_push_host_envelope(&compact_cfg, &core, ranks)?,
                 crate::placement::families::kimi::push_host_envelope(&compact_cfg, ranks)?);
+            for (rows, unit) in [(64, 64), (8256, 2752)] {
+                let before = CoreCharges::from_package_for_ranks(&compact_cfg, &compact_core,
+                    rows, unit, &compact_manifest, ranks)?;
+                let after = CoreCharges::from_package_for_ranks(&compact_cfg, &core,
+                    rows, unit, &compact_manifest, ranks)?;
+                assert_eq!(before, after, "compact mode changed parent core charges");
+                assert_eq!(before.demands()?, after.demands()?, "compact mode changed named owners");
+                assert_eq!(after.native_stage_bytes, 0);
+            }
         }
         assert!(core.native_attention_stages(8192, 2)?.is_empty());
         assert_eq!(core.attention_receive_bytes(64, 2)?, exchange_recv_bytes(64)?);
