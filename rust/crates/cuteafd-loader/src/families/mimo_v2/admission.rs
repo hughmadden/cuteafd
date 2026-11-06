@@ -64,8 +64,22 @@ pub fn draft_reservations_with(
     headers: &[crate::SafetensorsTensorMetadata],
     mode: crate::families::mimo_v2::draft_representation::MimoDraftRepresentation,
     capacity: crate::families::mimo_v2::draft_representation::MimoDraftCapacity,
+    scratch: impl FnMut(DraftScratch) -> Result<usize>,
+) -> Result<DraftReservations> {
+    draft_rank_reservations_with(cfg, headers, mode, capacity, 0, 1, scratch)
+}
+
+pub fn draft_rank_reservations_with(
+    source_cfg: &super::draft_config::DflashConfig,
+    headers: &[crate::SafetensorsTensorMetadata],
+    mode: crate::families::mimo_v2::draft_representation::MimoDraftRepresentation,
+    capacity: crate::families::mimo_v2::draft_representation::MimoDraftCapacity,
+    rank: usize,
+    ranks: usize,
     mut scratch: impl FnMut(DraftScratch) -> Result<usize>,
 ) -> Result<DraftReservations> {
+    ensure!(rank < ranks, "invalid DFlash rank {rank}/{ranks}");
+    let cfg = source_cfg;
     use super::draft_config::{RING, TAP_ROWS};
     use cuteafd_core::DType;
     const VOCABULARY_HEAD_WORKSPACE: usize = 4 << 20;
@@ -102,8 +116,6 @@ pub fn draft_reservations_with(
             .ok_or_else(|| anyhow::anyhow!("DFlash head width overflows"))
     };
     let (attention, kv) = (width(cfg.heads)?, width(cfg.kv_heads)?);
-    let two_kv = kv.checked_mul(2).context("DFlash KV width")?;
-    let qkv = attention.checked_add(two_kv).context("DFlash QKV width")?;
     let taps = cfg.taps.len().checked_mul(h).context("DFlash tap width")?;
     let source = |name: &str, shape: &[usize]| -> Result<()> {
         let t = headers
@@ -142,6 +154,12 @@ pub fn draft_reservations_with(
         }
         source(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?;
     }
+    let local = source_cfg.for_tp(ranks)?;
+    let cfg = &local;
+    let inter = cfg.intermediate;
+    let (attention, kv) = (width(cfg.heads)?, width(cfg.kv_heads)?);
+    let qkv = attention.checked_add(kv.checked_mul(2).context("DFlash local KV width")?)
+        .context("DFlash local QKV width")?;
     let layout = cfg.runtime_layout(mode, capacity)?;
     layout.weights.loading_peak_bytes()?;
     let mut costs = [
@@ -253,10 +271,15 @@ pub fn draft_reservations_with(
         ),
         (
             "topk_workspace",
-            vec![scratch(DraftScratch::Topk { rows: drafted })?],
+            vec![if rank == 0 { scratch(DraftScratch::Topk { rows: drafted })? } else { 0 }],
         ),
     ] {
-        reserve(format!("draft.workspace.{name}"), &dims)?;
+        if rank == 0 || !matches!(name, "head_workspace" | "logits" | "unary" | "candidates" | "topk_workspace") {
+            reserve(format!("draft.workspace.{name}"), &dims)?;
+        }
+    }
+    if ranks == 2 {
+        reserve("draft.workspace.reduced".into(), &[rows, h, 2])?;
     }
     drop(reserve);
     costs

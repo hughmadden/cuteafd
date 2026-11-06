@@ -799,7 +799,7 @@ pub(crate) struct MimoEngine<'a> {
     split_family: Option<&'static str>,
     /// The head split's second GPU and both ends of its exchange (rank 0's, the peer's).
     peer: Option<Peer<'a>>,
-    exchange: Option<PeerExchange<'a>>,
+    exchange: Option<Rc<PeerExchange<'a>>>,
     /// Per layer: the paged record pool (full) or the rings (SWA).
     kv: Vec<Rc<Allocation<'a>>>,
     workspace: RefCell<Option<Workspace<'a>>>,
@@ -1151,7 +1151,7 @@ impl<'a> MimoEngine<'a> {
                 decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         })?;
         self.peer = Some(peer);
-        self.exchange = Some(exchange);
+        self.exchange = Some(Rc::new(exchange));
         Ok(())
     }
 
@@ -1228,7 +1228,7 @@ impl<'a> MimoEngine<'a> {
         teardown(&mut Teardown {
             abort: || {
                 let mut failures = Vec::new();
-                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                for exchange in self.exchange.iter().map(Rc::as_ref).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
                     if exchange.terminal_state() == TerminalState::Aborting { continue; }
                     if let Err(error) = exchange.publish_abort() { failures.push(format!("{error:#}")); }
                 }
@@ -1259,7 +1259,7 @@ impl<'a> MimoEngine<'a> {
             },
             finish: |drained| {
                 self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
-                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                for exchange in self.exchange.iter().map(Rc::as_ref).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
                     exchange.finish_terminal(drained);
                 }
             },
@@ -1285,7 +1285,11 @@ impl<'a> MimoEngine<'a> {
     }
 
     fn exchange(&self) -> Result<&PeerExchange<'a>> {
-        self.exchange.as_ref().context("no head-split exchange")
+        self.exchange.as_deref().context("no head-split exchange")
+    }
+
+    pub(crate) fn draft_exchange(&self) -> Result<Rc<PeerExchange<'a>>> {
+        self.exchange.as_ref().map(Rc::clone).context("TP2 DFlash requires the target peer exchange")
     }
 
     /// Queues on `from`'s stream: push `bytes` of `source` into the other GPU's slot `slot`.

@@ -1632,6 +1632,15 @@ if [[ $family == deepseek_v4 || $family == mimo_v2 ]]; then
     *) release_die "EXPERT_USAGE must be on or off" ;;
   esac
 fi
+tp2_dflash="$(get TP2_DFLASH off)"
+case "$tp2_dflash" in on|off) ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
+[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
+  release_die "TP2_DFLASH requires MiMo/Kimi, two selected RTX GPUs and DFlash2"
+if [[ "$family" == mimo_v2 || "$family" == kimi_k3 ]]; then
+  # Forward false as well: an explicit off must survive future default changes.
+  tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"
+  family_args+=(--tp2-dflash "$tp2_dflash_bool")
+fi
 # Loop abort (boot-time only): unset keeps the daemon's shipped defaults.
 for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-copies' \
   'LOOP_FAST_SPAN:--loop-fast-span' 'LOOP_FAST_COPIES:--loop-fast-copies'; do
@@ -2038,6 +2047,8 @@ if [[ -n "$second" && "$split" != off ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
 fi
+[[ "$tp2_dflash" != on || "$head_split" == 1 ]] ||
+  release_die "TP2_DFLASH requires an active two-GPU target split"
 if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
   release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
 fi
@@ -2366,6 +2377,9 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t,b=map(float,sys.argv[1:]);print(max(0,b-(t-f)/1024))' "$free_mib" "$total_mib" "$profile_gib")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 ]]; then
+    plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
+  fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")

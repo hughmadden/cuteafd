@@ -219,7 +219,7 @@ mod tests {
             expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
             tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] },
             spark: phase_profiles(spark), no_spark: phase_profiles(no_spark),
-            post_kv_additional: vec![vec![]; ranks], draft_packing: vec![],
+            post_kv_additional: vec![vec![]; ranks], draft_packing: vec![vec![]; ranks],
             host: admission::HostOwners { expert_input: Default::default(), output: crate::families::mimo_v2::MimoPrefillOutput::LastRow,
                 serving: true, scoring_rows: 64, diagnostic_rows: 256, prefix_bytes: 0, media_bytes: 0, headroom: 0 },
             spark_reply_formats: Default::default(),

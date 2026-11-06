@@ -4874,3 +4874,33 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
     assert "prefill reserve does not fit" not in result.stderr
 
+
+@pytest.mark.parametrize("family,command", [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi")])
+@pytest.mark.parametrize("value,expected", [(None, "false"), ("off", "false"), ("on", "true")])
+def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, command, value, expected):
+    config = {"model_type": family, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    if family == "kimi_k3":
+        config = {"model_type": family, "text_config": {"model_type": "kimi_linear",
+                  "num_hidden_layers": 93, "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+    keys = "RTX_GPUS=2\nSPECULATOR=dflash2\nVISION=off\nAUDIO=off\n"
+    if family == "kimi_k3":
+        keys += "SPECULATOR_MODEL_ID=test/tp2-dflash\n"
+    if value is not None:
+        keys += f"TP2_DFLASH={value}\n"
+    result = _family_launch_result(tmp_path, config, "test/tp2-dflash", keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    serve = next(line for line in lines if f"cuteafd {command} --snapshot" in line)
+    plans = [line for line in lines if "cuteafd plan " in line]
+    assert f"--tp2-dflash {expected}" in serve
+    assert plans and all(f"--tp2-dflash {expected}" in line for line in plans)
+
+
+@pytest.mark.parametrize("keys", ["RTX_GPUS=1\nSPECULATOR=dflash2\n",
+                                  "RTX_GPUS=2\nSPECULATOR=off\n",
+                                  "RTX_GPUS=2\nCOORDINATOR_SPLIT=off\nSPECULATOR=dflash2\n"])
+def test_tp2_dflash_rejects_inapplicable_launch(tmp_path, keys):
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2", "num_hidden_layers": 2},
+                                  "test/tp2-dflash", keys + "TP2_DFLASH=on\n")
+    assert result.returncode == 2, result.stderr
+    assert "TP2_DFLASH requires" in result.stderr

@@ -58,7 +58,7 @@ impl MimoDraftCapacity {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MimoDraftGeometry {
     pub hidden: u64,
     pub intermediate: u64,
@@ -69,6 +69,21 @@ pub struct MimoDraftGeometry {
     pub taps: u64,
     pub vocab: u64,
     pub sinks: bool,
+}
+
+impl MimoDraftGeometry {
+    /// Local attention/FFN geometry. Hidden rows, context FC and norms remain
+    /// replicated; Q/K/V and gate/up split outputs, O/down split inputs.
+    pub fn for_tp(self, ranks: usize) -> Result<Self, MimoDraftStorageError> {
+        if !matches!(ranks, 1 | 2) || self.heads == 0 || self.kv_heads == 0
+            || self.intermediate == 0 || self.heads % self.kv_heads != 0
+            || self.heads % ranks as u64 != 0 || self.kv_heads % ranks as u64 != 0
+            || self.intermediate % ranks as u64 != 0 {
+            return Err(MimoDraftStorageError::Unsupported("drafter heads, KV heads and FFN must divide TP1 or TP2"));
+        }
+        Ok(Self { heads: self.heads / ranks as u64, kv_heads: self.kv_heads / ranks as u64,
+            intermediate: self.intermediate / ranks as u64, ..self })
+    }
 }
 
 /// One byte-exact retained DFlash context mark (opaque K/V records and valid floor).
@@ -356,6 +371,36 @@ mod tests {
         assert_eq!(layout.fp8_scratch.unwrap().rows, 1280);
         assert!(MimoDraftRuntimeLayout::new(pro(), MimoDraftRepresentation::Fp8Only, capacity, 0, 128).is_err());
     }
+    #[test]
+    fn tp2_splits_attention_and_ffn_but_replicates_context_fc_and_norms() {
+        let geometry = pro();
+        assert_eq!(geometry.for_tp(1).unwrap(), geometry);
+        let local = geometry.for_tp(2).unwrap();
+        assert_eq!((local.heads, local.kv_heads, local.intermediate), (64, 4, 8192));
+        assert_eq!((local.hidden, local.taps, local.layers), (6144, 5, 5));
+        for mode in [MimoDraftRepresentation::Bf16Only, MimoDraftRepresentation::Fp8Only] {
+            let whole = MimoDraftWeightLayout::new(geometry, mode).unwrap();
+            let half = MimoDraftWeightLayout::new(local, mode).unwrap();
+            let fc = geometry.hidden * geometry.hidden * geometry.taps;
+            assert_eq!(2 * half.bf16_values, whole.bf16_values
+                + if mode == MimoDraftRepresentation::Bf16Only { fc * 2 } else { 0 });
+            assert_eq!(2 * half.fp8_values, whole.fp8_values
+                + if mode == MimoDraftRepresentation::Fp8Only { fc } else { 0 });
+            assert_eq!(2 * half.fp8_scales, whole.fp8_scales
+                + if mode == MimoDraftRepresentation::Fp8Only { fc / 128 * 4 } else { 0 });
+            let capacity = MimoDraftCapacity::new(16, 4, 8).unwrap();
+            let layout = MimoDraftRuntimeLayout::new(local, mode, capacity, 1024, 0).unwrap();
+            if let Some(scratch) = layout.fp8_scratch {
+                assert!(scratch.shapes.contains(&MimoDraftLinearShape { k: 6144, n: 9216 }));
+                assert!(scratch.shapes.contains(&MimoDraftLinearShape { k: 8192, n: 6144 }));
+            }
+            assert_eq!(half.head_fp8_values + half.head_fp8_scales, 0);
+        }
+        for ranks in [0, 3, usize::MAX] { assert!(geometry.for_tp(ranks).is_err()); }
+        assert!(MimoDraftGeometry { kv_heads: 1, ..geometry }.for_tp(2).is_err());
+        assert!(MimoDraftGeometry { intermediate: 16385, ..geometry }.for_tp(2).is_err());
+    }
+
     #[test]
     fn pro_single_copy_counts_and_one_matrix_loading_peak() {
         let fp8 = MimoDraftWeightLayout::new(pro(), MimoDraftRepresentation::Fp8Only).unwrap();

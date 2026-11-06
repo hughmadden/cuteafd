@@ -214,7 +214,7 @@ pub struct ProductionInput<'a> {
     pub spark: MimoCapacityProfiles,
     pub no_spark: MimoCapacityProfiles,
     pub post_kv_additional: Vec<Vec<MemoryReservation>>,
-    pub draft_packing: Vec<MemoryReservation>,
+    pub draft_packing: Vec<Vec<MemoryReservation>>,
     pub host: HostOwners,
     pub spark_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     /// Retained checkpoint weights per coordinator, media towers included.
@@ -274,7 +274,7 @@ pub struct MimoRecipe<'a> {
     pub spark_profile: MimoCapacityProfiles,
     pub no_spark_profile: MimoCapacityProfiles,
     pub post_kv_additional: Vec<Vec<MemoryReservation>>,
-    pub draft_packing: Vec<MemoryReservation>,
+    pub draft_packing: Vec<Vec<MemoryReservation>>,
     pub host: HostOwners,
     pub kv: MimoKvFormats,
     pub mtp_stages: usize,
@@ -633,7 +633,7 @@ impl Recipe for MimoRecipe<'_> {
                     let mut reservations = costs.reservations.clone();
                     if phase != Phase::Load {
                         reservations.extend(self.post_kv_additional.get(rank).into_iter().flatten().cloned());
-                        if phase == Phase::DraftLoad && rank == 0 { reservations.extend(self.draft_packing.iter().cloned()); }
+                        if phase == Phase::DraftLoad { reservations.extend(self.draft_packing.get(rank).into_iter().flatten().cloned()); }
                     }
                     for reservation in reservations {
                         let owner = Allocation::buffer(format!("rtx{rank}.{phase:?}.{}", reservation.name),
