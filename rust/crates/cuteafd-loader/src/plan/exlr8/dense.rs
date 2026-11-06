@@ -1633,6 +1633,14 @@ mod tests {
         assert_eq!(vision.formats.values().sum::<usize>(), 1);
         let text_only = crate::plan::exlr8::inventory(root.path(), config.clone(), |_| false).unwrap();
         assert!(crate::plan::exlr8::bundled_vision_component(&text_only).unwrap().is_none());
+        let duplicate = root.path().join("dense/vision-copy.safetensors");
+        std::fs::copy(&path, &duplicate).unwrap();
+        for selected in [false, true] {
+            let error = crate::plan::exlr8::inventory(root.path(), config.clone(), |_| selected)
+                .unwrap_err().to_string();
+            assert!(error.contains("duplicate tensor model.visual.patch_embed.proj.weight"), "{error}");
+        }
+        std::fs::remove_file(duplicate).unwrap();
         write(&["model.visual.patch_embed.proj.weight", "model.language_model.norm.weight"]);
         assert!(matches!(DenseRecord::inventory(root.path()), Err(DenseError::NativeMetadata { path: p, .. }) if p == path));
         assert!(crate::plan::exlr8::catalog_headers(root.path()).is_err());

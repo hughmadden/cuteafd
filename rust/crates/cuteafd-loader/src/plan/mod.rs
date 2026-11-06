@@ -1295,6 +1295,21 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
     }
+    finalize_media_report(&mut report, checkpoint, family, spec)?;
+    if family.runtime() == RuntimeStatus::Planned && !report.native_serving_admitted {
+        report.fits = false;
+        report.placement_supported = false;
+        report.hints.push(Hint {
+            what: "planned family has no executable serving admission in this build".into(),
+            how: "The component bytes are a checkpoint inventory, not a serving-fit result; implement and gate the runtime first.".into(),
+        });
+    }
+    Ok(report)
+}
+
+/// Publish media ownership and the shared encoder handshake for every storage format.
+fn finalize_media_report(report: &mut PlanReport, checkpoint: &Checkpoint,
+    family: &dyn Family, spec: &ModelSpec) -> Result<(), PlanError> {
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
             encoder::EncoderKind::Rtx { gpu } => Some(format!("rtx{gpu} vision")),
@@ -1362,15 +1377,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
     }
     report.encoder_plan_hash = format!("{:x}", hash.finalize());
-    if family.runtime() == RuntimeStatus::Planned && !report.native_serving_admitted {
-        report.fits = false;
-        report.placement_supported = false;
-        report.hints.push(Hint {
-            what: "planned family has no executable serving admission in this build".into(),
-            how: "The component bytes are a checkpoint inventory, not a serving-fit result; implement and gate the runtime first.".into(),
-        });
-    }
-    Ok(report)
+    Ok(())
 }
 
 /// Inventory display and routed-package compatibility. Native family owners

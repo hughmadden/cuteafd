@@ -265,6 +265,7 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
         let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
         super::layout::charge_host(&mut report, layout, input, true)?;
     }
+    super::finalize_media_report(&mut report, checkpoint, family, model.spec())?;
     Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
 }
@@ -475,7 +476,8 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
             // Local native names repeat across shards; bundled plain vision
             // keeps its qualified HF names for the shared encoder loader.
             let name = if native { format!("{shard}::{}", meta.name) } else { meta.name.clone() };
-            weight_map.insert(name.clone(), shard.clone());
+            ensure!(weight_map.insert(name.clone(), shard.clone()).is_none(),
+                "duplicate tensor {name} in native shard {shard}");
             if needed(&name) {
                 meta.name = name;
                 tensors.push(CheckpointTensor { shard: shard.clone(), meta });

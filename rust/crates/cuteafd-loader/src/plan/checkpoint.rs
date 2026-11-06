@@ -204,6 +204,9 @@ impl Checkpoint {
         // Group once instead of scanning the complete index for every shard.
         let mut shards = BTreeMap::<&String, BTreeSet<&str>>::new();
         for (name, shard) in &weight_map {
+            ensure!(!shard.is_empty() && Path::new(shard).components().all(|component|
+                matches!(component, std::path::Component::Normal(_))),
+                "invalid checkpoint shard path {shard:?}");
             if needed(name) { shards.entry(shard).or_default().insert(name); }
         }
         let mut tensors = Vec::with_capacity(weight_map.len());
