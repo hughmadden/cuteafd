@@ -5,9 +5,11 @@
 //! byte-identical, the recording must not read the payload, and the recorded
 //! staging must fit the header-only admitted drafter push envelope.
 //!
-//! On the CPU fixture (default) W8A16 packs are no-ops, so FP8 rows prove the
-//! recipe and staging bound, not pack numerics. With CUTEAFD_NATIVE_LIB (a real
-//! GPU, run through golden-run --native-test) every representation is exact.
+//! On the CPU fixture (default) only the FP8 serving representation runs and its
+//! W8A16 packs are no-ops: BF16 tensor owners are compared, the packs prove only
+//! the recipe and staging bound. With CUTEAFD_NATIVE_LIB and
+//! CUTEAFD_PROGRAM_MANIFEST (a real GPU through golden-run --native-test) both
+//! representations run and every owner, packs included, must be byte-identical.
 use crate::shared::experts::rtx::dense::{self, RankLayout};
 use crate::shared::memory::device::Device;
 use crate::shared::speculation::{block_dspark::DsparkDrafter, dflash::{DflashConfig, DflashDrafter}};
@@ -75,11 +77,14 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
         cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)
     }).transpose()?;
     let library = library(&fixture)?;
-    let programs = library.programs()?;
+    // The byte-copying CPU fixture has no BF16 projection programs (those need its
+    // extent-only mode): it runs the FP8 (serving default) arms, real GPUs both.
     let programs = match std::env::var_os("CUTEAFD_PROGRAM_MANIFEST") {
-        Some(manifest) => programs.with_manifest(std::path::Path::new(&manifest))?,
-        None => programs,
+        Some(manifest) => library.programs()?.with_manifest(std::path::Path::new(&manifest))?,
+        None => library.programs()?,
     };
+    let representations: &[GlmDraftRepresentation] = if real { &[GlmDraftRepresentation::Bf16Only,
+        GlmDraftRepresentation::Fp8Only] } else { &[GlmDraftRepresentation::Fp8Only] };
     let device = Device { library: &library, id: 0 };
     let socket_root = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/cuteafd/builds/glmf-draft-push-sockets");
     std::fs::create_dir_all(&socket_root)?;
@@ -92,7 +97,7 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
         let capacity = flash_draft_capacity(&config, Some(4), 4)?;
         let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
         let mask = |hidden: usize| (0..hidden * 2).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-        for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+        for &representation in representations {
             let load = |recording: bool| -> Result<Loaded<'_>> {
                 device.run(|| Ok(if dspark {
                     let cfg = crate::shared::speculation::block_dspark::DsparkConfig::read(&snapshot)?;
@@ -148,6 +153,6 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
             arms += 1;
         }
     }
-    ensure!(arms == 4, "expected four drafter/representation arms, ran {arms}");
+    ensure!(arms == 2 * representations.len(), "expected every drafter/representation arm, ran {arms}");
     Ok(())
 }
