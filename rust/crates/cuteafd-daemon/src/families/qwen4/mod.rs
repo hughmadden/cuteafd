@@ -68,6 +68,9 @@ pub(crate) struct EngineArgs {
     /// Actual local encoder checkpoint weights, keyed by physical CUDA ordinal.
     #[arg(skip)]
     pub planner_media_weights: Option<(i32, cuteafd_loader::placement::ResidentWeights)>,
+    /// Resolved media embedding-cache quota (host), charged by the recipe.
+    #[arg(skip)]
+    pub planner_media_cache_bytes: u64,
     /// Sequences with GDN/PLE state (about 115 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
@@ -752,12 +755,25 @@ impl Opened {
         } else { None };
         let admitted_weights = loaded_weights.checked_add(expert_weights)?;
         admitted_weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
-        let pool_tokens = if budget_admission {
+        let (pool_tokens, admitted_host) = if budget_admission {
             let source = admission::ExpertSource::selected(admitted_experts.as_ref().and_then(Option::as_ref))?;
-            admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
+            // The first EXL3 window pushes after this solve; admit its receive
+            // envelope here, before any push allocation.
+            let window_push = match admitted_experts.as_ref().and_then(Option::as_ref) {
+                Some(engine::Experts::LocalExl3(local)) if matches!(
+                    crate::shared::experts::rtx::push::PushPolicy::for_snapshot(
+                        args.experts_snapshot.as_deref().unwrap_or(&args.snapshot))?,
+                    crate::shared::experts::rtx::push::PushPolicy::Required) =>
+                    vec![("qwen.host.push.exl3", local.push_envelope()?.2)],
+                _ => Vec::new(),
+            };
+            let host = admission::host_owners(args, &self.cfg, layers, model.mtp.is_some(), 1, source.spark_ranks(),
+                self.checkpoint.spark_input_is_bf16(), ple.as_ref().map(|p| p.row_bytes as u64), window_push)?;
+            let (pool, host) = admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
                 manifest_json.as_ref(), ple.as_ref().map(|p| (p.row_bytes as u64, p.fp8)),
-                future_expert_bytes)?, source, automatic_context, admitted_weights)?
-        } else { args.pool_tokens };
+                future_expert_bytes)?, source, automatic_context, admitted_weights, host)?;
+            (pool, Some(host))
+        } else { (args.pool_tokens, None) };
         let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
@@ -774,7 +790,9 @@ impl Opened {
             // Local EXL3 experts load their first window by push when the
             // checkpoint is SparkNest's (a group of this GPU alone), else lazily.
             if let engine::Experts::LocalExl3(local) = &experts {
-                local.push_window(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot), self.library.cuda_get_device()?)?;
+                local.push_window(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot), self.library.cuda_get_device()?,
+                    admitted_host.as_ref().and_then(|host| host.push.iter()
+                        .find(|(name, _)| *name == "qwen.host.push.exl3").map(|(_, envelope)| envelope)))?;
             }
             engine.set_experts(experts);
         }
@@ -782,6 +800,7 @@ impl Opened {
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        engine.admitted_host = admitted_host;
         engine.admit_host_memory(args)?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.prepare_prefill_units()?;

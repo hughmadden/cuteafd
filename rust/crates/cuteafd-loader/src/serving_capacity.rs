@@ -1396,3 +1396,38 @@ mod tests {
         assert_eq!(absent.requested_kv_floor_tokens, Some(2 << 20));
     }
 }
+
+/// Coordinator host Spark transport bytes: registered rings, egress request
+/// slots and the host-mode intake upper bound. `v4_decode` adds V4's separate
+/// decode request slot instead of multiplying egress by endpoints.
+#[allow(clippy::too_many_arguments)]
+pub fn spark_host_transport(geometry: cuteafd_core::ExpertGeometry, endpoints: usize, ranks: usize,
+    native: bool, bf16: bool, compact_bf16: bool, unit_rows: u64, intake_rows: u64, waves: u64,
+    v4_decode: Option<u64>) -> anyhow::Result<[u64; 3]> {
+    use anyhow::Context;
+    use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+    let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress, partial_reply_bytes: None };
+    let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
+    let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+        depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+    let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
+        .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
+        .context("coordinator host rings overflow")?;
+    let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?, compact_bf16)
+        .context("host egress geometry overflow")?.0 as u64;
+    let egress = match v4_decode {
+        Some(decode) => {
+            let decode_request = geometry.compact_wire_bytes(u32::try_from(decode)?, false)
+                .context("V4 decode egress geometry overflow")?.0 as u64;
+            egress_request.checked_mul(waves).and_then(|bytes| bytes.checked_add(decode_request))
+                .context("V4 registered egress overflow")?
+        }
+        None => egress_request.checked_mul(waves).and_then(|n| n.checked_mul(endpoints as u64))
+            .context("coordinator registered egress overflow")?,
+    };
+    let intake = intake_rows.checked_mul(geometry.hidden as u64).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
+        .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
+        .context("coordinator intake overflow")?;
+    Ok([bytes, egress, intake])
+}

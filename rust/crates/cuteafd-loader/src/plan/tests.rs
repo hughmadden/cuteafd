@@ -4693,19 +4693,15 @@ fn memory_constrained_spark_refuses_by_typed_owner_charge_not_waves() {
     assert!(tight.hints.iter().any(|hint| hint.what.starts_with("spark0") && hint.what.contains("shortfall 1 bytes")),
         "{:?}", tight.hints);
     let placement = roomy.solver_placement.as_ref().unwrap();
-    let maximum = placement.max_pool_tokens_no_onboard.expect("legacy solve computes the counterfactual");
-    assert!(maximum >= placement.pool_tokens);
-    assert!(render(&roomy).contains(&format!("max_pool_tokens_no_onboard {maximum}")));
+    // The shared Recipe runs one solve, so there is no legacy no-onboard
+    // counterfactual to report (same as GLM 5.3 and Mistral Large 4).
+    assert_eq!(placement.max_pool_tokens_no_onboard, None);
     let json = serde_json::to_value(&roomy).unwrap();
-    assert_eq!(json["max_pool_tokens_no_onboard"], maximum);
+    assert!(json.get("max_pool_tokens_no_onboard").is_none());
     assert_eq!(json["onboard_layers"], placement.onboard_layers);
-    let mut without_counterfactual = roomy.clone();
-    without_counterfactual.max_pool_tokens_no_onboard = None;
-    without_counterfactual.solver_placement.as_mut().unwrap().max_pool_tokens_no_onboard = None;
-    let text = render(&without_counterfactual);
+    let text = render(&roomy);
     assert!(text.contains(&format!("{} tokens admitted with {} RTX expert layers", roomy.memory_layout.as_ref().unwrap().pool_tokens, placement.onboard_layers)));
     assert!(!text.contains("max_pool_tokens_no_onboard") && !text.contains("null tokens"));
-    assert!(serde_json::to_value(&without_counterfactual).unwrap().get("max_pool_tokens_no_onboard").is_none());
     // One wave fits the same budget: the k units divide the reserve, they
     // never add a second prefill scratch (only per-unit staging differs).
     let one = spark(&plan_at(121 << 30, 1));
@@ -5204,6 +5200,23 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, 32768);
     let vision = auto.components.iter().find(|c| c.component == Component::Vision).unwrap();
     assert_eq!(vision.status, Status::Ready);
+    // The tower is the solve's choice: its owners are admitted device items.
+    let rtx = &auto.memory_layout.as_ref().unwrap().devices[0];
+    let tower = |group: &str| rtx.items.iter().filter(|i| i.group == group).map(|i| i.bytes).sum::<u64>();
+    assert_eq!((tower("vision tower"), tower("vision scratch")), (898_680_904, 447_778_048));
+    let ledger = auto.phase_ledger.as_ref().expect("recipe phase ledger");
+    assert!(ledger.budgets.iter().any(|b| b.id == "host"));
+    // Pool first: where the tower and the pinned pool cannot both fit, Auto
+    // turns vision off with the solver's reason instead of shrinking the pool.
+    let base = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
+    let used = base.memory_layout.as_ref().unwrap().devices[0].used_bytes();
+    let tight = layout::LayoutOptions { rtx_bytes: vec![used + (4 << 30)], ..options.layout.clone().unwrap() };
+    let crowded = plan(dir.path(), &PlanOptions { layout: Some(tight), ..options.clone() }).unwrap();
+    let declined = crowded.encoder.as_ref().unwrap();
+    assert_eq!(declined.kind, EncoderKind::Off, "{}", render(&crowded));
+    assert!(declined.reason.contains("pool-first"), "{}", declined.reason);
+    assert_eq!(crowded.memory_layout.as_ref().unwrap().pool_tokens, 32768);
+    assert!(!crowded.memory_layout.as_ref().unwrap().devices[0].items.iter().any(|i| i.group == "vision tower"));
     let off = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
     assert_eq!(off.max_image_tokens, Some(1024));
     assert_eq!(off.encoder.as_ref().unwrap().kind, EncoderKind::Off);
@@ -5692,4 +5705,33 @@ fn mimo_auto_pool_and_count_admission_preserve_one_recipe() {
     assert!(!counted.wip_launchable());
     assert!(counted.hints.iter().any(|hint| hint.what == typed), "{}", render(&counted));
     assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}
+
+#[test]
+fn qwen_auto_pool_is_one_recipe_and_keeps_its_typed_refusal() {
+    let (dir, manifest) = qwen4_matrix_snapshot();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536, prefix_slots: Some(0),
+        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+        workspace_manifest: Some(manifest), ..Default::default()
+    }), placement: ExpertPlacement::Local, ..Default::default() };
+    let unset = plan(dir.path(), &options).unwrap();
+    assert!(unset.wip_launchable(), "{}", render(&unset));
+    // CLI zero and an omitted pool select the same automatic admission.
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan(dir.path(), &zero).unwrap();
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens,
+        unset.memory_layout.as_ref().unwrap().pool_tokens);
+    assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves),
+        (unset.prefill_unit_rows, unset.prefill_waves));
+    // A pool below the compiled context is the recipe's typed refusal, not a
+    // smaller-prefill second solve.
+    zero.layout.as_mut().unwrap().pool_tokens = Some(1024);
+    let refused = plan(dir.path(), &zero).unwrap();
+    assert!(!refused.wip_launchable(), "{}", render(&refused));
+    assert!(refused.hints.iter().any(|hint|
+        hint.what.contains("Qwen admission: pool 1024 cannot hold selected context 65536")),
+        "{:?}", refused.hints);
+    assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }
