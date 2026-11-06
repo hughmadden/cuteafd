@@ -352,6 +352,10 @@ mod tests {
         let compact = TowerSpec::glm_flash_view(&view, 4096).unwrap();
         assert_eq!(compact.reads.len(), spec.reads.len());
         assert_eq!(compact.native.weight_bytes, spec.native.weight_bytes);
+        let worker = TowerSpec::from_view(&view, 4096).unwrap();
+        assert_eq!(worker.reads.len(), compact.reads.len());
+        assert_eq!(worker.native.weight_bytes, compact.native.weight_bytes);
+        assert_eq!(worker.encoder_id("selected", 121), compact.encoder_id("selected", 121));
 
     }
 }

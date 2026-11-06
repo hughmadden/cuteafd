@@ -280,7 +280,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // The vision owner loads in this process/device's primary CUDA context,
     // never beside expertd in a second process. Charge it before expert admission.
     let (_encoder, _audio_encoder, reserved) = crate::shared::vision::worker::start_encoders(
-        config.encoder.as_ref(), config.audio_encoder.as_ref(), &config.snapshot,
+        config.encoder.as_ref(), config.audio_encoder.as_ref(), &view,
         config.library.clone(), config.device_budget as u64)?;
     census.sample("after_media_owners_before_expert_bootstrap", None)?;
     config.device_budget = config.device_budget.checked_sub(usize::try_from(reserved)?)

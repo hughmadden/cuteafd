@@ -1048,7 +1048,10 @@ if os.environ.get("STUB_REAL_DEPLOYMENT"):
 def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 config = json.loads(os.environ["STUB_CHECKPOINT"])
-described = subprocess.check_output([sys.executable, os.environ["STUB_FAMILY_READER"], os.environ["STUB_CONFIG_PATH"]], text=True).split()
+config_path = os.environ["STUB_CONFIG_PATH"]
+if "--compact-attention" in args:
+    config_path = os.path.join(os.path.dirname(config_path), "config.compact-attention.json")
+described = subprocess.check_output([sys.executable, os.environ["STUB_FAMILY_READER"], config_path], text=True).split()
 family, _, first, last = described
 ranks = int(os.environ["STUB_PREFERRED_RANKS"] if os.environ["STUB_FORCE_PREFERRED"] else value("--spark-ranks", os.environ["STUB_PREFERRED_RANKS"]))
 tp = int(value("--spark-tp", str(ranks)))

@@ -195,6 +195,15 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
 }
 
 impl TowerSpec {
+    pub fn from_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView, max_tokens: usize) -> Result<Self> {
+        let cfg = view.config().map_err(|error| VisionError::Unsupported(error.to_string()))?;
+        if cfg["model_type"] == "glm5_next" {
+            Self::glm_flash_view(view, max_tokens)
+        } else {
+            Self::from_snapshot(view.snapshot(), max_tokens)
+        }
+    }
+
     pub fn from_snapshot(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         match cfg["model_type"].as_str() {
