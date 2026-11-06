@@ -27,6 +27,16 @@ use cuteafd_core::serving_capacity::{
 /// Decode rows a hop or route exchange carries at most.
 pub const DECODE_ROWS: u64 = 64;
 
+/// Measured post-module baseline for MiMo V2.6 Flash min on SM120, rounded up
+/// to MiB: 1,179,189,248 B, 8ce4ae066, planner-mimo-close-smoke 2026-11-06.
+/// Other shapes retain their own forecast; this is not a cross-family margin.
+pub const FLASH_MIN_BASELINE_BYTES: u64 = 1_179_648_000;
+
+/// Estimated first-use CUDA/runtime growth not attributed by MiMo receipts yet.
+/// The min-card corrected peak exceeded owned + sampled baseline by 20,500,736 B;
+/// target workspaces reconcile exactly. Whole-process attribution follows #1326.
+pub const FIRST_USE_RUNTIME_BYTES: u64 = 32 << 20;
+
 fn invalid(detail: impl std::fmt::Display) -> Refusal {
     Refusal::InvalidFact(format!("MiMo component contract: {detail}"))
 }
@@ -559,6 +569,17 @@ impl Recipe for MimoRecipe<'_> {
                 rank_sets: vec![(0..self.spark_ranks as u8).collect()],
             });
         }
+        for rank in 0..self.gpus {
+            contract.components.push(Component {
+                activation: crate::placement::planner::Activation::always(),
+                bytes: ByteCurve::fixed(FIRST_USE_RUNTIME_BYTES, maximum),
+                kind: crate::placement::planner::ComponentKind::Allowance(crate::placement::planner::Allowance {
+                    location: Location::coordinator(rank as u8), bytes: FIRST_USE_RUNTIME_BYTES,
+                    lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                    source: "estimated MiMo first-use CUDA/runtime growth; #1326".into(), assumed: true,
+                }),
+            });
+        }
         // Checkpoint weights are retained for every phase; the expert arena's
         // own retained weights join them for the selected prefix only.
         for (rank, &weights) in self.resident_weights.iter().enumerate() {
@@ -706,6 +727,8 @@ pub fn resolved_capacity(admitted: &AdmittedMimo, concurrency: u32, rings: u32)
             reservations.push(MemoryReservation { name: "transport.tp2_routes".into(),
                 bytes: admitted.route[rank] });
         }
+        reservations.push(MemoryReservation { name: "runtime.first_use_estimated".into(),
+            bytes: FIRST_USE_RUNTIME_BYTES });
         let reserved = reservations.iter().try_fold(0u64, |sum, reservation|
             sum.checked_add(reservation.bytes))
             .ok_or(PlacementError::Overflow("MiMo reservations"))?;

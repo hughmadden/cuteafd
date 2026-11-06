@@ -35,7 +35,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let cfg = MimoV2Config::from_hf(&checkpoint.config).ok();
         let base = cfg.as_ref().and_then(|cfg| cfg.program_family().ok()).unwrap_or("mimo");
         let families = std::iter::once(base.to_string()).chain((ranks == 2).then(|| format!("{base}2"))).collect::<Vec<_>>();
-        let runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, total);
+        let mut runtime = runtime_item(manifest, &families, "*", ranks == 2, rank, total);
+        if ranks == 1 && base == "mimof" {
+            runtime.bytes = crate::placement::families::mimo_v2::admission::FLASH_MIN_BASELINE_BYTES;
+            runtime.basis = Basis::Calibrated;
+        }
         DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, worker_budget_bytes: 0,
             items: vec![runtime], kv_tokens: 0 }
     }).collect::<Vec<_>>();
@@ -843,6 +847,27 @@ mod tests {
         let state = |profile: &MimoCapacityProfiles| profile.steady.devices[0].reservations.iter()
             .filter(|owner| owner.name == "state.active_rings").map(|owner| owner.bytes).sum::<u64>();
         assert!(state(&native) > state(&target));
+    }
+
+    #[test]
+    fn flash_min_baseline_uses_rounded_measured_smoke_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+        let report = crate::plan::plan(dir.path(), &crate::plan::PlanOptions {
+            placement: crate::plan::ExpertPlacement::Sparks { ranks: 2 },
+            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+            ..Default::default() }).unwrap();
+        let ledger = report.phase_ledger.unwrap();
+        let baseline = &ledger.budgets.iter().find(|b| b.id == "rtx0").unwrap().baseline;
+        let crate::placement::planner::Baseline::Forecast { occupied, .. } = baseline else { panic!("forecast") };
+        assert_eq!(*occupied, 1_179_648_000);
+        let ready = ledger.phases.iter().find(|row| row.budget == "rtx0"
+            && row.phase == crate::placement::planner::Phase::Ready).unwrap();
+        assert_eq!(ready.opaque, 32 << 20);
+        let measured_owned = 94_563_217_152u64;
+        let measured_baseline = 1_179_189_248u64;
+        let corrected_peak = 95_762_907_136u64;
+        assert!(measured_owned + measured_baseline + ready.opaque >= corrected_peak);
     }
 
     #[test]
