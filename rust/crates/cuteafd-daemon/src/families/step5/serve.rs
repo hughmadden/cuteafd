@@ -265,10 +265,13 @@ fn with_backend<T>(args: &ServeArgs,
     let args = &resolved;
     args.validate()?;
     let startup = std::time::Instant::now();
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let checkpoint = Checkpoint::coordinator_view(&view, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
     cuteafd_bench::context::set_family(cfg.family_id());
-    let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let mut catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     catalog.select_draft(DraftOwnership::None)?;
     ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "Step-5 routed geometry mismatch");
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
@@ -355,7 +358,7 @@ fn with_backend<T>(args: &ServeArgs,
         spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 };
     let bootstrap = super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
-    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(checkpoint.view.as_ref().context("Step-5 Spark admission requires selected checkpoint view")?, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
+    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(&view, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?, None)?) };
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
@@ -537,6 +540,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    args.attention.selected_view = Some(view);
     args.prefix.resolve_entries(usize::from(args.max_sequences));
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
@@ -592,6 +599,18 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn serve_retains_selected_view_through_checkpoint_catalog_and_spark_admission() {
+        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("args.attention.selected_view = Some(view)"));
+        assert!(source.contains("Checkpoint::coordinator_view(&view"));
+        assert!(source.contains("read_expert_catalog_view(&view)"));
+        assert!(source.contains("SparkAdmission::plan_view(&view"));
+        assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
+        assert!(!source.contains("read_expert_catalog(&args.snapshot"));
+        assert!(!source.contains("SparkAdmission::plan(&args.snapshot"));
     }
 
     #[test]

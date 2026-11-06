@@ -457,11 +457,12 @@ pub(super) fn request(
     Ok(request)
 }
 
-fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
+fn expert_admission(args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    rows: usize, layers: &[usize])
     -> Result<(SparkWorld, TcpTransportConfig, super::experts::StepExperts)> {
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
     let metadata: Value = serde_json::from_slice(&std::fs::read(
         format.package_manifest(&packages.join("lib"))?)?)?;
@@ -484,7 +485,7 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
     let unit = args.prefill_units.unwrap_or(rows);
     let config = TcpTransportConfig::default();
     SparkAdmission::plan_view(
-        &args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?,
+        view,
         ExpertGeometry::STEP5,
         Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet {
@@ -497,7 +498,8 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
         None,
         super::serve::spark_model(&exports,
             SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: format.ingress(), partial_reply_bytes: None },
-            u64::from(args.prefill_waves), 1, config.max_frame_bytes)?, None,
+            u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
+        None,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
@@ -505,8 +507,9 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
     Ok((world, config, format))
 }
 
-fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
-    let (world, config, format) = expert_admission(args, rows, layers)?;
+fn link<'a>(device: Device<'a>, args: &GoldenArgs,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
+    let (world, config, format) = expert_admission(args, view, rows, layers)?;
     let warm = super::execution::bootstrap_shape(rows, &format)?;
     // The widest wave sizes every rank's rings and the exchange staging.
     let mut link = SparkLink::new_waves(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2, 1, u32::try_from(rows)?)?;
@@ -874,7 +877,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
     let stages = [Staging::new_for_units(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize, 1, unit)?,
         Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
-    let (world, config, format) = expert_admission(args, rows, layers)?;
+    let (world, config, format) = expert_admission(args,
+        checkpoint.view.as_ref().context("Step-5 golden requires its selected checkpoint view")?, rows, layers)?;
     let transport = devices[0].own(|| {
         let mut link = SparkLink::new_waves(&library, world, &args.peers, unit as u32,
             config, H * 2, waves, unit as u32)?;
@@ -970,18 +974,21 @@ async fn on_engine_thread(work: impl FnOnce() -> Result<()> + Send + 'static) ->
 }
 
 fn run(args: GoldenArgs) -> Result<()> {
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
     diagnostic_selection(&args)?;
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
     if args.dump_layer0.is_none() {
         selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
         // The world comes from the planner's fit for this checkpoint, not a fixed list.
-        cuteafd_loader::plan::families::step5::spark_world_admitted(&args.snapshot, &args.manifest, args.peers.len())?;
+        cuteafd_loader::plan::families::step5::spark_world_admitted_view(&view, &args.manifest, args.peers.len())?;
     }
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
     checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), &format,
         args.fp8_diagnostic_reference)?;
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
     let reference = reference(&args, cfg.vocab)?;
     if args.dump_layer0.is_some() { return layer0_run(&args, &checkpoint, &cfg, reference); }
@@ -1069,7 +1076,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         "Step-5 cold prefix admission"
     );
     let started = std::time::Instant::now();
-    let link = device.run(|| link(device, &args, rows, &layers))?;
+    let link = device.run(|| link(device, &args, &view, rows, &layers))?;
     let (remaining, _) = library.cuda_memory_info()?;
     let owners = chain_bytes + head_bytes + cache_bytes + staging_bytes + input_bytes + pending + (2u64 << 30);
     ensure!(
@@ -1188,6 +1195,18 @@ mod tests {
         ].into_iter().chain(flags.iter().copied()))?;
         let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
         Ok(args)
+    }
+
+    #[test]
+    fn golden_retains_selected_view_through_fit_and_spark_admission() {
+        let source = include_str!("golden.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("Checkpoint::coordinator_view(&view"));
+        assert!(source.contains("spark_world_admitted_view(&view"));
+        assert!(source.contains("read_expert_catalog_view(&view)"));
+        assert!(source.contains("SparkAdmission::plan_view("));
+        assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
+        assert!(!source.contains("read_expert_catalog(&args.snapshot"));
+        assert!(!source.contains("spark_world_admitted(&args.snapshot"));
     }
 
     #[test]
