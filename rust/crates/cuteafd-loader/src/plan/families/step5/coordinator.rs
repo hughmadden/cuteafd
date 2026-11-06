@@ -129,6 +129,11 @@ impl CoordinatorContract {
     pub fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self> {
         let _construction = tracing::debug_span!("step5_coordinator_contract_construction").entered();
         let model = Model::open(checkpoint)?;
+        Self::from_model(checkpoint, &model)
+    }
+
+    /// Reuse the planner's validated model instead of rebuilding its tensor contract.
+    pub(super) fn from_model(checkpoint: &Checkpoint, model: &Model) -> Result<Self> {
         let cfg: &Config = &model.cfg;
         let declarations = model
             .tensors

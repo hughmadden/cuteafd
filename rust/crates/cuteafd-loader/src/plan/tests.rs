@@ -148,6 +148,17 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn step5_catalog_reuses_open_checkpoint_inventory() {
+    let dir = families::step5::tests::exl3_snapshot();
+    let input = PlanInput::open(dir.path()).unwrap();
+    // An open input owns its immutable index; catalog construction must not reopen it.
+    std::fs::write(dir.path().join("model.safetensors.index.json"), "not JSON").unwrap();
+    let catalog = input.expert_catalog().unwrap();
+    assert!(catalog.exl3().is_some());
+    assert_eq!(catalog.routed_experts().routed_layers(), 88);
+}
+
+#[test]
 fn plan_manifest_cache_parses_each_path_once_across_candidates() {
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let input = PlanInput::open(dir.path()).unwrap();
