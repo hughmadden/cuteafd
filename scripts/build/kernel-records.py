@@ -176,16 +176,6 @@ def stage0_inputs(root, payload, capability):
                                   "rules": digest(rules_path.read_bytes())}, sort_keys=True))
 
 
-def unchanged_trace_sources(root, previous, current_inputs):
-    old_inputs = previous.get("stage0_inputs")
-    if not old_inputs or not current_inputs:
-        return False
-    if (old_inputs.get("global_sources") != current_inputs.get("global_sources")
-            or old_inputs.get("rules") != current_inputs.get("rules")):
-        return False
-    return not job_candidates(root, {**previous, "stage0_inputs": current_inputs}, current_inputs)
-
-
 def job_candidates(root, previous, current_inputs):
     if current_inputs is None or previous.get("stage0_inputs") != current_inputs:
         return ["job-global-inputs"]
@@ -276,8 +266,7 @@ class Recorder:
     retaining module-level constants without making eager unused imports global.
     """
 
-    def __init__(self, root, output, backend_cache=None, prior_records=None):
-        self.prior_records = prior_records
+    def __init__(self, root, output, backend_cache=None):
         self.backend_cache = backend_cache
         self.root = Path(root).resolve()
         self.output = Path(output)
@@ -372,8 +361,6 @@ class Recorder:
                         self.frames.add(source)
 
     def reads(self):
-        if self.prior_records is not None:
-            return {}
         paths = self.opened | self.frames
         for name in set(sys.modules) - self.imported:
             module = sys.modules.get(name)
@@ -395,16 +382,15 @@ class Recorder:
     def install(self):
         from cutlass.base_dsl.dsl import BaseDSL
         from cutlass.base_dsl.jit_executor import JitCompiledFunction
+        sys.addaudithook(self._audit)
         self.imported = set(sys.modules)
-        if self.prior_records is None:
-            sys.addaudithook(self._audit)
-            self.active = True
-            self.start_monitoring()
+        self.active = True
+        self.start_monitoring()
 
         def frontend(original):
             @functools.wraps(original)
             def wrapped(dsl, *args, **kwargs):
-                frame = sys._getframe().f_back if self.prior_records is None else None
+                frame = sys._getframe().f_back
                 while frame is not None:
                     if frame.f_code not in self.stack_codes:
                         self.stack_codes.add(frame.f_code)
@@ -481,19 +467,11 @@ class Recorder:
                    "toolchain": context["toolchain"], "environment": context["environment"],
                    "abi_sha256": abi, "build_kind": context["build_kind"],
                    "job_global_inputs": job_global_inputs(context)}
-            if self.prior_records is not None:
-                prior = self.prior_records.get(relative)
-                if prior is None or prior.get("ir_sha256") != record["ir_sha256"]:
-                    raise ValueError(f"untraced candidate IR drift: {relative}; rerun with monitoring")
-                record = {**record, "source_reads_sha256": prior["source_reads_sha256"],
-                          "source_functions": prior.get("source_functions", [])}
             records[relative] = {**record, "object_sha256": digest(blob),
                                  "cubin_sha256": [digest(image) for image in images],
                                  "resources": resources, "abi_sha256": abi,
                                  "compile_key": stable_hash(key), "compile_inputs": key,
                                  "plan": plans.get(path.stem)}
-        if self.prior_records is not None and records.keys() != self.prior_records.keys():
-            raise ValueError("untraced candidate program inventory drift; rerun with monitoring")
         (self.output / "program-records.json").write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
         return records
 

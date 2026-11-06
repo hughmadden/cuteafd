@@ -149,19 +149,6 @@ def test_stage0_candidates_require_globals_and_all_recorded_reads(tmp_path):
     assert records.job_candidates(tmp_path, {"stage0_inputs": inputs}, inputs) == ["missing-recorded-reads"]
 
 
-def test_monitoring_can_be_suppressed_only_for_unchanged_sources(tmp_path):
-    source = tmp_path / "recipe.py"
-    source.write_text("TILE = 64\n")
-    inputs = {"global_sources": {"compiler.py": "same"}, "rules": "same", "identity": "old"}
-    previous = {"stage0_inputs": inputs, "source_reads_sha256": {"recipe.py": records.digest(source.read_bytes())}}
-    current = {**inputs, "identity": "changed-env"}
-    assert records.unchanged_trace_sources(tmp_path, previous, current)
-    assert not records.unchanged_trace_sources(tmp_path, previous, {**current, "global_sources": {}})
-    source.write_text("TILE = 128\n")
-    assert not records.unchanged_trace_sources(tmp_path, previous, current)
-    assert not records.unchanged_trace_sources(tmp_path, previous, None)
-
-
 def test_monitoring_disables_repeated_code_entry_and_releases_tool(tmp_path):
     source = tmp_path / "recipe.py"
     source.write_text("def recipe():\n    return 5\n")
@@ -180,6 +167,52 @@ def test_monitoring_disables_repeated_code_entry_and_releases_tool(tmp_path):
         recorder.stop_monitoring()
     import sys
     assert sys.monitoring.get_tool(tool_id) is None
+
+
+@pytest.mark.parametrize("changed", ["args", "environment"])
+def test_changed_identity_runs_traced_with_unchanged_reads_and_ir(tmp_path, monkeypatch, changed):
+    spec = importlib.util.spec_from_file_location("traced_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    source = tmp_path / "recipe.py"
+    source.write_text("def recipe():\n    return 5\n")
+    spec = importlib.util.spec_from_file_location("changed_identity_recipe", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    previous = tmp_path / "previous"
+    directory = previous / ".workers/programs"
+    directory.mkdir(parents=True)
+    inputs = {"args": ["old"], "environment": {"MODE": "old"}}
+    context = {"stage0_inputs": inputs, "source_reads_sha256": {
+        "recipe.py": records.digest(source.read_bytes())}}
+    (directory / "comparison-context.json").write_text(json.dumps(context))
+    (directory / "program-records.json").write_text(json.dumps({"kernel.o": {"ir_sha256": "same"}}))
+    files = {str(path.relative_to(previous)): records.digest(path.read_bytes()) for path in directory.iterdir()}
+    (previous / "INPUTS.json").write_text(json.dumps({"files": files}))
+    current = {**inputs, changed: ["new"] if changed == "args" else {"MODE": "new"}}
+    monkeypatch.setattr(publisher.kernel_records, "stage0_inputs", lambda *args: current)
+    monkeypatch.setattr(publisher, "ROOT", tmp_path)
+    monkeypatch.setattr(publisher, "check_job_sm170", lambda *args, **kwargs: {})
+    observed = []
+    def compile_worker(command, **kwargs):
+        payload = json.loads(command[-1])
+        assert payload["program_records"] is True
+        assert "prior_source_records" not in payload
+        output = Path(payload["output"])
+        recorder = records.Recorder(tmp_path, output)
+        recorder.start_monitoring()
+        try:
+            assert recorder.construct(module.recipe) == 5
+            observed.append(("recipe.py", "recipe") in recorder.functions)
+        finally:
+            recorder.stop_monitoring()
+        (output / "program-records.json").write_text(json.dumps({"kernel.o": {"ir_sha256": "same"}}))
+        (output / "comparison-context.json").write_text(json.dumps(context))
+    monkeypatch.setattr(publisher.subprocess, "run", compile_worker)
+    summary = publisher.compile_job(("programs", "x.py", current["args"]),
+                                    tmp_path / "staging", previous, {}, 1)
+    assert observed == [True]
+    assert summary["execution_stats"]["stage0_skipped"] is False
 
 
 def test_job_replay_checksums_and_verify_skips_reject_ir_drift(tmp_path, monkeypatch):
