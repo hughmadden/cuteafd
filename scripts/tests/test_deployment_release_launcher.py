@@ -99,6 +99,9 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
             if entry["family"] == "mimo_v2":
+                # Explicit off reaches serve just as it reaches the planner.
+                position = before["command"].index("--embedding-placement") + 2
+                before["command"][position:position] = ["--tp2-dflash", "false"]
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
