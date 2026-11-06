@@ -120,23 +120,42 @@ class Recorder:
         self.restores = []
         self.frame_paths = {}
         self.functions = set()
-        self.seen_codes = set()
         self.imported = set()
         self.construction = False
         self.latest = []
+        self.monitoring_id = None
+
+    def _start(self, code, offset):
+        frame = sys._getframe(1)
+        self._profile(frame, "call", None)
+        return sys.monitoring.DISABLE
+
+    def start_monitoring(self):
+        for tool_id in (3, 4):
+            if sys.monitoring.get_tool(tool_id) is None:
+                sys.monitoring.use_tool_id(tool_id, "cuteafd-kernel-records")
+                self.monitoring_id = tool_id
+                break
+        if self.monitoring_id is None:
+            raise RuntimeError("no sys.monitoring tool ID available for source recording")
+        sys.monitoring.register_callback(self.monitoring_id, sys.monitoring.events.PY_START, self._start)
+        sys.monitoring.restart_events()
+        sys.monitoring.set_events(self.monitoring_id, sys.monitoring.events.PY_START)
+
+    def stop_monitoring(self):
+        if self.monitoring_id is not None:
+            sys.monitoring.set_events(self.monitoring_id, 0)
+            sys.monitoring.register_callback(self.monitoring_id, sys.monitoring.events.PY_START, None)
+            sys.monitoring.free_tool_id(self.monitoring_id)
+            self.monitoring_id = None
 
     def construct(self, function, *args, **kwargs):
         """Trace the entire recipe, including launch construction and scratch."""
-        previous = sys.getprofile()
-        self.frames, self.functions, self.seen_codes, self.opened = set(), set(), set(), set()
-        self.imported = set(sys.modules)
         self.latest = []
         self.construction = True
-        sys.setprofile(self._profile)
         try:
             return function(*args, **kwargs)
         finally:
-            sys.setprofile(previous)
             reads = self.reads()
             functions = [list(pair) for pair in sorted(self.functions)]
             for record in self.latest:
@@ -161,11 +180,10 @@ class Recorder:
                 self.functions.add((path, frame.f_code.co_qualname))
                 # Active callers can hold function-local package imports that
                 # do not execute again inside the measured constructor.
-                names = (*frame.f_code.co_names, *frame.f_code.co_varnames, *frame.f_code.co_freevars)
+                names = (*frame.f_code.co_names, *frame.f_code.co_varnames,
+                         *frame.f_code.co_freevars, *frame.f_code.co_cellvars)
                 self._record_dependencies(frame.f_locals.get(name) for name in names)
-                if frame.f_code not in self.seen_codes:
-                    self.seen_codes.add(frame.f_code)
-                    self._record_dependencies(frame.f_globals.get(name) for name in frame.f_code.co_names)
+                self._record_dependencies(frame.f_globals.get(name) for name in frame.f_code.co_names)
 
     def _record_dependencies(self, values):
         for value in values:
@@ -186,11 +204,12 @@ class Recorder:
             path = source_name(getattr(module, "__file__", None), self.root)
             if path:
                 paths.add(path)
+        active = self.active
         self.active = False
         try:
             return {path: digest((self.root / path).read_bytes()) for path in sorted(paths)}
         finally:
-            self.active = True
+            self.active = active
 
     def patch(self, cls, method, replacement):
         original = getattr(cls, method)
@@ -201,24 +220,20 @@ class Recorder:
         from cutlass.base_dsl.dsl import BaseDSL
         from cutlass.base_dsl.jit_executor import JitCompiledFunction
         sys.addaudithook(self._audit)
+        self.imported = set(sys.modules)
         self.active = True
+        self.start_monitoring()
 
         def frontend(original):
             @functools.wraps(original)
             def wrapped(dsl, *args, **kwargs):
-                if not self.construction:
-                    self.frames, self.functions, self.seen_codes, self.opened = set(), set(), set(), set()
-                    self.imported = set(sys.modules)
                 frame = sys._getframe().f_back
                 while frame is not None:
+                    # Recipe locals/closures can change between capacities even
+                    # when PY_START has already disabled this code object's event.
                     self._profile(frame, "call", None)
                     frame = frame.f_back
-                previous = sys.getprofile()
-                sys.setprofile(self._profile)
-                try:
-                    result = original(dsl, *args, **kwargs)
-                finally:
-                    sys.setprofile(previous)
+                result = original(dsl, *args, **kwargs)
                 module = result[0]
                 # Do not normalize symbols or locations: both can carry semantics.
                 self.modules[id(module)] = {
@@ -262,6 +277,7 @@ class Recorder:
         return self
 
     def finish(self, inspector, context, plans):
+        self.stop_monitoring()
         self.active = False
         for cls, method, original in reversed(self.restores):
             setattr(cls, method, original)
@@ -349,7 +365,8 @@ def numeric_deltas(old, new, prefix=""):
 
 def write_report(destination, report):
     (destination / "CHANGES.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    lines = ["# Kernel Changes", "", "Program groups are the publication's export job names.", ""]
+    lines = ["# Kernel Changes", "", "Program groups are the publication's export job names.",
+             "Source observations are cumulative within each worker; Sources lists show only changed source hashes.", ""]
     if report["leaks"]:
         lines += ["## UNEXPECTED CHANGES OUTSIDE DECLARED TARGETS", "", *[f"- `{name}`" for name in report["leaks"]], ""]
     for category in ("added", "removed", "changed"):

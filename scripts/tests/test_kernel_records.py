@@ -14,11 +14,11 @@ SPEC.loader.exec_module(records)
 
 def test_change_report_classifies_and_flags_exact_groups(tmp_path):
     old = {"programs/glmf_mhc.o": {"group": "programs", "ir_sha256": "a", "object_sha256": "x",
-        "source_reads_sha256": {"kernel.py": "old"}, "resources": [{"kernels": {"k": {"registers": 32}}}],
+        "source_reads_sha256": {"kernel.py": "old", "unchanged.py": "same"}, "resources": [{"kernels": {"k": {"registers": 32}}}],
         "scratch_bytes_at_capacity": {"64": {"workspace": 16}}},
         "exl3/old.o": {"group": "exl3/old"}}
     new = {"programs/glmf_mhc.o": {**old["programs/glmf_mhc.o"], "object_sha256": "y",
-        "source_reads_sha256": {"kernel.py": "new"}, "resources": [{"kernels": {"k": {"registers": 40}}}],
+        "source_reads_sha256": {"kernel.py": "new", "unchanged.py": "same"}, "resources": [{"kernels": {"k": {"registers": 40}}}],
         "scratch_bytes_at_capacity": {"64": {"workspace": 32}}},
         "exl3/new.o": {"group": "exl3/new"}}
     report = records.change_report(old, new, ["programs"])
@@ -30,7 +30,10 @@ def test_change_report_classifies_and_flags_exact_groups(tmp_path):
     assert changed["scratch_deltas"]["64.workspace"]["delta"] == 16
     assert report["leaks"] == ["exl3/new.o", "exl3/old.o"]
     records.write_report(tmp_path, report)
-    assert "UNEXPECTED CHANGES" in (tmp_path / "CHANGES.md").read_text()
+    markdown = (tmp_path / "CHANGES.md").read_text()
+    assert "UNEXPECTED CHANGES" in markdown
+    assert "cumulative" in markdown and "Sources: kernel.py." in markdown
+    assert "unchanged.py" not in markdown
     assert json.loads((tmp_path / "CHANGES.json").read_text()) == report
 
 
@@ -100,8 +103,12 @@ def test_construct_captures_recipe_and_scratch_callback_sources(tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     recorder = records.Recorder(tmp_path, tmp_path / "output")
-    assert recorder.construct(module.construct) == 5
-    assert "recipe.py" in recorder.reads()
+    recorder.start_monitoring()
+    try:
+        assert recorder.construct(module.construct) == 5
+        assert "recipe.py" in recorder.reads()
+    finally:
+        recorder.stop_monitoring()
 
 
 def test_local_package_policy_is_a_recorded_input(tmp_path):
@@ -136,3 +143,163 @@ def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
     assert records.change_report({"k": {}}, {"k": {}})["changed"] == []
+
+
+@pytest.fixture
+def fake_cutlass(monkeypatch):
+    import sys
+    import types
+    class JitCompiledFunction:
+        def export_to_c(self, file_path, file_name, function_prefix=""):
+            (Path(file_path) / (file_name + ".o")).write_bytes(cuda_elf())
+    class BaseDSL:
+        def generate_original_ir(*args, **kwargs):
+            return ("same IR",)
+        def compile_and_cache(*args, **kwargs):
+            return JitCompiledFunction()
+    for name in ("cutlass", "cutlass.base_dsl", "cutlass.base_dsl.dsl", "cutlass.base_dsl.jit_executor"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules["cutlass.base_dsl.dsl"].BaseDSL = BaseDSL
+    sys.modules["cutlass.base_dsl.jit_executor"].JitCompiledFunction = JitCompiledFunction
+    return BaseDSL
+
+
+def load_recipe(path, text):
+    path.write_text(text)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def stop_recorder(recorder):
+    recorder.stop_monitoring()
+    recorder.active = False
+    for cls, method, original in reversed(recorder.restores):
+        setattr(cls, method, original)
+
+
+@pytest.mark.parametrize("binding", ["local", "global", "cell"])
+def test_each_program_rescans_recipe_tuning_modules(tmp_path, monkeypatch, fake_cutlass, binding):
+    import sys
+    import types
+    bodies = {
+        "local": "def recipe(policy, compile):\n    return compile(None)\n",
+        "global": "def recipe(unused, compile):\n    return compile(policy)\n",
+        "cell": "def recipe(value, compile):\n    policy = value\n    def closure():\n        return policy\n    return compile(None)\n",
+    }
+    recipe_module = load_recipe(tmp_path / "recipe.py", bodies[binding])
+    policies = []
+    for name in ("tuning_a", "tuning_b"):
+        path = tmp_path / (name + ".py")
+        path.write_text("TILE = 64\n")
+        policy = types.ModuleType(name)
+        policy.__file__ = str(path)
+        monkeypatch.setitem(sys.modules, name, policy)
+        policies.append(policy)
+    del policy
+    recorder = records.Recorder(tmp_path, tmp_path / "output").install()
+    try:
+        recipe_module.policy = policies[0]
+        recipe_module.recipe(policies[0], fake_cutlass.generate_original_ir)
+        first = next(iter(recorder.modules.values()))["source_reads_sha256"]
+        assert "tuning_a.py" in first and "tuning_b.py" not in first
+        recipe_module.policy = policies[1]
+        recipe_module.recipe(policies[1], fake_cutlass.generate_original_ir)
+        second = next(iter(recorder.modules.values()))["source_reads_sha256"]
+        assert "tuning_b.py" in second
+        assert "tuning_a.py" in second  # Program records are conservative cumulative observations.
+        assert {"tuning_a.py", "tuning_b.py"} <= recorder.reads().keys()
+    finally:
+        stop_recorder(recorder)
+
+
+def test_monitoring_restart_observes_same_code_in_later_recorder(tmp_path):
+    module = load_recipe(tmp_path / "recipe.py", "def recipe():\n    return 5\n")
+    for _ in range(2):
+        recorder = records.Recorder(tmp_path, tmp_path / "output")
+        recorder.start_monitoring()
+        try:
+            assert recorder.monitoring_id in (3, 4)
+            assert module.recipe() == 5
+            assert "recipe.py" in recorder.reads()
+        finally:
+            recorder.stop_monitoring()
+
+
+def test_monitoring_disables_repeated_code_entry_and_releases_tool(tmp_path):
+    source = tmp_path / "recipe.py"
+    source.write_text("def recipe():\n    return 5\n")
+    spec = importlib.util.spec_from_file_location("one_shot_recipe", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.start_monitoring()
+    tool_id = recorder.monitoring_id
+    try:
+        assert module.recipe() == 5
+        recorder.frames.clear()
+        assert module.recipe() == 5
+        assert "recipe.py" not in recorder.frames
+    finally:
+        recorder.stop_monitoring()
+    import sys
+    assert sys.monitoring.get_tool(tool_id) is None
+
+
+@pytest.fixture
+def fake_worker(tmp_path, monkeypatch, fake_cutlass):
+    import importlib.metadata
+    import sys
+    import types
+    spec = importlib.util.spec_from_file_location("installed_worker", ROOT / "scripts/build/compare-sm-exports.py")
+    worker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(worker)
+    monkeypatch.setattr(worker, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    for name in ("b12x", "b12x._lib", "b12x._lib.compile_pool", "b12x._lib.compiler",
+                 "b12x.integration", "b12x.integration.cuteafd", "_pinned_sparkinfer", "torch"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules["b12x._lib.compile_pool"]._initialize_worker = lambda *args: None
+    sys.modules["b12x._lib.compiler"].b12x_package_fingerprint = lambda: None
+    class AotProgram:
+        def export_to_c(*args, **kwargs):
+            pass
+    sys.modules["b12x.integration.cuteafd"].AotProgram = AotProgram
+    sys.modules["_pinned_sparkinfer"].REVISION = "pin"
+    sys.modules["_pinned_sparkinfer"].LOCK_DATA = {"source_tree_sha256": "tree"}
+    sys.modules["torch"].cuda = types.SimpleNamespace(
+        get_device_properties=lambda ordinal: types.SimpleNamespace(multi_processor_count=188),
+        is_initialized=lambda: False)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "fake")
+    monkeypatch.setattr(worker, "load_file", lambda name, path:
+                        records if name == "placement_kernel_records" else types.SimpleNamespace(
+                            cuda_images=lambda blob: [(0, blob)]))
+    exporter = tmp_path / "python/tools/aot/x.py"
+    exporter.parent.mkdir(parents=True)
+    exporter.write_text("# Fake backend; real worker and recorder install.\n")
+    recipe = load_recipe(tmp_path / "recipe.py", "def recipe(compile, output):\n    ir = compile.generate_original_ir(None)[0]\n    result = compile.compile_and_cache(None, ir)\n    result.export_to_c(output, 'kernel')\n")
+    after = load_recipe(tmp_path / "after.py", "def validate():\n    return 7\n")
+    def run_path(*args, **kwargs):
+        assert worker.PROGRAM_RECORDER.monitoring_id in (3, 4)
+        recipe.recipe(fake_cutlass, worker.PROGRAM_RECORDER.output)
+        assert after.validate() == 7
+    monkeypatch.setattr(worker.runpy, "run_path", run_path)
+    def run(payload):
+        try:
+            worker.worker(payload)
+        finally:
+            if worker.PROGRAM_RECORDER is not None:
+                stop_recorder(worker.PROGRAM_RECORDER)
+                worker.PROGRAM_RECORDER = None
+    return run
+
+
+def test_job_reads_include_helpers_after_last_program(tmp_path, fake_worker):
+    output = tmp_path / "output"
+    output.mkdir()
+    fake_worker({"sms": 188, "exporter": "x.py", "args": [],
+                 "output": str(output), "program_records": True})
+    summary = json.loads((output / "comparison-context.json").read_text())
+    assert {"recipe.py", "after.py"} <= summary["source_reads_sha256"].keys()

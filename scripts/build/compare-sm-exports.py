@@ -724,6 +724,7 @@ def worker(payload):
     if recorder is not None:
         inspector = load_file("placement_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
         recorder.finish(inspector, summary, plans)
+        summary["source_reads_sha256"] = recorder.reads()
     (Path(payload["output"]) / "comparison-context.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
