@@ -248,7 +248,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let view = config.attention.select(&config.snapshot)?;
     let inventory = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
-    config.attention.validate_family(family)?;
+    config.attention.validate_view(&view)?;
     let v41 = family == "deepseek_v41";
     let mut catalog = if v41 {
         cuteafd_loader::read_official_v41_spark_catalog(&config.snapshot, config.rank, config.world)?

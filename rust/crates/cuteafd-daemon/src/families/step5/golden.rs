@@ -1466,6 +1466,7 @@ mod tests {
             .collect::<Vec<_>>();
         std::fs::write(folder.join("layer87.bin"), &bytes)?;
         let mut args = GoldenArgs {
+            attention: Default::default(),
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             snapshot: root.path().into(),
             native_lib: None,
@@ -1531,6 +1532,7 @@ mod tests {
             .flat_map(f32::to_le_bytes).collect::<Vec<_>>();
         std::fs::write(folder.join("logits.bin"), &logits)?;
         let mut args = GoldenArgs {
+            attention: Default::default(),
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
             peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None,  poison_scratch: false, check_headers: true, nll: true, prefix_state: false,
