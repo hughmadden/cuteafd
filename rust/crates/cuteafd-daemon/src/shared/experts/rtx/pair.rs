@@ -197,27 +197,27 @@ struct Broadcast {
 }
 
 /// A complete routed owner on one stream, without peer routes or reduction storage.
-pub(crate) struct Whole<'a> {
+pub(crate) struct Whole<'a, C = WholeCombine<'a>> {
     pub layers: Vec<usize>,
     backend: RefCell<Box<dyn RtxExpertLayer + 'a>>,
-    add: cuteafd_ffi::Bf16Add<'a>,
+    add: C,
     device: i32,
     hidden: usize,
     max_rows: usize,
 }
 
+pub(crate) enum WholeCombine<'a> {
+    Bf16(cuteafd_ffi::Bf16Add<'a>),
+    F32(cuteafd_ffi::RtxTp2Combine<'a>),
+}
+
 impl<'a> Whole<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, device: i32,
         backend: Box<dyn RtxExpertLayer + 'a>, hidden: usize, max_rows: usize) -> Result<Self> {
-        ensure!(backend.shard() == RtxShard::Whole && backend.device() == device
-            && backend.partial() == PartialDtype::Bf16
-            && backend.partial_layout(max_rows)? == super::PartialLayout::Tokens,
-            "whole routed owner requires device-local BF16 token sums");
-        let layers = backend.layers().to_vec();
-        ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1])
-            && hidden > 0 && max_rows > 0, "invalid whole routed extent");
-        Ok(Self { layers, backend: RefCell::new(backend), add: library.bf16_add()?,
-            device, hidden, max_rows })
+        Self::bind(device, backend, hidden, max_rows, |dtype| Ok(match dtype {
+            PartialDtype::Bf16 => WholeCombine::Bf16(library.bf16_add()?),
+            PartialDtype::F32 => WholeCombine::F32(library.rtx_tp2_combine()?),
+        }))
     }
 
     pub(crate) fn uses_fp8_input(&self) -> bool { self.backend.borrow().uses_fp8_input() }
@@ -241,9 +241,30 @@ impl<'a> Whole<'a> {
         // consumes the result before any subsequent enqueue can reuse its scratch.
         unsafe {
             backend.enqueue(layer, rows, input, routes, stream, abort)?;
-            self.add.launch(CuteafdDeviceBuffer { ptr: backend.output(), bytes: count * 2,
-                device_id: self.device, flags: 0 }, shared, output, count, stream)
+            match &self.add {
+                WholeCombine::Bf16(add) => add.launch(CuteafdDeviceBuffer {
+                    ptr: backend.output(), bytes: count * 2, device_id: self.device, flags: 0 },
+                    shared, output, count, stream),
+                // Native EXL3 retains FP32 routed sums until the single BF16
+                // shared+routed boundary; no conversion arena or extra rounding.
+                WholeCombine::F32(add) => add.partial(backend.output().cast(), shared.ptr.cast(),
+                    output.ptr, count, ExchangeDtype::Bf16, stream),
+            }
         }
+    }
+}
+
+impl<'a, C> Whole<'a, C> {
+    fn bind(device: i32, backend: Box<dyn RtxExpertLayer + 'a>, hidden: usize, max_rows: usize,
+        combine: impl FnOnce(PartialDtype) -> Result<C>) -> Result<Self> {
+        ensure!(backend.shard() == RtxShard::Whole && backend.device() == device
+            && backend.partial_layout(max_rows)? == super::PartialLayout::Tokens,
+            "whole routed owner requires device-local token sums");
+        let layers = backend.layers().to_vec();
+        ensure!(!layers.is_empty() && layers.windows(2).all(|pair| pair[0] < pair[1])
+            && hidden > 0 && max_rows > 0, "invalid whole routed extent");
+        let add = combine(backend.partial())?;
+        Ok(Self { layers, backend: RefCell::new(backend), add, device, hidden, max_rows })
     }
 }
 
@@ -1262,6 +1283,33 @@ impl SubmissionOwners for TestSubmission<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_executor_binds_nonzero_native_f32_and_bf16_prefixes() -> anyhow::Result<()> {
+        use super::*;
+        struct Backend(PartialDtype, super::super::PartialLayout);
+        impl RtxExpertLayer for Backend {
+            fn shard(&self) -> RtxShard { RtxShard::Whole }
+            fn partial(&self) -> PartialDtype { self.0 }
+            fn partial_layout(&self, _: usize) -> Result<super::super::PartialLayout> { Ok(self.1) }
+            fn uses_fp8_input(&self) -> bool { true }
+            fn layers(&self) -> &[usize] { &[3, 4] }
+            fn device(&self) -> i32 { 0 }
+            fn workspace_bytes(&self) -> usize { 4096 }
+            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
+            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
+                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
+        }
+        for dtype in [PartialDtype::F32, PartialDtype::Bf16] {
+            let backend = Box::new(Backend(dtype, super::super::PartialLayout::Tokens));
+            let owner = Whole::bind(0, backend, 6144, 64, Ok)?;
+            assert_eq!(owner.layers, [3, 4]);
+            assert_eq!(owner.add, dtype, "bind the combine for the backend's real output dtype");
+        }
+        let routes = Box::new(Backend(PartialDtype::F32, super::super::PartialLayout::Routes { topk: 8 }));
+        assert!(Whole::bind(0, routes, 6144, 64, Ok).is_err());
+        Ok(())
+    }
+
     /// GLM's legacy pair keeps its exact behavior: rank 0 publishes routes only
     /// when the route check selected broadcast, slots carry no wire, and the
     /// generalized source broadcast reduces to the same push, wait and signal.

@@ -1055,6 +1055,38 @@ mod tests {
     }
 
     #[test]
+    fn ml4_world_one_exl3_uses_its_own_namespace_and_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        crate::plan::testing::write_mistral_large4_snapshot(&snapshot, Some(&[1]), true);
+        let catalog = crate::read_expert_catalog(&snapshot).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&crate::plan::checkpoint::read_json(&snapshot.join("config.json")).unwrap()).unwrap();
+        let tiers = catalog.exl3().unwrap().decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        let root = dir.path().join(format!("exl3/exl3-ml4-k{tiers}/rtx-tp1"));
+        for capacity in [1, 16, 80] {
+            let package = root.join(format!("m{capacity}"));
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("v41_exl3.json"), serde_json::json!({
+                "hidden": cfg.hidden, "intermediate": cfg.moe_intermediate, "experts": cfg.experts,
+                "top_k": cfg.topk, "capacity": capacity, "bits": catalog.exl3().unwrap().decoder_tiers(),
+                "output_dtype": "fp32", "input_format": "e4m3_k32", "direct": true,
+                "trellis_lut": {"file": "lut.bin", "bytes": 32},
+                "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * 64,
+                    "dtype": "f32", "zero_on_create": false}}
+            }).to_string()).unwrap();
+        }
+        let local = select_local_inventory(&cfg, &catalog, &dir.path().join("PROGRAMS.json"),
+            2, 1, 64, 3, false, Onboard::Auto, false, None).unwrap().unwrap();
+        assert_eq!(local.package, root);
+        assert_eq!(local.world, 1);
+        assert_eq!((cfg.moe_intermediate, cfg.experts, cfg.topk), (6144, 128, 4));
+        assert_eq!(local.experts[0].whole.resident, catalog.exl3().unwrap()
+            .residency(crate::V41Exl3Layer::Backbone(1), 1, 0).unwrap()
+            .device_arena_layout().unwrap().1 as u64);
+    }
+
+    #[test]
     fn local_inventory_charges_all_retained_capacities_and_exact_rank_storage() {
         let (_dir, catalog, manifest) = local_fixture();
         let cfg = glm_cfg();
