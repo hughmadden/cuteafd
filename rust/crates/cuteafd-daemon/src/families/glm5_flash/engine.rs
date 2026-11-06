@@ -5754,7 +5754,14 @@ mod prefill_lane_tests {
             // and preserves the wide tile. #250 selects bitwise-equal direct E4M3 widening
             // only for M16 outputs and a 2x2 TP2 q_b grid only at M64: the same MMAs,
             // K/fold order and FP32 accumulation; routes and capacity thresholds stay fixed.
-            ("integration/cuteafd/_fp8_weights.py", 0x378d51cc754cae80_u64),
+            // Fork #252 selects NcMmaFp8Gemv for full HQA q_b (2 warps, 1 group,
+            // 4 tiles) and o (4 warps, 2 groups, 2 tiles) at M17..64; TP2 o keeps
+            // the base kernel. Shipped K splits, thresholds and row-scale routes stay fixed.
+            ("integration/cuteafd/_fp8_weights.py", 0xcc76ce5ed134d682_u64),
+            // The #252 NC rewrite preserves scaled BF16 operands, per-warp K/MMA order,
+            // FP32 accumulation and ascending-warp fold. It changes load/prefetch scheduling,
+            // grid order and vectorized fold/store pairs, not per-output arithmetic.
+            ("integration/cuteafd/_fp8_gemv_nc.py", 0x0fab72d50aa7cf81_u64),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
