@@ -188,8 +188,11 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             }
         }
     }
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(
+    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(
         if core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] }, programs.names());
+    selected.names.extend(native_exports.programs.iter().cloned());
+    selected.names.sort();
+    selected.names.dedup();
     for (rank, sample) in inventory.gpus.iter().enumerate() {
         let pending = crate::shared::inventory::pending_code(library, sample.device, rank, RANKS == 2,
             "kimik3", "exl3", &selected)?;

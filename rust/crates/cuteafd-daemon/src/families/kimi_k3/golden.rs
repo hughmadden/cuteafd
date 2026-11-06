@@ -214,7 +214,10 @@ fn run(args: GoldenArgs) -> Result<()> {
     let panel: Value = serde_json::from_slice(&std::fs::read(args.windows.as_ref().context("prefix requires --windows")?)?)?;
     let reference = reference(args.reference_state.as_deref().context("prefix requires --reference-state")?,
         &panel, args.window.as_deref().context("prefix requires --window")?, last)?;
-    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
     println!("Kimi run provenance: {}", args.selected_provenance(checkpoint.view.as_ref()
         .context("Kimi golden requires the immutable selected checkpoint view")?));
     let full = KimiK3Config::from_hf(&checkpoint.config)?;
@@ -255,7 +258,10 @@ fn full_reference(args: &GoldenArgs) -> Result<Vec<cuteafd_bench::reference::Win
 
 fn full_run(args: GoldenArgs) -> Result<()> {
     let windows = full_reference(&args)?;
-    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
