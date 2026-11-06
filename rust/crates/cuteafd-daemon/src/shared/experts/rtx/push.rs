@@ -15,6 +15,14 @@ use cuteafd_loader::{push_load::{builder::CheckedPlan, PushHostEnvelope}, Offici
 pub(crate) fn load_alone<'a, T>(snapshot: &std::path::Path,
     devices: &[crate::shared::memory::device::Device<'a>],
     load: impl FnOnce() -> Result<T>) -> Result<T> {
+    load_alone_admitted(snapshot, devices, None, load)
+}
+
+/// [`load_alone`] whose group host owners (`envelope`) a recipe already charged:
+/// the exact recorded owners must fit it before any ring or staging allocation.
+pub(crate) fn load_alone_admitted<'a, T>(snapshot: &std::path::Path,
+    devices: &[crate::shared::memory::device::Device<'a>], envelope: Option<PushHostEnvelope>,
+    load: impl FnOnce() -> Result<T>) -> Result<T> {
     use super::dense;
     let policy = PushPolicy::for_snapshot(snapshot)?;
     if policy == PushPolicy::Mount { return load(); }
@@ -22,7 +30,7 @@ pub(crate) fn load_alone<'a, T>(snapshot: &std::path::Path,
         let (owners, records) = dense::recording(load)?;
         let (operands, steps) = (records.operands.len(), records.steps.len());
         let dense = dense::plan_records(snapshot, records, devices, 0)?;
-        let push = CoordinatorPush::prepare_alone(snapshot, None, devices.len(), None)?;
+        let push = CoordinatorPush::prepare_alone_with_host(snapshot, None, devices.len(), None, None, envelope)?;
         Ok((owners, push, dense, operands, steps))
     }).context("standalone coordinator dense push planning")?
         .context("required dense group was not planned")?;

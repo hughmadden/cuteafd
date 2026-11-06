@@ -15,6 +15,78 @@ pub struct ProcessOwners {
     pub media_cache_bytes: u64,
     pub alternate_resident: Option<Vec<GlmfResidentRank>>,
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
+    /// The drafter's standalone push group, after the target group has committed.
+    pub draft_push: Option<DraftPush>,
+}
+
+/// Owners of the drafter's standalone coordinator push group (draft loading only):
+/// its pinned receive ring and staged FP8 pack windows, and the drafter GPU's
+/// one-step device scratch the W8A16 packs read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftPush {
+    pub host: crate::push_load::PushHostEnvelope,
+    pub device_scratch: u64,
+}
+
+impl DraftPush {
+    /// Header-only, or None outside a push namespace. Every staged step is one
+    /// contiguous row window of one file, none overlapping, so the runtime
+    /// `HostStaging` bound is min(total, ring windows + one frontier step).
+    pub fn for_snapshot(snapshot: &std::path::Path, config: &serde_json::Value,
+        representation: crate::families::glm5::draft_representation::GlmDraftRepresentation)
+        -> anyhow::Result<Option<Self>> {
+        use anyhow::Context;
+        match crate::push_load::namespace(snapshot) {
+            Ok(_) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && error.raw_os_error().is_none() && snapshot.exists() => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let slots = cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64;
+        let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
+        let step = crate::shared::dense_read::STEP_BYTES as u64;
+        let fp8 = representation == crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only;
+        let matrices = if fp8 { draft_matrix_bytes(config)? } else { Vec::new() };
+        let total = matrices.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
+            .context("Flash draft push staging overflow")?;
+        let largest = matrices.iter().copied().max().unwrap_or(0).min(step);
+        let window = slot.checked_add(2 * largest).and_then(|n| n.checked_mul(slots))
+            .and_then(|n| n.checked_add(largest)).context("Flash draft push staging overflow")?;
+        Ok(Some(Self { host: crate::push_load::PushHostEnvelope::new(vec![0], vec![total.min(window)], slots, slot)?,
+            device_scratch: if fp8 { step } else { 0 } }))
+    }
+
+    /// Recipe owners on draft home `gpu`, alive only while the drafter loads.
+    pub fn allocations(&self, gpu: u8) -> Result<Vec<p::Allocation>, p::Refusal> {
+        let lifetime = p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::DraftLoad };
+        let mut owners = self.host.allocations(&format!("glmf.draft.push.{gpu}"))?;
+        for owner in &mut owners { owner.lifetime = lifetime; }
+        if self.device_scratch > 0 {
+            owners.push(p::Allocation::buffer(format!("glmf.draft.push.scratch.{gpu}"), p::Location::coordinator(gpu),
+                self.device_scratch, lifetime, Category::Staging, "draft push step scratch"));
+        }
+        Ok(owners)
+    }
+}
+
+/// BF16 source bytes of each FP8-packed drafter matrix (concatenated parts together).
+fn draft_matrix_bytes(config: &serde_json::Value) -> anyhow::Result<Vec<u64>> {
+    use crate::families::glm5::draft_representation::{draft_geometry, is_dspark};
+    let shapes = if is_dspark(config) {
+        let c = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
+        let (h, q, kv, inter) = (c.hidden, c.heads * c.head_dim, c.kv_heads * c.head_dim, c.intermediate);
+        let layer = [(h, q + 2 * kv), (q, h), (h, 2 * inter), (inter, h)];
+        std::iter::once((c.taps.len() * h, h)).chain((0..c.layers).flat_map(|_| layer)).collect::<Vec<_>>()
+    } else {
+        let (g, _) = draft_geometry(config).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let (h, q, kv) = (g.hidden as usize, (g.heads * g.head_dim) as usize, (g.kv_heads * g.head_dim) as usize);
+        let (conv, inter) = (4 * h / g.conv_group as usize, g.intermediate as usize);
+        let layer = [(h, conv), (h, conv), (h, q + 2 * kv), (q, h), (h, 2 * inter), (inter, h)];
+        [(g.taps as usize * h, h), (h, g.selector_rank as usize)].into_iter()
+            .chain((0..g.layers).flat_map(|_| layer)).collect()
+    };
+    shapes.into_iter().map(|(k, n)| k.checked_mul(n).and_then(|n| n.checked_mul(2))
+        .map(|bytes| bytes as u64).ok_or_else(|| anyhow::anyhow!("Flash draft matrix overflow"))).collect()
 }
 
 /// The same native reader extents are checked by the admitted executor.
@@ -107,7 +179,8 @@ impl NativeLoad {
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
         Self { host, host_headroom, allocations: vec![], links: vec![], native_load: None,
-            encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None }
+            encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
+            draft_push: None }
     }
 
     pub fn serving(&mut self, i: &GlmfInputs<'_>, quota: u64, chunk: u64, host_embedding: u64,
@@ -586,6 +659,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         let homes = if i.drafter_bridge.is_some() { vec![0, 1] } else { vec![0] };
         let variable = contract.variables.len();
         contract.variables.push(p::Variable::DraftHome(homes.clone()));
+        let (draft_variable, draft_homes) = (variable, homes.clone());
         for (option, gpu) in homes.into_iter().enumerate() {
             let activation = p::Activation::choice(variable, option);
             add_demand(&mut contract, &Demand::new(gpu, Category::Drafter, "DFlash", i.drafter_bytes,
@@ -602,6 +676,17 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             if let p::ComponentKind::Allocation { template, .. } = &mut owner.kind {
                 if template.id.starts_with("glmf.draft.") {
                     template.lifetime = p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth };
+                }
+            }
+        }
+        // After the resident lifetime above: these owners die when the drafter group commits.
+        if let Some(draft) = &process.draft_push {
+            for (option, gpu) in draft_homes.into_iter().enumerate() {
+                for owner in draft.allocations(gpu)? {
+                    let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
+                    let mut owner = p::Component::allocation(owner, bytes, false, maximum);
+                    owner.activation = p::Activation::choice(draft_variable, option);
+                    contract.components.push(owner);
                 }
             }
         }
@@ -774,6 +859,51 @@ mod tests {
         plan.set = ExpertSet::Routed;
         assert!(admitted.validate_shared(std::slice::from_ref(&plan)).is_err());
         assert!(admitted.validate_shared(&[]).is_err());
+    }
+
+    #[test]
+    fn draft_push_owners_charge_draft_loading_only_on_the_selected_home() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let input = crate::placement::families::glm5_flash::tests::inputs(&cfg, 1, 96 << 30);
+        let host = crate::push_load::PushHostEnvelope::new(vec![0], vec![6 << 20], 128, 1 << 20).unwrap();
+        let draft = DraftPush { host: host.clone(), device_scratch: 32 << 20 };
+        let solve = |push: Option<DraftPush>| {
+            let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            process.draft_push = push;
+            prepare(&input, 188, true, process).unwrap().admit().unwrap().solved
+        };
+        let (mount, pushed) = (solve(None), solve(Some(draft.clone())));
+        let owners = pushed.facts.allocations.iter().filter(|a| a.id.starts_with("glmf.draft.push.")).collect::<Vec<_>>();
+        assert!(mount.facts.allocations.iter().all(|a| !a.id.starts_with("glmf.draft.push.")));
+        assert_eq!(owners.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["glmf.draft.push.0.0.ring", "glmf.draft.push.0.0.dense", "glmf.draft.push.scratch.0"]);
+        let draft_load = p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::DraftLoad };
+        assert!(owners.iter().all(|a| a.lifetime == draft_load));
+        let host_bytes = host.bytes().unwrap();
+        assert_eq!(owners.iter().filter(|a| a.location == p::Location::PINNED).map(|a| a.bytes).sum::<u64>(), host_bytes);
+        let phase = |plan: &p::ResolvedPlan, budget: &str, phase| plan.phases.iter()
+            .find(|row| row.budget == budget && row.phase == phase).map(|row| row.owned).unwrap();
+        assert_eq!(phase(&pushed, "coordinator host RAM", p::Phase::DraftLoad),
+            phase(&mount, "coordinator host RAM", p::Phase::DraftLoad) + host_bytes);
+        for at in [p::Phase::Load, p::Phase::Ready] {
+            assert_eq!(phase(&pushed, "coordinator host RAM", at), phase(&mount, "coordinator host RAM", at));
+        }
+        // A BF16 drafter stages nothing; FP8 packs read one bounded device window.
+        let bf16 = DraftPush { host: crate::push_load::PushHostEnvelope::new(vec![0], vec![0], 128, 1 << 20).unwrap(),
+            device_scratch: 0 };
+        assert!(bf16.allocations(0).unwrap().iter().all(|a| !a.id.contains("scratch") && !a.id.ends_with(".dense")));
+    }
+
+    #[test]
+    fn flash_draft_matrices_bound_their_fp8_pack_windows() {
+        let dflash: serde_json::Value = serde_json::json!({"hidden_size": 4096, "intermediate_size": 12288,
+            "num_hidden_layers": 5, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+            "vocab_size": 154880, "dflash_config": {"target_layer_ids": [1, 2, 3, 4, 5], "conv_group_size": 16,
+                "selector_rank": 256, "block_size": 8}});
+        let matrices = draft_matrix_bytes(&dflash).unwrap();
+        assert_eq!(matrices.len(), 2 + 5 * 6);
+        assert_eq!(matrices[0], 5 * 4096 * 4096 * 2);
+        assert_eq!(*matrices.iter().max().unwrap(), 4096 * 2 * 12288 * 2);
     }
 
     #[test]

@@ -568,7 +568,7 @@ pub fn calibrate_local_tp2_graphs(graphs: &mut GraphSet) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -600,7 +600,7 @@ mod tests {
             rank as u8, Category::Workspace, "steps", bytes, Basis::Formula)).collect()
     }
 
-    fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
+    pub(crate) fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
         let context = ArchContext::coordinator(capacity, None).context_bytes;
         GlmfInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
             attention: Default::default(), cfg, layers: cfg.layers,
