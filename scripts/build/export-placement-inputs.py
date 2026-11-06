@@ -123,8 +123,37 @@ def reusable_workers(previous, staging, jobs, sources, lock):
     return metadata
 
 
-def publish(destination, staging, timeout, workers, reuse_workers=None, previous=None, expect=None):
+def verified_job_files(previous, name):
+    metadata = json.loads((previous / "INPUTS.json").read_text())
+    prefix = ".workers/" + name + "/"
+    files = {path[len(prefix):]: checksum for path, checksum in metadata["files"].items()
+             if path.startswith(prefix)}
+    if not files:
+        return None
+    directory = previous / ".workers" / name
+    for relative, checksum in files.items():
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts or compare.sha((directory / path).read_bytes()) != checksum:
+            raise ValueError(f"invalid or corrupt replay file: {name}/{relative}")
+    return directory, files
+
+
+def refresh_replay_provenance(directory, lock):
+    for path in directory.rglob("*.json"):
+        data = json.loads(path.read_text())
+        if isinstance(data, dict) and "sparkinfer_revision" in data:
+            data["sparkinfer_revision"] = lock["revision"]
+            if "source_tree_sha256" in data:
+                data["source_tree_sha256"] = lock["source_tree_sha256"]
+            path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def publish(destination, staging, timeout, workers, reuse_workers=None, previous=None, expect=None,
+            backend_cache=None, verify_skips=False):
     filesystem = compare.load_file("placement_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
+    if backend_cache:
+        filesystem.check_path(str(backend_cache))
+    verify_skips = verify_skips or os.environ.get("CUTEAFD_BUILD_KIND") == "release"
     for path in (destination, staging):
         filesystem.check_path(str(path))
         if path.exists() and any(path.iterdir()) and not (reuse_workers and path == staging):
@@ -141,6 +170,24 @@ def publish(destination, staging, timeout, workers, reuse_workers=None, previous
         output = staging / name
         output.mkdir(parents=True)
         payload = dict(sms=188, exporter=exporter, args=extra, output=str(output), program_records=True)
+        if backend_cache:
+            payload["backend_cache"] = str(backend_cache)
+        prior = verified_job_files(report_previous, name) if report_previous else None
+        skipped = False
+        if prior:
+            prior_directory, prior_files = prior
+            prior_context = json.loads((prior_directory / "comparison-context.json").read_text())
+            current_inputs = kernel_records.stage0_inputs(ROOT, payload, (12, 0))
+            triggers = kernel_records.job_candidates(ROOT, prior_context, current_inputs)
+            print(f"Placement job {name}: candidate triggers={triggers}", flush=True)
+            skipped = not triggers
+            if skipped and not verify_skips:
+                for relative in prior_files:
+                    target = output / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(prior_directory / relative, target)
+                refresh_replay_provenance(output, lock)
+                return json.loads((output / "comparison-context.json").read_text())
         env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
                    CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
                    CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
@@ -149,6 +196,12 @@ def publish(destination, staging, timeout, workers, reuse_workers=None, previous
             subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
                             "--_worker", json.dumps(payload)], env=env, stdout=log,
                            stderr=subprocess.STDOUT, check=True, timeout=timeout)
+        if skipped:
+            old_records = json.loads((prior_directory / "program-records.json").read_text())
+            new_records = json.loads((output / "program-records.json").read_text())
+            if ({key: record["ir_sha256"] for key, record in old_records.items()}
+                    != {key: record["ir_sha256"] for key, record in new_records.items()}):
+                raise ValueError(f"--verify-skips changed IR in skipped job {name}")
         return json.loads((output / "comparison-context.json").read_text())
 
     report_previous = previous
@@ -186,6 +239,14 @@ def publish(destination, staging, timeout, workers, reuse_workers=None, previous
                 for layout, capacities in layouts.items()}}
             target.mkdir(parents=True)
             (target / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    # Preserve only the exact metadata needed to replay a job, not heavy objects.
+    for name, _, _ in jobs:
+        for source in (staging / name).rglob("*.json"):
+            if source.name == "export.log":
+                continue
+            target = destination / ".workers" / name / source.relative_to(staging / name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
     records = publication_records(staging, jobs)
     if records:
         programs_path = destination / "PROGRAMS.json"
@@ -271,6 +332,8 @@ def main():
                         help="verified prior publication; reuse its exact retained --staging worker outputs")
     parser.add_argument("--previous", type=Path, help="previous publication to compare; writes CHANGES.json and CHANGES.md")
     parser.add_argument("--expect", type=Path, help="JSON list of export job groups expected to change")
+    parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache on NVMe")
+    parser.add_argument("--verify-skips", action="store_true", help="run skipped frontends and reject changed IR")
     args = parser.parse_args()
     if args.expect and not args.previous:
         parser.error("--expect requires --previous")
@@ -279,7 +342,8 @@ def main():
     publish(args.output.expanduser().resolve(), args.staging.expanduser().resolve(), args.timeout, args.workers,
             args.reuse_workers.expanduser().resolve() if args.reuse_workers else None,
             args.previous.expanduser().resolve() if args.previous else None,
-            args.expect.expanduser().resolve() if args.expect else None)
+            args.expect.expanduser().resolve() if args.expect else None,
+            args.backend_cache.expanduser().resolve() if args.backend_cache else None, args.verify_skips)
 
 
 if __name__ == "__main__":

@@ -132,6 +132,19 @@ def test_package_tuning_and_arguments_change_job_global_identity():
     assert before != records.stable_hash(records.job_global_inputs({**context, "args": ["--bits", "3"]}))
 
 
+def test_stage0_candidates_require_globals_and_all_recorded_reads(tmp_path):
+    source = tmp_path / "package.py"
+    source.write_text("TILE = 64\n")
+    inputs = {"exporter": "a", "args": ["--bits", "4"]}
+    previous = {"stage0_inputs": inputs, "source_reads_sha256": {"package.py": records.digest(source.read_bytes())}}
+    assert records.job_candidates(tmp_path, previous, inputs) == []
+    source.write_text("TILE = 128\n")
+    assert records.job_candidates(tmp_path, previous, inputs) == ["package.py"]
+    assert records.job_candidates(tmp_path, previous, {**inputs, "exporter": "b"}) == ["job-global-inputs"]
+    assert records.job_candidates(tmp_path, previous, None) == ["job-global-inputs"]
+    assert records.job_candidates(tmp_path, {"stage0_inputs": inputs}, inputs) == ["missing-recorded-reads"]
+
+
 def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})

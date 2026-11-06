@@ -2,6 +2,7 @@
 """Content identities and measured inputs for CPU-only AOT publications."""
 from __future__ import annotations
 
+import fnmatch
 import functools
 import hashlib
 import io
@@ -122,6 +123,42 @@ def compiler_identity(root, payload, capability):
                 Path(root) / "scripts/build/kernel-records.py",
                 Path(root) / "scripts/build/compare-sm-exports.py",
                 Path(root) / "scripts/build/export-placement-inputs.py")}}
+
+
+def stage0_inputs(root, payload, capability):
+    identity = compiler_identity(root, payload, capability)
+    if identity is None:
+        return None
+    root = Path(root)
+    rules_path = root / "scripts/build/kernel-input-rules.json"
+    rules = json.loads(rules_path.read_text())
+    hashes = {}
+    for directory in ("third_party/sparkinfer/b12x", "python/tools", "scripts/build", "docker"):
+        for path in sorted((root / directory).rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            if not path.is_file() or any(fnmatch.fnmatch(relative, pattern) for pattern in rules["ignore"]):
+                continue
+            if any(fnmatch.fnmatch(relative, pattern) for pattern in rules["global"]):
+                hashes[relative] = digest(path.read_bytes())
+    return json.loads(json.dumps({"identity": identity, "global_sources": hashes,
+                                  "rules": digest(rules_path.read_bytes())}, sort_keys=True))
+
+
+def job_candidates(root, previous, current_inputs):
+    if current_inputs is None or previous.get("stage0_inputs") != current_inputs:
+        return ["job-global-inputs"]
+    reads = previous.get("source_reads_sha256")
+    if not reads:
+        return ["missing-recorded-reads"]
+    changed = []
+    for relative, checksum in reads.items():
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            return ["invalid-recorded-path"]
+        source = Path(root) / path
+        if not source.is_file() or digest(source.read_bytes()) != checksum:
+            changed.append(relative)
+    return changed
 
 
 class BackendCache:
