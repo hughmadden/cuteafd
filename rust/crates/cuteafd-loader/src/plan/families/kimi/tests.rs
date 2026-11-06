@@ -102,6 +102,7 @@ fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(110 << 30));
+    // One owner runs whole MLA layers; an explicit `layers` pin needs the pair.
     options.attention_placement = None;
     // This BF16 geometry fixture needs an explicit weight cap above the native text owners.
     options.coordinator_budget_bytes = 192 << 30;
@@ -125,6 +126,7 @@ fn single_owner_header_plan_refuses_mandatory_weights_above_default_cap() {
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut options = with_layout(6, Some(110 << 30));
+    // One owner runs whole MLA layers; an explicit `layers` pin needs the pair.
     options.attention_placement = None;
     assert_eq!(options.coordinator_budget_bytes, ResidentWeights::DEFAULT_LIMIT.0);
     let layout = options.layout.as_mut().unwrap();
@@ -451,7 +453,10 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
     let refused = input.plan(&options).unwrap();
     assert!(!refused.fits);
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit --rtx-expert-layers 0")));
+    // The shared planner names the budget the pin cannot fit instead of the old
+    // minimum-layers message: an explicit 0 still refuses rather than clamping.
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("memory budget 'spark0'")
+        && hint.what.contains("available")), "{:#?}", refused.hints);
     // An impossible Spark ceiling must refuse instead of shrinking the 1M extent.
     options.layout.as_mut().unwrap().onboard = None;
     options.spark_budget_bytes = Some(1);

@@ -1,6 +1,7 @@
 //! Kimi physical-owner admission with checkpoint residency and shared native allocation layouts.
 use super::Model;
 use anyhow::Context;
+use crate::placement::families::kimi::{self, ExpertProfile, FixedOwner, KimiRecipe, SparkOwner, tp2_arenas, whole_arenas};
 use crate::{placement::*, plan::{Component, ExpertPlacement, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
@@ -32,7 +33,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
     ] };
     report.bytes_by_owner.clear();
-    let attention = crate::families::kimi_k3::resolve_attention(report.requested_attention, gpus);
+    // One owner runs whole MLA layers, so its convention is Heads; a pair
+    // resolves auto to Context.
+    let attention = if gpus == 1 { report.requested_attention.unwrap_or(AttentionPlacement::Heads) }
+        else { crate::families::kimi_k3::resolve_attention(report.requested_attention, gpus) };
     report.attention_placement = attention;
     let context = if opts.context_tokens == 0 { crate::families::kimi_k3::default_context(&model.core) as u64 } else { opts.context_tokens };
     memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
@@ -261,100 +265,156 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
     };
     let record = opts.mla_kv.record_bytes() as u64 * PAGE;
-    let layers = (|| -> anyhow::Result<Vec<LayerDemand>> { (0..cfg.layers).map(|layer| {
-        let mla = cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla;
-        let mut weights = ModeBytes { whole: model.mla[layer].split + model.mla[layer].replicated,
-            split: [model.mla[layer].split / 2 + model.mla[layer].replicated; 2] };
-        if let Some(core) = packed {
-            use crate::families::kimi_k3::weight_layout::LayerLayout;
-            if gpus == 1 {
-                weights = ModeBytes { whole: LayerLayout::ranks_with_core(cfg, layer, WHOLE, core, 1)?[0].bytes()? as u64,
-                    split: [0; 2] };
-            } else {
-                let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, core)?;
-                let mut attention = [0; 2];
-                for rank in 0..gpus {
-                    attention[rank] = split[rank].attention_bytes()? as u64;
-                    let fixed_weights = split[rank].bytes()? as u64 - attention[rank];
-                    fixed.push(Demand::new(rank as u8, Category::Weights,
-                        format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
-                        fixed_weights, Basis::Exact).with_resident_weights(ResidentWeights(fixed_weights)));
+    let prefill = crate::placement::planner::PrefillShape { rows: shape.unit_rows, waves: shape.waves };
+    let routed = cfg.dense.iter().filter(|dense| !**dense).count();
+    let fabricated = (|| -> anyhow::Result<_> {
+        use crate::families::kimi_k3::config::KimiAttention;
+        use crate::families::kimi_k3::weight_layout::LayerLayout;
+        let mut modes = Vec::with_capacity(cfg.layers);
+        let mut layer_attention = Vec::with_capacity(cfg.layers);
+        let mut records = vec![0u64; gpus];
+        for layer in 0..cfg.layers {
+            let mla = cfg.attention[layer] == KimiAttention::Mla;
+            let mut weights = ModeBytes { whole: model.mla[layer].split + model.mla[layer].replicated,
+                split: [model.mla[layer].split / 2 + model.mla[layer].replicated; 2] };
+            if let Some(core) = packed {
+                if gpus == 1 {
+                    weights = ModeBytes { whole: LayerLayout::ranks_with_core(cfg, layer, WHOLE, core, 1)?[0].bytes()? as u64,
+                        split: [0; 2] };
+                } else {
+                    let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, core)?;
+                    let mut halves = [0; 2];
+                    for rank in 0..gpus {
+                        halves[rank] = split[rank].attention_bytes()? as u64;
+                        let fixed_weights = split[rank].bytes()? as u64 - halves[rank];
+                        fixed.push(Demand::new(rank as u8, Category::Weights,
+                            format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
+                            fixed_weights, Basis::Exact).with_resident_weights(ResidentWeights(fixed_weights)));
+                    }
+                    weights = ModeBytes { split: halves, whole: if mla {
+                        LayerLayout::pair_with_core(cfg, layer, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, core)?[0].attention_bytes()? as u64
+                    } else { 0 } };
                 }
-                weights = ModeBytes { split: attention, whole: if mla {
-                    LayerLayout::pair_with_core(cfg, layer, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, core)?[0].attention_bytes()? as u64
-                } else { 0 } };
             }
+            // Resolved once here; the recipe never flips a layer to fit.
+            let mode = if gpus == 1 { WHOLE } else if mla {
+                match attention {
+                    AttentionPlacement::Context => LayerMode::ContextSplit,
+                    _ => LayerMode::HeadSplit,
+                }
+            } else { LayerMode::HeadSplit };
+            if mla {
+                match mode {
+                    LayerMode::Whole { gpu, .. } => records[usize::from(gpu)] += record,
+                    _ => for bytes in &mut records { *bytes += record; },
+                }
+            }
+            modes.push(mode);
+            layer_attention.push(weights);
         }
-        Ok(LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
-            weights,
-            kv_unit: KvDemand { unit_bytes_whole: if mla { record } else { 0 }, unit_bytes_split: if mla { [record; 2] } else { [0; 2] },
-                unit_bytes_context: mla.then_some([record / 2; 2]) },
-            fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
-            experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: if gpus == 1 { costs[layer][0] } else { Bytes2::default() },
-                half: costs[layer], tp2: gpus == 2, whole_supported: true, spark_ok: true }), modes: if gpus == 1 { vec![WHOLE] } else if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } })
-    }).collect() })();
-    let layers = match layers { Ok(value) => value, Err(error) => {
-        report.refuse_placement(format!("Kimi packed layer inventory refused: {error:#}"), "Check checkpoint layer geometry."); return memory;
-    }};
-    // Reuse pool-first TP2 onboarding, constrained by the Spark suffix budget.
-    let onboard = opts.resolve_onboard(cfg.dense.iter().filter(|dense| !**dense).count()).unwrap_or(Onboard::Auto);
-    let mut request = PlacementRequest {
-        resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)),
-        inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
-            headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
-            spark_ranks: ranks, peer_access: gpus == 2 },
-        // The single-owner solver uses auto/Heads with Whole-only physical modes.
-        attention_placement: if gpus == 2 { Some(attention) } else { report.requested_attention }, context_buffers, layers_first_gpu: 0,
-        pool: PoolPolicy { compiled_context: context,
-            requested: requested_pool, target: target_pool, floor: context,
-            ceiling: target_pool.max(requested_pool.unwrap_or(0)), unit_rows: PAGE },
-        layers, pool_overhead: vec![0; gpus], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
-        expert_workspace: if gpus == 1 { tp2_workspace[0] } else { 0 }, tp2_workspace: if gpus == 2 { tp2_workspace } else { [0; 2] }, onboard, expert_gpus: gpus, minimum_expert_layers: 0,
-        policy: LayerPolicy { default: if gpus == 1 { vec![WHOLE] } else { vec![LayerMode::HeadSplit] }, ownership: LayerOwnership::Ranges, expert_ownership: ExpertOwnership::Contiguous,
-            attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, if gpus == 1 { AttentionPlacement::Layers } else { AttentionPlacement::Heads })],
-            ..Default::default() },
-        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: if manifest.is_some() { unit as u64 } else { 0 }, lanes: if manifest.is_some() { LANES } else { 0 },
-            entry_gpu: 0, head_gpu: head_rank as u8, terminal: if gpus == 1 { TerminalHome::AttentionOwner } else { TerminalHome::Replicated } },
-        executor: ExecutorModes { family: "kimi_k3", modes, hops: gpus == 2, attention: AttentionPlacement::Layers },
+        Ok((modes, layer_attention, records))
+    })();
+    let (modes, layer_attention, records_per_page) = match fabricated {
+        Ok(value) => value,
+        Err(error) => { report.refuse_placement(format!("Kimi packed layer inventory refused: {error:#}"),
+            "Check checkpoint layer geometry."); return memory; }
     };
-    if let Err(error) = spark_budget.constrain(&mut request) {
-        report.refuse_placement(format!("Kimi joint admission refused: {error:#}"),
-            "Use automatic RTX expert selection or increase the explicit estimated Spark budget.");
-        return memory;
+    let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);
+    let counts: Vec<usize> = match onboard {
+        Onboard::Auto => (0..=routed).collect(),
+        Onboard::Layers(count) if count <= routed => vec![count],
+        Onboard::Layers(count) => {
+            report.refuse_placement(format!("Kimi --rtx-expert-layers {count} exceeds {routed} routed layers"),
+                "Use a count no greater than the routed layer count.");
+            return memory;
+        }
+    };
+    let halves = spark_budget.layers.iter().map(|&layer| costs[layer]).collect::<Vec<_>>();
+    let arenas = if gpus == 2 {
+        tp2_arenas(&counts, tp2_workspace, &halves)
+    } else {
+        whole_arenas(&counts, tp2_workspace[0], &halves.iter().map(|pair| pair[0]).collect::<Vec<_>>())
+    };
+    let arenas = match arenas {
+        Ok(value) => value,
+        Err(error) => { report.refuse_placement(format!("Kimi expert arena inventory refused: {error}"),
+            "Check the routed EXL3 arena costs."); return memory; }
+    };
+    let mut spark = Vec::new();
+    for rank in 0..ranks {
+        for &count in &counts {
+            let idle = count == spark_budget.layers.len();
+            spark.push(SparkOwner { count, rank,
+                experts: if idle { 0 } else { spark_budget.resident[rank][count..].iter().sum() },
+                overhead: if idle { 0 } else { spark_budget.overhead[rank] } });
+        }
     }
-    let groups = request.layers.iter().map(|layer|
-        (gpus == 2 && layer.kind == AttentionClass::Mla && !matches!(request.attention_placement,
-            Some(AttentionPlacement::Heads | AttentionPlacement::Context)), layer.colocate))
-        .collect::<Vec<_>>();
-    let selected = attention::solve_owners(&groups, LayerOwnership::Ranges, request.layers_first_gpu,
-        |owners| -> anyhow::Result<_> {
-            let mut candidate = request.clone();
-            for (layer, (&owner, &(selected, _))) in candidate.layers.iter_mut().zip(owners.iter().zip(&groups)) {
-                if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }
-            }
-            let admit = |trial: &PlacementRequest| -> anyhow::Result<_> {
-                if legacy_marks == 0 {
-                    Ok((solve(trial)?, MarkSelection { legacy_slots: 0, slots: 0, reduction_reason: None }))
-                } else { Ok(solve_with_marks(trial, legacy_marks, 1, &mark_demands)?) }
-            };
-            if let Some(layout) = &draft {
-                settle_pool((candidate.pool.requested.unwrap_or(candidate.pool.target), ()), |tokens, _| -> anyhow::Result<_> {
-                    let mut trial = candidate.clone();
-                    let layout = layout.with_pool_tokens(usize::try_from(tokens)?)?;
-                    let (demand, peak) = layout.demands(head_rank as u8)?;
-                    trial.movables = vec![demand.movable(gpus)?];
-                    trial.startup = vec![peak];
-                    trial.pool.target = trial.pool.target.min(tokens);
-                    trial.pool.ceiling = trial.pool.ceiling.min(tokens);
-                    let (placed, marks) = admit(&trial)?;
-                    Ok((placed.pool_tokens, (), (placed, marks)))
-                })
-            } else { admit(&candidate) }
-        });
-    let onboarded = match selected {
-        Ok((placed, selection)) => {
-            memory.notes.push(selection.summary());
-            memory.notes.push(format!("Kimi selected RTX expert layers: {}; retained marks: {}", placed.onboard_layers, selection.slots));
+    let mut fixed_owners = fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
+    if context_split {
+        match context_buffers.demands() {
+            Ok(demands) => fixed_owners.extend(demands.iter().map(FixedOwner::ready)),
+            Err(error) => { report.refuse_placement(format!("Kimi context buffers refused: {error:#}"),
+                "Check the context program geometry."); return memory; }
+        }
+    }
+    let peer_row_bytes = if context_split {
+        context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
+    } else { 0 };
+    let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
+    let ceiling = target_pool.max(requested_pool.unwrap_or(0));
+    let maximum_pages = ceiling.div_ceil(page_rows);
+    let draft = match &draft {
+        Some(layout) => match kimi::draft_facts(layout, page_rows, maximum_pages, head_rank as u8) {
+            Ok(value) => Some(value),
+            Err(error) => { report.refuse_placement(format!("Kimi native MLA draft inventory refused: {error:#}"),
+                "Provide a supported MLA DFlash2 checkpoint and matching native representation."); return memory; }
+        },
+        None => None,
+    };
+    let first_moe = spark_budget.layers.first().copied().unwrap_or(cfg.layers);
+    let mut kinds = Vec::new();
+    if cfg.attention.iter().any(|kind| *kind == crate::families::kimi_k3::config::KimiAttention::Mla) {
+        kinds.push(AttentionClass::Mla);
+    }
+    if cfg.attention.iter().any(|kind| *kind != crate::families::kimi_k3::config::KimiAttention::Mla) {
+        kinds.push(AttentionClass::Kda);
+    }
+    let recipe = KimiRecipe {
+        context, gpus, placement: attention, attention: modes,
+        prefill, lanes: LANES, spark_links: ranks > 0,
+        hop_spec: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2,
+            rows: if manifest.is_some() { unit as u64 } else { 0 },
+            lanes: if manifest.is_some() { LANES } else { 0 },
+            entry_gpu: 0, head_gpu: head_rank as u8,
+            terminal: if gpus == 1 { TerminalHome::AttentionOwner } else { TerminalHome::Replicated } },
+        peer_row_bytes, maximum_pages,
+        records_per_page, layer_attention, first_moe,
+        kinds,
+        experts: Some(ExpertProfile { layers: spark_budget.layers.clone(),
+            destination: if gpus == 2 { vec![0, 1] } else { vec![0] },
+            counts, rank_sets: if ranks > 0 { vec![(0..ranks as u8).collect()] } else { Vec::new() } }),
+        arenas, spark, draft, fixed: fixed_owners,
+    };
+    let mut occupied = vec![0u64; gpus];
+    for (rank, baseline) in baseline.iter().enumerate() {
+        if let crate::placement::Baseline::Planned { context_bytes, loaded_bytes } = baseline {
+            occupied[rank] = context_bytes.saturating_add(*loaded_bytes);
+        }
+    }
+    let sparks = vec![spark_budget.budget; ranks];
+    let budgets = match kimi::budgets(&opts.rtx_bytes.iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
+        opts.headroom_bytes, &occupied, &sparks) {
+        Ok(value) => value,
+        Err(error) => { report.refuse_placement(format!("Kimi physical budgets refused: {error}"),
+            "Check the requested card capacities."); return memory; }
+    };
+    let resolved = recipe.admit(kimi::request(context, requested_pool, onboard, prefill,
+        crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
+    let onboarded = match resolved {
+        Ok(selection) => {
+            let placed = &selection.placement;
+            memory.notes.push(format!("Kimi retained prefix marks are a fixed charge: {legacy_marks} slots per rank"));
+            memory.notes.push(format!("Kimi selected RTX expert layers: {}; retained marks: {}", placed.onboard_layers, legacy_marks));
             memory.pool_tokens = placed.pool_tokens;
             report.attention_placement = placed.attention_placement;
             for gpu in 0..gpus {
@@ -377,7 +437,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 pool {} tokens with {} routed layers on RTX ({:.2} GiB each)", opts.mla_kv.record_bytes() * cfg.mla_layers(),
                 cfg.mla_layers(), placed.attention_placement, placed.pool_tokens, placed.onboard_layers, layer_bytes as f64 / GIB as f64));
             let onboarded = placed.onboard_layers;
-            report.solver_placement = Some(placed);
+            report.solver_placement = Some(selection.placement);
             onboarded
         }
         Err(error) => {
