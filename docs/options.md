@@ -108,7 +108,7 @@ the launcher derives from them.
 | --- | --- | --- | --- |
 | `COORDINATOR_GPU_BUDGET_GIB` | planner default 95.5 | positive GiB | Logical per-GPU ceiling for plan/serve/golden. |
 | `COORDINATOR_GPU_HEADROOM_GIB` | `8` | non-negative | Free memory the coordinator leaves. |
-| `MEMORY_RESERVATION` | unset | size or `%` | V4.1 only: admission reservation. |
+| `MEMORY_RESERVATION` | unset | size or `%` | V4.1 only: explicit admission ceiling; unset uses full capacity minus sampled occupancy and declared owners, with no automatic percentage or small-card margin. |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |
 | `POOL_TOKENS` | `auto` where offered | `auto` or count | Planner-sized pool up to 2M tokens; a number pins it. |

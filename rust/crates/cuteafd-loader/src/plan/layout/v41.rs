@@ -157,10 +157,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
         let arch = ArchContext::coordinator(total, None);
-        let ceiling = if total <= 32 * GIB {
-            cuteafd_core::serving_capacity::admission_ceiling(total, 97,
-                cuteafd_core::serving_capacity::small_card_headroom_bytes(total))?
-        } else if automatic { (u128::from(total) * 97 / 100) as u64 } else { total };
+        let ceiling = total;
         devices[gpu].capacity_bytes = ceiling;
         devices[gpu].items.clear();
         cards.push((total, ceiling));

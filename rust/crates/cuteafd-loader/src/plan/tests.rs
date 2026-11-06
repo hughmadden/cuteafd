@@ -4372,7 +4372,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     options.layout = Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30], context_tokens: 512, pool_tokens: Some(0),
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100);
+    assert_eq!(automatic.devices[0].capacity_bytes, 96u64 << 30);
     // The runtime growth estimate does not grow with automatic admission.
     assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("V4.1 runtime growth reserve")).unwrap().bytes, 2 << 30);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);

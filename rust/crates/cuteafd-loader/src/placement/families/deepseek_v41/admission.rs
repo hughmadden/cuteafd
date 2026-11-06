@@ -1212,6 +1212,7 @@ impl Recipe for V41Recipe<'_> {
             .checked_mul(self.maximum_pages)
             .ok_or(Refusal::Overflow("V4.1 pool extent"))?;
         let mut contract = Contract {
+            floor_fallback: None,
             resident_weight_limit: request.resident_weight_limit,
             phase_order: PhaseOrder::DRAFT_THEN_TARGET,
             spark_reply_formats: (self.spark_ranks > 0).then(|| SparkReplyFormats {

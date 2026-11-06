@@ -535,27 +535,16 @@ pub(super) fn resolve_with_owners(
             "explicit V4.1 prefix exceeds available expert inventory"
         );
     }
-    let automatic = PoolPolicy::normalize_request(args.pool_tokens).is_none();
-    // A reservation is a logical ceiling; automatic plans keep the 97% and
-    // small-card admission margins on top of the sampled free bytes.
+    // Only an explicit reservation limits capacity beyond sampled occupancy.
     let mut ceilings = Vec::with_capacity(ranks);
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &(free, total)) in memory.iter().enumerate() {
         ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory sample");
-        let mut ceiling = args
+        let ceiling = args
             .memory_reservation
             .map(|r| r.bytes(total))
             .transpose()?
             .unwrap_or(total);
-        if total <= 32 << 30 {
-            ceiling = ceiling.min(cuteafd_core::serving_capacity::admission_ceiling(
-                total as u64,
-                97,
-                cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64),
-            )? as usize);
-        } else if automatic {
-            ceiling = ceiling.min((total as u128 * 97 / 100) as usize);
-        }
         ceilings.push(ceiling);
         cards.push((total as u64, ceiling as u64, free as u64));
     }

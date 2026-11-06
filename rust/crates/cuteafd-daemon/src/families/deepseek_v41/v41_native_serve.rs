@@ -146,9 +146,6 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     )?;
     ensure!((1..=8).contains(&args.peers.len()),
         "V4.1 Spark transport requires 1..=8 peers, got {}", args.peers.len());
-    if cuteafd_loader::placement::PoolPolicy::normalize_request(args.pool_tokens).is_none() && args.memory_reservation.is_none() {
-        args.memory_reservation = Some("97%".parse()?);
-    }
     args.host_cache_config()?;
     // The golden runs the worker without the API, so it loads no keyed policy.
     let api = if http { Some(args.api.load()?) } else { None };
