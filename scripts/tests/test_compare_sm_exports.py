@@ -263,7 +263,8 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
              "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
              "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64",
              "mla_draft_partial_full_m64", "mla_draft_partial_w4096_m64",
-             "mla_draft_partial_full_fp8_m64", "mla_draft_partial_w4096_fp8_m64"]
+             "mla_draft_partial_full_fp8_m64", "mla_draft_partial_w4096_fp8_m64",
+             "mla_draft_lse_combine2"]
     job = next(job for job in compare_sm.jobs("suspects") if job[0] == "mla-draft-h64")
     assert job == ("mla-draft-h64", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(names)])
@@ -277,7 +278,9 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
         calls.append((g, kwargs))
         return kwargs
 
-    module = SimpleNamespace(kimi_mla=SimpleNamespace(
+    combine_calls = []
+    module = SimpleNamespace(context_split=SimpleNamespace(
+        compile_lse_combine2_aot=lambda **kwargs: combine_calls.append(kwargs)), kimi_mla=SimpleNamespace(
         MlaDraftGeometry=lambda **kwargs: kwargs,
         **{f"compile_mla_draft_{op}_aot": compile_fake for op in ("producer", "output", "attention", "partial")}))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", module)
@@ -287,6 +290,7 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
     assert {row[0] for row in programs} == set(names)
     for row in programs:
         row[-1]()
+    assert combine_calls == [{"heads": 64, "has_sink": False}]
     assert calls == [({"window_size": None, "kv_cache": "bf16"}, {"max_rows": 64})] + [
         (dict(window_size=window, kv_cache=cache), dict(max_rows=64, **extra))
         for cache in ("bf16", "fp8")

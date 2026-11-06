@@ -981,7 +981,7 @@ def kimi_context_programs(decode_rows: int, max_context: int):
 
 def mla_draft_programs(max_rows: int, max_context: int):
     """Shared rotary MLA drafter; checkpoint scales are runtime ABI inputs."""
-    from b12x.integration.cuteafd import kimi_mla
+    from b12x.integration.cuteafd import context_split, kimi_mla
 
     def build(op, window=None, cache="bf16"):
         g = kimi_mla.MlaDraftGeometry(window_size=window, kv_cache=cache)
@@ -1005,6 +1005,8 @@ def mla_draft_programs(max_rows: int, max_context: int):
             out.append((f"mla_draft_partial_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_partial",
                         {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
                         lambda w=window, c=cache: build("partial", w, c)))
+    out.append(("mla_draft_lse_combine2", "lse_combine2", {"heads": 64, "has_sink": False},
+                lambda: context_split.compile_lse_combine2_aot(heads=64, has_sink=False)))
     return out
 
 

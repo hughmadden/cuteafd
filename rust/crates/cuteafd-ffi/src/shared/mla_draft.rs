@@ -96,6 +96,55 @@ impl MlaDraftWindow {
     }
 }
 
+/// Both normalized h64 partials already reside on the lead GPU. Their order is
+/// physical GPU 0, then GPU 1; the no-sink base2 merge is checkpoint-independent.
+#[derive(Clone, Copy, Debug)]
+pub struct MlaDraftCombineBatch {
+    pub rows: usize,
+    pub partial: [Buffer; 2],
+    pub lse: [Buffer; 2],
+    pub sink: Buffer,
+    pub output: Buffer,
+}
+
+pub struct MlaDraftCombine<'a> { program: Program<'a> }
+
+impl<'a> MlaDraftCombine<'a> {
+    pub fn load(programs: &'a Programs<'a>, namespace: &str) -> Result<Self> {
+        let name = format!("{namespace}_mla_draft_lse_combine2");
+        validate_combine_manifest(programs.spec(&name)?)?;
+        Ok(Self { program: programs.program(&name, &["o0", "l0", "o1", "l1", "sink", "out"])? })
+    }
+
+    pub fn launch(&self, batch: MlaDraftCombineBatch, stream: *mut c_void) -> Result<()> {
+        validate_combine_batch(batch)?;
+        // SAFETY: disjoint checked rank-local extents survive the ordered merge.
+        unsafe { self.program.launch(&[batch.partial[0].ptr, batch.lse[0].ptr,
+            batch.partial[1].ptr, batch.lse[1].ptr, batch.sink.ptr, batch.output.ptr],
+            &[Scalar::I32(batch.rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_combine_manifest(spec: &ProgramSpec) -> Result<()> {
+    if spec.scalar_kinds != b"i" || !spec.scratch.is_empty()
+        || spec.geometry["heads"].as_u64() != Some(64)
+        || spec.geometry["has_sink"].as_bool() != Some(false)
+        || !spec.pointers.iter().map(String::as_str).eq(["o0", "l0", "o1", "l1", "sink", "out"]) {
+        return Err(MlaDraftError::Invalid("h64 no-sink combine ABI"));
+    }
+    Ok(())
+}
+
+fn validate_combine_batch(batch: MlaDraftCombineBatch) -> Result<()> {
+    if !(1..=ROWS).contains(&batch.rows) { return Err(MlaDraftError::Invalid("combine rows")); }
+    let attention = batch.rows * HEADS * 512 * 2;
+    let lse = batch.rows * HEADS * 4;
+    validate_buffers(&[(batch.partial[0], attention), (batch.lse[0], lse),
+        (batch.partial[1], attention), (batch.lse[1], lse), (batch.sink, HEADS * 4),
+        (batch.output, attention)], batch.output.device_id)
+}
+
 /// BF16 low-rank operands. Unlike the target, draft output has no gate.
 /// DFlash2 fills every field; mtp_dspark has no q-LoRA: `qkv_a` holds `wq`,
 /// `q_b` holds `wkv_a_with_mqa`, `q_a_norm` the unit query-scale vectors
@@ -760,6 +809,32 @@ mod tests {
         assert!(validate_manifest(good.each_ref(), MlaDraftWindow::BlockAnchored2048, MlaCacheFormat::Fp8).is_err());
         let kimi = specs(MlaDraftWindow::Sliding4096, 1048576);
         assert!(validate_ml4_manifest(kimi.each_ref()).is_err());
+    }
+
+    #[test]
+    fn context_combine_checks_h64_no_sink_and_rank_local_disjoint_extents() {
+        let spec = ProgramSpec { name: "kimik3_mla_draft_lse_combine2".into(),
+            capacity_rows: 64, geometry: serde_json::json!({"heads":64,"has_sink":false}),
+            pointers: ["o0", "l0", "o1", "l1", "sink", "out"].map(str::to_owned).to_vec(),
+            scalar_kinds: b"i".to_vec(), scratch: Default::default() };
+        validate_combine_manifest(&spec).unwrap();
+        for (key, value) in [("heads", serde_json::json!(48)), ("has_sink", true.into())] {
+            let mut wrong = spec.clone(); wrong.geometry[key] = value;
+            assert!(validate_combine_manifest(&wrong).is_err());
+        }
+        let (_, b, _) = fixture();
+        let good = MlaDraftCombineBatch { rows: 64, partial: [b.attention, b.query],
+            lse: [b.lse, b.lengths], sink: b.slots, output: b.output };
+        validate_combine_batch(good).unwrap();
+        for rows in [0, 65, usize::MAX] {
+            assert!(validate_combine_batch(MlaDraftCombineBatch { rows, ..good }).is_err());
+        }
+        let mut wrong = good; wrong.partial[0] = wrong.output;
+        assert!(validate_combine_batch(wrong).is_err());
+        let mut wrong = good; wrong.lse[1].device_id = 0;
+        assert!(validate_combine_batch(wrong).is_err());
+        let mut wrong = good; wrong.output.bytes = 64 * 64 * 512 * 2 - 1;
+        assert!(validate_combine_batch(wrong).is_err());
     }
 
     fn fixture() -> (MlaDraftWeights, MlaDraftBatch, Layout) {
