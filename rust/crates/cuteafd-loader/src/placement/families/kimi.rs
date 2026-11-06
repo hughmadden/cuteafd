@@ -82,12 +82,14 @@ pub struct DraftOwner {
     pub weights_per_page: u64,
 }
 
-/// Drafter owners plus the transient load peak that overlaps them.
+/// Drafter owners plus the transient staging that overlaps them while they
+/// load. The owners themselves are the resident part of the load peak, so the
+/// transient is only the difference above them.
 #[derive(Debug, Clone)]
 pub struct Draft {
     pub owners: Vec<DraftOwner>,
-    pub peak_at_first: u64,
-    pub peak_per_page: u64,
+    pub staging_at_first: u64,
+    pub staging_per_page: u64,
 }
 
 /// The declared local expert prefix domain. `destination` names the
@@ -165,12 +167,22 @@ pub fn draft_facts(layout: &MlaDraftRuntimeLayout, page_rows: u64, maximum_pages
     if one.len() != last.len() || one.iter().zip(&last).any(|(a, b)| a.0 != b.0 || a.1 != b.1) {
         return Err(anyhow::anyhow!("Kimi draft owner set depends on the pool extent"));
     }
+    // The load peak is the owners plus transient packing; charging the peak on
+    // top of the owners would reserve the resident part twice.
+    let resident = |owners: &[(String, Category, u64, u64)]| -> anyhow::Result<u64> {
+        owners.iter().try_fold(0u64, |sum, owner| sum.checked_add(owner.2)
+            .context("Kimi draft owner total overflow"))
+    };
+    let staging_one = peak_one.checked_sub(resident(&one)?)
+        .context("Kimi draft load peak excludes its own owners")?;
+    let staging_last = peak_last.checked_sub(resident(&last)?)
+        .context("Kimi draft load peak excludes its own owners")?;
     let owners = one.into_iter().zip(last).map(|((group, category, bytes, weights), (_, _, end, end_weights))| {
         Ok(DraftOwner { category, group,
             bytes_at_first: bytes, bytes_per_page: step(bytes, end)?,
             weights_at_first: weights, weights_per_page: step(weights, end_weights)? })
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(Draft { owners, peak_at_first: peak_one, peak_per_page: step(peak_one, peak_last)? })
+    Ok(Draft { owners, staging_at_first: staging_one, staging_per_page: step(staging_one, staging_last)? })
 }
 
 /// Kimi's physical owners and finite domains. Every field is a resolved fact:
@@ -543,21 +555,23 @@ impl Recipe for KimiRecipe {
                     false, self.maximum_pages));
             }
             // The packing peak overlaps the target weights and the drafter's
-            // own resident owners; it is transient, never a resident owner.
-            let peak = Allocation::buffer("draft.load_peak", Location::coordinator(rank),
-                draft.peak_at_first, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
-                Category::Drafter, "MLA DFlash load peak including transient packing");
-            contract.components.push(Component::allocation(peak,
-                ByteCurve::linear(draft.peak_at_first, draft.peak_per_page, self.maximum_pages),
-                false, self.maximum_pages));
+            // own resident owners; only the staging above them is transient.
+            if draft.staging_at_first > 0 || draft.staging_per_page > 0 {
+                let peak = Allocation::buffer("draft.load_peak", Location::coordinator(rank),
+                    draft.staging_at_first, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad },
+                    Category::Drafter, "MLA DFlash load staging above its owners");
+                contract.components.push(Component::allocation(peak,
+                    ByteCurve::linear(draft.staging_at_first, draft.staging_per_page, self.maximum_pages),
+                    false, self.maximum_pages));
+            }
         }
         Ok(contract)
     }
 }
 
 /// Physical capacities and operator ceilings are independent inputs. `occupied`
-/// is what the process already holds at `Load` (CUDA context and modules), not
-/// a second subtraction of owners the recipe charges.
+/// is what the process already holds at `Load` (the CUDA context), not a second
+/// subtraction of owners the recipe charges.
 pub fn budgets(cards: &[(u64, u64)], headroom: u64, occupied: &[u64],
     sparks: &[u64]) -> Result<Vec<Budget>, Refusal> {
     if !(1..=2).contains(&cards.len()) || occupied.len() != cards.len() {
@@ -565,7 +579,7 @@ pub fn budgets(cards: &[(u64, u64)], headroom: u64, occupied: &[u64],
     }
     let forecast = |bytes: u64| Baseline::Forecast {
         occupied: bytes,
-        source: "planned context and loaded modules; every Kimi owner charged in the recipe".into(),
+        source: "measured CUDA context; every Kimi owner charged in the recipe".into(),
         assumed: true,
     };
     let mut budgets = cards.iter().enumerate().map(|(rank, &(physical, logical))| Budget {

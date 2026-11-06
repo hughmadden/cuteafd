@@ -343,10 +343,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mut spark = Vec::new();
     for rank in 0..ranks {
         for &count in &counts {
-            let idle = count == spark_budget.layers.len();
+            // The rank's runtime residual stays charged at every count; the
+            // expert suffix is empty only when every routed layer is onboarded.
             spark.push(SparkOwner { count, rank,
-                experts: if idle { 0 } else { spark_budget.resident[rank][count..].iter().sum() },
-                overhead: if idle { 0 } else { spark_budget.overhead[rank] } });
+                experts: spark_budget.resident[rank][count..].iter().sum(),
+                overhead: spark_budget.overhead[rank] });
         }
     }
     let mut fixed_owners = fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
