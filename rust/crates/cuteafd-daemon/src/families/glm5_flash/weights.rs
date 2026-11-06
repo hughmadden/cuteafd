@@ -1463,7 +1463,13 @@ mod tests {
                             dtype: dtype.clone(), shape: shape.to_vec() }, tensors, source_bytes: 0 };
                         let layout = NativeLayout { stem: stem.into(), shape: [256,256], fp8, rank, ranks: 2, split };
                         let records = attention_records(std::path::Path::new("/selected"), &selected, mode, &layout,
-                            Fp8Scales::Pow2, buffer(256*256*2), fp8.then(|| buffer(256)),)?;
+                            Fp8Scales::Pow2, buffer(256*256*2), fp8.then(|| buffer(256)));
+                        if dtype == DType::F8E4M3 && mode == AttentionMode::Fp8Compact {
+                            let error = records.err().expect("already-FP8 conversion must refuse");
+                            assert!(error.downcast_ref::<cuteafd_loader::formats::native_attention::UnsupportedFp8Conversion>().is_some());
+                            continue;
+                        }
+                        let records = records?;
                         let expected_rows = if split == CoreSplit::Output { rank*256..(rank+1)*256 } else { 0..256 };
                         let expected_col = if split == CoreSplit::Input { rank*256 } else { 0 };
                         if dtype == DType::Bf16 && fp8 {
