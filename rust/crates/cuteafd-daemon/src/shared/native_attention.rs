@@ -60,9 +60,10 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
     let grid = scales.context("native attention FP8 scale allocation missing")?;
     ensure!(grid.device_id == device && grid.bytes >= n/128*(k/128)*4, "native attention scale extent");
     if *dtype == DType::F8E4M3 {
+        let scale = cuteafd_loader::formats::native_attention::fp8_scale(selected, &layout.stem)?;
         return Ok(vec![AttentionRecord::Operand(Operand { device, buffer: values,
             lands: vec![(source(&weight, rows.clone(), cols.clone(), 1)?, 0)], bytes: n*k }),
-            AttentionRecord::Operand(Operand { device, buffer: grid, lands: vec![(source(&format!("{weight}_scale_inv"),
+            AttentionRecord::Operand(Operand { device, buffer: grid, lands: vec![(source(&scale.meta.name,
                 rows.start/128..rows.end/128, cols.start/128..cols.end/128, 4)?, 0)], bytes: n/128*(k/128)*4 })]);
     }
     let rule = if mode == AttentionMode::Fp8Compact { crate::shared::fp8_linear::Fp8Scales::Amax } else { rule };
@@ -77,5 +78,40 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
         Ok(AttentionRecord::Step(Step { device, rects, jobs: vec![Job::Quant { rows: 0..rows.len(), pitch: k,
             col0: 0, cols: k, layout: crate::shared::fp8_load_quant::Layout::Block, rule, target }] }))
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuteafd_loader::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
+        plan::checkpoint::{AttentionMode, CheckpointTensor, ProjectionStorage, SelectedProjection}, SafetensorsTensorMetadata};
+
+    #[test]
+    fn native_fp8_records_land_the_declared_scale_name_and_tp_slice() -> Result<()> {
+        for suffix in ["weight_scale_inv", "qscale_weight"] {
+            let stem = "layers.0.attention.wq";
+            let tensor = |name, dtype, shape: Vec<usize>, width| CheckpointTensor {
+                shard: "selected.safetensors".into(), meta: SafetensorsTensorMetadata { name, dtype,
+                    byte_length: shape.iter().product::<usize>() as u64 * width, shape, byte_offset: 128 } };
+            let mut selected = SelectedProjection { storage: ProjectionStorage::Native { dtype: DType::F8E4M3,
+                shape: vec![512, 256] }, source_bytes: 131104, tensors: vec![
+                    tensor(format!("{stem}.weight"), DType::F8E4M3, vec![512, 256], 1),
+                    tensor(format!("{stem}.{suffix}"), DType::F32, vec![4, 2], 4)] };
+            let layout = NativeLayout { stem: stem.into(), shape: [256, 256], fp8: true, rank: 1, ranks: 2, split: CoreSplit::Output };
+            let values = CuteafdDeviceBuffer { device_id: 0, bytes: 65536, ..Default::default() };
+            let scales = CuteafdDeviceBuffer { device_id: 0, bytes: 256, ..Default::default() };
+            let records = attention_records(std::path::Path::new("/selected"), &selected, AttentionMode::Hqa,
+                &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales))?;
+            let AttentionRecord::Operand(scale) = &records[1] else { panic!("native scale must land verbatim"); };
+            assert_eq!(scale.lands[0].0.name, format!("{stem}.{suffix}"));
+            assert_eq!(scale.lands[0].0.rows, 2..4);
+            assert_eq!(scale.lands[0].0.cols, 0..8);
+            selected.tensors.pop();
+            let error = attention_records(std::path::Path::new("/selected"), &selected, AttentionMode::Hqa,
+                &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales)).err().unwrap();
+            assert!(error.is::<cuteafd_loader::formats::native_attention::InvalidFp8Scale>());
+        }
+        Ok(())
+    }
 }
 
