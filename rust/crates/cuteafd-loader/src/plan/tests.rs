@@ -2909,6 +2909,41 @@ fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
 }
 
 #[test]
+fn v4_prefill_shape_follows_solved_experts_not_available_sparks() {
+    use crate::placement::{ExpertHome, OnboardSetting};
+    let dir = v4_snapshot();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        rtx_bytes: vec![96 << 30], pool_tokens: Some(32768), ..Default::default()
+    }), ..sparks(4) };
+    let local = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
+    assert!(local.placement_supported, "{}", render(&local));
+    assert!(!local.solver_placement.as_ref().unwrap().layers.iter().any(|layer|
+        layer.experts == ExpertHome::Spark));
+    assert_eq!((local.prefill_unit_rows, local.prefill_waves, local.prefill_span_rows,
+        local.prefill_transports), (Some(4096), Some(1), Some(4096), Some(0)));
+    let direct = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
+        ..options.clone() }).unwrap();
+    assert_eq!(local.solver_placement.as_ref().unwrap().items,
+        direct.solver_placement.as_ref().unwrap().items);
+    assert_eq!(serde_json::to_value(&local.phase_ledger).unwrap(),
+        serde_json::to_value(&direct.phase_ledger).unwrap());
+    let deployment_options = deployment::DeploymentOptions { rtx_gpus: 1, ..Default::default() };
+    let local_deployment = deployment::DeploymentSpec::from_report(&local, &deployment_options).unwrap();
+    assert_eq!((local_deployment.spark_expert_world, local_deployment.prefill_unit_rows,
+        local_deployment.prefill_waves), (0, 4096, 1));
+
+    let mut remote_options = options;
+    remote_options.layout.as_mut().unwrap().onboard = Some(OnboardSetting::Layers(0));
+    let remote = plan_spark_count(dir.path(), &remote_options, 4, Some(4)).unwrap();
+    assert!(remote.placement_supported, "{}", render(&remote));
+    assert!(remote.solver_placement.as_ref().unwrap().layers.iter().any(|layer|
+        layer.experts == ExpertHome::Spark));
+    assert_eq!((remote.prefill_unit_rows, remote.prefill_waves, remote.prefill_span_rows,
+        remote.prefill_transports), (Some(2752), Some(3), Some(8256), Some(1)));
+}
+
+#[test]
 fn v4_contract_owns_exact_host_tier_and_refuses_host_shortfall() {
     use crate::placement::planner::{Location, Phase};
     let dir = v4_snapshot();

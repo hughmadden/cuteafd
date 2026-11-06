@@ -30,10 +30,38 @@ use crate::plan::Checkpoint;
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
+    let original_report = report.clone();
+    let original_options = options.clone();
+    let memory = layout_for_experts(report, model, input, options, report.spark_ranks, false);
+    let all_local = report.solver_placement.as_ref().is_some_and(|placement|
+        !placement.layers.iter().any(|layer| layer.experts == crate::placement::ExpertHome::Spark));
+    if original_report.spark_ranks == 0
+        || (report.solver_placement.is_some() && !all_local) { return memory; }
+
+    // Workspace, host marks and exchange reserves depend on the executor shape.
+    // Re-admit the entire local geometry, never just rewrite the published rows.
+    let mut local_report = original_report.clone();
+    let mut local_options = original_options.clone();
+    let local = layout_for_experts(&mut local_report, model, input, &mut local_options, 0, false);
+    if local_report.placement_supported && local_report.solver_placement.is_some() {
+        *report = local_report;
+        *options = local_options;
+        return local;
+    }
+    // If the local shape cannot fit (or conflicts with an explicit shape),
+    // retain only candidates with real Spark ownership in the remote geometry.
+    *report = original_report;
+    *options = original_options;
+    layout_for_experts(report, model, input, options, report.spark_ranks, true)
+}
+
+fn layout_for_experts(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
+    input: &super::super::PlanInput, options: &mut LayoutOptions, expert_world: usize,
+    require_remote: bool) -> MemoryLayout {
     let checkpoint = input.checkpoint();
-    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
+    let prefill = match resolve_prefill(input, report, options, expert_world,
         crate::serving_capacity::prefill_waves::PrefillLimits {
-            max_waves: if report.spark_ranks == 0 { 1 } else { crate::serving_capacity::prefill_waves::MAX_WAVES }, ..crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V4)
+            max_waves: if expert_world == 0 { 1 } else { crate::serving_capacity::prefill_waves::MAX_WAVES }, ..crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V4)
         }) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
@@ -101,9 +129,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut pool_tokens = 0;
     let mut local_layers = 0;
     let admitted = (|| -> anyhow::Result<_> {
-        let (inputs, mut startup) = v4_inputs(report, input, options, &devices[..ranks],
+        let (mut inputs, mut startup) = v4_inputs(report, input, options, &devices[..ranks],
             &shape, exl3_workspace, workspace)?;
-        let prepared = v4::prepare(&inputs)?;
+        inputs.spark_ranks = expert_world;
+        let prepare = || {
+            let prepared = v4::prepare(&inputs)?;
+            if require_remote { prepared.require_remote_experts() } else { Ok(prepared) }
+        };
+        let prepared = prepare()?;
         let reserves = prepared.reserves().to_vec();
         let request = v4::production_request(&inputs);
         let prefix = prepared.prefix();
@@ -122,7 +155,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 encoder_request.onboard = Pin::Exact(0);
                 encoder_request.pool = Pin::Exact(placement.pool_tokens);
             }
-            let encoder_admitted = v4::prepare(&inputs)?.admit(encoder_request)?;
+            let encoder_admitted = prepare()?.admit(encoder_request)?;
             solve_us = solve_us.saturating_add(encoder_admitted.solve_us);
             admissions += 1;
             let encoder_budget = encoder_admitted.placement;
@@ -146,7 +179,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 // Mandatory media displaces optional experts, never the admitted pool.
                 let mut tower_request = request.clone();
                 tower_request.pool = Pin::Exact(placement.pool_tokens);
-                let admitted = v4::prepare(&with_tower)?.admit(tower_request)?;
+                let prepared = v4::prepare(&with_tower)?;
+                let prepared = if require_remote { prepared.require_remote_experts()? } else { prepared };
+                let admitted = prepared.admit(tower_request)?;
                 solve_us = solve_us.saturating_add(admitted.solve_us);
                 admissions += 1;
                 solved = admitted.solved;
