@@ -1215,6 +1215,7 @@ impl Recipe for V41Recipe<'_> {
                 decode: Some(request.spark_reply_formats.decode()),
             }),
             page_rows: self.page_tokens,
+            pool_page_multiple: 1,
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,
             variables: Vec::new(),
