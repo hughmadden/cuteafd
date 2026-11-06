@@ -1217,6 +1217,48 @@ def capture_qwen_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
     assert "prefill reserve does not fit" not in result.stderr
 
+def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                    programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Shipped Qwen config -> real launcher argv -> real CPU Recipe admission."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    assert int(config["SPARK_COUNT"]) == 0, "Qwen shipped configs are RTX-only (0 Sparks)"
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/qwen-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    deployment = json.loads(output.read_text())
+    assert deployment["family"] == "qwen4", deployment
+    assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
+    assert deployment["prefill_waves"] == 1 and deployment["prefill_unit_rows"] == 4096, deployment
+    layout = deployment["memory_layout"]
+    # Automatic pool: the checkpoint's own 262144-token context, then whatever
+    # the card admits on top (636672 EXL3, 439040 NVFP4).
+    assert layout["pool_tokens"] >= 262144, layout
+    devices = layout["devices"]
+    assert [device["kind"] for device in devices] == ["rtx"], devices
+    assert devices[0]["kv_tokens"] == layout["pool_tokens"], devices
+    groups = {item["group"] for item in devices[0]["items"]}
+    # The shared Recipe filled the layout: pool, step workspaces and graphs.
+    assert {"records", "state", "decode step", "prefill step", "startup graphs"} <= groups, groups
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if "cuteafd plan " in line and "--deployment" in line]
+    assert len(plans) == 1, result.stderr
+    assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    serve = shlex.split(next(line for line in result.stderr.splitlines()
+                             if "serve-qwen4 --snapshot" in line))
+    assert "--local-experts" in serve, serve
+    assert serve[serve.index("--pool-tokens") + 1] == "0", serve
+    assert "prefill reserve does not fit" not in result.stderr
+
 
 def capture_mimo_real_planner_launch(snapshot: Path, example: Path, binary: Path,
                                      programs: Path, hf_home: Path, temporary: Path) -> None:

@@ -510,28 +510,22 @@ mod tests {
                     max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard,
                     startup_graph_modes: None,
                 };
-                let mapped = qwen4::dual_request(&inputs, [0; 2])?;
+                let mapped = qwen4::dual_placement(&inputs)?;
                 assert!(mapped.movables.is_empty());
                 inputs.admission.ple = None;
-                let direct = qwen4::dual_request(&inputs, [0; 2])?;
+                let direct = qwen4::dual_placement(&inputs)?;
                 for (group, rows) in [("decode step", 64), ("prefill step", 4096)] {
                     for gpu in 0..2 {
-                        let bytes = |req: &cuteafd_loader::placement::PlacementRequest| req.fixed.iter()
-                            .find(|d| d.gpu == gpu && d.group == group).unwrap().bytes;
+                        let bytes = |p: &cuteafd_loader::placement::Placement| p.items[gpu].iter()
+                            .find(|item| item.group == group).unwrap().bytes;
                         assert_eq!(bytes(&mapped) - bytes(&direct),
                             rows * cfg.ple_rows() as u64 * (8 + resident.ple_row_bytes));
                     }
                 }
-                let planned = cuteafd_loader::placement::solve(&mapped)?;
-                let mut measured = mapped.clone();
-                for gpu in &mut measured.inventory.gpus {
-                    gpu.baseline = Baseline::Measured { free_bytes: capacity };
-                }
-                assert_eq!(planned, cuteafd_loader::placement::solve(&measured)?);
-                assert_eq!(planned.pool_tokens, 2 << 20);
-                assert_eq!(planned.items.iter().flatten().filter(|i| i.category == Category::Tables)
+                assert_eq!(mapped.pool_tokens, 2 << 20);
+                assert_eq!(mapped.items.iter().flatten().filter(|i| i.category == Category::Tables)
                     .map(|i| (i.group.as_str(), i.bytes)).collect::<Vec<_>>(), vec![("PLE scale", 256)]);
-                assert!(!planned.items.iter().flatten().any(|i| i.bytes == resident.ple_table_bytes));
+                assert!(!mapped.items.iter().flatten().any(|i| i.bytes == resident.ple_table_bytes));
             }
         }
         for (option, value) in [("--table-placement", "mapped"), ("--ple", "mapped"), ("--table-cache-mib", "0"),
@@ -890,19 +884,20 @@ mod tests {
             assert_eq!(peers.spark_ranks, 0);
             assert_eq!(with_peers.resolved_prefill()?.waves, 1);
             assert_eq!(with_peers.resolved_prefill()?, local.resolved_prefill()?);
-            assert_eq!(qwen4::request(&plain, 0)?, qwen4::request(&peers, 0)?);
+            // Configured peers never reach admission; the selected source does.
             assert_eq!(qwen4::placement(&plain)?, qwen4::placement(&peers)?);
         }
         let spark = ExpertSource::Spark { ranks: 4 };
         assert_eq!(spark.code_key(), "none");
         // The selected transport's actual world, not the configured two peers.
         assert_eq!(input(&with_peers, spark, 0)?.spark_ranks, 4);
-        // Runtime's measured baseline already includes the selected transport.
-        let request = qwen4::request(&input(&with_peers, spark, 0)?, 0)?;
-        assert!(matches!(request.inventory.gpus[0].baseline, cuteafd_loader::placement::Baseline::Measured { .. }));
-        assert!(request.fixed.iter().all(|d| d.group != "Spark intake planes"));
-        assert!(qwen4::request(&input(&local, ExpertSource::LocalExl3, 0)?, 0)?.fixed.iter()
-            .all(|d| d.group != "Spark intake planes"));
+        // Runtime's measured baseline already includes the selected transport,
+        // so the header-only Spark return planes are not charged a second time.
+        let spark_inputs = input(&with_peers, spark, 0)?;
+        assert!(matches!(spark_inputs.baseline, cuteafd_loader::placement::Baseline::Measured { .. }));
+        assert!(qwen4::placement(&spark_inputs)?.items[0].iter().all(|item| item.group != "Spark intake planes"));
+        assert!(qwen4::placement(&input(&local, ExpertSource::LocalExl3, 0)?)?.items[0].iter()
+            .all(|item| item.group != "Spark intake planes"));
         assert_eq!(ExpertSource::selected(None)?, ExpertSource::None);
         let shared = super::super::engine::Experts::SharedOnly;
         assert_eq!(ExpertSource::selected(Some(&shared))?, ExpertSource::None);

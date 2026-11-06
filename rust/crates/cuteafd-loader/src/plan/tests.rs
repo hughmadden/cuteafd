@@ -5693,3 +5693,32 @@ fn mimo_auto_pool_and_count_admission_preserve_one_recipe() {
     assert!(counted.hints.iter().any(|hint| hint.what == typed), "{}", render(&counted));
     assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }
+
+#[test]
+fn qwen_auto_pool_is_one_recipe_and_keeps_its_typed_refusal() {
+    let (dir, manifest) = qwen4_matrix_snapshot();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536, prefix_slots: Some(0),
+        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+        workspace_manifest: Some(manifest), ..Default::default()
+    }), placement: ExpertPlacement::Local, ..Default::default() };
+    let unset = plan(dir.path(), &options).unwrap();
+    assert!(unset.wip_launchable(), "{}", render(&unset));
+    // CLI zero and an omitted pool select the same automatic admission.
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan(dir.path(), &zero).unwrap();
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens,
+        unset.memory_layout.as_ref().unwrap().pool_tokens);
+    assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves),
+        (unset.prefill_unit_rows, unset.prefill_waves));
+    // A pool below the compiled context is the recipe's typed refusal, not a
+    // smaller-prefill second solve.
+    zero.layout.as_mut().unwrap().pool_tokens = Some(1024);
+    let refused = plan(dir.path(), &zero).unwrap();
+    assert!(!refused.wip_launchable(), "{}", render(&refused));
+    assert!(refused.hints.iter().any(|hint|
+        hint.what.contains("Qwen admission: pool 1024 cannot hold selected context 65536")),
+        "{:?}", refused.hints);
+    assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}
