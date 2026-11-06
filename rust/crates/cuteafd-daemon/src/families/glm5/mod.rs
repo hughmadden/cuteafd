@@ -1891,7 +1891,7 @@ impl Opened {
         let started = Instant::now();
         self.library.cuda_set_device(devices[0])?;
         ensure!(per_rank.len() == world, "native loader requires one owned plan per coordinator");
-        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(self.snapshot.join("config.json"))?)?;
+        let config = self.view.config()?;
         let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(push.is_some())?;
         let vocabulary = NativeVocabulary::load_admitted(&self.library, programs,
@@ -1990,7 +1990,7 @@ fn mean_kl(logits: &[f32], golden: &[f32], vocab: usize) -> f64 {
     }).sum::<f64>() / rows.max(1) as f64
 }
 
-fn write_attention_identity(dir: &Path, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<()> {
+fn write_attention_identity(dir: &std::path::Path, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<()> {
     std::fs::write(dir.join("attention.json"), serde_json::to_vec_pretty(&serde_json::json!({
         "mode": view.mode(), "bundle_fingerprint": view.fingerprint(),
         "config": view.config_name(), "index": view.index_name(),

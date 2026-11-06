@@ -695,8 +695,22 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 2 * glm::PAGE_ROWS } else { glm::PAGE_ROWS };
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(
         &options.rtx_bytes, context, options.pool_tokens, page_tokens, spark_ranks == 0).maximum_tokens();
-    let (draft, additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
-        context, attention, gpu_count, maximum_pool_tokens.div_ceil(page_tokens))?;
+    let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
+    let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
+        context, attention, gpu_count, maximum_pages)?;
+    let catalog = match checkpoint.view.as_ref() {
+        Some(view) => crate::read_expert_catalog_view(view)?,
+        None => crate::read_expert_catalog(&checkpoint.snapshot)?,
+    };
+    let largest_native = records.iter().flat_map(|record| &record.components)
+        .map(|component| component.source.bytes as u64).max().unwrap_or(0);
+    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpu_count, &catalog,
+        Some(metadata), largest_native)? {
+        additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }));
+    }
     let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
         topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
     let rings = cuteafd_core::SparkRings { max_frame_bytes: geometry.native_frame_budget(
