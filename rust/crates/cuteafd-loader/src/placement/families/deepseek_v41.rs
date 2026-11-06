@@ -498,8 +498,7 @@ mod tests {
                     assert!(allowances.iter().all(|a| a.location == Location::coordinator(gpu as u8)
                         && a.lifetime == Lifetime { first: Phase::Ready, last: Phase::Growth }));
                     assert_eq!(allowances.iter().map(|a| a.bytes).sum::<u64>(),
-                        graph_reserve(total, ranks) + runtime_reserve(total, ranks)
-                            + if total <= 32 << 30 { 32 << 20 } else { 0 });
+                        graph_reserve(total, ranks) + runtime_reserve(total, ranks));
                 }
             }
         }

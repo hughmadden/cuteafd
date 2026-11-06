@@ -4623,14 +4623,21 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
         (Some(8192), Some(2752), Some(3)));
     let options = PlanOptions { layout: Some(layout.clone()), ..sparks(4) };
     let capped = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
-    // The reserve is sized once: 8192 rows is what the family asks for, and
-    // its first typed refusal stands instead of the generic second solve
-    // shrinking the reserve for KV. A 32 GiB card with a 1M context therefore
-    // refuses with the pool/context shortfall; the operator's lever is an
-    // explicit smaller reserve, which keeps the fixed three-wave cut.
-    assert!(!capped.executable(), "{}", render(&capped));
-    assert_eq!(capped.prefill_reserve_rows, Some(8192));
-    assert!(capped.hints.iter().any(|hint| hint.what.contains("cannot fit")), "{}", render(&capped));
+    // Full physical capacity now fits the 1M pool without shrinking the
+    // reserve. The former automatic ceiling made this same card refuse.
+    assert!(capped.executable(), "{}", render(&capped));
+    assert_eq!((capped.prefill_reserve_rows, capped.prefill_unit_rows, capped.prefill_waves),
+        (Some(8192), Some(2752), Some(3)));
+    assert_eq!(capped.memory_layout.as_ref().unwrap().pool_tokens, 1 << 20);
+    // Less physical capacity must still refuse, not retry with a smaller
+    // reserve to make room for KV.
+    let limited = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![31 << 30], ..layout.clone() }), ..sparks(4) };
+    let limited = plan_spark_count(dir.path(), &limited, 6, Some(4)).unwrap();
+    assert!(!limited.executable(), "{}", render(&limited));
+    assert_eq!((limited.prefill_reserve_rows, limited.prefill_unit_rows, limited.prefill_waves),
+        (Some(8192), Some(2752), Some(3)));
+    assert!(limited.hints.iter().any(|hint| hint.what.contains("cannot fit")), "{}", render(&limited));
     let explicit = PlanOptions { layout: Some(layout::LayoutOptions {
         prefill_reserve_rows: Some(4096), ..layout.clone() }), ..sparks(4) };
     let explicit = plan_spark_count(dir.path(), &explicit, 6, Some(4)).unwrap();
