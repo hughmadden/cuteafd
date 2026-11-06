@@ -8,6 +8,16 @@ use crate::plan::checkpoint::Checkpoint;
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Step-5 FP8 TP2 partial export pending")]
+pub struct Fp8PartialExportPending;
+
+pub fn validate_attention_mode(checkpoint: &Checkpoint) -> Result<()> {
+    ensure!(checkpoint.attention_mode() != crate::plan::checkpoint::AttentionMode::Fp8Compact,
+        Fp8PartialExportPending);
+    Ok(())
+}
+
 /// The checkpoint's declared EXL3 widths, cross-checked against every header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Widths {
@@ -127,12 +137,12 @@ impl CoreInventory {
         self.projections.get(stem.strip_suffix(".weight").unwrap_or(stem))
     }
 
-    /// The engine runs complete operator groups natively or not at all.
+    /// Q/K/V and FFNs keep their fused contracts; O is independently selected.
     pub fn validate_groups(&self, cfg: &Config) -> Result<()> {
         for layer in 0..cfg.layers + cfg.mtp {
             let root = format!("model.layers.{layer}");
             let ffn = if cfg.moe[layer] { "share_expert" } else { "mlp" };
-            for (module, leaves) in [("self_attn", &["q_proj", "k_proj", "v_proj", "o_proj"][..]),
+            for (module, leaves) in [("self_attn", &["q_proj", "k_proj", "v_proj"][..]),
                 (ffn, &["gate_proj", "up_proj", "down_proj"][..])] {
                 let present = leaves.iter().filter(|leaf| self.projections
                     .contains_key(&format!("{root}.{module}.{leaf}"))).count();

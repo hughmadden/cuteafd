@@ -122,41 +122,42 @@ impl<'a> NativeScratch<'a> {
 
 /// Native q/k/v/o for one attention owner; `o` is input-split on head-split ranks.
 pub(super) struct NativeAttention<'a> {
-    pub(super) q: NativeLinear<'a>,
-    pub(super) k: NativeLinear<'a>,
-    pub(super) v: NativeLinear<'a>,
-    pub(super) o: NativeLinear<'a>,
+    pub(super) qkv: Option<[NativeLinear<'a>; 3]>,
+    pub(super) o: Option<NativeLinear<'a>>,
 }
 
 /// Operand slots (input norm, q, k, v, q_norm, k_norm, g, o) the native core replaces.
 pub(super) const ATTENTION_SLOTS: [usize; 4] = [1, 2, 3, 7];
 
 impl<'a> NativeAttention<'a> {
-    /// `None` for a BF16 layer; mixed native/BF16 attention is refused.
+    /// Q/K/V share one route; the output projection may retain native BF16.
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &Checkpoint,
         layout: &RankWeightLayout, layer: usize, rows: usize, q: usize, kv: usize, hidden: usize)
         -> Result<Option<Self>> {
         let names = ["q", "k", "v", "o"].map(|p| format!("model.layers.{layer}.self_attn.{p}_proj.weight"));
         let present = names.iter().filter(|name| layout.core.contains_key(*name)).count();
         if present == 0 { return Ok(None); }
-        ensure!(present == 4, "Step-5 layer {layer} attention mixes native and BF16 operands");
+        let qkv = names[..3].iter().filter(|name| layout.core.contains_key(*name)).count();
+        ensure!(matches!(qkv, 0 | 3), "Step-5 layer {layer} attention requires complete EXL3 q/k/v");
         let mut core = NativeLayer::load(device, programs, checkpoint, layout, rows, |name| names.iter().any(|n| n == name))?;
         let mut take = |name: &str| -> Result<NativeLinear<'a>> {
             Rc::try_unwrap(core.linears.remove(name).context("native attention operand")?)
                 .map_err(|_| anyhow::anyhow!("native attention operand aliased"))
         };
-        let attention = Self { q: take(&names[0])?, k: take(&names[1])?, v: take(&names[2])?, o: take(&names[3])? };
-        let split = attention.o.side() == TrellisSide::Input;
-        ensure!(attention.q.shape() == [q, hidden] && attention.k.shape() == [kv, hidden]
-            && attention.v.shape() == [kv, hidden] && attention.o.shape() == [hidden, q]
-            && [&attention.q, &attention.k, &attention.v].iter().all(|l| l.side() == TrellisSide::Output),
+        let has_o = layout.core.contains_key(&names[3]);
+        let attention = Self { qkv: if qkv == 3 { Some([take(&names[0])?, take(&names[1])?, take(&names[2])?]) } else { None },
+            o: if has_o { Some(take(&names[3])?) } else { None } };
+        let split = attention.o.as_ref().is_some_and(|o| o.side() == TrellisSide::Input);
+        ensure!(attention.qkv.as_ref().is_none_or(|linears| linears.iter().zip([q, kv, kv])
+                .all(|(linear, n)| linear.shape() == [n, hidden] && linear.side() == TrellisSide::Output))
+            && attention.o.as_ref().is_none_or(|o| o.shape() == [hidden, q]),
             "Step-5 layer {layer} native attention geometry (split o={split})");
         Ok(Some(attention))
     }
 
     pub(super) fn scratch_layout(&self, rows: usize) -> Result<ProjectionScratchLayout> {
         let mut merged = None::<ProjectionScratchLayout>;
-        for linear in [&self.q, &self.k, &self.v, &self.o] {
+        for linear in self.qkv.iter().flatten().chain(self.o.iter()) {
             let [n, k] = linear.shape();
             let next = ProjectionScratchLayout::new(k, n, rows)?;
             match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }

@@ -1845,3 +1845,97 @@ fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
     assert!(matches!(crate::plan::experts::spark_recipe("step5:nvfp4",1536,5),
         Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
 }
+
+/// Leave parent shards untouched: only the selected index replaces O buffers.
+fn hqa_snapshot() -> tempfile::TempDir {
+    let dir = exl3_snapshot();
+    let root = dir.path();
+    let config = std::fs::read_to_string(root.join("config.json")).unwrap();
+    std::fs::write(root.join("config.compact-attention.json"),
+        config.replace("quantize_config.json", "quantize_config.compact-attention.json")).unwrap();
+    std::fs::copy(root.join("model.safetensors.index.json"),
+        root.join("model.compact-attention.safetensors.index.json")).unwrap();
+    std::fs::copy(root.join("quantize_config.json"), root.join("quantize_config.compact-attention.json")).unwrap();
+    let mut index: Value = serde_json::from_slice(&std::fs::read(root.join("model.safetensors.index.json")).unwrap()).unwrap();
+    let mut quant: Value = serde_json::from_slice(&std::fs::read(root.join("quantize_config.json")).unwrap()).unwrap();
+    let mut native = Vec::new();
+    for layer in 0..95 {
+        let stem = format!("model.layers.{layer}.self_attn.o_proj");
+        for suffix in ["trellis", "suh", "svh", "mcg"] {
+            index["weight_map"].as_object_mut().unwrap().remove(&format!("{stem}.{suffix}"));
+        }
+        quant["tensor_storage"].as_object_mut().unwrap().remove(&stem);
+        let name = format!("{stem}.weight");
+        index["weight_map"][&name] = Value::from("hqa-attention.safetensors");
+        native.push(testing::t(&name, "BF16", &[4096, 12288]));
+    }
+    testing::write_safetensors(&root.join("hqa-attention.safetensors"), &native);
+    std::fs::write(root.join("model.safetensors.index.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+    std::fs::write(root.join("quantize_config.json"), serde_json::to_vec(&quant).unwrap()).unwrap();
+    dir
+}
+
+#[test]
+fn hqa_o_dispatch_and_exact_rank_charges_include_all_predictors() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    let hqa = CheckpointView::select(fixture.path(), AttentionMode::Hqa)?;
+    let compact = CheckpointView::select(fixture.path(), AttentionMode::Compact)?;
+    let native = Checkpoint::open_view(&hqa)?;
+    let parent = Checkpoint::open_view(&compact)?;
+    let cfg = Config::parse(&native)?;
+    for ranks in [1, 2] {
+        for rank in 0..ranks {
+            let hqa = coordinator::RankWeightLayout::from_checkpoint(&native, rank, ranks)?;
+            let compact = coordinator::RankWeightLayout::from_checkpoint(&parent, rank, ranks)?;
+            let mut delta = 0;
+            for layer in 0..cfg.layers {
+                let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+                let native = hqa.operands.iter().find(|w| w.name == name).unwrap();
+                assert_eq!(native.shape, [4096, 12288 / ranks]);
+                assert_eq!(native.dtype, DType::Bf16);
+                assert!(!hqa.core.contains_key(&name));
+                delta += native.allocation_bytes - compact.core[&name].bytes as u64;
+            }
+            assert_eq!(hqa.resident_bytes, compact.resident_bytes + delta);
+            assert_eq!(hqa.resident_bytes, hqa.operands.iter().map(|w| w.allocation_bytes)
+                .chain(hqa.core.values().map(|w| w.bytes as u64)).sum());
+        }
+    }
+    for stage in 0..cfg.mtp {
+        let hqa = coordinator::RankWeightLayout::for_mtp_stage(&native, stage)?;
+        let compact = coordinator::RankWeightLayout::for_mtp_stage(&parent, stage)?;
+        let name = format!("model.layers.{}.self_attn.o_proj.weight", cfg.layers + stage);
+        let output = hqa.operands.iter().find(|w| w.name == name).unwrap();
+        assert_eq!(output.shape, [4096, 12288]);
+        assert_eq!(hqa.resident_bytes, compact.resident_bytes + output.allocation_bytes - compact.core[&name].bytes as u64);
+    }
+    Ok(())
+}
+
+#[test]
+fn hqa_modes_bind_distinct_identities_and_compact_needs_no_native_shard() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{AttentionMode, CheckpointIdentity, CheckpointView};
+    let fixture = hqa_snapshot();
+    let mut identities = std::collections::BTreeSet::new();
+    for mode in [AttentionMode::Hqa, AttentionMode::Compact, AttentionMode::Fp8Compact] {
+        let view = CheckpointView::select(fixture.path(), mode)?;
+        identities.insert(CheckpointIdentity::from_view(&view, None)?.fingerprint);
+        let checkpoint = Checkpoint::coordinator_view(&view, false, true)?;
+        if mode == AttentionMode::Fp8Compact {
+            let error = Model::open(&checkpoint).err().unwrap();
+            assert!(error.downcast_ref::<exl3::Fp8PartialExportPending>().is_some(), "{error:#}");
+        } else {
+            Model::open(&checkpoint)?;
+        }
+    }
+    assert_eq!(identities.len(), 3);
+    std::fs::remove_file(fixture.path().join("hqa-attention.safetensors"))?;
+    let compact = CheckpointView::select(fixture.path(), AttentionMode::Compact)?;
+    let checkpoint = Checkpoint::open_view(&compact)?;
+    assert!(checkpoint.missing_shards.is_empty());
+    assert_eq!(Model::open(&checkpoint)?.core.projections.len(), 672);
+    std::fs::remove_file(fixture.path().join("quantize_config.compact-attention.json"))?;
+    assert!(CheckpointView::select(fixture.path(), AttentionMode::Compact).is_err());
+    Ok(())
+}
