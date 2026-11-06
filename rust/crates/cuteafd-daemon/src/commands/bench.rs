@@ -230,6 +230,27 @@ fn reply_settings(context: &mut cuteafd_bench::context::ServerContext,
     (prefill, decode)
 }
 
+/// Startup-derived argument definitions. This typed registry is shared by
+/// capture and the rewrite inventory gate; adding a normalizer requires an entry.
+#[derive(Clone, Copy)]
+struct DerivedArguments { family: Option<&'static str>, names: &'static [&'static str] }
+const DERIVED_ARGUMENTS: &[DerivedArguments] = &[
+    DerivedArguments { family: None, names: &["max-context", "pool-tokens", "kv-format", "prefill-rows", "prefill-waves",
+        "prefill-span-rows", "prefill-units", "rtx-expert-layers", "onboard", "attention-placement",
+        "attention-plan-rows", "prefix-cache-entries", "spark-prefill-reply-format", "spark-decode-reply-format"] },
+    DerivedArguments { family: Some("glm5"), names: &["max-sequences", "draft-context-slots", "draft-window-marks", "draft-fp8"] },
+    DerivedArguments { family: Some("glm5_flash"), names: &["max-sequences", "slots", "draft-sequences", "draft-context-slots",
+        "index-cache", "prefix-marks", "split-device", "draft-fp8", "kda-output-shard", "kda-prefill-expanded", "kda-fp32-partials", "fp8-head",
+        "kda-fp8", "kda-nvfp4-gate", "fp8-prefill"] },
+    DerivedArguments { family: Some("mimo_v2"), names: &["max-sequences", "rings", "draft-sequences", "draft-context-slots",
+        "http-queue-depth", "split-device", "embedding-placement", "fp8-head", "fp8-o-proj", "draft-fp8", "draft-representation"] },
+    DerivedArguments { family: Some("qwen4"), names: &["slots", "mtp"] },
+    DerivedArguments { family: Some("deepseek_v41"), names: &["prefill-batch-tokens", "prefill-reserve-rows", "decode-lanes", "max-context-tokens", "embedding-placement", "kv-pool-size"] },
+];
+fn derived_argument(family: &str, name: &str) -> bool {
+    DERIVED_ARGUMENTS.iter().any(|rule| rule.family.is_none_or(|id| id == family) && rule.names.contains(&name))
+}
+
 /// The serve command's resolved settings, without publishing them. Tests read
 /// this directly: `capture` stores one process-wide context, so a test that
 /// called it would replace whatever another test was asserting.
@@ -241,6 +262,7 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     let Some(definition) = command.find_subcommand(name) else { return Ok(None) };
     let mut settings: Vec<Setting> = Vec::new();
     let mut snapshot = None;
+    let mut derived = Vec::new();
     for arg in definition.get_arguments() {
         let id = arg.get_id().as_str();
         if matches!(id, "help" | "version" | "coordinator_gpu_budget_gib") {
@@ -254,9 +276,9 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
             Some(clap::parser::ValueSource::DefaultValue) => "default",
             _ => "unset",
         };
-        if value.is_none() && source == "unset" {
-            continue;
-        }
+        let name = arg.get_long().map(str::to_string).unwrap_or_else(|| id.replace('_', "-"));
+        if derived_argument(family, &name) { derived.push(name.clone()); }
+        if value.is_none() && source == "unset" && !derived_argument(family, &name) { continue; }
         let mut defaults: Vec<String> = arg.get_default_values().iter().map(|v| v.to_string_lossy().into_owned())
             .collect();
         if defaults.is_empty() {
@@ -297,8 +319,10 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
         default: None, source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
-    Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: None, snapshot, settings, supports_thinking_off: None }))
+    let mut context = cuteafd_bench::context::ServerContext { command: name.to_string(),
+        family: None, snapshot, settings, supports_thinking_off: None, derived: Vec::new() };
+    for name in derived { context.require_resolved(&name); }
+    Ok(Some(context))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
@@ -313,9 +337,69 @@ fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_prefix() -> crate::shared::prefix::PrefixArgs {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli { #[command(flatten)] prefix: crate::shared::prefix::PrefixArgs }
+    Cli::try_parse_from(["fixture"]).unwrap().prefix
+}
+
+#[cfg(test)]
+pub(crate) fn assert_resolved_family_seam<T>(family: &str, later: &[&str],
+    seam: impl FnOnce() -> Result<T>) -> Result<T> {
+    let command = crate::commands::family::FAMILIES.iter()
+        .find(|(id, _, _)| *id == family).unwrap().1;
+    let mut argv = vec!["cuteafd", command, "--snapshot", "/fixture", "--native-lib", "/native"];
+    if family == "step5" { argv.extend(["--peers", "127.0.0.1:19000"]); }
+    let matches = crate::cli::Cli::command().try_get_matches_from(argv)?;
+    let mut context = serve_context(&matches, None)?.unwrap();
+    reply_settings(&mut context, Default::default());
+    let (result, facts) = cuteafd_bench::context::capture_resolved(seam);
+    // A refused admission has no effective serving configuration to report.
+    let result = result?;
+    facts.apply(&mut context);
+    let missing = context.validate_resolved().err().unwrap_or_default()
+        .into_iter().collect::<std::collections::BTreeSet<_>>();
+    let later = later.iter().map(|name| name.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(missing, later, "{family}: update CPU coverage or later-stage inventory; facts={facts:?}");
+    context.derived.retain(|name| !later.contains(name));
+    assert_eq!(context.validate_resolved(), Ok(()), "{family}: missing CPU runtime facts");
+    Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) fn assert_resolved_seam<T>(family: &str, names: &[&str], seam: impl FnOnce() -> T) -> T {
+    let (result, facts) = cuteafd_bench::context::capture_resolved(seam);
+    let mut context = cuteafd_bench::context::ServerContext::default();
+    for name in names {
+        assert!(derived_argument(family, name), "{family}/{name} must be marked derived");
+        context.require_resolved(name);
+    }
+    facts.apply(&mut context);
+    assert_eq!(context.validate_resolved(), Ok(()), "{family}: {facts:?}");
+    result
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    #[test]
+    fn derived_cli_requests_are_not_effective_runtime_values() {
+        let matches = crate::cli::Cli::command().try_get_matches_from([
+            "cuteafd", "serve-glmf", "--snapshot", "/s", "--native-lib", "/l", "--slots", "8",
+            "--index-cache", "keys",
+        ]).unwrap();
+        let context = serve_context(&matches, None).unwrap().unwrap();
+        for name in ["slots", "index-cache", "draft-context-slots"] {
+            let value = context.settings.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(value.source, "unresolved");
+            assert!(value.value.is_none());
+        }
+        assert!(context.validate_resolved().is_err());
+    }
 
     #[test]
     fn cards_record_resolved_reply_pair_and_omission_separately() {

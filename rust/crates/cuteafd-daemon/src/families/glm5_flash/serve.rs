@@ -159,6 +159,19 @@ pub(crate) fn auto_vision_view(mode: cuteafd_loader::plan::MediaMode,
     })
 }
 
+pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_sequences: usize) {
+    engine_args.slots = cuteafd_core::concurrency::state_slots(max_sequences as u64) as usize;
+    (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(max_sequences,
+        engine_args.draft_sequences, engine_args.draft_context_slots);
+    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
+    cuteafd_bench::context::set_resolved("draft-fp8", if engine_args.draft.is_some() {
+        if engine_args.draft_fp8 == Some(false) { "false" } else { "true" }
+    } else { "unused" });
+    cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
+    cuteafd_bench::context::set_resolved("draft-sequences", &engine_args.draft_sequences.to_string());
+    cuteafd_bench::context::set_resolved("draft-context-slots", &engine_args.draft_context_slots.unwrap_or(0).to_string());
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
@@ -185,15 +198,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.slots = cuteafd_core::concurrency::state_slots(max_sequences as u64) as usize;
-    (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(max_sequences,
-        engine_args.draft_sequences, engine_args.draft_context_slots);
-    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
-    cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
-    cuteafd_bench::context::set_resolved("draft-sequences", &engine_args.draft_sequences.to_string());
-    if let Some(slots) = engine_args.draft_context_slots {
-        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
-    }
+    resolve_serving_capacity(&mut engine_args, max_sequences);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), max_sequences, args.decode_share);
     let policy = Policy { fixed: args.draft_fixed, batch: args.prefill_batch };
     let prefix = args.prefix.clone();
@@ -276,6 +281,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         tracing::info!("GLM 5.3 Flash prefix cache off (no entries): no prefix marks, no reserved unit");
         args.prefix_marks = marks;
     }
+    cuteafd_bench::context::set_resolved("prefix-marks", match args.prefix_marks { PrefixMarks::Arena => "arena", PrefixMarks::Pool => "pool" });
     // Either KV admission reserves the mark arena `prefix_cache` will allocate (none: marks in pool units),
     // counted once the engine's layout is known (`with_engine`).
     args.mark_arena = match args.prefix_marks {

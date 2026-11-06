@@ -260,6 +260,8 @@ impl EngineArgs {
             "Qwen prefill units need Spark experts or shared-only diagnostics");
         ensure!(self.split_device.is_none() || self.prefill_units.is_none(),
             "Qwen dual-owner execution does not admit diagnostic unit cuts");
+        cuteafd_bench::context::ResolvedSettings::prefill(shape)
+            .value("prefill-rows", shape.span_rows).value("prefill-units", shape.unit_rows).publish();
         Ok(shape)
     }
 
@@ -309,8 +311,10 @@ fn attention_plan(args: &EngineArgs, loaded_mtp: bool)
     -> std::result::Result<cuteafd_core::coordinator_programs::AttentionReductionPlan,
         cuteafd_core::coordinator_programs::AttentionPlanError>
 {
-    cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)
+    let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
+        engine::DECODE_ROWS, loaded_mtp.then_some(args.mtp), args.attention_plan_rows)?;
+    cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -362,7 +366,13 @@ mod weight_representation_tests {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
-            let shape = parsed.prefill_shape()?.unwrap();
+            let shape = crate::commands::bench::assert_resolved_family_seam("qwen4",
+                &["max-context", "pool-tokens", "slots", "mtp", "rtx-expert-layers", "attention-plan-rows"], || {
+                    crate::commands::bench::fixture_prefix().resolve_entries(16);
+                    let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
+                    let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
+                    Ok(inputs.prefill_shape)
+                })?.unwrap();
             assert_eq!((shape.unit_rows, shape.waves), (rows, waves));
             assert_eq!(parsed.prefill_rows, 0);
         }
@@ -634,6 +644,8 @@ impl Opened {
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let source = self.embed_source()?;
         let with_mtp = args.mtp > 0 && layers == self.cfg.layers;
+        cuteafd_bench::context::set_resolved("mtp", &if with_mtp { args.mtp.min(engine::DECODE_ROWS - 1) } else { 0 }.to_string());
+        if args.peers.is_none() { cuteafd_bench::context::set_rtx_expert_layers(if args.local_experts { layers } else { 0 }); }
         let admitted_target = admission::single_weights(args, &self.checkpoint, &self.cfg, layers, with_mtp)?;
         // The coordinator's dense records push in a group of this GPU alone when
         // the checkpoint is SparkNest's; records are planned from headers first,

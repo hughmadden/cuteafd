@@ -189,7 +189,7 @@ fn speculator(_family: Option<&str>, settings: &[Setting]) -> Option<String> {
 
 fn layout(hardware: &Hardware, settings: &[Setting]) -> String {
     let mut parts = vec![format!("{} RTX", hardware.used_gpus())];
-    if setting(settings, &["split-device"]).is_some() {
+    if setting(settings, &["split-device"]).is_some_and(|value| value.parse::<usize>().is_ok()) {
         parts[0].push_str(" (head split)");
     }
     match hardware.sparks.len() {
@@ -208,7 +208,7 @@ fn layout(hardware: &Hardware, settings: &[Setting]) -> String {
 }
 
 pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configuration {
-    let settings = context.settings.clone();
+    let settings = context.report_settings();
     let quant = context.snapshot.as_deref().map(|s| quant(s, hardware.sparks.len())).unwrap_or_default();
     Configuration {
         supports_thinking_off: context.supports_thinking_off,
@@ -361,6 +361,13 @@ mod tests {
 
     fn s(name: &str, value: &str, default: Option<&str>, source: &str) -> Setting {
         Setting { name: name.into(), value: Some(value.into()), default: default.map(str::to_string), source: source.into() }
+    }
+
+    #[test]
+    fn resolved_absent_split_is_not_a_head_split() {
+        let hardware = Hardware::default();
+        assert!(!layout(&hardware, &[s("split-device", "none", None, "resolved")]).contains("head split"));
+        assert!(layout(&hardware, &[s("split-device", "1", None, "resolved")]).contains("head split"));
     }
 
     #[test]
