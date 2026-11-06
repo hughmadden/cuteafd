@@ -44,6 +44,8 @@ type Dev<'a> = DeviceAllocation<'a>;
 
 #[path = "dflash_allocation.rs"]
 mod allocation;
+#[path = "dflash_context.rs"]
+pub(crate) mod context_split;
 #[cfg(test)]
 #[path = "dflash_physical_tests.rs"]
 mod physical_tests;
@@ -279,18 +281,29 @@ impl<'a> MlaDraftStorage<'a> {
             }
             ensure!(bytes == expected("fp8_scratch")?, "MLA draft FP8 workspace disagrees with admission");
         }
-        let buffers = layout.allocate_device_with(|b| DeviceAllocation::named(library, b.bytes, "drafter/mla"))?;
+        let buffers = Self::recipes(&layout)?.iter().map(|b|
+            DeviceAllocation::named(library, b.bytes, "drafter/mla")).collect::<Result<Vec<_>>>()?;
         Ok(Self { layout, buffers })
     }
 
+    fn recipes(layout: &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout)
+        -> Result<Vec<cuteafd_loader::formats::dflash::MlaDraftBuffer>> {
+        let mut recipes = layout.common_device_buffers();
+        if layout.context_split() {
+            recipes.extend(layout.context_layout()?.buffers[1].iter()
+                .filter(|buffer| buffer.name.starts_with("layer.")).cloned());
+        }
+        Ok(recipes)
+    }
+
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
-        let index = self.layout.device_buffers().iter().position(|b| b.name == name)
+        let index = Self::recipes(&self.layout)?.iter().position(|b| b.name == name)
             .with_context(|| format!("MLA draft unknown admitted buffer {name}"))?;
         Ok(self.buffers[index].buffer)
     }
 
     fn into_owners(self) -> Result<AdmittedBuffers<Dev<'a>>> {
-        let recipes = self.layout.device_buffers();
+        let recipes = Self::recipes(&self.layout)?;
         for (recipe, owner) in recipes.iter().zip(&self.buffers) {
             ensure!(owner.buffer.bytes == recipe.bytes, "MLA draft {} extent differs from admission", recipe.name);
         }
@@ -459,7 +472,8 @@ impl Drop for MlaPageLease<'_, '_> {
     fn drop(&mut self) {
         if self.reservations.is_empty() { return; }
         // SAFETY: this lease retains its destinations on the drafter's live owned stream.
-        if unsafe { self.library.cuda_stream_synchronize(self.stream) }.is_err() {
+        if unsafe { self.library.cuda_stream_synchronize(self.stream) }
+            .and_then(|()| self.context.split.as_ref().map_or(Ok(()), |split| split.drain())).is_err() {
             // Failed retirement deliberately retains ownership: never reuse live storage.
             return;
         }
@@ -474,6 +488,7 @@ struct MlaContext<'a> {
     cfg: cuteafd_loader::formats::dflash::MlaDflashConfig,
     layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
     state: RefCell<MlaPagedState>,
+    split: Option<context_split::ContextOwner<'a>>,
     slots: Dev<'a>,
 }
 
@@ -1123,13 +1138,15 @@ impl<'a> DflashDrafter<'a> {
         program_namespace: &str, snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
-        fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
+        fp8_rows: fp8_linear::Fp8Rows,
+        split: Option<context_split::ContextOwner<'a>>) -> Result<Self> {
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
         use cuteafd_loader::formats::dflash::MlaDflashConfig;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let native = MlaDflashConfig::read(snapshot)?;
         ensure!(native.runtime_layout(representation, layout.capacity(), layout.program().context,
-            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())? == layout,
+            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())?
+                .with_context_split(layout.context_split())? == layout && layout.context_split() == split.is_some(),
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
         let projections = Self::load_projections(programs, &cfg, representation, true, false, layout.capacity().max_batch_sequences)?;
@@ -1196,7 +1213,7 @@ impl<'a> DflashDrafter<'a> {
             taps: owners.take("taps")?, fused: owners.take("fused")?, fused_norm: owners.take("fused_norm")?,
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
-                layout, slots: owners.take("context_slots")? }),
+                split, layout, slots: owners.take("context_slots")? }),
             mask_row: Vec::new(), mask_rows: None, markov_workspace: None, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
@@ -1306,7 +1323,7 @@ impl<'a> DflashDrafter<'a> {
             taps: owners.take("taps")?, fused: owners.take("fused")?, fused_norm: owners.take("fused_norm")?,
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
-                layout, slots: owners.take("context_slots")? }),
+                split: None, layout, slots: owners.take("context_slots")? }),
             mask_row: Vec::new(), mask_rows: Some(masks), markov_workspace: Some(markov_workspace),
             workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false),
             representation: GlmDraftRepresentation::Bf16Only, fp8_workspace: None,
@@ -1437,7 +1454,13 @@ impl<'a> DflashDrafter<'a> {
                 ranges.push(("drafter/context_kv".into(), context.kv.buffer));
                 ranges.push(("drafter/context_slots".into(), context.slots.buffer));
             }
-            DraftContext::Mla(context) => ranges.push(("drafter/context_slots".into(), context.slots.buffer)),
+            DraftContext::Mla(context) => {
+                ranges.push(("drafter/context_slots".into(), context.slots.buffer));
+                if let Some(split) = &context.split {
+                    ranges.extend(split.buffers().map(|(rank, name, buffer)|
+                        (format!("drafter/context/{rank}/{name}"), buffer)));
+                }
+            }
         }
         for (layer, buffers) in self.layers.iter().enumerate() {
             match &buffers.attention {
@@ -1572,7 +1595,7 @@ impl<'a> DflashDrafter<'a> {
         };
         self.copy_mla_pages(&copies)?;
         // SAFETY: test-only readback retains all operands and their producing stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        self.drain_mla()?;
         let cache = context.layout.cache();
         let record_bytes = context.layout.paged_cache().record_bytes;
         let mut layers = Vec::new();
@@ -1586,10 +1609,13 @@ impl<'a> DflashDrafter<'a> {
                     let relative = position - origin;
                     pages[relative / 64].index as usize * 64 + relative % 64
                 };
-                let view = crate::shared::prefix::view(attention.cache.buffer,
-                    row * record_bytes, record_bytes)?;
+                let view = if let Some(split) = &context.split {
+                    draft_view(split.cache(index, attention.cache.buffer, row / 64 % 2)?,
+                        (row / 128 * 64 + row % 64) * record_bytes, record_bytes)?
+                } else { draft_view(attention.cache.buffer, row * record_bytes, record_bytes)? };
                 let mut row = vec![0; record_bytes];
-                self.library.copy_d2h(&mut row, view)?;
+                crate::shared::memory::device::Device { library: self.library, id: view.device_id }
+                    .run(|| self.library.copy_d2h(&mut row, view))?;
                 bytes.extend(row);
             }
             layers.push(bytes);
@@ -1599,23 +1625,36 @@ impl<'a> DflashDrafter<'a> {
         if count > 0 {
             self.library.copy_d2h(&mut taps, crate::shared::prefix::view(self.taps.buffer, 0, count)?)?;
         }
-        let window_owners = self.layers.iter().zip(&cache.layers).enumerate()
-            .filter(|(_, (_, layout))| layout.window().is_some()).map(|(index, (layer, _))| {
-                let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch"); };
-                let view = bind_draft_view(layer.cache.buffer, &context.layout.window_view(index, slot)?)?;
-                let mut bytes = vec![0; view.bytes];
-                self.library.copy_d2h(&mut bytes, view)?;
-                Ok(bytes)
-            }).collect::<Result<Vec<_>>>()?;
+        let mut window_owners = Vec::new();
+        for (index, layout) in cache.layers.iter().enumerate() {
+            if layout.window().is_none() { continue; }
+            let mut bytes = Vec::new();
+            for view in self.mla_window_layer_buffers(index, slot)? {
+                let mut part = vec![0; view.bytes];
+                crate::shared::memory::device::Device { library: self.library, id: view.device_id }
+                    .run(|| self.library.copy_d2h(&mut part, view))?;
+                bytes.extend(part);
+            }
+            window_owners.push(bytes);
+        }
         context.state.borrow_mut().pool.release_snapshot(snapshot)?;
         Ok(MlaReadback { frontier, layers, window_owners, taps })
+    }
+
+    pub(crate) fn drain_mla(&self) -> Result<()> {
+        // SAFETY: request/turn barriers retain the common stream and all Context owners.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        if let DraftContext::Mla(context) = &self.context {
+            if let Some(split) = &context.split { split.drain()?; }
+        }
+        Ok(())
     }
 
     pub(crate) fn reset_context(&self, slot: usize, origin: usize) -> Result<()> {
         ensure!(slot < self.slots, "DFlash reset outside admitted slots");
         if let DraftContext::Mla(context) = &self.context {
             // SAFETY: rebind retires the old request before its pooled destinations are released.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            self.drain_mla()?;
             context.state.borrow_mut().reset(slot, origin)?;
             self.canonicalize_mla_windows(context, &[slot], &context.state.borrow().rings)?;
         }
@@ -1629,9 +1668,13 @@ impl<'a> DflashDrafter<'a> {
             for (index, layer) in self.layers.iter().enumerate() {
                 let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch"); };
                 for rows in rings.window_slack(index, slot)? {
-                    let view = draft_view(layer.cache.buffer, rows.start * record, rows.len() * record)?;
-                    // SAFETY: slack excludes retained rows; the owned stream retires prior readers first.
-                    unsafe { self.library.cuda_zero_bytes_async(view, view.bytes, self.stream)?; }
+                    if let Some(split) = &context.split {
+                        split.zero(&split.segments(index, layer.cache.buffer, rows)?)?;
+                    } else {
+                        let view = draft_view(layer.cache.buffer, rows.start * record, rows.len() * record)?;
+                        // SAFETY: slack excludes retained rows; the owned stream retires prior readers first.
+                        unsafe { self.library.cuda_zero_bytes_async(view, view.bytes, self.stream)?; }
+                    }
                 }
             }
         }
@@ -1642,7 +1685,7 @@ impl<'a> DflashDrafter<'a> {
         ensure!(slot < self.slots, "DFlash discard outside admitted slots");
         if let DraftContext::Mla(context) = &self.context {
             // SAFETY: cancellation cannot recycle pages still addressed by queued work.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            self.drain_mla()?;
             context.state.borrow_mut().discard(slot)?;
         }
         Ok(())
@@ -1654,11 +1697,14 @@ impl<'a> DflashDrafter<'a> {
     }
 
     pub(crate) fn mla_snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>> {
-        let DraftContext::Mla(_) = &self.context else { anyhow::bail!("not an MLA drafter") };
-        self.layers.iter().map(|layer| {
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        let mut buffers = Vec::new();
+        for (index, layer) in self.layers.iter().enumerate() {
             let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
-            Ok(layer.cache.buffer)
-        }).collect()
+            buffers.push(layer.cache.buffer);
+            if let Some(split) = &context.split { buffers.push(split.cache(index, layer.cache.buffer, 0)?); }
+        }
+        Ok(buffers)
     }
 
     pub(crate) fn mla_draft_page_bytes(&self) -> usize {
@@ -1668,14 +1714,17 @@ impl<'a> DflashDrafter<'a> {
     }
 
     pub(crate) fn copy_mla_windows(&self, slot: usize, marks: &[CuteafdDeviceBuffer], capture: bool) -> Result<()> {
-        let windows = self.mla_window_segments(slot)?;
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        let windows = self.mla_window_buffers(slot)?;
         ensure!(windows.len() == marks.len(), "MLA window mark layer count");
-        for (window, mark) in windows.into_iter().zip(marks) {
-            ensure!(window.bytes == mark.bytes, "MLA window mark byte count");
-            let live = CuteafdDeviceBuffer { ptr: window.addr as *mut c_void, bytes: window.bytes, ..*mark };
+        for (live, mark) in windows.into_iter().zip(marks) {
+            ensure!(live.bytes == mark.bytes, "MLA window mark byte count");
             let (dst, src) = if capture { (*mark, live) } else { (live, *mark) };
-            // SAFETY: family retains both window and mark owners until its drafter drain.
-            unsafe { self.library.copy_d2d_async(dst, src, src.bytes, self.stream)?; }
+            if let Some(split) = &context.split { split.copy(dst, src)?; }
+            else {
+                // SAFETY: family retains both window and mark owners until its drafter drain.
+                unsafe { self.library.copy_d2d_async(dst, src, src.bytes, self.stream)?; }
+            }
         }
         Ok(())
     }
@@ -1687,7 +1736,7 @@ impl<'a> DflashDrafter<'a> {
         (|| -> Result<cuteafd_engine::prefix::DraftPageAttachment> {
             let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
             // SAFETY: the owned stream retires producers before snapshotting their canonical rows.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            self.drain_mla()?;
             let mut state = context.state.borrow_mut();
             let binding = state.bindings.get(slot).copied().flatten().context("unbound MLA draft slot")?;
             ensure!(state.pool.frontier(binding)?.1 == frontier, "MLA snapshot differs from committed frontier");
@@ -1697,7 +1746,7 @@ impl<'a> DflashDrafter<'a> {
             if let Err(error) = self.copy_mla_pages(&copies) {
                 // A failed copy may have queued work. Do not release its destinations unless drained.
                 // SAFETY: all copies use this drafter's owned stream.
-                if unsafe { self.library.cuda_stream_synchronize(self.stream) }.is_ok() {
+                if self.drain_mla().is_ok() {
                     context.state.borrow_mut().pool.release_snapshot(snapshot)?;
                 }
                 return Err(error);
@@ -1709,7 +1758,7 @@ impl<'a> DflashDrafter<'a> {
     pub(crate) fn release_mla_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<()> {
             let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
         // SAFETY: the family also retires its host-copy stream before calling this hook.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        self.drain_mla()?;
         let mut state = context.state.borrow_mut();
         state.pool.check_attachment(attachment)?;
         Ok(state.pool.release_snapshot(attachment.snapshot)?)
@@ -1775,7 +1824,7 @@ impl<'a> DflashDrafter<'a> {
         (|| -> Result<()> {
             let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
             // SAFETY: retire the previous request before replacing its ownership.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            self.drain_mla()?;
             let mut state = context.state.borrow_mut();
             state.pool.check_attachment(attachment)?;
             let rings = state.restored_rings(slot, attachment.origin, attachment.frontier)?;
@@ -1791,7 +1840,7 @@ impl<'a> DflashDrafter<'a> {
             let copied = self.copy_mla_pages(&copies);
             // SAFETY: retain the source pin and live destinations until every restore copy retires.
             // A failed drain deliberately leaves the pin/ownership quarantined in the pool.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+            self.drain_mla()?;
             context.state.borrow_mut().pool.unpin_snapshot(attachment.snapshot)?;
             copied?;
             context.state.borrow_mut().rings = rings;
@@ -1808,7 +1857,7 @@ impl<'a> DflashDrafter<'a> {
         ensure!(context.layout.paged_cache().full_layers == 0,
             "a drafter with pooled pages restores through its page attachment");
         // SAFETY: retire the previous request and the window copies before rebinding the slot.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        self.drain_mla()?;
         context.state.borrow_mut().restore_windows(slot, frontier)
     }
 
@@ -1823,25 +1872,48 @@ impl<'a> DflashDrafter<'a> {
             let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
         let page_bytes = context.layout.paged_cache().page_rows * context.layout.paged_cache().record_bytes;
         ensure!((page.index as usize) < context.layout.paged_cache().pages, "MLA draft page outside pool");
-        self.layers.iter().zip(&context.layout.cache().layers).filter(|(_, layout)| layout.window().is_none())
-            .map(|(layer, _)| {
+        self.layers.iter().zip(&context.layout.cache().layers).enumerate()
+            .filter(|(_, (_, layout))| layout.window().is_none())
+            .map(|(index, (layer, _))| {
                 let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
-                let buffer = draft_view(layer.cache.buffer, page.index as usize * page_bytes, page_bytes)?;
+                let buffer = if let Some(split) = &context.split {
+                    draft_view(split.cache(index, layer.cache.buffer, page.index as usize % 2)?,
+                        page.index as usize / 2 * page_bytes, page_bytes)?
+                } else { draft_view(layer.cache.buffer, page.index as usize * page_bytes, page_bytes)? };
                 Ok(cuteafd_hostcache::copy::DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes })
             }).collect()
     }
 
+    fn mla_window_layer_buffers(&self, index: usize, slot: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        let DraftAttention::Mla(layer) = &self.layers[index].attention else { anyhow::bail!("MLA draft layer mismatch") };
+        let view = context.layout.window_view(index, slot)?;
+        if let Some(split) = &context.split {
+            let record = context.layout.paged_cache().record_bytes;
+            let mut buffers = Vec::new();
+            // Marks use logical page order, not owner order. Odd-sized windows
+            // change starting owner between slots, but must keep the same wire layout.
+            for first in (view.offset / record..(view.offset + view.bytes) / record).step_by(64) {
+                buffers.extend(split.segments(index, layer.cache.buffer, first..first + 64)?);
+            }
+            Ok(buffers)
+        } else { Ok(vec![bind_draft_view(layer.cache.buffer, &view)?]) }
+    }
+
+    fn mla_window_buffers(&self, slot: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        ensure!(slot < self.slots, "MLA draft window slot outside capacity");
+        let mut buffers = Vec::new();
+        for (index, layout) in context.layout.cache().layers.iter().enumerate() {
+            if layout.window().is_some() { buffers.extend(self.mla_window_layer_buffers(index, slot)?); }
+        }
+        Ok(buffers)
+    }
+
     pub(crate) fn mla_window_segments(&self, slot: usize)
         -> Result<Vec<cuteafd_hostcache::copy::DeviceRange>> {
-            let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
-        ensure!(slot < self.slots, "MLA draft window slot outside capacity");
-        self.layers.iter().zip(&context.layout.cache().layers).enumerate()
-            .filter(|(_, (_, layout))| layout.window().is_some())
-            .map(|(index, (layer, _))| {
-                let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
-                let buffer = bind_draft_view(layer.cache.buffer, &context.layout.window_view(index, slot)?)?;
-                Ok(cuteafd_hostcache::copy::DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes })
-            }).collect()
+        Ok(self.mla_window_buffers(slot)?.into_iter().map(|buffer|
+            cuteafd_hostcache::copy::DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes }).collect())
     }
 
     fn copy_mla_pages(&self, copies: &[cuteafd_engine::prefix::TailCopy]) -> Result<()> {
@@ -1849,14 +1921,22 @@ impl<'a> DflashDrafter<'a> {
         let bytes_per_row = context.layout.paged_cache().record_bytes;
         let page_bytes = context.layout.paged_cache().page_rows * bytes_per_row;
         for copy in copies {
-            for (layer, layout) in self.layers.iter().zip(&context.layout.cache().layers) {
+            for (index, (layer, layout)) in self.layers.iter().zip(&context.layout.cache().layers).enumerate() {
                 if layout.window().is_some() { continue; }
                 let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
                 let bytes = copy.rows * bytes_per_row;
-                let from = draft_view(layer.cache.buffer, copy.from as usize * page_bytes, bytes)?;
-                let to = draft_view(layer.cache.buffer, copy.to as usize * page_bytes, bytes)?;
-                // SAFETY: allocator owns both checked ranges until the family's retirement barrier.
-                unsafe { self.library.copy_d2d_async(to, from, bytes, self.stream)?; }
+                if let Some(split) = &context.split {
+                    let from = draft_view(split.cache(index, layer.cache.buffer, copy.from as usize % 2)?,
+                        copy.from as usize / 2 * page_bytes, bytes)?;
+                    let to = draft_view(split.cache(index, layer.cache.buffer, copy.to as usize % 2)?,
+                        copy.to as usize / 2 * page_bytes, bytes)?;
+                    split.copy(to, from)?;
+                } else {
+                    let from = draft_view(layer.cache.buffer, copy.from as usize * page_bytes, bytes)?;
+                    let to = draft_view(layer.cache.buffer, copy.to as usize * page_bytes, bytes)?;
+                    // SAFETY: allocator owns both checked ranges until the family's retirement barrier.
+                    unsafe { self.library.copy_d2d_async(to, from, bytes, self.stream)?; }
+                }
             }
         }
         Ok(())
@@ -1882,6 +1962,7 @@ impl<'a> DflashDrafter<'a> {
                     bind_draft_view(self.fused_norm.buffer, &views[0])?, w.delta.buffer,
                     bind_draft_view(context.slots.buffer, &views[1])?,
                     bind_draft_view(self.context_positions.buffer, &views[2])?);
+                let b = if let Some(split) = &context.split { split.producer(b)? } else { b };
                 layer.program.check_produce(layer.weights(), b)?;
                 chunks.push(b);
             }
@@ -1903,7 +1984,14 @@ impl<'a> DflashDrafter<'a> {
                 // ordered copy fence, not a compute drain; the staging owner retains its bytes.
                 self.put(&context.slots, bytes_of(&plan.slots[index]))?;
             }
-            for batch in chunks { layer.program.produce(layer.weights(), batch, self.stream)?; }
+            for (chunk, batch) in chunks.into_iter().enumerate() {
+                if let Some(split) = &context.split { split.producer_slots(batch.rows)?; }
+                layer.program.produce(layer.weights(), batch, self.stream)?;
+                if let Some(split) = &context.split {
+                    split.scatter_update(index, layer.cache.buffer,
+                        &plan.slots[index][chunk * 64..chunk * 64 + batch.rows], &self.timing)?;
+                }
+            }
         }
         self.timing.end(span, self.stream)?;
         let slots = rows.iter().map(|row| row.slot).collect::<std::collections::BTreeSet<_>>()
@@ -1933,8 +2021,8 @@ impl<'a> DflashDrafter<'a> {
         if self.startup_primed.get() { return Ok(()); }
         let result = self.prime_isolated();
         if result.is_err() {
-            // SAFETY: startup still owns all operands; no bridge waits have been published.
-            if unsafe { self.library.cuda_stream_synchronize(self.stream) }.is_err() {
+            // Startup still owns all operands, including both Context exchange streams.
+            if self.drain_mla().is_err() {
                 self.library.quarantine_module_after_failed_drain();
             }
         }
@@ -2161,7 +2249,15 @@ impl<'a> DflashDrafter<'a> {
                         let batch = attention.batch(context, layer, chunk_rows, chunk.lengths.len(), chunk.page_table_width,
                             block_input(w, &views[0])?, bind_draft_view(w.delta.buffer, &views[1])?,
                             attention.slots.buffer, attention.positions.buffer);
-                        layer.program.check_launch(layer.weights(), batch)?;
+                        if let Some(split) = &context.split {
+                            split.preflight(index, layer, attention, chunk, context.cfg.windows[index],
+                                context.layout.paged_cache().layer_bytes[index] / (64 * context.layout.paged_cache().record_bytes),
+                                context.cfg.attention_scale())?;
+                            layer.program.check_produce(layer.weights(), split.producer(batch)?)?;
+                            layer.program.check_output(layer.weights(), batch)?;
+                        } else {
+                            layer.program.check_launch(layer.weights(), batch)?;
+                        }
                     }
                     all.push(chunks);
                 }
@@ -2267,7 +2363,16 @@ impl<'a> DflashDrafter<'a> {
                             let batch = attention.batch(context, a, chunk_rows, chunk.lengths.len(), chunk.page_table_width,
                                 block_input(w, &views[0])?, bind_draft_view(w.delta.buffer, &views[1])?,
                                 attention.slots.buffer, attention.positions.buffer);
-                            a.program.launch(a.weights(), batch, s)?;
+                            if let Some(split) = &context.split {
+                                split.producer_slots(chunk_rows)?;
+                                a.program.produce(a.weights(), split.producer(batch)?, s)?;
+                                split.attend(index, a, attention, chunk, context.cfg.windows[index],
+                                    context.layout.paged_cache().layer_bytes[index] / (64 * context.layout.paged_cache().record_bytes),
+                                    context.cfg.attention_scale(), &self.timing)?;
+                                a.program.output(a.weights(), batch, s)?;
+                            } else {
+                                a.program.launch(a.weights(), batch, s)?;
+                            }
                         }
                     }
                     _ => anyhow::bail!("DFlash layer/workspace mismatch"),

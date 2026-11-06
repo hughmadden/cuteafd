@@ -393,6 +393,9 @@ pub(crate) struct PlanArgs {
     /// Charge native MLA DFlash FP8 residency instead of BF16.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) draft_fp8: bool,
+    /// Split Kimi's DFlash cache and attention over two physical GPUs (default off).
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) tp2_dflash: Option<bool>,
     /// Separately configured vision checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) vision_snapshot: Option<PathBuf>,

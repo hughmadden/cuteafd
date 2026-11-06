@@ -127,6 +127,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 muse_partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
                 dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
                 kimi_draft_fp8: args.draft_fp8,
+                kimi_tp2_dflash: args.tp2_dflash.unwrap_or(false),
                 glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
@@ -565,6 +566,15 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
     if args.spark_ranks.is_none() {
         if cfg.get("EXPERT_BACKEND").is_some_and(|v| v == "local") { args.spark_ranks = Some(0); }
         else if let Some(ranks) = cfg.get("SPARK_COUNT") { args.spark_ranks = Some(ranks.parse().context("SPARK_COUNT")?); }
+    }
+    if family == "kimi_k3" {
+        if let Some(value) = cfg.get("TP2_DFLASH") {
+            let configured = match value.as_str() {
+                "on" => true, "off" => false,
+                _ => anyhow::bail!("TP2_DFLASH must be on or off"),
+            };
+            args.tp2_dflash.get_or_insert(configured);
+        }
     }
     resolve_speculator(&mut args, snapshot, family, &cfg)?;
     let needs_drafter = if let Some(layout) = &args.file_layout {
@@ -1107,7 +1117,7 @@ mod tests {
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,
-            drafter_snapshot: None, draft_fp8: false, vision_snapshot: None, audio_snapshot: None,
+            drafter_snapshot: None, draft_fp8: false, tp2_dflash: None, vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,
@@ -1206,6 +1216,22 @@ mod tests {
                     .any(|item| item.category == cuteafd_core::memory_layout::Category::Drafter));
             }
         }
+    }
+
+    #[test]
+    fn kimi_tp2_dflash_config_preserves_explicit_cli_false() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &kimi_k3_config(), &[t("unused.weight", "BF16", &[2])], None);
+        let config = target.path().join("pair.config");
+        std::fs::write(&config, "SPECULATOR=off\nTP2_DFLASH=on\nVISION=off\nAUDIO=off\n").unwrap();
+        let mut input = args(target.path(), 6, false);
+        input.config = Some(config.clone());
+        assert_eq!(file_args(input.clone(), target.path()).unwrap().tp2_dflash, Some(true));
+        input.tp2_dflash = Some(false);
+        assert_eq!(file_args(input.clone(), target.path()).unwrap().tp2_dflash, Some(false));
+        std::fs::write(&config, "SPECULATOR=off\nTP2_DFLASH=auto\nVISION=off\nAUDIO=off\n").unwrap();
+        assert!(file_args(input, target.path()).is_err());
     }
 
     #[test]

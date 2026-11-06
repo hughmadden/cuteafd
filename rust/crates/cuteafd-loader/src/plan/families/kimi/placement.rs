@@ -243,11 +243,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let draft = MlaDflashConfig::read(snapshot)?;
         anyhow::ensure!(draft.mla.hidden == cfg.hidden && draft.vocab == cfg.vocab_size
             && draft.taps.iter().all(|&layer| layer < cfg.layers), "Kimi drafter target geometry differs from checkpoint");
+        anyhow::ensure!(!opts.kimi_tp2_dflash || gpus == 2,
+            "Kimi TP2 DFlash requires two physical coordinator GPUs");
         let slots = usize::try_from(slots)?;
         let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
             else { GlmDraftRepresentation::Bf16Only };
         let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
-            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?;
+            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?.with_context_split(opts.kimi_tp2_dflash)?;
         fixed.extend(crate::families::kimi_k3::draft_bridge_demands_for_ranks(&layout, rows, gpus)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns

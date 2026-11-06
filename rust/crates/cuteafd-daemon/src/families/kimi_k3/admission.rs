@@ -197,11 +197,18 @@ impl<'a> Admission<'a> {
         programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &std::path::Path,
         file: Vec<u8>, stream: *mut std::ffi::c_void,
         representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation,
-        scales: crate::shared::fp8_linear::Fp8Scales, rows: crate::shared::fp8_linear::Fp8Rows)
+        scales: crate::shared::fp8_linear::Fp8Scales, rows: crate::shared::fp8_linear::Fp8Rows,
+        exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>)
         -> Result<DeviceOwner<'a, DflashDrafter<'a>>> {
-        self.allocate_draft_with(device.id, |layout| device.own(||
+        self.allocate_draft_with(device.id, |layout| device.own(|| {
+            let split = if layout.context_split() {
+                let (streams, peer) = exchange.context("Kimi Context draft requires target exchange")?;
+                Some(crate::shared::speculation::dflash::context_split::ContextOwner::allocate(
+                    programs, &layout, streams, peer, stream)?)
+            } else { None };
             DflashDrafter::load_mla(device.library, programs, "kimik3", snapshot, file, stream, layout,
-                representation, scales, rows)))
+                representation, scales, rows, split)
+        }))
     }
 
     fn check_draft(&self, device: i32) -> Result<&MlaDraftRuntimeLayout> {
@@ -219,13 +226,12 @@ impl<'a> Admission<'a> {
         ensure!(draft::home(&self.placement) == Some(head as u8), "Kimi drafter must stay on target head owner");
         let (demand, _) = layout.demands(head as u8)?;
         for demand in demand.owned {
-            let charges = self.placement.items[head].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
+            let rank = usize::from(demand.gpu);
+            ensure!(rank < self.devices.len(), "Kimi draft physical owner absent");
+            let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             ensure!(charges.len() == 1 && charges[0].category == demand.category
                 && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
                 "Kimi draft allocation differs from accepted {} charge", demand.group);
-            ensure!(!self.placement.items.iter().enumerate().filter(|(rank, _)| *rank != head)
-                .any(|(_, items)| items.iter().any(|item| item.group == demand.group)),
-                "Kimi draft allocation has an unexecutable remote charge");
         }
         Ok(layout)
     }
@@ -1080,7 +1086,7 @@ pub(super) mod tests {
         println!("spark minimum_onboard={} max_four_expert_bytes={}", spark.minimum_rtx_layers()?,
             (0..6).map(|rank| spark.rank_bytes(rank, 4)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap());
         let context = std::env::var("CUTEAFD_KIMI_REPLAY_CONTEXT").ok().map(|v| v.parse::<usize>()).transpose()?.unwrap_or(1 << 20);
-        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true, cache_format: cuteafd_core::MlaCacheFormat::Bf16 }.layout(8, context, 188)?;
+        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true, tp2_dflash: false, cache_format: cuteafd_core::MlaCacheFormat::Bf16 }.layout(8, context, 188)?;
         // Sealed program manifests and the failed card's post-module CUDA samples.
         // These are CPU arithmetic inputs, not a new hardware measurement.
         let scratch = NativeScratch { kda: 629_464_064, mla: [168_296_448, 101_056_512, 201_326_592] };
@@ -1591,6 +1597,27 @@ pub(super) mod tests {
         let mut admitted = admit(i)?;
         assert!(admitted.allocate_draft_with::<()>(1, |_| anyhow::bail!("injected partial allocation")).is_err());
         assert!(admitted.check_draft(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn context_draft_admission_preserves_both_physical_owners_and_page_pairs() -> Result<()> {
+        let cfg = cfg();
+        let mut i = inputs(&cfg);
+        i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576).with_context_split(true)?);
+        let admitted = admit(i)?;
+        let layout = admitted.check_draft(1)?;
+        assert!(layout.context_split());
+        assert_eq!(admitted.placement.pool_tokens % 128, 0);
+        let (demand, _) = layout.demands(1)?;
+        for rank in 0..2 {
+            assert!(demand.owned.iter().any(|owner| usize::from(owner.gpu) == rank));
+            assert!(admitted.placement.items[rank].iter().any(|owner|
+                owner.group.starts_with("MLA DFlash Context layer.")));
+        }
+        let mut i = inputs_for_ranks::<1>(&cfg);
+        i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576).with_context_split(true)?);
+        assert!(admit(i).is_err());
         Ok(())
     }
 

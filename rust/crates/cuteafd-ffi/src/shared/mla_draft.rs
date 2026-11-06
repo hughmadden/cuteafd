@@ -116,8 +116,12 @@ impl<'a> MlaDraftCombine<'a> {
         Ok(Self { program: programs.program(&name, &["o0", "l0", "o1", "l1", "sink", "out"])? })
     }
 
+    pub fn check(&self, batch: MlaDraftCombineBatch) -> Result<()> {
+        validate_combine_batch(batch)
+    }
+
     pub fn launch(&self, batch: MlaDraftCombineBatch, stream: *mut c_void) -> Result<()> {
-        validate_combine_batch(batch)?;
+        self.check(batch)?;
         // SAFETY: disjoint checked rank-local extents survive the ordered merge.
         unsafe { self.program.launch(&[batch.partial[0].ptr, batch.lse[0].ptr,
             batch.partial[1].ptr, batch.lse[1].ptr, batch.sink.ptr, batch.output.ptr],
@@ -339,13 +343,18 @@ impl<'a> MlaDraft<'a> {
         Ok(())
     }
 
-    /// Apply the output projection after Context partials have been LSE-combined.
-    pub fn output(&self, w: MlaDraftWeights, b: MlaDraftBatch, stream: *mut c_void) -> Result<()> {
+    /// Validate the final projection before a Context producer mutates cache.
+    pub fn check_output(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
         let hidden = self.kind.hidden();
         if !(1..=ROWS).contains(&b.rows) { return Err(MlaDraftError::Invalid("output rows")); }
         validate_buffers(&[(b.attention, b.rows * HEADS * 512 * 2),
             (w.uv, HEADS * 128 * 512 * 2), (w.output, hidden * HEADS * 128 * 2),
-            (b.output, b.rows * hidden * 2), (b.output_scratch, self.layout.scratch[2])], b.output.device_id)?;
+            (b.output, b.rows * hidden * 2), (b.output_scratch, self.layout.scratch[2])], b.output.device_id)
+    }
+
+    /// Apply the output projection after Context partials have been LSE-combined.
+    pub fn output(&self, w: MlaDraftWeights, b: MlaDraftBatch, stream: *mut c_void) -> Result<()> {
+        self.check_output(w, b)?;
         // SAFETY: checked rank-local live extents; caller orders the combined
         // attention producer before this projection and retains every owner.
         unsafe {

@@ -140,6 +140,24 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
         assert all(flag not in plan.split() for flag in ("--drafter-snapshot", "--draft-fp8"))
 
 
+@pytest.mark.parametrize("selection,expected", [(None, "false"), ("off", "false"), ("on", "true")])
+def test_kimi_tp2_dflash_plan_matches_serve_and_keeps_explicit_false(tmp_path: Path, selection, expected) -> None:
+    model, revision = "lightseekorg/kimi-k3-dflash2", "e77935fb4804e17eb55085bffd045eae1d779769"
+    _snapshot(tmp_path / "hf", model, {}, revision=revision)
+    keys = f"SPECULATOR=dflash2\nSPECULATOR_MODEL_ID={model}\nSPECULATOR_MODEL_REVISION={revision}\n"
+    if selection is not None:
+        keys += f"TP2_DFLASH={selection}\n"
+    result = _kimi(tmp_path, keys)
+    assert _flag(_line(result, "cuteafd serve-kimi --snapshot"), "--tp2-dflash") == expected
+    assert _flag(_line(result, "cuteafd plan"), "--tp2-dflash") == expected
+
+
+def test_kimi_tp2_dflash_refuses_invalid_selection(tmp_path: Path) -> None:
+    result = _kimi(tmp_path, "TP2_DFLASH=auto\n")
+    assert result.returncode != 0
+    assert "TP2_DFLASH must be on or off" in result.stderr
+
+
 @pytest.mark.parametrize("cache", [None, "bf16", "fp8"])
 def test_kimi_kv_format_reaches_both_plan_and_target_drafter(tmp_path: Path, cache) -> None:
     result = _kimi(tmp_path, "" if cache is None else f"KV_CACHE={cache}\n")
