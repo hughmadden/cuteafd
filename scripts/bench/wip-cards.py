@@ -145,7 +145,7 @@ def resolve_container_keys(entry):
 def container_targets(job):
     resolved = resolve_container_keys(job['entry'])
     targets = [('raptor', 'cuteafd-coordinator-' + resolved['instance'])]
-    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in resolved['sparks']]
+    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in job.get('spark_role_hosts', resolved['sparks'])]
     return targets
 
 
@@ -679,8 +679,9 @@ def preflight_at_grant(job, arm):
     """Smoke's prelaunch hook, run once it holds this card's locks: the absence of
     our containers is only meaningful then. Checked up front it would refuse a job
     queued behind a running task that still holds a container of the same name."""
+    artifacts = preflight_job(job, arm)
     assert_absent(job)
-    return preflight_job(job, arm)
+    return artifacts
 
 
 def preflight_deployment(job, arm):
@@ -734,6 +735,7 @@ def preflight_job(job, arm):
         if type(rank) is not int or not 0 <= rank < len(inventory):
             raise ValueError(f'planner Spark role rank has no configured host: {rank!r}')
         active_roles[inventory[rank]] = role
+    job['spark_role_hosts'] = list(active_roles)
     for host in ('raptor', *active_roles):
         meta = json.loads(slot_check(arm, host))
         release = 'release' in arm

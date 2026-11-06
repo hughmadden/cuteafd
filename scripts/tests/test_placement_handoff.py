@@ -40,6 +40,7 @@ class PlacementHandoffTest(unittest.TestCase):
             setup=r'''
 set -euo pipefail
 source scripts/lib/release-common.sh
+source scripts/lib/family-keys.sh
 release_die() { echo "$*" >&2; exit 1; }
 get() { printf '%s' "${2:-}"; }
 RELEASE_RTX_GPUS="$1"
@@ -189,8 +190,8 @@ resolved_decode_lanes=2
         self.assertEqual(coordinator[coordinator.index('--encoder-plan-hash')+1],'ab'*32)
         tails=[self.worker_tail(args) for tool,args in events if tool=='ssh' and '-s' in args]
         self.assertEqual(len(tails),4)
-        self.assertTrue(all(tail[15:]==[str(i) if i == 2 else '-1','19541','ab'*32,
-            '0123456789012345678901234567890123456789','1'] for i, tail in enumerate(tails)))
+        self.assertTrue(all(tail[15:]==[tail[2] if tail[2] == '2' else '-1','19541','ab'*32,
+            '0123456789012345678901234567890123456789','1'] for tail in tails))
         self.assertIn('if [[ "$rank" == "${16:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
 
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):

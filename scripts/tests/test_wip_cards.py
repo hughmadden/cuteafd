@@ -3220,7 +3220,13 @@ def test_deployment_preflight_checks_only_assigned_spark_roles(entry, tmp_path, 
     checked = []
     def seal(arm, host):
         checked.append(host)
-        return json.dumps(dict(slot='s', contents=dict(packages=[], tp_roles=[])))
+        return json.dumps(dict(slot='s', seal_sha256='seal', artifact_manifest_sha256='art', contents=dict(packages=[], tp_roles=[])))
     monkeypatch.setattr(cards, 'slot_check', seal)
     cards.preflight_job(job, dict(instance='test-base', slot='s'))
     assert checked == ['raptor'] + ([] if media_rank is None else [job['entry']['sparks'][media_rank]])
+    seen = []
+    monkeypatch.setattr(cards, 'run', lambda cmd: seen.append(cmd) or SimpleNamespace(stdout=''))
+    cards.assert_absent(job)
+    assert len(seen) == len(checked)
+    assert all(host in str(seen) for host in checked if host != 'raptor')
+

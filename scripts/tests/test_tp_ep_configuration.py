@@ -394,6 +394,7 @@ class LauncherTopologyTest(unittest.TestCase):
             )
             setup = f'''set -euo pipefail
 source scripts/lib/release-common.sh
+source scripts/lib/family-keys.sh
 release_die() {{ echo "$*" >&2; exit 1; }}
 get() {{ printf '%s' "${{2:-}}"; }}
 RELEASE_RTX_GPUS="$1"
@@ -420,6 +421,7 @@ EMBEDDING=gpu
 # These topology tests exercise the text-only legacy startup contract.
 VISION=off
 AUDIO=off
+RELEASE_MODEL_REVISION=0123456789012345678901234567890123456789
 DSPARK_DRAFT_POLICY=adaptive
 dspark_draft_limit=
 TP2_ATTENTION=off
@@ -1623,6 +1625,7 @@ class SparkRoleGateTest(unittest.TestCase):
         block = run_sh_block('spark_advertised_roles=""', '\npeers="$(jq')
         script = f'''set -euo pipefail
 source scripts/lib/release-common.sh
+source scripts/lib/family-keys.sh
 release_die() {{ echo "die: $*" >&2; exit 1; }}
 ssh() {{ [[ {ssh_rc} -eq 0 ]] || {{ echo "No such image" >&2; return 255; }}; printf '%s\\n' '{advertised}'; }}
 spark_expert_ranks=({" ".join(map(str, range(hosts)))})
@@ -1660,6 +1663,7 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
             # Execute the actual per-host Python guard; Docker and SSH alone are mocked.
             script = '''set -euo pipefail
 source scripts/lib/release-common.sh
+source scripts/lib/family-keys.sh
 release_die() { echo "die: $*" >&2; exit 1; }
 release_ssh() {
   [[ "$1" == -o ]]; shift 2

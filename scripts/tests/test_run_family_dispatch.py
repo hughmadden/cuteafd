@@ -254,7 +254,7 @@ def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_pat
             assert "--spark-budget-gib" not in plan
         else:
             assert float(plan[plan.index("--spark-budget-gib") + 1]) == explicit / 2**30
-    workers = [line for line in result.stderr.splitlines() if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == 4
     assert all(f"--device-budget-bytes {device_budget} " in worker for worker in workers)
 
@@ -1986,7 +1986,7 @@ def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, con
         "EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + keys,
         extra_env=env)
     assert result.returncode == 0, result.stderr
-    workers = [line for line in result.stderr.splitlines() if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert workers
     assert all("--rdma-endpoints" not in line and "--capacity" not in line for line in workers)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
@@ -2042,7 +2042,7 @@ def test_generic_custom_hosts_reach_workers_from_config(tmp_path, count):
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 4},
                                   "test/model", keys, root_launcher=True)
     assert result.returncode == 0, result.stderr
-    workers = [line for line in result.stderr.splitlines() if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == count
     for rank, host in enumerate(reversed(hosts)):
         worker = next(line for line in workers if f"--rank {rank} --world {count}" in line)

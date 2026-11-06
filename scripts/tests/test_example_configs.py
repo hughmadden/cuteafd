@@ -306,6 +306,13 @@ def test_glm_k6_core_cards_preserve_native_checkpoint_and_topology() -> None:
         assert entry["family"] == baseline["family"] == "glm5"
 
 
+def test_v4_flash_max_keeps_all_experts_on_the_rtx_pair() -> None:
+    config = keys(EXAMPLES / "deepseek-v4-flash-mxfp4-max.config")
+    assert config["RTX_GPUS"] == "2" and config["SPARK_COUNT"] == "0"
+    assert config["EXPERT_BACKEND"] == "local"
+    assert not any(re.fullmatch(r"SPARK_\d+_(HOST|LANE_A|LANE_B)", key) for key in config)
+
+
 def test_v41_max_uses_six_sparks_and_keeps_tp4_reference() -> None:
     pool = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
     config = keys(ROOT / "examples/configs/deepseek-v41-mxfp4-max.config")
