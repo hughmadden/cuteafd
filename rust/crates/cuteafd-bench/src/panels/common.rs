@@ -299,6 +299,7 @@ pub fn doublings(from: u64, max: u64) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
     #[test]
     fn zero_tokens_omits_the_output_budget() {
         use serde_json::json;
