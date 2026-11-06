@@ -790,3 +790,59 @@ async fn responses_history_follows_the_1017_drop_thinking_rule() {
     assert_eq!(status, StatusCode::OK, "{text}");
     assert!(worker.prompts.lock().unwrap()[0].contains("<think>r1</think>a1"));
 }
+
+#[tokio::test]
+async fn truncated_parallel_calls_obey_policy_in_gateway_streams() {
+    let complete = "<｜DSML｜ invoke name=\"lookup\"><｜DSML｜ parameter name=\"n\" string=\"false\">42</｜DSML｜ parameter></｜DSML｜ invoke>";
+    let reply = format!("<｜DSML｜ calls>\n{complete}\n<｜DSML｜ invoke name=\"lookup\">");
+    for path in ["/v1/messages", "/v1/responses"] {
+        for parallel in [false, true] {
+            let mut profile = ModelProfile::new("ds-fixture", ModelEncoding::DeepseekV41);
+            profile.gateway = Some(Arc::new(GatewayMount {
+                models: crate::gateway::ModelMap::single("ds-fixture"), snapshot: None,
+                options: EngineOptions::default(), search: None, gate: None, origins: Default::default(),
+            }));
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let reply = reply.clone();
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                let _ = job.events.send(Ok(InferenceChunk::Ready {
+                    system_fingerprint: None, prompt_usage: PromptUsage::default(),
+                }));
+                for character in reply.chars() {
+                    if job.events.send(Ok(InferenceChunk::Text {
+                        content: character.to_string(), content_tokens: 1,
+                    })).is_err() { return; }
+                }
+                let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
+            });
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+            let schema = json!({"type":"object","properties":{"n":{"type":"integer"}}});
+            let mut body = if path == "/v1/messages" {
+                json!({"messages":[{"role":"user","content":"lookup"}], "max_tokens":128,
+                    "thinking":{"type":"disabled"}, "tools":[{"name":"lookup","input_schema":schema}],
+                    "tool_choice":{"type":"auto","disable_parallel_tool_use":!parallel}})
+            } else {
+                json!({"input":"lookup", "store":false, "reasoning":{"effort":"none"},
+                    "tools":[{"type":"function","name":"lookup","parameters":schema}],
+                    "parallel_tool_calls":parallel})
+            };
+            body["model"] = json!("ds-fixture"); body["stream"] = json!(true);
+            let (status, text) = post(&app, path, body).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {text}");
+            let events: Vec<Value> = text.split("\n\n").filter_map(|frame| frame.lines()
+                .find_map(|line| line.strip_prefix("data: ")))
+                .map(|data| serde_json::from_str(data).unwrap()).collect();
+            let failed = events.iter().any(|event| event.get("error").is_some() || event["type"] == "response.failed");
+            assert_eq!(failed, !parallel, "{path}/{parallel}: {text}");
+            if parallel && path == "/v1/messages" {
+                assert!(events.iter().any(|event| event["delta"]["stop_reason"] == "max_tokens"), "{text}");
+            } else if parallel {
+                assert!(events.iter().any(|event| event["type"] == "response.incomplete"
+                    && event["response"]["incomplete_details"]["reason"] == "max_output_tokens"), "{text}");
+            }
+            worker.await.unwrap();
+        }
+    }
+}
