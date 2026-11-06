@@ -655,7 +655,8 @@ mod tests {
                         }
                         for rank in 0..ranks {
                             let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
-                                + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes;
+                                + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes
+                                + crate::placement::families::mimo_v2::admission::FIRST_USE_RUNTIME_BYTES;
                             assert_eq!(devices[rank].used_bytes(), total, "mapped planner items equal admission total");
                             assert_eq!(planned.steady.devices[rank].reservations, admitted.steady.devices[rank].reservations,
                                 "pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
