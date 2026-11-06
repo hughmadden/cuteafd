@@ -114,8 +114,8 @@ pub struct Opaque {
     pub source: String,
 }
 
-/// The lazy-capture envelope, runtime growth and small-card admission margin as
-/// one declared reserve per GPU. None of these bytes is live at ready, so they
+/// The lazy-capture envelope and runtime growth as declared reserves per GPU.
+/// None of these bytes is live at ready, so they
 /// price only the post-ready phases.
 pub fn growth_allowances(total: u64, ranks: usize, gpu: u8) -> Vec<Opaque> {
     let location = Location::coordinator(gpu);
@@ -135,15 +135,6 @@ pub fn growth_allowances(total: u64, ranks: usize, gpu: u8) -> Vec<Opaque> {
             basis: Basis::Estimated,
             lifetime,
             source: "V4.1 runtime growth reserve (estimated; qualified max cards observed 780-854 MiB)".into(),
-        });
-    }
-    if total <= 32 << 30 {
-        out.push(Opaque {
-            location,
-            bytes: 32 << 20,
-            basis: Basis::Calibrated,
-            lifetime,
-            source: "V4.1 small-card admission margin".into(),
         });
     }
     out
@@ -1415,5 +1406,22 @@ impl Recipe for V41Recipe<'_> {
             contract.components.extend(components);
         }
         Ok(contract)
+    }
+}
+
+#[cfg(test)]
+mod explicit_budget_tests {
+    #[test]
+    fn growth_reserves_price_only_named_graph_and_runtime_owners() {
+        for total in [32u64 << 30, 96u64 << 30] {
+            for ranks in [1, 2] {
+                let reserves = super::growth_allowances(total, ranks, 0);
+                assert_eq!(reserves.iter().map(|reserve| reserve.bytes).sum::<u64>(),
+                    super::super::graph_reserve(total, ranks)
+                        + super::super::runtime_reserve(total, ranks));
+                assert!(reserves.iter().all(|reserve| reserve.source.contains("graph")
+                    || reserve.source.contains("runtime")));
+            }
+        }
     }
 }

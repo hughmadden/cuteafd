@@ -590,8 +590,8 @@ pub(super) fn resolve_with_owners(
         ),
         waves: u64::from(args.prefill_waves),
     };
-    // Future owners beside the pool: the calibrated lazy-graph envelope, the
-    // runtime growth reserve and the small-card margin. None is live at ready,
+    // Future owners beside the pool: the calibrated lazy-graph envelope and
+    // runtime growth reserve. None is live at ready,
     // so each prices only the post-ready phases.
     let mut allowances = Vec::new();
     for (gpu, sample) in memory.iter().enumerate() {
@@ -1301,6 +1301,7 @@ mod admission_tests {
             let zero = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
             assert_eq!(omitted.placement, zero.placement);
             assert_eq!(omitted.reservation_bytes, zero.reservation_bytes);
+            assert_eq!(zero.reservation_bytes, vec![96usize << 30; ranks]);
             assert_eq!(omitted.host_ledger, zero.host_ledger);
         }
         Ok(())
@@ -1327,6 +1328,7 @@ mod admission_tests {
         let admitted = resolve(&args, &[(30usize << 30, 32usize << 30)], no_experts(), 0, &[0], 0, None)?;
         assert_eq!(admitted.placement.pool_tokens, 1 << 20);
         assert_eq!(admitted.pages[0], 2048 + 56);
+        assert_eq!(admitted.reservation_bytes, vec![32usize << 30]);
         args.memory_reservation = Some(crate::shared::memory::budget::Reservation::Percent(
             1_000_000,
         ));
