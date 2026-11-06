@@ -134,6 +134,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         expected_command = before["command"] + (["--mapped-scale-preload-gib", "0",
             "--prefill-waves", value("--prefill-waves"),
             "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
+        if role == "coordinator":
+            expected_command.append("--expert-usage")
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
@@ -186,7 +188,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         draft_limit = command[command.index("--dspark-draft-limit") + 1] if "--dspark-draft-limit" in command else ""
         available = int(expected[expected.index("--available-sparks") + 1])
         normalized = (f"TP2_DSPARK_EXPERTS={'on' if enabled else 'off'}\nSPECULATOR=dspark\n"
-                      f"DSPARK_DRAFT_LIMIT={draft_limit}\nEXPERT_USAGE=off\n"
+                      f"DSPARK_DRAFT_LIMIT={draft_limit}\nEXPERT_USAGE=on\n"
                       + ''.join(f"SPARK_{rank}_HOST={host}\n" for rank, host in enumerate(HOSTS[:available])))
         digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
         mount_index = expected.index("-v") + 2

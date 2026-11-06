@@ -1064,10 +1064,13 @@ mod expert_usage_policy_tests {
     use clap::Parser;
 
     #[test]
-    fn expert_usage_remains_opt_in_and_uses_the_shared_reader_policy() {
-        for requested in [false, true] {
+    fn expert_usage_defaults_on_and_explicit_off_uses_the_shared_reader_policy() {
+        for requested in [None, Some(false), Some(true)] {
             let mut argv = vec!["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
-            if requested { argv.push("--expert-usage"); }
+            if let Some(enabled) = requested {
+                argv.push(if enabled { "--expert-usage" } else { "--expert-usage=false" });
+            }
+            let requested = requested.unwrap_or(true);
             let crate::cli::Commands::ServeNative(args) = crate::cli::Cli::try_parse_from(argv).unwrap().command else {
                 panic!("expected serve-native");
             };

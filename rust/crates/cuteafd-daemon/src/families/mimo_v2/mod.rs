@@ -33,8 +33,9 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
-    /// Device-only executed backbone route counts, split by prefill/decode.
-    #[arg(long)]
+    /// Count executed backbone expert routes by phase (disable with =false).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
+        default_missing_value = "true", require_equals = true)]
     pub expert_usage: bool,
     #[arg(skip)]
     pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
@@ -283,12 +284,17 @@ mod draft_storage_tests {
     }
 
     #[test]
-    fn expert_usage_is_opt_in_and_reader_starts_disabled() {
-        let off = args(&[]);
-        assert!(!off.expert_usage);
+    fn expert_usage_defaults_on_and_explicit_off_or_skipped_stays_disabled() {
+        let default = args(&[]);
+        assert!(default.expert_usage);
+        assert!(default.expert_usage_enabled().unwrap());
+        assert_eq!(default.expert_usage_reader.snapshot()["enabled"], false);
+        let off = args(&["--expert-usage=false"]);
+        assert!(!off.expert_usage_enabled().unwrap());
+        assert!(off.expert_usage_reader.require_enabled().is_err());
         assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
         assert!(args(&["--expert-usage"]).expert_usage);
-        let skipped = args(&["--expert-usage", "--skip-experts"]);
+        let skipped = args(&["--skip-experts"]);
         assert!(!skipped.expert_usage_enabled().unwrap());
         assert!(skipped.expert_usage_reader.require_enabled().is_err());
         assert_eq!(skipped.expert_usage_reader.snapshot()["enabled"], false);

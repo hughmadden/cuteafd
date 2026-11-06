@@ -474,6 +474,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_off_keeps_authenticated_routes_unavailable() {
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret.path(), "b".repeat(64)).unwrap();
+        let gate = crate::console_gate::ConsoleGate::from_file(secret.path(), false).unwrap();
+        let console = ConsoleHub::disabled();
+        console.set_gate(gate.clone());
+        let reader = Reader::default();
+        assert!(!reader.configure(false, false).unwrap());
+        assert!(reader.require_enabled().is_err());
+        let app = gate.mount(routes(console, reader));
+        let unlock = app.clone().oneshot(
+            Request::get(format!("/console/unlock?token={}", "b".repeat(64)))
+                .body(Body::empty()).unwrap(),
+        ).await.unwrap();
+        let cookie = unlock.headers()[header::SET_COOKIE].to_str().unwrap()
+            .split(';').next().unwrap();
+        let request = |uri| Request::get(uri).header(header::COOKIE, cookie)
+            .body(Body::empty()).unwrap();
+        let json = app.clone().oneshot(request("/console/expert-usage")).await.unwrap();
+        assert_eq!(json.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(json.into_body(), 1024).await.unwrap(),
+        ).unwrap();
+        assert_eq!(body, serde_json::json!({"enabled": false}));
+        let binary = app.oneshot(request("/console/expert-usage.bin")).await.unwrap();
+        assert_eq!(binary.status(), StatusCode::NO_CONTENT);
+        assert_eq!(binary.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(!binary.headers().contains_key(header::ETAG));
+        assert!(to_bytes(binary.into_body(), 1024).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn dashboard_without_configured_gate_stays_locked() {
         let app = routes(ConsoleHub::disabled(), Reader::default());
         let response = app
