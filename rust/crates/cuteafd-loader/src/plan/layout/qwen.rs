@@ -271,20 +271,12 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     Ok(pool_tokens)
 }
 
-/// The coordinator host sample before this process allocates (tests inject it).
+/// The coordinator host sample before this process allocates (the shared
+/// recipe convention); an inventory admits no host owners, so it solves
+/// device placement against an unconstrained host.
 fn host_sample(options: &LayoutOptions) -> Result<(u64, u64)> {
-    match options.host_memory {
-        Some(memory) => Ok(memory),
-        // An inventory admits no host owners: an unconstrained host lets the
-        // device placement solve, and no host ledger is published.
-        None if options.inventory => Ok((u64::MAX >> 2, u64::MAX >> 2)),
-        None => {
-            #[cfg(test)]
-            panic!("planner tests must inject LayoutOptions.host_memory");
-            #[cfg(not(test))]
-            crate::formats::mapped_preload::host_memory_before_process()
-        }
-    }
+    if options.inventory && options.host_memory.is_none() { return Ok((u64::MAX >> 2, u64::MAX >> 2)); }
+    super::recipe_host_memory(options)
 }
 
 /// Coordinator host owners of one Qwen route, from the plan options and the
