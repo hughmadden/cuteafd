@@ -223,6 +223,9 @@ mod tests {
         }
         let script = root.path().join("scripts/build/compare-sm-exports.py");
         fs::write(&script, "source").unwrap();
+        for name in ["kernel-records.py", "export-placement-inputs.py"] {
+            fs::write(root.path().join("scripts/build").join(name), "source").unwrap();
+        }
         let metadata = json!({"engine_sources_sha256": v4_placement_source_hashes(root.path()).unwrap()});
         validate_v4_placement_sources(&metadata, root.path()).unwrap();
         fs::write(&script, "changed").unwrap();
@@ -245,7 +248,7 @@ mod tests {
             fs::create_dir_all(root.join(relative)).unwrap();
         }
         for relative in ["scripts/build/compare-sm-exports.py", "scripts/build/export-placement-inputs.py",
-            "scripts/build/release-scope.py", "scripts/lib/wip_aot_scopes.py",
+            "scripts/build/kernel-records.py", "scripts/build/release-scope.py", "scripts/lib/wip_aot_scopes.py",
             "examples/configs/live.config", "examples/configs/retired.config"] {
             fs::write(root.join(relative), "original").unwrap();
         }
