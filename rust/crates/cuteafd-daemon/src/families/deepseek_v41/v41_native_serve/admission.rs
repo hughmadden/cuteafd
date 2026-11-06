@@ -942,6 +942,10 @@ mod admission_tests {
                     let mut args = args(dir.path());
                     args.peers = vec![args.peers[0].clone(); 4];
                     args.rtx_gpus = ranks as u32;
+                    // Match the synthetic target owners' 256-row, two-wave prefill arena.
+                    args.prefill_batch_tokens = 256;
+                    args.prefill_waves = 2;
+                    args.prefill_reserve_rows = 512;
                     args.max_context_tokens = 262_144;
                     args.pool_tokens = pool_tokens;
                     args.concurrency = concurrency;
