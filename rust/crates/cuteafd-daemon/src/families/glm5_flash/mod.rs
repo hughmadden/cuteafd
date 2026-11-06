@@ -2066,8 +2066,8 @@ impl Opened {
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
         resolve_prefill(&mut context_args, args.layers.is_none_or(|n| n == self.cfg.layers))?;
-        context_args.max_context = crate::shared::context::checkpoint_context(
-            &args.snapshot, &args.manifest, "glm5_flash", args.max_context)?;
+        context_args.max_context = crate::shared::context::checkpoint_context_config(
+            &self.checkpoint.config, &args.manifest, "glm5_flash", args.max_context)?;
         let args = &context_args;
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let active_drafts = args.draft.as_deref().map(|path| -> Result<usize> {

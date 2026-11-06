@@ -1029,7 +1029,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                                 prompt.tokens.len(), engine.max_context))));
                             continue;
                         }
-                        if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, snapshot) {
+                        if let Err(error) = super::media::probe_features(&prompt, &mut request_media, &mut media.cache, &opened.view) {
                             if let Some(probe) = &prompt.job.probe { probe.fail(format!("reference features: {error:#}")); }
                             let _ = events.send(Err(NativeFailure::BadRequest(format!("reference features: {error:#}"))));
                             drop(request_media); media.cache.prune_reservations();

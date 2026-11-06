@@ -61,7 +61,7 @@ pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, Plan
     resolve_audio_config(mode, snapshot, &config)
 }
 
-pub(crate) fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value)
+pub fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value)
     -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
     let kind = crate::media::AudioTowerKind::from_config(config)

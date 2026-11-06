@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches};
 use serde::Serialize;
 use std::io::IsTerminal;
@@ -69,13 +69,24 @@ fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
 fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::MediaMode,
     audio: cuteafd_loader::plan::MediaMode) -> Result<(cuteafd_loader::plan::MediaMode, cuteafd_loader::plan::MediaMode)> {
     use cuteafd_loader::plan::MediaMode;
+    // Once selected, a missing view is an error, never permission to reopen defaults.
+    let selected = match &*command {
+        Commands::ServeGlmf(args) => Some(args.engine.selected_view.as_ref()
+            .context("GLM Flash media requires its selected checkpoint view")?.config()?),
+        _ => None,
+    };
     let Some(options) = serve_media(command) else {
         anyhow::ensure!(matches!(audio, MediaMode::Auto | MediaMode::Off),
             "explicit audio placement requires a media-capable serve command");
         return Ok((vision, MediaMode::Off));
     };
+    let config = match selected {
+        Some(config) => config,
+        None if vision != MediaMode::Off || audio != MediaMode::Off =>
+            cuteafd_loader::read_json_file(&options.snapshot.join("config.json"))?,
+        None => serde_json::Value::Null,
+    };
     let vision = if vision == MediaMode::Off { vision } else {
-        let config: serde_json::Value = cuteafd_loader::read_json_file(&options.snapshot.join("config.json"))?;
         match config.get("vision_config").filter(|value| !value.is_null()) {
             Some(config) => {
                 anyhow::ensure!(config.is_object(), "vision_config must be an object");
@@ -85,7 +96,7 @@ fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::Med
             None => anyhow::bail!("checkpoint has no bundled vision tower"),
         }
     };
-    let audio = cuteafd_loader::plan::resolve_audio(audio, options.snapshot)?;
+    let audio = cuteafd_loader::plan::resolve_audio_config(audio, options.snapshot, &config)?;
     anyhow::ensure!(options.audio.is_some() || audio == MediaMode::Off,
         "this serve command has no bundled audio execution owner");
     *options.vision = vision;
@@ -163,8 +174,38 @@ mod media_defaults_tests {
 
     fn media_command(name: &str, snapshot: &std::path::Path) -> super::Commands {
         use clap::Parser;
-        super::cli::Cli::try_parse_from(["cuteafd", name, "--snapshot", snapshot.to_str().unwrap(),
-            "--native-lib", "/native.so"]).unwrap().command
+        let mut command = super::cli::Cli::try_parse_from(["cuteafd", name, "--snapshot", snapshot.to_str().unwrap(),
+            "--native-lib", "/native.so"]).unwrap().command;
+        if let super::Commands::ServeGlmf(args) = &mut command {
+            args.engine.selected_view = Some(args.engine.attention.select(snapshot).unwrap());
+        }
+        command
+    }
+
+    #[test]
+    fn compact_consumers_require_and_reuse_selected_view() -> anyhow::Result<()> {
+        use clap::Parser;
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("config.compact-attention.json"),
+            r#"{"model_type":"glm5_next","vision_config":{},"max_position_embeddings":65536}"#)?;
+        std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#)?;
+        std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}")?;
+        let mut command = super::cli::Cli::try_parse_from(["cuteafd", "serve-glmf", "--snapshot",
+            root.path().to_str().unwrap(), "--native-lib", "/native.so", "--compact-attention"])?.command;
+        assert!(super::resolve_serve_media(&mut command, MediaMode::Auto, MediaMode::Auto).is_err());
+        let super::Commands::ServeGlmf(args) = &mut command else { unreachable!() };
+        let view = args.engine.attention.select(root.path())?;
+        let fingerprint = view.fingerprint().to_owned();
+        args.engine.selected_view = Some(view.clone());
+        std::fs::remove_file(root.path().join("config.compact-attention.json"))?;
+        assert_eq!(super::resolve_serve_media(&mut command, MediaMode::Auto, MediaMode::Auto)?,
+            (MediaMode::Auto, MediaMode::Off));
+        let manifest = root.path().join("programs.json");
+        std::fs::write(&manifest, r#"{"capacities":{"max_context":131072}}"#)?;
+        assert_eq!(super::shared::context::checkpoint_context_config(&view.config()?, &manifest,
+            "glm5_flash", 0)?, 65536);
+        assert_eq!(view.fingerprint(), fingerprint);
+        Ok(())
     }
 
     #[test]
@@ -308,10 +349,11 @@ async fn run() -> Result<()> {
     // GLM 5.3 Flash: automatic vision serves text when the checkpoint's own chat template cannot
     // mark images. Planner-resolved peers are an explicit placement and keep serving's refusal.
     let vision = match &mut command {
-        Commands::ServeGlmf(args) if args.vision_peers.is_none() => {
+        Commands::ServeGlmf(args) => {
             let view = args.engine.attention.select(&args.engine.snapshot)?;
-            let (vision, note) = families::glm5_flash::serve::auto_vision_view(vision, &view,
-                args.chat_template_from.as_deref())?;
+            let (vision, note) = if args.vision_peers.is_none() {
+                families::glm5_flash::serve::auto_vision_view(vision, &view, args.chat_template_from.as_deref())?
+            } else { (vision, None) };
             args.engine.selected_view = Some(view);
             if let Some(note) = note { tracing::warn!("{note}"); }
             vision
