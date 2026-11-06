@@ -127,7 +127,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 muse_partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
                 dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
                 kimi_draft_fp8: args.draft_fp8,
-                kimi_tp2_dflash: args.tp2_dflash.unwrap_or(false),
                 glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
@@ -1117,7 +1116,7 @@ mod tests {
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,
-            drafter_snapshot: None, draft_fp8: false, tp2_dflash: None, vision_snapshot: None, audio_snapshot: None,
+            drafter_snapshot: None, draft_fp8: false, vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,

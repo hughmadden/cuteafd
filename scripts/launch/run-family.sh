@@ -1960,14 +1960,6 @@ if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; t
   case "$draft_kv_cache" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--draft-kv-cache "$draft_kv_cache")
 fi
-if [[ "$family" == kimi_k3 ]]; then
-  kimi_tp2_dflash="$(get TP2_DFLASH off)"
-  case "$kimi_tp2_dflash" in
-    on) family_args+=(--tp2-dflash true) ;;
-    off) family_args+=(--tp2-dflash false) ;;
-    *) release_die "TP2_DFLASH must be on or off" ;;
-  esac
-fi
 # GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB;
 # unset: auto for GLM 5.3 and GLM 5.3 Flash, off for MiMo and Qwen) pulls the
 # next layer's weights into L2 during each one-lane decode step's Spark exchange; FP8_SCALES (amax, pow2, best) is the scale rule of the FP8
@@ -2426,8 +2418,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
   if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
-    plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true
-      --tp2-dflash "$([[ "$kimi_tp2_dflash" == on ]] && echo true || echo false)")
+    plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true)
   fi
   if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")

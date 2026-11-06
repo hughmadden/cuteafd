@@ -33,11 +33,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         "Kimi K3 header lower bound: coordinator workspaces/graphs not charged; NOT serving admission".into(),
         "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
     ] };
-    if opts.tp2_dflash {
-        report.refuse_placement("Kimi TP2 DFlash requires draft Context attention exports".into(),
-            "Disable --tp2-dflash until the draft window/noncausal Context kernel is installed.");
-        return memory;
-    }
     report.bytes_by_owner.clear();
     // One owner runs whole MLA layers, so its convention is Heads; a pair
     // resolves auto to Context.
@@ -243,13 +238,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let draft = MlaDflashConfig::read(snapshot)?;
         anyhow::ensure!(draft.mla.hidden == cfg.hidden && draft.vocab == cfg.vocab_size
             && draft.taps.iter().all(|&layer| layer < cfg.layers), "Kimi drafter target geometry differs from checkpoint");
-        anyhow::ensure!(!opts.kimi_tp2_dflash || gpus == 2,
+        anyhow::ensure!(!opts.tp2_dflash || gpus == 2,
             "Kimi TP2 DFlash requires two physical coordinator GPUs");
         let slots = usize::try_from(slots)?;
         let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
             else { GlmDraftRepresentation::Bf16Only };
         let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
-            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?.with_context_split(opts.kimi_tp2_dflash)?;
+            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?.with_context_split(opts.tp2_dflash)?;
         fixed.extend(crate::families::kimi_k3::draft_bridge_demands_for_ranks(&layout, rows, gpus)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns

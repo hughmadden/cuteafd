@@ -88,7 +88,8 @@ impl ServeArgs {
     }
 
     fn validate(&self) -> Result<()> {
-        ensure!(!self.tp2_dflash, "Kimi TP2 DFlash requires draft Context attention exports");
+        ensure!(!self.tp2_dflash || (self.draft.is_some() && self.split_device.is_some()),
+            "Kimi TP2 DFlash requires a drafter and two coordinator devices");
         ensure!(self.device >= 0 && self.split_device.is_none_or(|peer| peer >= 0 && peer != self.device),
             "Kimi serving requires one device or two distinct coordinator devices");
         ensure!((1..=8).contains(&self.peers.len()) && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
@@ -284,6 +285,18 @@ mod tests {
         for depth in ["0", "8"] {
             assert!(args(&["--draft", "/drafter", "--draft-fixed", depth]).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn context_draft_validation_requires_drafter_and_physical_peer() -> Result<()> {
+        let base = ["--tp2-dflash", "true", "--peers", "127.0.0.1:8001"];
+        assert!(args(&base)?.validate().is_err());
+        let mut selected = base.to_vec();
+        selected.extend(["--draft", "/drafter"]);
+        assert!(args(&selected)?.validate().is_err());
+        selected.extend(["--split-device", "1"]);
+        args(&selected)?.validate()?;
         Ok(())
     }
 

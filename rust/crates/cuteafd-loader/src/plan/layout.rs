@@ -127,7 +127,6 @@ pub struct LayoutOptions {
     /// Muse Spark's lossless partial-reply cutoff (`--expert-partial-bf16-max-rows`).
     pub muse_partial_bf16_max_rows: usize,
     pub kimi_draft_fp8: bool,
-    pub kimi_tp2_dflash: bool,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
@@ -294,7 +293,6 @@ impl Default for LayoutOptions {
             muse_drafter_snapshot: None,
             muse_partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             kimi_draft_fp8: false,
-            kimi_tp2_dflash: false,
             mla_kv: Default::default(),
             headroom_bytes: 2 * GIB,
             concurrency: 0,
