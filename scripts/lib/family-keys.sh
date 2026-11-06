@@ -359,13 +359,63 @@ release_validate_deployment() {
     release_die "invalid deployment specification"
   fi
 }
+# Physical ranks can own media without joining the expert transport world.
+release_deployment_spark_roles() {
+  local deployment="$1" inventory="$2"
+  spark_expert_world="$(jq -er '.spark_expert_world | select(type == "number" and . >= 0 and . <= 8 and . == floor)' <<<"$deployment")" ||
+    release_die "the deployment plan names no Spark expert world"
+  jq -e --argjson inventory "$inventory" '
+    .spark_ranks as $n | .spark_expert_world as $world |
+    (.spark_roles | length) == $n and
+    ([.spark_roles[].rank] | length == (unique | length)) and
+    all(.spark_roles[];
+      (.rank | type) == "number" and .rank == (.rank | floor) and
+      .rank >= 0 and .rank < $inventory and
+      (.experts or .encoder or .audio_encoder or .drafter)) and
+    ([.spark_roles[] | select(.experts == true) | .rank] == [range($world)]) and
+    all(.spark_roles[]; (.experts | type) == "boolean")' <<<"$deployment" >/dev/null ||
+    release_die "the deployment plan has inconsistent Spark roles"
+  mapfile -t spark_worker_ranks < <(jq -r '.spark_roles[] | select(.experts or .encoder or .audio_encoder or .drafter) | .rank' <<<"$deployment")
+  mapfile -t spark_expert_ranks < <(jq -r '.spark_roles[] | select(.experts) | .rank' <<<"$deployment")
+  mapfile -t spark_vision_ranks < <(jq -r '.spark_roles[] | select(.encoder) | .rank' <<<"$deployment")
+  mapfile -t spark_audio_ranks < <(jq -r '.spark_roles[] | select(.audio_encoder) | .rank' <<<"$deployment")
+  jq -e 'all(.spark_roles[]; .drafter == null)' <<<"$deployment" >/dev/null ||
+    release_die "unsupported Spark drafter role: no standalone drafter worker is available"
+  local rank
+  for rank in "${spark_worker_ranks[@]}"; do
+    [[ -n "$(get "SPARK_${rank}_HOST")" && -n "$(get "SPARK_${rank}_LANE_A")" ]] ||
+      release_die "Spark role rank $rank has no configured host or lane"
+    release_spark_role_budget "$deployment" "$rank" >/dev/null || return 1
+  done
+}
+release_spark_role_has_experts() {
+  jq -e --argjson rank "$2" '.spark_roles[] | select(.rank == $rank) | .experts == true' <<<"$1" >/dev/null
+}
+release_spark_role_ready_marker() {
+  local deployment="$1" rank="$2"
+  if release_spark_role_has_experts "$deployment" "$rank"; then
+    echo 'worker bootstrap ready'
+  elif jq -e --argjson rank "$rank" '.spark_roles[] | select(.rank == $rank) | .audio_encoder' <<<"$deployment" >/dev/null; then
+    echo 'audio encoder ready'
+  else
+    echo 'vision encoder ready'
+  fi
+}
 release_spark_worker_budget() {
   local deployment="$1" ranks="$2"
   jq -er --argjson ranks "$ranks" '
-    [.memory_layout.devices[] | select(.kind == "spark") | .worker_budget_bytes] |
+    [.spark_roles[] | select(.experts) | .rank] as $experts |
+    [.memory_layout.devices[] | select(.kind == "spark") |
+      select(.index as $index | any($experts[]; . == $index)) | .worker_budget_bytes] |
     select(length == $ranks and all(.[]; type == "number" and . > 0)) |
     unique | select(length == 1) | .[0]' <<<"$deployment" ||
     release_die "the deployment plan names no uniform Spark worker allocation ceiling"
+}
+release_spark_role_budget() {
+  jq -er --argjson rank "$2" '
+    [.memory_layout.devices[] | select(.kind == "spark" and .index == $rank) | .worker_budget_bytes] |
+    select(length == 1 and all(.[]; type == "number" and . > 0)) | .[0]' <<<"$1" ||
+    release_die "the deployment plan names no uniform Spark worker allocation ceiling for rank $2"
 }
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {

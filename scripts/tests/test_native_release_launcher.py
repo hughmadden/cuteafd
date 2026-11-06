@@ -339,7 +339,8 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         self.assertEqual(FAMILY.read_text().count('-v "$USAGE_DIR:/run/cuteafd/usage"'), 1)
         self.assertIn('shared_api_state', v41_source())
         v41 = v41_source().split("<<'REMOTE' &", 1)[1].split('\nREMOTE', 1)[0]
-        self.assertIn('release_serving_docker_args\ncuteafd_cdi_gpu_args all || exit 2\ndocker run -d "${RELEASE_SERVING_ARGS[@]}"', v41)
+        self.assertLess(v41.index('release_serving_docker_args\ncuteafd_cdi_gpu_args all || exit 2'),
+                        v41.index('docker run -d "${RELEASE_SERVING_ARGS[@]}"'))
 
     def test_v41_worker_capacity_covers_every_coordinator_chunk_and_replay(self) -> None:
         chunks = list(range(80, 4097))
@@ -357,12 +358,13 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         self.assertIn('encoder_plan="$count_plan"', source)
         self.assertNotIn('--prefill-rows "$expert_capacity"', source)
 
-    def test_count_fallback_precedes_bf16_package_preflight(self) -> None:
+    def test_role_selection_precedes_bf16_package_preflight(self) -> None:
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         selection = source.index('selected_ranks="')
-        reexec = source.index('exec bash "$repo_root/scripts/launch/run-family.sh"', selection)
+        roles = source.index('release_deployment_spark_roles "$deployment_json"', selection)
         package = source.index('printf -v preflight_command')
-        self.assertLess(reexec, package)
+        self.assertLess(roles, package)
+        self.assertNotIn('exec bash "$repo_root/scripts/launch/run-family.sh"', source)
         self.assertLess(package, source.index('if [[ "$restart" == 1 ]];'))
 
     def test_v41_capacity_registry_rejects_invalid_chunks_and_syntax_drift(self) -> None:

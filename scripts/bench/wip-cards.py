@@ -145,7 +145,7 @@ def resolve_container_keys(entry):
 def container_targets(job):
     resolved = resolve_container_keys(job['entry'])
     targets = [('raptor', 'cuteafd-coordinator-' + resolved['instance'])]
-    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in resolved['sparks']]
+    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in job.get('spark_role_hosts', resolved['sparks'])]
     return targets
 
 
@@ -679,8 +679,37 @@ def preflight_at_grant(job, arm):
     """Smoke's prelaunch hook, run once it holds this card's locks: the absence of
     our containers is only meaningful then. Checked up front it would refuse a job
     queued behind a running task that still holds a container of the same name."""
+    artifacts = preflight_job(job, arm)
     assert_absent(job)
-    return preflight_job(job, arm)
+    return artifacts
+
+
+def preflight_deployment(job, arm):
+    """Use the launcher's CPU deployment admission, not a second family policy."""
+    repo = Path(arm.get('repo', REPO))
+    entry = job['entry']
+    cmd = [str(repo / 'run.sh'), '--config', entry['config'],
+           *entry.get('run_args', []), '--dry-run', '--total-capacity']
+    for key, value in sorted(entry.get('set', {}).items()):
+        cmd += ['--set', f'{key}={value}']
+    try:
+        result = run(cmd, timeout=300)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or str(error)).strip()
+        raise ValueError('launcher deployment preflight refused: ' + detail) from None
+    except subprocess.TimeoutExpired:
+        raise ValueError('launcher deployment preflight timed out after 300 seconds') from None
+    decoder = json.JSONDecoder()
+    for offset, char in enumerate(result.stdout):
+        if char != '{':
+            continue
+        try:
+            deployment, _ = decoder.raw_decode(result.stdout[offset:])
+        except ValueError:
+            continue
+        if isinstance(deployment, dict) and isinstance(deployment.get('spark_roles'), list):
+            return deployment
+    raise ValueError('launcher deployment preflight returned no typed Spark roles')
 
 
 def preflight_job(job, arm):
@@ -696,7 +725,18 @@ def preflight_job(job, arm):
         container_targets(job)
     except ValueError as error:
         problems.append(str(error))
-    for host in ('raptor', *(h for h in job['entry']['sparks'] if isinstance(h, str) and h in HOSTS)):
+    if problems:
+        raise ValueError('; '.join(problems))
+    deployment = preflight_deployment(job, arm)
+    inventory = resolve_container_keys(job['entry'])['sparks']
+    active_roles = {}
+    for role in deployment['spark_roles']:
+        rank = role.get('rank')
+        if type(rank) is not int or not 0 <= rank < len(inventory):
+            raise ValueError(f'planner Spark role rank has no configured host: {rank!r}')
+        active_roles[inventory[rank]] = role
+    job['spark_role_hosts'] = list(active_roles)
+    for host in ('raptor', *active_roles):
         meta = json.loads(slot_check(arm, host))
         release = 'release' in arm
         keys = ('image', 'image_id', 'repo_digests') if release else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
@@ -704,21 +744,23 @@ def preflight_job(job, arm):
         contents = meta.get('contents')
         if release or contents is None:
             continue
-        wanted = needs['coordinator'] if host == 'raptor' else needs['spark']
+        role = active_roles.get(host)
+        wanted = needs['coordinator'] if host == 'raptor' else (needs['spark'] if role['experts'] else [])
         missing = sorted(set(wanted) - set(contents['packages']))
         if missing:
             problems.append(f"{host}: slot {arm['slot']} lacks {', '.join(missing)} (build with the card's scopes: wip-cards --build)")
-        if needs['audio'] and contents.get('audio') is False:
+        needs_audio = needs['audio'] if host == 'raptor' else bool(role.get('audio_encoder'))
+        if needs_audio and contents.get('audio') is False:
             problems.append(f"{host}: slot {arm['slot']} was built without the audio tower (AUDIO={values.get('AUDIO', 'auto')}); "
                             'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON or set AUDIO=off')
-        if needs['audio'] and job['entry'].get('family') == 'muse_spark' and contents.get('pcm_audio') is not True:
+        if needs_audio and job['entry'].get('family') == 'muse_spark' and contents.get('pcm_audio') is not True:
             problems.append(f"{host}: slot {arm['slot']} lacks the Muse audio tower (cuteafd_pcm_required); "
                             'rebuild with CUTEAFD_WIP_AUDIO_AOT=ON')
-        role = needs.get('tp_role')
+        tp_role = deployment.get('artifact_requirements', {}).get('spark_tp_role')
         # The seal check always reports tp_roles (None: no TP manifest); a record
         # without the field is not a seal check result and carries no attestation.
-        if role and host != 'raptor' and 'tp_roles' in contents:
-            problems.extend(tp_role_problems(host, arm['slot'], role, needs.get('nvfp4', False), contents))
+        if tp_role and host != 'raptor' and role['experts'] and 'tp_roles' in contents:
+            problems.extend(tp_role_problems(host, arm['slot'], tp_role, needs.get('nvfp4', False), contents))
     for key in ('SPECULATION_TRACE', 'PROFILE_DIR'):
         if values.get(key):
             directory = Path(values[key]) if key == 'PROFILE_DIR' else Path(values[key]).parent

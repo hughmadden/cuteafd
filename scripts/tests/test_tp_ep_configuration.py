@@ -394,6 +394,7 @@ class LauncherTopologyTest(unittest.TestCase):
             )
             setup = f'''set -euo pipefail
 source scripts/lib/release-common.sh
+source scripts/lib/family-keys.sh
 release_die() {{ echo "$*" >&2; exit 1; }}
 get() {{ printf '%s' "${{2:-}}"; }}
 RELEASE_RTX_GPUS="$1"
@@ -420,6 +421,7 @@ EMBEDDING=gpu
 # These topology tests exercise the text-only legacy startup contract.
 VISION=off
 AUDIO=off
+RELEASE_MODEL_REVISION=0123456789012345678901234567890123456789
 DSPARK_DRAFT_POLICY=adaptive
 dspark_draft_limit=
 TP2_ATTENTION=off
@@ -464,7 +466,9 @@ v41_engram_warm=off
 v41_decode_lanes=
 resolved_decode_lanes=2
 {extra_setup}'''
-            setup += '\ncount_plan=\'{"spark_admission":"coordinator_authoritative"}\'\n'
+            roles = [dict(rank=i, experts=True) for i in range(spark_count)]
+            setup += f"\nspark_expert_world={spark_count}\nspark_worker_ranks=({' '.join(map(str, range(spark_count)))})\nspark_vision_ranks=()\n"
+            setup += "count_plan=" + __import__('shlex').quote(json.dumps(dict(spark_roles=roles, memory_layout=dict(devices=[dict(kind="spark", index=i, worker_budget_bytes=107374182400) for i in range(spark_count)])))) + "\n"
             result = subprocess.run(
                 ["bash", "-c", setup + block, "test", str(gpus)],
                 env=env,
@@ -486,7 +490,7 @@ resolved_decode_lanes=2
                 if tool == "ssh" and "-s" in args and "--profile-args" in args:
                     tail = args[args.index("--profile-args") + 1:]
                     assert "-e" in tail and "CUTEAFD_THERMAL=on" in tail, tail
-                    args = args[:args.index("--profile-args")]
+                    args = args[:args.index("--profile-args") - 5]
                 trimmed.append([tool, args])
             return result, trimmed
 
@@ -664,7 +668,7 @@ resolved_decode_lanes=2
         harness = 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' + remote
         explicit = subprocess.run(
             ["bash", "-euc", harness, "test", "image", "name", "1",
-             "107374182400", "19441", "snapshot", "fingerprint", "4", "1", "2", "2"],
+             "107374182400", "19441", "snapshot", "fingerprint", "4", "1", "2", "2", "", "", "info", "__none__", "-1", "19541", "", "revision", "1"],
             cwd=ROOT, text=True, capture_output=True,
         )
         self.assertEqual(explicit.returncode, 0, explicit.stderr)
@@ -680,7 +684,7 @@ resolved_decode_lanes=2
         # Legacy invocation: ten positional arguments, no topology flags.
         legacy = subprocess.run(
             ["bash", "-euc", harness, "test", "image", "name", "1",
-             "107374182400", "19441", "snapshot", "fingerprint", "4", "0", "4", "1"],
+             "107374182400", "19441", "snapshot", "fingerprint", "4", "0", "4", "1", "", "", "info", "__none__", "-1", "19541", "", "revision", "1"],
             cwd=ROOT, text=True, capture_output=True,
         )
         self.assertEqual(legacy.returncode, 0, legacy.stderr)
@@ -959,7 +963,7 @@ class BuildScopeTest(unittest.TestCase):
         self.assertLess(native.index('echo "== starting native Spark experts =="'),
                         native.rindex("start_coordinator"))
         readiness = native[native.index('for pid in "${pids[@]}"'):native.rindex("start_coordinator")]
-        self.assertIn("native worker bootstrap ready", readiness)
+        self.assertIn("release_spark_role_ready_marker", readiness)
         self.assertIn("docker logs '$remote'", readiness)
         self.assertNotIn("/dev/tcp", readiness)
 
@@ -1618,11 +1622,13 @@ class SparkRoleGateTest(unittest.TestCase):
 
     def gate(self, *, required: str, advertised: str | None, hosts: int = 3,
              ssh_rc: int = 0) -> subprocess.CompletedProcess[str]:
-        block = run_sh_block('spark_advertised_roles=""', "\n# Zero-Spark deployments")
+        block = run_sh_block('spark_advertised_roles=""', '\npeers="$(jq')
         script = f'''set -euo pipefail
 source scripts/lib/release-common.sh
+source scripts/lib/family-keys.sh
 release_die() {{ echo "die: $*" >&2; exit 1; }}
 ssh() {{ [[ {ssh_rc} -eq 0 ]] || {{ echo "No such image" >&2; return 255; }}; printf '%s\\n' '{advertised}'; }}
+spark_expert_ranks=({" ".join(map(str, range(hosts)))})
 hosts=(h0 h1 h2 h3 h4 h5)
 hosts=("${{hosts[@]:0:{hosts}}}")
 spark_tp=2
@@ -1636,7 +1642,7 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
                  corrupt_hash: bool = False, corrupt_host: bool = False,
                  expert_format: str = 'native', nvfp4_roles: list[str] | None = None,
                  tp: int = 3) -> subprocess.CompletedProcess[str]:
-        block = run_sh_block('spark_advertised_roles=""', "\n# Zero-Spark deployments")
+        block = run_sh_block('spark_advertised_roles=""', '\npeers="$(jq')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for host in ('h0', 'h1', 'h2'):
@@ -1657,6 +1663,7 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
             # Execute the actual per-host Python guard; Docker and SSH alone are mocked.
             script = '''set -euo pipefail
 source scripts/lib/release-common.sh
+source scripts/lib/family-keys.sh
 release_die() { echo "die: $*" >&2; exit 1; }
 release_ssh() {
   [[ "$1" == -o ]]; shift 2
@@ -1667,6 +1674,7 @@ release_ssh() {
   python3 -c 'import sys; code=sys.stdin.read().replace("/wip/slots",sys.argv[1]); sys.argv=["guard",*sys.argv[2:]]; exec(compile(code,"guard","exec"))' "$MOCK_SLOTS/$host" "${w[-4]}" "${w[-3]}" "${w[-2]%;}"
 }
 hosts=(h0 h1 h2)
+spark_expert_ranks=(0 1 2)
 spark_tp=3
 spark_tp_roles_required=tp3
 wip_slot=slot

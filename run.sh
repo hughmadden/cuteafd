@@ -17,9 +17,9 @@ FULL_PREFILL_LOGITS=on (off by default) admits probe-only all-row prefill logits
 at launch for these five families (--full-prefill-logits in the daemon). Fidelity
 score_path=prefill requires this option; ordinary serving still uses last-row logits.
 The CPU planner counts this workspace with plan --layout --full-prefill-logits.
-Unspecified Spark count uses all configured hosts, or warns once and selects
-its widest executable count. SPARK_COUNT or SPARK_HOSTS is exact: the planner
-honors it or refuses with a reason and the counts that work, on every card size.
+Unspecified Spark count makes all configured hosts available to the planner.
+SPARK_COUNT or SPARK_HOSTS bounds the available Sparks; the plan may use fewer,
+including 0, and refuses only when the requested deployment cannot fit.
 An optional expert-group topology is selected in the configuration with
 SPARK_TP and SPARK_EP (all-or-none, native checkpoint only); at SPARK_COUNT=3
 the explicit SPARK_TP=3 SPARK_EP=1 form is one unreplicated three-rank group.

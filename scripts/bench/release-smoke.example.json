@@ -201,26 +201,13 @@
         0,
         1
       ],
-      "sparks": [
-        "ostrich",
-        "dodo",
-        "emu",
-        "kiwi"
-      ],
+      "sparks": [],
       "set": {
         "RTX_GPUS": "2",
         "COORDINATOR_GPUS": "0,1",
-        "SPARK_COUNT": "4",
+        "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8805",
-        "EXPERT_PORT": "19905",
-        "SPARK_0_HOST": "ostrich",
-        "SPARK_0_LANE_A": "10.55.0.1",
-        "SPARK_1_HOST": "dodo",
-        "SPARK_1_LANE_A": "10.55.0.2",
-        "SPARK_2_HOST": "emu",
-        "SPARK_2_LANE_A": "10.55.0.3",
-        "SPARK_3_HOST": "kiwi",
-        "SPARK_3_LANE_A": "10.55.0.4"
+        "EXPERT_PORT": "19905"
       }
     },
     {

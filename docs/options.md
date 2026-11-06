@@ -75,13 +75,13 @@ the launcher derives from them.
 | `RTX_GPUS` | `auto` | `auto`, `1`, `2` | Coordinator GPUs the layout may use. |
 | `COORDINATOR_GPUS` | lowest index | ordered ids, primary first | Explicit GPU pair. |
 | `COORDINATOR_SPLIT` | `auto` | `auto`, `heads`, `off` | Split a two-GPU layout by heads; `off` serves from the primary. |
-| `SPARK_COUNT` | every available | `0`–`8` | Routed experts on the first N ranks. |
+| `SPARK_COUNT` | every available | `0`–`8` | Upper bound on physical Spark ranks available to the deployment (experts, media or drafter); the planner may use fewer when ranks have no role. `0` is accepted for every family when the planner can fit all owners on the selected RTX GPUs. Only ranks assigned a role start containers, using their configured host indices (unused indices may be skipped); expert peers include expert ranks only. |
 | `SPARK_HOSTS` | pool order | comma list | Explicit rank order, same length as `SPARK_COUNT`. |
 | `SPARK_<rank>_HOST` | pool host | hostname | Ranks 0–7; required for a host outside the pool. |
 | `SPARK_<rank>_LANE_A` | pool value | IPv4 | Rail A address for that rank. |
 | `SPARK_<rank>_LANE_B` | unset | IPv4 | Rail B; all active ranks or none. |
 | `SPARK_TP`, `SPARK_EP` | unset | positive ints, all-or-none | Replicated Spark expert groups; `SPARK_EP` is 1–3. |
-| `EXPERT_BACKEND` | `auto` | `auto`, `local`, `spark` | `local` requires `SPARK_COUNT=0`. Dense Qwen and Step-5 are fixed. |
+| `EXPERT_BACKEND` | `auto` | `auto`, `local`, `spark` | `local` requires `SPARK_COUNT=0`. Dense Qwen is local-only; the planner admits other families by fit. |
 | `RTX_EXPERT_LAYERS` | `auto` | `auto`, `all`, `N` | Pool-first onboarding of routed-expert layers on the RTX pair. |
 | `RTX_EXPERT_PEER` | `off` | `off` | `on` is refused; TP2 halves replaced it. |
 | `EMBEDDING` | `gpu` | `host`, `gpu` | Untied token-embedding placement. |
@@ -192,7 +192,7 @@ the launcher derives from them.
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower. |
+| `VISION` | `auto` | `auto`, `off`, `rtx[:gpu]`, `spark[:rank]` | Vision tower placement; `auto` enables the family's bundled tower. `spark[:rank]` may use a media-only Spark when every expert layer is on RTX (include it in `SPARK_COUNT`); that rank starts only the tower, not expert transport. GLM Flash passes physical tower ranks independently of expert peers, including sparse ranks and replicas. |
 | `AUDIO` | `auto` | `auto`, `off` | Bundled audio tower. |
 | `VISION_REPLICAS` | `1` | 1–8 | Vision replicas. |
 | `MEDIA_CACHE_BYTES` | engine | byte size | Media cache. |

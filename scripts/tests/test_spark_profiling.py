@@ -227,7 +227,7 @@ def test_v41_worker_puts_the_spark_wrapper_between_image_and_command():
     # Unprofiled workers keep the exact pre-existing argv (no wrapper sentinel).
     assert 'if ((${#RELEASE_PROFILE_WRAPPER[@]})); then' in invocation
     positional = ['image', 'name', '0', '107374182400', '19441', 'snapshot', 'fingerprint', '4',
-                  '0', '', '', '', '', '', 'info', '__none__']
+                  '0', '4', '1', '', '', 'info', '__none__', '-1', '19541', '', 'revision', '1']
     tail = ['--profile-args', '-e', 'CUTEAFD_PROFILE_HOST=emu', *GRACEFUL, '--profile-wrapper', '/bin/bash', '-c', 'script', 'x', 'ncu', '--set', 'full']
     result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n'
                              + remote.replace(' >/dev/null', ''), 'test', *positional, *tail], cwd=ROOT, text=True, capture_output=True)

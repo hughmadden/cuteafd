@@ -188,13 +188,13 @@ def test_flash_native_tp2_without_sparks_leaves_attention_to_planner(tmp_path, a
     assert "--split-device 1" in coordinators[0]
 
 
-def test_glm_native_without_sparks_still_refuses(tmp_path):
+def test_glm_native_without_sparks_defers_to_planner(tmp_path):
     config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
     keys = ("EXLR8_MANIFEST=up1\nSPARK_COUNT=0\nRTX_GPUS=2\nCOORDINATOR_GPUS=0,1\n"
             "EXPERT_BACKEND=local\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     result = _family_launch_result(tmp_path, config, "test/glm-exlr8-local", keys)
-    assert result.returncode != 0
-    assert "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "cuteafd plan" in result.stderr and "cuteafd expertd-native" not in result.stderr
 
 
 @pytest.mark.parametrize("manifest", ["../k4", "k4.json", "k4/other", "k4;false", "k4 space"])
@@ -947,7 +947,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s \\n" "$(basename "$0") $*" >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
+                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; echo "vision encoder ready"; '
                                     'printf "audio encoder ready \\033[3mbackend\\033[0m\\033[2m=\\033[0m%s\\n" '
                                     '"${STUB_AUDIO_BACKEND:-' + audio_backend + '}" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
@@ -970,7 +970,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      if tool == "docker" and previous_peers is not None else ''))
         if tool == "ssh" and execute_workers:
             with (bin_dir / tool).open("a") as stream:
-                stream.write('if [[ "$*" == *"release_hub_mounts ()"* ]]; then shift; command="$*"; '
+                stream.write('if [[ "$*" == *"release_hub_mounts ()"* ]]; then while [[ "$1" == -* ]]; do shift 2; done; shift; command="$*"; '
                              'if [[ -n "${STUB_REMOTE_HF_HOME:-}" ]]; then command="${command//${HF_HOME}/${STUB_REMOTE_HF_HOME}}"; fi; '
                              'exec bash -c "$command"; fi\n')
         if tool == "ssh" and native_v41:
@@ -1080,17 +1080,28 @@ if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
     decode_lanes = 1
 report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
     decode_lanes=decode_lanes)
-deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
-    topology=dict(tp=tp, ep=ep,
-                  wire="native_ownership" if explicit else "canonical"), peers=peers,
+expert_world = int(report.get("spark_expert_world", ranks))
+roles = report.get("spark_roles", [dict(rank=i, experts=i < expert_world, layers=[], encoder=None, audio_encoder=None, drafter=None) for i in range(ranks)])
+for key, field in (("encoder", "encoder"), ("audio_encoder", "audio_encoder")):
+    placement = report.get(key)
+    if placement and placement["kind"]["kind"] == "spark":
+        for rank in [placement["kind"]["rank"], *placement.get("replicas", [])]:
+            next(role for role in roles if role["rank"] == rank)[field] = placement
+ranks = len(roles)
+report["spark_ranks"] = ranks
+peers = peers[:expert_world]
+deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio_encoder"),
+    encoder_plan_hash=report.get("encoder_plan_hash", "ab" * 32), spark_expert_world=expert_world, spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
+    topology=dict(tp=expert_world, ep=ep,
+                  wire="native_ownership" if explicit and expert_world else "canonical"), peers=peers,
     speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
-    artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report,
+    artifact_requirements=dict(spark_tp_role=f"tp{expert_world}" if family == "deepseek_v41" and explicit and expert_world not in (0, 4) else None), report=report,
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
                                                                  dict(category="kv", bytes=64 << 30)]) for i in range(gpus)] +
-                               [dict(kind="spark", index=i, capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for i in range(ranks)]))
+                               [dict(kind="spark", index=role["rank"], capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for role in roles]))
 deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
 if deployment.get("wip_launchable") == "absent":
     deployment.pop("wip_launchable")
@@ -1098,7 +1109,8 @@ print(json.dumps(deployment))
 """)
     config = repo / "f.config"
     initial_count = 0 if "EXPERT_BACKEND=local" in keys else 1
-    config.write_text(f"MODEL_ID={model}\nSPARK_COUNT={initial_count}\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
+    config.write_text(f"MODEL_ID={model}\nSPARK_COUNT={initial_count}\n" + "".join(
+        f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n" for rank in range(8)) + keys)
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), "STUB_SPARK_COUNT": str(exact_count),
            "STUB_DEPLOYMENT": str(deployment_stub), "STUB_CHECKPOINT": json.dumps(family_config),
@@ -1129,7 +1141,8 @@ print(json.dumps(deployment))
 
     # V4.1 launches its experts through a heredoc (the command line is stdin, so
     # it prints no worker argv); every other family prints one per host.
-    expected = 0 if native_v41 or completed.returncode else exact_count
+    active_count = len(encoder_plan.get("spark_roles", range(exact_count))) if encoder_plan else exact_count
+    expected = 0 if native_v41 or completed.returncode else active_count
     deadline = time.monotonic() + 10
     while True:
         text = read(stderr_path)
@@ -1163,6 +1176,75 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
         assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
 
 
+def _assert_real_deployment_ledger(deployment: dict) -> None:
+    """One physical device owns one allocation ceiling and one copy of each tower."""
+    devices = deployment["memory_layout"]["devices"]
+    identities = [(device["kind"], device["index"]) for device in devices]
+    assert len(identities) == len(set(identities)), ("duplicate device ledger", devices)
+    for role in deployment["spark_roles"]:
+        matches = [device for device in devices
+                   if device["kind"] == "spark" and device["index"] == role["rank"]]
+        assert len(matches) == 1, ("missing Spark role ledger", role, devices)
+        device = matches[0]
+        ceiling = device.get("worker_budget_bytes")
+        assert type(ceiling) is int and ceiling > 0, ("missing Spark allocation ceiling", device)
+        for field, prefix in (("encoder", "vision"), ("audio_encoder", "audio")):
+            placement = role.get(field)
+            if placement is None:
+                continue
+            weights = [item for item in device["items"]
+                       if item["group"] in (f"{prefix} weights", f"{prefix} tower")]
+            scratch = [item for item in device["items"] if item["group"] == f"{prefix} scratch"]
+            overhead = [item for item in device["items"] if item["group"] == f"{prefix} CUDA overhead"]
+            assert len(weights) == 1 and weights[0]["bytes"] == placement["weights"], (role, device)
+            # V4.1 splits measured CUDA overhead out of its scratch reservation.
+            assert len(scratch) == 1 and len(overhead) <= 1, (role, device)
+            assert sum(item["bytes"] for item in scratch + overhead) == placement["scratch"], (role, device)
+
+
+def _read_real_deployment(path: Path) -> dict:
+    deployment = json.loads(path.read_text())
+    _assert_real_deployment_ledger(deployment)
+    return deployment
+
+
+def test_real_deployment_ledger_accepts_shared_tower_expert_rank():
+    _assert_real_deployment_ledger(_shared_tower_expert_deployment())
+
+
+def _shared_tower_expert_deployment() -> dict:
+    return {"spark_roles": [{"rank": 2, "experts": True,
+                            "encoder": {"weights": 20, "scratch": 8}}],
+            "memory_layout": {"devices": [{"kind": "spark", "index": 2,
+                "worker_budget_bytes": 100, "items": [
+                    {"group": "routed_expert", "bytes": 30},
+                    {"group": "vision weights", "bytes": 20},
+                    {"group": "vision scratch", "bytes": 6},
+                    {"group": "vision CUDA overhead", "bytes": 2}]}]}}
+
+
+@pytest.mark.parametrize("defect", ["duplicate_device", "missing_device", "missing_ceiling",
+                                  "duplicate_weights", "duplicate_scratch", "wrong_scratch"])
+def test_real_deployment_ledger_rejects_inconsistent_physical_owners(defect):
+    deployment = _shared_tower_expert_deployment()
+    devices = deployment["memory_layout"]["devices"]
+    device = devices[0]
+    if defect == "duplicate_device":
+        devices.append(device.copy())
+    elif defect == "missing_device":
+        devices.clear()
+    elif defect == "missing_ceiling":
+        device["worker_budget_bytes"] = 0
+    elif defect == "duplicate_weights":
+        device["items"].append(device["items"][1].copy())
+    elif defect == "duplicate_scratch":
+        device["items"].append(device["items"][2].copy())
+    else:
+        device["items"][2]["bytes"] += 1
+    with pytest.raises(AssertionError):
+        _assert_real_deployment_ledger(deployment)
+
+
 def _capture_real_planner_launch(snapshot: Path, example: Path, binary: Path,
                                  programs: Path, hf_home: Path, temporary: Path,
                                  model: str, family: str) -> tuple:
@@ -1185,7 +1267,7 @@ def _capture_real_planner_launch(snapshot: Path, example: Path, binary: Path,
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == family, deployment
     assert deployment["spark_ranks"] == int(config["SPARK_COUNT"]), deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
@@ -1239,7 +1321,7 @@ def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary:
                 "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
                 "STUB_REAL_PLAN_OUTPUT": str(strict_output), "CUTEAFD_CDI_CHECK": "off"})
         assert strict.returncode == 0, strict.stderr
-        vision_on = json.loads(strict_output.read_text())
+        vision_on = _read_real_deployment(strict_output)
         assert deployment["memory_layout"]["pool_tokens"] == vision_on["memory_layout"]["pool_tokens"]
         assert deployment["report"]["onboard_layers"] == 42
 
@@ -1288,7 +1370,7 @@ def capture_v41_real_planner_launch(snapshot: Path, example: Path, binary: Path,
         assert "invalid deployment specification" in result.stderr, result.stderr
         return
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "deepseek_v41", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     # One shared prefill policy sizes the reserve and cuts it into three units.
@@ -1325,7 +1407,7 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     # Single-owner placement retains the solver's Heads label with Whole-only modes.
     expected = "context" if gpus == 2 else "heads"
@@ -1365,7 +1447,7 @@ def capture_v4_real_planner_launch(snapshot: Path, example: Path, binary: Path,
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "deepseek_v4", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
@@ -1406,7 +1488,7 @@ def capture_qwen_real_planner_launch(snapshot: Path, example: Path, binary: Path
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     # The automatic pool still holds the checkpoint's selected context, and KV
     # pages keep the planner's page geometry.
@@ -1438,7 +1520,7 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "qwen4", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["prefill_waves"] == 1 and deployment["prefill_unit_rows"] == 4096, deployment
@@ -1496,7 +1578,7 @@ def capture_mimo_real_planner_launch(snapshot: Path, example: Path, binary: Path
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "mimo_v2", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["rtx_gpus"] == gpus, deployment
@@ -1530,7 +1612,7 @@ def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
     assert deployment["family"] == "glm5_flash"
     assert deployment["rtx_gpus"] in (1, 2)
     assert deployment["wip_launchable"] is True
-    source = (ROOT / "scripts/launch/run-family.sh").read_text()
+    source = (ROOT / "scripts/lib/family-keys.sh").read_text()
     functions = []
     for name in ("release_spark_worker_budget", "release_validate_deployment"):
         match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.MULTILINE | re.DOTALL)
@@ -1544,9 +1626,11 @@ release_spark_worker_budget "$plan" "$2"
 release_validate_deployment "$plan" glm5_flash
 '''
     result = subprocess.run(["bash", "-euc", script, "native-capability", str(deployment_path),
-                             str(deployment["spark_ranks"])], capture_output=True, text=True)
-    devices = [device for device in deployment["memory_layout"]["devices"] if device["kind"] == "spark"]
-    assert len(devices) == deployment["spark_ranks"]
+                             str(deployment["spark_expert_world"])], capture_output=True, text=True)
+    experts = {role["rank"] for role in deployment["spark_roles"] if role["experts"]}
+    devices = [device for device in deployment["memory_layout"]["devices"]
+               if device["kind"] == "spark" and device["index"] in experts]
+    assert len(devices) == deployment["spark_expert_world"]
     assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
     assert result.returncode == 0, result.stderr
 
@@ -1787,6 +1871,8 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
     if family == "deepseek_v41":
         keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
                  "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
+    if family == "qwen4" and rtx_gpus == 2:
+        keys += "SPARK_COUNT=0\n"
     if override:
         keys += f"CONCURRENCY={4 if override == 'config' else 7}\n"
     result = _family_launch_result(tmp_path, config, model, keys, physical_gpus=tuple(range(rtx_gpus)),
@@ -3318,14 +3404,34 @@ def test_full_prefill_logits_rejects_invalid_setting_before_launch(tmp_path):
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
-def test_explicit_split_without_kernels_serves_from_the_first_gpu(
+def test_qwen_explicit_pair_checks_admitted_expert_world(
         tmp_path: Path, checkpoint: str, keys: str) -> None:
-    model = "zai-org/GLM-5.3-Flash" if checkpoint == "glm5_flash" else "test/model"
-    result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, keys)
-    assert result.returncode == 0, result.stderr
-    assert "has no head split yet" in result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert _coordinator_gpus(launch) == [0] and "--split-device" not in launch
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], "test/model", keys)
+    assert result.returncode != 0, result.stderr
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert "--rtx 2" in planner and "--attention-placement layers" in planner
+    assert "Qwen dual requires a Spark-free local TP2 layout" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
+def test_qwen_tower_only_pair_reaches_typed_planner_refusal(tmp_path: Path, keys: str) -> None:
+    placement = {"kind": {"kind": "spark", "rank": 2}, "replicas": []}
+    result = _family_launch_result(tmp_path,
+        {**SPLIT_CONFIGS["qwen4"], "vision_config": {"depth": 2}}, "test/model",
+        keys + "SPARK_COUNT=3\nSPECULATOR=off\nVISION=spark:2\nAUDIO=off\n",
+        encoder_plan={"placement_supported": False, "fits": False, "spark_expert_world": 0,
+                      "spark_roles": [dict(rank=2, experts=False, layers=[], encoder=placement,
+                                           audio_encoder=None, drafter=None)],
+                      "encoder": placement,
+                      "hints": ["vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS"]})
+    assert result.returncode != 0, result.stderr
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert "--rtx 2" in planner and "--attention-placement layers" in planner
+    assert "vision-only Spark workers are not supported" in result.stderr
+    assert "invalid deployment specification" in result.stderr
+    assert "Qwen dual requires a Spark-free" not in result.stderr
+    assert "docker run -d" not in result.stderr
 
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
@@ -3739,9 +3845,15 @@ def test_qwen_preferred_experts_use_the_planner_before_launch(tmp_path: Path, ba
                                                              preferred: int, local: bool) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
                                   f"EXPERT_BACKEND={backend}\n", preferred_ranks=preferred)
-    assert result.returncode != 0
-    assert "planner changed exact Spark count" in result.stderr
-    assert "cuteafd serve-qwen4" not in result.stderr
+    if preferred == 0:
+        assert result.returncode == 0, result.stderr
+        launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+        assert "--local-experts" in launch
+        assert "cuteafd expertd-native" not in result.stderr
+    else:
+        assert result.returncode != 0
+        assert "planner requested more Spark ranks than configured" in result.stderr
+        assert "cuteafd serve-qwen4" not in result.stderr
 
 
 def test_qwen_preferred_local_allows_native_mtp(tmp_path: Path) -> None:
@@ -4902,7 +5014,7 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "step5", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["memory_layout"]["pool_tokens"] >= 262144, deployment
@@ -4946,3 +5058,137 @@ def test_tp2_dflash_rejects_inapplicable_launch(tmp_path, keys):
                                   "test/tp2-dflash", keys + "TP2_DFLASH=on\n")
     assert result.returncode == 2, result.stderr
     assert "TP2_DFLASH requires" in result.stderr
+
+@pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41", "step5", "kimi_k3"])
+@pytest.mark.parametrize("fits", [True, False])
+def test_zero_spark_is_admitted_by_planner_not_family(tmp_path, family, fits):
+    config = {"model_type": family}
+    if family == "kimi_k3":
+        config["num_hidden_layers"] = 2
+    elif family == "step5":
+        config.update(num_hidden_layers=92, moe_layer_list=list(range(3, 91)))
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    keys = "MODEL_REVISION=\nSPARK_COUNT=0\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    result = _family_launch_result(tmp_path, config, model, keys,
+        extra_args=("--wip", "zero-spark"),
+        encoder_plan={"placement_supported": fits, "fits": fits, "hints": ["does not fit"]})
+    assert (result.returncode == 0) == fits, result.stderr
+    assert " plan " in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+    if not fits:
+        assert "does not fit" in result.stderr and "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("media", ["off", "spark:0", "spark:2"])
+@pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
+def test_expertless_deployment_starts_only_assigned_media(tmp_path, media, family):
+    config = {"model_type": family, "vision_config": {"depth": 2}}
+    if family == "mimo_v2":
+        config["moe_layer_freq"] = [0, 1]
+        config["num_hidden_layers"] = 2
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    rank = int(media.split(":")[1]) if media != "off" else 0
+    placement = {"kind": {"kind": "spark", "rank": rank} if media != "off" else {"kind": "off"}, "replicas": []}
+    ranks = 1 if media != "off" else 0
+    roles = [dict(rank=rank, experts=False, layers=[], encoder=placement, audio_encoder=None, drafter=None)] if ranks else []
+    result = _family_launch_result(tmp_path, config, model,
+        f"MODEL_REVISION=\nSPARK_COUNT=3\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\nSPARK_2_HOST=h2\nSPARK_2_LANE_A=10.0.0.3\nRTX_GPUS=1\nSPECULATOR=off\nVISION={media}\nAUDIO=off\n",
+        extra_args=("--wip", "media-only"), execute_workers=True,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_expert_world": 0,
+                      "spark_roles": roles, "encoder": placement, "encoder_plan_hash": "ab" * 32})
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    assert len(workers) == ranks, result.stderr
+    if ranks:
+        worker = workers[0]
+        assert "--encoder-only" in worker and "--encoder-listen" in worker
+        assert "--world" not in worker and "--listen 0.0.0.0:19441" not in worker
+        assert "--spark-tp" not in worker
+    else:
+        assert "docker run -d --name cuteafd-spark-expert" not in result.stderr
+    coordinator = next(line for line in result.stderr.splitlines()
+                       if "docker run -d" in line and "--max-output-tokens" in line)
+    if family == "mimo_v2":
+        assert "--local-experts" in coordinator
+    assert "127.0.0.1:1,127.0.0.1:2" not in coordinator
+    for unused in set(range(3)) - ({rank} if ranks else set()):
+        assert f"cuteafd-spark-expert-h{unused}-19441" not in result.stderr
+
+
+@pytest.mark.parametrize("role,world,diagnostic", [
+    (dict(rank=3, experts=False, encoder={"kind": {"kind": "spark", "rank": 3}}), 0, "inconsistent Spark roles"),
+    (dict(rank=1, experts=True), 1, "inconsistent Spark roles"),
+    (dict(rank=0, experts=False, drafter={"kind": {"kind": "spark", "rank": 0}}), 0, "unsupported Spark drafter role"),
+])
+def test_spark_roles_reject_unlaunchable_rank_contracts(tmp_path, role, world, diagnostic):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}, "test/model",
+        "SPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        encoder_plan={"placement_supported": True, "fits": True, "spark_expert_world": world,
+                      "spark_roles": [dict(layers=[], encoder=None, audio_encoder=None, drafter=None) | role]})
+    assert result.returncode != 0 and diagnostic in result.stderr, result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
+def test_expert_world_excludes_rank_two_media_worker(tmp_path, family):
+    config = {"model_type": family, "vision_config": {"depth": 2}}
+    if family == "mimo_v2":
+        config.update(num_hidden_layers=2, moe_layer_freq=[0, 1])
+    placement = {"kind": {"kind": "spark", "rank": 2}, "replicas": []}
+    roles = [dict(rank=i, experts=i < 2, layers=[], encoder=placement if i == 2 else None,
+                  audio_encoder=None, drafter=None) for i in range(3)]
+    budgets = [108 << 30, 108 << 30, 96 << 30]
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    result = _family_launch_result(tmp_path, config, model,
+        "MODEL_REVISION=\nSPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=spark:2\nAUDIO=off\n",
+        extra_args=("--wip", "mixed-roles"), execute_workers=True,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_expert_world": 2,
+                      "spark_roles": roles, "encoder": placement, "encoder_plan_hash": "ab" * 32},
+        deployment_overrides={"memory_layout": {"devices": [
+            dict(kind="rtx", index=0, items=[dict(category="weights", bytes=8 << 30)]),
+            *[dict(kind="spark", index=i, worker_budget_bytes=budget) for i, budget in enumerate(budgets)],
+            dict(kind="spark", index=7, worker_budget_bytes=1)]}})
+    assert result.returncode == 0, result.stderr
+    workers = [shlex.split(line) for line in result.stderr.splitlines()
+               if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    assert len(workers) == 3, result.stderr
+    by_rank = {int(worker[worker.index("--rank") + 1]): worker for worker in workers}
+    assert set(by_rank) == {0, 1, 2}
+    for rank, worker in by_rank.items():
+        assert worker[worker.index("--device-budget-bytes") + 1] == str(budgets[rank])
+        if rank < 2:
+            assert worker[worker.index("--world") + 1] == "2"
+            assert "--encoder-only" not in worker and "--listen" in worker
+        else:
+            assert "--encoder-only" in worker and "--encoder-listen" in worker
+            assert not {"--world", "--listen", "--spark-tp", "--spark-ep"} & set(worker)
+    coordinator = next(shlex.split(line) for line in result.stderr.splitlines()
+                       if "docker run -d" in line and "--max-output-tokens" in line)
+    assert coordinator[coordinator.index("--peers") + 1] == "10.0.0.1:19441,10.0.0.2:19441"
+
+
+@pytest.mark.parametrize("vision_ranks", [(0,), (2,), (0, 2), (2, 0)])
+def test_glmf_expertless_vision_handoff_preserves_physical_ranks(tmp_path, vision_ranks):
+    placement = {"kind": {"kind": "spark", "rank": vision_ranks[0]},
+                 "replicas": list(vision_ranks[1:])}
+    roles = [dict(rank=rank, experts=False, layers=[], encoder=placement,
+                  audio_encoder=None, drafter=None) for rank in sorted(vision_ranks)]
+    result = _family_launch_result(tmp_path, GLMF_VISION, "test/model",
+        "RTX_GPUS=1\nSPARK_COUNT=3\nSPECULATOR=off\nVISION=auto\nAUDIO=off\n",
+        extra_args=("--wip", "tower-ranks"), execute_workers=True,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_expert_world": 0,
+                      "spark_roles": roles, "encoder": placement, "encoder_plan_hash": "ab" * 32})
+    assert result.returncode == 0, result.stderr
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "cuteafd serve-glmf --snapshot" in line)
+    assert serve[serve.index("--vision-peer-ranks") + 1] == ",".join(map(str, vision_ranks))
+    assert serve[serve.index("--vision-peers") + 1] == ",".join(
+        f"10.0.0.{rank + 1}:19442" for rank in vision_ranks)
+    assert serve[serve.index("--vision") + 1] == f"spark:{vision_ranks[0]}"
+    assert "--local-experts" in serve
+    assert "--peers" not in serve
+    workers = [shlex.split(line) for line in result.stderr.splitlines()
+               if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    assert {int(worker[worker.index("--rank") + 1]) for worker in workers} == set(vision_ranks)
+    assert all("--encoder-only" in worker and "--world" not in worker for worker in workers)

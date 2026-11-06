@@ -371,7 +371,7 @@ def select(args: argparse.Namespace) -> dict:
 def admit(args: argparse.Namespace) -> None:
     """Each selected GPU holds the plan's fixed owners for its logical device.
 
-    The KV pool sizes itself into what remains, and with Spark ranks so do the
+    The KV pool sizes itself into what remains, and with Spark expert ranks so do the
     RTX-onboarded expert layers; everything else must fit the GPU's free memory
     now. A GPU another job occupies fails here, before any container starts."""
     gpus = inventory(args.nvidia_smi, set(args.reclaim_pid), total_capacity=args.total_capacity)
@@ -384,7 +384,7 @@ def admit(args: argparse.Namespace) -> None:
     try:
         with open(args.deployment) as stream:
             deployment = json.load(stream)
-        flexible = {"kv"} | ({"experts"} if deployment["spark_ranks"] else set())
+        flexible = {"kv"} | ({"experts"} if deployment["spark_expert_world"] else set())
         devices = sorted((device for device in deployment["memory_layout"]["devices"] if device["kind"] == "rtx"),
                          key=lambda device: device["index"])
         required = [sum(item["bytes"] for item in device["items"] if item["category"] not in flexible)
