@@ -546,23 +546,32 @@ pub fn local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Catalog, 
 pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Catalog,
     manifest: &std::path::Path, selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool, a4: bool)
     -> anyhow::Result<LocalInventory> {
+    local_inventory_world(cfg, catalog, manifest, selected_layers, 2, rows, lanes, exchange_f32, a4)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_inventory_world(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Catalog,
+    manifest: &std::path::Path, selected_layers: usize, world: usize, rows: u64, lanes: u64,
+    exchange_f32: bool, a4: bool) -> anyhow::Result<LocalInventory> {
     let shape = catalog.routed_experts();
     anyhow::ensure!(shape.hidden == cfg.hidden && shape.intermediate == cfg.moe_intermediate
         && shape.experts == cfg.experts && shape.topk == cfg.topk && shape.first_layer == cfg.first_moe_layer,
         "routed expert catalog {shape:?} differs from the checkpoint config");
-    anyhow::ensure!(shape.intermediate % 2 == 0 && (1..=4096).contains(&rows) && (1..=4).contains(&lanes)
+    anyhow::ensure!((1..=2).contains(&world) && shape.intermediate % world == 0 && (1..=4096).contains(&rows) && (1..=4).contains(&lanes)
         && (shape.first_layer..=shape.layers).contains(&selected_layers), "GLM TP2 geometry/layer extent");
     let Some(exl3) = catalog.exl3() else {
+        anyhow::ensure!(world == 2, "GLM native NVFP4 local experts require two GPUs");
         anyhow::ensure!(cfg.variant.is_glm(), "{} routed experts serve TP2 only from its EXL3 publication",
             cfg.program_family());
         return nvfp4_inventory(catalog, manifest, selected_layers, rows, lanes, exchange_f32, a4);
     };
     let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
     let stem = format!("exl3-{}-k{tiers}", cfg.program_family());
+    let layout = format!("rtx-tp{world}");
     let parent = manifest.parent().ok_or_else(|| anyhow::anyhow!("GLM program manifest parent"))?;
     let package = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
-        .into_iter().map(|p| p.join("rtx-tp2")).find(|p| p.is_dir())
-        .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(format!("{stem}/rtx-tp2"))))?;
+        .into_iter().map(|p| p.join(&layout)).find(|p| p.is_dir())
+        .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(format!("{stem}/{layout}"))))?;
     let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let max_rows = rows.max(DECODE_ROWS);
     let compiled = capacities.into_iter().find(|&c| c >= max_rows).unwrap();
@@ -570,7 +579,7 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
         let directory = package.join(format!("m{capacity}"));
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
         anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
-            && value["intermediate"].as_u64() == Some(shape.intermediate as u64 / 2)
+            && value["intermediate"].as_u64() == Some(shape.intermediate as u64 / world as u64)
             && value["experts"].as_u64() == Some(shape.experts as u64)
             && value["top_k"].as_u64() == Some(shape.topk as u64)
             && value["capacity"].as_u64() == Some(capacity)
@@ -605,9 +614,11 @@ pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41
         experts.push(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half,
             tp2: true, whole_supported: true, spark_ok: true });
     }
-    Ok(LocalInventory { package, format: GlmLocalFormat::Exl3, experts, backend_workspace, world: 2, unit_limit: 0,
-        extra_workspace: local_extra_workspace(shape.hidden as u64, shape.experts as u64,
-            shape.topk as u64, rows, lanes, exchange_f32) })
+    Ok(LocalInventory { package, format: GlmLocalFormat::Exl3, experts, backend_workspace, world, unit_limit: 0,
+        extra_workspace: if world == 1 { [0; 2] } else {
+            local_extra_workspace(shape.hidden as u64, shape.experts as u64,
+                shape.topk as u64, rows, lanes, exchange_f32)
+        } })
 }
 
 fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
@@ -634,7 +645,7 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
         && value["role"].as_str() == Some("coordinator") && value["geometry"].as_str() == Some(geometry)
         && layout["tp"].as_u64() == Some(2) && layout["hidden"].as_u64() == Some(shape.hidden as u64)
         && layout["intermediate"].as_u64() == Some(shape.intermediate as u64)
-        && layout["slice"].as_u64() == Some(shape.intermediate as u64 / 2)
+        && layout["slice"].as_u64() == Some(shape.intermediate as u64 / world as u64)
         && layout["experts"].as_u64() == Some(shape.experts as u64)
         && layout["top_k"].as_u64() == Some(shape.topk as u64)
         && layout["input"].as_str() == Some("bf16") && layout["weights"].as_str() == Some("nvfp4")
@@ -760,7 +771,7 @@ pub fn select_local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Ca
         let (selected, activations) = exlr8.ok_or_else(|| anyhow::anyhow!("EXLR8 local inventory requires the selected native manifest"))?;
         return exlr8_inventory(catalog.snapshot(), selected, manifest, layers, gpus, rows, lanes, exchange_f32, activations).map(Some);
     }
-    if gpus != 2 {
+    if gpus != 2 && !(gpus == 1 && catalog.exl3().is_some()) {
         anyhow::ensure!(onboard == Onboard::Auto,
             "GLM local experts require a two-GPU TP2 executor");
         return Ok(None);
@@ -770,7 +781,7 @@ pub fn select_local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Ca
     let supported = catalog.exl3().is_some() || catalog.fp8().is_some_and(|t|
         t.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4);
     if automatic && !supported { return Ok(None); }
-    match local_inventory(cfg, catalog, manifest, layers, rows, lanes, exchange_f32) {
+    match local_inventory_world(cfg, catalog, manifest, layers, gpus, rows, lanes, exchange_f32, true) {
         Ok(local) => Ok(Some(local)),
         Err(error) if automatic && error.is::<MissingLocalPackage>() => {
             tracing::info!(reason = %error, "GLM RTX TP2 package unavailable; automatic placement uses Sparks");
@@ -999,6 +1010,49 @@ mod tests {
         assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), false, None).is_err());
     }
 
+
+    #[test]
+    fn world_one_exl3_uses_whole_package_and_exact_physical_owners() {
+        use super::local_physical::{LocalPhysicalInput, LocalPhysicalSource, LocalStorage};
+        let (dir, catalog, manifest) = local_fixture();
+        let cfg = glm_cfg();
+        let root = dir.path().join("exl3/exl3-glm-k45");
+        for capacity in [1, 16, 80] {
+            let source = root.join(format!("rtx-tp2/m{capacity}/v41_exl3.json"));
+            let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+            value["intermediate"] = serde_json::json!(cfg.moe_intermediate);
+            let package = root.join(format!("rtx-tp1/m{capacity}"));
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("v41_exl3.json"), value.to_string()).unwrap();
+        }
+        for onboard in [Onboard::Auto, Onboard::Layers(1)] {
+            let local = select_local_inventory(&cfg, &catalog, &manifest, 2, 1, 64, 3, false,
+                onboard, false, None).unwrap().unwrap();
+            assert_eq!(local.world, 1);
+            assert!(local.package.ends_with("rtx-tp1"));
+            assert_eq!(local.extra_workspace, [0; 2]);
+            assert_eq!(local.workspace(), [local.backend_workspace, 0]);
+            let resident = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(1), 1, 0)
+                .unwrap().device_arena_layout().unwrap().1 as u64;
+            assert_eq!(local.experts[0].whole.resident, resident);
+            for storage in [LocalStorage::Push, LocalStorage::Mount] {
+                let input = LocalPhysicalInput { layers: vec![1], max_rows: 64, lanes: 3, storage,
+                    route_checks: true, peer_diagnostics: true,
+                    activations: crate::plan::exlr8::PrefillActivations::A16 };
+                let physical = LocalPhysicalSource::read(&cfg, &catalog, &local, &input, None)
+                    .unwrap().inventory(&input).unwrap();
+                assert_eq!(physical.backend_bytes(0).unwrap(), resident + local.backend_workspace);
+                assert_eq!(physical.backend_bytes(1).unwrap(), 0);
+                assert!(!physical.owners.iter().any(|owner| owner.id.contains("peer") || owner.id.contains("checks")));
+            }
+        }
+        let path = root.join("rtx-tp1/m16/v41_exl3.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["intermediate"] = serde_json::json!(cfg.moe_intermediate / 2);
+        std::fs::write(path, value.to_string()).unwrap();
+        assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 1, 64, 3, false,
+            Onboard::Auto, false, None).is_err(), "a TP2 package cannot masquerade as Whole");
+    }
 
     #[test]
     fn local_inventory_charges_all_retained_capacities_and_exact_rank_storage() {
