@@ -66,13 +66,6 @@ impl Drop for RoutedLane<'_> {
 }
 
 impl<'a> RoutedLane<'a> {
-    pub(super) fn unlinked(library_owner: &Arc<cuteafd_ffi::NativeLibrary>, local: &LocalLane<'a>,
-        waves: usize, unit: usize) -> Self {
-        Self { stream: local.stream().clone(), link: None, library_owner: Arc::clone(library_owner),
-            terminal: false, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
-            outstanding: std::collections::VecDeque::new() }
-    }
-
     pub(super) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>,
         local: &LocalLane<'a>, placement: &Placement, world: SparkWorld,
         peers: Vec<SocketAddr>, config: TcpTransportConfig, waves: usize, unit: usize,
@@ -113,12 +106,12 @@ impl<'a> RoutedLane<'a> {
     }
 
     pub(crate) fn world_size(&self) -> Result<usize> {
-        Ok(self.link.as_ref().map_or(0, SparkLink::world_size))
+        Ok(self.link.as_ref().context("Kimi Spark link retired")?.world_size())
     }
 
     pub(crate) fn installed_grouping(&self)
         -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
-        self.link.as_ref().map_or_else(|| Ok(vec![]), SparkLink::installed_grouping)
+        self.link.as_ref().context("Kimi Spark link retired")?.installed_grouping()
     }
 
     /// Checked QP quiescence precedes copy drainage and owner release.

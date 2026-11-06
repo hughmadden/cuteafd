@@ -853,6 +853,11 @@ impl Recipe for MuseRecipe<'_> {
     }
 }
 
+/// The linked expert path remains required until local-only startup is qualified.
+pub const LOCAL_ONLY_REFUSAL: Refusal = Refusal::MissingExecutor {
+    family: "Muse Spark", executor: "coordinator-only routed experts", issue: 1395,
+};
+
 impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
@@ -862,6 +867,7 @@ impl PreparedMuse<'_> {
         let solved = solve(request, budgets, &recipe)?;
         let solve_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         let (placement, spark) = recipe.execution(&solved)?;
+        if spark.spark_layers.is_empty() { return Err(LOCAL_ONLY_REFUSAL); }
         let push = push.get(placement.onboard_layers).ok_or_else(|| invalid("push onboarding extent"))?.clone();
         let media = recipe.media(&solved)?;
         if media.vision.admitted_bytes() == 0 && media.audio.admitted_bytes() == 0 { host.media_bytes = 0; }

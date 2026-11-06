@@ -168,8 +168,8 @@ impl<'a> Engine<'a> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
-        ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && peers.len() <= 8,
-            "Kimi startup needs process latent geometry and at most eight expert ranks");
+        ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && (1..=8).contains(&peers.len()),
+            "Kimi startup needs process latent geometry and 1..8 real expert ranks");
         let coordinator_packing_cap = programs.iter().map(|programs| programs.packing_cap).min().unwrap_or(0);
         let plan = admission.execution_plan()?;
         cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
@@ -198,8 +198,8 @@ impl<'a> Engine<'a> {
             u64::from(rows), admission.waves() as u64)?;
         let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;
         model.validate(ExpertGeometry::KIMI_K3)?;
-        let spark = (!peers.is_empty()).then(|| SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
-            Some(&catalog), &admission.working_set(), peers.len(), None, model)).transpose()?;
+        let spark = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
+            Some(&catalog), &admission.working_set(), peers.len(), None, model)?;
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).
         let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,
@@ -251,8 +251,8 @@ impl<'a> Engine<'a> {
         // until every persistent local binding has acquired the same operands.
         if let Some(draft) = draft.as_mut() { draft.bind_target_ranks(weights.global.clone(), programs[RANKS - 1].clone())?; }
         drop((weights, kda, mla));
-        if let Some(pending) = pending { pending.wait()?; }
-        let world = (!peers.is_empty()).then(|| SparkWorld::canonical(peers.len())).transpose()?;
+        pending.wait()?;
+        let world = SparkWorld::canonical(peers.len())?;
         let routed = local.iter().map(|owners| admission.connect_spark(library, &owners[RANKS - 1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };

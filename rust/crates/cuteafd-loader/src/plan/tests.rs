@@ -2358,6 +2358,15 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     assert!(report_tp5.executable(), "{}", render(&report_tp5));
     assert_eq!(component(&report_tp5, Component::RoutedExpert).status, Status::Ready, "{}", render(&report_tp5));
     assert!((report_tp5.spark_rank_share - 512.0 / 2048.0).abs() < 1e-9);
+    // A geometry-valid but frozen remote world must not bypass its policy
+    // merely because Flash defers remote-package admission to the joint solve.
+    assert!(super::experts::spark_recipe("glmf:nvfp4", 2048, 7).is_err());
+    assert!(super::experts::frozen_refusal("glmf:nvfp4", 7).is_some());
+    let mut frozen = quant_options(7);
+    frozen.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+    let refused = plan(dir.path(), &frozen).unwrap();
+    assert!(!refused.executable(), "{}", render(&refused));
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("pool-first placement")), "{:?}", refused.hints);
     // Metadata that excludes the experts contradicts their NVFP4 tensors.
     let hf = json!({"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "NVFP4", "group_size": 16,
         "exclude_modules": ["model.language_model.layers.1.mlp.experts*", "*.shared_experts.*", "*.self_attn.*"]}});

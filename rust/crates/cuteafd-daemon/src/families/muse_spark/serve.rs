@@ -205,9 +205,9 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
     let sequences = usize::from(args.max_sequences);
     let spark = super::admission::spark_plan(placement, prefill, cutoff, sequences, args.peers.len())?;
-    let admission_plan = (!args.peers.is_empty()).then(|| crate::shared::placement::SparkAdmission::plan(&args.snapshot,
+    let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
-        spark.model.clone())).transpose()?;
+        spark.model.clone())?;
     let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
         .collect::<Vec<_>>();
     let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
@@ -235,7 +235,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let prepared = policy.plan(|| {
         let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement,
             gpus, &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
-        if admission_plan.as_ref().is_some_and(|plan| plan.coordinator_pushes()) {
+        if admission_plan.coordinator_pushes() {
             let (push, streams, ranks) = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), gpus, experts, built.push.clone())?;
             Ok((push, Some((streams, ranks)), args.peers.len()))
         } else {
@@ -246,10 +246,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         Some((push, coordinator, sparks)) => (Some(push), coordinator, sparks),
         None => (None, None, 0),
     };
-    let admission = admission_plan.map(|plan| plan.start_with(&args.peers, coordinator)).transpose()?;
+    let admission = admission_plan.start_with(&args.peers, coordinator)?;
     let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
         .collect::<Result<Vec<_>>>()?;
-    let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(admission, || {
+    let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(Some(admission), || {
         let load = || -> Result<_> {
             let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
                 crate::shared::memory::EmbedPlacement::Gpu, || {

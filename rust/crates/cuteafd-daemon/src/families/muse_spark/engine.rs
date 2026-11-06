@@ -204,8 +204,7 @@ impl<'r, 'a: 'r> MuseEngine<'r, 'a> {
                 crate::shared::peer_split::RankDevice { device: ranks[rank].device.id, stream: streams[rank].raw }), sizes,
                 super::peer::decode_peer_bytes(cfg.hidden, cfg.expert_hidden, cfg.topk, onboarded)?)
         }).transpose()?;
-        let world = (!link.spark.working.spark_layers.is_empty()).then(||
-            cuteafd_transport::expert::SparkWorld::canonical(peers.len())).transpose()?;
+        let world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let config = cuteafd_transport::TcpTransportConfig { max_frame_bytes: link.spark.max_frame_bytes,
             timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
         let path = super::spark::MuseSparkPath::connect(library_owner, Rc::clone(&streams[0]), world, peers, config, link.cutoff, link.unit_rows, link.waves, link.intake_row_bytes)?;

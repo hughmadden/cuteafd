@@ -29,7 +29,8 @@ pub(crate) fn spark_plan(placement: &Placement, prefill: PrefillPlan, cutoff: Cu
     ensure!(spark_layers.len() + rtx_layers.len() == placement.layers.len(),
         "Muse places every layer's experts on the Sparks or an RTX (all layers are MoE)");
     ensure!(rtx_layers.len() == placement.onboard_layers, "Muse onboarded layers differ from the placement count");
-    ensure!(spark_layers.is_empty() || spark_ranks > 0, "Muse remote experts need admitted peers");
+    // Current RTX capacities refuse an all-local Muse plan before this runtime path.
+    ensure!(!spark_layers.is_empty(), "Muse serves with at least one Spark layer");
     let (endpoint, rings) = shared::spark_endpoint(prefill, cutoff, sequences)?;
     let max_frame_bytes = endpoint.frame_bytes(geometry, rings).context("Muse Spark endpoint frame")?;
     let rings = cuteafd_core::SparkRings { max_frame_bytes, ..rings };

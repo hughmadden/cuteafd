@@ -58,6 +58,11 @@ pub fn push_host_owners(envelope: &crate::push_load::PushHostEnvelope, maximum: 
     }).collect())
 }
 
+/// Local-only routed execution still needs startup/lifetime hardware qualification.
+pub const LOCAL_ONLY_REFUSAL: Refusal = Refusal::MissingExecutor {
+    family: "Kimi K3", executor: "coordinator-only routed experts", issue: 1395,
+};
+
 /// Native page quantum of the retained MLA records.
 pub const PAGE_ROWS: u64 = 64;
 
@@ -288,6 +293,9 @@ impl KimiRecipe {
     pub fn admit(&self, request: Request, budgets: Vec<Budget>) -> Result<AdmittedKimi, Refusal> {
         let solved = solve(request, budgets, self)?;
         let placement = self.execution(&solved)?;
+        if self.experts.is_some() && !placement.layers.iter().any(|layer| layer.experts == ExpertHome::Spark) {
+            return Err(LOCAL_ONLY_REFUSAL);
+        }
         let onboard = solved.decisions.onboard_layers.iter().map(Vec::len).max().unwrap_or(0);
         Ok(AdmittedKimi { placement, solved, onboard })
     }

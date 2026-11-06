@@ -277,15 +277,12 @@ impl<'a> Admission<'a> {
 
     pub(crate) fn connect_spark(&mut self, library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
         local: &LocalLane<'a>,
-        world: Option<cuteafd_transport::expert::SparkWorld>, peers: Vec<std::net::SocketAddr>,
+        world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>,
         config: cuteafd_transport::TcpTransportConfig) -> Result<super::spark::RoutedLane<'a>> {
         let lane = local.lane_index();
-        if self.working_set().spark_layers.is_empty() {
-            return Ok(super::spark::RoutedLane::unlinked(library, local, self.waves, self.unit_rows));
-        }
         let expected = self.check_spark(lane)?;
         ensure!(Rc::ptr_eq(&expected, local.stream()), "Kimi Spark lane differs from admitted GPU1 intake owner");
-        let routed = super::spark::RoutedLane::connect(library, local, &self.placement, world.context("Kimi remote expert world")?, peers, config,
+        let routed = super::spark::RoutedLane::connect(library, local, &self.placement, world, peers, config,
             self.waves, self.unit_rows, self.spark_links.get(lane).context("Kimi missing admitted Spark link")?.clone())?;
         self.spark_connected[lane] = true;
         Ok(routed)
@@ -302,11 +299,11 @@ impl<'a> Admission<'a> {
     /// Spark push group, planned from headers before membership. Required
     /// push planning/delivery errors never fall back to the mount.
     /// Returns the pending admission with the loaded owners.
-    pub(crate) fn start_and_load<const RANKS: usize>(&mut self, spark: Option<crate::shared::placement::SparkAdmission>,
+    pub(crate) fn start_and_load<const RANKS: usize>(&mut self, spark: crate::shared::placement::SparkAdmission,
         peers: &[std::net::SocketAddr], devices: [Device<'a>; RANKS], checkpoint: &cuteafd_loader::plan::Checkpoint,
         catalog: &cuteafd_loader::OfficialV41Catalog, streams: [*mut std::ffi::c_void; RANKS],
         draft_records: crate::shared::experts::rtx::dense::Records)
-        -> Result<(Option<crate::shared::placement::PendingSparkAdmission>,
+        -> Result<(crate::shared::placement::PendingSparkAdmission,
             Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>>, LoadedWeights<'a>)> {
         use crate::shared::experts::rtx::{dense::{self, DenseLoad}, push::{CoordinatorExperts, CoordinatorPush}};
         ensure!(RANKS == self.devices.len(), "Kimi load physical rank inventory differs");
@@ -322,6 +319,7 @@ impl<'a> Admission<'a> {
         // Dense owners and records, planned before membership.
         let policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?;
         let planned = policy.plan(|| -> Result<_> {
+            ensure!(spark.coordinator_pushes(), "Kimi Spark admission did not select required push");
             let owners = self.record(&devices, checkpoint, &load, &streams)?;
             let mut records = draft_records;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
@@ -340,21 +338,15 @@ impl<'a> Admission<'a> {
                         budget: budgets[0] }] }
                 } else { CoordinatorExperts::Tp2 { layers: layers.clone(), budgets } })
             }).transpose()?;
-            let (push, membership) = if spark.as_ref().is_some_and(|spark| spark.coordinator_pushes()) {
-                let (push, streams, ranks) = CoordinatorPush::prepare_admitted(&checkpoint.snapshot,
-                    Some(catalog), RANKS, experts, self.push_host.clone())?;
-                (push, Some((streams, ranks)))
-            } else {
-                (CoordinatorPush::prepare_alone_admitted(&checkpoint.snapshot, Some(catalog), RANKS,
-                    experts, self.push_host.clone())?, None)
-            };
-            Ok((push, membership, owners, records, dense))
+            let prepared = CoordinatorPush::prepare_admitted(&checkpoint.snapshot, Some(catalog), RANKS,
+                experts, self.push_host.clone())?;
+            Ok((prepared, owners, records, dense))
         })?;
         let (planned, ranks) = match planned {
-            Some((push, membership, owners, records, dense)) => (Some((push, owners, records, dense)), membership),
+            Some(((push, streams, ranks), owners, records, dense)) => (Some((push, owners, records, dense)), Some((streams, ranks))),
             None => (None, None),
         };
-        let pending = spark.map(|spark| spark.start_with(peers, ranks)).transpose()?;
+        let pending = spark.start_with(peers, ranks)?;
         let started = std::time::Instant::now();
         let (weights, pushed) = match planned {
             Some((push, owners, records, dense)) => {
@@ -689,11 +681,8 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let maximum_pages = request.pool.ceiling.div_ceil(page_rows);
     let routed = request.layers.iter().enumerate().filter_map(|(layer, demand)| demand.experts.is_some().then_some(layer)).collect::<Vec<_>>();
     let counts = match request.onboard {
-        Onboard::Auto => (if spark_ranks == 0 { routed.len() } else { 0 }..=routed.len()).collect::<Vec<_>>(),
-        Onboard::Layers(count) => {
-            ensure!(spark_ranks > 0 || count == routed.len(), "Kimi zero-world requires every routed expert onboarded");
-            vec![count]
-        },
+        Onboard::Auto => (0..=routed.len()).collect::<Vec<_>>(),
+        Onboard::Layers(count) => vec![count],
     };
     let arenas = if RANKS == 2 {
         let halves = routed.iter().map(|&layer| request.layers[layer].experts.as_ref().unwrap().half).collect::<Vec<_>>();
@@ -747,7 +736,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             if !kinds.contains(&kind) { kinds.push(kind); } kinds
         }),
         experts: (!routed.is_empty()).then_some(ExpertProfile { layers: routed, destination: (0..RANKS as u8).collect(), counts,
-            rank_sets: if spark_ranks == 0 { vec![] } else { vec![(0..spark_ranks as u8).collect()] } }),
+            rank_sets: vec![(0..spark_ranks as u8).collect()] }),
         arenas, spark,
         links: kimi::production_links((RANKS - 1) as u8, spark_ranks, lanes,
             contract::PrefillShape { rows: unit_rows as u64, waves: inputs_waves as u64 },
@@ -885,8 +874,8 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
     let cfg = i.cfg;
     ensure!(cfg.layers > 0 && cfg.layers == cfg.attention.len() && cfg.layers == cfg.dense.len(),
         "Kimi admission layer inventory differs from checkpoint");
-    ensure!(i.spark_ranks <= 8 && (RANKS == 1 || i.peer_access),
-        "Kimi native admission accepts at most eight Spark ranks and requires peer access for a pair");
+    ensure!((1..=8).contains(&i.spark_ranks) && (RANKS == 1 || i.peer_access),
+        "Kimi native admission requires 1..8 Spark ranks and peer access for a pair");
     ensure!(i.devices.iter().all(|device| *device >= 0) && (RANKS == 1 || i.devices[0] != i.devices[1]),
         "Kimi admitted devices must be distinct CUDA ordinals");
     ensure!(i.context.is_some() == (i.attention == Some(AttentionPlacement::Context)),
@@ -962,7 +951,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
             fixed.push(demand);
         }
     }
-    for lane in 0..if i.spark_ranks == 0 { 0 } else { i.lanes } {
+    for lane in 0..i.lanes {
         let demand = super::spark::admitted_demand_on(i.waves, unit, lane, i.spark_ranks, RANKS - 1,
             cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false))?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),

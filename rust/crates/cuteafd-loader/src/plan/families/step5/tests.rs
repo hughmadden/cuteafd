@@ -1536,6 +1536,22 @@ fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
     eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
 }
 
+#[test]
+fn exl3_zero_spark_refuses_partial_ownership_in_the_joint_planner() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    let report = plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(0), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![96 << 30; 2], workspace_manifest: Some(manifest),
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }),
+        ..Default::default()
+    }).unwrap();
+    assert!(!report.executable() && !report.wip_launchable());
+    assert!(report.solver_placement.is_none());
+    assert!(report.hints.iter().any(|hint| hint.what.contains("native placement refused")), "{:?}", report.hints);
+}
+
 /// NVFP4 Step is deprecated: auto onboards nothing (with the named reason),
 /// an explicit layer count is refused.
 #[test]
