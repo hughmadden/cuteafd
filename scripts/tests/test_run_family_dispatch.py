@@ -1176,6 +1176,75 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
         assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
 
 
+def _assert_real_deployment_ledger(deployment: dict) -> None:
+    """One physical device owns one allocation ceiling and one copy of each tower."""
+    devices = deployment["memory_layout"]["devices"]
+    identities = [(device["kind"], device["index"]) for device in devices]
+    assert len(identities) == len(set(identities)), ("duplicate device ledger", devices)
+    for role in deployment["spark_roles"]:
+        matches = [device for device in devices
+                   if device["kind"] == "spark" and device["index"] == role["rank"]]
+        assert len(matches) == 1, ("missing Spark role ledger", role, devices)
+        device = matches[0]
+        ceiling = device.get("worker_budget_bytes")
+        assert type(ceiling) is int and ceiling > 0, ("missing Spark allocation ceiling", device)
+        for field, prefix in (("encoder", "vision"), ("audio_encoder", "audio")):
+            placement = role.get(field)
+            if placement is None:
+                continue
+            weights = [item for item in device["items"]
+                       if item["group"] in (f"{prefix} weights", f"{prefix} tower")]
+            scratch = [item for item in device["items"] if item["group"] == f"{prefix} scratch"]
+            overhead = [item for item in device["items"] if item["group"] == f"{prefix} CUDA overhead"]
+            assert len(weights) == 1 and weights[0]["bytes"] == placement["weights"], (role, device)
+            # V4.1 splits measured CUDA overhead out of its scratch reservation.
+            assert len(scratch) == 1 and len(overhead) <= 1, (role, device)
+            assert sum(item["bytes"] for item in scratch + overhead) == placement["scratch"], (role, device)
+
+
+def _read_real_deployment(path: Path) -> dict:
+    deployment = json.loads(path.read_text())
+    _assert_real_deployment_ledger(deployment)
+    return deployment
+
+
+def test_real_deployment_ledger_accepts_shared_tower_expert_rank():
+    _assert_real_deployment_ledger(_shared_tower_expert_deployment())
+
+
+def _shared_tower_expert_deployment() -> dict:
+    return {"spark_roles": [{"rank": 2, "experts": True,
+                            "encoder": {"weights": 20, "scratch": 8}}],
+            "memory_layout": {"devices": [{"kind": "spark", "index": 2,
+                "worker_budget_bytes": 100, "items": [
+                    {"group": "routed_expert", "bytes": 30},
+                    {"group": "vision weights", "bytes": 20},
+                    {"group": "vision scratch", "bytes": 6},
+                    {"group": "vision CUDA overhead", "bytes": 2}]}]}}
+
+
+@pytest.mark.parametrize("defect", ["duplicate_device", "missing_device", "missing_ceiling",
+                                  "duplicate_weights", "duplicate_scratch", "wrong_scratch"])
+def test_real_deployment_ledger_rejects_inconsistent_physical_owners(defect):
+    deployment = _shared_tower_expert_deployment()
+    devices = deployment["memory_layout"]["devices"]
+    device = devices[0]
+    if defect == "duplicate_device":
+        devices.append(device.copy())
+    elif defect == "missing_device":
+        devices.clear()
+    elif defect == "missing_ceiling":
+        device["worker_budget_bytes"] = 0
+    elif defect == "duplicate_weights":
+        device["items"].append(device["items"][1].copy())
+    elif defect == "duplicate_scratch":
+        device["items"].append(device["items"][2].copy())
+    else:
+        device["items"][2]["bytes"] += 1
+    with pytest.raises(AssertionError):
+        _assert_real_deployment_ledger(deployment)
+
+
 def _capture_real_planner_launch(snapshot: Path, example: Path, binary: Path,
                                  programs: Path, hf_home: Path, temporary: Path,
                                  model: str, family: str) -> tuple:
@@ -1198,7 +1267,7 @@ def _capture_real_planner_launch(snapshot: Path, example: Path, binary: Path,
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == family, deployment
     assert deployment["spark_ranks"] == int(config["SPARK_COUNT"]), deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
@@ -1252,7 +1321,7 @@ def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary:
                 "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
                 "STUB_REAL_PLAN_OUTPUT": str(strict_output), "CUTEAFD_CDI_CHECK": "off"})
         assert strict.returncode == 0, strict.stderr
-        vision_on = json.loads(strict_output.read_text())
+        vision_on = _read_real_deployment(strict_output)
         assert deployment["memory_layout"]["pool_tokens"] == vision_on["memory_layout"]["pool_tokens"]
         assert deployment["report"]["onboard_layers"] == 42
 
@@ -1301,7 +1370,7 @@ def capture_v41_real_planner_launch(snapshot: Path, example: Path, binary: Path,
         assert "invalid deployment specification" in result.stderr, result.stderr
         return
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "deepseek_v41", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     # One shared prefill policy sizes the reserve and cuts it into three units.
@@ -1338,7 +1407,7 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     # Single-owner placement retains the solver's Heads label with Whole-only modes.
     expected = "context" if gpus == 2 else "heads"
@@ -1378,7 +1447,7 @@ def capture_v4_real_planner_launch(snapshot: Path, example: Path, binary: Path,
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "deepseek_v4", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
@@ -1419,7 +1488,7 @@ def capture_qwen_real_planner_launch(snapshot: Path, example: Path, binary: Path
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     # The automatic pool still holds the checkpoint's selected context, and KV
     # pages keep the planner's page geometry.
@@ -1451,7 +1520,7 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "qwen4", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["prefill_waves"] == 1 and deployment["prefill_unit_rows"] == 4096, deployment
@@ -1509,7 +1578,7 @@ def capture_mimo_real_planner_launch(snapshot: Path, example: Path, binary: Path
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "mimo_v2", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["rtx_gpus"] == gpus, deployment
@@ -4945,7 +5014,7 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    deployment = json.loads(output.read_text())
+    deployment = _read_real_deployment(output)
     assert deployment["family"] == "step5", deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
     assert deployment["memory_layout"]["pool_tokens"] >= 262144, deployment
