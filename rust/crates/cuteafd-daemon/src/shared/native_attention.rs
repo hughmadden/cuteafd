@@ -30,6 +30,11 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
         anyhow::bail!("{}: native recipe received trellis", layout.stem);
     };
     ensure!(shape.len() == 2 && matches!(dtype, DType::Bf16 | DType::F8E4M3), "native attention source geometry");
+    if *dtype == DType::F8E4M3 && mode == AttentionMode::Fp8Compact {
+        return Err(cuteafd_loader::formats::native_attention::UnsupportedFp8Conversion {
+            tensor: format!("{}.weight", layout.stem), found: "E4M3".into(),
+        }.into());
+    }
     let fp8 = *dtype == DType::F8E4M3 || mode == AttentionMode::Fp8Compact;
     ensure!(fp8 == layout.fp8 && layout.ranks > 0 && layout.rank < layout.ranks,
         "native attention recipe differs from selected mode");
@@ -85,6 +90,21 @@ mod tests {
     use super::*;
     use cuteafd_loader::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
         plan::checkpoint::{AttentionMode, CheckpointTensor, ProjectionStorage, SelectedProjection}, SafetensorsTensorMetadata};
+
+    #[test]
+    fn fp8_compact_records_refuse_already_fp8_before_allocations_or_sources() {
+        let selected = SelectedProjection { storage: ProjectionStorage::Native {
+            dtype: DType::F8E4M3, shape: vec![256, 256] }, source_bytes: 0, tensors: Vec::new() };
+        let layout = NativeLayout { stem: "layers.0.attention.wq".into(), shape: [256, 256],
+            fp8: true, rank: 0, ranks: 1, split: CoreSplit::Whole };
+        let error = attention_records(std::path::Path::new("/unreadable"), &selected,
+            AttentionMode::Fp8Compact, &layout, crate::shared::fp8_linear::Fp8Scales::Amax,
+            CuteafdDeviceBuffer::default(), None).err().expect("already-FP8 must refuse");
+        let refusal = error.downcast_ref::<cuteafd_loader::formats::native_attention::UnsupportedFp8Conversion>()
+            .expect("conversion refusal must retain its typed error");
+        assert_eq!(refusal.tensor, "layers.0.attention.wq.weight");
+        assert_eq!(refusal.found, "E4M3");
+    }
 
     #[test]
     fn native_fp8_records_land_the_declared_scale_name_and_tp_slice() -> Result<()> {
