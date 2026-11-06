@@ -41,7 +41,7 @@ fn v4_placement_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
 fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
     use sha2::{Digest, Sha256};
     let mut files = v4_placement_source_hashes(root)?;
-    let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/release-scope.py",
+    let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/kernel-records.py", "scripts/build/release-scope.py",
         "scripts/lib/wip_aot_scopes.py"].map(|path| root.join(path)).to_vec();
     let matrix: Value = serde_json::from_slice(&fs::read(root.join("benchmarks/current-matrix.json"))?)?;
     let retired = matrix["retired"].as_array().ok_or_else(|| anyhow::anyhow!("missing retired config list"))?

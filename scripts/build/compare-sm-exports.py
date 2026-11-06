@@ -662,6 +662,10 @@ def worker(payload):
         return original_export(program, file_path, file_name, function_prefix)
 
     AotProgram.export_to_c = export_with_plan
+    recorder = None
+    if payload.get("program_records"):
+        records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
+        recorder = records_module.Recorder(ROOT, output).install()
     start = time.monotonic()
     path = ROOT / "python/tools/aot" / payload["exporter"]
     if payload["exporter"] == "package_fp8_moe_aot.py":
@@ -702,6 +706,9 @@ def worker(payload):
                    for source in sorted((ROOT / "python/tools/aot").glob("*.py"))},
                "max_shared_memory_per_block": 101376, "max_shared_memory_per_multiprocessor": 102400,
                "seconds": time.monotonic() - start}
+    if recorder is not None:
+        inspector = load_file("placement_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
+        recorder.finish(inspector, summary, plans)
     (Path(payload["output"]) / "comparison-context.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 

@@ -1542,7 +1542,7 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
 def test_placement_fingerprints_only_live_config_contents(tmp_path, monkeypatch):
     publisher = compare_sm.load_file('test_live_placement_hashes', ROOT / 'scripts/build/export-placement-inputs.py')
     for relative in ('scripts/build/export-placement-inputs.py', 'scripts/build/release-scope.py',
-                     'scripts/lib/wip_aot_scopes.py', 'examples/configs/live.config',
+                     'scripts/build/kernel-records.py', 'scripts/lib/wip_aot_scopes.py', 'examples/configs/live.config',
                      'examples/configs/retired.config', 'benchmarks/current-matrix.json'):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)

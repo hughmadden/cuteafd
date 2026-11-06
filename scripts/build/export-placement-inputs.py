@@ -29,6 +29,7 @@ def load(name, path):
 
 
 compare = load("placement_compare", ROOT / "scripts/build/compare-sm-exports.py")
+kernel_records = load("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
 
 
 def live_configs(root=ROOT):
@@ -40,7 +41,7 @@ def live_configs(root=ROOT):
 def source_hashes():
     # Keep identical to plan::testing::placement_input_source_hashes. Card report
     # rewrites do not affect compilation; only the selected example inventory does.
-    paths = [ROOT / "scripts/build/export-placement-inputs.py",
+    paths = [ROOT / "scripts/build/export-placement-inputs.py", ROOT / "scripts/build/kernel-records.py",
              ROOT / "scripts/build/release-scope.py", ROOT / "scripts/lib/wip_aot_scopes.py",
              *(ROOT / config for config in live_configs(ROOT))]
     return {**compare.v4_placement_sources(),
@@ -122,7 +123,7 @@ def reusable_workers(previous, staging, jobs, sources, lock):
     return metadata
 
 
-def publish(destination, staging, timeout, workers, reuse_workers=None):
+def publish(destination, staging, timeout, workers, reuse_workers=None, previous=None, expect=None):
     filesystem = compare.load_file("placement_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
     for path in (destination, staging):
         filesystem.check_path(str(path))
@@ -139,7 +140,7 @@ def publish(destination, staging, timeout, workers, reuse_workers=None):
         name, exporter, extra = job
         output = staging / name
         output.mkdir(parents=True)
-        payload = dict(sms=188, exporter=exporter, args=extra, output=str(output))
+        payload = dict(sms=188, exporter=exporter, args=extra, output=str(output), program_records=True)
         env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
                    CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
                    CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
@@ -150,6 +151,7 @@ def publish(destination, staging, timeout, workers, reuse_workers=None):
                            stderr=subprocess.STDOUT, check=True, timeout=timeout)
         return json.loads((output / "comparison-context.json").read_text())
 
+    report_previous = previous
     previous = reusable_workers(reuse_workers, staging, jobs, sources, lock) if reuse_workers else None
     if previous:
         summaries = previous["exports"]
@@ -184,6 +186,12 @@ def publish(destination, staging, timeout, workers, reuse_workers=None):
                 for layout, capacities in layouts.items()}}
             target.mkdir(parents=True)
             (target / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    records = publication_records(staging, jobs)
+    if records:
+        programs_path = destination / "PROGRAMS.json"
+        programs = json.loads(programs_path.read_text())
+        programs["kernel_records"] = records
+        programs_path.write_text(json.dumps(programs, indent=2) + "\n")
     files = {str(path.relative_to(destination)): compare.sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     if previous and files != previous["files"]:
@@ -195,9 +203,55 @@ def publish(destination, staging, timeout, workers, reuse_workers=None):
         provenance.update(reused_workers_from=str(reuse_workers),
                           compiler_engine_commit=previous.get("compiler_engine_commit", previous["engine_commit"]),
                           compiler_wall_seconds=previous.get("compiler_wall_seconds", previous["wall_seconds"]))
+    provenance["program_records"] = records
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    if report_previous:
+        old = json.loads((report_previous / "INPUTS.json").read_text()).get("program_records")
+        if old is None:
+            raise ValueError("previous publication has no program records; seed it with a cold export")
+        expected = json.loads(expect.read_text()) if expect else None
+        if isinstance(expected, dict):
+            expected = expected["groups"]
+        if expected is not None and (not isinstance(expected, list) or not all(isinstance(x, str) for x in expected)):
+            raise ValueError("--expect must contain a JSON list of export groups, or {groups: [...]}")
+        report = kernel_records.change_report(old, records, expected)
+        kernel_records.write_report(destination, report)
+        if report["leaks"]:
+            raise ValueError(f"UNEXPECTED KERNEL CHANGES outside --expect: {report['leaks']}")
     print(f"Published placement inputs: {destination}; {provenance['wall_seconds']} s; "
           f"{sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())} bytes", flush=True)
+
+
+def publication_records(staging, jobs):
+    records = {}
+    for name, _, _ in jobs:
+        directory = staging / name
+        path = directory / "program-records.json"
+        if not path.exists():
+            continue  # Legacy --reuse-workers publications have no identities.
+        job_records = json.loads(path.read_text())
+        if name == "programs":
+            manifest = json.loads((directory / "dsv4_programs.json").read_text())
+            for program in manifest.get("programs", []):
+                for plan in program.get("card_plans", [program]):
+                    label = plan.get("label", program["name"])
+                    record = job_records[label + ".o"]
+                    record["scratch_bytes_at_capacity"] = {
+                        str(program["capacity_rows"]): plan.get("scratch_bytes_at_capacity", {})}
+                    record["family"] = program["family"]
+        elif name.startswith("fp8/"):
+            for program in json.loads((directory / "routed.json").read_text())["programs"]:
+                job_records[program["name"] + ".o"]["scratch_bytes_at_capacity"] = {
+                    str(program["capacity"]): program["scratch_bytes"]}
+        else:
+            for manifest_path in directory.rglob("v41_exl3.json"):
+                manifest = json.loads(manifest_path.read_text())
+                for record_path, record in job_records.items():
+                    if Path(record_path).parent == manifest_path.parent.relative_to(directory):
+                        record["scratch_bytes_at_capacity"] = {
+                            str(manifest["capacity"]): manifest["unique_execution_buffer_bytes"]}
+        records.update({f"{name}/{path}": {**record, "group": name} for path, record in job_records.items()})
+    return records
 
 
 def main():
@@ -208,11 +262,17 @@ def main():
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--reuse-workers", type=Path,
                         help="verified prior publication; reuse its exact retained --staging worker outputs")
+    parser.add_argument("--previous", type=Path, help="previous publication to compare; writes CHANGES.json and CHANGES.md")
+    parser.add_argument("--expect", type=Path, help="JSON list of export job groups expected to change")
     args = parser.parse_args()
+    if args.expect and not args.previous:
+        parser.error("--expect requires --previous")
     if args.workers < 1 or args.timeout < 1:
         parser.error("--workers and --timeout must be positive")
     publish(args.output.expanduser().resolve(), args.staging.expanduser().resolve(), args.timeout, args.workers,
-            args.reuse_workers.expanduser().resolve() if args.reuse_workers else None)
+            args.reuse_workers.expanduser().resolve() if args.reuse_workers else None,
+            args.previous.expanduser().resolve() if args.previous else None,
+            args.expect.expanduser().resolve() if args.expect else None)
 
 
 if __name__ == "__main__":
