@@ -311,6 +311,85 @@ pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan:
     Ok(DualWeightPlan { resident, fixed, layer_extra })
 }
 
+/// Header-only pinned staging of each dual owner's coordinator records: the
+/// staged source rectangles the loader records on that GPU (FP8 projection
+/// quantization in 128-row windows, the FP8 head and MTP on owner 0, BF16 to
+/// FP32 widening), split by the same window rules, bounded by the same
+/// `HostStaging::for_steps` the receiving rank applies, plus its job table.
+/// The executor validates the recorded ranks against this before offers.
+pub(super) fn dual_dense_staging(checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &Qwen4Config,
+    owners: &[usize], mtp: bool, fp8_decode: bool, fp8_head: bool) -> Result<[u64; 2]> {
+    use anyhow::{ensure, Context};
+    use cuteafd_core::DType;
+    use crate::shared::experts::rtx::dense::{windows, windows_with_tail, HostStaging, Rect};
+    use cuteafd_loader::families::qwen4::Qwen4Attention;
+    use super::weights::PREFIX;
+    let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
+        .with_context(|| format!("Qwen checkpoint lacks {name}"));
+    let rect = |name: &str| -> Result<Rect> {
+        let t = tensor(name)?;
+        let total = if t.meta.shape.len() >= 2 { t.meta.shape[0] } else { 1 };
+        let row_bytes = usize::try_from(t.meta.byte_length)? / total;
+        Ok(Rect { name: name.into(), path: checkpoint.snapshot.join(&t.shard), base: t.meta.byte_offset,
+            row_bytes, rows: 0..total, cols: 0..row_bytes })
+    };
+    let mut steps: [Vec<Vec<Rect>>; 2] = [Vec::new(), Vec::new()];
+    let mut tables = [0usize; 2];
+    let widen = |name: &str, out: &mut Vec<Vec<Rect>>| -> Result<()> {
+        if tensor(name)?.meta.dtype == DType::Bf16 {
+            for (parts, _) in windows(&[rect(name)?], 1)? { out.push(parts); }
+        }
+        Ok(())
+    };
+    let layer = |p: &str, attention: Qwen4Attention, ple: bool, out: &mut Vec<Vec<Rect>>| -> Result<()> {
+        let projections: Vec<Vec<String>> = match attention {
+            Qwen4Attention::Gdn => {
+                let a = |n: &str| format!("{p}.linear_attn.{n}");
+                for name in [a("conv1d.weight"), a("A_log"), a("dt_bias")] { widen(&name, out)?; }
+                vec![["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"].map(|n| a(&format!("{n}.weight"))).to_vec(),
+                    vec![a("out_proj.weight")]]
+            }
+            Qwen4Attention::Full => {
+                let a = |n: &str| format!("{p}.self_attn.{n}");
+                vec![vec![a("q_proj.weight"), a("k_proj.weight"), a("v_proj.weight"), a("indexer.index_qk_proj.weight")],
+                    vec![a("o_proj.weight")]]
+            }
+        };
+        if fp8_decode {
+            for names in projections {
+                let rects = names.iter().map(|name| rect(name)).collect::<Result<Vec<_>>>()?;
+                for (parts, _) in windows_with_tail(&rects, 128)? { out.push(parts); }
+            }
+        }
+        if ple { widen(&format!("{p}.ple.conv1d.weight"), out)?; }
+        Ok(())
+    };
+    for (index, &owner) in owners.iter().enumerate() {
+        ensure!(owner < 2, "Qwen dual owner outside two GPUs");
+        layer(&format!("{PREFIX}layers.{index}"), cfg.attention[index], cfg.ple_layers.contains(&index), &mut steps[owner])?;
+    }
+    // The head and MTP load under owner 0 (model_placed enters ranks[0]).
+    if fp8_head {
+        for (parts, window) in windows(&[rect("lm_head.weight")?], 1)? {
+            tables[0] = tables[0].max(crate::shared::fp8_load_quant::quant_table_bytes(window.len(),
+                crate::families::glm5_flash::fp8::Layout::Row128)?);
+            steps[0].push(parts);
+        }
+    }
+    if mtp { layer("mtp.layers.0", Qwen4Attention::Full, false, &mut steps[0])?; }
+    let mut out = [0u64; 2];
+    for rank in 0..2 {
+        out[rank] = u64::try_from(HostStaging::for_steps(steps[rank].iter().map(Vec::as_slice), tables[rank])?.bytes()?)?;
+    }
+    Ok(out)
+}
+
+/// The dual coordinator push group's receive envelope (two GPUs, dense only).
+pub(super) fn dual_push_envelope(dense: [u64; 2]) -> Result<cuteafd_loader::push_load::PushHostEnvelope> {
+    Ok(cuteafd_loader::push_load::PushHostEnvelope::new(vec![0, 0], dense.to_vec(),
+        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?)
+}
+
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
@@ -1050,4 +1129,58 @@ mod tests {
         Ok(())
     }
 
+}
+
+#[cfg(test)]
+mod dual_push_tests {
+    use super::*;
+    use anyhow::Context;
+
+    /// The header-only dual staging charge equals each GPU's recorded
+    /// `HostStaging` (the bound the receiving rank enforces) on the installed
+    /// checkpoint, for every projection/head representation: a loader change
+    /// that adds, moves or reshapes a staged source fails here, not at serving.
+    #[test]
+    #[ignore = "requires CUTEAFD_PUSH_QWEN4 (installed Qwen checkpoint) and an NVMe fixture directory"]
+    fn installed_dual_staging_charge_equals_recorded_ranks() -> anyhow::Result<()> {
+        use crate::shared::{experts::rtx::dense::{DenseLoad, RankLayout}, memory::device::Device};
+        let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_QWEN4").map(std::path::PathBuf::from) else { return Ok(()) };
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+            .join(".cache/cuteafd/builds/qwen-dual-push-fixture");
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        let library = fixture.load()?;
+        fixture.extent_only(&library)?;
+        fixture.quiet_events(&library, true)?;
+        for device in 0..2 { fixture.configure_memory(&library, device, 96usize << 30)?; }
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, true, true)?;
+        let cfg = Qwen4Config::read(&snapshot)?;
+        let owners = qwen4::dual_owners(cfg.layers);
+        let mut arms = 0;
+        for (fp8_decode, fp8_head) in [(false, false), (true, false), (false, true), (true, true)] {
+            let load = std::rc::Rc::new(DenseLoad::push(&library));
+            let loader = super::super::weights::Qwen4Loader { library: &library, checkpoint: &checkpoint, fp8_decode,
+                fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(), dense: load.clone() };
+            let ranks: Vec<_> = (0..2).map(|id| (Device { library: &library, id }, std::ptr::null_mut())).collect();
+            let model = loader.model_placed(&cfg, &owners, &ranks, true, fp8_head)?;
+            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let charged = dual_dense_staging(&checkpoint, &cfg, &owners, true, fp8_decode, fp8_head)?;
+            for rank in 0..2 {
+                let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), rank as i32)?;
+                let actual = layout.host_staging.bytes()? as u64;
+                eprintln!("fp8_decode={fp8_decode} fp8_head={fp8_head} GPU{rank}: {} operands, {} steps, \
+                    recorded staging {actual} B, charged {} B", layout.operands.len(), layout.steps.len(), charged[rank]);
+                anyhow::ensure!(actual == charged[rank],
+                    "GPU{rank} recorded staging {actual} B differs from the header charge {} B", charged[rank]);
+            }
+            let envelope = dual_push_envelope(charged)?;
+            let actual = crate::shared::experts::rtx::push::push_host_envelope(&[None, None],
+                &[0, 1].map(|rank| RankLayout::new(records.operands.clone(), records.steps.clone(), rank)
+                    .map(|layout| layout.host_staging)).into_iter().collect::<anyhow::Result<Vec<_>>>()?)?;
+            anyhow::ensure!(envelope == actual, "dual envelope differs from the recorded ranks");
+            drop(model);
+            arms += 1;
+        }
+        anyhow::ensure!(arms == 4, "every representation arm ran");
+        Ok(())
+    }
 }
