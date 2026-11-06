@@ -2,9 +2,14 @@
 """Content identities and measured inputs for CPU-only AOT publications."""
 from __future__ import annotations
 
+import fnmatch
 import functools
 import hashlib
+import io
+import inspect
 import json
+import shutil
+import subprocess
 import os
 from pathlib import Path
 import struct
@@ -100,6 +105,159 @@ def elf_resources(blob):
     return {name: kernels[name] for name in sorted(kernels)}
 
 
+# Keep explicit absent values too; the source-scan regression guards new reads.
+EXPORT_ENVIRONMENT_NAMES = frozenset("""
+B12X_COMPILE_DISK_CACHE B12X_COMPILE_MEMORY_CACHE CUDA_VISIBLE_DEVICES TRITON_CACHE_DIR
+CUTEAFD_BUILD_KIND CUTEAFD_CUTE_HOST_TARGET CUTEAFD_EXL3_ROUTE_BLOCKS
+CUTEAFD_EXPORT_NARROW_AOT CUTEAFD_EXPORT_HC_LAGGED CUTEAFD_EXPORT_IMAGE_ID
+CUTEAFD_SOURCE_ROOT CUTEAFD_SPARKINFER_SOURCE_DIR CUTEAFD_SPARKINFER_LOCK_FILE
+CUTEAFD_EXPORT_HOST_CLASS CUTEAFD_EXPORT_HOST_CONTEXTS CUTEAFD_EXPORT_HOST_WORKERS
+CUTEAFD_EXPORT_JOBS CUTEAFD_EXPORT_SLOT_DIR CUTEAFD_EXPORT_HOST_SLOT_DIR
+CUTEAFD_EXPORT_GPU_SLOT_DIR CUTEAFD_EXPORT_GPU_BUDGET_MIB
+CUTEAFD_EXPORT_WORKER_GPU_MIB CUTEAFD_EXPORT_WORKER_RAM_MIB
+CUTEAFD_EXPORT_CONTEXT_SPACING_S HF_HUB_CACHE HF_HOME XDG_CACHE_HOME
+""".split())
+
+
+def export_environment():
+    values = {name: os.environ.get(name) for name in sorted(EXPORT_ENVIRONMENT_NAMES)}
+    values.update({name: value for name, value in sorted(os.environ.items())
+                   if name.startswith("CUTEAFD_")})
+    # These are forced by the offline worker, not inherited policy. Paths name
+    # verified sources or disposable compiler storage rather than semantic inputs.
+    values.update(CUTEAFD_BUILD_KIND=os.environ.get("CUTEAFD_BUILD_KIND", "development"),
+                  CUTEAFD_EXPORT_NARROW_AOT="1", CUTEAFD_EXPORT_HC_LAGGED="1",
+                  B12X_COMPILE_DISK_CACHE="0", B12X_COMPILE_MEMORY_CACHE="0",
+                  CUDA_VISIBLE_DEVICES="", TRITON_CACHE_DIR="<worker-cache>",
+                  CUTEAFD_SOURCE_ROOT="<verified-source>",
+                  CUTEAFD_SPARKINFER_SOURCE_DIR="<verified-fork>",
+                  CUTEAFD_SPARKINFER_LOCK_FILE="<verified-lock>")
+    return values
+
+
+def compiler_identity(root, payload, capability):
+    """An immutable compiler image is mandatory; unknown identity disables reuse."""
+    from b12x._lib import compiler
+    image = os.environ.get("CUTEAFD_EXPORT_IMAGE_ID", "")
+    ptxas = shutil.which("ptxas")
+    if not image.startswith("sha256:") or not ptxas:
+        return None
+    version = subprocess.check_output([ptxas, "--version"], text=True, timeout=30)
+    exporter = Path(root) / "python/tools/aot" / payload["exporter"]
+    return {"schema": 1, "image_id": image, "runtime": compiler._runtime_toolchain_key(),
+            "environment": compiler._compile_environment_key(),
+            "export_environment": export_environment(),
+            "ptxas_version": version,
+            "ptxas_sha256": digest(Path(ptxas).read_bytes()), "sms": payload["sms"],
+            "capability": list(capability), "exporter": payload["exporter"], "args": payload["args"],
+            "exporter_sha256": digest(exporter.read_bytes()),
+            "scripts": {str(path.relative_to(root)): digest(path.read_bytes()) for path in (
+                Path(root) / "scripts/build/kernel-records.py",
+                Path(root) / "scripts/build/compare-sm-exports.py",
+                Path(root) / "scripts/build/export-placement-inputs.py")}}
+
+
+def stage0_inputs(root, payload, capability):
+    identity = compiler_identity(root, payload, capability)
+    if identity is None:
+        return None
+    root = Path(root)
+    rules_path = root / "scripts/build/kernel-input-rules.json"
+    rules = json.loads(rules_path.read_text())
+    hashes = {}
+    for directory in ("third_party/sparkinfer/b12x", "python/tools", "scripts/build", "docker"):
+        for path in sorted((root / directory).rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            if not path.is_file() or any(fnmatch.fnmatch(relative, pattern) for pattern in rules["ignore"]):
+                continue
+            if any(fnmatch.fnmatch(relative, pattern) for pattern in rules["global"]):
+                hashes[relative] = digest(path.read_bytes())
+    return json.loads(json.dumps({"identity": identity, "global_sources": hashes,
+                                  "rules": digest(rules_path.read_bytes())}, sort_keys=True))
+
+
+def job_candidates(root, previous, current_inputs):
+    if current_inputs is None or previous.get("stage0_inputs") != current_inputs:
+        return ["job-global-inputs"]
+    reads = previous.get("source_reads_sha256")
+    if not reads:
+        return ["missing-recorded-reads"]
+    changed = []
+    for relative, checksum in reads.items():
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            return ["invalid-recorded-path"]
+        source = Path(root) / path
+        if not source.is_file() or digest(source.read_bytes()) != checksum:
+            changed.append(relative)
+    return changed
+
+
+class BackendCache:
+    """Retain lowered MLIR, never Python executors or a guessed launch ABI."""
+
+    def __init__(self, directory, identity):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.identity = identity
+        self.hits = 0
+        self.misses = 0
+
+    def key(self, dsl, original, module, args, kwargs, ir_hash):
+        bound = inspect.signature(original).bind(dsl, module, *args, **kwargs)
+        bound.apply_defaults()
+        values = bound.arguments
+        if not self.identity or not values.get("no_jit_engine") or not values.get("no_cache"):
+            return None
+        options = {kind.__module__ + "." + kind.__qualname__: option.value
+                   for kind, option in dsl.compile_options.options.items()}
+        if any(value for name, value in options.items() if name.endswith(".LinkLibraries")):
+            return None  # External bitcode contents are not yet fingerprinted.
+        inputs = {"schema": 1, "ir_sha256": ir_hash, "identity": self.identity,
+                  "options": options, "pipeline": values.get("pipeline"),
+                  "function_name": values["function_name"], "signature": str(values["sig"]),
+                  "executor_type": str(values["func_type"])}
+        try:
+            return stable_hash(inputs)
+        except (TypeError, ValueError):
+            return None  # Unserializable compiler inputs are never a hit.
+
+    def compile(self, dsl, original, module, args, kwargs, ir_hash):
+        from cutlass._mlir import ir
+        key = self.key(dsl, original, module, args, kwargs, ir_hash)
+        metadata = self.directory / (str(key) + ".json")
+        bytecode = self.directory / (str(key) + ".mlirbc")
+        if key and metadata.is_file() and bytecode.is_file():
+            saved = json.loads(metadata.read_text())
+            blob = bytecode.read_bytes()
+            if saved == {"key": key, "sha256": digest(blob)}:
+                restored = ir.Module.parse(blob, context=module.context)
+                provider = dsl.compiler_provider
+                compile_method = provider.compile
+                def already_compiled(current, *unused_args, **unused_kwargs):
+                    if current is not restored:
+                        raise ValueError("backend replay received an unexpected module")
+                provider.compile = already_compiled
+                try:
+                    result = original(dsl, restored, *args, **kwargs)
+                finally:
+                    provider.compile = compile_method
+                self.hits += 1
+                return result
+        self.misses += 1
+        result = original(dsl, module, *args, **kwargs)
+        if key:
+            stream = io.BytesIO()
+            result.ir_module.operation.write_bytecode(stream)
+            blob = stream.getvalue()
+            temporary = self.directory / (key + f".{os.getpid()}.tmp")
+            temporary.write_bytes(blob)
+            temporary.replace(bytecode)
+            temporary.write_text(json.dumps({"key": key, "sha256": digest(blob)}, sort_keys=True))
+            temporary.replace(metadata)
+        return result
+
+
 class Recorder:
     """Observe the existing compiler pass; never invoke a second compilation.
 
@@ -108,7 +266,8 @@ class Recorder:
     retaining module-level constants without making eager unused imports global.
     """
 
-    def __init__(self, root, output):
+    def __init__(self, root, output, backend_cache=None):
+        self.backend_cache = backend_cache
         self.root = Path(root).resolve()
         self.output = Path(output)
         self.executors = {}
@@ -177,7 +336,9 @@ class Recorder:
             path = self.frame_paths[filename]
             if path:
                 self.frames.add(path)
-                self.functions.add((path, frame.f_code.co_qualname))
+                if not (path == "scripts/build/kernel-records.py"
+                        and frame.f_code.co_qualname.startswith("BackendCache.")):
+                    self.functions.add((path, frame.f_code.co_qualname))
                 # Active callers can hold function-local package imports that
                 # do not execute again inside the measured constructor.
                 names = (*frame.f_code.co_names, *frame.f_code.co_varnames,
@@ -251,7 +412,8 @@ class Recorder:
                 if record is None:
                     record = {"ir_kind": "mlir", "ir_sha256": digest(str(module).encode()),
                               "source_reads_sha256": self.reads()}
-                result = original(dsl, module, *args, **kwargs)
+                result = (self.backend_cache.compile(dsl, original, module, args, kwargs, record["ir_sha256"])
+                          if self.backend_cache is not None else original(dsl, module, *args, **kwargs))
                 self.executors[id(result)] = (weakref.ref(result), record)
                 if self.construction:
                     self.latest.append(record)
@@ -313,7 +475,10 @@ class Recorder:
 
 
 def change_report(previous, current, expected=None):
-    changes = {"schema": 1, "added": [], "removed": [], "changed": [], "leaks": []}
+    changes = {"schema": 1, "added": [], "removed": [], "changed": [], "leaks": [],
+               "sm170_mismatches": sorted(name for name, record in current.items()
+                                         if "sm170_object_sha256" in record
+                                         and record["sm170_object_sha256"] != record.get("object_sha256"))}
     for name in sorted(previous.keys() | current.keys()):
         old, new = previous.get(name), current.get(name)
         group = (new or old).get("group", name.split("/", 1)[0])
@@ -367,6 +532,9 @@ def write_report(destination, report):
     (destination / "CHANGES.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     lines = ["# Kernel Changes", "", "Program groups are the publication's export job names.",
              "Source observations are cumulative within each worker; Sources lists show only changed source hashes.", ""]
+    if report.get("sm170_mismatches"):
+        lines += ["## HARD FAILURE: SM 170 / 188 OBJECT MISMATCH", "",
+                  *[f"- `{name}`" for name in report["sm170_mismatches"]], ""]
     if report["leaks"]:
         lines += ["## UNEXPECTED CHANGES OUTSIDE DECLARED TARGETS", "", *[f"- `{name}`" for name in report["leaks"]], ""]
     for category in ("added", "removed", "changed"):

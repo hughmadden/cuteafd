@@ -440,7 +440,7 @@ def routed_core_variants(package, role, weights):
     return variants
 
 
-def export_routed(extra, output):
+def export_routed(extra, output, selected_objects=None):
     """Use the package's exact compiler/form policy without linking its DSOs."""
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.fp8_moe import (
@@ -485,6 +485,8 @@ def export_routed(extra, output):
                 stem += "_segments"
             if core_only:
                 stem += "_core"
+            if selected_objects is not None and stem not in selected_objects:
+                continue
             def construct():
                 with exportable_compilation():
                     program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
@@ -676,14 +678,22 @@ def worker(payload):
     AotProgram.export_to_c = export_with_plan
     recorder = None
     if payload.get("program_records"):
+        # The ordinary cache fingerprints the package, not frontend semantics.
+        # Warm that bookkeeping before observing actual recipe dependencies.
+        from b12x._lib.compiler import b12x_package_fingerprint
+        b12x_package_fingerprint()
         records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
-        recorder = records_module.Recorder(ROOT, output).install()
+        backend_cache = None
+        if payload.get("backend_cache"):
+            identity = records_module.compiler_identity(ROOT, payload, capability)
+            backend_cache = records_module.BackendCache(payload["backend_cache"], identity)
+        recorder = records_module.Recorder(ROOT, output, backend_cache).install()
         PROGRAM_RECORDER = recorder
         # runpy exporters receive a worker-local hook, not a serving dependency.
     start = time.monotonic()
     path = ROOT / "python/tools/aot" / payload["exporter"]
     if payload["exporter"] == "package_fp8_moe_aot.py":
-        export_routed(payload["args"], output)
+        export_routed(payload["args"], output, payload.get("selected_objects"))
     elif payload["exporter"] == "package_exl3_aot.py":
         export_exl3(payload["args"], output)
     elif payload["exporter"] == "export_b12x_exl3_routes_aot.py":
@@ -704,7 +714,8 @@ def worker(payload):
                 compile_pool._initialize_worker = _initialize_worker
         else:
             runpy.run_path(str(path), run_name="__main__", init_globals={
-                "_record_construction": recorded_construction})
+                "_record_construction": recorded_construction,
+                "_selected_object_labels": payload.get("selected_objects")})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
         raise RuntimeError("exporter changed the synthetic SM count")
     if torch.cuda.is_initialized():
@@ -723,8 +734,11 @@ def worker(payload):
                "seconds": time.monotonic() - start}
     if recorder is not None:
         inspector = load_file("placement_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
-        recorder.finish(inspector, summary, plans)
+        program_records = recorder.finish(inspector, summary, plans)
         summary["source_reads_sha256"] = recorder.reads()
+        summary["stage0_inputs"] = records_module.stage0_inputs(ROOT, payload, capability)
+        if recorder.backend_cache is not None:
+            summary["backend_reuse"] = {"hits": recorder.backend_cache.hits, "misses": recorder.backend_cache.misses}
     (Path(payload["output"]) / "comparison-context.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
@@ -969,7 +983,7 @@ def v4_placement_sources():
     return {str(path.relative_to(ROOT)): sha(path.read_bytes()) for path in sorted(paths)}
 
 
-def v4_placement_inputs(destination, staging, timeout, workers):
+def v4_placement_inputs(destination, staging, timeout, workers, previous=None, backend_cache=None, verify_skips=False):
     """Publish compiler-produced planner metadata, never inferred scratch sizes."""
     filesystem = load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
     for path in (destination, staging):
@@ -988,19 +1002,13 @@ def v4_placement_inputs(destination, staging, timeout, workers):
                     ["--geometry", "dsv4p", "--capacities", EXL3_CAPACITIES,
                      "--bits", "2,3", "--role", "coordinator"]))
 
+    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
+    if backend_cache:
+        filesystem.check_path(str(backend_cache))
+    verify_skips = verify_skips or os.environ.get("CUTEAFD_BUILD_KIND") == "release"
+
     def compile_one(job):
-        name, exporter, extra = job
-        output = staging / name
-        output.mkdir()
-        payload = dict(sms=188, exporter=exporter, args=extra, output=str(output), program_records=True)
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
-                   CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
-                   CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
-        print(f"V4 placement export {name}: {extra}", flush=True)
-        with (output / "export.log").open("w") as log:
-            subprocess.run([sys.executable, str(Path(__file__).resolve()), "--_worker", json.dumps(payload)],
-                           env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=timeout)
-        return json.loads((output / "comparison-context.json").read_text())
+        return publisher.compile_job(job, staging, previous, lock, timeout, backend_cache, verify_skips)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         summaries = list(pool.map(compile_one, exports))
@@ -1029,12 +1037,25 @@ def v4_placement_inputs(destination, staging, timeout, workers):
                         copied = package / source.relative_to(staging / "exl3")
                         copied.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, copied)
+    for name, _, _ in exports:
+        for source in (staging / name).rglob("*.json"):
+            target = destination / ".workers" / name / source.relative_to(staging / name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
     files = {str(path.relative_to(destination)): sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
                       source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
                       exports=summaries, files=files, program_records=records)
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    sm_report = publisher.kernel_records.change_report({}, records)
+    if sm_report["sm170_mismatches"]:
+        publisher.kernel_records.write_report(destination, sm_report)
+        raise ValueError(f"SM 170 / 188 OBJECT MISMATCH: {sm_report['sm170_mismatches']}")
+    if previous:
+        records_module = load_file("v4_change_records", ROOT / "scripts/build/kernel-records.py")
+        old = json.loads((previous / "INPUTS.json").read_text())["program_records"]
+        records_module.write_report(destination, records_module.change_report(old, records))
     print(f"Published V4 placement inputs: {destination}", flush=True)
 
 
@@ -1057,6 +1078,9 @@ def main():
     parser.add_argument("--workers", type=int, default=1, help="independent CPU export groups in parallel")
     parser.add_argument("--v4-placement-inputs", type=Path,
                         help="CPU-only Flash/Pro 1/2-RTX x 128K/1M planner metadata; --output-dir is staging")
+    parser.add_argument("--previous", type=Path, help="prior V4 publication for incremental job replay")
+    parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache")
+    parser.add_argument("--verify-skips", action="store_true", help="run skipped frontends and reject IR drift")
     parser.add_argument("--_worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args._worker:
@@ -1066,7 +1090,10 @@ def main():
         if args.workers < 1 or args.timeout < 1:
             parser.error("--workers and --timeout must be positive")
         v4_placement_inputs(args.v4_placement_inputs.expanduser().resolve(),
-                            args.output_dir.expanduser().resolve(), args.timeout, args.workers)
+                            args.output_dir.expanduser().resolve(), args.timeout, args.workers,
+                            args.previous.expanduser().resolve() if args.previous else None,
+                            args.backend_cache.expanduser().resolve() if args.backend_cache else None,
+                            args.verify_skips)
         return 0
     if args.expected_removals and not args.baseline_source:
         parser.error("--expected-removals requires --baseline-source")

@@ -139,10 +139,17 @@ def test_package_tuning_and_arguments_change_job_global_identity():
     assert before != records.stable_hash(records.job_global_inputs({**context, "args": ["--bits", "3"]}))
 
 
-def test_identity_and_reports_are_deterministic():
-    assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
-    assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
-    assert records.change_report({"k": {}}, {"k": {}})["changed"] == []
+def test_stage0_candidates_require_globals_and_all_recorded_reads(tmp_path):
+    source = tmp_path / "package.py"
+    source.write_text("TILE = 64\n")
+    inputs = {"exporter": "a", "args": ["--bits", "4"]}
+    previous = {"stage0_inputs": inputs, "source_reads_sha256": {"package.py": records.digest(source.read_bytes())}}
+    assert records.job_candidates(tmp_path, previous, inputs) == []
+    source.write_text("TILE = 128\n")
+    assert records.job_candidates(tmp_path, previous, inputs) == ["package.py"]
+    assert records.job_candidates(tmp_path, previous, {**inputs, "exporter": "b"}) == ["job-global-inputs"]
+    assert records.job_candidates(tmp_path, previous, None) == ["job-global-inputs"]
+    assert records.job_candidates(tmp_path, {"stage0_inputs": inputs}, inputs) == ["missing-recorded-reads"]
 
 
 @pytest.fixture
@@ -273,6 +280,7 @@ def fake_worker(tmp_path, monkeypatch, fake_cutlass):
         get_device_properties=lambda ordinal: types.SimpleNamespace(multi_processor_count=188),
         is_initialized=lambda: False)
     monkeypatch.setattr(importlib.metadata, "version", lambda name: "fake")
+    monkeypatch.setattr(records, "stage0_inputs", lambda *args: {"fake": True})
     monkeypatch.setattr(worker, "load_file", lambda name, path:
                         records if name == "placement_kernel_records" else types.SimpleNamespace(
                             cuda_images=lambda blob: [(0, blob)]))
@@ -303,3 +311,233 @@ def test_job_reads_include_helpers_after_last_program(tmp_path, fake_worker):
                  "output": str(output), "program_records": True})
     summary = json.loads((output / "comparison-context.json").read_text())
     assert {"recipe.py", "after.py"} <= summary["source_reads_sha256"].keys()
+
+
+@pytest.mark.parametrize("changed", ["args", "environment"])
+def test_changed_identity_runs_traced_with_unchanged_reads_and_ir(tmp_path, monkeypatch, changed, fake_worker):
+    spec = importlib.util.spec_from_file_location("traced_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    source = tmp_path / "recipe.py"
+    previous = tmp_path / "previous"
+    directory = previous / ".workers/programs"
+    directory.mkdir(parents=True)
+    inputs = {"args": ["old"], "environment": {"MODE": "old"}}
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    fake_worker({"sms": 188, "exporter": "x.py", "args": [],
+                 "output": str(seed), "program_records": True})
+    before = json.loads((seed / "program-records.json").read_text())["kernel.o"]
+    context = {"stage0_inputs": inputs, "source_reads_sha256": {
+        "recipe.py": records.digest(source.read_bytes())}}
+    (directory / "comparison-context.json").write_text(json.dumps(context))
+    (directory / "program-records.json").write_text(json.dumps({"kernel.o": before}))
+    files = {str(path.relative_to(previous)): records.digest(path.read_bytes()) for path in directory.iterdir()}
+    (previous / "INPUTS.json").write_text(json.dumps({"files": files}))
+    current = {**inputs, changed: ["new"] if changed == "args" else {"MODE": "new"}}
+    monkeypatch.setattr(publisher.kernel_records, "stage0_inputs", lambda *args: current)
+    monkeypatch.setattr(publisher, "ROOT", tmp_path)
+    monkeypatch.setattr(publisher, "check_job_sm170", lambda *args, **kwargs: {})
+    observed = []
+    def compile_worker(command, **kwargs):
+        payload = json.loads(command[-1])
+        assert payload["program_records"] is True
+        assert "prior_source_records" not in payload
+        output = Path(payload["output"])
+        fake_worker(payload)
+        worker_context = json.loads((output / "comparison-context.json").read_text())
+        after = json.loads((output / "program-records.json").read_text())["kernel.o"]
+        assert after["ir_sha256"] == before["ir_sha256"]
+        observed.append("recipe.py" in worker_context["source_reads_sha256"])
+    monkeypatch.setattr(publisher.subprocess, "run", compile_worker)
+    summary = publisher.compile_job(("programs", "x.py", current["args"]),
+                                    tmp_path / "staging", previous, {}, 1)
+    assert observed == [True]
+    assert summary["execution_stats"]["stage0_skipped"] is False
+
+
+def test_job_replay_checksums_and_verify_skips_reject_ir_drift(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("replay_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    previous = tmp_path / "previous"
+    directory = previous / ".workers/programs"
+    directory.mkdir(parents=True)
+    context = {"stage0_inputs": {"global": "same"}, "source_reads_sha256": {"kernel.py": "unused"}}
+    (directory / "comparison-context.json").write_text(json.dumps(context))
+    (directory / "program-records.json").write_text(json.dumps({"kernel.o": {"ir_sha256": "old"}}))
+    files = {str(path.relative_to(previous)): records.digest(path.read_bytes()) for path in directory.iterdir()}
+    (previous / "INPUTS.json").write_text(json.dumps({"files": files}))
+    assert publisher.verified_job_files(previous, "programs")[0] == directory
+    monkeypatch.setattr(publisher.kernel_records, "stage0_inputs", lambda *args: context["stage0_inputs"])
+    monkeypatch.setattr(publisher.kernel_records, "job_candidates", lambda *args: [])
+    def compile_worker(command, **kwargs):
+        output = Path(json.loads(command[-1])["output"])
+        (output / "program-records.json").write_text(json.dumps({"kernel.o": {"ir_sha256": "changed"}}))
+    monkeypatch.setattr(publisher.subprocess, "run", compile_worker)
+    with pytest.raises(ValueError, match="--verify-skips changed IR"):
+        publisher.compile_job(("programs", "x.py", []), tmp_path / "staging", previous, {}, 1, verify_skips=True)
+    (directory / "program-records.json").write_text("{}")
+    with pytest.raises(ValueError, match="corrupt replay"):
+        publisher.verified_job_files(previous, "programs")
+
+
+def test_export_policy_environment_changes_invalidate_identity(monkeypatch):
+    monkeypatch.delenv("CUTEAFD_BUILD_KIND", raising=False)
+    monkeypatch.delenv("CUTEAFD_EXL3_ROUTE_BLOCKS", raising=False)
+    before = records.export_environment()
+    monkeypatch.setenv("CUTEAFD_BUILD_KIND", "release")
+    assert records.export_environment() != before
+    monkeypatch.delenv("CUTEAFD_BUILD_KIND")
+    monkeypatch.setenv("CUTEAFD_EXL3_ROUTE_BLOCKS", "glmf=16")
+    assert records.export_environment() != before
+
+
+def test_export_environment_covers_every_source_read(monkeypatch):
+    import ast
+    paths = [*sorted((ROOT / "python/tools/aot").glob("*.py")),
+             *sorted((ROOT / "python/tools/lib").glob("*.py")),
+             ROOT / "scripts/build/compare-sm-exports.py",
+             ROOT / "scripts/build/export-placement-inputs.py"]
+    names = set()
+    for path in paths:
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                owner = ast.unparse(node.func.value)
+                if ((owner == "os.environ" and node.func.attr in ("get", "setdefault"))
+                        or (owner == "os" and node.func.attr == "getenv")
+                        or (owner == "env" and node.func.attr == "get")):
+                    assert node.args and isinstance(node.args[0], ast.Constant), (path, node.lineno)
+                    names.add(node.args[0].value)
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+                if ast.unparse(node.value) in ("os.environ", "env"):
+                    if isinstance(node.slice, ast.Constant):
+                        names.add(node.slice.value)
+                    else:
+                        # The comparison context uses this fixed two-name loop.
+                        assert (path.name == "compare-sm-exports.py"
+                                and ast.unparse(node.slice) == "key"), (path, node.lineno)
+    assert names <= records.EXPORT_ENVIRONMENT_NAMES
+    assert names <= records.export_environment().keys()
+    for name in names - {"CUTEAFD_SOURCE_ROOT", "CUTEAFD_SPARKINFER_SOURCE_DIR",
+                          "CUTEAFD_SPARKINFER_LOCK_FILE", "TRITON_CACHE_DIR",
+                          "CUDA_VISIBLE_DEVICES", "B12X_COMPILE_DISK_CACHE",
+                          "B12X_COMPILE_MEMORY_CACHE", "CUTEAFD_EXPORT_NARROW_AOT",
+                          "CUTEAFD_EXPORT_HC_LAGGED"}:
+        before = records.export_environment()
+        with monkeypatch.context() as patch:
+            patch.setenv(name, "environment-coverage-sentinel")
+            assert records.export_environment() != before, name
+
+
+@pytest.mark.parametrize("filename", ["comparison-plans.json", "program-records.json", "manifest.json"])
+def test_verify_skips_rejects_same_ir_metadata_drift(tmp_path, filename):
+    spec = importlib.util.spec_from_file_location("metadata_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    previous, current = tmp_path / "previous", tmp_path / "current"
+    previous.mkdir()
+    current.mkdir()
+    metadata = {"ir_sha256": "same", "scratch_bytes": 64, "abi": ["ptr", "i32"],
+                "geometry": {"rows": 80}, "params": {"tile": 128}}
+    def document(record):
+        return {"kernel.o": record} if filename == "program-records.json" else record
+    (previous / filename).write_text(json.dumps(document(metadata)))
+    (current / filename).write_text(json.dumps(document(metadata)))
+    publisher.verify_job_metadata(previous, current, {}, "test")
+    (current / filename).write_text(json.dumps(document({**metadata, "scratch_bytes": 128})))
+    with pytest.raises(ValueError, match="placement metadata"):
+        publisher.verify_job_metadata(previous, current, {}, "test")
+
+
+def test_sm170_mismatch_is_reported_as_hard_failure(tmp_path):
+    report = records.change_report({}, {"programs/kernel.o": {
+        "object_sha256": "188", "sm170_object_sha256": "170"}})
+    assert report["sm170_mismatches"] == ["programs/kernel.o"]
+    records.write_report(tmp_path, report)
+    assert "HARD FAILURE" in (tmp_path / "CHANGES.md").read_text()
+
+
+def test_sm170_recompiles_only_changed_routed_objects(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("sm170_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    job = ("fp8/test", "package_fp8_moe_aot.py", [])
+    previous, staging = tmp_path / "previous", tmp_path / "staging"
+    directory = staging / job[0]
+    directory.mkdir(parents=True)
+    programs = {"same.o": {"object_sha256": "same"}, "changed.o": {"object_sha256": "new"}}
+    (directory / "program-records.json").write_text(json.dumps(programs))
+    def publication(path, jobs):
+        return {job[0] + "/" + name: {**record, "object_sha256": "old" if path != staging and name == "changed.o"
+                                     else record["object_sha256"]} for name, record in programs.items()}
+    monkeypatch.setattr(publisher, "publication_records", publication)
+    calls = []
+    def worker(command, **kwargs):
+        payload = json.loads(command[-1])
+        calls.append(payload)
+        (Path(payload["output"]) / "program-records.json").write_text(json.dumps({"changed.o": {"object_sha256": "new"}}))
+    monkeypatch.setattr(publisher.subprocess, "run", worker)
+    result = publisher.check_job_sm170(job, staging, previous, 1, {})
+    assert result["sm170_programs"] == 1
+    assert calls[0]["sms"] == 170 and calls[0]["selected_objects"] == ["changed"]
+    output = json.loads((directory / "program-records.json").read_text())
+    assert output["changed.o"]["sm170_object_sha256"] == "new"
+    assert "sm170_object_sha256" not in output["same.o"]
+
+
+def test_verify_metadata_normalizes_only_pin_and_route_checksum(tmp_path):
+    spec = importlib.util.spec_from_file_location("pin_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    old, new = tmp_path / "old", tmp_path / "new"
+    lock = {"revision": "new-pin", "source_tree_sha256": "new-tree"}
+    for directory, revision in ((old, "old-pin"), (new, "new-pin")):
+        directory.mkdir()
+        route = {"sparkinfer_revision": revision, "source_tree_sha256": revision + "-tree", "scratch": 64}
+        (directory / "routes.json").write_text(json.dumps(route))
+        manifest = {"sparkinfer_revision": revision,
+                    "route_preparation": {"manifest": "routes.json", "sha256": records.digest(json.dumps(route).encode())}}
+        (directory / "v41_exl3.json").write_text(json.dumps(manifest))
+    publisher.verify_job_metadata(old, new, lock, "exl3")
+    (new / "routes.json").write_text(json.dumps({"sparkinfer_revision": "new-pin", "scratch": 128}))
+    with pytest.raises(ValueError, match="routes.json"):
+        publisher.verify_job_metadata(old, new, lock, "exl3")
+
+
+def test_publisher_writes_sm170_report_before_failing(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("mismatch_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    job = ("programs", "export_b12x_dsv4_aot.py", [])
+    monkeypatch.setattr(publisher, "export_jobs", lambda: [job])
+    monkeypatch.setattr(publisher, "source_hashes", lambda: {})
+    lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
+    def worker(job, staging, *args):
+        directory = staging / "programs"
+        directory.mkdir()
+        (directory / "dsv4_programs.json").write_text('{"programs": []}')
+        (directory / "program-records.json").write_text(json.dumps({"kernel.o": {
+            "object_sha256": "188", "sm170_object_sha256": "170"}}))
+        return {"sparkinfer_revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"],
+                "cuda_initialized": False}
+    monkeypatch.setattr(publisher, "compile_job", worker)
+    original_load = publisher.compare.load_file
+    def load(name, path):
+        if name == "placement_filesystem":
+            import types
+            return types.SimpleNamespace(check_path=lambda path: None)
+        return original_load(name, path)
+    monkeypatch.setattr(publisher.compare, "load_file", load)
+    destination = tmp_path / "output"
+    with pytest.raises(ValueError, match="SM 170 / 188 OBJECT MISMATCH"):
+        publisher.publish(destination, tmp_path / "staging", 1, 1)
+    assert json.loads((destination / "CHANGES.json").read_text())["sm170_mismatches"] == ["programs/kernel.o"]
+    assert "HARD FAILURE" in (destination / "CHANGES.md").read_text()
+
+
+def test_identity_and_reports_are_deterministic():
+    assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
+    assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
+    assert records.change_report({"k": {}}, {"k": {}})["changed"] == []
