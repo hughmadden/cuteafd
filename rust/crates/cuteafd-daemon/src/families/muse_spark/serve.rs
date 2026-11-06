@@ -250,12 +250,17 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                             unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
                         .collect::<Result<Vec<_>>>()
                 }))?;
-            // Admission charges the drafter beside the head; it joins that GPU's
-            // dense rank before the one target/expert push group is planned.
+            // Admission names the drafter's home; it joins that GPU's dense
+            // rank before the one target/expert push group is planned.
             let draft = match (args.draft.as_deref(), &built.drafter) {
-                (Some(snapshot), Some(admitted)) => Some(super::draft::MuseDraft::load(
-                    programs.last().context("Muse head programs")?, &cfg, ranks.last().context("Muse head rank")?,
-                    streams.last().context("Muse head stream")?.raw, snapshot, &embedding, admitted, args.draft_kv_cache)?),
+                (Some(snapshot), Some(admitted)) => {
+                    let home = usize::from(built.draft_home.context("Muse drafter admission names no home")?);
+                    Some(super::draft::MuseDraft::load(
+                        programs.get(home).context("Muse drafter programs")?, &cfg,
+                        ranks.get(home).context("Muse drafter rank")?,
+                        streams.get(home).context("Muse drafter stream")?.raw, snapshot, &embedding, admitted,
+                        args.draft_kv_cache)?)
+                }
                 (None, None) => None,
                 _ => anyhow::bail!("Muse drafter admission differs from --draft"),
             };

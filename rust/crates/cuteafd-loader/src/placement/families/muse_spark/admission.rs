@@ -138,6 +138,8 @@ pub struct AdmittedMuse {
     pub media: MediaAdmission,
     pub local: LocalPackage,
     pub drafter: Option<MuseDrafter>,
+    /// The coordinator GPU the solve placed the drafter on (the target head).
+    pub draft_home: Option<u8>,
     pub prefill_logits_bytes: usize,
     /// Per layer, per coordinator rank: the operands the device packs.
     pub layouts: Vec<Vec<LayerLayout>>,
@@ -175,6 +177,8 @@ pub struct MuseRecipe<'a> {
     /// Expert arena peak per onboarding count, per GPU.
     pub peaks: Vec<[u64; 2]>,
     pub local: LocalPackage,
+    /// The DFlash2 drafter whose head-adjacent owner the contract declares.
+    pub drafter: Option<MuseDrafter>,
 }
 
 /// One allocation, dropped when it charges nothing.
@@ -355,12 +359,8 @@ impl<'a> ProductionInput<'a> {
             maximum_pages)?);
         components.extend(buffer("muse.partial_planes".into(), Location::coordinator(0), planes,
             Lifetime::RESIDENT, Category::Transport, "Muse Spark partial reply planes", maximum_pages));
-        if let Some(drafter) = &drafter {
-            let bytes = [drafter.owned, drafter.scratch, drafter.head_scratch, drafter.runtime].into_iter()
-                .try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).ok_or(Refusal::Overflow("Muse drafter"))?;
-            components.extend(weights("muse.drafter".into(), Location::coordinator(head_gpu), bytes,
-                drafter.weights.0, Category::Drafter, "Drafter", maximum_pages)?);
-        }
+        // The drafter is not a fixed owner: it borrows the target head (its
+        // weights, embedding and taps), so its home is a declared domain.
         for (index, demand) in fixed.iter().enumerate() {
             if demand.bytes == 0 { continue; }
             components.extend(weights(format!("muse.fixed.{index}"), Location::coordinator(demand.gpu),
@@ -467,7 +467,8 @@ impl<'a> ProductionInput<'a> {
         cases.extend(encoder_cases);
         let recipe = MuseRecipe { cfg, context, gpus, maximum_pages,
             prefill: PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }, attention,
-            spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone() };
+            spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
+            drafter: drafter.clone() };
         Ok(PreparedMuse { recipe, budgets, prefill_logits_bytes, local, drafter, layouts, global, projections,
             spark_budget })
     }
@@ -551,6 +552,11 @@ impl MuseRecipe<'_> {
         let residual = residual_homes(&self.attention, &hop_spec)
             .map_err(|error| invalid(&error.to_string()))?;
         let hops = plan_hops(&self.attention, &hop_spec).map_err(|error| invalid(&error.to_string()))?;
+        let home = solved.decisions.draft_home;
+        if home.is_some() != self.drafter.is_some()
+            || home.is_some_and(|gpu| usize::from(gpu) + 1 != self.gpus) {
+            return Err(invalid("resolved draft home differs from the declared head"));
+        }
         let placement = Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Heads,
             attention_by_kind: vec![(AttentionClass::Gqa, AttentionPlacement::Heads),
@@ -663,6 +669,21 @@ impl Recipe for MuseRecipe<'_> {
         });
         let encoder = contract.variables.len();
         contract.variables.push(Variable::Encoder((0..self.encoders.len()).collect()));
+        // The DFlash2 drafter reads the target head, its embedding and its
+        // taps, so the head GPU is its only home; declaring the domain keeps
+        // the owner charged and named by the shared solve.
+        if let Some(drafter) = &self.drafter {
+            let home = u8::try_from(self.gpus - 1).map_err(|_| Refusal::Overflow("Muse GPUs"))?;
+            let variable = contract.variables.len();
+            contract.variables.push(Variable::DraftHome(vec![home]));
+            let bytes = [drafter.owned, drafter.scratch, drafter.head_scratch, drafter.runtime].into_iter()
+                .try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).ok_or(Refusal::Overflow("Muse drafter"))?;
+            for mut component in weights("muse.drafter".into(), Location::coordinator(home), bytes,
+                drafter.weights.0, Category::Drafter, "Drafter", self.maximum_pages)? {
+                component.activation = Activation::choice(variable, 0);
+                contract.components.push(component);
+            }
+        }
         // A Spark tower keeps a retained expert worker: a full onboarding has
         // no Spark layer left to run it.
         for (option, (vision, audio)) in self.encoders.iter().enumerate() {
@@ -693,7 +714,7 @@ impl PreparedMuse<'_> {
         let solved = solve(request, budgets, &recipe)?;
         let (placement, spark) = recipe.execution(&solved)?;
         let media = recipe.media(&solved)?;
-        Ok(AdmittedMuse { placement, spark, solved, media, local, drafter, prefill_logits_bytes, layouts,
-            global, projections, spark_budget })
+        Ok(AdmittedMuse { placement, spark, draft_home: solved.decisions.draft_home, solved, media, local,
+            drafter, prefill_logits_bytes, layouts, global, projections, spark_budget })
     }
 }
