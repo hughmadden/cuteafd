@@ -78,6 +78,7 @@ impl Family for Qwen35 {
 
 struct Model { header: Qwen35Checkpoint, spec: ModelSpec }
 impl FamilyModel for Model {
+    fn contract_admission(&self) -> bool { true }
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn native_serving_admission(&self) -> bool { true }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
