@@ -195,6 +195,21 @@ def write_new(path, data):
     return True
 
 
+def replace_generated(path, data):
+    """Rewrite a file this tool generated (producer identity may change between runs).
+
+    Only an unpublished, single-link staging file can be replaced; an inherited
+    hard link (link count > 1) is never unlinked or rewritten here.
+    """
+    path = Path(path)
+    if path.exists() and not path.is_symlink() and path.read_bytes() != data:
+        if path.stat().st_nlink != 1:
+            raise HqaError(f'refuse to replace a linked file: {path}')
+        path.unlink()
+        _sync_dir(path.parent)
+    return write_new(path, data)
+
+
 def json_style(raw):
     """Serialization settings that reproduce the parent's bytes, if any."""
     value = json.loads(raw)
@@ -750,8 +765,8 @@ def build(run, *, fault_after=None):
     metadata, summary = build_metadata(run, inv, plan, shard_records)
     for name, data in metadata.items():
         write_new(staging / name, data)
-    write_new(staging / PROVENANCE, (json.dumps(provenance(run, inv, plan, shard_records, summary),
-                                                indent=1, sort_keys=False) + '\n').encode())
+    replace_generated(staging / PROVENANCE, (json.dumps(provenance(run, inv, plan, shard_records, summary),
+                                                        indent=1, sort_keys=False) + '\n').encode())
     inherited, new = plan_files(run, inv, plan, metadata)
     linked = link_inherited(run, staging, inherited)
     present = staging_inventory(staging)
@@ -1068,7 +1083,11 @@ def run_planner(run, planner, views_dir):
     for mode in VIEWS:
         rc, text = plan(views_dir / mode)
         (run.state / f'plan-{mode}.txt').write_text(text)
-        out[mode] = dict(exit=rc, identical_to_parent=(rc == base_rc and text == base),
+        # New planner diagnostics relative to the parent, minus the per-count summary.
+        blockers = sorted({line[2:] for line in text.splitlines()
+                           if line.startswith('* ') and line not in base.splitlines()
+                           and not line.startswith('* Spark count') and ': ' in line})
+        out[mode] = dict(exit=rc, identical_to_parent=(rc == base_rc and text == base), blockers=blockers,
                          tail=text.strip().splitlines()[-3:] if rc else None)
     out['parent'] = dict(exit=base_rc)
     return out
@@ -1095,6 +1114,33 @@ def front_matter(text):
     return text[4:text.index('\n---\n', 4)].splitlines()
 
 
+def bits_text(modules):
+    parts = []
+    for mtp, label in ((False, 'main'), (True, 'MTP')):
+        bits = sorted({m['compact_bits'] for m in modules if m['mtp'] == mtp})
+        if bits:
+            parts.append('/'.join(f'K{b}' for b in bits) + ' ' + label)
+    return ' EXL3, '.join(parts) + ' EXL3'
+
+
+def planner_text(results):
+    planner = results.get('planner')
+    if not planner:
+        return ''
+    compact = planner['compact']
+    hqa_ok = planner['hqa']['exit'] == 0 and not planner['hqa'].get('blockers')
+    text = (f'- The cuteafd planner (`cuteafd plan` at {results.get("planner_revision", "this branch")}) on a '
+            'directory exposing only the compact bundle under the canonical filenames, with the native shards '
+            f'absent, {"reproduced the pinned parent plan exactly" if compact["identical_to_parent"] else "did not reproduce the parent plan"}. ')
+    if hqa_ok:
+        text += 'The same planner accepted the HQA bundle.\n'
+    else:
+        text += ('The same planner does **not** yet execute the HQA bundle: '
+                 + '; '.join(f'`{b}`' for b in planner['hqa'].get('blockers') or ['see provenance'])
+                 + '. That is the separate family loader work; the artifact contract does not depend on it.\n')
+    return text
+
+
 def card(run, inv, plan, state, results):
     fam = run.family
     meta = front_matter((run.parent / 'README.md').read_text())
@@ -1111,19 +1157,13 @@ def card(run, inv, plan, state, results):
     s = results['sizes']
     rows = '\n'.join(
         f'| `{leaf}` | {len(ms)} | {sum(not m["mtp"] for m in ms)} main + {sum(m["mtp"] for m in ms)} MTP | '
-        f'{", ".join(sorted({"K" + str(m["compact_bits"]) for m in ms}))} | {fam.native_dtype}'
+        f'{bits_text(ms)} | {fam.native_dtype}'
         f'{" + F32 " + fam.scales[0] + " (block " + str(fam.block) + ")" if fam.scales else ""} |'
         for leaf, ms in sorted(leafs.items()))
     shard_rows = '\n'.join(f'| `{x["file"]}` | {x["bytes"]:,} | `{x["sha256"]}` |'
                            for x in results['shard_table'])
     views = results['views']
-    planner = results.get('planner', {})
-    ptext = ''
-    if planner:
-        ptext = (f'- The cuteafd planner (`cuteafd plan`, {results.get("planner_revision", "this branch")}) run on a '
-                 f'directory exposing only the compact bundle under canonical names (native shards absent) '
-                 f'{"produced output identical to the pinned parent" if planner["compact"]["identical_to_parent"] else "did not match the parent"}. '
-                 f'The same planner on the HQA bundle {"succeeded" if planner["hqa"]["exit"] == 0 else "rejects it (expected: the current loader does not yet understand restored native attention)"}.\n')
+    ptext = planner_text(results)
     lines = ['---', *meta, '---']
     body = f'''
 # {fam.name}-HQA
@@ -1193,8 +1233,9 @@ The views share almost all bytes; do not add them. New shards (balanced across {
   tensor resolves in its file header; each view's payload equals its `total_size`; no projection exposes both
   native and EXL3 storage; the compact view equals the pinned parent's tensor selection and payload exactly and
   opens none of the native shards (and loads with them physically absent); the views have distinct identities.
-- Inherited files are server-side copies of the pinned parent; their Hub SHA256 identities were verified after
-  publication.
+- Inherited files are server-side copies of the pinned parent. Publication completes only after the remote tree
+  matches the planned inventory exactly: inherited LFS SHA256 values equal the pinned parent's, and new files
+  equal the local write records.
 {ptext}- Not performed: whole-model generation, quality or performance evaluation of the HQA view.
 
 ## Provenance
@@ -1366,7 +1407,10 @@ def main(argv=None):
         if args.stage == 'validate':
             return
         staging = Path(state['staging'])
-        write_new(staging / 'README.md', card(run, inv, plan, state, results))
+        if (run.state / 'upload-parent.json').exists() and (staging / 'README.md').exists():
+            write_new(staging / 'README.md', card(run, inv, plan, state, results))
+        else:
+            replace_generated(staging / 'README.md', card(run, inv, plan, state, results))
         state['new_bytes'] = sum((staging / n).stat().st_size for n in state['new'])
         if staging_inventory(staging) != set(state['inherited']) | set(state['new']):
             raise HqaError('staging inventory differs from the planned publication')
