@@ -15,6 +15,7 @@ pub mod qwen4;
 pub mod qwen3_5;
 pub mod mimo_v2;
 pub mod muse_spark;
+pub mod step5;
 
 use super::{AttentionPlacement, ExecutorModes, FfnMode, LayerMode};
 

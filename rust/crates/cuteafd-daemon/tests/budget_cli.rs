@@ -623,6 +623,8 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
         let revision = config.get("MODEL_REVISION").copied();
         let snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
         let capture = [
+            (&["step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config",
+              "step5-fp8-max.config"][..], "capture_step5_real_planner_launch"),
             (&["glm53-exl3-min.config", "glm53-exl3-max.config",
               "glm53-exlr8-min.config", "glm53-exlr8-max.config"][..], "capture_glm_real_planner_launch"),
             (&["glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config",

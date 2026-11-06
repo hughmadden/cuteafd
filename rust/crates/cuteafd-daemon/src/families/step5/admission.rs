@@ -198,12 +198,16 @@ mod tests {
             #[command(flatten)]
             prefix: crate::shared::prefix::PrefixArgs,
         }
+        // 1M tokens of BF16 KV do not fit beside nvfp4 min's weights on one
+        // 96 GiB card; FP8 KV does. The contract refuses with the feasible
+        // context instead of clamping the pool and serving a smaller one.
+        let full_context_fits = !nvfp4;
         for ((context, pool, launchable, host, entries), kv_format) in [
             (262_144, Some(262_144), true, None, 20),
-            (1_048_576, None, true, None, 20),
+            (1_048_576, None, full_context_fits, None, 20),
             (1_048_576, Some(262_144), false, None, 20),
-            (1_048_576, None, true, Some(0), 20),
-            (1_048_576, None, true, None, 0),
+            (1_048_576, None, full_context_fits, Some(0), 20),
+            (1_048_576, None, full_context_fits, None, 0),
         ].into_iter().flat_map(|case| [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8]
             .into_iter().map(move |format| (case, format))) {
@@ -226,6 +230,8 @@ mod tests {
                     ..Default::default()
                 },
             )?;
+            let launchable = launchable
+                || (context > 262_144 && pool.is_none() && kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
             let retention_pressure = host == Some(0) && entries > 0;
             if !retention_pressure {
                 assert_eq!(report.wip_launchable(), launchable,
@@ -270,7 +276,7 @@ mod tests {
                 })
                 .collect();
             let mut inputs = RuntimeInputs {
-                resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
+                host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
                 spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format,
                 inventory: Inventory {
@@ -292,7 +298,6 @@ mod tests {
                 ]).prefix, 16),
                 peer_diagnostics: false,
                 pending_code: code,
-                startup: vec![],
                 // As serve-step5 builds them: pool-first RTX onboarding.
                 onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
                     Some(&path), unit, ranks, waves, cuteafd_loader::placement::Onboard::Auto)?,
@@ -301,7 +306,16 @@ mod tests {
             if !report.wip_launchable() {
                 let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
-                if !retention_pressure { assert!(refusal.contains("compiled/max-context floor of 1048576")); }
+                if !retention_pressure {
+                    // An explicit pool below the context names the floor; an
+                    // automatic one names the context it could not fit.
+                    let expected = if pool.is_some_and(|tokens| tokens < context) {
+                        "compiled/max-context floor of 1048576"
+                    } else {
+                        "selected context 1048576 cannot fit"
+                    };
+                    assert!(refusal.contains(expected), "{refusal}");
+                }
                 assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)));
                 continue;
             }

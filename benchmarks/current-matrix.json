@@ -409,6 +409,13 @@
       "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
     },
     {
+      "name": "step5-fp8-max",
+      "config": "examples/configs/step5-fp8-max.config",
+      "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-2rtx-6spark-step5-fp8-max",
+      "release": "v4.0.0-rc2",
+      "release_note": "Step-5 FP8 retired in v5 (TJ 2026-10-31)"
+    },
+    {
       "name": "step5-nvfp4-min",
       "config": "examples/configs/step5-nvfp4-min.config",
       "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min",
