@@ -220,7 +220,7 @@ RUN_STATEMENTS = {
         '|| true; done\n',
     ),
     "expert-launch": (
-        'remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i"',
+        'worker_budget="$(release_spark_role_budget "$count_plan" "$i")" || exit 1',
         '\nREMOTE\n',
     ),
     "readiness-poll": (

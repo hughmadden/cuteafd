@@ -1098,7 +1098,7 @@ deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
-    artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report,
+    artifact_requirements=dict(spark_tp_role=f"tp{expert_world}" if family == "deepseek_v41" and explicit and expert_world not in (0, 4) else None), report=report,
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
                                                                  dict(category="kv", bytes=64 << 30)]) for i in range(gpus)] +
                                [dict(kind="spark", index=role["rank"], capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for role in roles]))
@@ -1543,11 +1543,10 @@ def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
     assert deployment["family"] == "glm5_flash"
     assert deployment["rtx_gpus"] in (1, 2)
     assert deployment["wip_launchable"] is True
-    source = (ROOT / "scripts/launch/run-family.sh").read_text()
+    source = (ROOT / "scripts/lib/family-keys.sh").read_text()
     functions = []
     for name in ("release_spark_worker_budget", "release_validate_deployment"):
-        helper_source = (ROOT / "scripts/lib/family-keys.sh").read_text() if name == "release_spark_worker_budget" else source
-        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", helper_source, re.MULTILINE | re.DOTALL)
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.MULTILINE | re.DOTALL)
         assert match, f"missing actual launcher function {name}"
         functions.append(match.group())
     script = '\n'.join(functions) + r'''
@@ -1558,9 +1557,11 @@ release_spark_worker_budget "$plan" "$2"
 release_validate_deployment "$plan" glm5_flash
 '''
     result = subprocess.run(["bash", "-euc", script, "native-capability", str(deployment_path),
-                             str(deployment["spark_ranks"])], capture_output=True, text=True)
-    devices = [device for device in deployment["memory_layout"]["devices"] if device["kind"] == "spark"]
-    assert len(devices) == deployment["spark_ranks"]
+                             str(deployment["spark_expert_world"])], capture_output=True, text=True)
+    experts = {role["rank"] for role in deployment["spark_roles"] if role["experts"]}
+    devices = [device for device in deployment["memory_layout"]["devices"]
+               if device["kind"] == "spark" and device["index"] in experts]
+    assert len(devices) == deployment["spark_expert_world"]
     assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
     assert result.returncode == 0, result.stderr
 
