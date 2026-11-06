@@ -145,6 +145,7 @@ pub struct PreparedV4<'a> {
     tp2: bool,
     /// The retained host prefix, resolved before admission.
     prefix: super::HostPrefix,
+    prepare_time: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -152,6 +153,9 @@ pub struct AdmittedV4 {
     pub solved: ResolvedPlan,
     pub placement: Placement,
     pub reserves: Vec<u64>,
+    /// Prepare plus solve/execution work, excluding checkpoint inventory and
+    /// any caller delay between preparing and admitting the request.
+    pub solve_us: u64,
 }
 
 fn modes(inputs: &V4Inputs) -> Result<(Vec<LayerMode>, AttentionPlacement), Refusal> {
@@ -306,6 +310,7 @@ fn context_floor(inputs: &V4Inputs) -> u64 {
 
 /// Prepare V4's immutable contract terms from one admission input.
 pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
+    let started = std::time::Instant::now();
     let (modes, attention) = modes(inputs)?;
     let (_, _, reserves) = fixed_demands(inputs).map_err(invalid)?;
     let budgets = budgets(inputs, &reserves)?;
@@ -376,6 +381,7 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
         counts,
         tp2,
         prefix,
+        prepare_time: started.elapsed(),
     })
 }
 
@@ -803,6 +809,7 @@ impl<'a> PreparedV4<'a> {
     }
 
     pub fn admit(self, request: Request) -> Result<AdmittedV4, Refusal> {
+        let started = std::time::Instant::now();
         if let Pin::Exact(count) = request.onboard {
             if count as usize > self.routed.len() {
                 return Err(invalid(format!(
@@ -813,11 +820,10 @@ impl<'a> PreparedV4<'a> {
         }
         let solved = solve(request, self.budgets.clone(), &self)?;
         let placement = self.execution(&solved)?;
-        Ok(AdmittedV4 {
-            solved,
-            placement,
-            reserves: self.reserves.clone(),
-        })
+        let reserves = self.reserves.clone();
+        let solve_us = self.prepare_time.saturating_add(started.elapsed()).as_micros()
+            .try_into().unwrap_or(u64::MAX);
+        Ok(AdmittedV4 { solved, placement, reserves, solve_us })
     }
 }
 

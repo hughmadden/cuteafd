@@ -433,6 +433,7 @@ mod default_tests {
             input.onboard = Onboard::Layers(count);
             let prepared = prepare(&input).unwrap();
             let result = prepared.admit(production_request(&input)).unwrap();
+            assert!(result.solve_us > 0, "prepare and admission work must be timed");
             let tp2 = result.placement.tp2.unwrap();
             let expected = 2048 + payload + (3 + count as u64) * half.resident_bytes + half.staging_bytes;
             assert_eq!(tp2.peak_bytes, [expected; 2]);

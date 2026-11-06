@@ -116,7 +116,10 @@ pub(crate) fn admit(inputs: &v4::V4Inputs)
     let prefix = prepared.prefix().owners;
     for note in prepared.prefix().notes(inputs.max_context, inputs.sequences) { tracing::info!("{note}"); }
     let request = v4::production_request(inputs);
-    prepared.admit(request).map(|admitted| (admitted.placement, prefix)).map_err(anyhow::Error::msg)
+    let admitted = prepared.admit(request).map_err(anyhow::Error::msg)?;
+    tracing::info!(solve_us = admitted.solve_us, admissions = 1,
+        "V4 admission prepare + solve/execution (excludes checkpoint inventory)");
+    Ok((admitted.placement, prefix))
 }
 
 /// The family facts serve-dsv4 admits: the same inputs `plan --layout` builds.

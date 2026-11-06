@@ -108,6 +108,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let request = v4::production_request(&inputs);
         let prefix = prepared.prefix();
         let admitted = prepared.admit(request.clone())?;
+        let mut solve_us = admitted.solve_us;
+        let mut admissions = 1u32;
         let mut solved = admitted.solved;
         let mut placement = admitted.placement;
         if report.encoder.is_none() {
@@ -120,7 +122,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 encoder_request.onboard = Pin::Exact(0);
                 encoder_request.pool = Pin::Exact(placement.pool_tokens);
             }
-            let encoder_budget = v4::prepare(&inputs)?.admit(encoder_request)?.placement;
+            let encoder_admitted = v4::prepare(&inputs)?.admit(encoder_request)?;
+            solve_us = solve_us.saturating_add(encoder_admitted.solve_us);
+            admissions += 1;
+            let encoder_budget = encoder_admitted.placement;
             let mut encoder_devices = devices[..ranks].to_vec();
             for ((device, reserve), items) in encoder_devices.iter_mut().zip(&reserves).zip(&encoder_budget.items) {
                 device.capacity_bytes = device.capacity_bytes.saturating_sub(*reserve);
@@ -142,15 +147,18 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 let mut tower_request = request.clone();
                 tower_request.pool = Pin::Exact(placement.pool_tokens);
                 let admitted = v4::prepare(&with_tower)?.admit(tower_request)?;
+                solve_us = solve_us.saturating_add(admitted.solve_us);
+                admissions += 1;
                 solved = admitted.solved;
                 placement = admitted.placement;
             }
         }
         startup.add_experts(input.expert_catalog()?, shape.native_layers, &placement, options.tp2_dspark_experts)?;
-        Ok((placement, reserves, startup.notes()?, solved, prefix))
+        Ok((placement, reserves, startup.notes()?, solved, prefix, solve_us, admissions))
     })();
     match admitted {
-        Ok((placement, reserves, startup_notes, solved, prefix)) => {
+        Ok((placement, reserves, startup_notes, solved, prefix, solve_us, admissions)) => {
+            notes.push(format!("deepseek_v4 solve_us={solve_us} admissions={admissions} (prepare + solve/execution; excludes checkpoint inventory)"));
             notes.extend(startup_notes);
             report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&solved));
             report.host_budget_bytes = prefix.owners.quota_bytes;
