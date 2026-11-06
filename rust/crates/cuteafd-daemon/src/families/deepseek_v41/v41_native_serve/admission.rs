@@ -584,12 +584,7 @@ pub(super) fn resolve_with_owners(
     // so each prices only the post-ready phases.
     let mut allowances = Vec::new();
     for (gpu, sample) in memory.iter().enumerate() {
-        allowances.extend(admission::growth_allowances(
-            sample.1 as u64,
-            ranks,
-            automatic,
-            gpu as u8,
-        ));
+        allowances.extend(admission::growth_allowances(sample.1 as u64, ranks, gpu as u8));
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
@@ -1176,7 +1171,7 @@ mod admission_tests {
                 .enumerate()
                 .map(|(gpu, &bytes)| {
                     let reserve = total - ceiling
-                        + families::deepseek_v41::runtime_reserve(total as u64, ranks, false)
+                        + families::deepseek_v41::runtime_reserve(total as u64, ranks)
                             as usize
                         + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
                     (bytes + reserve + deferred[gpu] as usize, total)

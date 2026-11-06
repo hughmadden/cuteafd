@@ -117,7 +117,7 @@ pub struct Opaque {
 /// The lazy-capture envelope, runtime growth and small-card admission margin as
 /// one declared reserve per GPU. None of these bytes is live at ready, so they
 /// price only the post-ready phases.
-pub fn growth_allowances(total: u64, ranks: usize, automatic: bool, gpu: u8) -> Vec<Opaque> {
+pub fn growth_allowances(total: u64, ranks: usize, gpu: u8) -> Vec<Opaque> {
     let location = Location::coordinator(gpu);
     let lifetime = Lifetime { first: Phase::Ready, last: Phase::Growth };
     let mut out = vec![Opaque {
@@ -127,12 +127,12 @@ pub fn growth_allowances(total: u64, ranks: usize, automatic: bool, gpu: u8) -> 
         lifetime,
         source: "V4.1 lazy graph capture envelope".into(),
     }];
-    let runtime = super::runtime_reserve(total, ranks, automatic);
+    let runtime = super::runtime_reserve(total, ranks);
     if runtime > 0 {
         out.push(Opaque {
             location,
             bytes: runtime,
-            basis: Basis::Calibrated,
+            basis: Basis::Estimated,
             lifetime,
             source: "V4.1 runtime growth reserve".into(),
         });

@@ -172,7 +172,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             reserves.push(Opaque { location: Location::coordinator(gpu as u8), bytes, basis,
                 lifetime: Lifetime::RESIDENT, source: source.into() });
         }
-        reserves.extend(admission::growth_allowances(total, ranks, automatic, gpu as u8));
+        reserves.extend(admission::growth_allowances(total, ranks, gpu as u8));
     }
     if let Some(draft) = &draft {
         startup.extend(owners.draft_load_phases(draft)?.iter().map(Owner::from_demand));

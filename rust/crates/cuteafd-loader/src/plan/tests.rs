@@ -4373,7 +4373,8 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100);
-    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "V4.1 runtime growth reserve").unwrap().bytes, 3 << 30);
+    // The runtime growth estimate does not grow with automatic admission.
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "V4.1 runtime growth reserve").unwrap().bytes, 2 << 30);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();

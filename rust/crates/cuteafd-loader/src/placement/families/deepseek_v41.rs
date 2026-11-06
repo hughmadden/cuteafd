@@ -10,9 +10,14 @@ pub fn graph_reserve(total: u64, ranks: usize) -> u64 {
     if total <= 32 << 30 { 2048 << 20 } else if ranks == 1 { 3264 << 20 } else { 1472 << 20 }
 }
 
-pub fn runtime_reserve(total: u64, ranks: usize, automatic: bool) -> u64 {
-    if total <= 32 << 30 { 0 } else if automatic { 3 << 30 }
-    else if ranks == 1 { 2 << 30 } else { 800 << 20 }
+/// Estimated post-ready runtime growth per GPU, the same under automatic and
+/// explicit pools: no warmed plateau is measured for it yet. The retained
+/// V4.1 max cards (2026-10-25, 757-land/router-astra-land memory.jsonl) grew
+/// 780-854 MiB raw per GPU in the ~20 s after ready, lazy captures included,
+/// against 1472 + 800 MiB of graph and runtime reserve; that is not a warmed
+/// C16/8K figure. Small cards fold their slack into the ceiling.
+pub fn runtime_reserve(total: u64, ranks: usize) -> u64 {
+    if total <= 32 << 30 { 0 } else if ranks == 1 { 2 << 30 } else { 800 << 20 }
 }
 
 /// Exact expert allocation extents, supplied either by linked native info or
@@ -485,21 +490,22 @@ mod tests {
     }
 
     #[test]
-    fn growth_reserves_are_post_ready_allowances_on_every_card_and_policy() {
+    fn growth_reserves_are_post_ready_allowances_on_every_card() {
         for total in [32 << 30, 96 << 30] {
             for ranks in [1, 2] {
-                for automatic in [false, true] {
-                    for gpu in 0..ranks {
-                        let allowances = admission::growth_allowances(total, ranks, automatic, gpu as u8);
-                        assert!(allowances.iter().all(|a| a.location == Location::coordinator(gpu as u8)
-                            && a.lifetime == Lifetime { first: Phase::Ready, last: Phase::Growth }));
-                        assert_eq!(allowances.iter().map(|a| a.bytes).sum::<u64>(),
-                            graph_reserve(total, ranks) + runtime_reserve(total, ranks, automatic)
-                                + if total <= 32 << 30 { 32 << 20 } else { 0 });
-                    }
+                for gpu in 0..ranks {
+                    let allowances = admission::growth_allowances(total, ranks, gpu as u8);
+                    assert!(allowances.iter().all(|a| a.location == Location::coordinator(gpu as u8)
+                        && a.lifetime == Lifetime { first: Phase::Ready, last: Phase::Growth }));
+                    assert_eq!(allowances.iter().map(|a| a.bytes).sum::<u64>(),
+                        graph_reserve(total, ranks) + runtime_reserve(total, ranks)
+                            + if total <= 32 << 30 { 32 << 20 } else { 0 });
                 }
             }
         }
+        // One estimate per card shape: automatic and explicit pools share it.
+        assert_eq!(runtime_reserve(96 << 30, 1), 2 << 30);
+        assert_eq!(runtime_reserve(96 << 30, 2), 800 << 20);
     }
 
     #[test]
