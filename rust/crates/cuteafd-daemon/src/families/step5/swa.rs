@@ -304,8 +304,7 @@ impl<'a> SwaLayer<'a> {
         // Native slots carry no BF16 operand; the remaining slots keep their indices.
         let weights = suffixes
             .iter()
-            .enumerate()
-            .map(|(slot, suffix)| {
+            .map(|suffix| {
                 if layout.core.contains_key(&format!("model.layers.{layer_id}.{suffix}")) { return Ok(None); }
                 layout
                     .operands

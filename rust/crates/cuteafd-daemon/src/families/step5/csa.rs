@@ -315,9 +315,8 @@ impl<'a> CsaLayer<'a> {
         let native_o = layout.core.contains_key(&format!("model.layers.{layer_id}.self_attn.o_proj.weight"));
         let weights = suffixes
             .iter()
-            .enumerate()
-            .map(|(slot, s)| {
-                if layout.core.contains_key(&format!("model.layers.{layer_id}.{suffix}")) { return Ok(None); }
+            .map(|s| {
+                if layout.core.contains_key(&format!("model.layers.{layer_id}.{s}")) { return Ok(None); }
                 layout
                     .operands
                     .iter()

@@ -413,7 +413,8 @@ impl Model {
             ] };
         let mut spec = spec;
         if complete {
-            if let Ok(index) = crate::plan::checkpoint::read_json(&checkpoint.snapshot.join("model.safetensors.index.json")) {
+            let index_name = checkpoint.view.as_ref().map_or("model.safetensors.index.json", |view| view.index_name());
+            if let Ok(index) = crate::plan::checkpoint::read_json(&checkpoint.snapshot.join(index_name)) {
                 if let Some(advertised) = index["metadata"]["total_size"].as_u64() {
                     let headers: u64 = bytes.values().sum();
                     if advertised != headers {
@@ -623,9 +624,17 @@ impl FamilyModel for Model {
 /// its own list. RTX columns are the caller's (golden sizes its own chain).
 pub fn spark_world_admitted(snapshot: &std::path::Path, programs: &std::path::Path, ranks: usize)
     -> anyhow::Result<()> {
+    let view = crate::plan::checkpoint::CheckpointView::select(snapshot,
+        crate::plan::checkpoint::AttentionMode::Hqa)?;
+    spark_world_admitted_view(&view, programs, ranks)
+}
+
+/// Golden admission uses the same immutable bundle as its weight/catalog loads.
+pub fn spark_world_admitted_view(view: &crate::plan::checkpoint::CheckpointView,
+    programs: &std::path::Path, ranks: usize) -> anyhow::Result<()> {
     use cuteafd_core::memory_layout::DeviceKind;
     anyhow::ensure!(ranks > 0, "Step-5 golden needs real Spark experts");
-    let report = crate::plan::plan(snapshot, &crate::plan::PlanOptions {
+    let report = crate::plan::PlanInput::open_view(view)?.plan(&crate::plan::PlanOptions {
         placement: crate::plan::ExpertPlacement::from_spark_ranks(ranks),
         draft_ownership: Some(crate::plan::spec::DraftOwnership::None),
         layout: Some(crate::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),

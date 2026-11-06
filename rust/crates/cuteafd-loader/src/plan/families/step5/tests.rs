@@ -1855,7 +1855,9 @@ fn hqa_snapshot() -> tempfile::TempDir {
         config.replace("quantize_config.json", "quantize_config.compact-attention.json")).unwrap();
     std::fs::copy(root.join("model.safetensors.index.json"),
         root.join("model.compact-attention.safetensors.index.json")).unwrap();
-    std::fs::copy(root.join("quantize_config.json"), root.join("quantize_config.compact-attention.json")).unwrap();
+    let compact_quant = std::fs::read_to_string(root.join("quantize_config.json")).unwrap()
+        .replace("quantize_config.json", "quantize_config.compact-attention.json");
+    std::fs::write(root.join("quantize_config.compact-attention.json"), compact_quant).unwrap();
     let mut index: Value = serde_json::from_slice(&std::fs::read(root.join("model.safetensors.index.json")).unwrap()).unwrap();
     let mut quant: Value = serde_json::from_slice(&std::fs::read(root.join("quantize_config.json")).unwrap()).unwrap();
     let mut native = Vec::new();
@@ -1899,8 +1901,36 @@ fn hqa_o_dispatch_and_exact_rank_charges_include_all_predictors() -> anyhow::Res
             }
             assert_eq!(hqa.resident_bytes, compact.resident_bytes + delta);
             assert_eq!(hqa.resident_bytes, hqa.operands.iter().map(|w| w.allocation_bytes)
-                .chain(hqa.core.values().map(|w| w.bytes as u64)).sum());
+                .chain(hqa.core.values().map(|w| w.bytes as u64)).sum::<u64>());
         }
+    }
+    // Serving head-splits SWA but keeps each CSA whole on one contiguous owner.
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let modes: Vec<_> = (0..cfg.layers).map(|layer| if cfg.full[layer] {
+        LayerMode::Whole { gpu: u8::from(layer >= 44), ffn: FfnMode::Owner }
+    } else { LayerMode::HeadSplit }).collect();
+    let owners = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0))?;
+    for rank in 0..2 {
+        let hqa = coordinator::RankWeightLayout::for_execution(&native, rank, &owners)?;
+        let compact = coordinator::RankWeightLayout::for_execution(&parent, rank, &owners)?;
+        let mut delta = 0;
+        for layer in 0..cfg.layers {
+            let local = owners.layer(layer, rank)?;
+            let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+            let output = hqa.operands.iter().find(|w| w.name == name);
+            assert!(!hqa.core.contains_key(&name));
+            if local.query_heads == 0 {
+                assert!(output.is_none());
+                assert!(!compact.core.contains_key(&name));
+            } else {
+                let output = output.unwrap();
+                assert_eq!(output.dtype, DType::Bf16);
+                assert_eq!(output.shape, [4096, local.query_heads * cfg.dim]);
+                delta += output.allocation_bytes - compact.core[&name].bytes as u64;
+            }
+        }
+        assert_eq!(hqa.resident_bytes, compact.resident_bytes + delta);
     }
     for stage in 0..cfg.mtp {
         let hqa = coordinator::RankWeightLayout::for_mtp_stage(&native, stage)?;
@@ -1915,17 +1945,21 @@ fn hqa_o_dispatch_and_exact_rank_charges_include_all_predictors() -> anyhow::Res
 
 #[test]
 fn hqa_modes_bind_distinct_identities_and_compact_needs_no_native_shard() -> anyhow::Result<()> {
-    use crate::plan::checkpoint::{AttentionMode, CheckpointIdentity, CheckpointView};
+    use crate::plan::checkpoint::{identity::CheckpointIdentity, AttentionMode, CheckpointView};
     let fixture = hqa_snapshot();
     let mut identities = std::collections::BTreeSet::new();
     for mode in [AttentionMode::Hqa, AttentionMode::Compact, AttentionMode::Fp8Compact] {
         let view = CheckpointView::select(fixture.path(), mode)?;
         identities.insert(CheckpointIdentity::from_view(&view, None)?.fingerprint);
-        let checkpoint = Checkpoint::coordinator_view(&view, false, true)?;
         if mode == AttentionMode::Fp8Compact {
-            let error = Model::open(&checkpoint).err().unwrap();
+            let inventory = Checkpoint::inventory_view(&view)?;
+            let error = Model::open(&inventory).err().expect("FP8-compact is not qualified");
             assert!(error.downcast_ref::<exl3::Fp8PartialExportPending>().is_some(), "{error:#}");
+            // The registry's family error preserves diagnostics, not the concrete type.
+            let error = Checkpoint::coordinator_view(&view, false, true).unwrap_err();
+            assert!(error.to_string().contains("Step-5 FP8 TP2 partial export pending"), "{error:#}");
         } else {
+            let checkpoint = Checkpoint::coordinator_view(&view, false, true)?;
             Model::open(&checkpoint)?;
         }
     }
