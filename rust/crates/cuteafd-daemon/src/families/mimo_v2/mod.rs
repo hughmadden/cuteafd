@@ -126,6 +126,9 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
+    /// Split DFlash attention and FFN over both RTX ranks (default on with --split-device and --draft).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
     /// Native MTP drafter: run this many of the checkpoint's MTP stages
     /// (`model.mtp.layers.*`, 0 = off) after each next token.
     #[arg(long, default_value_t = 0)]
@@ -1253,9 +1256,14 @@ impl Opened {
                 let capacity = args.draft_capacity(cfg.block)?;
                 let representation = self.weight_formats.draft;
                 let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
-                let drafter = crate::shared::experts::rtx::push::load_alone(dir, &[device], ||
+                let exchange = args.tp2_dflash.then(|| engine.draft_exchange()).transpose()?;
+                let mut devices = vec![device];
+                if let Some(exchange) = &exchange {
+                    devices.push(crate::shared::memory::device::Device { library: &self.library, id: exchange.device(1) });
+                }
+                let drafter = crate::shared::experts::rtx::push::load_alone(dir, &devices, ||
                     dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
-                        capacity.max_batch_sequences, representation, args.fp8_scales, args.draft_kv_cache))?;
+                        capacity.max_batch_sequences, representation, args.fp8_scales, args.draft_kv_cache, exchange))?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
             }

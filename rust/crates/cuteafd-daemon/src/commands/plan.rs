@@ -97,6 +97,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 concurrency: args.concurrency,
                 dspark_draft_limit: args.dspark_draft_limit.unwrap_or(5),
                 tp2_dspark_experts: args.tp2_dspark_experts,
+                tp2_dflash: args.tp2_dflash.unwrap_or(false),
                 state_slots: args.state_slots,
                 glmf_mark_lanes: args.mark_lanes,
                 prefix_slots: args.prefix_slots,
@@ -171,6 +172,23 @@ fn tp2_dspark_experts(args: &PlanArgs, family: &str,
     };
     anyhow::ensure!(!enabled || applicable,
         "--tp2-dspark-experts requires V4/V4.1, --layout, --rtx 2 and dSpark");
+    Ok(enabled)
+}
+
+fn tp2_dflash(args: &PlanArgs, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
+    let default_on = crate::cli::tp2_dflash_default(family, args.layout && args.rtx == 2,
+        args.speculator == "dflash2");
+    let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
+        None | Some("") => default_on,
+        Some("off") => false,
+        Some("on") => true,
+        Some(_) => anyhow::bail!("TP2_DFLASH must be on or off"),
+    };
+    let enabled = args.tp2_dflash.unwrap_or(configured);
+    anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
+        && matches!(family, "mimo_v2" | "kimi_k3")),
+        "TP2_DFLASH requires MiMo/Kimi, --layout, --rtx 2 and DFlash2");
     Ok(enabled)
 }
 
@@ -302,9 +320,11 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
     let tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
+    let tp2_dflash = tp2_dflash(&args, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
     if let Some(layout) = &mut options.layout {
         layout.tp2_dspark_experts = tp2_dspark_experts;
+        layout.tp2_dflash = tp2_dflash;
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
@@ -943,6 +963,62 @@ mod tests {
     }
 
     #[test]
+    fn tp2_dflash_plan_and_direct_serve_defaults_agree() {
+        use clap::{CommandFactory, FromArgMatches, Parser};
+        for split in [false, true] {
+            for draft in [false, true] {
+                for explicit in [None, Some(false), Some(true)] {
+                    let mut plan = vec!["cuteafd", "plan", "model", "--layout", "--rtx", if split { "2" } else { "1" },
+                        "--speculator", if draft { "dflash2" } else { "off" }];
+                    let mut serve = vec!["cuteafd", "serve-mimo", "--snapshot", "/model", "--native-lib", "/native.so"];
+                    if split { serve.extend(["--split-device", "1"]); }
+                    if draft { serve.extend(["--draft", "/draft"]); }
+                    if let Some(enabled) = explicit {
+                        let flag = if enabled { "true" } else { "false" };
+                        plan.extend(["--tp2-dflash", flag]);
+                        serve.extend(["--tp2-dflash", flag]);
+                    }
+                    let crate::cli::Commands::Plan(planned) = crate::cli::Cli::try_parse_from(plan).unwrap().command
+                        else { panic!("expected plan") };
+                    let matches = crate::cli::Cli::command().try_get_matches_from(serve).unwrap();
+                    let mut parsed = crate::cli::Cli::from_arg_matches(&matches).unwrap();
+                    crate::cli::resolve_tp2_dflash(&mut parsed.command, &matches);
+                    let crate::cli::Commands::ServeMimo(served) = parsed.command else { panic!("expected serve") };
+                    let resolved = tp2_dflash(&planned, "mimo_v2", &Default::default());
+                    if explicit == Some(true) && !(split && draft) { assert!(resolved.is_err()); }
+                    else { assert_eq!(resolved.unwrap(), served.engine.tp2_dflash); }
+                    assert_eq!(served.engine.tp2_dflash, explicit.unwrap_or(split && draft));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tp2_dflash_explicit_off_overrides_config_on() {
+        use clap::Parser;
+        let argv = ["cuteafd", "plan", "model", "--layout", "--rtx", "2", "--speculator", "dflash2"];
+        let cfg = [("TP2_DFLASH".into(), "on".into())].into();
+        for (explicit, expected) in [("false", false), ("true", true)] {
+            let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
+                argv.into_iter().chain(["--tp2-dflash", explicit])).unwrap().command
+                else { panic!("expected plan") };
+            for family in ["mimo_v2", "kimi_k3"] {
+                assert_eq!(tp2_dflash(&request, family, &cfg).unwrap(), expected);
+            }
+            assert_eq!(options(&request).unwrap().layout.unwrap().tp2_dflash, expected);
+        }
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+            else { panic!("expected plan") };
+        assert!(tp2_dflash(&request, "mimo_v2", &Default::default()).unwrap());
+        assert!(!tp2_dflash(&request, "kimi_k3", &Default::default()).unwrap());
+        assert!(!tp2_dflash(&request, "mimo_v2", &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
+        assert!(tp2_dflash(&request, "mimo_v2", &cfg).unwrap());
+        request.rtx = 1;
+        assert!(!tp2_dflash(&request, "mimo_v2", &Default::default()).unwrap());
+        assert!(tp2_dflash(&request, "mimo_v2", &cfg).is_err());
+    }
+
+    #[test]
     fn v4_and_v41_tp2_dspark_cli_and_config_resolve_before_layout() {
         use clap::Parser;
         let argv = ["cuteafd", "plan", "model", "--layout", "--rtx", "2", "--speculator", "dspark"];
@@ -1050,6 +1126,7 @@ mod tests {
             concurrency: 8,
             dspark_draft_limit: None,
             tp2_dspark_experts: false,
+            tp2_dflash: None,
             state_slots: None,
             mark_lanes: None,
             prefix_slots: None,

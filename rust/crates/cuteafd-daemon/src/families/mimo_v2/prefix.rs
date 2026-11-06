@@ -86,7 +86,7 @@ pub(crate) struct MimoPrefix<'e, 'a> {
     draft_metadata: Option<Rc<Allocation<'a>>>,
     draft_offset: usize,
     /// Per rank: the prefix copy stream, fenced against that rank's engine stream (the
-    /// drafter and MTP run on rank 0's).
+    /// TP2 drafter shares both target streams; MTP uses rank 0's).
     copies: crate::shared::prefix::PrefixCopies<'a>,
 }
 
@@ -147,10 +147,10 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
             // Leave room for speculative writes and the target mark's capture reach.
             let rows = draft_mark_rows(window);
             let row = drafter.kv_cache.plane_record_bytes(drafter.cfg.kv_heads, drafter.cfg.head_dim);
-            for buffer in drafter.context_rings() {
-                states.push(RingState { rank: 0, buffer, row, ring_rows: super::dflash::RING,
-                    rows, offset: offsets[0], draft: true });
-                offsets[0] += super::dflash::RING * row;
+            for (rank, buffer) in drafter.context_rings() {
+                states.push(RingState { rank, buffer, row, ring_rows: super::dflash::RING,
+                    rows, offset: offsets[rank], draft: true });
+                offsets[rank] += super::dflash::RING * row;
             }
             offsets[0] += 8;
             debug_assert_eq!((offsets[0] - draft_offset) as u64,
@@ -189,7 +189,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
     }
 
     fn draft_metadata_offset(&self) -> usize {
-        self.states.iter().filter(|s| s.draft).map(|s| s.ring_rows * s.row).sum::<usize>() + self.draft_offset
+        self.states.iter().filter(|s| s.draft && s.rank == 0).map(|s| s.ring_rows * s.row).sum::<usize>() + self.draft_offset
     }
 
     pub fn mark_bytes(&self) -> usize {

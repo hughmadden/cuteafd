@@ -4,6 +4,23 @@ use std::path::PathBuf;
 
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
+pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
+    family == "mimo_v2" && split && draft
+}
+
+/// Resolve the topology-dependent bool once, without losing an explicit false.
+pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatches) {
+    let engine = match command {
+        Commands::ServeMimo(args) => &mut args.engine,
+        Commands::MimoGolden(args) => &mut args.engine,
+        _ => return,
+    };
+    let Some((_, sub)) = matches.subcommand() else { return };
+    if sub.value_source("tp2_dflash") != Some(clap::parser::ValueSource::CommandLine) {
+        engine.tp2_dflash = tp2_dflash_default("mimo_v2", engine.split_device.is_some(), engine.draft.is_some());
+    }
+}
+
 /// Inspect original argv: clap normalizes aliases before exposing matches.
 pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<&'static str> {
     let mut replacements = Vec::new();
@@ -449,6 +466,9 @@ pub(crate) struct PlanArgs {
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
+    /// Split MiMo/Kimi DFlash over both target GPUs (explicit false wins over config).
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) tp2_dflash: Option<bool>,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) state_slots: Option<u64>,
@@ -1067,6 +1087,19 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn tp2_dflash_deployment_accepts_explicit_on_and_off_without_layout() {
+        for mode in ["--deployment", "--layout", "--spark-range"] {
+            for (value, expected) in [("false", false), ("true", true)] {
+                let Commands::Plan(args) = Cli::try_parse_from([
+                    "cuteafd", "plan", "model", mode, "--rtx", "2",
+                    "--speculator", "dflash2", "--tp2-dflash", value,
+                ]).unwrap().command else { panic!("expected plan command"); };
+                assert_eq!(args.tp2_dflash, Some(expected));
+            }
+        }
+    }
 
     #[test]
     fn mimo_layout_swa_default_and_explicit_formats_match_serving() {
