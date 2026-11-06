@@ -1,6 +1,6 @@
 //! Native projection export selection shared by CPU placement and preweight loading.
 use super::Refusal;
-use crate::{families::glm5_flash::core::NativeLayout, placement::inventory::ProgramsManifest};
+use crate::{formats::native_attention::NativeLayout, placement::inventory::ProgramsManifest};
 use cuteafd_ffi::draft_projection::ProjectionOutput;
 use std::collections::BTreeSet;
 
