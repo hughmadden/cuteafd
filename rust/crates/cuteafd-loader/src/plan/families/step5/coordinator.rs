@@ -6,7 +6,7 @@ use crate::plan::{
     checkpoint::{Checkpoint, CheckpointTensor},
     spec::Component,
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_core::dense_attention::{
     GqaGeometry, NormWeight, RotaryArithmetic, RouterBiasOrder, SigmoidRouter, SlidingWindow,
 };
@@ -14,6 +14,7 @@ use cuteafd_core::DType;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorContract {
+    pub attention_mode: crate::plan::checkpoint::AttentionMode,
     pub weights: NativeDenseLayout,
     /// Header-native EXL3 dense projections (empty for FP8/NVFP4 releases).
     pub core: super::exl3::CoreInventory,
@@ -93,6 +94,16 @@ impl LayerContract {
 }
 
 impl CoordinatorContract {
+    /// FP8-compact load-only staging; final device values/scales are charged by rank layouts.
+    pub fn attention_mount_load(&self, ranks: usize) -> Result<crate::shared::dense_read::MountLoad> {
+        if self.attention_mode != crate::plan::checkpoint::AttentionMode::Fp8Compact {
+            return Ok(Default::default());
+        }
+        crate::shared::dense_read::MountLoad::from_headers(self.weights.tensors.iter()
+            .filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight"))
+            .map(|tensor| &tensor.meta), ranks)
+    }
+
     /// `copy_h2d` retains its largest pinned source until the library drops.
     /// Whole source extents conservatively cover TP shards; embedding uses the
     /// separate dense loader, not this reusable synchronous upload owner.
@@ -157,6 +168,7 @@ impl CoordinatorContract {
             !is_exl3_member(name) && tensor.role.component == Component::Speculator)
             .map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone())).collect();
         Ok(Self {
+            attention_mode: checkpoint.attention_mode(),
             weights,
             mtp_declarations,
             core: model.core.clone(),
@@ -191,6 +203,21 @@ pub struct WeightOperand {
     pub shape: Vec<usize>,
     pub slice: WeightSlice,
     pub allocation_bytes: u64,
+}
+
+impl WeightOperand {
+    pub fn native_layout(&self, rank: usize, ranks: usize) -> Result<crate::formats::native_attention::NativeLayout> {
+        use crate::formats::trellis_core::CoreSplit;
+        ensure!(self.shape.len() == 2, "Step-5 native output matrix");
+        let split = match self.slice { WeightSlice::Replicated => CoreSplit::Whole,
+            WeightSlice::Rows => CoreSplit::Output, WeightSlice::Cols => CoreSplit::Input };
+        Ok(crate::formats::native_attention::NativeLayout {
+            stem: self.name.strip_suffix(".weight").ok_or_else(|| anyhow::anyhow!("native weight name"))?.into(),
+            shape: [self.shape[0], self.shape[1]], fp8: self.dtype == DType::F8E4M3,
+            rank: if split == CoreSplit::Whole { 0 } else { rank },
+            ranks: if split == CoreSplit::Whole { 1 } else { ranks }, split,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +269,7 @@ impl RankWeightLayout {
         let mut layout = Self::from_native(&weights, 0, 1, None)?;
         for operand in &mut layout.operands { operand.slice = WeightSlice::Replicated; }
         layout.attach_core(&cfg, &contract.core, None, |layer| layer >= cfg.layers && layer < cfg.layers + depth)?;
+        layout.select_attention(contract.attention_mode)?;
         Ok(layout)
     }
 
@@ -282,7 +310,25 @@ impl RankWeightLayout {
         if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
         let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
         layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
+        layout.select_attention(contract.attention_mode)?;
         Ok(layout)
+    }
+
+    /// FP8-compact replaces only selected native O matrices, never the EXL3 core.
+    fn select_attention(&mut self, mode: crate::plan::checkpoint::AttentionMode) -> Result<()> {
+        if mode != crate::plan::checkpoint::AttentionMode::Fp8Compact { return Ok(()); }
+        for operand in &mut self.operands {
+            if !operand.name.ends_with(".self_attn.o_proj.weight") { continue; }
+            ensure!(operand.dtype == DType::Bf16 && operand.shape.len() == 2
+                && operand.shape.iter().all(|dim| dim % 128 == 0), "Step-5 FP8 output geometry");
+            operand.dtype = DType::F8E4M3;
+            operand.allocation_bytes = operand.native_layout(self.rank, self.ranks)?.bytes()?;
+        }
+        self.resident_bytes = self.operands.iter().map(|w| w.allocation_bytes)
+            .chain(self.core.values().map(|w| w.bytes as u64))
+            .try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
+            .context("Step-5 selected attention weight size overflow")?;
+        Ok(())
     }
 
     /// Native trellis owners follow the same ownership as their BF16 operands:

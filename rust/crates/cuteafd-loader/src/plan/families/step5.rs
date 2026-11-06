@@ -225,7 +225,6 @@ impl Model {
 
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
         let _construction = tracing::debug_span!("step5_model_open").entered();
-        exl3::validate_attention_mode(checkpoint)?;
         let cfg = Config::parse(checkpoint)?;
         let exl3 = exl3::is_exl3(checkpoint);
         let core = exl3::CoreInventory::from_checkpoint(&cfg, checkpoint)?;

@@ -2052,7 +2052,7 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
     use super::admission::{self, MarkRule, RuntimeInputs};
     use crate::plan::checkpoint::{AttentionMode, CheckpointView};
     let fixture = hqa_snapshot();
-    for mode in [AttentionMode::Hqa, AttentionMode::Compact] {
+    for mode in [AttentionMode::Hqa, AttentionMode::Compact, AttentionMode::Fp8Compact] {
         let view = CheckpointView::select(fixture.path(), mode)?;
         let checkpoint = Checkpoint::open_view(&view)?;
         let cfg = Config::parse(&checkpoint)?;
@@ -2106,17 +2106,8 @@ fn hqa_modes_bind_distinct_identities_and_compact_needs_no_native_shard() -> any
     for mode in [AttentionMode::Hqa, AttentionMode::Compact, AttentionMode::Fp8Compact] {
         let view = CheckpointView::select(fixture.path(), mode)?;
         identities.insert(CheckpointIdentity::from_view(&view, None)?.fingerprint);
-        if mode == AttentionMode::Fp8Compact {
-            let inventory = Checkpoint::inventory_view(&view)?;
-            let error = Model::open(&inventory).err().expect("FP8-compact is not qualified");
-            assert!(error.downcast_ref::<exl3::Fp8PartialExportPending>().is_some(), "{error:#}");
-            // The registry's family error preserves diagnostics, not the concrete type.
-            let error = Checkpoint::coordinator_view(&view, false, true).unwrap_err();
-            assert!(error.to_string().contains("Step-5 FP8 TP2 partial export pending"), "{error:#}");
-        } else {
-            let checkpoint = Checkpoint::coordinator_view(&view, false, true)?;
-            Model::open(&checkpoint)?;
-        }
+        let checkpoint = Checkpoint::coordinator_view(&view, false, true)?;
+        Model::open(&checkpoint)?;
     }
     assert_eq!(identities.len(), 3);
     std::fs::remove_file(fixture.path().join("hqa-attention.safetensors"))?;
@@ -2224,6 +2215,70 @@ fn hqa_compact_and_legacy_code_allowance_matches_old_formula_on_same_manifest() 
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    let fp8 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), AttentionMode::Fp8Compact)?)?;
+    let bf16 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), AttentionMode::Hqa)?)?;
+    let cfg = Config::parse(&fp8)?;
+    let contract = coordinator::CoordinatorContract::from_checkpoint(&fp8)?;
+    let selection = native::NativeSelection::resolve(&contract, &cfg, 2, 3, 2048, None)?;
+    assert_eq!(selection.requirements.len(), 95);
+    assert_eq!(selection.resolved.programs, ["native_attention_n4096_k12288_m4096", "native_attention_n4096_k6144_m4096_f32"]);
+    assert_eq!(selection.resolved.fp8_scratch_bytes, 256);
+    for ranks in [1,2] {
+        for rank in 0..ranks {
+            let a = coordinator::RankWeightLayout::from_checkpoint(&fp8, rank, ranks)?;
+            let b = coordinator::RankWeightLayout::from_checkpoint(&bf16, rank, ranks)?;
+            assert_eq!(a.core, b.core);
+            assert_eq!(a.operands.len(), b.operands.len());
+            for (a,b) in a.operands.iter().zip(&b.operands) {
+                assert_eq!(a.name, b.name);
+                if a.name.ends_with(".self_attn.o_proj.weight") {
+                    assert_eq!(a.dtype, DType::F8E4M3);
+                    let layout = a.native_layout(rank,ranks)?;
+                    assert_eq!(a.allocation_bytes, layout.bytes()?);
+                    assert_eq!(a.allocation_bytes, b.allocation_bytes / 2 + (a.shape[0]/128*a.shape[1]/128*4) as u64);
+                } else {
+                    assert_eq!(a.dtype, b.dtype);
+                    assert_eq!(a.allocation_bytes, b.allocation_bytes);
+                }
+            }
+        }
+    }
+    let mtp = coordinator::RankWeightLayout::mtp_from_contract(&fp8, &contract, 3)?;
+    selection.validate_layout(&mtp, 2048)?;
+    assert_eq!(mtp.operands.iter().filter(|w| w.dtype == DType::F8E4M3).count(), 3);
+    // Final storage admission also proves the dead trellis plane covers the selected ABI.
+    for rows in [1, 64, 65, 2048, 4096] {
+        use crate::placement::inventory::ProgramsManifest;
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let stage = if rows <= 64 { 64 } else { 4096 };
+        let entry = |k: usize, output: ProjectionOutput, scratch: u64| {
+            let suffix = if output == ProjectionOutput::F32 { "_f32" } else { "" };
+            serde_json::json!({"name":format!("native_attention_n4096_k{k}_m{stage}{suffix}"),
+                "capacity_rows":stage,"pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                "scalars":[{"type":"int32"}],"scratch_bytes_at_capacity":{"scratch":scratch},
+                "geometry":{"input_features":k,"output_features":4096,"output_dtype":output.torch_dtype(),
+                    "max_rows":stage,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                    "reduction":"canonical_fp8_gemv64_w8a16"}})
+        };
+        let manifest = |scratch| ProgramsManifest::from_manifest(&serde_json::json!({"programs":[
+            entry(12288, ProjectionOutput::Bf16, scratch), entry(6144, ProjectionOutput::F32, scratch)]}));
+        let exact = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(256)?))?;
+        exact.validate_layout(&mtp, rows)?;
+        let oversized = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(1 << 30)?))?;
+        assert!(oversized.validate_layout(&mtp, rows).unwrap_err().is::<native::NativeOwnerMismatch>());
+        let mut stale = entry(6144, ProjectionOutput::F32, 256);
+        stale["geometry"]["output_dtype"] = serde_json::json!("torch.bfloat16");
+        let bad = ProgramsManifest::from_manifest(&serde_json::json!({"programs":[
+            entry(12288, ProjectionOutput::Bf16, 256), stale]}))?;
+        assert!(native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&bad)).is_err());
     }
     Ok(())
 }

@@ -165,3 +165,51 @@ impl<'a> NativeAttention<'a> {
         merged.context("native attention scratch")
     }
 }
+
+/// Mixed-attention O keeps the selected storage and typed output together.
+pub(super) enum OutputProjection<'a> {
+    Bf16(cuteafd_ffi::draft_projection::DraftProjections<'a>),
+    Fp8 { program: cuteafd_ffi::native_attention::Fp8Projections<'a>,
+        output: cuteafd_ffi::draft_projection::ProjectionOutput },
+}
+impl<'a> OutputProjection<'a> {
+    pub(super) fn load(programs: &'a Programs<'a>, layout: &RankWeightLayout, layer: usize,
+        rows: usize, k: usize, n: usize, output: cuteafd_ffi::draft_projection::ProjectionOutput) -> Result<Self> {
+        let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+        let operand = layout.operands.iter().find(|w| w.name == name).context("selected native O")?;
+        if operand.dtype != cuteafd_core::DType::F8E4M3 {
+            return Ok(Self::Bf16(cuteafd_ffi::draft_projection::DraftProjections::load_with_output(
+                programs, &[(k, n)], rows, output)?));
+        }
+        let program = cuteafd_ffi::native_attention::Fp8Projections::load(programs, &[(k,n)], rows, output)?;
+        let prefix = format!("model.layers.{layer}.self_attn.");
+        let borrowed = layout.core.iter().filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(_, core)| rows * core.shape[1] * 2).max().context("FP8 O requires serialized trellis scratch")?.max(256);
+        ensure!(program.scratch_bytes(k,n)? <= borrowed, "FP8 O manifest scratch exceeds borrowed rotated plane");
+        Ok(Self::Fp8 { program, output })
+    }
+
+    pub(super) fn output(&self) -> cuteafd_ffi::draft_projection::ProjectionOutput {
+        match self { Self::Bf16(program) => program.output(), Self::Fp8 { output, .. } => *output }
+    }
+
+    pub(super) fn launch(&self, input: *const c_void, weight: Buffer, out: Buffer,
+        scratch: Option<&NativeScratch<'_>>, rows: usize, k: usize, n: usize, stream: *mut c_void) -> Result<()> {
+        match self {
+            Self::Bf16(program) => {
+                // SAFETY: caller retains admitted BF16 input, weight and typed output until stream drain.
+                unsafe { program.launch_checked(input, weight.ptr, out, rows, k, n, stream)?; }
+            }
+            Self::Fp8 { program, .. } => {
+                let (values, scales) = super::weights::fp8_buffers(weight, &[n,k])?;
+                // QKV trellis egress precedes O on this same stream. Its rotated plane is
+                // dead until the next serialized projection; sibling lanes own sibling scratch.
+                let scratch = scratch.context("FP8 O borrowed scratch missing")?.scratch.buffers["rotated"];
+                // SAFETY: disjoint admitted input/output/final weights and borrowed dead scratch,
+                // retained by the lane through stream drainage; no hot-path allocation.
+                unsafe { program.launch(input, values.ptr, scales.ptr, out, scratch, rows, k, n, stream)?; }
+            }
+        }
+        Ok(())
+    }
+}

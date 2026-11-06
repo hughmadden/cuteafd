@@ -159,7 +159,7 @@ struct SwaWeights<'a> {
     /// EXL3 q, k, v, o (replacing operand slots 1, 2, 3, 7, which then hold
     /// no BF16 allocation); the o projection is K-split when heads are split.
     native: Option<super::native::NativeAttention<'a>>,
-    hqa_output: Option<cuteafd_ffi::draft_projection::DraftProjections<'a>>,
+    hqa_output: Option<super::native::OutputProjection<'a>>,
 }
 
 pub(super) struct SwaLayer<'a> {
@@ -324,7 +324,7 @@ impl<'a> SwaLayer<'a> {
             (DType::F32, vec![192]),
             (DType::F32, vec![192]),
             (DType::Bf16, vec![heads, H]),
-            (DType::Bf16, vec![H, q]),
+            (if contract.attention_mode == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact { DType::F8E4M3 } else { DType::Bf16 }, vec![H, q]),
         ]) {
             let Some(weight) = weight else { continue };
             ensure!(
@@ -436,8 +436,8 @@ impl<'a> SwaLayer<'a> {
         let hqa_output = if native_layer && !native_o {
             let output = if heads == 32 { cuteafd_ffi::draft_projection::ProjectionOutput::F32 }
                 else { cuteafd_ffi::draft_projection::ProjectionOutput::Bf16 };
-            Some(device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load_with_output(
-                programs, &[(q, H)], rows, output)?))?)
+            Some(device.run(|| super::native::OutputProjection::load(
+                programs, &layout, layer_id, rows, q, H, output))?)
         } else { None };
         // All composed contracts and aggregate bytes are checked before the first allocation.
         let resolved = DEFS
@@ -649,7 +649,8 @@ impl<'a> SwaLayer<'a> {
             let delta = CuteafdDeviceBuffer { bytes: rows * H * output.output().bytes(), ..self.planes[DELTA].buffer };
             stream.device.run(|| {
                 // SAFETY: admitted BF16 input/weight and typed delta owners survive stream drainage.
-                unsafe { output.launch_checked(p(GATED), self.weight(7), delta, rows, q, H, stream.raw)?; }
+                output.launch(p(GATED), self.immutable.weights[7].as_ref().context("SWA O weight")?.buffer,
+                    delta, self.native_scratch.as_deref(), rows, q, H, stream.raw)?;
                 Ok(())
             })?;
         } else {

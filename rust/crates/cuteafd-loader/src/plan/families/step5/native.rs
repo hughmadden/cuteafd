@@ -73,7 +73,7 @@ impl NativeSelection {
             let split = layer < cfg.layers && !cfg.full[layer] && ranks == 2;
             requirements.push(NativeRequirement { layout: NativeLayout {
                 stem, shape: [cfg.hidden, cfg.heads * cfg.dim / if split { 2 } else { 1 }],
-                fp8: false, rank: 0, ranks: if split { 2 } else { 1 },
+                fp8: contract.attention_mode == crate::plan::checkpoint::AttentionMode::Fp8Compact, rank: 0, ranks: if split { 2 } else { 1 },
                 split: if split { CoreSplit::Input } else { CoreSplit::Whole },
             }, output: if split { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 } });
         }
@@ -106,10 +106,17 @@ impl NativeSelection {
             } else { ProjectionOutput::Bf16 };
             let request = self.requirements.iter().find(|request| request.layout.stem == stem)
                 .ok_or_else(|| mismatch(&operand.name, "owner was not selected before inventory"))?;
-            ensure!(!request.layout.fp8 && operand.dtype == cuteafd_core::DType::Bf16
+            ensure!(operand.dtype == if request.layout.fp8 { cuteafd_core::DType::F8E4M3 } else { cuteafd_core::DType::Bf16 }
                 && operand.shape == request.layout.shape && output == request.output
                 && operand.allocation_bytes == request.layout.bytes()?,
                 mismatch(&operand.name, "shape, storage, output precision or capacity changed"));
+            if request.layout.fp8 {
+                let prefix = stem.strip_suffix("o_proj").expect("output requirement");
+                let borrowed = layout.core.iter().filter(|(name, _)| name.starts_with(prefix))
+                    .map(|(_, core)| (self.rows * core.shape[1] * 2).max(256) as u64).max().unwrap_or(0);
+                ensure!(self.resolved.fp8_scratch_bytes <= borrowed,
+                    mismatch(&operand.name, "manifest FP8 scratch exceeds serialized trellis rotated plane"));
+            }
         }
         for request in &self.requirements {
             let prefix = request.layout.stem.strip_suffix("o_proj").expect("output requirement");

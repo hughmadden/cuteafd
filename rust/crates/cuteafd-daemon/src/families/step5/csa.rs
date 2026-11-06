@@ -185,7 +185,7 @@ struct CsaWeights<'a> {
     residual: Program<'a>,
     epsilon: f32,
     native: Option<super::native::NativeAttention<'a>>,
-    hqa_output: Option<cuteafd_ffi::draft_projection::DraftProjections<'a>>,
+    hqa_output: Option<super::native::OutputProjection<'a>>,
 }
 
 pub(super) struct CsaLayer<'a> {
@@ -333,7 +333,7 @@ impl<'a> CsaLayer<'a> {
             (DType::F32, vec![192]),
             (DType::F32, vec![192]),
             (DType::Bf16, vec![64, H]),
-            (DType::Bf16, vec![H, Q]),
+            (if contract.attention_mode == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact { DType::F8E4M3 } else { DType::Bf16 }, vec![H, Q]),
             (DType::Bf16, vec![H, H]),
             (DType::Bf16, vec![256, H]),
             (DType::Bf16, vec![256, H]),
@@ -503,8 +503,8 @@ impl<'a> CsaLayer<'a> {
             "CSA residual geometry"
         );
         let hqa_output = if native_layer && !native_o {
-            Some(device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load_with_output(
-                programs, &[(Q, H)], rows.min(4096), cuteafd_ffi::draft_projection::ProjectionOutput::Bf16)?))?)
+            Some(device.run(|| super::native::OutputProjection::load(
+                programs, &layout, layer_id, rows.min(4096), Q, H, cuteafd_ffi::draft_projection::ProjectionOutput::Bf16))?)
         } else { None };
         let resolved = DEFS
             .iter()
@@ -1087,8 +1087,9 @@ impl<'a> CsaLayer<'a> {
                 bytes: rows * H * 2, ..self.planes[DELTA].buffer };
             stream.device.run(|| {
                 // SAFETY: the admitted BF16 tile and whole output weight survive stream drainage.
-                unsafe { output.launch_checked(self.ptr(GATED, start * Q * 2), self.weight(7),
-                    delta, rows, Q, H, stream.raw)?; }
+                output.launch(self.ptr(GATED, start * Q * 2),
+                    self.immutable.weights[7].as_ref().context("CSA O weight")?.buffer,
+                    delta, self.native_scratch.as_deref(), rows, Q, H, stream.raw)?;
                 Ok(())
             })?;
         } else {

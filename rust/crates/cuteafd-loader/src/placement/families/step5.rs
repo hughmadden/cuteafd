@@ -579,6 +579,10 @@ impl Recipe for Step5Recipe<'_> {
             contract.components.push(Component::allocation(owner,
                 ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
         }
+        for owner in self.inputs.host.attention_mount_load.allocations("step5.attention.load") {
+            contract.components.push(Component::allocation(owner.clone(),
+                ByteCurve::fixed(owner.bytes, self.maximum_pages), false, self.maximum_pages));
+        }
         if let Some(push) = &self.inputs.host.push {
             for owner in push.allocations("step5.push")? {
                 contract.components.push(Component::allocation(owner.clone(),

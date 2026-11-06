@@ -8,16 +8,6 @@ use crate::plan::checkpoint::Checkpoint;
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
-#[derive(Debug, thiserror::Error)]
-#[error("Step-5 FP8 TP2 partial export pending")]
-pub struct Fp8PartialExportPending;
-
-pub fn validate_attention_mode(checkpoint: &Checkpoint) -> Result<()> {
-    ensure!(checkpoint.attention_mode() != crate::plan::checkpoint::AttentionMode::Fp8Compact,
-        Fp8PartialExportPending);
-    Ok(())
-}
-
 /// The checkpoint's declared EXL3 widths, cross-checked against every header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Widths {

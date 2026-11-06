@@ -51,11 +51,14 @@ and onboarding experts. Parent-only checkpoint layouts do not predict HQA fit.
 Native O uses row-invariant ordered-K16 BF16-weight projections. Whole CSA
 and MTP outputs stay BF16; TP2 SWA produces F32 partials, sums them in peer
 order and narrows directly to BF16 without a trellis output rotation.
-`ATTENTION_MODE=fp8-compact` / `--fp8-compact-attention` is not supported for
-Step-5: it returns the explicit `Step-5 FP8 TP2 partial export pending`
-refusal rather than allocating an incomplete execution path. Hardware quality
-and performance qualification are pending; enabling bundle selection is not
-numerical qualification.
+`ATTENTION_MODE=fp8-compact` / `--fp8-compact-attention` converts the selected
+native BF16 O matrices to one resident E4M3 copy plus F32 block-128 scales,
+using the identity-bound amax/RNE recipe. Activations remain BF16 (W8A16),
+whole CSA/MTP outputs remain BF16, and TP2 SWA keeps genuine F32 partials.
+The manifest-owned FP8 workspace borrows dead trellis scratch on the same
+serialized lane stream; it adds no per-layer workspace allocation. Hardware
+quality and performance qualification are pending; enabling bundle selection
+is not numerical qualification.
 
 ## Native MTP
 

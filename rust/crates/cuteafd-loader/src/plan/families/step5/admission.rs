@@ -163,6 +163,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 
 /// All demands are future to the pre-weight inventory. Startup phases are
 /// absolute additional peaks above that same sample, not steady-state deltas.
+#[derive(Clone)]
 pub struct RuntimeInputs {
     pub host: HostInputs,
     pub resident_weight_limit: Option<ResidentWeights>,
@@ -216,12 +217,13 @@ pub struct HostInputs {
     pub cache_bytes: Option<u64>,
     pub headroom: u64,
     pub retained_sync_h2d_bytes: u64,
+    pub attention_mount_load: crate::shared::dense_read::MountLoad,
     pub push: Option<crate::push_load::PushHostEnvelope>,
 }
 impl Default for HostInputs {
     fn default() -> Self {
         Self { memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30,
-            retained_sync_h2d_bytes: 0, push: None }
+            retained_sync_h2d_bytes: 0, attention_mount_load: Default::default(), push: None }
     }
 }
 
@@ -429,6 +431,9 @@ impl RuntimeInputs {
 pub fn admit(checkpoint: &Checkpoint, inputs: &RuntimeInputs) -> Result<Admission> {
     let cfg = Config::parse(checkpoint)?;
     let contract = super::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?;
+    let mut selected_inputs = inputs.clone();
+    selected_inputs.host.attention_mount_load = contract.attention_mount_load(inputs.inventory.gpus.len())?;
+    let inputs = &selected_inputs;
     admit_with(&cfg, inputs, |ownership| {
         (0..ownership.ranks())
             .map(|rank| super::native::rank_admission_from_contract(&contract, &cfg, ownership, rank, inputs.unit_rows(),
@@ -454,6 +459,9 @@ pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) 
 pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize,
     contract: &super::coordinator::CoordinatorContract) -> Result<Admission> {
     let cfg = Config::parse(checkpoint)?;
+    let mut selected_inputs = inputs.clone();
+    selected_inputs.host.attention_mount_load = contract.attention_mount_load(inputs.inventory.gpus.len())?;
+    let inputs = &selected_inputs;
     if depth == 0 {
         return admit_with(&cfg, inputs, |ownership| (0..ownership.ranks()).map(|rank|
             super::native::rank_admission_from_contract(contract, &cfg, ownership, rank,
