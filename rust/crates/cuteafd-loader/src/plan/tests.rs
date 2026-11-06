@@ -4118,7 +4118,9 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
     let mut options = PlanOptions {
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true,
-            context_tokens: 256 << 10, ..Default::default() }),
+            // One page below the freed embedding's worth of KV: the GPU plan
+            // misses the context floor, the host plan clears it.
+            context_tokens: 4096, ..Default::default() }),
         ..sparks(6)
     };
     let probe = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -4130,10 +4132,14 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
             - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
             + bytes + options.layout.as_ref().unwrap().headroom_bytes
                 .max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
-    let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(gpu.devices[1].by_category().get(&Category::Embedding), None);
+    let gpu_report = plan(dir.path(), &options).unwrap();
+    assert!(!gpu_report.fits, "the GPU plan cannot reach the context floor");
+    assert_eq!(gpu_report.memory_layout.as_ref().unwrap().devices[1].by_category()
+        .get(&Category::Embedding), None);
     options.layout.as_mut().unwrap().host_embedding = true;
     let report = plan(dir.path(), &options).unwrap();
+    assert!(report.fits, "{:?}", report.hints);
+    let gpu = gpu_report.memory_layout.unwrap();
     let host = report.memory_layout.unwrap();
     assert!(!host.devices.iter().any(|d| d.by_category().contains_key(&Category::Embedding)));
     assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={} host_notes={:?} gpu_notes={:?}",
@@ -4933,7 +4939,7 @@ fn mimo_local_media_weights_share_the_native_cap_without_charging_scratch() {
     let target = owners.ranks[0].iter().map(|owner| owner.bytes).sum::<u64>();
     let options = PlanOptions { vision: MediaMode::Rtx(Some(0)),
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-            pool_tokens: Some(32768), concurrency: 4,
+            pool_tokens: Some(32768), context_tokens: 32768, concurrency: 4,
             onboard: Some(OnboardSetting::Layers(0)), ..Default::default() }), ..sparks(4) };
     let roomy = plan(dir.path(), &options).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));
@@ -5004,7 +5010,8 @@ fn mimo_spark_tower_sees_rank_io_under_a_tight_spark_budget() {
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(config, &tensors, Some(4));
     let options = |budget: u64| PlanOptions { vision: super::MediaMode::Spark(None), spark_budget_bytes: Some(budget),
-        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), concurrency: 4,
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768),
+            context_tokens: 32768, concurrency: 4,
             spark_allocation_budget_bytes: Some(budget),
             onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }), ..sparks(4) };
     let roomy = plan(dir.path(), &options(100 << 30)).unwrap();
@@ -5153,7 +5160,7 @@ fn explicit_encoder_failure_and_small_pool_admission() {
     tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
     let dir = snapshot_tp(cfg, &tensors, Some(1));
     let options = PlanOptions { vision: MediaMode::Rtx(Some(0)), layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        rtx_bytes: vec![32<<30], pool_tokens: Some(32768), ..Default::default()
+        rtx_bytes: vec![32<<30], context_tokens: 32768, pool_tokens: Some(32768), ..Default::default()
     }), ..Default::default() };
     let local = plan(dir.path(), &options).unwrap();
     assert_eq!(local.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu:0 });
