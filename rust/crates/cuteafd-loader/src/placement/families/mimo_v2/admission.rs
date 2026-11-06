@@ -6,7 +6,8 @@
 //! the same `MimoRecipe`; only the sampled baseline differs. Execution later
 //! consumes the admitted owners and never re-samples memory or re-solves.
 use crate::families::mimo_v2::admission::headroom_bytes;
-use crate::families::mimo_v2::{MimoAttention, MimoKvFormats, MimoV2Config};
+use crate::families::mimo_v2::{MimoAttention, MimoKvFormats, MimoV2Config, MimoExpertInput, MimoPrefillOutput};
+use crate::families::mimo_v2::capacity::MimoCapacityProfiles;
 use crate::placement::planner::{
     Allocation, Baseline, Budget, ByteCurve, Component, Contract, EmbeddingHome, ExpertDestination,
     Lifetime, Location, Operation, Phase, PhaseOrder, Pin, PrefillShape, Recipe, Refusal, Request,
@@ -112,6 +113,72 @@ pub fn production_request(context: u64, pool: Option<u64>, onboard: crate::place
     }
 }
 
+/// Future host allocations, resolved before the shared admission (not a second ledger).
+#[derive(Clone, Copy)]
+pub struct HostOwners {
+    pub expert_input: MimoExpertInput,
+    pub output: MimoPrefillOutput,
+    pub serving: bool,
+    pub scoring_rows: usize,
+    pub diagnostic_rows: usize,
+    pub prefix_bytes: u64,
+    pub media_bytes: u64,
+    pub headroom: u64,
+}
+
+impl HostOwners {
+    pub(super) fn demands(&self, recipe: &MimoRecipe<'_>, pages: u64, count: usize) -> Result<Vec<(String, u64)>, Refusal> {
+        let mut owners = crate::families::mimo_v2::admission::future_host_workspaces(recipe.cfg,
+            recipe.prefill.rows as usize, recipe.lanes as usize, recipe.gpus,
+            pages.checked_mul(recipe.page_rows).ok_or(Refusal::Overflow("MiMo host pool"))?,
+            recipe.context as usize, if count < recipe.routed.len() { recipe.spark_ranks } else { 0 },
+            self.expert_input, recipe.kv, self.output, self.serving, self.diagnostic_rows,
+            if recipe.gpus == 2 { count } else { 0 }).map_err(invalid)?;
+        if recipe.embedding == EmbeddingHome::HostPinned {
+            owners.push(("mimo/embedding".into(), (recipe.cfg.vocab_size as u64)
+                .checked_mul(recipe.cfg.hidden as u64).and_then(|n| n.checked_mul(2))
+                .ok_or(Refusal::Overflow("MiMo host embedding"))?));
+        }
+        let scoring = cuteafd_core::memory_layout::host_logits_bytes(self.scoring_rows as u64,
+            self.scoring_rows.max(64) as u64, recipe.cfg.vocab_size as u64)
+            .ok_or(Refusal::Overflow("MiMo host scoring"))?;
+        owners.extend([("mimo/scoring".into(), scoring), ("mimo/prefix".into(), self.prefix_bytes),
+            ("mimo/media-cache".into(), self.media_bytes)]);
+        Ok(owners)
+    }
+
+    pub(super) fn components(&self, recipe: &MimoRecipe<'_>, count: usize) -> Result<Vec<Component>, Refusal> {
+        let maximum = recipe.maximum_pages;
+        // Ordered host tables use max(256, pages * rows * 4). The sync buffer
+        // uses max(64 MiB, largest table); these are their only slope changes.
+        let table_slope = 4 * recipe.lanes.max(DECODE_ROWS);
+        let mut starts = vec![1, 65, (64u64 << 20) / table_slope + 1];
+        starts.retain(|&n| n <= maximum);
+        starts.sort_unstable();
+        starts.dedup();
+        starts.push(maximum + 1);
+        let first = self.demands(recipe, 1, count)?;
+        let mut curves = vec![Vec::new(); first.len()];
+        for interval in starts.windows(2) {
+            let (start, last) = (interval[0], interval[1] - 1);
+            let a = self.demands(recipe, start, count)?;
+            let b = self.demands(recipe, last, count)?;
+            for (index, ((_, a), (_, b))) in a.iter().zip(&b).enumerate() {
+                curves[index].push(crate::placement::planner::BytePiece { first: start, last,
+                    bytes_at_first: *a, bytes_per_page: if last == start { 0 } else { b.saturating_sub(*a).div_ceil(last - start) } });
+            }
+        }
+        Ok(first.into_iter().zip(curves).map(|((name, bytes), pieces)| {
+            let category = if name == "mimo/embedding" { Category::Embedding }
+                else if name.starts_with("mimo/transport/") { Category::Transport }
+                else if name == "mimo/prefix" { Category::Prefix } else { Category::Staging };
+            let owner = Allocation::buffer(format!("host.{name}"), Location::PINNED, bytes,
+                Lifetime::RESIDENT, category, name);
+            Component::allocation(owner, ByteCurve(pieces), false, maximum)
+        }).collect())
+    }
+}
+
 /// Everything both entries know about MiMo's physical owners before admission.
 pub struct ProductionInput<'a> {
     pub cfg: &'a MimoV2Config,
@@ -129,8 +196,12 @@ pub struct ProductionInput<'a> {
     pub experts: Vec<Option<ExpertCost>>,
     pub expert_workspace: u64,
     pub tp2_workspace: [u64; 2],
-    pub spark: CapacityProfile,
-    pub no_spark: CapacityProfile,
+    pub spark: MimoCapacityProfiles,
+    pub no_spark: MimoCapacityProfiles,
+    pub post_kv_additional: Vec<Vec<MemoryReservation>>,
+    pub draft_packing: Vec<MemoryReservation>,
+    pub host: HostOwners,
+    pub spark_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     /// Retained checkpoint weights per coordinator, media towers included.
     pub resident_weights: Vec<ResidentWeights>,
     pub operation: Operation,
@@ -184,8 +255,14 @@ pub struct MimoRecipe<'a> {
     pub embedding: EmbeddingHome,
     pub attention: Vec<LayerMode>,
     pub rows: u64,
-    pub spark_profile: CapacityProfile,
-    pub no_spark_profile: CapacityProfile,
+    pub spark_profile: MimoCapacityProfiles,
+    pub no_spark_profile: MimoCapacityProfiles,
+    pub post_kv_additional: Vec<Vec<MemoryReservation>>,
+    pub draft_packing: Vec<MemoryReservation>,
+    pub host: HostOwners,
+    pub kv: MimoKvFormats,
+    pub mtp_stages: usize,
+    pub spark_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     pub resident_weights: Vec<ResidentWeights>,
 }
 
@@ -198,16 +275,16 @@ impl<'a> ProductionInput<'a> {
             || self.layers > self.cfg.layers
             || self.experts.len() != self.layers
             || self.resident_weights.len() != self.gpus
-            || self.spark.devices.len() != self.gpus
-            || self.no_spark.devices.len() != self.gpus
-            || self.spark.pool_unit_rows == 0
-            || self.spark.pool_unit_rows != self.no_spark.pool_unit_rows
+            || self.spark.steady.devices.len() != self.gpus
+            || self.no_spark.steady.devices.len() != self.gpus
+            || self.spark.steady.pool_unit_rows == 0
+            || self.spark.steady.pool_unit_rows != self.no_spark.steady.pool_unit_rows
             || self.context == 0
             || self.spark_ranks > 8
         {
             return Err(invalid("incomplete production geometry"));
         }
-        let page_rows = self.spark.pool_unit_rows;
+        let page_rows = self.spark.steady.pool_unit_rows;
         let cache = mimo_cache_geometry(self.cfg, self.layers, self.gpus, self.kv, self.mtp_stages)
             .map_err(|error| invalid(error))?;
         if cache.logical_unit_rows != page_rows {
@@ -249,9 +326,14 @@ impl<'a> ProductionInput<'a> {
                 context: self.context, page_rows, maximum_pages, prefill: self.prefill,
                 lanes: self.lanes, embedding: self.embedding, attention, rows: self.prefill.rows,
                 spark_profile: self.spark, no_spark_profile: self.no_spark,
-                resident_weights: self.resident_weights,
+                resident_weights: self.resident_weights, post_kv_additional: self.post_kv_additional,
+                draft_packing: self.draft_packing, host: self.host, kv: self.kv, mtp_stages: self.mtp_stages,
+                spark_reply_formats: self.spark_reply_formats,
             },
-            budgets: self.budgets,
+            budgets: self.budgets.into_iter().map(|mut budget| {
+                if budget.locations.contains(&Location::HOST) { budget.headroom = self.host.headroom; }
+                budget
+            }).collect(),
         })
     }
 }
@@ -280,7 +362,7 @@ impl PreparedMimo<'_> {
 
 impl MimoRecipe<'_> {
     pub fn profile(&self, count: usize) -> &CapacityProfile {
-        if count < self.routed.len() { &self.spark_profile } else { &self.no_spark_profile }
+        if count < self.routed.len() { &self.spark_profile.steady } else { &self.no_spark_profile.steady }
     }
 
     /// Arena peak and retained expert weights per GPU for one local prefix.
@@ -304,7 +386,8 @@ impl MimoRecipe<'_> {
             for gpu in 0..2 {
                 weights[gpu] = resident[gpu];
                 peak[gpu] = self.tp2_workspace[gpu]
-                    .checked_add(resident[gpu])
+                    .checked_add(self.route[gpu])
+                    .and_then(|n| n.checked_add(resident[gpu]))
                     .and_then(|n| n.checked_add(staging[gpu]))
                     .ok_or(Refusal::Overflow("MiMo TP2 arena peak"))?;
             }
@@ -331,7 +414,7 @@ impl MimoRecipe<'_> {
     fn pool_pages(&self, profile: &CapacityProfile, rank: usize) -> Result<(u64, u64), Refusal> {
         let costs = profile.devices.get(rank).ok_or_else(|| invalid("profile rank"))?;
         let cache = mimo_cache_geometry(self.cfg, self.layers, self.gpus,
-            MimoKvFormats::default(), 0).map_err(|error| invalid(error))?;
+            self.kv, self.mtp_stages).map_err(|error| invalid(error))?;
         let records = cache.ranks[rank].persistent_unit_bytes
             .checked_add(cache.ranks[rank].pool_metadata_unit_bytes)
             .ok_or(Refusal::Overflow("MiMo pool records"))?;
@@ -448,7 +531,8 @@ impl Recipe for MimoRecipe<'_> {
         let maximum = self.maximum_pages;
         let mut contract = Contract {
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
-            spark_reply_formats: None,
+            spark_reply_formats: (self.spark_ranks > 0).then_some(cuteafd_core::spark_reply::SparkReplyFormats {
+                prefill: Some(self.spark_reply_formats.prefill(false)), decode: Some(self.spark_reply_formats.decode()) }),
             resident_weight_limit: request.resident_weight_limit,
             page_rows: self.page_rows,
             maximum_pages: maximum,
@@ -491,14 +575,45 @@ impl Recipe for MimoRecipe<'_> {
         }
         for (option, &count) in self.counts.iter().enumerate() {
             let activation = crate::placement::planner::Activation::choice(onboard, option);
-            let profile = self.profile(count);
+            let profiles = if count < self.routed.len() { &self.spark_profile } else { &self.no_spark_profile };
+            let profile = &profiles.steady;
+            for mut component in self.host.components(self, count)? {
+                component.activation = activation.clone();
+                contract.components.push(component);
+            }
+            for (phase, costs) in [(Phase::Load, &profiles.loading),
+                (Phase::PostTargetKv, &profiles.post_target_kv), (Phase::DraftLoad, &profiles.post_target_kv)] {
+                for (rank, costs) in costs.iter().enumerate() {
+                    let mut reservations = costs.reservations.clone();
+                    if phase != Phase::Load {
+                        reservations.extend(self.post_kv_additional.get(rank).into_iter().flatten().cloned());
+                        if phase == Phase::DraftLoad && rank == 0 { reservations.extend(self.draft_packing.iter().cloned()); }
+                    }
+                    for reservation in reservations {
+                        let owner = Allocation::buffer(format!("rtx{rank}.{phase:?}.{}", reservation.name),
+                            Location::coordinator(rank as u8), reservation.bytes, Lifetime { first: phase, last: phase },
+                            super::reservation_category(&reservation.name), super::reservation_group(&reservation.name));
+                        let mut component = Component::allocation(owner, ByteCurve::fixed(reservation.bytes, maximum), false, maximum);
+                        component.activation = activation.clone();
+                        contract.components.push(component);
+                    }
+                    if costs.pool_unit_bytes > 0 {
+                        let owner = Allocation::buffer(format!("rtx{rank}.{phase:?}.pool"), Location::coordinator(rank as u8),
+                            costs.pool_unit_bytes, Lifetime { first: phase, last: phase }, Category::Kv, "records");
+                        let mut component = Component::allocation(owner,
+                            ByteCurve::linear(costs.pool_unit_bytes, costs.pool_unit_bytes, maximum), false, maximum);
+                        component.activation = activation.clone();
+                        contract.components.push(component);
+                    }
+                }
+            }
             let (arena, weights) = self.arena(count)?;
             let first = self.routed.first().copied().unwrap_or(0);
             for (rank, costs) in profile.devices.iter().enumerate() {
                 let location = Location::coordinator(rank as u8);
                 for reservation in &costs.reservations {
                     let owner = Allocation::buffer(format!("rtx{rank}.{}", reservation.name),
-                        location, reservation.bytes, Lifetime::TARGET,
+                        location, reservation.bytes, Lifetime { first: Phase::Warmup, last: Phase::Growth },
                         super::reservation_category(&reservation.name),
                         super::reservation_group(&reservation.name));
                     let mut component = Component::allocation(owner,
@@ -513,7 +628,7 @@ impl Recipe for MimoRecipe<'_> {
                 ] {
                     if bytes == 0 { continue; }
                     let owner = Allocation::buffer(format!("rtx{rank}.pool.{group}"), location,
-                        bytes, Lifetime::TARGET, category, group);
+                        bytes, Lifetime { first: Phase::Warmup, last: Phase::Growth }, category, group);
                     let mut component = Component::allocation(owner,
                         ByteCurve::linear(bytes, bytes, maximum), false, maximum);
                     component.activation = activation.clone();
@@ -526,7 +641,7 @@ impl Recipe for MimoRecipe<'_> {
                         format!("resident routed layers {:?}", &self.routed[..count])
                     };
                     let owner = Allocation::buffer(format!("rtx{rank}.experts.arena"), location,
-                        arena[rank].saturating_sub(self.route[rank]), Lifetime::TARGET,
+                        arena[rank].saturating_sub(self.route[rank]), Lifetime { first: Phase::Warmup, last: Phase::Growth },
                         Category::Experts, group);
                     let mut component = Component::allocation(owner,
                         ByteCurve::fixed(arena[rank].saturating_sub(self.route[rank]), maximum),
@@ -535,7 +650,7 @@ impl Recipe for MimoRecipe<'_> {
                     contract.components.push(component);
                     if self.route[rank] > 0 {
                         let owner = Allocation::buffer(format!("rtx{rank}.transport.tp2_routes"),
-                            location, self.route[rank], Lifetime::TARGET, Category::Transport,
+                            location, self.route[rank], Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Transport,
                             "TP2 canonical routes");
                         let mut component = Component::allocation(owner,
                             ByteCurve::fixed(self.route[rank], maximum), false, maximum);
@@ -564,7 +679,7 @@ impl Recipe for MimoRecipe<'_> {
 }
 
 /// Preserve the capacity interface consumed by context/prefix startup, without
-/// a second pool solve. Startup load and post-KV packing checks stay separate.
+/// a second pool solve. Load and post-KV packing are phases of the same admission.
 pub fn resolved_capacity(admitted: &AdmittedMimo, concurrency: u32, rings: u32)
     -> Result<ResolvedCapacity, CacheGeometryError> {
     let profile = &admitted.profile;

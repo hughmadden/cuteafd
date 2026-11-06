@@ -196,6 +196,12 @@ mod tests {
         (cfg, profile.clone(), profile)
     }
 
+    fn phase_profiles(profile: &CapacityProfile) -> crate::families::mimo_v2::capacity::MimoCapacityProfiles {
+        crate::families::mimo_v2::capacity::MimoCapacityProfiles { resident_weights: vec![ResidentWeights(0); profile.devices.len()],
+            loading: profile.devices.iter().map(|costs| DeviceCosts { device: costs.device, reservations: vec![], pool_unit_bytes: 0 }).collect(),
+            post_target_kv: profile.devices.clone(), steady: profile.clone() }
+    }
+
     fn input<'a>(cfg: &'a MimoV2Config, spark: &'a CapacityProfile, no_spark: &'a CapacityProfile,
         ranks: usize, context: u64) -> admission::ProductionInput<'a> {
         let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
@@ -211,7 +217,11 @@ mod tests {
             experts: vec![None, Some(cost), Some(cost), Some(cost)],
             expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
             tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] },
-            spark: spark.clone(), no_spark: no_spark.clone(),
+            spark: phase_profiles(spark), no_spark: phase_profiles(no_spark),
+            post_kv_additional: vec![vec![]; ranks], draft_packing: vec![],
+            host: admission::HostOwners { expert_input: Default::default(), output: crate::families::mimo_v2::MimoPrefillOutput::LastRow,
+                serving: true, scoring_rows: 64, diagnostic_rows: 256, prefix_bytes: 0, media_bytes: 0, headroom: 0 },
+            spark_reply_formats: Default::default(),
             resident_weights: vec![ResidentWeights(11 << 30); ranks],
             operation: crate::placement::planner::Operation::Serving,
             budgets: admission::production_budgets(&vec![(96 << 30, 96 << 30); ranks],
@@ -236,6 +246,46 @@ mod tests {
         assert_eq!(unset.placement.pool_tokens, zero.placement.pool_tokens);
         assert_eq!(unset.spark.rtx_layers, zero.spark.rtx_layers);
         assert_eq!(unset.placement.items, zero.placement.items);
+    }
+
+    #[test]
+    fn host_tables_match_admitted_curves_and_share_embedding_budget() {
+        let (cfg, spark, no_spark) = fixture(2, 4096);
+        let mut facts = input(&cfg, &spark, &no_spark, 2, 4096);
+        facts.embedding = crate::placement::planner::EmbeddingHome::HostPinned;
+        let prepared = facts.prepare().unwrap();
+        let recipe = &prepared.recipe;
+        let components = recipe.host.components(recipe, 1).unwrap();
+        for pages in [1, 2, 63, 64, 65, 66, 1024, recipe.maximum_pages] {
+            for (component, (name, bytes)) in components.iter().zip(recipe.host.demands(recipe, pages, 1).unwrap()) {
+                assert_eq!(component.bytes.at(pages).unwrap(), bytes, "{name} pages={pages}");
+            }
+        }
+        let request = admission::production_request(4096, Some(4096), Onboard::Layers(1), recipe.prefill,
+            crate::placement::planner::Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+        let admitted = prepared.admit(request).unwrap();
+        let host = admitted.solved.items(crate::placement::planner::Location::PINNED).unwrap();
+        assert!(host.iter().any(|item| item.category == Category::Embedding && item.bytes > 0));
+        assert!(admitted.solved.phases.iter().any(|row| row.budget == "rtx0"
+            && row.phase == crate::placement::planner::Phase::Load));
+    }
+
+    #[test]
+    fn explicit_reply_formats_are_preserved_by_the_same_contract() {
+        use cuteafd_core::spark_reply::{SparkReplyFormat::*, SparkReplyFormats};
+        let (cfg, spark, no_spark) = fixture(1, 4096);
+        for prefill in [Bf16, Fp8, Nvfp4] {
+            for decode in [Bf16, Fp8, Nvfp4] {
+                let formats = SparkReplyFormats { prefill: Some(prefill), decode: Some(decode) };
+                let mut facts = input(&cfg, &spark, &no_spark, 1, 4096);
+                facts.spark_reply_formats = formats;
+                let prepared = facts.prepare().unwrap();
+                let request = admission::production_request(4096, Some(4096), Onboard::Layers(0), prepared.recipe.prefill,
+                    crate::placement::planner::Operation::Serving, ResidentWeights(u64::MAX), formats);
+                let admitted = prepared.admit(request).unwrap();
+                assert_eq!(admitted.solved.decisions.spark_reply_formats, Some(formats));
+            }
+        }
     }
 
     #[test]

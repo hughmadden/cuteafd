@@ -1250,6 +1250,20 @@ def capture_mimo_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert len(plans) == 1, result.stderr
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
     assert "prefill reserve does not fit" not in result.stderr
+    # The plan charges the native MTP depth serve-mimo receives (0 without --mtp).
+    serves = [shlex.split(line) for line in result.stderr.splitlines()
+              if "serve-mimo" in line and "docker run -d" in line]
+    assert len(serves) == 1, result.stderr
+    serve = serves[0]
+    serve_mtp = serve[serve.index("--mtp") + 1] if "--mtp" in serve else "0"
+    assert "--native-mtp-layers" in plans[0], plans[0]
+    assert plans[0][plans[0].index("--native-mtp-layers") + 1] == serve_mtp, (plans[0], serve)
+    # A shipped DFlash2 config charges its drafter in the admitted layout.
+    if config.get("SPECULATOR") == "dflash2":
+        assert "--draft" in serve, serve
+        lead = next(device for device in deployment["memory_layout"]["devices"]
+                    if device["kind"] == "rtx" and device["index"] == 0)
+        assert any(item["category"] == "drafter" and item["bytes"] > 0 for item in lead["items"]), lead
 
 
 def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
