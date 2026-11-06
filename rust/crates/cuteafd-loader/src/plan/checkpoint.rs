@@ -723,6 +723,20 @@ mod sliced_tests {
     }
 
     #[test]
+    fn shard_paths_stay_inside_snapshot_even_for_unselected_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        for shard in ["/outside.safetensors", "../outside.safetensors", "dense/../../outside.safetensors", ""] {
+            std::fs::write(dir.path().join("model.safetensors.index.json"),
+                serde_json::to_vec(&json!({"weight_map": {"model.visual.weight": shard}})).unwrap()).unwrap();
+            for selected in [false, true] {
+                let error = Checkpoint::open_for_role(dir.path(), "vision", |_| selected).unwrap_err().to_string();
+                assert!(error.contains("invalid checkpoint shard path"), "{shard:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
     fn grouped_shards_ignore_unindexed_and_wrong_shard_headers() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
