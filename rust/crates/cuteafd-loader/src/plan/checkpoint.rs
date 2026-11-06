@@ -103,7 +103,7 @@ pub struct Checkpoint {
     pub quantize_config: Option<Value>,
     /// Authoritative inventory, including tensors whose shards are not local.
     pub weight_map: BTreeMap<String, String>,
-    /// Headers read for this role, sorted by name.
+    /// Payload and declared native-attention classification headers, sorted by name.
     pub tensors: Vec<CheckpointTensor>,
     /// Shards named by the index that are not readable (absent or incomplete).
     pub missing_shards: Vec<String>,
@@ -233,8 +233,9 @@ impl Checkpoint {
         Ok(checkpoint)
     }
 
-    /// A runtime role declares the tensors it reads before any shard is opened.
-    /// Every selected index entry must have a readable, matching header.
+    /// A runtime role declares its payload reads before any shard is opened.
+    /// Declared native-attention headers also remain available for classification;
+    /// they do not add role payload bytes. Every selected header must be readable.
     pub fn open_view_for_role(view: &CheckpointView, role: &str, needed: impl Fn(&str) -> bool) -> Result<Self> {
         Self::open_view_filtered(view, Some(role), needed, None)
     }
@@ -289,13 +290,17 @@ impl Checkpoint {
                 .map(|meta| (meta.name, "model.safetensors".to_owned()))
                 .collect()
         };
+        // Native headers classify eager family cores even when this role never
+        // reads their payloads. Share the role's once-per-shard header pass.
+        let native = if role.is_some() { view.native_attention_names().collect::<BTreeSet<_>>() }
+            else { BTreeSet::new() };
         // Group once instead of scanning the complete index for every shard.
         let mut shards = BTreeMap::<&String, BTreeSet<&str>>::new();
         for (name, shard) in &weight_map {
             ensure!(!shard.is_empty() && Path::new(shard).components().all(|component|
                 matches!(component, std::path::Component::Normal(_))),
                 "invalid checkpoint shard path {shard:?}");
-            if needed(name) { shards.entry(shard).or_default().insert(name); }
+            if needed(name) || native.contains(name.as_str()) { shards.entry(shard).or_default().insert(name); }
         }
         let mut tensors = Vec::with_capacity(weight_map.len());
         let mut missing_shards = Vec::new();
@@ -335,7 +340,7 @@ impl Checkpoint {
                         snapshot.display());
                 }
             }
-            shard_bytes += metadata.len();
+            if names.iter().any(|name| needed(name)) { shard_bytes += metadata.len(); }
             for meta in headers {
                 if names.contains(meta.name.as_str()) {
                     tensors.push(CheckpointTensor {

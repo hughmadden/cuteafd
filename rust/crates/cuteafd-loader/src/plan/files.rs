@@ -336,14 +336,43 @@ mod tests {
                 let stem = name.strip_suffix(".weight").unwrap();
                 assert_eq!(inventory.projection(stem)?.storage, opened.projection(stem)?.storage);
             }
+            let role = ReadRole::Spark { rank: 0, world: 6 };
+            let selected = required_tensors(&inventory, role)?;
+            let opened = open_role_view(&view, role)?;
+            let expert_shards = selected.iter().map(|name| &inventory.weight_map[name]).collect::<BTreeSet<_>>();
+            let expert_bytes = expert_shards.iter().map(|shard|
+                std::fs::metadata(dir.path().join(shard)).map(|meta| meta.len())).sum::<std::io::Result<u64>>()?;
+            assert_eq!(opened.shard_bytes, expert_bytes, "classification headers cannot grow role payload bytes");
+            assert_eq!(opened.tensors.len(), selected.len() + names.len());
+            let classification = Checkpoint::open_view_for_role(&view, "classification-only", |_| false)?;
+            assert_eq!(classification.shard_bytes, 0);
+            assert_eq!(classification.tensors.len(), names.len());
+            for name in names {
+                assert!(opened.has_header(name), "role checkpoint lost classification header {name}");
+                assert!(!selected.contains(name), "native attention is not a Spark read");
+            }
+            assert!(!opened.has_header("unindexed.weight"));
+            assert_eq!(required_tensors(&opened, role)?, selected);
+            let recipe = super::super::experts::checkpoint_spark_recipe(&opened, 6, &[1])?;
+            assert_eq!(recipe, super::super::experts::checkpoint_spark_recipe(
+                &Checkpoint::open_view(&view)?, 6, &[1])?);
+            let manifest = manifest_roles_view(&view, &[role])?;
+            let payload_files = manifest.files.iter().filter(|file| file.path.ends_with(".safetensors"))
+                .map(|file| &file.path).collect::<BTreeSet<_>>();
+            assert_eq!(payload_files, expert_shards);
+            assert!(!manifest.files.iter().any(|file| file.path == "native.safetensors"));
         }
         write_safetensors(&dir.path().join("native.safetensors"), &tensors[..1]);
         let view = CheckpointView::select(dir.path(), AttentionMode::Hqa)?;
         assert!(Checkpoint::inventory_view(&view).unwrap_err().to_string().contains("native attention header missing"));
+        assert!(Checkpoint::open_view_for_role(&view, "spark0", |name| name.contains(".experts."))
+            .unwrap_err().to_string().contains("header is missing"));
         let mut malformed = tensors.clone();
         malformed[0].2[0] += 1;
         write_safetensors(&dir.path().join("native.safetensors"), &malformed);
         assert!(Checkpoint::inventory_view(&view).unwrap_err().to_string().contains("disagree with selected safetensors header"));
+        assert!(Checkpoint::open_view_for_role(&view, "spark0", |name| name.contains(".experts."))
+            .unwrap_err().to_string().contains("disagree with selected safetensors header"));
         Ok(())
     }
 
