@@ -32,7 +32,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let original_report = report.clone();
     let original_options = options.clone();
+    let started = std::time::Instant::now();
     let memory = layout_for_experts(report, model, input, options, report.spark_ranks, false);
+    tracing::info!(seconds = started.elapsed().as_secs_f64(), "V4 initial geometry admission");
+    let initial_timing = report.admission_timing.clone();
     let all_local = report.solver_placement.as_ref().is_some_and(|placement|
         !placement.layers.iter().any(|layer| layer.experts == crate::placement::ExpertHome::Spark));
     if original_report.spark_ranks == 0 || !all_local { return memory; }
@@ -41,7 +44,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     // Re-admit the entire local geometry, never just rewrite the published rows.
     let mut local_report = original_report.clone();
     let mut local_options = original_options.clone();
+    let started = std::time::Instant::now();
     let local = layout_for_experts(&mut local_report, model, input, &mut local_options, 0, false);
+    tracing::info!(seconds = started.elapsed().as_secs_f64(), "V4 local geometry re-admission");
+    add_admission_timing(&mut local_report, initial_timing.as_ref());
     if local_report.placement_supported && local_report.solver_placement.is_some() {
         *report = local_report;
         *options = local_options;
@@ -51,7 +57,16 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     // retain only candidates with real Spark ownership in the remote geometry.
     *report = original_report;
     *options = original_options;
-    layout_for_experts(report, model, input, options, report.spark_ranks, true)
+    let remote = layout_for_experts(report, model, input, options, report.spark_ranks, true);
+    add_admission_timing(report, local_report.admission_timing.as_ref());
+    remote
+}
+
+fn add_admission_timing(report: &mut PlanReport, prior: Option<&crate::plan::AdmissionTiming>) {
+    if let (Some(current), Some(prior)) = (&mut report.admission_timing, prior) {
+        current.solve_us = current.solve_us.saturating_add(prior.solve_us);
+        current.admissions = current.admissions.saturating_add(prior.admissions);
+    }
 }
 
 fn layout_for_experts(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
