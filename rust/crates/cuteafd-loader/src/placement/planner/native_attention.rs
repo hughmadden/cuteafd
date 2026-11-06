@@ -152,6 +152,66 @@ mod tests {
     }
 
     #[test]
+    fn typed_specs_match_manifest_entries_without_losing_metadata() {
+        use cuteafd_ffi::programs::ProgramSpec;
+        let mut values = Vec::new();
+        let mut specs = Vec::new();
+        for fp8 in [false, true] {
+            for output in [ProjectionOutput::Bf16, ProjectionOutput::F32] {
+                for stage in if fp8 { &[64, 4096][..] } else { &[4096][..] } {
+                    let mut value = entry(fp8, output, *stage, 2048);
+                    value["scalars"] = json!([{"type":"int32"},{"type":"int64"},{"type":"float32"}]);
+                    specs.push(ProgramSpec {
+                        name: value["name"].as_str().unwrap().into(),
+                        pointers: if fp8 { ["x", "weight", "scales", "out", "scratch"].as_slice() }
+                            else { ["x", "w", "out"].as_slice() }.iter().map(|name| (*name).into()).collect(),
+                        scalar_kinds: vec![b'i', b'l', b'f'],
+                        scratch: if fp8 { [("scratch".into(), 2048)].into() } else { Default::default() },
+                        capacity_rows: if fp8 { *stage as u32 } else { 4096 },
+                        geometry: value["geometry"].clone(),
+                    });
+                    values.push(value);
+                }
+            }
+        }
+        let parsed = ProgramsManifest::from_manifest(&json!({"programs":values})).unwrap();
+        let typed = ProgramsManifest::from_specs(specs.iter()).unwrap();
+        for spec in &specs {
+            let left = &parsed.get(&spec.name).unwrap().spec;
+            let right = &typed.get(&spec.name).unwrap().spec;
+            assert_eq!(left.name, right.name);
+            assert_eq!(left.pointers, right.pointers);
+            assert_eq!(left.scalar_kinds, right.scalar_kinds);
+            assert_eq!(left.scratch, right.scratch);
+            assert_eq!(left.capacity_rows, right.capacity_rows);
+            assert_eq!(left.geometry, right.geometry);
+        }
+        specs[0].geometry = json!({"changed_after_copy":true});
+        assert_ne!(typed.get(&specs[0].name).unwrap().spec.geometry, specs[0].geometry);
+    }
+
+    #[test]
+    fn typed_specs_narrowly_filter_and_refuse_native_duplicates() {
+        let value = entry(false, ProjectionOutput::Bf16, 4096, 0);
+        let parsed = ProgramsManifest::from_manifest(&json!({"programs":[value]})).unwrap();
+        let name = ProjectionOutput::Bf16.program_name(4096, 8192);
+        let native = parsed.get(&name).unwrap().spec.clone();
+        let mut unrelated = native.clone();
+        unrelated.name = "muse_attention".into();
+        unrelated.geometry = Value::Null;
+        let mut near_match = unrelated.clone();
+        near_match.name = "native_attention_other".into();
+        let specs = [&unrelated, &unrelated, &near_match, &native];
+        let typed = ProgramsManifest::from_specs(specs.into_iter()).unwrap();
+        assert!(typed.get(&native.name).is_some());
+        assert!(typed.get(&unrelated.name).is_none());
+        assert!(typed.get(&near_match.name).is_none());
+        let error = ProgramsManifest::from_specs([&native, &native].into_iter()).unwrap_err();
+        assert!(error.to_string().contains(&format!("duplicate native program {name}")));
+        assert!(ProgramsManifest::from_specs(std::iter::empty()).unwrap().get(&name).is_none());
+    }
+
+    #[test]
     fn manifest_narrowly_parses_native_entries_and_refuses_duplicates() {
         let valid = entry(false,ProjectionOutput::Bf16,4096,0);
         assert!(ProgramsManifest::from_manifest(&json!({"programs":[{"name":"unrelated","opaque":true},valid.clone()]})).is_ok());

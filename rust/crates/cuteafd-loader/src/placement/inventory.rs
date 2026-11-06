@@ -360,12 +360,26 @@ impl ProgramsManifest {
         let programs = manifest["programs"].as_array().context("PROGRAMS.json has no program list")?;
         let mut entries = std::collections::BTreeMap::new();
         for entry in programs {
-            let Some(name) = entry["name"].as_str().filter(|name|
-                name.starts_with("draft_bf16_k") || name.starts_with("native_attention_n")) else { continue; };
+            let Some(name) = entry["name"].as_str().filter(|name| Self::is_native(name)) else { continue; };
             let parsed = ProgramEntry::from_manifest(entry).with_context(|| format!("native program {name}"))?;
             ensure!(entries.insert(name.to_owned(), parsed).is_none(), "duplicate native program {name}");
         }
         Ok(Self { entries })
+    }
+
+    /// Reuse an already parsed runtime program table without rereading its manifest.
+    pub fn from_specs<'a>(specs: impl Iterator<Item = &'a cuteafd_ffi::programs::ProgramSpec>)
+        -> anyhow::Result<Self> {
+        let mut entries = std::collections::BTreeMap::new();
+        for spec in specs.filter(|spec| Self::is_native(&spec.name)) {
+            anyhow::ensure!(entries.insert(spec.name.clone(), ProgramEntry { spec: spec.clone() }).is_none(),
+                "duplicate native program {}", spec.name);
+        }
+        Ok(Self { entries })
+    }
+
+    fn is_native(name: &str) -> bool {
+        name.starts_with("draft_bf16_k") || name.starts_with("native_attention_n")
     }
 
     pub fn get(&self, name: &str) -> Option<&ProgramEntry> { self.entries.get(name) }
