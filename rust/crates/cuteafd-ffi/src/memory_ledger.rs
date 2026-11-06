@@ -548,12 +548,21 @@ pub fn device_memory(device: i32) -> Option<(usize, usize)> {
     }
 }
 
+/// Hold for the whole test, including allocation cleanup: audits observe all
+/// threads' events, not just the allocations owned by the current test.
+#[cfg(test)]
+pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn startup_history_preserves_transients_reuse_and_initial_owners() {
+        let _ledger = test_guard();
         let base = 0x7300_0000_0000usize;
         record_alloc(Space::Pinned, -1, base, 64);
         let audit = AllocationAudit::begin();
@@ -586,6 +595,7 @@ mod tests {
 
     #[test]
     fn dropped_audit_does_not_retain_steady_state_history() {
+        let _ledger = test_guard();
         let audit = AllocationAudit::begin();
         let events = Arc::downgrade(&audit.events);
         drop(audit);
@@ -601,6 +611,7 @@ mod tests {
 
     #[test]
     fn scopes_tensors_and_frees_balance() {
+        let _ledger = test_guard();
         let base = 0x7000_0000_0000usize;
         {
             let _weights = scope("test/weights");
@@ -632,6 +643,7 @@ mod tests {
     /// the owner, so plan == runtime sums every allocation a component makes.
     #[test]
     fn owners_survive_nested_category_scopes() {
+        let _ledger = test_guard();
         let base = 0x7100_0000_0000usize;
         {
             let _owner = owner("test/lanes/head");
