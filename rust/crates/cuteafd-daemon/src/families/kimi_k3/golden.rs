@@ -98,6 +98,16 @@ impl GoldenArgs {
             "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
     }
 
+    fn selected_provenance(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Value {
+        use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, AttentionMode};
+        let mut provenance = self.provenance();
+        provenance["attention_mode"] = serde_json::json!(view.mode());
+        provenance["attention_bundle_fingerprint"] = serde_json::json!(view.fingerprint());
+        provenance["attention_fp8_recipe"] = serde_json::json!(
+            if view.mode() == AttentionMode::Fp8Compact { FP8_RECIPE } else { "none" });
+        provenance
+    }
+
     fn resolved_attention(&self) -> cuteafd_loader::placement::AttentionPlacement {
         cuteafd_loader::families::kimi_k3::resolve_attention(
             cuteafd_loader::placement::attention::parse(&self.attention_placement).expect("clap validated attention"),
@@ -200,12 +210,13 @@ async fn on_engine_thread(work: impl FnOnce() -> Result<()> + Send + 'static) ->
 fn run(args: GoldenArgs) -> Result<()> {
     if args.nll { return full_run(args); }
     tracing::info!(ffn_mode = args.ffn_mode().name(), "Kimi FFN numerics selection");
-    println!("Kimi run provenance: {}", args.provenance());
     let last = args.last_layer.context("prefix requires --last-layer")?;
     let panel: Value = serde_json::from_slice(&std::fs::read(args.windows.as_ref().context("prefix requires --windows")?)?)?;
     let reference = reference(args.reference_state.as_deref().context("prefix requires --reference-state")?,
         &panel, args.window.as_deref().context("prefix requires --window")?, last)?;
     let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+    println!("Kimi run provenance: {}", args.selected_provenance(checkpoint.view.as_ref()
+        .context("Kimi golden requires the immutable selected checkpoint view")?));
     let full = KimiK3Config::from_hf(&checkpoint.config)?;
     full.release_geometry()?;
     let cfg = admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?;
@@ -251,7 +262,8 @@ fn full_run(args: GoldenArgs) -> Result<()> {
     ensure!((1..=8).contains(&args.peers.len()) && hosted == cfg.dense.iter().enumerate()
         .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
         "Kimi full-forward needs the planned Spark routed subset on the selected real ranks");
-    println!("Kimi all-layer run provenance: {}", args.provenance());
+    println!("Kimi all-layer run provenance: {}", args.selected_provenance(checkpoint.view.as_ref()
+        .context("Kimi golden requires the immutable selected checkpoint view")?));
     println!("Kimi F32 reference: config={} revision={} windows={} scored_rows={}",
         cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG, cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
         windows.len(), windows.iter().map(|w| w.positions.len()).sum::<usize>());
@@ -290,7 +302,7 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
             top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path("prefill");
-        probe.provenance(args.provenance());
+        probe.provenance(args.selected_provenance(engine.target_view()));
         for chunk in chunks {
             let (first, end) = (chunk.start, chunk.end);
             let sequences = vec![vec![super::device::SequenceRows {
@@ -331,7 +343,7 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
         "reference_config":cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG,
         "reference_revision":cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
         "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
-        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":args.provenance(),"score":score}))?;
+        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":args.selected_provenance(engine.target_view()),"score":score}))?;
     Ok(())
 }
 
@@ -366,7 +378,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
             top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
         probe.admitted("kimi_k3", &window.tokens, 0);
         probe.selected_score_path(if graphs { "verify-graphs" } else { "verify-eager" });
-        probe.provenance(args.provenance());
+        probe.provenance(args.selected_provenance(engine.target_view()));
         // Prompt prefix: rows 0..score_from-1, chunked at the lane capacity.
         let prefix = window.score_from - 1;
         for first in (0..prefix).step_by(capacity) {
@@ -420,7 +432,7 @@ fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engin
         "reference_config":cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG,
         "reference_revision":cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
         "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
-        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":args.provenance(),
+        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":args.selected_provenance(engine.target_view()),
         "graph_replays":replays,"score":score}))?;
     Ok(())
 }
@@ -614,6 +626,34 @@ mod tests {
                 .filter_map(|(index, arg)| (!(at..at + 2).contains(&index)).then_some(*arg))).is_err());
         }
         assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(["--nll"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn golden_provenance_binds_selected_mode_bundle_and_fp8_recipe() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::checkpoint::{view::{COMPACT_CONFIG, COMPACT_INDEX, COMPACT_QUANT, FP8_RECIPE},
+            AttentionMode, CheckpointView};
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), "{}")?;
+        std::fs::write(dir.path().join(COMPACT_CONFIG), "{}")?;
+        std::fs::write(dir.path().join(COMPACT_INDEX), r#"{"weight_map":{}}"#)?;
+        std::fs::write(dir.path().join(COMPACT_QUANT), "{}")?;
+        let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output"])?.command
+            else { panic!("Kimi command"); };
+        let mut fingerprints = std::collections::BTreeSet::new();
+        for mode in [AttentionMode::Hqa, AttentionMode::Compact, AttentionMode::Fp8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let provenance = args.selected_provenance(&view);
+            assert_eq!(provenance["attention_mode"], serde_json::to_value(mode)?);
+            assert_eq!(provenance["attention_bundle_fingerprint"], view.fingerprint());
+            assert_eq!(provenance["attention_fp8_recipe"],
+                if mode == AttentionMode::Fp8Compact { FP8_RECIPE } else { "none" });
+            fingerprints.insert(view.fingerprint().to_owned());
+        }
+        assert_eq!(fingerprints.len(), 3);
         Ok(())
     }
 

@@ -311,6 +311,10 @@ impl<'a> Engine<'a> {
             hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
     }
 
+    pub(crate) fn target_view(&self) -> &cuteafd_loader::plan::checkpoint::CheckpointView {
+        &self.target_view
+    }
+
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
         let mut prefix = self.prefix.try_borrow_mut()?;
         if let Some(prefix) = prefix.as_ref() { return Ok(prefix.clone()); }

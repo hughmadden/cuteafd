@@ -500,3 +500,53 @@ impl LayerLayout {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod native_record_tests {
+    use super::*;
+    use crate::families::glm5_flash::weights::{attention_records, AttentionRecord};
+    use cuteafd_loader::{families::glm5_flash::core::{CoreSplit, NativeLayout, NativeProjection},
+        plan::checkpoint::{AttentionMode, CheckpointTensor, ProjectionStorage, SelectedProjection},
+        SafetensorsTensorMetadata};
+
+    #[test]
+    fn native_mount_estimate_covers_actual_qb_and_o_records() -> Result<()> {
+        for (leaf, shape, split) in [("q_b_proj", [18432, 1536], CoreSplit::Output),
+            ("o_proj", [7168, 12288], CoreSplit::Input)] {
+            let stem = format!("language_model.model.layers.0.self_attn.{leaf}");
+            let selected = SelectedProjection { storage: ProjectionStorage::Native {
+                dtype: DType::Bf16, shape: shape.to_vec() }, source_bytes: (shape[0] * shape[1] * 2) as u64,
+                tensors: vec![CheckpointTensor { shard: "not-opened.safetensors".into(),
+                    meta: SafetensorsTensorMetadata { name: format!("{stem}.weight"), dtype: DType::Bf16,
+                        shape: shape.to_vec(), byte_offset: 4096, byte_length: (shape[0] * shape[1] * 2) as u64 } }] };
+            for fp8 in [false, true] {
+                let core = CoreInventory { native: BTreeMap::from([(stem.clone(), NativeProjection {
+                    shape, fp8, split })]), ..Default::default() };
+                for ranks in [1, 2] { for rank in 0..ranks {
+                    let mut local = shape;
+                    match split { CoreSplit::Input => local[1] /= ranks,
+                        CoreSplit::Output => local[0] /= ranks, CoreSplit::Whole => {} }
+                    let layout = NativeLayout { stem: stem.clone(), shape: local, fp8, rank, ranks, split };
+                    let values = CuteafdDeviceBuffer { ptr: 0x1000usize as *mut _,
+                        bytes: local[0] * local[1] * if fp8 { 1 } else { 2 }, ..Default::default() };
+                    let scales = fp8.then(|| CuteafdDeviceBuffer { ptr: 0x2000usize as *mut _,
+                        bytes: local[0] / 128 * (local[1] / 128) * 4, ..Default::default() });
+                    let mode = if fp8 { AttentionMode::Fp8Compact } else { AttentionMode::Hqa };
+                    let records = attention_records(std::path::Path::new("/not-opened"), &selected, mode,
+                        &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, scales)?;
+                    let mut actual = cuteafd_loader::shared::dense_read::MountLoad::default();
+                    for record in records {
+                        actual.merge(match record {
+                            AttentionRecord::Operand(record) => record.mount_load()?,
+                            AttentionRecord::Step(record) => record.mount_load()?,
+                        });
+                    }
+                    core.native_mount_load(ranks)?.validate(actual)?;
+                    assert_eq!(actual.pinned_tables > 0, fp8);
+                    assert_eq!(actual.full_row_cache > 0, ranks == 2 && split == CoreSplit::Input);
+                } }
+            }
+        }
+        Ok(())
+    }
+}

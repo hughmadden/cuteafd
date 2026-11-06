@@ -157,6 +157,19 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
             cfg.release_geometry()?;
             cuteafd_bench::context::set_family(cfg.family_id());
+            let view = checkpoint.view.as_ref()
+                .context("Kimi serving requires the immutable selected checkpoint view")?;
+            use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, AttentionMode};
+            let mode = match view.mode() {
+                AttentionMode::Hqa => "hqa", AttentionMode::Compact => "compact",
+                AttentionMode::Fp8Compact => "fp8-compact",
+            };
+            let recipe = if view.mode() == AttentionMode::Fp8Compact { FP8_RECIPE } else { "none" };
+            cuteafd_bench::context::set_resolved("attention-mode", mode);
+            cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
+            cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
+            tracing::info!(attention_mode = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+                "selected immutable attention bundle");
             let concurrency = usize::from(worker_args.max_sequences);
             let slots = cuteafd_core::concurrency::state_slots(concurrency as u64) as usize;
             let prefill = worker_args.prefill()?;
