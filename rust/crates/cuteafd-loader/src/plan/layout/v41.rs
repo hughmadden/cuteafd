@@ -24,17 +24,18 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // Units, waves and span come from the shared prefill policy and the
     // descriptor (two units in flight, one target pass per slot).
     let limits = crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V41);
+    // The reserve the units are cut from: explicit, else the standard one.
+    // The launcher's serve argv carries it, so a pinned shape reports the
+    // standard reserve it replaced. Reported before the shared prefill solve
+    // so a refusal keeps it and the count selector never re-solves the shape.
+    report.prefill_reserve_rows = Some(options.prefill_reserve_rows
+        .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS));
     let prefill = super::resolve_prefill(input, report, options, report.placement.spark_ranks(), limits)?;
     let mut shape = Shape::resolve(input, report, model, options, ShapePolicy {
         context: ContextPolicy::Checkpoint, prefill_rows: Some(prefill.unit_rows), all_native_stages: false,
     });
     shape.prefill_rows = prefill.unit_rows;
     report.prefill_span_rows = Some(prefill.span_rows);
-    // The reserve the units are cut from: explicit, else the standard one.
-    // The launcher's serve argv carries it, so a pinned shape reports the
-    // standard reserve it replaced.
-    report.prefill_reserve_rows = Some(options.prefill_reserve_rows
-        .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS));
     let ranks = options.rtx_bytes.len();
     ensure!((1..=2).contains(&ranks), "V4.1 requires one or two coordinator GPUs");
     cuteafd_core::concurrency::validate("deepseek_v41", shape.concurrency)?;

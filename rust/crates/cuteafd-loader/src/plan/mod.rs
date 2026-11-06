@@ -1548,7 +1548,9 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         let mut report = input.plan(&candidate)?;
         // Shared Recipe families admit one fixed prefill shape. Preserve their
         // typed refusal instead of retrying smaller reserves in a second solve.
+        // A plan that already fixed its reserve has nothing left to shrink.
         if ranks == 0 || candidate.layout.is_none()
+            || report.prefill_reserve_rows.is_some()
             || input.family_model().is_ok_and(|model| model.contract_admission()) {
             return Ok(report);
         }
