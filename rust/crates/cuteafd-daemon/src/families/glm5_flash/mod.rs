@@ -2906,7 +2906,7 @@ impl Opened {
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
-        let remote = selected;
+        if selected.is_empty() { return Ok(None); }
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         // One link retains independent intake planes for every outstanding unit wave.
@@ -2916,22 +2916,12 @@ impl Opened {
             args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
         transport.enable_terminal_ownership(self.library.clone())?;
         let warm_rows = args.expert_rows();
-        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
-        // Publish grouping before the draft planner prices the installed workers.
-        transport.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&warm)?)?;
-        let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
-            .get("transport/rdma-rings").copied().unwrap_or(0);
-        let (started, before) = (Instant::now(), rings());
-        let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
-        let exchange = transport.exchange()?;
-        let payload_bytes = exchange.compact_payload(warm.header.row_count as usize);
-        let wave = exchange.send_request(warm, payload_bytes)?;
-        exchange.land_drained(wave, warm_stream.raw())
-            .with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
-        warm_stream.finish()?;
-        tracing::info!(waves = args.prefill_waves, ranks = peers.len(), rows = warm_rows,
-            ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
-            "Spark expert transport warm");
+        let dtype = if self.checkpoint.spark_input_is_bf16() { cuteafd_transport::ExpertV2Dtype::Bf16 }
+            else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+        let mut shape = cuteafd_transport::SparkSessionShape::new(warm_rows as u32,
+            self.cfg.hidden as u32, self.cfg.topk as u32, dtype)?;
+        shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        transport.bootstrap(&shape)?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport) }))
     }
 }

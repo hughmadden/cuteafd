@@ -1422,28 +1422,18 @@ impl Opened {
         // Bootstrap each endpoint with its own widest dtype/row shape so ring
         // admission and BF16 package validation finish before serving starts.
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let warm = |rows: usize, bf16: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
-            let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-                row_index: (i / topk) as u32, expert_id: (i % self.cfg.experts) as u32, gate_weight: 0.0,
-            }).collect();
-            let (dtype, row_bytes) = if bf16 { (cuteafd_transport::ExpertV2Dtype::Bf16, 2 * h) }
-                else { (cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32, h + h / 32) };
-            let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, moe_layers[0] as u32, h as u32,
-                dtype,
-                (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
-                    row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
-                    source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
-                    route_count: topk as u32,
-                }).collect(),
-                routes, vec![0; rows * row_bytes])?;
-            request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-            Ok(request)
+        let shape = |rows: usize, bf16: bool| -> Result<cuteafd_transport::SparkSessionShape> {
+            let dtype = if bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
+                else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+            let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32, h as u32, topk as u32, dtype)?;
+            shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            Ok(shape)
         };
         let endpoints = cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
             args.prefill_rows, args.expert_input.into())?;
-        let decode_warm = warm(engine::DECODE_ROWS, args.expert_input.bf16(true))?;
-        let prefill_warm = warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?;
-        let link = |endpoint: u32, waves: usize, request: &cuteafd_transport::ExpertProtocolV2Request|
+        let decode_shape = shape(engine::DECODE_ROWS, args.expert_input.bf16(true))?;
+        let prefill_shape = shape(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?;
+        let link = |endpoint: u32, waves: usize, request: &cuteafd_transport::SparkSessionShape|
             -> Result<crate::shared::spark_intake::SparkLink<'_>> {
             let capacity = endpoints[endpoint as usize].capacity;
             let label = format!("mimo/transport/endpoint-{endpoint}");
@@ -1460,7 +1450,7 @@ impl Opened {
             link.bind_model_endpoint(endpoint)?;
             link.enable_terminal_ownership(self.library.clone())?;
             // Bootstrap with this endpoint's widest request, never prefill on decode.
-            link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&request)?)?;
+            link.bootstrap(request)?;
             let actual = cuteafd_ffi::memory_ledger::snapshot()
                 .by_owner(cuteafd_ffi::memory_ledger::Space::Device, args.device)
                 .get(label.as_str()).copied().unwrap_or(0);
@@ -1475,19 +1465,9 @@ impl Opened {
         crate::shared::memory_report::release_load_staging(&self.library)?;
         // Decode keeps fixed graph-safe planes and the probed landing path;
         // only prefill owns overlapping waves and per-slot GPU landing planes.
-        let mut decode = link(0, 1, &decode_warm)?;
-        let mut prefill = link(1, lanes, &prefill_warm)?;
+        let decode = link(0, 1, &decode_shape)?;
+        let prefill = link(1, lanes, &prefill_shape)?;
         tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
-        let started = Instant::now();
-        let warm_stream = crate::shared::spark_intake::WarmStream::new(&*self.library)?;
-        for (transport, request) in [(&mut decode, &decode_warm), (&mut prefill, &prefill_warm)] {
-            let exchange = transport.exchange()?;
-            let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
-            let wave = exchange.send_request(request.clone(), payload_bytes)?;
-            exchange.land_drained(wave, warm_stream.raw())?;
-        }
-        warm_stream.finish()?;
-        tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { decode: std::cell::RefCell::new(decode),
             prefill: std::cell::RefCell::new(prefill) }))
     }

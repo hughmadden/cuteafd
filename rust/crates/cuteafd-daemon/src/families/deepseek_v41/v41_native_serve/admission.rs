@@ -31,6 +31,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     -> Result<Option<crate::shared::placement::SparkAdmission>> {
     let geometry = catalog.routed_experts().geometry()?;
     ensure!(local_layers <= geometry.layers as usize, "V4.1 local boundary exceeds checkpoint");
+    if local_layers == geometry.layers as usize { return Ok(None); }
     if args.peers.is_empty() {
         ensure!(local_layers == geometry.layers as usize, "V4.1 remote layers require Spark peers");
         return Ok(None);

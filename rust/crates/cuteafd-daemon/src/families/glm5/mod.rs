@@ -1245,7 +1245,7 @@ impl Opened {
                 .check(devices.len(), placement.onboard_layers > 0)?;
         }
         let prefill_lanes = usize::try_from(working.prefill_lanes)?;
-        let selected_peers = if working.spark_ranks > 0 { args.peers.as_deref() } else { None };
+        let selected_peers = if !working.spark_layers.is_empty() { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
         let draft_home = match cuteafd_loader::placement::draft::require_home(&placement, "glm5", &[0, 1])? {
@@ -1336,7 +1336,7 @@ impl Opened {
             let dense = push::plan_ranks(&self.snapshot, records.clone(), &dense_devices, sparks)?;
             Ok((embedding, model, drafter, records, deferred, dense))
         };
-        let admission = if let Some(peers) = args.peers.as_deref() {
+        let admission = if let Some(peers) = selected_peers {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let admission = crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
@@ -1617,25 +1617,13 @@ impl Opened {
         self.startup_probe(&devices, "glm/pool-before-transport", None, false)?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
-        let (h, topk, experts, layer) =
-            (self.cfg.hidden, self.cfg.topk, self.cfg.experts,
-                working.spark_layers.first().copied().unwrap_or(self.cfg.first_moe_layer) as u32);
-        let warm = move |rows: usize, decode: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
-            let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-                row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
-            }).collect();
-            let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, layer,
-                h as u32, if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
-                    else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
-                (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
-                    row_id: u64::from(row), source_kind: if decode { cuteafd_transport::ExpertV2SourceKind::Decode }
-                        else { cuteafd_transport::ExpertV2SourceKind::Prefill },
-                    source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
-                    route_count: topk as u32,
-                }).collect(),
-                routes, vec![0; rows * (if engine.spark_bf16 { h * 2 } else { h + h / 32 })])?;
-            request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-            Ok(request)
+        let session_shape = |rows: usize| -> Result<cuteafd_transport::SparkSessionShape> {
+            let dtype = if engine.spark_bf16 { cuteafd_transport::ExpertV2Dtype::Bf16 }
+                else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+            let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32,
+                self.cfg.hidden as u32, self.cfg.topk as u32, dtype)?;
+            shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            Ok(shape)
         };
         let mut transport = selected_peers.map(|peers| -> Result<SparkLink<'_>> {
             let (peers, world) = ranks(peers)?;
@@ -1644,7 +1632,7 @@ impl Opened {
             // The bootstrap opens every rank before any wave does, so the
             // installed grouping is readable from here on. The warm-up below
             // then reuses these sessions.
-            link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&warm(engine::DECODE_ROWS, true)?)?)?;
+            link.bootstrap(&session_shape(engine::DECODE_ROWS)?)?;
             Ok(link)
         }).transpose()?;
         // One prefill transport with `prefill_lanes` waves in flight (PLAN
@@ -1654,26 +1642,12 @@ impl Opened {
                 let (peers, world) = ranks(peers)?;
                 let mut link = SparkLink::prepared(&self.library, world, &peers, config.clone(),
                     admitted.prefill_link.clone().context("admitted prefill transport")?)?;
-                link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&warm(args.prefill_rows, false)?)?)?;
+                link.bootstrap(&session_shape(args.prefill_rows)?)?;
                 Some(link)
             }
             None => None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let started = Instant::now();
-        for (link, decode) in transport.iter_mut().map(|link| (link, true))
-            .chain(prefill_link.iter_mut().map(|link| (link, false))) {
-            // A full-width wave through each link's exchange (rings and the
-            // Sparks' first-use costs), landed and drained on the stream.
-            let rows = link.capacity() as usize;
-            let exchange = link.exchange()?;
-            let ticket = exchange.send_request(warm(rows, decode)?, exchange.compact_payload(rows))?;
-            exchange.land_drained(ticket, stream)?;
-        }
-        if transport.is_some() {
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, prefill_waves = prefill_lanes,
-                "Spark expert transports warm");
-        }
         *engine.prefill_link.borrow_mut() = prefill_link;
         engine.prefill_runtime = Some(tokio::runtime::Builder::new_current_thread().enable_all().build()?);
         engine.configure_packing(args.prefill_packing.unwrap_or_default())?;

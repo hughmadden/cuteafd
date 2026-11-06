@@ -149,9 +149,9 @@ impl<'a> DeploymentSpec<'a> {
             encoder: encoder_ranks.contains(&rank).then(|| report.encoder.clone()).flatten(),
             audio_encoder: audio_ranks.contains(&rank).then(|| report.audio_encoder.clone()).flatten(),
             drafter: None,
-        }).collect::<Vec<_>>();
-        ensure!(spark_roles.iter().all(|role| role.experts || role.encoder.is_some() || role.audio_encoder.is_some()
-            || role.drafter.is_some()), "Spark physical rank has no solved role");
+        }).filter(|role| role.experts || role.encoder.is_some() || role.audio_encoder.is_some()
+            || role.drafter.is_some()).collect::<Vec<_>>();
+        let physical = spark_roles.len();
         ensure!(options.spark_tp.is_some() == options.spark_ep.is_some(),
             "--spark-tp and --spark-ep must be set together");
         let exl3 = report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"));

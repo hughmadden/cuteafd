@@ -340,8 +340,8 @@ fn with_backend<T>(args: &ServeArgs,
         spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 };
     let bootstrap = super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
-    let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
-        spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
+    let spark_admission = if spark_working.spark_layers.is_empty() { None } else { Some(SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
+        spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?) };
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
         let native = Execution::serving_admission_with_plan(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
@@ -401,7 +401,7 @@ fn with_backend<T>(args: &ServeArgs,
         Ok((native, mtp))
     });
     let planned = policy.plan(|| -> Result<_> {
-        ensure!(spark_admission.coordinator_pushes(), "Step-5 Spark admission did not select required push");
+        ensure!(spark_admission.as_ref().is_none_or(|plan| plan.coordinator_pushes()), "Step-5 Spark admission did not select required push");
         let recorder = dense::Recorder::start(true)?.context("dense recorder")?;
         let loaded = load();
         let records = recorder.finish();
@@ -409,7 +409,8 @@ fn with_backend<T>(args: &ServeArgs,
         let (landed, operands, staged, steps, largest, finishes) = records.summary();
         tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
             "Step-5 coordinator dense records planned");
-        let dense = dense::plan_records(&args.snapshot, records.clone(), &devices, args.peers.len())?;
+        let expert_world = if spark_admission.is_some() { args.peers.len() } else { 0 };
+        let dense = dense::plan_records(&args.snapshot, records.clone(), &devices, expert_world)?;
         let experts = if ownership.onboarded_layers().is_empty() { None } else {
             let budget = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
             let package = budget.package(&format, &args.native_lib)?;
@@ -426,12 +427,13 @@ fn with_backend<T>(args: &ServeArgs,
     tracing::info!(elapsed_s = native_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup native preparation complete");
     let push_start = std::time::Instant::now();
-    let pending = spark_admission.start_with(&args.peers, ranks)?;
-    let (embedding, native, mtp) = crate::shared::placement::load_while_admitting(Some(pending), || {
+    let expert_world = if spark_admission.is_some() { args.peers.len() } else { 0 };
+    let pending = spark_admission.map(|plan| plan.start_with(&args.peers, ranks)).transpose()?;
+    let (embedding, native, mtp) = crate::shared::placement::load_while_admitting(pending, || {
         let ((embedding, (native, mtp)), mut pushed) = match coordinator {
             Some((push, loaded, records, dense)) => {
                 let split = crate::shared::memory::load_timing::Split::start();
-                let (received, ()) = push.receive_with(devices.clone(), Some(&catalog), args.peers.len(), Some(Ok(dense)), || ());
+                let (received, ()) = push.receive_with(devices.clone(), Some(&catalog), expert_world, Some(Ok(dense)), || ());
                 let pushed = policy.committed(received)?;
                 split.log("step5 dense and onboarded expert push");
                 tracing::info!(operands = records.operands.len(), steps = records.steps.len(),
@@ -467,9 +469,12 @@ fn with_backend<T>(args: &ServeArgs,
     tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup weight delivery complete");
     let bind_start = std::time::Instant::now();
-    cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
-    let world = SparkWorld::canonical(args.peers.len())?;
-    let transport = devices[0].own(|| {
+    if !spark_working.spark_layers.is_empty() {
+        cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
+    }
+    let transport = if spark_working.spark_layers.is_empty() { None } else {
+        let world = SparkWorld::canonical(args.peers.len())?;
+        Some(devices[0].own(|| {
         // One return slot per prefill wave.
         let waves = usize::from(args.prefill_waves);
         let mut link = SparkLink::new_waves(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2,
@@ -477,10 +482,10 @@ fn with_backend<T>(args: &ServeArgs,
         link.enable_terminal_ownership(library.clone())?;
         link.bootstrap(&bootstrap)?;
         Ok(link)
-    })?;
+    })?) };
     library.cuda_set_device(args.device)?;
     let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
-        Some(transport), 92, 1)?;
+        transport, 92, 1)?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_admitted_host(admission.host_cache_bytes, admission.host_geometry)
         .with_full_prefill_logits(args.full_prefill_logits)

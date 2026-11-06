@@ -335,7 +335,7 @@ impl SparkSessionShape {
         let payload = (rows as usize).checked_mul(stride).context("Spark session payload overflow")?;
         let request = cuteafd_core::expert_geometry::expert_request_payload_offset(
             EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, rows as usize * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
-            routes as usize * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN)?;
+            routes as usize * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN).context("Spark session prefix overflow")?;
         let response = (rows as usize).checked_mul(stride.max(hidden as usize * 2) + 4)
             .and_then(|n| n.checked_add(EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN))
             .context("Spark session response overflow")?;

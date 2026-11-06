@@ -610,7 +610,7 @@ impl Opened {
             Ok(())
         })?;
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        if let Some(peers) = args.peers.as_deref() {
+        if let Some(peers) = args.peers.as_deref().filter(|_| !args.local_experts) {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let working = cuteafd_loader::placement::SparkWorkingSet {
