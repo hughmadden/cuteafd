@@ -114,6 +114,27 @@ class Recorder:
         self.functions = set()
         self.seen_codes = set()
         self.imported = set()
+        self.construction = False
+        self.latest = []
+
+    def construct(self, function, *args, **kwargs):
+        """Trace the entire recipe, including launch construction and scratch."""
+        previous = sys.getprofile()
+        self.frames, self.functions, self.seen_codes, self.opened = set(), set(), set(), set()
+        self.imported = set(sys.modules)
+        self.latest = []
+        self.construction = True
+        sys.setprofile(self._profile)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            sys.setprofile(previous)
+            reads = self.reads()
+            functions = [list(pair) for pair in sorted(self.functions)]
+            for record in self.latest:
+                record["source_reads_sha256"].update(reads)
+                record["source_functions"] = functions
+            self.construction = False
 
     def _audit(self, event, args):
         if self.active and event == "open" and args and isinstance(args[0], (str, bytes, os.PathLike)):
@@ -169,8 +190,13 @@ class Recorder:
         def frontend(original):
             @functools.wraps(original)
             def wrapped(dsl, *args, **kwargs):
-                self.frames, self.functions, self.seen_codes, self.opened = set(), set(), set(), set()
-                self.imported = set(sys.modules)
+                if not self.construction:
+                    self.frames, self.functions, self.seen_codes, self.opened = set(), set(), set(), set()
+                    self.imported = set(sys.modules)
+                frame = sys._getframe().f_back
+                while frame is not None:
+                    self._profile(frame, "call", None)
+                    frame = frame.f_back
                 previous = sys.getprofile()
                 sys.setprofile(self._profile)
                 try:
@@ -196,6 +222,8 @@ class Recorder:
                               "source_reads_sha256": self.reads()}
                 result = original(dsl, module, *args, **kwargs)
                 self.executors[id(result)] = (weakref.ref(result), record)
+                if self.construction:
+                    self.latest.append(record)
                 return result
             return wrapped
 
@@ -207,7 +235,8 @@ class Recorder:
                 if found is None or found[0]() is not executor:
                     raise ValueError(f"{file_name}: export has no recorded compiler IR")
                 path = (Path(file_path) / (file_name + ".o")).relative_to(self.output).as_posix()
-                self.exports[path] = {**found[1], "export_prefix": function_prefix or file_name}
+                self.exports[path] = found[1]
+                self.exports[path]["export_prefix"] = function_prefix or file_name
                 return result
             return wrapped
 
@@ -260,7 +289,8 @@ def change_report(previous, current, expected=None):
         elif new is None:
             category, entry = "removed", {"program": name, "group": group}
         else:
-            fields = ("object_sha256", "cubin_sha256", "ir_sha256", "resources", "scratch_bytes_at_capacity")
+            fields = ("object_sha256", "cubin_sha256", "ir_sha256", "resources", "scratch_bytes_at_capacity",
+                      "abi_sha256", "plan", "planner_metadata")
             if all(old.get(field) == new.get(field) for field in fields):
                 continue
             reads = old.get("source_reads_sha256", {})
@@ -268,6 +298,9 @@ def change_report(previous, current, expected=None):
             entry = {"program": name, "group": group,
                      "object_changed": old.get("object_sha256") != new.get("object_sha256"),
                      "ir_changed": old.get("ir_sha256") != new.get("ir_sha256"),
+                     "abi_changed": old.get("abi_sha256") != new.get("abi_sha256"),
+                     "plan_changed": old.get("plan") != new.get("plan"),
+                     "planner_metadata_changed": old.get("planner_metadata") != new.get("planner_metadata"),
                      "triggering_sources": sorted(path for path in reads.keys() | new_reads.keys()
                                                   if reads.get(path) != new_reads.get(path)),
                      "resource_deltas": numeric_deltas(old.get("resources"), new.get("resources")),
@@ -307,7 +340,9 @@ def write_report(destination, report):
         for entry in report[category]:
             lines += [f"- `{entry['program']}`"]
             if category == "changed":
-                lines += [f"  Object changed: {entry['object_changed']}; IR changed: {entry['ir_changed']}.",
+                lines += [f"  Object changed: {entry['object_changed']}; IR changed: {entry['ir_changed']}; "
+                          f"ABI changed: {entry['abi_changed']}; plan changed: {entry['plan_changed']}; "
+                          f"planner metadata changed: {entry['planner_metadata_changed']}.",
                           f"  Sources: {', '.join(entry['triggering_sources']) or '(no recorded source delta)' }.",
                           f"  Resources: {json.dumps(entry['resource_deltas'], sort_keys=True)}.",
                           f"  Scratch: {json.dumps(entry['scratch_deltas'], sort_keys=True)}."]

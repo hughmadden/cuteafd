@@ -85,6 +85,25 @@ def test_cuda_resources_match_elf_symbol_regcount_and_thread_attributes():
         records.elf_resources(b"not a cubin")
 
 
+@pytest.mark.parametrize("field", ["abi_sha256", "plan", "planner_metadata"])
+def test_metadata_only_changes_are_reported_and_checked(field):
+    report = records.change_report({"k": {field: "old"}}, {"k": {field: "new"}}, [])
+    assert len(report["changed"]) == 1
+    assert report["leaks"] == ["k"]
+    assert not report["changed"][0]["ir_changed"]
+
+
+def test_construct_captures_recipe_and_scratch_callback_sources(tmp_path):
+    source = tmp_path / "recipe.py"
+    source.write_text("def construct():\n    return 5\n")
+    spec = importlib.util.spec_from_file_location("record_recipe", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    assert recorder.construct(module.construct) == 5
+    assert "recipe.py" in recorder.reads()
+
+
 def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})

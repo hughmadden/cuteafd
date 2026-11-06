@@ -51,6 +51,13 @@ def resolve_source_root(path: Path | str | None = None, env=os.environ) -> Path:
 
 
 ROOT = resolve_source_root()
+PROGRAM_RECORDER = None
+
+
+def recorded_construction(function, *args, **kwargs):
+    if PROGRAM_RECORDER is not None:
+        return PROGRAM_RECORDER.construct(function, *args, **kwargs)
+    return function(*args, **kwargs)
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
@@ -478,19 +485,23 @@ def export_routed(extra, output):
                 stem += "_segments"
             if core_only:
                 stem += "_core"
-            with exportable_compilation():
-                program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
-                    max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
-                    **({"row_addresses": True} if row_addresses else {}),
-                    **({"core_only": True} if core_only else {}))
+            def construct():
+                with exportable_compilation():
+                    program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
+                        max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
+                        **({"row_addresses": True} if row_addresses else {}),
+                        **({"core_only": True} if core_only else {}))
+                scratch = (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
+                           if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))
+                return program, scratch
+            program, scratch = recorded_construction(construct)
             program.export_to_c(str(output), stem, "cuteafd_" + stem)
             checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
             if checked["argument_count"] != package.POINTERS + 2:
                 raise ValueError(f"{stem}: unexpected routed expert ABI")
             records.append({"name": stem, "layout": layout, "capacity": rows, "form": form, "abi": checked,
                             **({"core_only": True} if core_only else {}),
-                            "scratch_bytes": (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
-                                              if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))})
+                            "scratch_bytes": scratch})
             print(f"exported {stem}", flush=True)
     (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
 
@@ -602,10 +613,10 @@ def _export_exl3(extra, output):
             default_options = dict(options)
             if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
                 default_options["decode_schedule"] = schedule
-            export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **default_options)
+            recorded_construction(export, output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **default_options)
             if not compact:
                 for schedule, schedule_options in package.decode_schedule_variants(geometry, role, profile, rows):
-                    export(output / profile / f"m{rows}-{schedule}", width, experts, rows, bits, "auto", topk,
+                    recorded_construction(export, output / profile / f"m{rows}-{schedule}", width, experts, rows, bits, "auto", topk,
                            dtype, **{**options, **schedule_options})
 
 
@@ -630,6 +641,7 @@ def export_exl3_routes(extra, output):
 
 
 def worker(payload):
+    global PROGRAM_RECORDER
     output = Path(payload["output"])
     os.environ["TRITON_CACHE_DIR"] = str(output.parent / f".triton-cache-{payload['sms']}")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -666,6 +678,8 @@ def worker(payload):
     if payload.get("program_records"):
         records_module = load_file("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
         recorder = records_module.Recorder(ROOT, output).install()
+        PROGRAM_RECORDER = recorder
+        # runpy exporters receive a worker-local hook, not a serving dependency.
     start = time.monotonic()
     path = ROOT / "python/tools/aot" / payload["exporter"]
     if payload["exporter"] == "package_fp8_moe_aot.py":
@@ -689,7 +703,8 @@ def worker(payload):
             finally:
                 compile_pool._initialize_worker = _initialize_worker
         else:
-            runpy.run_path(str(path), run_name="__main__")
+            runpy.run_path(str(path), run_name="__main__", init_globals={
+                "_record_construction": recorded_construction})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
         raise RuntimeError("exporter changed the synthetic SM count")
     if torch.cuda.is_initialized():
@@ -945,7 +960,8 @@ def parse_sms(value):
 
 def v4_placement_sources():
     # Keep this set identical to plan::testing::v4_placement_source_hashes.
-    paths = {ROOT / "scripts/build/compare-sm-exports.py"}
+    paths = {ROOT / "scripts/build/compare-sm-exports.py", ROOT / "scripts/build/kernel-records.py",
+             ROOT / "scripts/build/export-placement-inputs.py"}
     for directory in ("python/tools/aot", "python/tools/lib"):
         paths.update((ROOT / directory).rglob("*.py"))
     paths.update((ROOT / "scripts/build").glob("*.json"))
@@ -975,7 +991,7 @@ def v4_placement_inputs(destination, staging, timeout, workers):
         name, exporter, extra = job
         output = staging / name
         output.mkdir()
-        payload = dict(sms=188, exporter=exporter, args=extra, output=str(output))
+        payload = dict(sms=188, exporter=exporter, args=extra, output=str(output), program_records=True)
         env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
                    CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
                    CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
@@ -994,12 +1010,18 @@ def v4_placement_inputs(destination, staging, timeout, workers):
                 or summary.get("source_tree_sha256") != lock["source_tree_sha256"]
                 or summary.get("cuda_initialized") is not False):
             raise ValueError("V4 worker provenance differs from captured source lock or initialized CUDA")
+    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
+    records = publisher.publication_records(staging, [(name, exporter, extra) for name, exporter, extra in exports])
     for context in (131072, 1048576):
         for model in ("flash", "pro"):
             for rtx in (1, 2):
                 target = destination / f"{model}-{rtx}-{context}"
                 target.mkdir()
-                shutil.copy2(staging / str(context) / "dsv4_programs.json", target / "PROGRAMS.json")
+                programs = json.loads((staging / str(context) / "dsv4_programs.json").read_text())
+                if records:
+                    programs["kernel_records"] = {name: record for name, record in records.items()
+                                                  if name.startswith(str(context) + "/")}
+                (target / "PROGRAMS.json").write_text(json.dumps(programs, indent=2) + "\n")
                 if model == "pro":
                     package = target / "exl3/exl3-dsv4p-k23"
                     for source in (staging / "exl3").rglob("v41_exl3.json"):
@@ -1010,7 +1032,7 @@ def v4_placement_inputs(destination, staging, timeout, workers):
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
                       source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
-                      exports=summaries, files=files)
+                      exports=summaries, files=files, program_records=records)
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
     print(f"Published V4 placement inputs: {destination}", flush=True)
 

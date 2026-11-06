@@ -1471,8 +1471,12 @@ def main() -> None:
         minimum_sms = 0
         for sms in plan_sms:
             label = stem if sms is None else f"{stem}_sm{sms}"
-            with exportable_compilation():
-                program = thunk() if sms is None else thunk(sm_count=sms)
+            def construct():
+                with exportable_compilation():
+                    program = thunk() if sms is None else thunk(sm_count=sms)
+                # Include scratch callbacks in the measured dependency set.
+                return program, program.scratch_bytes(capacity)
+            program, plan_scratch = globals().get("_record_construction", lambda fn: fn())(construct)
             validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
             minimum_sms = max(minimum_sms, program_minimum_sms(stem, program.geometry))
             if abi is not None and program.abi != abi:
@@ -1483,7 +1487,6 @@ def main() -> None:
             checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
                 raise ValueError(f"{label}: header argument count disagrees with the ABI")
-            plan_scratch = program.scratch_bytes(capacity)
             for key, size in plan_scratch.items():
                 scratch[key] = max(scratch.get(key, 0), size)
             plans.append({"sm_count": sms, "label": label, "geometry": dict(program.geometry),

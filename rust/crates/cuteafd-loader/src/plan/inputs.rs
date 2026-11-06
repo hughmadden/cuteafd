@@ -33,8 +33,10 @@ fn v4_placement_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
         collect(root, &root.join(directory), true, "py", &mut files)?;
     }
     collect(root, &root.join("scripts/build"), false, "json", &mut files)?;
-    let script = "scripts/build/compare-sm-exports.py";
-    files.insert(script.into(), Value::String(format!("{:x}", Sha256::digest(fs::read(root.join(script))?))));
+    for script in ["scripts/build/compare-sm-exports.py", "scripts/build/kernel-records.py",
+        "scripts/build/export-placement-inputs.py"] {
+        files.insert(script.into(), Value::String(format!("{:x}", Sha256::digest(fs::read(root.join(script))?))));
+    }
     Ok(Value::Object(files))
 }
 

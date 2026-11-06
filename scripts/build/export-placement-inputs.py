@@ -230,7 +230,7 @@ def publication_records(staging, jobs):
         if not path.exists():
             continue  # Legacy --reuse-workers publications have no identities.
         job_records = json.loads(path.read_text())
-        if name == "programs":
+        if (directory / "dsv4_programs.json").exists():
             manifest = json.loads((directory / "dsv4_programs.json").read_text())
             for program in manifest.get("programs", []):
                 for plan in program.get("card_plans", [program]):
@@ -239,10 +239,14 @@ def publication_records(staging, jobs):
                     record["scratch_bytes_at_capacity"] = {
                         str(program["capacity_rows"]): plan.get("scratch_bytes_at_capacity", {})}
                     record["family"] = program["family"]
+                    record["planner_metadata"] = {key: value for key, value in program.items()
+                                                  if key not in ("object_sha256", "card_plans")}
+                    record["planner_metadata"]["plan"] = plan
         elif name.startswith("fp8/"):
             for program in json.loads((directory / "routed.json").read_text())["programs"]:
                 job_records[program["name"] + ".o"]["scratch_bytes_at_capacity"] = {
                     str(program["capacity"]): program["scratch_bytes"]}
+                job_records[program["name"] + ".o"]["planner_metadata"] = program
         else:
             for manifest_path in directory.rglob("v41_exl3.json"):
                 manifest = json.loads(manifest_path.read_text())
@@ -250,6 +254,9 @@ def publication_records(staging, jobs):
                     if Path(record_path).parent == manifest_path.parent.relative_to(directory):
                         record["scratch_bytes_at_capacity"] = {
                             str(manifest["capacity"]): manifest["unique_execution_buffer_bytes"]}
+                        record["planner_metadata"] = {key: value for key, value in manifest.items()
+                                                      if key not in ("sparkinfer_revision", "gpu", "physical_sms", "objects")}
+                        record["planner_metadata"]["objects"] = manifest["objects"]
         records.update({f"{name}/{path}": {**record, "group": name} for path, record in job_records.items()})
     return records
 
