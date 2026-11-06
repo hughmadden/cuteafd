@@ -1,0 +1,153 @@
+//! GLM Flash drafters (DFlash2 and block dSpark) from their installed SparkNest
+//! snapshots: the serving constructor recorded under the shared recorder, one
+//! standalone coordinator rank replayed through a ring and committed, versus the
+//! same constructor through the mount. Every checkpoint-sourced owner must be
+//! byte-identical, the recording must not read the payload, and the recorded
+//! staging must fit the header-only admitted drafter push envelope.
+//!
+//! On the CPU fixture (default) W8A16 packs are no-ops, so FP8 rows prove the
+//! recipe and staging bound, not pack numerics. With CUTEAFD_NATIVE_LIB (a real
+//! GPU, run through golden-run --native-test) every representation is exact.
+use crate::shared::experts::rtx::dense::{self, RankLayout};
+use crate::shared::memory::device::Device;
+use crate::shared::speculation::{block_dspark::DsparkDrafter, dflash::{DflashConfig, DflashDrafter}};
+use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
+use cuteafd_loader::families::{glm5::draft_representation::{flash_draft_capacity, GlmDraftRepresentation},
+    qwen4::Qwen4KvCache};
+use std::path::PathBuf;
+
+fn installed(repo: &str) -> Result<PathBuf> {
+    let home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(|| "/mnt/sparknest/hf-home".into());
+    let model = home.join("hub").join(format!("models--{}", repo.replace('/', "--")));
+    let revision = std::fs::read_to_string(model.join("refs/main")).with_context(|| format!("{repo} not installed"))?;
+    Ok(model.join("snapshots").join(revision.trim()))
+}
+
+fn read(library: &NativeLibrary, buffer: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; buffer.bytes];
+    library.copy_d2h(&mut bytes, buffer)?;
+    Ok(bytes)
+}
+
+enum Loaded<'a> { Dflash(DflashDrafter<'a>), Dspark(DsparkDrafter<'a>) }
+
+impl Loaded<'_> {
+    /// Checkpoint-sourced owners only: rings, taps and workspaces are zeroed, not loaded.
+    fn owners(&self) -> Result<Vec<(String, CuteafdDeviceBuffer)>> {
+        Ok(match self {
+            Self::Dflash(draft) => {
+                let ids = [draft.taps.buffer.device_id];
+                let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&ids)?;
+                draft.allocation_receipts(devices, "draft")?.into_iter().filter(|r| {
+                    let id = &r.allocation.id;
+                    r.allocation.location != cuteafd_loader::placement::planner::Location::HOST
+                        && !["ring", "taps", "fused", "context", "workspace", "fp8_workspace"].iter()
+                            .any(|skip| id.contains(skip))
+                }).map(|r| (r.allocation.id.clone(), CuteafdDeviceBuffer { ptr: r.address as *mut _,
+                    bytes: r.allocation.bytes as usize, device_id: draft.taps.buffer.device_id,
+                    flags: draft.taps.buffer.flags })).collect()
+            }
+            Self::Dspark(draft) => draft.weight_buffers(),
+        })
+    }
+}
+
+fn library(fixture: &Option<cuteafd_ffi::native_library_lifetime_fixture::Fixture>) -> Result<NativeLibrary> {
+    match fixture {
+        Some(fixture) => {
+            let library = fixture.load()?;
+            fixture.configure_memory(&library, 0, 64 << 30)?;
+            fixture.immediate_copies(&library)?;
+            Ok(library)
+        }
+        // SAFETY: the slot's native library, loaded once for this test process.
+        None => unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?) },
+    }
+}
+
+#[test]
+#[ignore = "requires installed GLM Flash drafters in SparkNest and an NVMe fixture directory (or CUTEAFD_NATIVE_LIB)"]
+fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging() -> Result<()> {
+    let real = std::env::var_os("CUTEAFD_NATIVE_LIB").is_some();
+    let fixture = (!real).then(|| {
+        let root = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/cuteafd/builds/glmf-draft-push-fixture");
+        cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)
+    }).transpose()?;
+    let library = library(&fixture)?;
+    let programs = library.programs()?;
+    let programs = match std::env::var_os("CUTEAFD_PROGRAM_MANIFEST") {
+        Some(manifest) => programs.with_manifest(std::path::Path::new(&manifest))?,
+        None => programs,
+    };
+    let device = Device { library: &library, id: 0 };
+    let socket_root = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/cuteafd/builds/glmf-draft-push-sockets");
+    std::fs::create_dir_all(&socket_root)?;
+    let mut arms = 0;
+    for repo in ["incoai/GLM-5.3-Flash-DFlash2", "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"] {
+        let snapshot = installed(repo)?;
+        let (root, _) = cuteafd_loader::push_load::namespace(&snapshot).context("drafter outside SparkNest")?;
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let dspark = crate::shared::speculation::block_dspark::is_dspark(&snapshot)?;
+        let capacity = flash_draft_capacity(&config, Some(4), 4)?;
+        let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
+        let mask = |hidden: usize| (0..hidden * 2).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+            let load = |recording: bool| -> Result<Loaded<'_>> {
+                device.run(|| Ok(if dspark {
+                    let cfg = crate::shared::speculation::block_dspark::DsparkConfig::read(&snapshot)?;
+                    let tensors = if recording { Default::default() }
+                        else { crate::shared::speculation::block_dspark::prefetch(&snapshot).join()
+                            .map_err(|_| anyhow::anyhow!("prefetch panicked"))?? };
+                    Loaded::Dspark(DsparkDrafter::load(&library, &programs, &snapshot, tensors, std::ptr::null_mut(),
+                        slots, batch, mask(cfg.hidden), representation, crate::shared::fp8_linear::Fp8Scales::Pow2,
+                        crate::shared::fp8_linear::Fp8Rows::W8a16, Qwen4KvCache::Bf16)?)
+                } else {
+                    let cfg = DflashConfig::read(&snapshot)?;
+                    let file = if recording { Vec::new() } else { crate::shared::speculation::dflash::prefetch(&snapshot)
+                        .join().map_err(|_| anyhow::anyhow!("prefetch panicked"))?? };
+                    Loaded::Dflash(DflashDrafter::load(&library, &programs, &snapshot, file, std::ptr::null_mut(),
+                        slots, batch, mask(cfg.hidden), true, representation, crate::shared::fp8_linear::Fp8Scales::Pow2,
+                        crate::shared::fp8_linear::Fp8Rows::W8a16, Qwen4KvCache::Bf16)?)
+                }))
+            };
+            let mounted = load(false)?;
+            let (pushed, records) = dense::recording(|| load(true))?;
+            ensure!(!records.operands.is_empty(), "{repo}: nothing recorded");
+            ensure!(representation == GlmDraftRepresentation::Bf16Only || !records.steps.is_empty(),
+                "{repo}: FP8 pack steps were not recorded");
+            ensure!(records.peer_copies.is_empty(), "{repo}: a local drafter recorded peer copies");
+            // The admitted header-only envelope bounds the exact recorded staging.
+            let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), 0)?.with_finishes(&records.finishes);
+            let admitted = cuteafd_loader::placement::families::glm5_flash::admission::DraftPush::for_snapshot(
+                &snapshot, &config, representation)?.context("namespace drafter has push owners")?;
+            let actual = crate::shared::experts::rtx::push::push_host_envelope(&[None], &[layout.host_staging])?;
+            admitted.host.validate_usage(&actual).map_err(|error| anyhow::anyhow!("{repo} {representation:?}: {error}"))?;
+            eprintln!("{repo} {representation:?}: {} operands, {} steps, {} finishes; staging {} B admitted {} B",
+                records.operands.len(), records.steps.len(), records.finishes.len(),
+                layout.host_staging.bytes()?, admitted.host.dense_bytes[0]);
+            let sockets = tempfile::tempdir_in(&socket_root)?;
+            dense::testing::PEAKS.with(|p| p.borrow_mut().clear());
+            crate::shared::experts::rtx::push::tests::receive_pushed(device, None, &root, sockets.path(), &records, None, 0, 0)?;
+            for (_, pinned) in dense::testing::PEAKS.with(|p| p.take()) {
+                ensure!(pinned <= admitted.host.dense_bytes[0], "{repo}: pinned staging peak {pinned} B over admission");
+            }
+            let (expected, actual) = (mounted.owners()?, pushed.owners()?);
+            ensure!(expected.len() == actual.len() && !expected.is_empty(), "{repo}: owner inventories differ");
+            let mut compared = 0usize;
+            for ((name, mount), (other, push)) in expected.iter().zip(&actual) {
+                ensure!(name == other && mount.bytes == push.bytes, "{repo}: owner {name} differs from {other}");
+                let packed = name.ends_with(".values") || name.ends_with(".scales");
+                // The CPU fixture's W8A16 pack writes nothing; compare packs on a real GPU only.
+                if packed && !real { continue; }
+                ensure!(device.run(|| Ok(read(&library, *mount)? == read(&library, *push)?))?,
+                    "{repo} {representation:?}: pushed {name} differs from the mount");
+                compared += mount.bytes;
+            }
+            eprintln!("{repo} {representation:?}: {} owners, {compared} B byte-identical", expected.len());
+            arms += 1;
+        }
+    }
+    ensure!(arms == 4, "expected four drafter/representation arms, ran {arms}");
+    Ok(())
+}

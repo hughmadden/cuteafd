@@ -62,10 +62,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 usize::try_from(sequences)?, usize::try_from(options.glm_draft_sequences())?,
                 options.draft_context_slots.map(usize::try_from).transpose()?);
             let capacity = crate::families::glm5::draft_representation::flash_draft_capacity(&config, slots, batch)?;
-            Some((config, capacity))
+            Some((config, capacity, path))
         };
         let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-            64, draft_config.as_ref().map(|(_, capacity)| capacity.block_rows / capacity.max_batch_sequences - 1),
+            64, draft_config.as_ref().map(|(_, capacity, _)| capacity.block_rows / capacity.max_batch_sequences - 1),
             options.glm5_attention_plan_rows)?;
         let sms = options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms);
         let selected_manifest = manifest.map(|manifest| -> anyhow::Result<_> {
@@ -205,7 +205,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             else if options.drafter_bytes > 0 && options.glmf_drafter_snapshot.is_none() {
                 (options.drafter_bytes, placement::ResidentWeights(options.drafter_bytes), vec![0; ranks], None)
             } else {
-            let (config, capacity) = draft_config.as_ref().context("resolved Flash drafter config")?;
+            let (config, capacity, _) = draft_config.as_ref().context("resolved Flash drafter config")?;
             let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
             draft_rows = Some(capacity.block_rows);
             let (bytes, scratch) = glmf::drafter_inventory(config, slots, batch,
@@ -338,6 +338,11 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         process.serving(&inputs, quota, geometry.chunk_bytes().min(quota), embedding, 0)?;
         process.spark_link(&inputs, checkpoint.spark_input_is_bf16())?;
         process.push_host = glmf::admission::push_host_envelope(checkpoint, &cfg, ranks, Some(&catalog), exlr8)?;
+        // The serving drafter loads FP8-packed (its default) as its own push group.
+        process.draft_push = draft_config.as_ref().filter(|_| draft > 0).map(|(config, _, path)|
+            glmf::admission::DraftPush::for_snapshot(path, config,
+                crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only))
+            .transpose()?.flatten();
         if let Some((facts, metadata)) = exlr8 {
             use crate::plan::exlr8::{dense::{DensePlan, DenseRole}, residency::ExpertSet};
             let owners = whole_mla(attention.first_owner as usize);

@@ -491,6 +491,39 @@ impl<'a> DsparkDrafter<'a> {
         self.head_mode.set(mode);
     }
 
+    /// Every checkpoint-sourced device owner (weights, FP8 values and scales, the
+    /// Markov norms finish), named, for push-versus-mount byte equality.
+    #[cfg(test)]
+    pub(crate) fn weight_buffers(&self) -> Vec<(String, CuteafdDeviceBuffer)> {
+        let mut out = Vec::new();
+        let mut weight = |name: String, weight: &Weight<'_>| match weight {
+            Weight::Bf16(owner) => out.push((name, owner.buffer)),
+            Weight::Fp8(owner) => {
+                let (values, scales) = owner.buffers();
+                out.push((format!("{name}.values"), values));
+                out.push((format!("{name}.scales"), scales));
+            }
+        };
+        weight("fc".into(), &self.fc);
+        for (index, layer) in self.layers.iter().enumerate() {
+            for (name, owner) in [("qkv", &layer.qkv), ("o", &layer.o), ("gate_up", &layer.gate_up), ("down", &layer.down)] {
+                weight(format!("layer.{index}.{name}"), owner);
+            }
+        }
+        for (index, layer) in self.layers.iter().enumerate() {
+            for (name, owner) in [("input_norm", &layer.input_norm), ("post_norm", &layer.post_norm),
+                ("q_norm", &layer.q_norm), ("k_norm", &layer.k_norm)] {
+                out.push((format!("layer.{index}.{name}"), owner.buffer));
+            }
+        }
+        for (name, owner) in [("hidden_norm", &self.hidden_norm), ("norm", &self.norm), ("markov_w1", &self.markov_w1),
+            ("markov_w2", &self.markov_w2), ("markov_norms", &self.markov_norms), ("confidence_w", &self.confidence_w),
+            ("confidence_b", &self.confidence_b)] {
+            out.push((name.into(), owner.buffer));
+        }
+        out
+    }
+
     /// How the FP8 GEMMs run from now on: the load's mode or one before it.
     pub fn set_draft_linear(&self, mode: fp8_linear::Fp8Rows) -> Result<()> {
         ensure!(mode <= self.fp8_admitted, "the dSpark FP8 scratch was admitted for {:?}, not {mode:?}",

@@ -2,6 +2,8 @@
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod dspark;
 mod remote_dflash;
+#[cfg(test)]
+mod draft_push_tests;
 pub(crate) use crate::shared::draft::resource as draft_binding;
 use crate::shared::draft::probe as draft_probe;
 pub(crate) mod engine;
@@ -1964,6 +1966,7 @@ impl Opened {
         process.push_host = admission::admission::push_host_envelope(&headers, &self.cfg, devices.len(),
             self.experts.as_ref(),
             native_admission.map(|native| (&native.facts, &native.metadata)))?;
+        process.draft_push = self.draft_push(args)?;
         let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
         admitted.validate_spark_topology(spark_ranks)?;
         tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
@@ -2763,6 +2766,9 @@ impl Opened {
         let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
             args.draft_context_slots, args.draft_sequences)?;
         let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
+        // Admitted standalone push group of the drafter's own GPU, after the target
+        // group committed; priming (RemoteDflash::new) reads only committed weights.
+        let admitted = self.draft_push(args)?.map(|draft| draft.host);
         let drafter = if let Some(prepared) = prepared {
             use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             let cfg = DflashConfig::read(snapshot)?;
@@ -2771,18 +2777,31 @@ impl Opened {
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
-            let draft = device.own(|| DflashDrafter::load(&self.library, programs, snapshot, file, prepared.stream.raw,
-                slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
+            let draft = crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
+                device.own(|| DflashDrafter::load(&self.library, programs, snapshot, file, prepared.stream.raw,
+                    slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache)))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
-            dspark::Drafter::load(&self.library, programs, snapshot, stream, slots, batch,
-                embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
-                args.draft_linear, args.draft_kv_cache, read)?
+            let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
+            crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
+                dspark::Drafter::load(&self.library, programs, snapshot, stream, slots, batch,
+                    embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
+                    args.draft_linear, args.draft_kv_cache, read))?
         };
         drafter.set_draft_head(args.draft_head);
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, draft_head = ?args.draft_head,
             draft_linear = ?args.draft_linear, "{} drafter resident", drafter.name());
         Ok(Some(drafter))
+    }
+
+    /// The drafter's standalone push owners from its headers alone (None: no
+    /// drafter, or a snapshot outside a push namespace, which mounts).
+    fn draft_push(&self, args: &EngineArgs)
+        -> Result<Option<cuteafd_loader::placement::families::glm5_flash::admission::DraftPush>> {
+        let Some(snapshot) = &args.draft else { return Ok(None) };
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        cuteafd_loader::placement::families::glm5_flash::admission::DraftPush::for_snapshot(snapshot, &config,
+            cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8))
     }
 
     /// The one-expert NVFP4 package of ModelOpt NVFP4 dense MLPs, when `layers` have them.

@@ -31,7 +31,7 @@ use crate::shared::fp8_linear;
 use crate::shared::token_io::TokenEmbedding;
 use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
 use cuteafd_ffi::NativeLibrary;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::path::Path;
 use std::ffi::c_void;
 use crate::shared::speculation::dflash::DraftHead;
@@ -48,22 +48,39 @@ pub(crate) use crate::shared::speculation::block_dspark::{
 pub(crate) enum DraftRead {
     Dspark(std::thread::JoinHandle<Result<std::collections::HashMap<String, Vec<u8>>>>),
     Dflash(std::thread::JoinHandle<std::io::Result<Vec<u8>>>),
+    /// A SparkNest snapshot: its standalone push group streams the payload, so
+    /// nothing is read here (a prefetch would read every byte twice).
+    Pushed { dspark: bool },
 }
 
 impl DraftRead {
     /// Starts reading the drafter snapshot `snapshot` names (the family's
-    /// `prefetch` for whichever drafter it holds).
+    /// `prefetch` for whichever drafter it holds), unless it is pushed.
     pub(crate) fn start(snapshot: &Path) -> Result<Self> {
-        Ok(if is_dspark(snapshot)? { Self::Dspark(prefetch(snapshot)) }
+        use crate::shared::experts::rtx::push::PushPolicy;
+        let dspark = is_dspark(snapshot)?;
+        Ok(if PushPolicy::for_snapshot(snapshot)? == PushPolicy::Required { Self::Pushed { dspark } }
+            else if dspark { Self::Dspark(prefetch(snapshot)) }
             else { Self::Dflash(crate::shared::speculation::dflash::prefetch(snapshot)) })
     }
 
-    /// The DFlash2 file bytes, for a read started with [`Self::start`]; errors
-    /// when the snapshot is a dSpark drafter.
+    /// The DFlash2 file bytes, for a read started with [`Self::start`] (empty when
+    /// pushed); errors when the snapshot is a dSpark drafter.
     pub(crate) fn join_dflash(self) -> Result<Vec<u8>> {
         match self {
             Self::Dflash(handle) => Ok(handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??),
-            Self::Dspark(_) => anyhow::bail!("the drafter read was started for dSpark, not DFlash2"),
+            Self::Pushed { dspark: false } => Ok(Vec::new()),
+            Self::Dspark(_) | Self::Pushed { dspark: true } =>
+                anyhow::bail!("the drafter read was started for dSpark, not DFlash2"),
+        }
+    }
+
+    /// The prefetched dSpark tensors (empty when pushed).
+    fn join_dspark(self) -> Result<Option<std::collections::HashMap<String, Vec<u8>>>> {
+        match self {
+            Self::Dspark(handle) => Ok(Some(handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??)),
+            Self::Pushed { dspark: true } => Ok(Some(Default::default())),
+            Self::Dflash(_) | Self::Pushed { dspark: false } => Ok(None),
         }
     }
 }
@@ -115,13 +132,17 @@ impl<'a> Drafter<'a> {
         embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, read: DraftRead)
         -> Result<Self> {
-        if let DraftRead::Dspark(handle) = read {
+        let read = match read {
+            DraftRead::Dspark(_) | DraftRead::Pushed { dspark: true } => Err(read),
+            other => Ok(other),
+        };
+        if let Err(read) = read {
             let cfg = DsparkConfig::read(snapshot)?;
             ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
                 "the dSpark drafter does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-            let tensors = handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
+            let tensors = read.join_dspark()?.context("dSpark drafter read")?;
             return Ok(Self::Dspark(DsparkDrafter::load(library, programs, snapshot, tensors, stream, slots,
                 sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache)?));
         }
@@ -130,7 +151,7 @@ impl<'a> Drafter<'a> {
             "the DFlash2 drafter does not fit this target");
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-        let file = read.join_dflash()?;
+        let file = read.ok().context("DFlash2 drafter read")?.join_dflash()?;
         Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, programs, snapshot, file, stream, slots,
             sequences, mask, true, representation, scales, fp8_rows, kv_cache)?))
     }
