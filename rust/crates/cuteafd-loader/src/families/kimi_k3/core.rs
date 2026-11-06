@@ -657,6 +657,19 @@ mod tests {
         }
         testing::write_safetensors(&dir.path().join("hqa.safetensors"), &restored);
         std::fs::write(dir.path().join("model.safetensors.index.json"), serde_json::to_vec(&index)?)?;
+        let declaration = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
+            "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
+                "compact-attention":{"config":"config.compact-attention.json",
+                    "index":"model.compact-attention.safetensors.index.json", "quantize":"quantize_config.compact-attention.json"}},
+            "native_modules":"quantize_config.json:native_attention"});
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("config.json"))?)?;
+        config["quantization_config"]["attention_view"] = declaration.clone();
+        let declarations = restored.iter().map(|(name, dtype, shape)| (name.strip_suffix(".weight").unwrap().to_owned(),
+            serde_json::json!({"format":"bf16", "shard":"hqa.safetensors", "compact_attention_bits":6,
+                "tensors":{name:{"dtype":dtype,"shape":shape}}}))).collect::<serde_json::Map<_, _>>();
+        let quant = serde_json::json!({"attention_view":declaration, "native_attention":declarations});
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
+        std::fs::write(dir.path().join("quantize_config.json"), serde_json::to_vec(&quant)?)?;
         let expected = testing::kimi_k3_tensors(false).into_iter().map(|(n, _, s)| (n, s)).collect();
         let mut charges = Vec::new();
         for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
@@ -702,6 +715,34 @@ mod tests {
             charges.push(bytes);
         }
         assert!(charges[1] < charges[0]);
+        for mutation in 0..4 {
+            let mut bad_config = config.clone();
+            let mut bad_quant = quant.clone();
+            let mut bad_index = index.clone();
+            let stem = restored[0].0.strip_suffix(".weight").unwrap();
+            match mutation {
+                0 => bad_config["quantization_config"]["attention_view"]["mode"] = serde_json::json!("compact-attention"),
+                1 => { bad_quant.as_object_mut().unwrap().remove("native_attention"); }
+                2 => { bad_index["weight_map"].as_object_mut().unwrap().remove(&restored[0].0); }
+                _ => bad_index["weight_map"][format!("{stem}.trellis")] = serde_json::json!("parent.safetensors"),
+            }
+            for (name, value) in [("config.json", &bad_config), ("quantize_config.json", &bad_quant),
+                ("model.safetensors.index.json", &bad_index)] {
+                std::fs::write(dir.path().join(name), serde_json::to_vec(value)?)?;
+            }
+            assert!(CheckpointView::select(dir.path(), AttentionMode::Hqa).is_err(), "mixed bundle {mutation}");
+        }
+        for (name, value) in [("config.json", &config), ("quantize_config.json", &quant),
+            ("model.safetensors.index.json", &index)] {
+            std::fs::write(dir.path().join(name), serde_json::to_vec(value)?)?;
+        }
+        for name in ["config.compact-attention.json", "quantize_config.compact-attention.json",
+            "model.compact-attention.safetensors.index.json"] {
+            let bytes = std::fs::read(dir.path().join(name))?;
+            std::fs::remove_file(dir.path().join(name))?;
+            assert!(CheckpointView::select(dir.path(), AttentionMode::Compact).is_err(), "missing {name}");
+            std::fs::write(dir.path().join(name), bytes)?;
+        }
         let compact_view = CheckpointView::select(dir.path(), AttentionMode::Compact)?;
         std::fs::remove_file(dir.path().join("hqa.safetensors"))?;
         let checkpoint = Checkpoint::open_view(&compact_view)?;
