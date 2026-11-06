@@ -15,6 +15,7 @@ pub(crate) struct CorePrograms<'a> {
     exact_cap: usize,
     projections: BTreeMap<(ProjectionKey, ProjectionOutput), Projection<'a>>,
     pub(crate) scratch: Option<ProjectionScratch<'a>>,
+    bf16: cuteafd_ffi::draft_projection::DraftProjections<'a>,
 }
 
 fn dtype(output: ProjectionOutput) -> TrellisDType {
@@ -74,10 +75,26 @@ impl<'a> CorePrograms<'a> {
                 [&policy.native_input, &policy.native, &policy.output_program].into_iter()
                     .map(|name| (name.as_str(), crate::shared::prefill_packing::ProgramRows::PackedRows))
             }), usize::MAX)?;
-        Ok(Self { projections, scratch, exact_cap })
+        ensure!(admitted.native.iter().all(|weight| !weight.fp8 && weight.ranks == 1),
+            "Muse native TP2/Fp8 projection export pending");
+        let shapes = admitted.native.iter().map(|weight| (weight.shape[1], weight.shape[0])).collect::<Vec<_>>();
+        let rows = admitted.scratch.as_ref().map_or(1, |scratch| scratch.rows);
+        let bf16 = device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load(programs, &shapes, rows)?))?;
+        Ok(Self { projections, scratch, exact_cap, bf16 })
     }
 
     pub(crate) fn packed_cap(&self) -> usize { self.exact_cap }
+
+    pub(crate) fn native(&self, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
+        output: Buffer, stream: *mut c_void) -> Result<()> {
+        ensure!(!weight.layout.fp8 && weight.layout.ranks == 1, "Muse native TP2/Fp8 projection export pending");
+        let [n, k] = weight.layout.shape;
+        ensure!(input.bytes >= rows * k * 2 && output.bytes >= rows * n * 2,
+            "Muse native projection exceeds admitted buffers");
+        // SAFETY: the checked selected weights and lane buffers live through the stream's completion.
+        unsafe { self.bf16.launch(input.ptr, weight.values.buffer.ptr, output.ptr, rows, k, n, stream)?; }
+        Ok(())
+    }
 
     fn projection(&self, weights: &CoreWeights<'_>, output: ProjectionOutput) -> Result<&Projection<'a>> {
         let key = projection_key(&cuteafd_loader::formats::trellis_core::CoreWeightLayout {

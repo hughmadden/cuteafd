@@ -142,7 +142,7 @@ fn layer_rects(checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &MuseSparkCon
         ("moe.pre_expert", "mlp.pre_expert_proj", cfg.expert_hidden, cfg.hidden, true),
         ("moe.post_expert", "mlp.post_expert_proj", cfg.hidden, cfg.expert_hidden, false),
     ] {
-        if layout.core.contains_key(name) { continue; }
+        if layout.core.contains_key(name) || layout.native.contains_key(name) { continue; }
         let (rows, cols) = if row_split { (Some(rank * n / ranks..(rank + 1) * n / ranks), None) }
             else { (None, Some(rank * k * 2 / ranks..(rank + 1) * k * 2 / ranks)) };
         let tensor_name = format!("{root}.{stem}.weight");
@@ -182,6 +182,13 @@ fn land<'a>(device: Device<'a>, dense: &DenseLoad<'a>, rect: Rect) -> Result<All
 pub(crate) struct LayerWeights<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
     core: BTreeMap<&'static str, CoreWeights<'a>>,
+    native: BTreeMap<&'static str, NativeWeights<'a>>,
+}
+
+pub(crate) struct NativeWeights<'a> {
+    pub layout: cuteafd_loader::families::muse_spark::core::NativeLayout,
+    pub values: Allocation<'a>,
+    pub scales: Option<Allocation<'a>>,
 }
 
 impl<'a> LayerWeights<'a> {
@@ -213,7 +220,23 @@ impl<'a> LayerWeights<'a> {
         }).collect::<Result<BTreeMap<_, _>>>()?;
         ensure!(operands.len() == layout.operands.len() && operands.iter().all(|(name, allocation)|
             layout.operands.get(name) == Some(&allocation.buffer.bytes)), "Muse recorded operand inventory");
-        Ok(Self { operands, core })
+        let native = layout.native.iter().map(|(&name, layout)| {
+            use super::super::glm5_flash::weights::{attention_records, AttentionRecord};
+            let [n, k] = layout.shape;
+            let values = allocate(device, n * k * if layout.fp8 { 1 } else { 2 })?;
+            let scales = layout.fp8.then(|| allocate(device, n.div_ceil(128) * k.div_ceil(128) * 4)).transpose()?;
+            let selected = checkpoint.projection(&layout.stem)?;
+            for record in attention_records(&checkpoint.snapshot, &selected, checkpoint.attention_mode(), layout,
+                crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
+                scales.as_ref().map(|scales| scales.buffer))? {
+                match record {
+                    AttentionRecord::Operand(operand) => dense.operand(operand)?,
+                    AttentionRecord::Step(step) => dense.step(step, std::ptr::null_mut())?,
+                }
+            }
+            Ok((name, NativeWeights { layout: layout.clone(), values, scales }))
+        }).collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(Self { operands, core, native })
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -221,6 +244,8 @@ impl<'a> LayerWeights<'a> {
     }
 
     pub(crate) fn core(&self, name: &str) -> Option<&CoreWeights<'a>> { self.core.get(name) }
+
+    pub(crate) fn native(&self, name: &str) -> Option<&NativeWeights<'a>> { self.native.get(name) }
 }
 
 /// One rank's share of the global weights (`GlobalLayout`) beyond the token

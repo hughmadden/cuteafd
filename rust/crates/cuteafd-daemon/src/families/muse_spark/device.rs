@@ -173,6 +173,9 @@ impl RankDevice<'_, '_> {
         if let Some(core) = weights.core(name) {
             return self.core.local(rows, input, core, output, self.stream);
         }
+        if let Some(native) = weights.native(name) {
+            return self.core.native(rows, input, native, output, self.stream);
+        }
         // BF16 checkpoint projections (gate_proj): the exported BF16 projection.
         ensure!(name == "attn.gate", "Muse BF16 projection {name} has no program");
         // SAFETY: lane planes and resident weights are live and sized by admission.
@@ -266,7 +269,8 @@ impl RankDevice<'_, '_> {
             (1, Some(core)) => self.core.local(rows, gated, core, attended, self.stream),
             (2, Some(core)) => self.k_split(Channel::Attention, rows, gated, core, attended,
                 peer.context("Muse TP2 o_proj needs the peer exchange")?),
-            _ => anyhow::bail!("Muse o_proj must be a K6 core projection"),
+            (1, None) => self.project(layer, "attn.o", rows, gated, attended),
+            _ => anyhow::bail!("Muse native TP2 o_proj export pending"),
         }
     }
 

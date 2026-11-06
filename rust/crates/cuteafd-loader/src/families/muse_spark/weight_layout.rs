@@ -5,7 +5,7 @@
 //! projections split over E (pre_expert by outputs, post_expert by inputs);
 //! the router, norms and gates are whole on each GPU. K6 projections keep their payload + H128 vectors;
 //! the residual gates are packed as host-computed F32 alpha/beta.
-use super::{core::{CoreInventory, CoreSplit, PREFIX}, MuseSparkConfig};
+use super::{core::{CoreInventory, CoreSplit, NativeLayout, PREFIX}, MuseSparkConfig};
 use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
@@ -16,11 +16,15 @@ use std::collections::BTreeMap;
 pub struct LayerLayout {
     pub operands: BTreeMap<&'static str, usize>,
     pub core: BTreeMap<&'static str, CoreWeightLayout>,
+    pub native: BTreeMap<&'static str, NativeLayout>,
 }
 
 impl LayerLayout {
     pub fn bytes(&self) -> Result<usize> {
-        self.operands.values().copied().chain(self.core.values().map(|c| c.bytes))
+        let native = self.native.values().map(|layout| layout.bytes()
+            .and_then(|bytes| usize::try_from(bytes).context("Muse native weight extent")))
+            .collect::<Result<Vec<_>>>()?;
+        self.operands.values().copied().chain(self.core.values().map(|c| c.bytes)).chain(native)
             .try_fold(0usize, |n, b| n.checked_add(b).context("Muse layer weight extent overflow"))
     }
 
@@ -34,6 +38,7 @@ impl LayerLayout {
         (0..ranks).map(|rank| {
             let mut operands = BTreeMap::new();
             let mut cores = BTreeMap::new();
+            let mut native = BTreeMap::new();
             let mut matrix = |name: &'static str, stem: &str, n: usize, k: usize, split: Option<CoreSplit>| -> Result<()> {
                 match core.projections.get(&format!("{root}.{stem}")) {
                     Some(projection) => {
@@ -47,7 +52,13 @@ impl LayerLayout {
                         let (r, w) = if split.is_some() && ranks == 2 { (rank, 2) } else { (0, 1) };
                         cores.insert(name, CoreWeightLayout::new(projection, side, r, w)?);
                     }
-                    None => { operands.insert(name, n * k * 2); }
+                    None => {
+                        if let Some(projection) = core.native.get(&format!("{root}.{stem}")) {
+                            ensure!(Some(projection.split) == split, "Muse native projection split differs from layout");
+                            native.insert(name, NativeLayout { stem: format!("{root}.{stem}"), shape: [n, k],
+                                fp8: projection.fp8, rank, ranks, split: projection.split });
+                        } else { operands.insert(name, n * k * 2); }
+                    }
                 }
                 Ok(())
             };
@@ -72,7 +83,7 @@ impl LayerLayout {
             for gate in ["gate.attention.alpha", "gate.attention.beta", "gate.ffn.alpha", "gate.ffn.beta"] {
                 operands.insert(gate, h * 4);
             }
-            Ok(Self { operands, core: cores })
+            Ok(Self { operands, core: cores, native })
         }).collect()
     }
 }
@@ -118,6 +129,7 @@ pub fn projection_key(layout: &CoreWeightLayout) -> ProjectionKey {
 pub struct RankProjections {
     pub programs: BTreeMap<(ProjectionKey, ProjectionOutput), usize>,
     pub scratch: Option<crate::formats::trellis_core::ProjectionScratchLayout>,
+    pub native: Vec<NativeLayout>,
 }
 
 /// Per rank: the K6 geometries of every layer plus the head on the head rank
@@ -125,9 +137,14 @@ pub struct RankProjections {
 /// the decode/verify width; wider prefill/drafter scoring uses head microbatches).
 pub fn projections(cfg: &MuseSparkConfig, core: &CoreInventory, ranks: usize, rows: usize)
     -> Result<Vec<RankProjections>> {
-    let mut out = vec![RankProjections { programs: BTreeMap::new(), scratch: None }; ranks];
+    let mut out = vec![RankProjections { programs: BTreeMap::new(), scratch: None, native: Vec::new() }; ranks];
     for layer in 0..cfg.layers {
         for (rank, layout) in LayerLayout::ranks(cfg, layer, ranks, core)?.into_iter().enumerate() {
+            for weight in layout.native.values() {
+                if !out[rank].native.iter().any(|existing| existing.shape == weight.shape && existing.fp8 == weight.fp8) {
+                    out[rank].native.push(weight.clone());
+                }
+            }
             for weight in layout.core.values() {
                 // The package's K-split H128 egress is F32; narrow only after
                 // summing full-width partials and applying that one egress.
