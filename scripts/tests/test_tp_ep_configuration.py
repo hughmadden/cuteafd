@@ -395,6 +395,7 @@ class LauncherTopologyTest(unittest.TestCase):
             setup = f'''set -euo pipefail
 source scripts/lib/release-common.sh
 release_die() {{ echo "$*" >&2; exit 1; }}
+get() {{ printf '%s' "${{2:-}}"; }}
 RELEASE_RTX_GPUS="$1"
 repo_root="$PWD"
 coordinator=coordinator

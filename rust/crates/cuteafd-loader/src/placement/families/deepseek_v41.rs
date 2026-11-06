@@ -505,8 +505,8 @@ mod tests {
                     draft: None, encoders: Vec::new(), media_cache_bytes: 0,
                     resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
                     operation: Operation::Serving,
-                    budgets: admission::live_budgets(&vec![(96 << 30, 96 << 30, 96 << 30); ranks],
-                        &vec![64 << 30; 4])?,
+                    budgets: admission::production_budgets(&vec![(96 << 30, 96 << 30); ranks],
+                        0, Some((128 << 30, 128 << 30)), 0, &vec![64 << 30; 4])?,
                 }.prepare()?;
                 let request = production_request(512, Some(4096), Onboard::Layers(0),
                     PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
