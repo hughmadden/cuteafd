@@ -267,14 +267,21 @@ def expert_geometry(config):
 def expert_snapshot(tick, geometry=None):
     geometry = geometry or dict(layers=12, experts=32, topk=2, routed_layers=list(range(1, 12)))
     experts = geometry["experts"]
+    popularity = {}
+    for layer in geometry["routed_layers"]:
+        for phase in ["prefill", "decode"]:
+            rng = random.Random(f"expert-fixture/{layer}/{phase}/{experts}")
+            weights = [(rank + 6) ** -0.8 for rank in range(experts)]
+            rng.shuffle(weights)
+            popularity[layer, phase] = weights
 
     def window(scale):
         prefill, decode = [0] * (geometry["layers"] * experts), [0] * (geometry["layers"] * experts)
         for layer in geometry["routed_layers"]:
             for expert in range(experts):
                 index = layer * experts + expert
-                prefill[index] = scale * (tick + layer) * (1 + (expert + layer) % 7) if expert < experts * 3 // 4 else 0
-                decode[index] = scale * (tick + 2) * (1 + (expert * 3 + layer + tick) % 13) if (expert + tick) % 5 else 0
+                prefill[index] = scale * int((tick + layer) * 80 * popularity[layer, "prefill"][expert])
+                decode[index] = scale * int((tick + 2) * 56 * popularity[layer, "decode"][expert])
 
         def summarize(values):
             layers = [values[layer * experts:(layer + 1) * experts] for layer in geometry["routed_layers"]]
