@@ -203,6 +203,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         prefix_marks = admitted.mark_selection.slots, marks = %admitted.mark_selection.summary(),
         spark_budget_gib, reserve = "estimated until W9 census",
         "Kimi admitted TP2 expert ownership");
+    cuteafd_bench::context::set_resolved("attention-placement", &admitted.placement.attention_summary());
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())

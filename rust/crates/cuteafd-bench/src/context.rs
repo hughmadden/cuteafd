@@ -242,6 +242,21 @@ mod tests {
     }
 
     #[test]
+    fn admitted_attention_overrides_launch_default_before_ready() {
+        set(ServerContext { settings: vec![Setting {
+            name: "attention-placement".into(), value: Some("layers".into()),
+            default: Some("layers".into()), source: "resolved".into(),
+        }], ..Default::default() });
+        set_resolved("attention-placement", "context");
+        mark_ready("127.0.0.1:8123".parse().unwrap());
+        let context = get();
+        let settings = context.settings.iter().filter(|s| s.name == "attention-placement").collect::<Vec<_>>();
+        assert_eq!(settings.len(), 1);
+        assert_eq!(settings[0].value.as_deref(), Some("context"));
+        assert_eq!(settings[0].source, "resolved");
+    }
+
+    #[test]
     fn resolved_setting_replaces_every_copy_of_the_name() {
         let mut settings = vec![
             Setting { name: "attention-placement".into(), value: Some("auto".into()),
