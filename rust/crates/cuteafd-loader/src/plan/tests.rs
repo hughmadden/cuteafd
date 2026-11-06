@@ -4158,7 +4158,7 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     // Leave only one table's worth of KV room, below this small fixture's target cap.
     options.layout.as_mut().unwrap().rtx_bytes[0] =
         probe.devices[0].used_bytes()
-            - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "KV pool").map(|i| i.bytes).sum::<u64>()
+            - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
             + bytes + options.layout.as_ref().unwrap().headroom_bytes
                 .max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
     let gpu_report = plan(dir.path(), &options).unwrap();
@@ -4171,8 +4171,7 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     let gpu = gpu_report.memory_layout.unwrap();
     let host = report.memory_layout.unwrap();
     assert!(!host.devices.iter().any(|d| d.by_category().contains_key(&Category::Embedding)));
-    // Releasing an embedding cannot grow a pool already at the shared small-card cap.
-    assert!(host.pool_tokens > gpu.pool_tokens || (host.pool_tokens == gpu.pool_tokens && host.pool_tokens == 1_048_576), "host={} GPU={} host_notes={:?} gpu_notes={:?}",
+    assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={} host_notes={:?} gpu_notes={:?}",
         host.pool_tokens, gpu.pool_tokens, host.notes, gpu.notes);
     assert_eq!(host.devices[1].by_category().get(&Category::Weights), gpu.devices[1].by_category().get(&Category::Weights));
     assert!(host.notes.iter().any(|n| n.contains(&format!("{bytes} device bytes freed"))));
