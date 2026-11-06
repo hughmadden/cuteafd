@@ -7,7 +7,7 @@ use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::devic
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::{placement::{Demand, GpuBudget, Inventory, ProgramSet, SparkWorkingSet},
+use cuteafd_loader::{placement::{GpuBudget, Inventory, ProgramSet, SparkWorkingSet},
     plan::{checkpoint::Checkpoint, families::step5::Config, spec::DraftOwnership}};
 use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
 use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
@@ -305,27 +305,17 @@ fn with_backend<T>(args: &ServeArgs,
         sequences: usize::from(args.max_sequences), context: args.max_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
-        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![],
+        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
     let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
     let planning = std::time::Instant::now();
-    // The first solve only prices retained startup owners. Validate native ABIs
-    // once, after the final solve selects the ownership used for allocation.
-    let admission = cuteafd_loader::plan::families::step5::admission::admit_mtp_with_contract(
-        &checkpoint, &inputs, usize::from(args.mtp), &contract)?;
-    cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
-    // Uploads convert on the host and copy synchronously. No transient device
-    // conversion arena exists: each loading phase is bounded by retained owners.
-    inputs.startup = admission.placement.items.iter().enumerate().map(|(rank, items)| {
-        let bytes = items.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
-            .context("Step-5 loading phase overflow")?;
-        Ok(Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Workspace,
-            "Step-5 retained loading peak", bytes, cuteafd_core::memory_layout::Basis::Exact))
-    }).collect::<Result<Vec<_>>>()?;
+    // One admission: the contract prices every retained owner, and native ABIs
+    // are validated against the ownership it selected.
     let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract)?;
+    cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup planning complete");
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
@@ -712,19 +702,12 @@ mod tests {
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
-            startup: vec![],
             onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
                 Some(&args.manifest), 256, 2, 1, args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))?,
         };
         for depth in 1..=3 {
             args.mtp = depth;
             args.validate()?;
-            inputs.startup.clear();
-            let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
-            inputs.startup = admitted.placement.items.iter().enumerate().map(|(rank, items)|
-                Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Workspace,
-                    "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
-                    cuteafd_core::memory_layout::Basis::Exact)).collect();
             let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
             let endpoint = args.endpoint(format.ingress());
             let clients = admitted.ownership.routed_endpoints()?;

@@ -198,7 +198,6 @@ pub(super) fn layout(
         },
         peer_diagnostics: false,
         pending_code: code,
-        startup: vec![],
         onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
             checked_rows, coordinators, waves, opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto))?,
     };

@@ -154,7 +154,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
-            peer_diagnostics: false, startup: vec![], onboard: None,
+            peer_diagnostics: false, onboard: None,
         };
         for depth in [0, 1, 3].into_iter().filter(|&depth| depth != 3
             || kv_format == crate::families::qwen4::Qwen4KvCache::Bf16) {

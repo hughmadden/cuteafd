@@ -5614,6 +5614,37 @@ fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
 }
 
 #[test]
+fn step5_auto_pool_and_count_admission_preserve_one_recipe() {
+    let dir = families::step5::tests::exl3_snapshot();
+    let manifest = testing::step5_native_manifest(dir.path());
+    testing::install_step5_exl3_rtx_package(&manifest);
+    let options = PlanOptions { draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30], context_tokens: 262_144, prefix_slots: None,
+            host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+            workspace_manifest: Some(manifest), ..Default::default()
+        }), ..sparks(3) };
+    let unset = plan_spark_count(dir.path(), &options, 3, Some(3)).unwrap();
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan_spark_count(dir.path(), &zero, 3, Some(3)).unwrap();
+    assert!(automatic.wip_launchable(), "{}", render(&automatic));
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens,
+        unset.memory_layout.as_ref().unwrap().pool_tokens);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    // One typed refusal: the first solve's, not a smaller-prefill-reserve retry.
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let direct = plan(dir.path(), &zero).unwrap();
+    let counted = plan_spark_count(dir.path(), &zero, 3, Some(3)).unwrap();
+    assert!(!counted.wip_launchable());
+    assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
+    for hint in &direct.hints {
+        assert!(counted.hints.iter().any(|other| other.what == hint.what), "{:?}", counted.hints);
+    }
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}
+
+#[test]
 fn glm_auto_pool_and_count_admission_preserve_one_recipe() {
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let options = PlanOptions { layout: Some(layout::LayoutOptions {

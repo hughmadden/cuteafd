@@ -505,6 +505,7 @@ impl Family for Step5 {
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn native_serving_admission(&self) -> bool { true }
+    fn contract_admission(&self) -> bool { true }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
