@@ -645,7 +645,7 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
         && value["role"].as_str() == Some("coordinator") && value["geometry"].as_str() == Some(geometry)
         && layout["tp"].as_u64() == Some(2) && layout["hidden"].as_u64() == Some(shape.hidden as u64)
         && layout["intermediate"].as_u64() == Some(shape.intermediate as u64)
-        && layout["slice"].as_u64() == Some(shape.intermediate as u64 / world as u64)
+        && layout["slice"].as_u64() == Some(shape.intermediate as u64 / 2)
         && layout["experts"].as_u64() == Some(shape.experts as u64)
         && layout["top_k"].as_u64() == Some(shape.topk as u64)
         && layout["input"].as_str() == Some("bf16") && layout["weights"].as_str() == Some("nvfp4")
