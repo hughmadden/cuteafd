@@ -779,6 +779,23 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     Ok(())
 }
 
+fn selected_programs(programs: &cuteafd_ffi::programs::Programs<'_>, checkpoint: &Checkpoint,
+    cfg: &Config, ranks: usize, rows: usize, ownership: Option<&cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership>)
+    -> Result<(cuteafd_loader::placement::ProgramSet, cuteafd_loader::plan::families::step5::native::NativeSelection)> {
+    use cuteafd_loader::plan::families::step5::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
+    let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+    let specs = programs.names().map(|name| programs.spec(name)).collect::<Result<Vec<_>>>()?;
+    let manifest = cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?;
+    let selection = native::NativeSelection::resolve(&contract, cfg, ranks, 0, rows, Some(&manifest))?;
+    for rank in 0..ranks {
+        let layout = RankWeightLayout::from_contract(&contract, cfg, rank, ranks, ownership)?;
+        selection.validate_layout(&layout, rows)?;
+    }
+    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(native::program_prefixes(ranks == 2), programs.names());
+    selection.augment_programs(&mut selected);
+    Ok((selected, selection))
+}
+
 fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     reference: Reference, layers: &[usize], format: &super::experts::StepExperts) -> Result<()> {
     use super::execution::Execution;
@@ -816,7 +833,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     library.cuda_set_device(args.device)?;
     let devices = [args.device, peer_device].map(|id| Device { library: &library, id });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5", "step52"], programs.names());
+    let (selected, _native_selection) = selected_programs(&programs, checkpoint, cfg, 2, unit, Some(&ownership))?;
+    for device in &devices {
+        device.run(|| { programs.load_matching(|name| selected.names.iter().any(|selected| selected == name))?; Ok(()) })?;
+    }
     let head_rank = ownership.execution().spec().head_gpu as usize;
     let pages = (rows as u64).div_ceil(64) + 1;
     let mut available = [0u64; 2];
@@ -990,7 +1010,8 @@ fn run(args: GoldenArgs) -> Result<()> {
         id: args.device,
     };
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5"], programs.names());
+    let (selected, _native_selection) = selected_programs(&programs, &checkpoint, &cfg, 1, rows, None)?;
+    programs.load_matching(|name| selected.names.iter().any(|selected| selected == name))?;
     let pending = crate::shared::inventory::pending_code(
         &library,
         args.device,
