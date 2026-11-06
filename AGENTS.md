@@ -183,10 +183,11 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   Full-plan tests use `plan::testing::BudgetedPlanInput`'s strict 30 s per-plan
   budget with phase diagnostics; multi-shape tests may take longer in total.
   The nextest and cargo-test fallback selections agree. Add no failing ids.
-- Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
-  From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
-  (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
-  relative submodule gitfiles resolve only from the real path.
+- Kernel and exporter changes gate on their own oracles plus the full CPU gate's installed/placement tests.
+  Don't run `scripts/build/compare-sm-exports.py` object/cubin diffs as a routine per-merge gate (TJ, 2026-11-06);
+  use it only to investigate a specific suspected leak. From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu`
+  by the worktree's real path (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`),
+  not `/workspace/cuteafd`: relative submodule gitfiles resolve only from the real path.
 - Kernel row curves: for new kernels/families/expert formats, duel winners or export/tiling/threshold changes,
   measure warmed time per routed row across the policy's live-row band (8192/k, k=2..4: 2048/2752/4096 plus real tails),
   using runtime-selected exports on SM120 and SM121 where the kernel runs, with fork bench `--capacity` and `--routes`.
