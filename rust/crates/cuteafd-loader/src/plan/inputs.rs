@@ -33,15 +33,17 @@ fn v4_placement_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
         collect(root, &root.join(directory), true, "py", &mut files)?;
     }
     collect(root, &root.join("scripts/build"), false, "json", &mut files)?;
-    let script = "scripts/build/compare-sm-exports.py";
-    files.insert(script.into(), Value::String(format!("{:x}", Sha256::digest(fs::read(root.join(script))?))));
+    for script in ["scripts/build/compare-sm-exports.py", "scripts/build/kernel-records.py",
+        "scripts/build/export-placement-inputs.py"] {
+        files.insert(script.into(), Value::String(format!("{:x}", Sha256::digest(fs::read(root.join(script))?))));
+    }
     Ok(Value::Object(files))
 }
 
 fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
     use sha2::{Digest, Sha256};
     let mut files = v4_placement_source_hashes(root)?;
-    let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/release-scope.py",
+    let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/kernel-records.py", "scripts/build/release-scope.py",
         "scripts/lib/wip_aot_scopes.py"].map(|path| root.join(path)).to_vec();
     let matrix: Value = serde_json::from_slice(&fs::read(root.join("benchmarks/current-matrix.json"))?)?;
     let retired = matrix["retired"].as_array().ok_or_else(|| anyhow::anyhow!("missing retired config list"))?
@@ -221,6 +223,9 @@ mod tests {
         }
         let script = root.path().join("scripts/build/compare-sm-exports.py");
         fs::write(&script, "source").unwrap();
+        for name in ["kernel-records.py", "export-placement-inputs.py"] {
+            fs::write(root.path().join("scripts/build").join(name), "source").unwrap();
+        }
         let metadata = json!({"engine_sources_sha256": v4_placement_source_hashes(root.path()).unwrap()});
         validate_v4_placement_sources(&metadata, root.path()).unwrap();
         fs::write(&script, "changed").unwrap();
@@ -243,7 +248,7 @@ mod tests {
             fs::create_dir_all(root.join(relative)).unwrap();
         }
         for relative in ["scripts/build/compare-sm-exports.py", "scripts/build/export-placement-inputs.py",
-            "scripts/build/release-scope.py", "scripts/lib/wip_aot_scopes.py",
+            "scripts/build/kernel-records.py", "scripts/build/release-scope.py", "scripts/lib/wip_aot_scopes.py",
             "examples/configs/live.config", "examples/configs/retired.config"] {
             fs::write(root.join(relative), "original").unwrap();
         }

@@ -38,6 +38,7 @@ docker_args=(
   -v "$hf_home:$hf_home:ro"
   -v "$hf_home:/root/.cache/huggingface:ro"
   -e HF_HOME="$hf_home"
+  -e "CUTEAFD_EXPORT_IMAGE_ID=$(docker image inspect "$image" --format '{{.Id}}')"
 )
 # The host hub is usually a symlink into the shared store; mount its target too,
 # or the link dangles inside the container.
