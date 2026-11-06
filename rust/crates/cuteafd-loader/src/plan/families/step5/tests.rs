@@ -1457,6 +1457,8 @@ fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<(
     use crate::formats::dense_trellis::TrellisSide;
     let fixture = exl3_snapshot();
     let cp = Checkpoint::open(fixture.path())?;
+    let contract = coordinator::CoordinatorContract::from_checkpoint(&cp)?;
+    assert_eq!(contract.retained_sync_h2d_bytes()?, 128896 * 4096 * 6 / 8);
     let whole = coordinator::RankWeightLayout::from_checkpoint(&cp, 0, 1)?;
     // 92 target layers x 7 + lm_head; no BF16 operand duplicates a native one.
     assert_eq!(whole.core.len(), 645);

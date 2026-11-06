@@ -180,11 +180,12 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
+    let host_contract = super::coordinator::CoordinatorContract::from_checkpoint(input.checkpoint())?;
     let inputs = RuntimeInputs { host: super::admission::HostInputs {
             memory: crate::plan::layout::recipe_host_memory(opts)?, cache_bytes: opts.host_cache_bytes,
             headroom: 8 << 30,
-            push: Some(super::admission::push_host_envelope(
-                &super::coordinator::CoordinatorContract::from_checkpoint(input.checkpoint())?, &model.cfg, coordinators)?),
+            retained_sync_h2d_bytes: host_contract.retained_sync_h2d_bytes()?,
+            push: Some(super::admission::push_host_envelope(&host_contract, &model.cfg, coordinators)?),
         }, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
                 kv_format: opts.step5_kv,
         inventory,

@@ -215,11 +215,13 @@ pub struct HostInputs {
     pub memory: (u64, u64),
     pub cache_bytes: Option<u64>,
     pub headroom: u64,
+    pub retained_sync_h2d_bytes: u64,
     pub push: Option<crate::push_load::PushHostEnvelope>,
 }
 impl Default for HostInputs {
     fn default() -> Self {
-        Self { memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30, push: None }
+        Self { memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30,
+            retained_sync_h2d_bytes: 0, push: None }
     }
 }
 
@@ -952,6 +954,19 @@ mod tests {
         let load = admitted.solved.phases.iter().find(|row| row.budget == "host"
             && row.phase == crate::placement::planner::Phase::Load).unwrap();
         assert!(load.owned >= inputs.host.push.as_ref().unwrap().bytes()?);
+        Ok(())
+    }
+
+    #[test]
+    fn synchronous_h2d_staging_remains_owned_through_ready_and_growth() -> Result<()> {
+        let mut inputs = inputs(1);
+        inputs.host.retained_sync_h2d_bytes = 395_968_512;
+        let admitted = run(&inputs)?;
+        let owner = admitted.solved.facts.allocations.iter()
+            .find(|owner| owner.id == "step5.host.sync_h2d").unwrap();
+        assert_eq!(owner.bytes, 395_968_512);
+        assert_eq!(owner.location, crate::placement::planner::Location::PINNED);
+        assert_eq!(owner.lifetime, crate::placement::planner::Lifetime::RESIDENT);
         Ok(())
     }
 

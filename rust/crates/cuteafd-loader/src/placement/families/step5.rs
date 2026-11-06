@@ -561,6 +561,13 @@ impl Recipe for Step5Recipe<'_> {
             contract.components.push(Component::allocation(owner,
                 ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
         }
+        if self.inputs.host.retained_sync_h2d_bytes > 0 {
+            let bytes = self.inputs.host.retained_sync_h2d_bytes;
+            let owner = Allocation::buffer("step5.host.sync_h2d", Location::PINNED, bytes,
+                Lifetime::RESIDENT, Category::Staging, "Step-5 retained synchronous H2D staging");
+            contract.components.push(Component::allocation(owner,
+                ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
+        }
         if let Some(push) = &self.inputs.host.push {
             for owner in push.allocations("step5.push")? {
                 contract.components.push(Component::allocation(owner.clone(),

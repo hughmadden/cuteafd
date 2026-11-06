@@ -317,6 +317,7 @@ fn with_backend<T>(args: &ServeArgs,
             crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes),
         },
         headroom: args.prefix.host_cache_headroom_bytes,
+        retained_sync_h2d_bytes: contract.retained_sync_h2d_bytes()?,
         push: Some(cuteafd_loader::plan::families::step5::admission::push_host_envelope(&contract, &cfg, ids.len())?),
     };
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
