@@ -97,11 +97,115 @@ pub fn exchange_recv_bytes(rows: usize) -> Result<usize> {
     Ok((rows * 7168 * 2).max(256))
 }
 
+impl CoreInventory {
+    /// All native projection routes that placement may select, resolved before allocation.
+    /// Tuple fields are (K, N, FP8 storage, F32 TP2 partial output).
+    pub fn native_geometries(&self, ranks: usize) -> Result<Vec<(usize, usize, bool, bool)>> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi native attention physical rank count");
+        let mut shapes = std::collections::BTreeSet::new();
+        for (stem, projection) in &self.native {
+            let mla = stem.ends_with(".q_b_proj") || (stem.ends_with(".o_proj")
+                && self.projections.contains_key(&format!("{}.q_a_proj", stem.rsplit_once('.').unwrap().0)));
+            let worlds: &[usize] = if ranks == 1 || projection.split == CoreSplit::Whole { &[1] }
+                else if mla { &[1, 2] } else { &[2] };
+            for &world in worlds {
+                let [mut n, mut k] = projection.shape;
+                match projection.split {
+                    CoreSplit::Input => k /= world,
+                    CoreSplit::Output => n /= world,
+                    CoreSplit::Whole => {},
+                }
+                shapes.insert((k, n, projection.fp8, world == 2 && projection.split == CoreSplit::Input));
+            }
+        }
+        Ok(shapes.into_iter().collect())
+    }
+
+    /// Serialized native records reuse one mapped BF16 source and quant table.
+    /// Partial input-column reads also retain a full-width host row window.
+    pub fn native_mount_load(&self, ranks: usize) -> Result<crate::shared::dense_read::MountLoad> {
+        use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
+        ensure!(matches!(ranks, 1 | 2), "Kimi native mount physical rank count");
+        let mut owner = MountLoad::default();
+        for projection in self.native.values() {
+            for world in [1, ranks] {
+                let [n, k] = projection.shape;
+                let (rows, cols) = match projection.split {
+                    CoreSplit::Output => (n / world, k),
+                    CoreSplit::Input => (n, k / world),
+                    CoreSplit::Whole => (n, k),
+                };
+                let row_bytes = k.checked_mul(2).context("Kimi native source row overflow")?;
+                let width = cols.checked_mul(2).context("Kimi native source slice overflow")?;
+                if projection.fp8 {
+                    let per = (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / width / 128).max(1) * 128;
+                    let batch_rows = rows.min(per);
+                    let mut load = MountLoad::read(ReadBatch::new(batch_rows, row_bytes, width, usize::MAX)?);
+                    load.pinned_tables = cuteafd_ffi::programs::fp8_load_table_bytes(batch_rows, 128)? as u64;
+                    owner.merge(load);
+                } else {
+                    owner.merge(MountLoad::read(ReadBatch::new(rows, row_bytes, width, STEP_BYTES)?));
+                }
+            }
+        }
+        Ok(owner)
+    }
+
+    pub fn native_attention_split(&self, ranks: usize) -> bool {
+        ranks == 2 && self.native.values().any(|p| p.split == CoreSplit::Input)
+    }
+
+    /// Native output projections retain unrotated F32 until the TP meet.
+    /// Compact K6 keeps its original BF16 transformed-basis planes unchanged.
+    pub fn native_attention_stages(&self, rows: usize, ranks: usize)
+        -> Result<BTreeMap<&'static str, usize>> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi native attention physical rank count");
+        if !self.native_attention_split(ranks) { return Ok(BTreeMap::new()); }
+        let bytes = rows.checked_mul(7168 * 4).context("Kimi native attention partial overflow")?;
+        Ok(BTreeMap::from([("native attention F32 partial", bytes)]))
+    }
+
+    pub fn native_package_stages(&self, manifest: &serde_json::Value, rows: usize, unit: usize,
+        ranks: usize) -> Result<BTreeMap<&'static str, usize>> {
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let mut stages = self.native_attention_stages(rows, ranks)?;
+        let mut scratch = 0;
+        for (k, n, fp8, partial) in self.native_geometries(ranks)? {
+            let output = if partial { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 };
+            if fp8 {
+                scratch = scratch.max(cuteafd_ffi::native_attention::validate_package_geometry(
+                    manifest, k, n, unit.max(64), output)
+                    .with_context(|| format!("Kimi native attention K{k}/N{n}: export pending"))?.1);
+            } else {
+                cuteafd_ffi::draft_projection::validate_package_geometry_with_output(
+                    manifest, k, n, unit.max(64), output)
+                    .with_context(|| format!("Kimi native attention K{k}/N{n}: export pending"))?;
+            }
+        }
+        if scratch != 0 { stages.insert("native attention FP8 scratch", scratch); }
+        Ok(stages)
+    }
+
+    pub fn attention_receive_bytes(&self, rows: usize, ranks: usize) -> Result<usize> {
+        let base = exchange_recv_bytes(rows)?;
+        Ok(if self.native_attention_split(ranks) { base * 2 } else { base })
+    }
+
+    pub fn native_attention_receive_demand(&self, rows: usize, rank: u8, ranks: usize)
+        -> Result<crate::placement::Demand> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        let bytes = self.attention_receive_bytes(rows, ranks)? - exchange_recv_bytes(rows)?;
+        Ok(crate::placement::Demand::new(rank, Category::Workspace,
+            "Kimi native attention F32 peer receive", bytes as u64, Basis::Exact))
+    }
+}
+
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct CoreCharges {
     pub projection: Vec<Option<ProjectionScratchLayout>>,
     pub stages: BTreeMap<&'static str,usize>,
     pub stage_bytes: usize,
+    pub native_stage_bytes: usize,
     pub receive: usize,
 }
 impl CoreCharges {
@@ -115,8 +219,11 @@ impl CoreCharges {
     pub fn from_package_for_ranks(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
         manifest: &serde_json::Value, ranks: usize) -> Result<Self> {
         ensure!(matches!(ranks, 1 | 2), "Kimi K6 charge physical rank count");
-        let stages = if core.projections.is_empty() { BTreeMap::new() }
+        let mut stages = if core.projections.is_empty() { BTreeMap::new() }
             else { package_lane_extents_for_ranks(manifest,rows,unit,ranks)? };
+        let native_stages = core.native_package_stages(manifest, rows, unit, ranks)?;
+        let native_stage_bytes = native_stages.values().sum::<usize>();
+        stages.extend(native_stages);
         let stage_bytes = if stages.is_empty() { 0 } else {
             let base = super::allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, super::COMPILED_CONTEXT,
                 super::allocation::NativeScratch::from_manifest_for_ranks(manifest, ranks)?, ranks)?;
@@ -125,7 +232,7 @@ impl CoreCharges {
         };
         Ok(Self {
             projection: projection_scratch_for_ranks(cfg,core,unit,&manifest["families"]["dense_trellis_k6"],ranks)?,
-            stages, stage_bytes,
+            stages, stage_bytes, native_stage_bytes,
             receive: if ranks == 2 { exchange_recv_bytes(unit)? } else { 0 },
         })
     }
@@ -136,7 +243,13 @@ impl CoreCharges {
             demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
                 "Kimi K6 projection scratch",projection.as_ref().map_or(Ok(0),|layout|layout.bytes())? as u64,Basis::Exact));
             demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
-                "Kimi K6 split-stage operands",self.stage_bytes as u64,Basis::Exact));
+                "Kimi K6 split-stage operands",(self.stage_bytes - self.native_stage_bytes) as u64,Basis::Exact));
+            for (name, bytes) in &self.stages {
+                if name.starts_with("native attention ") {
+                    demands.push(crate::placement::Demand::new(gpu as u8, Category::Workspace,
+                        format!("Kimi {name}"), *bytes as u64, Basis::Exact));
+                }
+            }
             if self.receive != 0 {
                 demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
                     "Kimi K6 peer receive",self.receive as u64,Basis::Exact));
@@ -236,6 +349,7 @@ pub fn draft_head_demand(core: &CoreInventory, rows: usize, metadata: &serde_jso
 pub struct CoreInventory {
     pub projections: BTreeMap<String, CoreProjection>,
     pub native: BTreeMap<String, crate::families::glm5_flash::core::NativeProjection>,
+    pub largest_selected_dense_bytes: Option<u64>,
 }
 
 impl CoreInventory {
@@ -262,13 +376,19 @@ impl CoreInventory {
             }
             let selected = checkpoint.projection(stem)?;
             let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape: actual } = selected.storage else { continue; };
+            ensure!(stem.ends_with(".o_proj") || stem.ends_with(".q_b_proj"),
+                "{stem}: Kimi native mixed attention only supports q_b_proj/o_proj; grouped inputs require K6");
             ensure!(actual == *shape && shape.len() == 2 && dtype == cuteafd_core::DType::Bf16,
                 "{stem}: Kimi native attention requires BF16 {shape:?}, found {dtype:?} {actual:?}");
             native.insert(stem.into(), crate::families::glm5_flash::core::NativeProjection {
                 shape: [shape[0], shape[1]], split: split(stem).unwrap(),
                 fp8: checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact });
         }
-        let inventory = Self { projections, native };
+        let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.tensors.iter()
+            .filter(|tensor| checkpoint.contains_tensor(&tensor.meta.name)
+                && !tensor.meta.name.contains(".experts."))
+            .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0));
+        let inventory = Self { projections, native, largest_selected_dense_bytes };
         inventory.validate_runtime_groups(cfg)?;
         Ok(inventory)
     }
@@ -364,7 +484,18 @@ mod tests {
         use crate::placement::{LayerMode, FfnMode};
         let dir = tempfile::tempdir()?;
         testing::write_kimi_core_snapshot(dir.path(), false);
+        let compact_checkpoint = Checkpoint::open(dir.path())?;
+        let compact_cfg = KimiK3Config::from_hf(&compact_checkpoint.config)?;
+        let compact_core = crate::plan::families::kimi::core_inventory(&compact_checkpoint)?;
+        let compact_layouts = (0..compact_cfg.layers).map(|layer|
+            super::super::weight_layout::LayerLayout::pair_with_core(&compact_cfg, layer, LayerMode::HeadSplit, &compact_core))
+            .collect::<Result<Vec<_>>>()?;
         let compact_index = std::fs::read(dir.path().join("model.safetensors.index.json"))?;
+        for (source, target) in [("config.json", "config.compact-attention.json"),
+            ("model.safetensors.index.json", "model.compact-attention.safetensors.index.json"),
+            ("quantize_config.json", "quantize_config.compact-attention.json")] {
+            std::fs::copy(dir.path().join(source), dir.path().join(target))?;
+        }
         let mut index: serde_json::Value = serde_json::from_slice(&compact_index)?;
         let mut restored = Vec::new();
         for (name, dtype, shape) in testing::kimi_k3_tensors(false) {
@@ -388,6 +519,22 @@ mod tests {
             let core = CoreInventory::from_checkpoint(&cfg, &checkpoint, &expected)?;
             assert_eq!(core.native.len(), restored.len());
             assert!(core.native.values().all(|p| p.fp8 == (mode == AttentionMode::Fp8Compact)));
+            let largest = checkpoint.tensors.iter().filter(|tensor| checkpoint.contains_tensor(&tensor.meta.name)
+                && !tensor.meta.name.contains(".experts.")).map(|tensor| tensor.meta.byte_length).max().unwrap();
+            assert_eq!(core.largest_selected_dense_bytes, Some(largest));
+            for ranks in [1, 2] {
+                let envelope = crate::placement::families::kimi::selected_push_host_envelope(&cfg, &core, ranks)?;
+                assert_eq!(envelope.dense_bytes, vec![crate::push_load::admitted_push_envelope(largest, 128, 1 << 20)?; ranks]);
+                let mount = core.native_mount_load(ranks)?;
+                assert!(mount.pinned_source > 0);
+                assert_eq!(mount.pinned_tables > 0, mode == AttentionMode::Fp8Compact);
+                assert!(mount.allocations("kimi.test.native").iter().all(|owner|
+                    owner.lifetime == crate::placement::planner::Lifetime {
+                        first: crate::placement::planner::Phase::Load, last: crate::placement::planner::Phase::Load }));
+                assert_eq!(core.attention_receive_bytes(64, ranks)?, 64 * 7168 * if ranks == 2 { 4 } else { 2 });
+                assert_eq!(core.native_attention_stages(8192, ranks)?.values().sum::<usize>(),
+                    if ranks == 2 { 8192 * 7168 * 4 } else { 0 });
+            }
             let mut bytes = 0;
             for layer in 0..cfg.layers {
                 let pair = super::super::weight_layout::LayerLayout::pair_with_core(&cfg, layer, LayerMode::HeadSplit, &core)?;
@@ -409,6 +556,24 @@ mod tests {
             charges.push(bytes);
         }
         assert!(charges[1] < charges[0]);
+        let compact_view = CheckpointView::select(dir.path(), AttentionMode::Compact)?;
+        std::fs::remove_file(dir.path().join("hqa.safetensors"))?;
+        let checkpoint = Checkpoint::open_view(&compact_view)?;
+        let core = CoreInventory::from_checkpoint(&compact_cfg, &checkpoint, &expected)?;
+        assert!(core.native.is_empty());
+        assert!(core.largest_selected_dense_bytes.is_none());
+        for ranks in [1, 2] {
+            assert_eq!(core.native_mount_load(ranks)?, crate::shared::dense_read::MountLoad::default());
+            assert!(crate::placement::families::kimi::native_load_owners(&core, ranks, 16384)?.is_empty());
+            assert_eq!(crate::placement::families::kimi::selected_push_host_envelope(&compact_cfg, &core, ranks)?,
+                crate::placement::families::kimi::push_host_envelope(&compact_cfg, ranks)?);
+        }
+        assert!(core.native_attention_stages(8192, 2)?.is_empty());
+        assert_eq!(core.attention_receive_bytes(64, 2)?, exchange_recv_bytes(64)?);
+        for (layer, before) in compact_layouts.iter().enumerate() {
+            let after = super::super::weight_layout::LayerLayout::pair_with_core(&compact_cfg, layer, LayerMode::HeadSplit, &core)?;
+            assert_eq!(before, &after, "compact mode changed the parent layer {layer} allocation");
+        }
         Ok(())
     }
 

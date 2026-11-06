@@ -276,10 +276,17 @@ impl<'a> KimiRecords<'_, 'a> {
                     scales.as_ref().map(|scales| scales.buffer))?;
                 let stream = self.streams.iter().find(|(id, _)| *id == device.id)
                     .context("Kimi native attention load stream")?.1;
+                let admitted = self.core.native_mount_load(devices.len())?;
                 for record in records {
                     match record {
-                        AttentionRecord::Operand(record) => self.dense.operand(record)?,
-                        AttentionRecord::Step(record) => self.dense.step(record, stream)?,
+                        AttentionRecord::Operand(record) => {
+                            admitted.validate(record.mount_load()?)?;
+                            self.dense.operand(record)?;
+                        }
+                        AttentionRecord::Step(record) => {
+                            admitted.validate(record.mount_load()?)?;
+                            self.dense.step(record, stream)?;
+                        }
                     }
                 }
                 Ok((name, NativeAttention { layout: layout.clone(), values, scales }))

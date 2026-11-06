@@ -170,6 +170,11 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         super::graphs::inventory_for_ranks(cfg, 1, unit, options.slots, verify_rows, RANKS, |_, _| true)
     } else { super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows) }).transpose()?;
     let mut fixed = if RANKS == 2 { exchange_demands(unit, diagnostics)? } else { vec![] };
+    if core.native_attention_split(RANKS) {
+        for rank in 0..RANKS {
+            fixed.push(core.native_attention_receive_demand(unit, rank as u8, RANKS)?);
+        }
+    }
     if let Some(layout) = &draft_layout {
         fixed.extend(cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(layout, rows, RANKS)?);
         fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
@@ -194,6 +199,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         GpuBudget { capacity_bytes: sample.total_bytes, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
+    let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
+        core.attention_receive_bytes(unit.min(64), RANKS)?];
     let mut admitted = admission::admit(admission::Inputs { expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, requested_pool: options.pool_tokens,
@@ -228,7 +235,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let (peer, hops) = if RANKS == 2 {
         let ranks = [0, 1].map(|rank| RankDevice { device: streams[rank].device.id, stream: streams[rank].raw });
         let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1,
-            exchange_recv_bytes(unit)?, exchange_recv_bytes(unit.min(64))?))?;
+            peer_receive[0], peer_receive[1]))?;
         let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec(),
             unit.min(64) * plan.spec().row_bytes as usize))?;
         hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
@@ -319,7 +326,7 @@ mod tests {
         let stem=format!("{root}.q_proj");
         core.projections.insert(stem.clone(),projection(&stem));
         let error=core.validate_runtime_groups(&cfg).unwrap_err().to_string();
-        assert!(error.contains(&stem) && error.contains("k_proj") && error.contains("whole-group"));
+        assert!(error.contains("validated per-projection") && error.contains(root));
         for leaf in ["k_proj","v_proj","g_proj","o_proj"] {
             let stem=format!("{root}.{leaf}");core.projections.insert(stem.clone(),projection(&stem));
         }

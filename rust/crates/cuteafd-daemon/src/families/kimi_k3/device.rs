@@ -22,6 +22,19 @@ pub(crate) struct Plane {
     pub(crate) width: usize,
 }
 
+/// TP2 publications keep native and transformed-basis arithmetic distinct.
+#[derive(Clone, Copy)]
+pub(crate) enum CorePartial { K6Bf16(CuteafdDeviceBuffer), NativeF32(CuteafdDeviceBuffer) }
+impl CorePartial {
+    pub(crate) fn buffer(self) -> CuteafdDeviceBuffer {
+        match self { Self::K6Bf16(buffer) | Self::NativeF32(buffer) => buffer }
+    }
+    pub(crate) fn received(self, buffer: CuteafdDeviceBuffer) -> Result<Self> {
+        ensure!(self.buffer().bytes == buffer.bytes, "Kimi peer partial extent changed");
+        Ok(match self { Self::K6Bf16(_) => Self::K6Bf16(buffer), Self::NativeF32(_) => Self::NativeF32(buffer) })
+    }
+}
+
 /// The exported KDA programs (fork #29, exporter geometry `kimik3`, 48 heads
 /// per TP2 rank): `kda_m{rows}` writes the head-local `o_norm(o, g)` output;
 /// `o_proj` is not part of the program (`w_o` stays in the packed operand set
@@ -304,8 +317,10 @@ impl<'a> NativePrograms<'a> {
             // producers; admission retains the larger exact requirement.
             let kda=core.kda.iter().map(|p|p.scratch_bytes()).max().unwrap_or(0);
             let mla=core.mla.values().map(|p|p.scratch_bytes()).max().unwrap_or(0);
-            let stages = cuteafd_loader::families::kimi_k3::core::lane_extents_for_ranks(rows, unit,
+            let mut stages = cuteafd_loader::families::kimi_k3::core::lane_extents_for_ranks(rows, unit,
                 layout.operands["KDA scratch"],layout.operands["MLA producer scratch"],kda,mla,self.ranks)?;
+            stages.extend(core.native_inventory.native_attention_stages(rows, self.ranks)?);
+            if core.native_scratch != 0 { stages.insert("native attention FP8 scratch", core.native_scratch); }
             layout.base = layout.base.with_core_stages(stages)?;
             layout.bytes()?;
         }
@@ -407,7 +422,8 @@ fn subwave_extent(name: &str, bytes: usize, capacity: usize, window: &std::ops::
     -> Result<(usize, usize)> {
     ensure!(capacity > 0 && window.start < window.end && window.end <= capacity,
         "Kimi sub-wave operand {name} differs from admitted row layout");
-    if cuteafd_loader::families::kimi_k3::allocation::HOOK_SCRATCH.contains(&name) {
+    if cuteafd_loader::families::kimi_k3::allocation::HOOK_SCRATCH.contains(&name)
+        || name == "native attention FP8 scratch" {
         return Ok((0, bytes));
     }
     ensure!(bytes % capacity == 0, "Kimi row plane {name} stride differs from admission");
@@ -566,8 +582,8 @@ impl<'a> LocalLane<'a> {
         use cuteafd_loader::families::kimi_k3::config::KimiAttention;
         let weights = self.layer(layer)?;
         Ok(match self.config().attention.get(layer) {
-            Some(KimiAttention::Kda) => (weights.kda().is_ok() || weights.is_core("kda.output"), self.kda.layer(layer, self.lane_index).is_ok()),
-            Some(KimiAttention::Mla) => (weights.mla().is_ok() || weights.is_core("mla.output"), self.mla.layer(layer).is_ok()),
+            Some(KimiAttention::Kda) => (weights.kda().is_ok() || weights.is_core("kda.output") || weights.native.contains_key("kda.output"), self.kda.layer(layer, self.lane_index).is_ok()),
+            Some(KimiAttention::Mla) => (weights.mla().is_ok() || weights.is_core("mla.output") || weights.native.contains_key("mla.output"), self.mla.layer(layer).is_ok()),
             None => bail!("Kimi attention census layer outside inventory"),
         })
     }
@@ -867,7 +883,8 @@ impl<'a> LocalLane<'a> {
             lengths: owner.metadata("shard lengths", bank)?, query_offsets: owner.metadata("context offsets", bank)?,
             query: self.lane.buffer("MLA query")?, q_resid: self.lane.buffer("MLA q residual")?,
             attention: self.lane.buffer("MLA attention")?, lse: self.lane.buffer("MLA LSE")?,
-            output: owner.buffer("decode output")?, producer_scratch: self.lane.buffer("MLA producer scratch")?,
+            output: if self.native_f32_attention(layer)? { self.attention_result(layer, rows)? }
+                else { owner.buffer("decode output")? }, producer_scratch: self.lane.buffer("MLA producer scratch")?,
             attention_scratch: self.lane.buffer("MLA attention scratch")?, output_scratch: self.lane.buffer("MLA output scratch")? })
     }
 
@@ -968,6 +985,8 @@ impl<'a> LocalLane<'a> {
         context.ranks[self.rank].upload("active splits", 0, &splits.to_le_bytes(), &stream)?;
         ensure!(self.replay(bucket, super::graphs::Op::Context { layer, speculative })?,
             "Kimi context whole-step graph missing");
+        // Native output was captured directly into the persistent F32 lane plane.
+        if self.native_f32_attention(layer)? { return Ok(()); }
         let rank = self.rank;
         let output = context.ranks[rank].buffer("decode output")?;
         let destination = self.attention_result(layer, rows)?;
@@ -1078,8 +1097,15 @@ impl<'a> LocalLane<'a> {
                     slots: batch.slots, q_resid: batch.q_resid, cache: batch.cache,
                     scratch: self.lane.buffer(if self.lane.layout.operands.contains_key("K6 MLA scratch") {
                         "K6 MLA scratch" } else { "MLA producer scratch" })? }, stream.raw)?;
-            super::core_runtime::mla_query_projected(split, projected("mla.q_b")?, batch.rows, batch.q_resid,
-                self.lane.buffer("K6 q_b")?, weights.buffer("mla.uk")?, batch.query, stream.raw)
+            let q_b = self.lane.buffer("K6 q_b")?;
+            if weights.native.contains_key("mla.q_b") {
+                self.native_projection(layer, "mla.q_b", batch.rows, batch.q_resid, q_b)?;
+                split.query(batch.rows, q_b, weights.buffer("mla.uk")?, batch.query, stream.raw)?;
+                Ok(())
+            } else {
+                super::core_runtime::mla_query_projected(split, projected("mla.q_b")?, batch.rows, batch.q_resid,
+                    q_b, weights.buffer("mla.uk")?, batch.query, stream.raw)
+            }
         })
     }
 
@@ -1099,6 +1125,9 @@ impl<'a> LocalLane<'a> {
             super::core_runtime::mla_gate_projected(split, programs.projected(weights.core("mla.gate")?, scratch)?,
                 batch.rows, batch.x, batch.attention, weights.buffer("mla.uv")?,
                 self.lane.buffer("K6 gate")?, normalized, stream.raw)?;
+            if weights.native.contains_key("mla.output") {
+                return self.native_projection(layer, "mla.output", batch.rows, normalized, batch.output);
+            }
             let weight = weights.core("mla.output")?;
             let projection = programs.projection(weight)?;
             if heads == 96 { projection.local(batch.rows, normalized, weight, scratch, batch.output, stream.raw) }
@@ -1112,13 +1141,34 @@ impl<'a> LocalLane<'a> {
 
     pub(crate) fn native_attention(&self,layer:usize)->Result<bool> {
         let weights=self.layer(layer)?;
-        Ok(weights.is_core("kda.output") || weights.is_core("mla.output"))
+        Ok(weights.is_core("kda.output") || weights.is_core("mla.output")
+            || weights.native.contains_key("kda.output") || weights.native.contains_key("mla.output"))
     }
     pub(crate) fn native_ffn(&self,layer:usize)->Result<bool> {Ok(self.layer(layer)?.is_core("ffn.down"))}
+    fn native_f32_attention(&self, layer:usize)->Result<bool> {
+        let weights = self.layer(layer)?;
+        Ok(weights.attention == crate::shared::placement::layers::AttentionShare::Split
+            && (weights.native.contains_key("kda.output") || weights.native.contains_key("mla.output")))
+    }
     fn attention_result(&self,layer:usize,rows:usize)->Result<CuteafdDeviceBuffer> {
-        if self.native_attention(layer)? && self.layer(layer)?.attention==crate::shared::placement::layers::AttentionShare::Split {
+        if self.native_f32_attention(layer)? {
+            view(self.lane.buffer("native attention F32 partial")?,0,rows*7168*4)
+        } else if self.native_attention(layer)? && self.layer(layer)?.attention==crate::shared::placement::layers::AttentionShare::Split {
             view(self.lane.buffer("K6 attention partial")?,0,rows*7168*2)
         } else {self.plane("attention output",rows,7168)}
+    }
+    pub(crate) fn core_partial(&self, layer:usize, ffn:bool, rows:usize)->Result<CorePartial> {
+        if !ffn && self.native_f32_attention(layer)? {
+            Ok(CorePartial::NativeF32(self.attention_result(layer,rows)?))
+        } else {
+            Ok(CorePartial::K6Bf16(if ffn { self.ffn_result(layer,rows)? } else { self.attention_result(layer,rows)? }))
+        }
+    }
+    fn native_projection(&self, layer:usize, name:&str, rows:usize, input:CuteafdDeviceBuffer,
+        output:CuteafdDeviceBuffer)->Result<()> {
+        let weights = self.layer(layer)?.native.get(name).context("Kimi native projection absent")?;
+        self.programs.core.as_ref().context("Kimi native programs not resolved")?.native_projection(weights, rows,
+            input, output, if weights.layout.fp8 { Some(self.lane.buffer("native attention FP8 scratch")?) } else { None }, self.stream().raw)
     }
     pub(super) fn ffn_result(&self,layer:usize,rows:usize)->Result<CuteafdDeviceBuffer> {
         if self.native_ffn(layer)? && self.kda.heads() == 48 {view(self.lane.buffer("K6 FFN partial")?,0,rows*7168*2)}
@@ -1175,17 +1225,27 @@ impl<'a> LocalLane<'a> {
                             kv_norm:weights.buffer("mla.kv_norm")?,slots:batch.slots,q_resid:batch.q_resid,cache:batch.cache,
                             scratch:self.lane.buffer(if self.lane.layout.operands.contains_key("K6 MLA scratch") {
                                 "K6 MLA scratch"}else{"MLA producer scratch"})?},stream.raw)?;
-                    super::core_runtime::mla_query_projected(split,projected("mla.q_b")?,rows,batch.q_resid,
-                        self.lane.buffer("K6 q_b")?,weights.buffer("mla.uk")?,batch.query,stream.raw)?;
+                    let q_b = self.lane.buffer("K6 q_b")?;
+                    if weights.native.contains_key("mla.q_b") {
+                        self.native_projection(layer, "mla.q_b", rows, batch.q_resid, q_b)?;
+                        split.query(rows, q_b, weights.buffer("mla.uk")?, batch.query, stream.raw)?;
+                    } else {
+                        super::core_runtime::mla_query_projected(split,projected("mla.q_b")?,rows,batch.q_resid,
+                            q_b,weights.buffer("mla.uk")?,batch.query,stream.raw)?;
+                    }
                     attention.attention(layer,batch,stream.raw)?;
                     super::core_runtime::mla_gate_projected(split,projected("mla.gate")?,rows,input,batch.attention,
                         weights.buffer("mla.uv")?,self.lane.buffer("K6 gate")?,normalized,stream.raw)?;
                     "mla.output"
                 }
             };
+            let output=self.attention_result(layer,rows)?;
+            if weights.native.contains_key(output_name) {
+                self.native_projection(layer, output_name, rows, normalized, output)?;
+                return Ok(output);
+            }
             let weight=weights.core(output_name)?;
             let projection=programs.projection(weight)?;
-            let output=self.attention_result(layer,rows)?;
             if weights.attention==crate::shared::placement::layers::AttentionShare::Whole {
                 projection.local(rows,normalized,weight,scratch,output,stream.raw)?;
             } else {
@@ -1216,20 +1276,36 @@ impl<'a> LocalLane<'a> {
             Ok(output)
         })
     }
-    /// Both ranks narrow independently before publication. Sum their BF16
-    /// partials in rank order into F32, then run exactly one H128 egress.
-    pub(crate) fn reduce_core(&self,layer:usize,ffn:bool,rows:usize,peer:CuteafdDeviceBuffer,
+    /// Native outputs add unrotated F32 partials and narrow once. K6 retains
+    /// its BF16 transformed-basis meet and exactly one H128 egress.
+    pub(crate) fn reduce_core(&self,layer:usize,ffn:bool,rows:usize,peer:CorePartial,
         destination:&str,stream:*mut std::ffi::c_void)->Result<()> {
-        let weights=self.layer(layer)?;
-        let name=if ffn {"ffn.down"}else if self.cfg.attention[layer]==cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda {
-            "kda.output"
-        }else{"mla.output"};
-        let weight=weights.core(name)?;
-        let programs=self.programs.core.as_ref().context("K6 programs not resolved")?;
-        let local=if ffn {self.ffn_result(layer,rows)?}else{self.attention_result(layer,rows)?};
-        let (rank0,rank1)=if self.rank==0 {(local,peer)}else{(peer,local)};
-        programs.projection(weight)?.reduced(&programs.core_add,rows,rank0,rank1,self.lane.buffer("K6 reduced")?,
-            weight,self.plane(destination,rows,7168)?,stream)
+        let programs=self.programs.core.as_ref().context("Kimi core programs not resolved")?;
+        let local=self.core_partial(layer,ffn,rows)?;
+        let reduced=self.lane.buffer("K6 reduced")?;
+        let output=self.plane(destination,rows,7168)?;
+        match (local,peer) {
+            (CorePartial::NativeF32(local),CorePartial::NativeF32(peer)) => {
+                let (rank0,rank1)=if self.rank==0 {(local,peer)}else{(peer,local)};
+                // SAFETY: persistent disjoint F32 producers and reduced plane are
+                // ordered on the peer stream; all owners survive graph replay.
+                unsafe {
+                    programs.native_add.launch(rank0,rank1,reduced,rows*7168,stream)?;
+                    programs.narrow.launch(reduced.ptr,output.ptr,rows*7168,stream)?;
+                }
+                Ok(())
+            }
+            (CorePartial::K6Bf16(local),CorePartial::K6Bf16(peer)) => {
+                let weights=self.layer(layer)?;
+                let name=if ffn {"ffn.down"}else if self.cfg.attention[layer]==cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda {
+                    "kda.output"
+                }else{"mla.output"};
+                let weight=weights.core(name)?;
+                let (rank0,rank1)=if self.rank==0 {(local,peer)}else{(peer,local)};
+                programs.projection(weight)?.reduced(&programs.core_add,rows,rank0,rank1,reduced,weight,output,stream)
+            }
+            _ => bail!("Kimi peer partial precision/basis differs between ranks"),
+        }
     }
 
     /// Seed only the mutable prefix from admitted embedded/delta rows. Slot 0
@@ -1828,6 +1904,22 @@ mod tests {
     }
 
     #[test]
+    fn peer_partial_receives_preserve_precision_and_exact_extent() -> Result<()> {
+        for rows in [1, 4, 64, 2752] {
+            for f32 in [false, true] {
+                let buffer = CuteafdDeviceBuffer { ptr: 0x1000usize as *mut _,
+                    bytes: rows * 7168 * if f32 { 4 } else { 2 }, device_id: 0, flags: 0 };
+                let partial = if f32 { CorePartial::NativeF32(buffer) } else { CorePartial::K6Bf16(buffer) };
+                let received = partial.received(CuteafdDeviceBuffer { ptr: 0x2000usize as *mut _, ..buffer })?;
+                assert_eq!(std::mem::discriminant(&partial), std::mem::discriminant(&received));
+                assert_eq!(received.buffer().bytes, buffer.bytes);
+                assert!(partial.received(CuteafdDeviceBuffer { bytes: buffer.bytes - 2, ..buffer }).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn subwave_views_partition_persistent_rows_and_preserve_residual_planes() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for (rows, unit, waves) in [(4096, 1408, 1), (8192, 4096, 2), (8256, 2752, 3), (8192, 2048, 4)] {
@@ -1871,6 +1963,17 @@ mod tests {
             }
         }
         assert!(subwave_extent("invalid", 4095, 4096, &(0..256)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_subwaves_keep_fp8_scratch_whole_and_slice_f32_rows() -> Result<()> {
+        for window in [0..2752, 2752..5504, 5504..8256] {
+            assert_eq!(subwave_extent("native attention FP8 scratch", 1_048_592, 8256, &window)?,
+                (0, 1_048_592));
+            assert_eq!(subwave_extent("native attention F32 partial", 8256 * 7168 * 4, 8256, &window)?,
+                (window.start * 7168 * 4, window.len() * 7168 * 4));
+        }
         Ok(())
     }
 
@@ -2318,7 +2421,7 @@ mod tests {
         use cuteafd_loader::formats::exl3_storage::Exl3Codebook;
         let cfg=KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let stem="language_model.lm_head".to_owned();
-        let core=CoreInventory { native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{stem,bits:6,
+        let core=CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{stem,bits:6,
             codebook:Exl3Codebook::Mcg,shape:[cfg.vocab_size,cfg.hidden],stored_outputs:cfg.vocab_size,
             source_bytes:0,split:CoreSplit::Whole})])};
         for rows in [1,8,64,4096] {
@@ -2337,7 +2440,7 @@ mod tests {
         use cuteafd_loader::formats::exl3_storage::Exl3Codebook;
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let stem = "language_model.lm_head".to_owned();
-        let core = CoreInventory { native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
+        let core = CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
             stem, bits: 6, codebook: Exl3Codebook::Mcg, shape: [cfg.vocab_size, cfg.hidden],
             stored_outputs: cfg.vocab_size, source_bytes: 0, split: CoreSplit::Whole })]) };
         for rows in [1, 64, 8256] {

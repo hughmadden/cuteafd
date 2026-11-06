@@ -481,15 +481,24 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
-    let push = kimi::push_host_envelope(cfg, gpus).and_then(|envelope|
+    match kimi::native_load_owners(&model.core, gpus, maximum_pages) {
+        Ok(owners) => recipe.owners.extend(owners),
+        Err(error) => { report.refuse_placement(format!("Kimi native load owners refused: {error:#}"),
+            "Supply supported native attention source geometry."); return memory; }
+    }
+    let push = kimi::selected_push_host_envelope(cfg, &model.core, gpus).and_then(|envelope|
         kimi::push_host_owners(&envelope, maximum_pages));
     match push {
         Ok(owners) => recipe.owners.extend(owners),
         Err(error) => { report.refuse_placement(format!("Kimi push host owners refused: {error}"),
             "Supply supported coordinator push geometry."); return memory; }
     }
-    memory.notes.push(format!("Kimi push Load-only host owners include {} GiB estimated dense staging per coordinator rank; #1329 measured 9,606,907,904 B aggregate with unknown rank split. These do not add to the Ready host ledger.",
-        kimi::PUSH_DENSE_BYTES_PER_RANK >> 30));
+    memory.notes.push(if model.core.largest_selected_dense_bytes.is_some() {
+        "Kimi native attention Load-only source, row cache, quant tables and push windows are derived from the selected view; actual records validate before load.".into()
+    } else {
+        format!("Kimi push Load-only host owners include {} GiB estimated dense staging per coordinator rank; #1329 measured 9,606,907,904 B aggregate with unknown rank split. These do not add to the Ready host ledger.",
+            kimi::PUSH_DENSE_BYTES_PER_RANK >> 30)
+    });
     let mut budgets = match kimi::budgets(&opts.rtx_bytes.iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
         opts.headroom_bytes, &occupied, &sparks) {
         Ok(value) => value,
