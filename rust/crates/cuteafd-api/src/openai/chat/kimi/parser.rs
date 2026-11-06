@@ -1,11 +1,8 @@
-//! Incremental XTML channels. Calls remain buffered until their closing tag,
-//! so malformed or truncated calls cannot become partial OpenAI tool calls.
-//!
-//! Streamed requests emit each argument delta as it arrives instead of holding
-//! the whole call. The
-//! assembled call is byte-identical to the non-streamed one; a call that turns
-//! out unreadable has already been streamed, so it is counted and the validator
-//! rejects its arguments with a clean 400/SSE error rather than a 500.
+//! Incremental XTML channels. Non-streamed calls remain buffered until their
+//! closing tag. Streamed requests emit argument deltas as they arrive, holding
+//! the object's final brace until the outer call closes. Valid assembled calls
+//! are byte-identical to buffered ones; unreadable streamed calls remain
+//! incomplete and are rejected by the completion validator.
 use super::{close, open, END, OPEN, SEP};
 use crate::openai::chat::glm5::{parser::GlmStop, TextParser};
 use crate::openai::chat::stream_args::{ArgStream, held_prefix, json_string_contents, name_is_readable};
@@ -588,7 +585,6 @@ impl KimiOutputParser {
         stream.delta(&call.value[call.streamed_json_len..end], out);
         call.streamed_json_len = end;
     }
-
 }
 
 fn unescape(text: &str) -> String {

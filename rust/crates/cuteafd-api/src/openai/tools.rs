@@ -446,7 +446,9 @@ mod tests {
                     else {
                         let bytes = bytes.unwrap_or_else(|error| panic!("{name}/{thinking}: {error}"));
                         let text = String::from_utf8_lossy(&bytes);
-                        assert!(!text.contains("\"error\""), "{name}/{thinking}: unexpected error: {text}");
+                        if valid {
+                            assert!(!text.contains("\"error\""), "{name}/{thinking}: unexpected error: {text}");
+                        }
                         if truncated {
                             // A truncated response is a 200 whose stream ends with
                             // `length`; an SSE `error` inside it would still pass a
@@ -470,16 +472,18 @@ mod tests {
             parameters: json!({"type":"object"}), strict: None };
         let mut validator = CompletionValidator::new(None,
             ToolConstraints::new(&[tool], ToolChoice::Auto, false, true, false, ToolSyntax::Dsml).unwrap());
-        let values = vec![
-            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function",
-                "function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":null}]}),
-            json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
-        ];
-        let chunks = values.into_iter().map(move |mut value| {
-            value["id"] = json!("test"); value["object"] = json!("chat.completion.chunk");
-            value["created"] = json!(0); value["model"] = json!(MODEL);
-            validator.observe(&value)?;
-            Ok(serde_json::from_value::<ChatChunk>(value).unwrap())
+        use deepseek_recipe::stream::{ChunkGenerator, OutputChunk, FinishReason, CompletionUsage};
+        use deepseek_recipe::openai::chat_completion::response::ChatCompletionChunkGenerator;
+        let mut generator = ChatCompletionChunkGenerator::new("test".into(), MODEL.into(), false, false);
+        let mut chunks = generator.generate(OutputChunk::ToolCall {
+            tool_name: "lookup".into(), arguments: "{}".into(),
+        }).await;
+        chunks.extend(generator.generate(OutputChunk::Finish {
+            reason: FinishReason::Stop, stop_sequence: None, usage: CompletionUsage::default(),
+        }).await);
+        let chunks = chunks.into_iter().map(move |chunk| {
+            validator.observe(&serde_json::to_value(&chunk).unwrap())?;
+            Ok(chunk)
         }).collect::<Vec<_>>();
         let response = respond(Running { chunks: Box::pin(futures::stream::iter(chunks)),
             failure: Default::default(), image_tokens: 0, audio_tokens: 0,
