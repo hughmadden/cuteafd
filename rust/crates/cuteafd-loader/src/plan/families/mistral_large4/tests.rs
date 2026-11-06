@@ -668,6 +668,65 @@ fn compact_hqa_view_loads_without_native_shards_and_preserves_parent_owners() {
 }
 
 #[test]
+fn native_hqa_projection_exports_preserve_ml4_geometry_and_tp2_output() {
+    use crate::families::glm5_flash::core::NativeLayout;
+    use crate::formats::trellis_core::CoreSplit;
+    use crate::placement::{inventory::ProgramsManifest, planner::native_attention::{
+        NativeProgram, NativePrograms, NativeResolution,
+    }};
+    use cuteafd_ffi::draft_projection::ProjectionOutput;
+    use serde_json::json;
+
+    for (ranks, split_layers) in [(1, false), (2, false), (2, true)] {
+        let parts = if split_layers { 1 } else { ranks };
+        let layouts = [
+            NativeLayout { stem: "layers.0.attention.wq".into(),
+                shape: [8192 / parts, 6144], fp8: true, rank: 0, ranks: parts,
+                split: if parts == 1 { CoreSplit::Whole } else { CoreSplit::Output } },
+            NativeLayout { stem: "layers.0.attention.wo".into(),
+                shape: [6144, 8192 / parts], fp8: true, rank: 0, ranks: parts,
+                split: if parts == 1 { CoreSplit::Whole } else { CoreSplit::Input } },
+        ];
+        let outputs = [ProjectionOutput::Bf16,
+            if parts == 2 { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 }];
+        let requests: Vec<_> = layouts.iter().zip(outputs)
+            .map(|(layout, output)| NativeProgram { layout, output }).collect();
+        let owned_layers = if split_layers { 36 } else { 72 };
+        let bytes: u64 = layouts.iter().map(|layout| layout.bytes().unwrap()).sum();
+        assert_eq!(bytes * owned_layers, 7_249_526_784 / ranks as u64);
+        for rows in [1, 4, 8, 16, 64, 128, 2048, 2752, 4096] {
+            let stage = if rows <= 64 { 64 } else { 4096 };
+            let entries: Vec<_> = requests.iter().enumerate().map(|(index, request)| {
+                let [n, k] = request.layout.shape;
+                let suffix = if request.output == ProjectionOutput::F32 { "_f32" } else { "" };
+                json!({"name":format!("native_attention_n{n}_k{k}_m{stage}{suffix}"),
+                    "capacity_rows":stage,
+                    "pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                    "scalars":[{"type":"int32"}], "scratch_bytes_at_capacity":{"scratch":1024 << index},
+                    "geometry":{"input_features":k,"output_features":n,
+                        "output_dtype":request.output.torch_dtype(),"max_rows":stage,"decode_rows":64,
+                        "scale_block":128,"storage":"row_major_e4m3",
+                        "reduction":"canonical_fp8_gemv64_w8a16"}})
+            }).collect();
+            let manifest = ProgramsManifest::from_manifest(&json!({"programs":entries})).unwrap();
+            let exact = NativePrograms::resolve(&requests, rows, Some(&manifest)).unwrap();
+            assert_eq!(exact.resolution, NativeResolution::Exact);
+            assert_eq!(exact.fp8_scratch_bytes, 2048);
+            assert_eq!(exact.programs.len(), 2);
+            let assumed = NativePrograms::resolve(&requests, rows, None).unwrap();
+            assert_eq!(assumed.programs, exact.programs);
+            assert_eq!(assumed.resolution, NativeResolution::Assumed);
+            assert!(NativePrograms::resolve(&requests, rows, Some(&ProgramsManifest::default())).is_err());
+            if parts == 2 {
+                let wrong = [NativeProgram { layout: &layouts[1], output: ProjectionOutput::Bf16 }];
+                assert!(NativePrograms::resolve(&wrong, rows, Some(&manifest)).is_err(),
+                    "TP2 wo must not substitute a BF16 output for its F32 partial");
+            }
+        }
+    }
+}
+
+#[test]
 fn compact_hqa_view_refuses_incomplete_or_mixed_metadata() {
     use crate::plan::checkpoint::view::{AttentionMode, CheckpointView, COMPACT_CONFIG, COMPACT_QUANT};
     let dir = hqa_snapshot();
