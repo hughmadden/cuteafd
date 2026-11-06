@@ -175,11 +175,13 @@ mod tests {
     use super::*;
     use std::fs::File;
     fn config() -> serde_json::Value {
-        serde_json::json!({"model_type":"glm5_next","text_config":{"hidden_size":4096},"vision_config":{
+        let mut config = cuteafd_loader::plan::testing::glm5_flash_config(2);
+        config["vision_config"] = serde_json::json!({
             "depth":24,"hidden_size":1024,"intermediate_size":4096,"num_heads":16,
             "out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,"spatial_merge_size":2,
             "projection_intermediate_size":10240,"in_channels":3,"attention_bias":true,
-            "hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0}})
+            "hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+        config
     }
     #[test]
     fn rejects_unknown_geometry_before_tensor_reads() {
