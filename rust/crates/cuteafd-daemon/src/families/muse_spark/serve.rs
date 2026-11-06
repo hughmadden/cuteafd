@@ -158,7 +158,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     // SAFETY: every native owner drops on this worker before the library.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
     let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
-    let (built, placement) = startup::admit(startup::Options { cfg: &cfg, core: &core, catalog: &catalog,
+    let built = startup::admit(startup::Options { cfg: &cfg, core: &core, catalog: &catalog,
         manifest: &manifest,
         measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
             free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
@@ -186,15 +186,16 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                 args.draft_kv_cache)
         }).transpose()?, media: Some(super::media::inventory(&args.snapshot,
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
+    let placement = &built.placement;
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
-    let mut media = super::media::Ready::load(args, &library, built.media.as_ref().context("Muse media admission missing")?)?;
+    let mut media = super::media::Ready::load(args, &library, &built.media)?;
     let prefill = args.prefill()?;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_formats(args.expert_partial_bf16_max_rows,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
     let sequences = usize::from(args.max_sequences);
-    let spark = super::admission::spark_plan(&placement, prefill, cutoff, sequences, args.peers.len())?;
+    let spark = super::admission::spark_plan(placement, prefill, cutoff, sequences, args.peers.len())?;
     let admission_plan = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
         spark.model.clone())?;
@@ -223,7 +224,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
     let prepared = policy.plan(|| {
-        let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, &placement,
+        let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement,
             gpus, &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
         if admission_plan.coordinator_pushes() {
             let (push, streams, ranks) = CoordinatorPush::prepare(&args.snapshot, Some(&catalog), gpus, experts)?;
@@ -245,7 +246,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                 crate::shared::memory::EmbedPlacement::Gpu, || {
                     devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
                         super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
-                            checkpoint: &checkpoint, built: &built, placement: &placement, rank, slots: sequences as u64,
+                            checkpoint: &checkpoint, built: &built, placement, rank, slots: sequences as u64,
                             unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
                         .collect::<Result<Vec<_>>>()
                 }))?;
@@ -282,7 +283,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                     "Muse received unselected onboarded experts");
                 Vec::new()
             }
-            Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, &placement,
+            Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, placement,
                 onboarded.clone(), usize::try_from(prefill.unit_rows)?, pushed)?,
         };
         Ok((embedding, ranks, local, draft))

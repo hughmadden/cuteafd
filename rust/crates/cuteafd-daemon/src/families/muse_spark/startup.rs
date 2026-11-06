@@ -1,11 +1,11 @@
-//! Muse Spark startup: manifest preflight, then measured admission through the
-//! same request builder the planner uses
+//! Muse Spark startup: manifest preflight, then measured admission over the
+//! same contract facts the planner builds
 //! (`cuteafd_loader::placement::families::muse_spark`). Admission precedes
 //! every retained operand; nothing here allocates.
 use super::programs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{families::muse_spark::{core::CoreInventory, MuseSparkConfig},
-    placement::{families::muse_spark as shared, Baseline, GpuBudget, Onboard, Placement, ProgramSet}};
+    placement::{families::muse_spark as shared, Onboard, ProgramSet}};
 use std::path::Path;
 
 /// Every program a coordinator layout binds is in the image's manifest, before
@@ -58,38 +58,40 @@ pub(crate) struct Options<'a> {
     pub media: Option<shared::MediaOptions>,
 }
 
-/// Measured admission: the shared request with live baselines and the code the
-/// sample has not yet loaded. Same solver, same executor check as the planner.
-pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placement)> {
+/// Measured admission: the same facts the planner states, with live baselines
+/// and the code the sample has not yet loaded. Same solve, same executor and
+/// package checks.
+pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let gpus = options.measured.len();
     shared::executor(gpus)?;
     let programs = ProgramSet::from_manifest(options.manifest, shared::program_families(gpus));
     let mut fixed = Vec::with_capacity(gpus);
-    let budgets = options.measured.iter().enumerate().map(|(rank, sample)| {
+    let mut budgets = Vec::with_capacity(gpus + options.spark_ranks);
+    for (rank, sample) in options.measured.iter().enumerate() {
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", sample.total_bytes);
         let code = cuteafd_loader::placement::inventory::loaded_code_allowance("muse", "exl3", gpus == 2,
             rank as u8, arch, Some(&programs));
         fixed.push(shared::code_demand(rank, code.pending(sample.untracked_bytes, arch.context_bytes))?);
         let capacity = cuteafd_ffi::coordinator_gpu_budget().map_or(sample.total_bytes, |b| b.0.min(sample.total_bytes));
-        Ok(GpuBudget { capacity_bytes: capacity, headroom_bytes: options.headroom_bytes,
-            baseline: Baseline::Measured { free_bytes: sample.free_bytes } })
-    }).collect::<Result<Vec<_>>>()?;
+        budgets.push(shared::measured_budget(rank as u8, capacity, options.headroom_bytes, sample.free_bytes));
+    }
+    budgets.extend((0..options.spark_ranks).map(|rank| shared::spark_budget(rank as u8, options.spark_budget_bytes)));
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
-    let mut built = shared::request(shared::MuseInputs {
-        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), cfg: options.cfg, core: options.core, catalog: options.catalog,
-        gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill,
-        full_prefill_logits: options.full_prefill_logits, slots: options.slots,
-        mark_slots: options.mark_slots, context,
-        automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
-        onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
+    let capacities = options.measured.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>();
+    let maximum_pool_tokens = shared::maximum_pool_tokens(&capacities, context, options.pool_tokens);
+    let media = options.media.unwrap_or(shared::MediaOptions { vision: cuteafd_loader::plan::MediaMode::Off,
+        audio: cuteafd_loader::plan::MediaMode::Off, replicas: 1, vision_bytes: (0, 0), audio_bytes: (0, 0) });
+    let prepared = shared::ProductionInput { cfg: options.cfg, core: options.core, catalog: options.catalog,
+        budgets, prefill: options.prefill, full_prefill_logits: options.full_prefill_logits, slots: options.slots,
+        mark_slots: options.mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
-        local: options.local, drafter: options.drafter, fixed, startup: Vec::new() })?;
-    if let Some(media) = &options.media { built.admit_media(media)?; }
-    let placed = built.admitted_placement()?;
-    built.local.check(&placed)?;
-    built.request.executor.check(&placed)?;
-    built.check_media_workers(&placed)?;
-    Ok((built, placed))
+        local: options.local, drafter: options.drafter, fixed, media }.prepare()?;
+    let request = shared::production_request(context, options.pool_tokens, options.onboard,
+        cuteafd_loader::placement::planner::PrefillShape { rows: options.prefill.unit_rows, waves: options.prefill.waves },
+        if options.full_prefill_logits { cuteafd_loader::placement::planner::Operation::Scoring }
+        else { cuteafd_loader::placement::planner::Operation::Serving },
+        Some(crate::shared::memory::budget::resident_weight_limit()), options.partial_reply_formats);
+    Ok(prepared.admit(request)?)
 }
 
 #[cfg(test)]
@@ -184,7 +186,7 @@ mod tests {
                 shared::drafter_inventory(&cfg, &config, 16, 16, 202_112, u64::from(sms), draft_kv)
             }).transpose()?;
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
-            let (_, live) = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
+            let live = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &preflight(&path, gpus)?,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
@@ -196,7 +198,7 @@ mod tests {
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cutoff_rows, partial_reply_formats: formats,
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
-                drafter: served_drafter, media: None })?;
+                drafter: served_drafter, media: None })?.placement;
             // Coordinator ledgers, item by item (then the whole placement).
             for gpu in 0..gpus {
                 assert_eq!(live.items[gpu], planned.items[gpu], "{label}: GPU {gpu} ledger");
@@ -258,7 +260,7 @@ mod tests {
             assert_eq!((report.prefill_unit_rows, report.prefill_waves), (Some(prefill.unit_rows), Some(prefill.waves)));
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
             let inventory = preflight(&path, gpus)?;
-            let (_, live) = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
+            let live = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &inventory,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
@@ -273,7 +275,7 @@ mod tests {
                 partial_reply_formats: Default::default(),
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
-                    cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?) })?;
+                    cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?) })?.placement;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks, scoring {full_prefill_logits}");
             for gpu in 0..gpus {
                 let output = live.items[gpu].iter().find(|item| item.group == "Muse prefill logits");
@@ -375,7 +377,7 @@ mod tests {
             cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::muse_spark::MUSE_SPARK),
             Default::default())?;
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
-        let (built, live) = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
+        let built = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
             manifest: &preflight(&path, gpus)?,
             measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                 untracked_bytes: arch.context_bytes }; gpus],
@@ -388,8 +390,9 @@ mod tests {
             partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
             local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
             drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint, vision, audio, replicas)?) })?;
-        assert_eq!(&live, planned);
-        let admitted = built.media.context("runtime media")?;
+        let live = &built.placement;
+        assert_eq!(live, planned);
+        let admitted = &built.media;
         assert_eq!(Some(&admitted.vision), report.encoder.as_ref());
         assert_eq!(Some(&admitted.audio), report.audio_encoder.as_ref());
         let layout = report.memory_layout.as_ref().context("media memory layout")?;

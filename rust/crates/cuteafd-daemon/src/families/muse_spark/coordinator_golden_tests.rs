@@ -98,7 +98,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         super::startup::Measured { total_bytes: 101_970_345_984, free_bytes: 101_375_541_248,
             untracked_bytes: 594_804_736 },
     ];
-    let (built, placement) = super::startup::admit(super::startup::Options { cfg: &cfg, core: &core,
+    let built = super::startup::admit(super::startup::Options { cfg: &cfg, core: &core,
         catalog: &catalog, manifest: &manifest, measured, headroom_bytes: 2 << 30, spark_ranks: SPARKS,
         prefill, full_prefill_logits: false, slots: SEQUENCES as u64,
         mark_slots: mark.slots(shared::mark_bytes(&cfg, 1) as usize) as u64, max_context: None,
@@ -108,11 +108,12 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         partial_reply_formats: Default::default(),
         local: shared::local_workspace(&catalog, Some(&manifest_path), GPUS, prefill.unit_rows)?,
         drafter, media: Some(super::media::inventory(&snapshot, MediaMode::Off, MediaMode::Off, 1)?) })?;
+    let placement = &built.placement;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4)?;
-    let spark = super::admission::spark_plan(&placement, prefill, cutoff, SEQUENCES, SPARKS)?;
+    let spark = super::admission::spark_plan(placement, prefill, cutoff, SEQUENCES, SPARKS)?;
     let admission = SparkAdmission::plan(&snapshot, cuteafd_core::ExpertGeometry::MUSE_SPARK,
         Some(&catalog), &spark.working, SPARKS, None, spark.model.clone())?;
     anyhow::ensure!(admission.coordinator_pushes(), "Muse max planned without a coordinator push group");
@@ -127,7 +128,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         .collect::<Vec<_>>();
     let package = if onboarded.is_empty() { None } else {
         Some(shared::local_package(&catalog, &manifest_path, GPUS, prefill.unit_rows)?.0) };
-    let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, &placement, GPUS,
+    let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement, GPUS,
         &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
     let (mut push, streams, coordinator) = CoordinatorPush::prepare(&snapshot, Some(&catalog), GPUS, experts)?;
     let mut plans = Vec::with_capacity(SPARKS);

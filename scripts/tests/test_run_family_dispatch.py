@@ -888,6 +888,14 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         shutil.copytree(checkpoint_source, staged, dirs_exist_ok=True, copy_function=os.link)
     if family_config.get("model_type") == "glm_moe_dsa":
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
+    if family_config.get("model_type") == "muse_spark":
+        # Muse's plan reads the drafter it charges, so stage the shipped
+        # DFlash2 drafter's header-exact config (the same fixture the loader
+        # test uses) at the revision the shipped config names.
+        _snapshot(hf, "nvidia/Muse-Spark-Open-816B-A42B-DFlash2",
+                  json.loads((ROOT / "rust/crates/cuteafd-daemon/src/families/muse_spark/fixtures"
+                              "/drafters/nvidia.json").read_text()),
+                  "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     audio_backend = ("pcm-bf16-aot-v1" if family_config.get("model_type") == "muse_spark" else
@@ -1099,34 +1107,60 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
         assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
 
 
-def capture_glm_real_planner_launch(snapshot: Path, example: Path, binary: Path,
-                                    programs: Path, hf_home: Path, temporary: Path) -> None:
-    """Exercise shipped config -> real launcher argv -> real CPU Recipe admission."""
+def _capture_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                 programs: Path, hf_home: Path, temporary: Path,
+                                 model: str, family: str) -> tuple:
+    """Shipped config -> real launcher argv -> real CPU contract admission.
+
+    Fakes only hardware and execution: the planner reads the actual snapshot,
+    drafter and exporter metadata, not a canned deployment response.
+    """
     raw = example.read_text()
     config = dict(line.split("=", 1) for line in raw.splitlines()
                   if line and not line.startswith("#") and "=" in line)
     gpus = int(config["RTX_GPUS"])
-    # Fake only hardware and execution. The planner reads the actual snapshot,
-    # drafter and exporter metadata, not a canned deployment response.
     keys = "\n".join(line for line in raw.splitlines()
                      if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
-        "test/glm-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        model, keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
         extra_args=("--wip", "real-planner-test"), extra_env={
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
             "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
     deployment = json.loads(output.read_text())
+    assert deployment["family"] == family, deployment
+    assert deployment["spark_ranks"] == int(config["SPARK_COUNT"]), deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
-    assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
-    assert deployment["prefill_unit_rows"] == 2752 and deployment["prefill_waves"] == 3, deployment
+    # The pool never falls below the config's declared serving context (and the
+    # historical 1M floor where the config declares none).
+    declared = int(config.get("MAX_CONTEXT_TOKENS", "0")) or 1 << 20
+    assert deployment["memory_layout"]["pool_tokens"] >= declared, deployment
+    assert deployment["report"]["placement_supported"], deployment
     plans = [shlex.split(line) for line in result.stderr.splitlines()
              if "cuteafd plan " in line and "--deployment" in line]
     assert len(plans) == 1, result.stderr
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
     assert "prefill reserve does not fit" not in result.stderr
+    return result, deployment
+
+
+def capture_glm_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                    programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Exercise shipped config -> real launcher argv -> real CPU Recipe admission."""
+    _, deployment = _capture_real_planner_launch(snapshot, example, binary, programs, hf_home,
+        temporary, "test/glm-real-plan", "glm5")
+    assert deployment["prefill_unit_rows"] == 2752 and deployment["prefill_waves"] == 3, deployment
+
+
+def capture_muse_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                     programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Muse's shipped min/max configs through the real launcher and contract."""
+    _, deployment = _capture_real_planner_launch(snapshot, example, binary, programs, hf_home,
+        temporary, "test/muse-real-plan", "muse_spark")
+    assert deployment["prefill_waves"] == 3, deployment
+    assert deployment["prefill_unit_rows"] >= 1024, deployment
 
 
 
