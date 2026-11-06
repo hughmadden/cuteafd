@@ -108,7 +108,12 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     # must not alias a Qwen [N, K].
     qwen_tiles = {(2560, 6144), (16480, 2560), (13952, 2560), (2560, 640), (10240, 320)}
     step5_tiles = {(4096, 12288), (4096, 6144), (384, 4096), (3072, 4096)}
-    assert set(tables["DECODE_TMA_TILES"]) == qwen_tiles | step5_tiles
+    native_hqa_tiles = {(16384, 2048), (8192, 2048), (6144, 16384), (6144, 8192),
+                        (18432, 1536), (9216, 1536), (7168, 12288), (7168, 6144),
+                        (8192, 8192), (8192, 4096)}
+    flash_hqa_tiles = {(4096, 4096), (4096, 8192), (4096, 16384)}
+    assert (native_hqa_tiles | flash_hqa_tiles).isdisjoint(qwen_tiles)
+    assert set(tables["DECODE_TMA_TILES"]) == qwen_tiles | step5_tiles | native_hqa_tiles | flash_hqa_tiles
     for (n, k), entries in tables["SKINNY_TILES_BY_ROWS"].items():
         assert len({t for _, _, _, t in entries}) == 1
         assert entries[-1][0] == scalar_rule(n, k)

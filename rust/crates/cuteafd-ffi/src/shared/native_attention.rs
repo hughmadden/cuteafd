@@ -87,6 +87,11 @@ impl<'a> Fp8Projections<'a> {
         Ok(Self { programs: loaded, output })
     }
 
+    /// Loaded programs participating in the family's packing exactness proof.
+    pub fn program_names(&self) -> impl Iterator<Item = &str> {
+        self.programs.values().map(|program| program.spec().name.as_str())
+    }
+
     /// Charge this named manifest owner before allocating the projection workspace.
     pub fn scratch_bytes(&self, k: usize, n: usize) -> Result<usize> {
         let spec = self.programs.get(&(k,n)).context("native FP8 shape not admitted")?.spec();
@@ -151,6 +156,14 @@ mod tests {
                 "max_rows":64,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
                 "reduction":"canonical_fp8_gemv64_w8a16"}}]})
     }
+    #[test]
+    fn program_names_reports_only_loaded_programs() {
+        for output in [ProjectionOutput::Bf16, ProjectionOutput::F32] {
+            let registry = Fp8Projections { programs: BTreeMap::new(), output };
+            assert_eq!(registry.program_names().collect::<Vec<&str>>(), Vec::<&str>::new());
+        }
+    }
+
     #[test]
     fn typed_spec_selects_exact_runtime_stage() {
         for output in [ProjectionOutput::Bf16, ProjectionOutput::F32] {

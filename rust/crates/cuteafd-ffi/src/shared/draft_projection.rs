@@ -81,6 +81,11 @@ impl<'a> DraftProjections<'a> {
 
     pub fn output(&self) -> ProjectionOutput { self.output }
 
+    /// Loaded programs participating in the family's packing exactness proof.
+    pub fn program_names(&self) -> impl Iterator<Item = &str> {
+        self.programs.values().map(|program| program.spec().name.as_str())
+    }
+
     /// # Safety
     /// Input/weight pointers and the stream satisfy `launch`'s device/lifetime contract.
     /// The output owner survives all queued work; its extent is checked before launching.
@@ -209,6 +214,14 @@ mod tests {
             geometry: serde_json::json!({"width":5120,"outputs":7168,"output_dtype":"torch.bfloat16",
                 "reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]}) }
     }
+    #[test]
+    fn program_names_reports_only_loaded_programs() {
+        for output in [ProjectionOutput::Bf16, ProjectionOutput::F32] {
+            let registry = DraftProjections { programs: BTreeMap::new(), output };
+            assert_eq!(registry.program_names().collect::<Vec<&str>>(), Vec::<&str>::new());
+        }
+    }
+
     #[test]
     fn startup_refuses_block_times_concurrency_before_loading() {
         let s = spec();
