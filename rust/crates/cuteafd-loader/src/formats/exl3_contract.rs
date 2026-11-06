@@ -351,6 +351,10 @@ impl AttentionContract {
         Ok(())
     }
 
+    pub(crate) fn native_tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.native.values().flat_map(|entry| entry.tensors.keys().map(String::as_str))
+    }
+
     pub(crate) fn check_headers<'a>(&self,
         headers: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>) -> Result<()> {
         use cuteafd_core::DType;

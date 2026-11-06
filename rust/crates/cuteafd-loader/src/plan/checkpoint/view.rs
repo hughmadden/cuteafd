@@ -190,6 +190,9 @@ impl CheckpointView {
     pub fn config(&self) -> Result<Value> { Ok(self.config.as_ref().clone()) }
     pub(super) fn quantize_config(&self) -> Option<Value> { self.quantize_config.as_deref().cloned() }
     pub(super) fn weight_map(&self) -> Option<&BTreeMap<String, String>> { self.weight_map.as_deref() }
+    pub(super) fn native_attention_names(&self) -> impl Iterator<Item = &str> {
+        self.attention.iter().flat_map(|contract| contract.native_tensor_names())
+    }
     pub(crate) fn check_attention_headers<'a>(&self,
         headers: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>) -> Result<()> {
         if let Some(contract) = &self.attention { contract.check_headers(headers)?; }
