@@ -613,11 +613,27 @@ pub struct PlanInput {
 #[derive(Default)]
 struct ManifestCache {
     values: Mutex<BTreeMap<std::path::PathBuf, Result<Arc<serde_json::Value>, String>>>,
+    programs: Mutex<BTreeMap<std::path::PathBuf, Result<Arc<crate::placement::inventory::ProgramsManifest>, String>>>,
+    #[cfg(test)]
+    program_parses: Mutex<BTreeMap<std::path::PathBuf, usize>>,
     #[cfg(test)]
     parses: Mutex<BTreeMap<std::path::PathBuf, usize>>,
 }
 
 impl ManifestCache {
+    fn programs(&self, path: &Path) -> anyhow::Result<Arc<crate::placement::inventory::ProgramsManifest>> {
+        let mut programs = self.programs.lock().expect("plan typed manifest cache poisoned");
+        match programs.entry(path.to_path_buf()).or_insert_with(|| {
+            #[cfg(test)]
+            { *self.program_parses.lock().unwrap().entry(path.to_path_buf()).or_default() += 1; }
+            self.read(path).and_then(|value| crate::placement::inventory::ProgramsManifest::from_manifest(&value))
+                .map(Arc::new).map_err(|error| format!("{}: {error:#}", path.display()))
+        }) {
+            Ok(value) => Ok(Arc::clone(value)),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+
     fn read(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
         use anyhow::Context;
         let mut values = self.values.lock().expect("plan manifest cache poisoned");
@@ -681,6 +697,12 @@ impl PlanInput {
 
     pub(crate) fn manifest(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
         self.manifests.read(path)
+    }
+
+    /// Native projection metadata is parsed once per immutable artifact path,
+    /// including failures, alongside the raw manifest cache used by other exports.
+    pub fn programs_manifest(&self, path: &Path) -> anyhow::Result<Arc<crate::placement::inventory::ProgramsManifest>> {
+        self.manifests.programs(path)
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {

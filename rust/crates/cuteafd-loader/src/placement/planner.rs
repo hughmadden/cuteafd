@@ -418,6 +418,7 @@ pub struct Facts {
 
 mod contract;
 mod search;
+pub mod native_attention;
 pub mod serving;
 pub use contract::{
     Activation, ByteCurve, BytePiece, Choice, Component, ComponentKind, Contract, Requires,

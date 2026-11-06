@@ -203,6 +203,33 @@ fn plan_manifest_cache_parses_each_path_once_across_candidates() {
 }
 
 #[test]
+fn typed_program_manifest_cache_reuses_successes_and_failures() {
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let input = PlanInput::open(dir.path()).unwrap();
+    let path = dir.path().join("typed-programs.json");
+    std::fs::write(&path, json!({"programs":[]}).to_string()).unwrap();
+    let first = input.programs_manifest(&path).unwrap();
+    std::fs::write(&path, "not JSON").unwrap();
+    for _ in 0..4 {
+        assert!(std::sync::Arc::ptr_eq(&first, &input.programs_manifest(&path).unwrap()));
+    }
+    assert_eq!(input.manifests.program_parses.lock().unwrap().get(&path), Some(&1));
+    assert_eq!(input.manifests.parses.lock().unwrap().get(&path), Some(&1));
+    let fresh = PlanInput::open(dir.path()).unwrap();
+    assert!(fresh.programs_manifest(&path).is_err());
+    std::fs::write(&path, json!({"programs":[]}).to_string()).unwrap();
+    assert!(fresh.programs_manifest(&path).is_err());
+    let malformed = dir.path().join("malformed-native.json");
+    std::fs::write(&malformed, json!({"programs":[{"name":"draft_bf16_k4096_n8192"}]}).to_string()).unwrap();
+    assert!(fresh.programs_manifest(&malformed).is_err());
+    std::fs::write(&malformed, json!({"programs":[]}).to_string()).unwrap();
+    assert!(fresh.programs_manifest(&malformed).is_err());
+    assert!(fresh.manifests.program_parses.lock().unwrap().values().all(|&count| count == 1));
+    assert!(fresh.manifests.parses.lock().unwrap().values().all(|&count| count == 1));
+    assert!(PlanInput::open(dir.path()).unwrap().programs_manifest(&malformed).is_ok());
+}
+
+#[test]
 fn report_census_reuses_only_checkpoint_facts_across_options() {
     let mut tensors = mimo_flash_tensors();
     tensors.extend([
