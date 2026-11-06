@@ -275,9 +275,11 @@ fn attention_variants_match_launcher_rows() {
     let launcher: std::collections::BTreeMap<String, bool> =
         serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
     assert_eq!(&launcher, attention_variants());
-    assert_eq!(launcher.len(), 6);
-    assert_eq!(launcher.iter().filter(|(_, enabled)| **enabled).map(|(family, _)| family.as_str())
-        .collect::<Vec<_>>(), ["glm5_flash"]);
+    assert!(!launcher.is_empty());
+    for family in launcher.keys() {
+        assert!(cuteafd_loader::plan::family::registry().iter().any(|entry| entry.id() == family),
+            "unknown attention qualification family {family}");
+    }
 }
 
 #[derive(Debug, Clone, Args)]

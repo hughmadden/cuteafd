@@ -32,6 +32,11 @@ _spark_slot_keys() {
 # WIP_INSTANCE and WIP_ROOT are the shared `--wip` slot staging root (the
 # start_coordinator block below passes both to every rank's staging script).
 _family_allowed_keys() {
+  local checkpoint_family="${2:-$1}" registry_dir
+  registry_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  if python3 "$registry_dir/checkpoint-family.py" --attention-variant "$checkpoint_family"; then
+    printf '%s\n' ATTENTION_MODE
+  fi
   cat <<'EOF'
 VISION
 AUDIO
@@ -238,7 +243,6 @@ EOF
       ;;
     glm5_flash)
       cat <<'EOF'
-ATTENTION_MODE
 L2_PREFETCH
 FP8_SCALES
 SPECULATOR_FP8
