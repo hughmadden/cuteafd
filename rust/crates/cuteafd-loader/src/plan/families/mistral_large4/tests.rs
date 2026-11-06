@@ -575,9 +575,9 @@ fn hqa_snapshot() -> tempfile::TempDir {
     use serde_json::json;
     let dir = snapshot(true, Some(EXPERT_LAYERS));
     let root = dir.path();
-    let mut config = crate::read_json_file(&root.join("config.json")).unwrap();
-    let mut quant = crate::read_json_file(&root.join("quantize_config.json")).unwrap();
-    let mut index = crate::read_json_file(&root.join("consolidated.safetensors.index.json")).unwrap();
+    let mut config: serde_json::Value = crate::read_json_file(&root.join("config.json")).unwrap();
+    let mut quant: serde_json::Value = crate::read_json_file(&root.join("quantize_config.json")).unwrap();
+    let mut index: serde_json::Value = crate::read_json_file(&root.join("consolidated.safetensors.index.json")).unwrap();
     let mut compact = config.clone();
     compact["transformers_weights"] = json!(COMPACT_INDEX);
     compact["quantization_config"]["per_module_metadata"] = json!(format!("{COMPACT_QUANT}:tensor_storage"));
