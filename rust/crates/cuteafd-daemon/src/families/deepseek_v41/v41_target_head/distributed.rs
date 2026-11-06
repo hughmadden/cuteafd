@@ -97,7 +97,7 @@ impl<'w, 'a> Rank<'w, 'a> {
                 },
                 (Err(error), Ok(graph)) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
                 (Err(first), Err(second)) => return Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
-            (Ok(()), Err(error)) => return Err(error),
+                (Ok(()), Err(error)) => return Err(error),
             }
             // Warmup already produced the result. The captured graph runs on
             // the next use of this shape, without repeating this projection.
@@ -463,9 +463,7 @@ mod tests {
     use super::*;
     #[test]
     fn vocabulary_capture_preserves_device_error_over_host_enqueue_error() -> Result<()> {
-        let root = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
-            .join(".cache/cuteafd/builds/finish-1156/fixtures");
-        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let lib = fixture.load()?;
         fixture.extent_only(&lib)?;
         let weights = VocabularyShard::without_resident_weights_for_test();

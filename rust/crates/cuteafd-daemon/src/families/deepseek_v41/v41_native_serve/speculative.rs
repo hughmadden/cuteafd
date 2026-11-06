@@ -938,8 +938,7 @@ mod anchor_fallback_tests {
         }
     }
     fn fixture() -> Result<Fixture> {
-        Fixture::build_in(&std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
-            .join(".cache/cuteafd/builds/finish-1156/fixtures"))
+        Fixture::build_for_tests()
     }
     fn runtime<'a>(lib: &'a NativeLibrary, at: At, device_error: bool) -> Result<DraftRuntime<'a, 'a, FailingChain>> {
         let window = || DsparkWindow::new(lib, 4, 8, DsparkWindow::device_bytes(4, 8)?);

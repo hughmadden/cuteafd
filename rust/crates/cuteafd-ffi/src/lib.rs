@@ -5882,9 +5882,7 @@ mod tests {
     use std::slice;
 
     pub(super) fn draft_failure_library() -> Result<NativeLibrary> {
-        let root = PathBuf::from(env::var_os("HOME").context("HOME")?)
-            .join(".cache/cuteafd/builds/finish-1156/fixtures");
-        let fixture = crate::native_library_lifetime_fixture::Fixture::build_in(&root)?;
+        let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         fixture.load()
     }
 

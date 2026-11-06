@@ -18,6 +18,15 @@ impl Fixture {
         self.module.parent().expect("fixture module has a directory")
     }
 
+    /// Hermetic CPU fixture beside this test executable, inside its asserted
+    /// NVMe Cargo target. No task-specific path or shared mutable DSO is used.
+    pub fn build_for_tests() -> Result<Self> {
+        let executable = std::env::current_exe()?;
+        let root = executable.parent().context("test executable has no parent")?
+            .join("native-fixtures");
+        Self::build_in(&root)
+    }
+
     pub fn build() -> Result<Self> {
         let root = PathBuf::from(
             std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")
