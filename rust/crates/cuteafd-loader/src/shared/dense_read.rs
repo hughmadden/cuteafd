@@ -87,7 +87,8 @@ impl MountLoad {
     }
 
     pub fn allocations(self, prefix: &str) -> Vec<crate::placement::planner::Allocation> {
-        use crate::placement::{planner as p, Category};
+        use crate::placement::planner as p;
+        use cuteafd_core::memory_layout::Category;
         let load = p::Lifetime { first: p::Phase::Load, last: p::Phase::Load };
         [("source", self.pinned_source, p::Location::PINNED),
          ("rows", self.full_row_cache, p::Location::HOST),
