@@ -310,7 +310,23 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     + 2 * 64 * 5120 * 2) + rows * waves * 5120 * 2
                     + 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * waves * 5120 * 2)?);
             }
-            if matches!(family, "glm" | "ml4" | "glmf") {
+            if family == "v41" {
+                // Intake is an explicitly estimated PINNED allocation in the
+                // joint contract, not an exact item in the old host ledger.
+                let ledger = report.phase_ledger.as_ref().expect("joint V4.1 physical ledger");
+                let host = ledger.budgets.iter().find(|budget|
+                    budget.locations.contains(&cuteafd_loader::placement::planner::Location::HOST))
+                    .expect("shared host budget");
+                let intake = rows * waves * hidden * 4 * peers as u64 * 3;
+                let router = (rows + 64) * (hidden * 2 + 8 * 8);
+                let staging = (rows + 64) * hidden * 8 + (2 << 20);
+                let ready = ledger.phases.iter().find(|phase| phase.budget == host.id
+                    && phase.phase == cuteafd_loader::placement::planner::Phase::Ready)
+                    .expect("ready host phase");
+                assert_eq!(ready.opaque, intake + router + staging,
+                    "{key}: shared PINNED intake estimate omits a rank or wave");
+                assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
+            } else if matches!(family, "glm" | "ml4" | "glmf") {
                 let prefix = if family == "glmf" { "glmf.spark" } else { "glm.prefill" };
                 // GLM's unified physical ledger admits GPU return reserves;
                 // the deleted ordinary-host ledger is not an allocation owner.

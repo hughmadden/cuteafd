@@ -1,10 +1,13 @@
 //! Native V4.1 allocation owners, shared with serving admission. CED layer
-//! ownership is fixed; the solver chooses only KV and the local expert prefix.
+//! ownership is fixed; the shared planner chooses only the KV pool and the
+//! local expert prefix from these facts.
 pub use crate::placement::families::deepseek_v41::resident::*;
 use super::*;
 use anyhow::{ensure, Context, Result};
-use crate::placement::{self, families::deepseek_v41 as v41, ArchContext, Baseline,
-    Demand, GpuBudget, Inventory, Onboard, PoolPolicy, ResidentWeights, SparkWorkingSet};
+use crate::placement::families::deepseek_v41::admission::{self, Opaque, Owner, ProductionInput};
+use crate::placement::{self, families::deepseek_v41 as v41, ArchContext, Demand, Onboard, PoolPolicy,
+    ResidentWeights, SparkWorkingSet};
+use crate::placement::planner::{Lifetime, Location, Operation, PrefillShape};
 use v41::DraftInventory;
 
 // Conservative combined code/ready-graph envelope; pure LoadedCode is unqualified.
@@ -21,6 +24,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // Units, waves and span come from the shared prefill policy and the
     // descriptor (two units in flight, one target pass per slot).
     let limits = crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V41);
+    // The reserve the units are cut from: explicit, else the standard one.
+    // The launcher's serve argv carries it, so a pinned shape reports the
+    // standard reserve it replaced. Reported before the shared prefill solve
+    // so a refusal keeps it and the count selector never re-solves the shape.
+    report.prefill_reserve_rows = Some(options.prefill_reserve_rows
+        .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS));
     let prefill = super::resolve_prefill(input, report, options, report.placement.spark_ranks(), limits)?;
     let mut shape = Shape::resolve(input, report, model, options, ShapePolicy {
         context: ContextPolicy::Checkpoint, prefill_rows: Some(prefill.unit_rows), all_native_stages: false,
@@ -67,19 +76,19 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         "Native LoadedCode: Estimated 2 GiB per GPU beyond the measured architecture context; combined startup census residuals fit this bound. Pure LoadedCode and ready parity are not qualified.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
-        "Lazy graph/runtime growth is reserved by shared V4.1 solver demands, not included in the ready residency claim.".into()];
+        "Lazy graph/runtime growth is a typed post-ready reserve, not part of the ready residency claim.".into()];
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
     let fixed = devices.iter().flat_map(|d| d.items.iter().map(|i|
         Demand::new(d.index as u8, i.category, i.group.clone(), i.bytes, i.basis)
             .with_resident_weights(ResidentWeights(i.bytes)))).collect::<Vec<_>>();
-    let mut startup = Vec::new();
+    let mut startup: Vec<Owner> = Vec::new();
     if ranks == 1 {
         if let Some(head) = checkpoint.tensors.iter().find(|t| t.meta.name == "head.weight") {
             let source = head.meta.byte_length;
             let packing = mode.load_bytes(source);
-            startup.push(v41::owners::vocabulary_load_phase(&fixed, &target, packing)?);
+            startup.push(Owner::from_demand(&v41::owners::vocabulary_load_phase(&fixed, &target, packing)?));
         }
     }
     let spark_ranks = report.placement.spark_ranks();
@@ -91,7 +100,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             options.drafter_bytes, Basis::Exact).with_resident_weights(ResidentWeights(options.drafter_bytes)));
     }
     let mut owners = v41::owners::TargetOwners::new(fixed, target, ranks, transport, marks)?;
-    let mut fixed = owners.fixed.clone();
     let catalog = input.expert_catalog()?;
     let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots, span,
         v41::owners::DECODE_LANE_ROWS)?;
@@ -128,100 +136,155 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
         Some(draft)
     } else { None };
-    let automatic = options.pool_tokens == Some(0);
-    let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0)
-        .with_automatic_context(options.context_tokens == 0);
-    if pool.requested.is_none() {
-        pool.floor = pool.floor.max(shape.context_tokens.div_ceil(512) * 512 + shape.concurrency * 512);
-        pool.target = pool.target.min(options.target_pool_tokens).max(pool.floor);
+    let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0);
+    // CLI zero and an omitted pool are the same automatic admission.
+    let automatic = pool.requested.is_none();
+    if automatic {
+        pool.target = pool.target.min(options.target_pool_tokens.max(shape.context_tokens));
     }
-    pool.ceiling = pool.requested.unwrap_or(pool.target).div_ceil(512) * 512;
-    let mut inventory = Inventory { gpus: Vec::new(), spark_ranks, peer_access: ranks == 2 };
+    pool.validate_explicit()?;
+    let maximum_pool_tokens = pool.maximum_tokens();
+    let context = shape.context_tokens.max(if automatic { pool.floor } else { 0 });
+    let mut working = SparkWorkingSet { rtx_layers: Vec::new(),
+        spark_layers: if spark_ranks > 0 { (0..40).collect() } else { Vec::new() },
+        spark_ranks, prefill_lanes: slots as u64 };
+    let mut sparks = spark_devices(report, model, input, options, SPARK, &working,
+        spark_endpoints("deepseek_v41", working.prefill_lanes), &mut waste, &mut notes);
+    // Ready-resident owners and the two typed per-GPU reserves. The pool bytes
+    // and the routed-expert arenas are separate contract components.
+    let mut physical = owners.fixed.iter().map(Owner::from_demand).collect::<Vec<_>>();
+    let mut reserves = Vec::new();
+    let mut cards = Vec::with_capacity(ranks);
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
         let arch = ArchContext::coordinator(total, None);
-        let ceiling = if total <= 32 * GIB {
-            cuteafd_core::serving_capacity::admission_ceiling(total, 97,
-                cuteafd_core::serving_capacity::small_card_headroom_bytes(total))?
-        } else if automatic { (u128::from(total) * 97 / 100) as u64 } else { total };
-        let context = arch.context_bytes + arch.cublas_bytes;
-        inventory.gpus.push(GpuBudget { capacity_bytes: total, headroom_bytes: total - ceiling,
-            baseline: Baseline::Planned { context_bytes: context, loaded_bytes: NATIVE_CODE_ESTIMATE } });
+        let ceiling = total;
         devices[gpu].capacity_bytes = ceiling;
         devices[gpu].items.clear();
-        devices[gpu].items.push(Item::new(Category::Runtime, "CUDA context and cuBLAS", "SM120 architecture inventory", context, Basis::Calibrated));
-        devices[gpu].items.push(Item::new(Category::Runtime, "native LoadedCode estimate", "unqualified native code/ready graph residency", NATIVE_CODE_ESTIMATE, Basis::Estimated));
-        fixed.extend(v41::growth_demands(total, ranks, automatic, gpu as u8));
+        cards.push((total, ceiling));
+        for (bytes, basis, source) in [
+            (arch.context_bytes + arch.cublas_bytes, Basis::Calibrated, "CUDA context and cuBLAS"),
+            (NATIVE_CODE_ESTIMATE, Basis::Estimated, "native LoadedCode estimate"),
+        ] {
+            reserves.push(Opaque { location: Location::coordinator(gpu as u8), bytes, basis,
+                lifetime: Lifetime::RESIDENT, source: source.into() });
+        }
+        reserves.extend(admission::growth_allowances(total, ranks, gpu as u8));
     }
-    let onboard = if spark_ranks == 0 { Onboard::Layers(catalog.routed_experts().routed_layers()) } else {
-        options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto)
+    if let Some(draft) = &draft {
+        startup.extend(owners.draft_load_phases(draft)?.iter().map(Owner::from_demand));
+    }
+    let onboard = if spark_ranks == 0 { Onboard::Layers(40) }
+        else { options.resolve_onboard(40).unwrap_or(Onboard::Auto) };
+    let onboard_minimum = usize::from(ranks == 2 && !matches!(onboard, Onboard::Layers(0)));
+    // Encoders are enumerated against the pre-solve hardware; the shared solve
+    // keeps the first candidate whose whole placement fits every phase.
+    let towers = v41_towers(report);
+    let (vision_weights, vision_scratch) = match towers.vision {
+        Ok(bytes) => bytes,
+        Err(_) if report.vision == crate::plan::MediaMode::Off => (0, 0),
+        Err(reason) => anyhow::bail!("bundled vision tower unavailable: {reason}"),
     };
-    let mut request = v41::request(inventory, pool, vec![0; ranks], experts, workspace, onboard);
-    request.resident_weight_limit = Some(ResidentWeights(options.weight_budget_bytes));
-    request.fixed = fixed;
-    request.startup = startup.clone();
-    if let Some(draft) = &draft { request.startup.extend(owners.draft_load_phases(draft)?); }
-    request.minimum_expert_layers = usize::from(ranks == 2 && !matches!(onboard, Onboard::Layers(0)));
-    if let Some(draft) = &draft { request.movables.push(v41::drafter(draft, ranks)?); }
-    v41::cache_demands(&mut request, &checkpoint.config, shape.concurrency, turns, false)?;
-    let mut placement = placement::solve(&request)?;
-    let mut working = SparkWorkingSet { rtx_layers: (0..placement.onboard_layers).collect(),
-        spark_layers: (placement.onboard_layers..40).collect(), spark_ranks, prefill_lanes: slots as u64 };
-    let mut sparks = spark_devices(report, model, input, options, SPARK, &working, 2, &mut waste, &mut notes);
-    update_sparks(catalog, &working, &mut sparks)?;
-    // A mandatory encoder displaces an optional expert prefix, not the pool.
-    // Resolve its policy against only compulsory experts, then admit its owners.
-    let mut encoder_request = request.clone();
-    if request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none() {
-        encoder_request.onboard = Onboard::Layers(request.minimum_expert_layers);
-        encoder_request.pool.pin_selected(placement.pool_tokens);
+    let mut encoders = encoder_candidates(report, options, &devices[..ranks], &sparks,
+        vision_weights, vision_scratch);
+    if report.vision == crate::plan::MediaMode::Auto && vision_weights > 0 {
+        encoders.push(crate::plan::encoder::encoder_placement(crate::plan::MediaMode::Off,
+            &encoder_hardware(true, &devices[..ranks], &sparks, options), 0, 0, 1));
     }
-    let encoder_budget = placement::solve(&encoder_request)?;
-    let mut encoder_devices = devices.clone();
-    for (d, items) in encoder_devices.iter_mut().zip(&encoder_budget.items) { d.items.extend(items.iter().cloned()); }
-    resolve_encoder(report, &v41_towers(report), &mut encoder_devices, &mut sparks, &vec![0; ranks], options, &mut notes);
-    for device in &encoder_devices {
-        for item in device.items.iter().filter(|i| i.group.starts_with("vision ")) {
-            let demand = Demand::new(device.index as u8, item.category, item.group.clone(), item.bytes, item.basis);
-            owners.add_vision(demand.clone())?;
-            request.fixed.push(demand);
+    if encoders.is_empty() { anyhow::bail!("requested bundled encoder has no executable device"); }
+    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
+    let host_facts = admission::HostFacts::prepare(&checkpoint.config,
+        &checkpoint.tensors.iter().map(|tensor| &tensor.meta).collect::<Vec<_>>(),
+        PrefillShape { rows, waves: slots as u64 }, ranks, spark_ranks, context, shape.concurrency,
+        dspark, options.host_cache_bytes, options.host_cache_bytes != Some(0) && turns > 0,
+        256 << 20, host, report.mapped_placement.cap_bytes, Some(report.mapped_placement.host_budget_bytes), options.full_prefill_logits)?;
+    report.mapped_placement = host_facts.mapped.clone();
+    report.bytes_by_owner.remove("host-preloaded");
+    if host_facts.mapped.preloaded_bytes > 0 {
+        report.bytes_by_owner.insert("host-preloaded".into(), host_facts.mapped.preloaded_bytes);
+    }
+    mapped_table_note(report, &mut notes);
+    if notes.iter().any(|note| note.starts_with("embedding placement: host")) {
+        let bytes = checkpoint.tensors.iter().filter(|tensor| tensor.meta.name == "embed.weight")
+            .map(|tensor| tensor.meta.byte_length).sum();
+        physical.push(Owner::host(Category::Embedding, "embedding", bytes).at(Location::PINNED));
+    }
+    physical.extend(host_facts.owners.clone());
+    reserves.extend(host_facts.estimates.clone());
+    let budgets = admission::production_budgets(&cards, 0, Some(host), 0,
+        &vec![options.spark_bytes; spark_ranks])?;
+    let request = admission::production_request(context, options.pool_tokens, onboard,
+        PrefillShape { rows, waves: slots as u64 },
+        if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+        options.weight_budget_bytes, options.spark_reply_formats);
+    let media_cache_bytes = options.media_cache_bytes.unwrap_or(0);
+    let mut prepared = ProductionInput {
+        config: &checkpoint.config,
+        gpus: ranks,
+        context,
+        maximum_pool_tokens,
+        prefill: PrefillShape { rows, waves: slots as u64 },
+        concurrency: shape.concurrency,
+        retained_turns: turns,
+        replicated: false,
+        spark_ranks,
+        onboard_minimum,
+        onboard_counts: onboard.layers(40).map(|layers| vec![layers]),
+        experts,
+        workspace,
+        owners: physical.drain(..).collect(),
+        startup,
+        allowances: reserves,
+        draft,
+        encoders: Vec::new(),
+        media_cache_bytes: 0,
+        resident_weight_limit: options.weight_budget_bytes,
+        spark_reply_formats: options.spark_reply_formats,
+        operation: if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
+        budgets,
+    }.prepare()?;
+    prepared.recipe.encoders = encoders.clone();
+    prepared.recipe.media_cache_bytes = media_cache_bytes;
+    let admitted = prepared.admit(request)?;
+    report.host_ledger = Some(admitted.host_ledger(host_facts.prefix_bytes)?);
+    let mut encoder = encoders[admitted.solved.decisions.encoder.context("missing admitted encoder")?].clone();
+    if report.vision == crate::plan::MediaMode::Auto && vision_weights > 0
+        && encoder.kind == crate::plan::encoder::EncoderKind::Off {
+        encoder.reason = format!("Auto disabled image input at the pool-first/onboarding solution: {}; free memory or choose a smaller layout",
+            admitted.solved.encoder_diagnostics.iter().map(|(reason, _)| reason.as_str()).collect::<Vec<_>>().join("; "));
+        encoder.shortfall = admitted.solved.encoder_diagnostics.iter().map(|(_, bytes)| *bytes)
+            .filter(|bytes| *bytes > 0).min().unwrap_or(0);
+        tracing::warn!(reason = %encoder.reason, shortfall_bytes = encoder.shortfall, "bundled vision disabled by shared admission");
+    }
+    ensure!(!admitted.spark.spark_layers.is_empty()
+        || !matches!(encoder.kind, crate::plan::encoder::EncoderKind::Spark { .. }),
+        "encoder requires an active Spark worker");
+    if encoder.kind == crate::plan::encoder::EncoderKind::Off {
+        if let Some(component) = report.components.iter_mut().find(|c| c.component == Component::Vision)
+            .filter(|c| c.status != Status::Unused) {
+            report.disabled_media_bytes += component.bytes;
+            component.bytes = 0;
+            component.status = Status::Disabled;
         }
     }
-    if let Some(encoder) = &report.encoder {
-        if let super::super::encoder::EncoderKind::Rtx { gpu } = encoder.kind {
-            let weights = Demand::new(gpu as u8, Category::Weights, "vision checkpoint owners", 0, Basis::Formula)
-                .with_resident_weights(ResidentWeights(encoder.weights));
-            owners.add_vision(weights.clone())?;
-            request.fixed.push(weights);
-        }
-    }
-    if request.fixed.len() > request.fixed.iter().filter(|d| !d.group.starts_with("vision ")).count() {
-        if let Some(draft) = &draft {
-            request.startup = startup.clone();
-            request.startup.extend(owners.draft_load_phases(draft)?);
-        }
-        placement = placement::solve(&request)?;
-    }
-    v41::validate_pool_floor(&request.pool, &placement)?;
-    working.rtx_layers = (0..placement.onboard_layers).collect();
-    working.spark_layers = (placement.onboard_layers..40).collect();
-    if working.spark_layers.is_empty() { sparks.clear(); }
-    update_sparks(catalog, &working, &mut sparks)?;
-    charge_spark_devices(report, model, input, options, SPARK, &working,
-        spark_endpoints("deepseek_v41", working.prefill_lanes), &mut sparks, &mut notes,
-        |d| format!("Spark rank {} I/O admission", d.index));
-    for spark in &mut sparks {
-        for item in &mut spark.items {
-            if item.group == "expert waves" || item.group == "vision CUDA overhead" { item.basis = Basis::Estimated; }
-        }
-    }
-    for (device, items) in devices.iter_mut().zip(&placement.items) {
-        device.items.extend(items.iter().cloned());
-        device.kv_tokens = placement.pool_tokens;
-    }
+    notes.push(format!("vision {:?}: {}; {} bytes admitted", encoder.kind, encoder.reason, encoder.admitted_bytes()));
+    report.encoder = Some(encoder.clone());
+    report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
+    let placement = admitted.placement;
+    working = admitted.spark;
+    report.solver_placement = Some(placement.clone());
     report.attention_placement = placement.attention_placement;
     notes.push(format!("attention placement {}", placement.attention_placement));
     notes.push(format!("placement: {}", placement.summary()));
     notes.push(format!("{} routed backbone layers resident on RTX", placement.onboard_layers));
+    if working.spark_layers.is_empty() { sparks.clear(); }
+    for rank in encoder.spark_ranks() {
+        let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) else { continue };
+        let overhead = crate::plan::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES;
+        device.items.push(Item::new(Category::Weights, "vision tower", "", encoder.weights, Basis::Exact));
+        device.items.push(Item::new(Category::Workspace, "vision scratch", "",
+            encoder.scratch.saturating_sub(overhead), Basis::Exact));
+        device.items.push(Item::new(Category::Runtime, "vision CUDA overhead", "", overhead, Basis::Exact));
+    }
     if catalog.exl3().is_none() && catalog.nvfp4().is_none() {
         let e = catalog.routed_experts();
         let capacity = cuteafd_core::V41_TARGET_CAPACITIES.into_iter().find(|&c| c >= rows)
@@ -236,10 +299,42 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
                 widths.into_iter().map(|(_, width)| width), 121, capacity as u32, e.experts, e.topk));
         }
     }
+    update_sparks(catalog, &working, &mut sparks)?;
+    charge_spark_devices(report, model, input, options, SPARK, &working,
+        spark_endpoints("deepseek_v41", working.prefill_lanes), &mut sparks, &mut notes,
+        |d| format!("Spark rank {} I/O admission", d.index));
+    for spark in &mut sparks {
+        for item in &mut spark.items {
+            if item.group == "expert waves" || item.group == "vision CUDA overhead" { item.basis = Basis::Estimated; }
+        }
+    }
     let pool_tokens = placement.pool_tokens;
-    report.solver_placement = Some(placement);
+    for (device, items) in devices.iter_mut().zip(&placement.items) {
+        device.items = items.clone();
+        device.kv_tokens = pool_tokens;
+    }
     devices.extend(sparks);
     Ok(MemoryLayout { devices, pool_tokens, waste, notes })
+}
+
+fn encoder_hardware(v41: bool, devices: &[DeviceLayout], sparks: &[DeviceLayout],
+    options: &LayoutOptions) -> crate::plan::encoder::EncoderHardware {
+    use crate::plan::encoder::{EncoderGpuBudget, EncoderHardware, EncoderSparkBudget};
+    EncoderHardware { v41,
+        gpus: devices.iter().map(|device| EncoderGpuBudget {
+            free_bytes: device.capacity_bytes, kv_target_bytes: 0 }).collect(),
+        sparks: sparks.iter().map(|device| EncoderSparkBudget { rank: device.index as usize,
+            host: format!("spark{}", device.index), idle: false,
+            expert_bytes: device.items.iter().filter(|item| item.category == Category::Experts)
+                .map(|item| item.bytes).sum(),
+            free_bytes: spark_encoder_headroom(device, options.spark_allocation_budget_bytes) }).collect() }
+}
+
+fn encoder_candidates(report: &PlanReport, options: &LayoutOptions, devices: &[DeviceLayout],
+    sparks: &[DeviceLayout], weights: u64, scratch: u64) -> Vec<crate::plan::encoder::EncoderPlacement> {
+    crate::plan::encoder::candidates(&crate::plan::encoder::EncoderRequest { mode: report.vision,
+        weights, scratch, copies: options.vision_replicas },
+        &encoder_hardware(true, devices, sparks, options))
 }
 
 #[cfg(test)]
@@ -265,35 +360,101 @@ mod tests {
         }
     }
 
+    /// The recipe's KV decomposition is the allocator's own total at every
+    /// pool size, and the pool extent stays inside the indexable group domain.
     #[test]
-    fn retained_weight_ceiling_limits_optional_experts_not_their_arena() -> Result<()> {
-        let inventory = Inventory { gpus: vec![GpuBudget { capacity_bytes: 96 * GIB,
-            headroom_bytes: 0, baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }],
-            spark_ranks: 4, peer_access: false };
-        let expert = placement::ExpertCost { whole: placement::Bytes2 { resident: 4 * GIB, staging: 8 * GIB },
-            half: Default::default(), tp2: false, whole_supported: true, spark_ok: true };
-        let mut request = v41::request(inventory, PoolPolicy::resolve(&[96 * GIB], 512, None, 512, false),
-            vec![512 * 1024], vec![expert; 40], 16 * GIB, Onboard::Auto);
-        request.fixed.push(Demand::new(0, Category::Weights, "backbone", 2 * GIB, Basis::Exact)
-            .with_resident_weights(ResidentWeights(2 * GIB)));
-        let unconstrained = placement::solve(&request)?;
-        request.resident_weight_limit = Some(ResidentWeights(10 * GIB));
-        let placed = placement::solve(&request)?;
-        assert_eq!(placed.onboard_layers, 2);
-        assert_eq!(request.fixed[0].resident_weights.0
-            + placed.onboard_layers as u64 * expert.whole.resident, 10 * GIB);
-        assert!(placed.items[0].iter().filter(|i| i.category == Category::Experts)
-            .map(|i| i.bytes).sum::<u64>() > 10 * GIB);
-        assert!(placed.pool_tokens >= 262_144);
-        assert_eq!(placed.pool_tokens, unconstrained.pool_tokens);
-        request.onboard = Onboard::Layers(3);
-        assert!(matches!(placement::solve(&request), Err(placement::PlacementError::ResidentWeightLimit { .. })));
-        request.onboard = Onboard::Auto;
-        request.minimum_expert_layers = 1;
-        request.resident_weight_limit = Some(ResidentWeights(5 * GIB));
-        assert!(matches!(placement::solve(&request), Err(placement::PlacementError::ResidentWeightLimit { .. })));
+    fn cache_owners_equal_the_allocator_total_at_every_pool_page() -> Result<()> {
+        let config: serde_json::Value = serde_json::from_str(include_str!(
+            "../../families/deepseek_v41/official-v41-config.json"))?;
+        for ranks in [1usize, 2] {
+            for tails in [0u64, 3, 20] {
+                let maximum = 64;
+                let owners = admission::cache_owners(&config, ranks, 1, tails, false, maximum)?;
+                for pages in 1..=maximum {
+                    let expected = crate::serving_capacity::deepseek_v41_cache_bytes(
+                        &config, ranks, 1, pages + tails, false)?;
+                    let charged = owners.iter().flatten()
+                        .map(|component| component.bytes.at(pages).unwrap()).sum::<u64>();
+                    assert_eq!(charged, expected.iter().sum::<u64>(), "ranks {ranks} tails {tails} pages {pages}");
+                }
+            }
+        }
+        assert!(admission::cache_owners(&config, 2, 1, 0, true, 64)?.len() == 2);
         Ok(())
     }
+
+    /// The pool and the local prefix come from one solve: the resident-weight
+    /// ceiling can only shrink the optional expert prefix, never the pool.
+    #[test]
+    fn resident_weight_ceiling_limits_the_optional_expert_prefix() -> Result<()> {
+        let config: serde_json::Value = serde_json::from_str(include_str!(
+            "../../families/deepseek_v41/official-v41-config.json"))?;
+        let gib = 1u64 << 30;
+        let expert = placement::ExpertCost { whole: placement::Bytes2 { resident: gib, staging: 8 * gib },
+            half: [placement::Bytes2 { resident: gib / 2, staging: 4 * gib }; 2],
+            tp2: true, whole_supported: true, spark_ok: true };
+        let run = |limit: u64|
+            -> std::result::Result<(usize, u64, [u64; 2]), crate::placement::planner::Refusal> {
+            let cards = vec![(96 * gib, 96 * gib); 2];
+            let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
+            let input = ProductionInput {
+                config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
+                prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
+                replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
+                experts: vec![expert; 40], workspace: 0,
+                owners: vec![Owner::charged(0, Category::Weights, "backbone", 2 * gib),
+                    Owner::charged(1, Category::Weights, "backbone", 2 * gib)],
+                startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
+                media_cache_bytes: 0, resident_weight_limit: limit,
+                spark_reply_formats: Default::default(), operation: Operation::Serving, budgets,
+            };
+            let request = admission::production_request(512, Some(512 * 64),
+                crate::placement::Onboard::Auto, PrefillShape { rows: 64, waves: 1 },
+                Operation::Serving, limit, Default::default());
+            let admitted = input.prepare()?.admit(request)?;
+            let count = admitted.placement.onboard_layers;
+            let (peak, _) = admission::arena(count, 2, &vec![expert; 40], 0)?;
+            // TP2 names both GPUs but counts each layer once, so the arena peak
+            // lives in the plan's TP2 range; a whole-layer home uses the range.
+            let admitted_peak = admitted.placement.tp2.map_or_else(|| {
+                assert_eq!(admitted.placement.expert_ranges[0].layers, count);
+                [admitted.placement.expert_ranges[0].peak_bytes, 0]
+            }, |range| {
+                assert_eq!(range.layers, count);
+                range.peak_bytes
+            });
+            assert_eq!(admitted_peak, peak, "the ceiling trades layers, never per-layer workspace");
+            Ok((count, admitted.placement.pool_tokens, peak))
+        };
+        let (loose, pool, _) = run(40 * gib)?;
+        let (tight, tight_pool, _) = run(10 * gib)?;
+        let (none, none_pool, zero) = run(0)?;
+        assert!(tight < loose && none < tight, "the weight ceiling shrinks the optional prefix");
+        assert_eq!(none, 0);
+        assert_eq!(zero, [0, 0]);
+        assert_eq!((pool, tight_pool, none_pool), (pool, pool, pool),
+            "the pool target does not move with the ceiling");
+        // Compulsory resident weights above the ceiling are a typed refusal.
+        let cards = vec![(96 * gib, 96 * gib); 2];
+        let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
+        let input = ProductionInput {
+            config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
+            prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
+            replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
+            experts: vec![expert; 40], workspace: 0,
+            owners: vec![Owner::weights(0, Category::Weights, "backbone", 2 * gib)],
+            startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
+            media_cache_bytes: 0, resident_weight_limit: 0, spark_reply_formats: Default::default(),
+            operation: Operation::Serving, budgets,
+        };
+        let request = admission::production_request(512, Some(512 * 64),
+            crate::placement::Onboard::Auto, PrefillShape { rows: 64, waves: 1 },
+            Operation::Serving, 0, Default::default());
+        assert!(matches!(input.prepare()?.admit(request),
+            Err(crate::placement::planner::Refusal::ResidentWeightLimit { gpu: 0, .. })));
+        Ok(())
+    }
+
 }
 
 fn update_sparks(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet, devices: &mut [DeviceLayout]) -> Result<()> {

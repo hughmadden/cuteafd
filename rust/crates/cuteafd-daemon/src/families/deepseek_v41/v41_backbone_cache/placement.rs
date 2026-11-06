@@ -44,23 +44,40 @@ mod tests {
     use super::*;
     #[test]
     fn execution_plan_binds_single_and_ced_ownership() -> Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::admission::{
+            live_budgets, production_request, ProductionInput,
+        };
+        use cuteafd_loader::placement::planner::{Operation, PrefillShape};
         use cuteafd_loader::placement::*;
+        let config: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"
+        ))?;
         for ranks in [1, 2] {
-            let request = families::deepseek_v41::request(Inventory {
-                gpus: vec![GpuBudget { capacity_bytes: 1 << 40, headroom_bytes: 0,
-                    baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }; ranks],
-                spark_ranks: 4, peer_access: ranks == 2,
-            }, PoolPolicy::resolve(&vec![1 << 40; ranks], 512, Some(512), 512, false),
-                vec![0; ranks], vec![], 0, Onboard::Layers(0));
-            let mut placement = solve(&request)?;
-            let plan = LayerExecutionPlan::new(&placement, request.hops)?;
+            let prefill = PrefillShape { rows: 128, waves: 1 };
+            let placement = ProductionInput {
+                config: &config, gpus: ranks, context: 4096, maximum_pool_tokens: 8192,
+                prefill, concurrency: 1, retained_turns: 0, replicated: false, spark_ranks: 4,
+                onboard_minimum: 0, onboard_counts: None,
+                experts: vec![ExpertCost { whole: Bytes2::default(), half: [Bytes2::default(); 2],
+                    tp2: ranks == 2, whole_supported: true, spark_ok: true }; 40],
+                workspace: 0, owners: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
+                draft: None, encoders: Vec::new(), media_cache_bytes: 0,
+                resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+                operation: Operation::Serving,
+                budgets: live_budgets(&vec![(1 << 40, 1 << 40, 1 << 39); ranks],
+                    &vec![cuteafd_loader::plan::layout::DEFAULT_SPARK_DEVICE_BYTES; 4])?,
+            }.prepare()?.admit(production_request(4096, Some(4096), Onboard::Layers(0), prefill,
+                Operation::Serving, u64::MAX, Default::default()))?.placement;
+            let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(ranks);
+            let plan = LayerExecutionPlan::new(&placement, spec)?;
             let map = CachePlacement::from_execution_plan(&plan)?;
             for layer in 0..40 {
                 assert_eq!(map.attention(layer)?, usize::from(ranks == 2 && layer >= 20));
             }
             assert_eq!(plan.hops().len(), ranks - 1);
-            placement.residual[1] = ResidualHome::Replicated;
-            assert!(LayerExecutionPlan::new(&placement, request.hops).is_err());
+            let mut wrong = placement.clone();
+            wrong.residual[1] = ResidualHome::Replicated;
+            assert!(LayerExecutionPlan::new(&wrong, spec).is_err());
         }
         Ok(())
     }
