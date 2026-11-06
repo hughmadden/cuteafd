@@ -687,7 +687,9 @@ def worker(payload):
         if payload.get("backend_cache"):
             identity = records_module.compiler_identity(ROOT, payload, capability)
             backend_cache = records_module.BackendCache(payload["backend_cache"], identity)
-        recorder = records_module.Recorder(ROOT, output, backend_cache).install()
+        prior_records = (json.loads(Path(payload["prior_source_records"]).read_text())
+                         if payload.get("prior_source_records") else None)
+        recorder = records_module.Recorder(ROOT, output, backend_cache, prior_records).install()
         PROGRAM_RECORDER = recorder
         # runpy exporters receive a worker-local hook, not a serving dependency.
     start = time.monotonic()

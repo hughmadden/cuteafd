@@ -149,6 +149,39 @@ def test_stage0_candidates_require_globals_and_all_recorded_reads(tmp_path):
     assert records.job_candidates(tmp_path, {"stage0_inputs": inputs}, inputs) == ["missing-recorded-reads"]
 
 
+def test_monitoring_can_be_suppressed_only_for_unchanged_sources(tmp_path):
+    source = tmp_path / "recipe.py"
+    source.write_text("TILE = 64\n")
+    inputs = {"global_sources": {"compiler.py": "same"}, "rules": "same", "identity": "old"}
+    previous = {"stage0_inputs": inputs, "source_reads_sha256": {"recipe.py": records.digest(source.read_bytes())}}
+    current = {**inputs, "identity": "changed-env"}
+    assert records.unchanged_trace_sources(tmp_path, previous, current)
+    assert not records.unchanged_trace_sources(tmp_path, previous, {**current, "global_sources": {}})
+    source.write_text("TILE = 128\n")
+    assert not records.unchanged_trace_sources(tmp_path, previous, current)
+    assert not records.unchanged_trace_sources(tmp_path, previous, None)
+
+
+def test_monitoring_disables_repeated_code_entry_and_releases_tool(tmp_path):
+    source = tmp_path / "recipe.py"
+    source.write_text("def recipe():\n    return 5\n")
+    spec = importlib.util.spec_from_file_location("one_shot_recipe", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.start_monitoring()
+    tool_id = recorder.monitoring_id
+    try:
+        assert module.recipe() == 5
+        recorder.frames.clear()
+        assert module.recipe() == 5
+        assert "recipe.py" not in recorder.frames
+    finally:
+        recorder.stop_monitoring()
+    import sys
+    assert sys.monitoring.get_tool(tool_id) is None
+
+
 def test_job_replay_checksums_and_verify_skips_reject_ir_drift(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("replay_publisher", ROOT / "scripts/build/export-placement-inputs.py")
     publisher = importlib.util.module_from_spec(spec)

@@ -199,6 +199,9 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
         triggers = kernel_records.job_candidates(ROOT, prior_context, current_inputs)
         print(f"Placement job {name}: candidate triggers={triggers}", flush=True)
         skipped = not triggers
+        if (not verify_skips and not skipped
+                and kernel_records.unchanged_trace_sources(ROOT, prior_context, current_inputs)):
+            payload["prior_source_records"] = str(prior_directory / "program-records.json")
         if skipped and not verify_skips:
             for relative in prior_files:
                 target = output / relative
@@ -213,10 +216,21 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
                CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
                CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
     print(f"Placement export {name}: {extra}", flush=True)
-    with (output / "export.log").open("w") as log:
-        subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
-                        "--_worker", json.dumps(payload)], env=env, stdout=log,
-                       stderr=subprocess.STDOUT, check=True, timeout=timeout)
+    def run_worker():
+        with (output / "export.log").open("w") as log:
+            subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
+                            "--_worker", json.dumps(payload)], env=env, stdout=log,
+                           stderr=subprocess.STDOUT, check=True, timeout=timeout)
+    try:
+        run_worker()
+    except subprocess.CalledProcessError:
+        if ("prior_source_records" not in payload
+                or "untraced candidate" not in (output / "export.log").read_text()):
+            raise
+        payload.pop("prior_source_records")
+        shutil.rmtree(output)
+        output.mkdir()
+        run_worker()
     if skipped:
         verify_job_metadata(prior_directory, output, lock, name)
     summary = json.loads((output / "comparison-context.json").read_text())
