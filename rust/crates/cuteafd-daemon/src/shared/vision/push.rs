@@ -5,7 +5,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::{sync::{mpsc, Arc, Mutex}, thread::JoinHandle};
 
-pub(super) struct OwnerThread {
+pub(crate) struct OwnerThread {
     thread: Mutex<Option<JoinHandle<()>>>,
     cancel: mpsc::Sender<bool>,
 }
@@ -17,7 +17,7 @@ impl OwnerThread {
     pub(super) fn new(thread: JoinHandle<()>, cancel: mpsc::Sender<bool>) -> Self {
         Self { thread: Mutex::new(Some(thread)), cancel }
     }
-    pub(super) fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.thread.lock().unwrap().as_ref().is_none_or(JoinHandle::is_finished)
     }
 }
@@ -27,6 +27,10 @@ impl Drop for OwnerThread {
         if let Some(thread) = self.thread.get_mut().unwrap().take() { let _ = thread.join(); }
     }
 }
+
+/// Address-only operand descriptors of [`Records`], movable between threads.
+#[allow(clippy::type_complexity)]
+pub(crate) struct SentRecords(Vec<(i32, usize, usize, u64, usize, Vec<(Rect, usize)>)>);
 
 struct Completion {
     commit: mpsc::Sender<bool>,
@@ -77,6 +81,26 @@ impl Contribution {
         check_destinations(&out.records, reserved)?;
         Ok(out)
     }
+    /// [`Records`] as plain addresses: a family media thread's recorded owners
+    /// cross to the startup thread (one process, one primary context per device).
+    pub(crate) fn send_records(records: Records) -> Result<SentRecords> {
+        ensure!(records.steps.is_empty() && records.finishes.is_empty() && records.peer_copies.is_empty(),
+            "sent media records carry only direct operands");
+        Ok(SentRecords(records.operands.into_iter().map(|operand| (operand.device, operand.buffer.ptr as usize,
+            operand.buffer.bytes, operand.buffer.flags, operand.bytes, operand.lands)).collect()))
+    }
+    /// A family-owned media thread's recorded owners (its own mount-mode loader
+    /// under the shared recorder, payload unread) with the same commit protocol:
+    /// `commit` releases the owner only after the family group has committed.
+    pub(crate) fn recorded(records: SentRecords, commit: mpsc::Sender<bool>,
+        acknowledgement: mpsc::Receiver<super::Result<()>>, thread: JoinHandle<()>) -> Result<(Self, Arc<OwnerThread>)> {
+        let records = Records { operands: records.0.into_iter().map(|(device, ptr, buffer_bytes, flags, bytes, lands)|
+            Operand { device, buffer: CuteafdDeviceBuffer { ptr: ptr as *mut _, bytes: buffer_bytes, device_id: device, flags },
+                lands, bytes }).collect(), ..Default::default() };
+        check_destinations(&records, Vec::new())?;
+        let owner = Arc::new(OwnerThread::new(thread, commit.clone()));
+        Ok((Self { records, completions: vec![Completion { commit, acknowledgement, _owner: owner.clone() }] }, owner))
+    }
     pub(crate) fn extend(&mut self, mut other: Self) {
         self.records.extend(std::mem::take(&mut other.records));
         self.completions.append(&mut other.completions);
@@ -125,6 +149,18 @@ fn check_destinations(records: &Records, mut ranges: Vec<(i32, usize, usize)>) -
     Ok(())
 }
 
+/// One BF16 media vector's widen windows (one staged step each), shared by the
+/// recorded contribution and the header-only host admission of its staging.
+pub(crate) fn widen_windows(path: &std::path::Path, metadata: &cuteafd_loader::SafetensorsTensorMetadata) -> Vec<Rect> {
+    let bytes = metadata.byte_length as usize;
+    let window = crate::shared::experts::rtx::dense::TRANSFORM_BYTES & !1;
+    (0..bytes).step_by(window).map(|at| {
+        let count = (bytes - at).min(window);
+        Rect { name: metadata.name.clone(), path: path.into(), base: metadata.byte_offset + at as u64,
+            row_bytes: count, rows: 0..1, cols: 0..count }
+    }).collect()
+}
+
 fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize,
     path: &std::path::Path, metadata: &cuteafd_loader::SafetensorsTensorMetadata,
     destination: usize, widen: bool) -> Result<()> {
@@ -139,13 +175,12 @@ fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize
     };
     if widen {
         ensure!(bytes % 2 == 0, "media BF16 tensor has an odd byte extent");
-        let window = crate::shared::experts::rtx::dense::TRANSFORM_BYTES & !1;
-        for at in (0..bytes).step_by(window) {
-            let count = (bytes - at).min(window);
-            let rect = Rect { name: metadata.name.clone(), path: path.into(), base: metadata.byte_offset + at as u64,
-                row_bytes: count, rows: 0..1, cols: 0..count };
+        let mut at = 0;
+        for rect in widen_windows(path, metadata) {
+            let count = rect.bytes();
             records.steps.push(Step { device, rects: vec![rect],
                 jobs: vec![Job::Widen { at: 0, bytes: count, dst: buffer(destination + at * 2, count * 2) }] });
+            at += count;
         }
     } else {
         let rect = Rect { name: metadata.name.clone(), path: path.into(), base: metadata.byte_offset,
@@ -159,6 +194,10 @@ fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    /// A tower's header-only contribution at a synthetic arena address on `device`.
+    pub(crate) fn vision_records(device: i32, spec: &TowerSpec) -> Result<Records> {
+        Ok(Contribution::prepare(device, Some((spec, 1 << 40)), None, None, None)?.records())
+    }
     pub(crate) fn assert_vision_plan(snapshot: &std::path::Path, spec: &TowerSpec) {
         let contribution = Contribution::prepare(0, Some((spec, 4096)), None, None, None).unwrap();
         let records = contribution.records();

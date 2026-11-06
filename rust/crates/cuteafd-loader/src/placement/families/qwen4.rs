@@ -735,7 +735,7 @@ pub struct QwenDualInputs<'a> {
 /// the executor cannot run and the shipped dense route never reaches.
 pub fn dual_cut(layers: usize) -> usize { layers / 2 }
 
-fn dual_owners(layers: usize) -> Vec<usize> {
+pub fn dual_owners(layers: usize) -> Vec<usize> {
     let cut = dual_cut(layers);
     (0..layers).map(|layer| usize::from(layer >= cut)).collect()
 }

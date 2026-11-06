@@ -354,7 +354,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
     } else { None };
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
-    let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
+    // A local tower records on its owner thread and joins the coordinator group.
+    let (mut vision, vision_push) = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load_pushed(
+        &args, &catalog, records.is_some())?;
+    if let Some(records) = records.as_mut() { records.extend(vision_push.records()); }
     memory_checkpoint("vision")?;
     let prefix_arenas = super::prefix::Arenas::new(devices[0], None, snapshot_slots)?;
     let snapshot_bytes = super::prefix::Arenas::device_bytes(snapshot_slots, args.dspark);
@@ -430,6 +433,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         None => None,
     };
     if pushed.is_none() { if let Some(records) = &records { super::coordinator_push::fill(&lib, records)?; } }
+    // Either the group committed or its records (vision included) filled through the mount.
+    vision_push.commit()?;
     let pushed = if let Some(prepared) = prepared_draft {
         let [left, right] = pushed.context("V4.1 TP2 dSpark requires committed push")?;
         let mut weights = [left.native()?, right.native()?];
