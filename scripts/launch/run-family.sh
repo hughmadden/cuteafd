@@ -2665,12 +2665,13 @@ else: raise ValueError("idle-host launch needs an explicit inventory")
 ' "$family" "$(printf '%s\n' "${spark_vision_ranks[@]}" | jq -sc '[.[] | select(. != null)]')" <<<"$plan_json")"
   read -r vision encoder_hash rank_csv encoder_max_tokens <<<"$selected"
   if [[ "$vision" == spark:* ]]; then
-    encoder_ranks=("${spark_vision_ranks[@]}")
+    IFS=, read -r -a encoder_ranks <<<"$rank_csv"
     for encoder_rank in "${encoder_ranks[@]}"; do
       vision_peers+=("$(get "SPARK_${encoder_rank}_LANE_A"):$encoder_port")
     done
     family_args+=(--vision-peers "$(IFS=,; printf '%s' "${vision_peers[*]}")" --encoder-plan-hash "$encoder_hash" --encoder-revision "$revision")
     if [[ "$family" == glm5_flash ]]; then
+      # Internal plan-derived physical identities, never a user configuration key.
       family_args+=(--vision-peer-ranks "$(IFS=,; printf '%s' "${encoder_ranks[*]}")")
     fi
   fi

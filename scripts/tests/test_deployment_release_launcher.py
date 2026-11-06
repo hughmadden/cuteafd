@@ -148,6 +148,13 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 if "--split-device" in before["command"] and "--dspark" in before["command"]:
                     before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
             if entry["family"] == "glm5_flash":
+                if "--vision-peers" in before["command"]:
+                    endpoints = before["command"][before["command"].index("--vision-peers") + 1].split(",")
+                    # Historical endpoint lanes encode the physical rank, not expert-world order.
+                    physical = ",".join(str(int(peer.split(":")[0].rsplit(".", 1)[1]) - 1)
+                                        for peer in endpoints)
+                    position = before["command"].index("--encoder-revision") + 2
+                    before["command"][position:position] = ["--vision-peer-ranks", physical]
                 # The span is exactly the live rows (no old 16384 span).
                 position = before["command"].index("--console-secret-file")
                 before["command"][position:position] = ["--prefill-rows", str(unit), "--prefill-waves", str(waves),

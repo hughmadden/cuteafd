@@ -5168,12 +5168,12 @@ def test_expert_world_excludes_rank_two_media_worker(tmp_path, family):
     assert coordinator[coordinator.index("--peers") + 1] == "10.0.0.1:19441,10.0.0.2:19441"
 
 
-@pytest.mark.parametrize("vision_ranks", [(0,), (2,), (0, 2)])
+@pytest.mark.parametrize("vision_ranks", [(0,), (2,), (0, 2), (2, 0)])
 def test_glmf_expertless_vision_handoff_preserves_physical_ranks(tmp_path, vision_ranks):
     placement = {"kind": {"kind": "spark", "rank": vision_ranks[0]},
                  "replicas": list(vision_ranks[1:])}
     roles = [dict(rank=rank, experts=False, layers=[], encoder=placement,
-                  audio_encoder=None, drafter=None) for rank in vision_ranks]
+                  audio_encoder=None, drafter=None) for rank in sorted(vision_ranks)]
     result = _family_launch_result(tmp_path, GLMF_VISION, "test/model",
         "RTX_GPUS=1\nSPARK_COUNT=3\nSPECULATOR=off\nVISION=auto\nAUDIO=off\n",
         extra_args=("--wip", "tower-ranks"), execute_workers=True,
