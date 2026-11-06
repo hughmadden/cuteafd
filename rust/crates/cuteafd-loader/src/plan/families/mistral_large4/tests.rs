@@ -579,11 +579,12 @@ fn hqa_snapshot() -> tempfile::TempDir {
     let mut quant: serde_json::Value = crate::read_json_file(&root.join("quantize_config.json")).unwrap();
     let mut index: serde_json::Value = crate::read_json_file(&root.join("consolidated.safetensors.index.json")).unwrap();
     let mut compact = config.clone();
-    compact["transformers_weights"] = json!(COMPACT_INDEX);
+    compact["transformers_weights"] = json!("consolidated.compact-attention.safetensors.index.json");
     compact["quantization_config"]["per_module_metadata"] = json!(format!("{COMPACT_QUANT}:tensor_storage"));
     let mut compact_quant = quant.clone();
     compact_quant["per_module_metadata"] = json!(format!("{COMPACT_QUANT}:tensor_storage"));
-    for (name, value) in [(COMPACT_CONFIG, &compact), (COMPACT_INDEX, &index), (COMPACT_QUANT, &compact_quant)] {
+    for (name, value) in [(COMPACT_CONFIG, &compact), (COMPACT_INDEX, &index),
+        ("consolidated.compact-attention.safetensors.index.json", &index), (COMPACT_QUANT, &compact_quant)] {
         std::fs::write(root.join(name), value.to_string()).unwrap();
     }
     let restored: Vec<_> = testing::mistral_large4_tensors(Some(&[]), false).into_iter()
@@ -595,7 +596,9 @@ fn hqa_snapshot() -> tempfile::TempDir {
     let view = json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa", "views": {
         "hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
         "compact-attention":{"config":COMPACT_CONFIG, "index":COMPACT_INDEX, "quantize":COMPACT_QUANT}},
-        "native_modules":"quantize_config.json:native_attention"});
+        "native_modules":"quantize_config.json:native_attention",
+        "index_aliases":{"hqa":["consolidated.safetensors.index.json"],
+            "compact-attention":["consolidated.compact-attention.safetensors.index.json"]}});
     let mut native = serde_json::Map::new();
     for (name, _, shape) in restored.iter().filter(|(name, _, _)| name.ends_with(".weight")) {
         let stem = name.strip_suffix(".weight").unwrap();
@@ -610,12 +613,12 @@ fn hqa_snapshot() -> tempfile::TempDir {
                 "semantics":"checkpoint-native: original FP8 weight with its original per-block FP32 scale"}}));
     }
     for (name, _, _) in &restored { index["weight_map"][name] = json!(shard); }
-    config["transformers_weights"] = json!("model.safetensors.index.json");
+    config["transformers_weights"] = json!("consolidated.safetensors.index.json");
     config["quantization_config"]["attention_view"] = view.clone();
     quant["attention_view"] = view;
     quant["native_attention"] = json!(native);
     for (name, value) in [("config.json", &config), ("quantize_config.json", &quant),
-        ("model.safetensors.index.json", &index)] {
+        ("model.safetensors.index.json", &index), ("consolidated.safetensors.index.json", &index)] {
         std::fs::write(root.join(name), value.to_string()).unwrap();
     }
     dir
@@ -664,6 +667,38 @@ fn compact_hqa_view_loads_without_native_shards_and_preserves_parent_owners() {
     for (ranks, owners) in [(1, None), (2, None), (2, Some(owners.as_slice()))] {
         assert_eq!(crate::plan::layout::glm5::resident_owned(&checkpoint, ranks, cfg.layers, owners).unwrap(),
             crate::plan::layout::glm5::resident_owned(&parent, ranks, cfg.layers, owners).unwrap());
+    }
+}
+
+#[test]
+fn hqa_declared_index_aliases_preserve_canonical_selection_and_refuse_mismatch() {
+    use crate::plan::checkpoint::view::{AttentionMode, CheckpointView, InvalidIndexAlias, COMPACT_INDEX};
+    use serde_json::json;
+    let dir = hqa_snapshot();
+    for (mode, canonical, alias, native) in [
+        (AttentionMode::Hqa, "model.safetensors.index.json", "consolidated.safetensors.index.json", true),
+        (AttentionMode::Compact, COMPACT_INDEX, "consolidated.compact-attention.safetensors.index.json", false),
+    ] {
+        let view = CheckpointView::select(dir.path(), mode).unwrap();
+        assert_eq!(view.index_name(), canonical);
+        assert_eq!(view.config().unwrap()["transformers_weights"], alias);
+        let checkpoint = Checkpoint::open_view(&view).unwrap();
+        assert_eq!(checkpoint.contains_tensor("layers.0.attention.wq.weight"), native);
+        assert_eq!(checkpoint.contains_tensor("layers.0.attention.wq.trellis"), !native);
+
+        let path = dir.path().join(alias);
+        let mut changed: serde_json::Value = crate::read_json_file(&path).unwrap();
+        changed["metadata"] = json!({"alias_only":"not the canonical index identity"});
+        std::fs::write(&path, changed.to_string()).unwrap();
+        let alias_metadata = CheckpointView::select(dir.path(), mode).unwrap();
+        assert_eq!(view.fingerprint(), alias_metadata.fingerprint());
+        changed["weight_map"]["layers.0.attention.wq.weight"] = json!("wrong.safetensors");
+        std::fs::write(&path, changed.to_string()).unwrap();
+        let error = CheckpointView::select(dir.path(), mode).unwrap_err();
+        let error = error.downcast_ref::<InvalidIndexAlias>().expect("typed alias refusal");
+        assert_eq!(error.alias, alias);
+        assert_eq!(error.reason, "weight map differs from canonical index");
+        std::fs::copy(dir.path().join(canonical), &path).unwrap();
     }
 }
 
