@@ -624,10 +624,10 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
         let snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
         let capture = [
             (&["glm53-exl3-min.config", "glm53-exl3-max.config",
-              "glm53-exlr8-min.config", "glm53-exlr8-max.config",
-              "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config",
+              "glm53-exlr8-min.config", "glm53-exlr8-max.config"][..], "capture_glm_real_planner_launch"),
+            (&["glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config",
               "glm53-flash-exl3-min.config", "glm53-flash-exl3-max.config",
-              "glm53-flash-exlr8-k4-min.config", "glm53-flash-exlr8-k4-max.config"][..], "capture_glm_real_planner_launch"),
+              "glm53-flash-exlr8-k4-min.config", "glm53-flash-exlr8-k4-max.config"][..], "capture_glm_flash_real_planner_launch"),
             (&["qwen35-9b-bf16-min.config", "qwen38-27b-bf16-min.config",
               "qwen38-27b-fp8-min.config"][..], "capture_qwen_real_planner_launch"),
             (&["mimo-v26-flash-mxfp4-min.config", "mimo-v26-flash-mxfp4-max.config",
