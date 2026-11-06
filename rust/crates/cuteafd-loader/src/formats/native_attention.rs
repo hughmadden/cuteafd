@@ -24,5 +24,5 @@ impl NativeLayout {
 
 /// FP8-compact is a conversion of native BF16, never a requantization of native FP8.
 #[derive(Debug, thiserror::Error)]
-#[error("{tensor}: fp8-compact attention requires native BF16, found {found}")]
+#[error("{tensor}: HQA attention is already FP8; --fp8-compact-attention applies only to BF16 HQA attention (found {found})")]
 pub struct UnsupportedFp8Conversion { pub tensor: String, pub found: String }
