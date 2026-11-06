@@ -561,6 +561,33 @@ getattr(importlib.import_module('test_run_family_dispatch'), sys.argv[2])(*map(P
         String::from_utf8_lossy(&output.stderr));
 }
 
+/// The successful min-card smoke's native package must keep the same local prefix.
+/// Called by the full-tier installed-example sweep, never an ignored/optional test.
+fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
+    snapshot: &std::path::Path, example: &std::path::Path, programs: &std::path::Path) {
+    let manifest = root.join("rust/crates/cuteafd-loader/tests/fixtures/mimo-flash-min-native-manifest.json");
+    assert!(manifest.is_file(), "required MiMo native manifest fixture missing: {}", manifest.display());
+    let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+        .arg(snapshot).args(["--deployment", "--config"]).arg(example)
+        .args(["--rtx", "1", "--spark-ranks", "2", "--pool-tokens", "0", "--native-mtp-layers", "0",
+            "--speculator", "dflash2", "--vision", "auto", "--audio", "auto", "--workspace-manifest"])
+        .arg(programs).arg("--mimo-expert-manifest").arg(manifest)
+        .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+    assert!(output.status.success(), "MiMo min installed native plan: {}", String::from_utf8_lossy(&output.stderr));
+    let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(deployment["report"]["fits"], true, "{deployment}");
+    assert_eq!(deployment["report"]["onboard_layers"], 15, "measured min-card local prefix must not drift");
+    assert_eq!(deployment["memory_layout"]["pool_tokens"], 2_097_152);
+    assert_eq!(deployment["prefill_unit_rows"], 2752);
+    assert_eq!(deployment["prefill_waves"], 3);
+    let lead = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
+        .find(|device| device["kind"] == "rtx" && device["index"] == 0).unwrap();
+    let admitted = lead["items"].as_array().unwrap().iter()
+        .map(|item| item["bytes"].as_u64().unwrap()).sum::<u64>();
+    assert!(admitted >= 95_762_907_136, "admission must cover measured corrected peak");
+    assert!(admitted <= lead["capacity_bytes"].as_u64().unwrap());
+}
+
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
     root: &std::path::Path) {
@@ -598,6 +625,9 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
         ].into_iter().find_map(|(names, capture)| names.contains(&name).then_some(capture));
         if let Some(capture) = capture {
             installed_real_planner_launch(root, capture, &snapshot, &example, &programs, &hf_home);
+        }
+        if name == "mimo-v26-flash-mxfp4-min.config" {
+            installed_mimo_min_onboarding_matches_smoke(root, &snapshot, &example, &programs);
         }
         if name.starts_with("kimi-k3-") {
             let temporary = tempfile::tempdir().unwrap();

@@ -356,7 +356,8 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
         assert_eq!(report.host_budget_bytes, expected << 30);
         assert_eq!(host.host_budget_bytes, report.host_budget_bytes);
         assert!(host.items.iter().all(|i| i.lifetime == ItemLifetime::PostReadyReserve));
-        for owner in ["mimo/owner-0/prefill.ordered-tables", "scoring/full-logits"] {
+        // This directly exercises the legacy ledger, not MiMo's Recipe route.
+        for owner in ["staging/tables-and-sync", "scoring/full-logits"] {
             assert!(host.items.iter().any(|i| i.group == owner && i.bytes > 0), "{owner}");
         }
         assert!(host.host_budget_bytes + host.deferred_bytes + host.reserve_bytes <= host.total_bytes);
@@ -1182,14 +1183,15 @@ fn real_layout_charges_host_and_names_unsupported_snapshot_geometry() {
         host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
     }), ..sparks(4) };
     let report = plan(dir.path(), &options).unwrap();
-    assert!(report.spec.is_some() && report.host_ledger.is_some());
+    assert!(report.spec.is_some() && report.host_ledger.is_none());
     assert!(!report.fits && !report.placement_supported);
-    assert!(report.hints.iter().any(|h| h.what.contains("mimo_v2 host prefix cache unsupported")
-        && h.what.contains("auto bytes") && h.what.contains("context 0")), "{}", render(&report));
+    assert!(report.hints.iter().any(|h| h.what.contains("MiMo placement")
+        && h.what.contains("max_position_embeddings")), "{}", render(&report));
     options.layout.as_mut().unwrap().host_cache_bytes = Some(1234567);
     let explicit = plan(dir.path(), &options).unwrap();
-    assert_eq!(explicit.host_budget_bytes, 1234567);
-    assert_eq!(explicit.host_ledger.as_ref().unwrap().host_budget_bytes, 1234567);
+    assert!(!explicit.fits && explicit.host_ledger.is_none());
+    assert_eq!(explicit.hints[0].what, report.hints[0].what,
+        "an explicit host quota must not replace the first context refusal");
 }
 
 #[test]
