@@ -169,6 +169,7 @@ impl CheckpointView {
             config.get("quantization_config").unwrap_or(&Value::Null),
             quantize_config.as_deref().unwrap_or(&Value::Null))?.map(Arc::new);
         if let Some(contract) = &attention {
+            if mode == AttentionMode::Fp8Compact { contract.check_fp8_conversion()?; }
             contract.check_selection(config_name, &index_name, &quant_names, weight_map.as_deref())?;
         }
         Ok(Self { snapshot: snapshot.into(), mode, config_name: config_name.into(), index_name,
