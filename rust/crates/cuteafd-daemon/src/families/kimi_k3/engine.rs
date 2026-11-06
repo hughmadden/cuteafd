@@ -17,6 +17,7 @@ struct Lanes<'a> {
 
 pub(crate) struct Engine<'a> {
     pub max_pool_tokens_no_onboard: Option<u64>,
+    pub host_prefix: Option<cuteafd_hostcache::config::Config>,
     draft: Option<Rc<super::draft::NativeDraft<'a>>>,
     draft_probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a,
         crate::shared::draft::probe::RoundProbe<'a>>>>,
@@ -258,6 +259,7 @@ impl<'a> Engine<'a> {
         let mut engine = Self::bind(exchange_streams.into(), plan, peer, hops,
             local, routed, io, experts, prefill, coordinator_packing_cap)?;
         engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
+        engine.host_prefix = admission.host_prefix.take();
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)
@@ -289,7 +291,7 @@ impl<'a> Engine<'a> {
         let streams = local.iter().map(|ranks| ranks.iter().map(|local| local.stream().clone()).collect()).collect();
         let execution = Execution::new(plan, peer.as_ref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
-        Ok(Self { max_pool_tokens_no_onboard: None, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+        Ok(Self { host_prefix: None, max_pool_tokens_no_onboard: None, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
             hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
     }

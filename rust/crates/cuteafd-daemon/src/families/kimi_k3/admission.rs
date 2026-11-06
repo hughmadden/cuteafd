@@ -72,6 +72,7 @@ pub(crate) struct Inputs<'a, const RANKS: usize = 2> {
     pub draft: Option<MlaDraftRuntimeLayout>,
     /// Exact speculative verify widths with startup graphs: the drafter's block, else 0.
     pub verify_rows: usize,
+    pub prefix: Option<&'a crate::shared::prefix::PrefixArgs>,
 }
 
 /// CPU-planned native residency; no backend owner allocates before solve.
@@ -108,6 +109,7 @@ pub(crate) fn plan_rtx_for_ranks(cfg: &KimiK3Config, catalog: &cuteafd_loader::O
 
 pub(crate) struct Admission<'a> {
     pub placement: Placement,
+    pub host_prefix: Option<cuteafd_hostcache::config::Config>,
     pub mark_selection: MarkSelection,
     pub graph_set: Option<cuteafd_loader::placement::inventory::StartupGraphs<super::graphs::Key>>,
     cfg: KimiK3Config,
@@ -622,9 +624,6 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let lane_layouts = inputs.lane_layouts.iter().map(|pair| pair.to_vec()).collect::<Vec<_>>();
     let state_slots = inputs.state_slots;
     let legacy_marks = inputs.prefix_marks;
-    let one_mark = KdaLayout::for_ranks(cfg, state_slots, 1, inputs.lanes, RANKS)?;
-    let mut mark_demands = (0..RANKS).map(|rank| one_mark.demands(rank as u8).map(|demands| demands[2].clone()))
-        .collect::<Result<Vec<_>>>()?;
     let global_layouts = GlobalLayout::ranks_with_core(cfg, &core, devices.len())?;
     let io_layouts = (0..devices.len()).map(|rank| IoLayout::for_ranks(cfg, rank, inputs.rows, &core, devices.len()))
         .collect::<Result<Vec<_>>>()?;
@@ -636,6 +635,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let graph_slots = inputs.state_slots;
     let graph_verify = inputs.verify_rows;
     let context = inputs.context.clone();
+    let prefix_args = inputs.prefix;
     let mut request = request(inputs)?;
     if let Some(layout) = &draft {
         let demand = Demand::new((RANKS - 1) as u8, Category::Prefix, DRAFT_MARKS, layout.window_mark_bytes()? as u64, Basis::Exact);
@@ -643,7 +643,6 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             let mut total = demand.clone();
             total.bytes = total.bytes.checked_mul(legacy_marks as u64).context("Kimi draft window marks overflow")?;
             request.fixed.push(total);
-            mark_demands.push(demand);
         }
     }
     if let Some(inventory) = &rtx {
@@ -702,7 +701,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             }
         }
     }
-    let spark = spark_budget.iter().flat_map(|budget| (0..budget.resident.len()).flat_map(|rank|
+    let spark = spark_budget.iter().flat_map(|budget| (0..budget.resident.len()).flat_map(move |rank|
         counts.iter().map(move |&count| SparkOwner { count, rank,
             experts: budget.resident[rank][count..].iter().sum(), overhead: budget.overhead[rank] }))).collect();
     let mut fixed = request.fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
@@ -750,11 +749,33 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         recipe.fixed.push(owner);
     }
     ensure!(request.pool_bounded.is_empty(), "Kimi has no pool-bounded native owners");
-    let cards = request.inventory.gpus.iter().map(|gpu| (gpu.capacity_bytes, gpu.capacity_bytes)).collect::<Vec<_>>();
+    let cards = request.inventory.gpus.iter().map(|gpu| (gpu.capacity_bytes,
+        cuteafd_ffi::coordinator_gpu_budget().map_or(gpu.capacity_bytes, |limit| limit.0.min(gpu.capacity_bytes))))
+        .collect::<Vec<_>>();
     let sparks = spark_budget.as_ref().map_or_else(Vec::new, |budget| vec![budget.budget; budget.resident.len()]);
     let mut budgets = kimi::budgets(&cards, request.inventory.gpus[0].headroom_bytes, &vec![0; RANKS], &sparks)?;
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-    recipe.owners.push(kimi::host_prefix_owner(0, maximum_pages));
+    let resident = modes.iter().enumerate().fold(vec![0usize; RANKS], |mut resident, (layer, mode)| {
+        if cfg.attention[layer] == KimiAttention::Mla {
+            for rank in 0..RANKS {
+                if !matches!(mode, LayerMode::Whole { gpu, .. } if usize::from(*gpu) != rank) { resident[rank] += 1; }
+            }
+        }
+        resident
+    });
+    let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, cache_format)?;
+    let page_bytes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>()
+        / if placement_mode == AttentionPlacement::Context { 2 } else { 1 };
+    let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>()
+        + draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose()?.unwrap_or(0) as u64;
+    let host_prefix = prefix_args.map(|args| args.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
+        page_rows: MLA_PAGE_ROWS, pages: 0, page_bytes: usize::try_from(page_bytes)?,
+        mark_bytes: usize::try_from(mark_bytes)?, draft_bytes: 0, rule: super::mla::PREFIX_REUSE,
+        mark_store: cuteafd_engine::prefix::MarkStore::Arena,
+        page_owners: if placement_mode == AttentionPlacement::Context { cuteafd_engine::prefix::PageOwners::Parity }
+            else { Default::default() },
+    }, usize::try_from(request.pool.compiled_context)?, graph_slots)).transpose()?.flatten();
+    recipe.owners.push(kimi::host_prefix_owner(host_prefix.as_ref().map_or(0, |config| config.bytes), maximum_pages));
     budgets.push(kimi::host_budget(host_total, host_available));
     let admitted = recipe.admit(kimi::request(request.pool.compiled_context, request.pool.requested, request.onboard,
         recipe.prefill, contract::Operation::Serving, request.resident_weight_limit.unwrap_or(ResidentWeights::DEFAULT_LIMIT),
@@ -794,7 +815,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let lane_readers = vec![vec![Weak::new(); devices.len()]; lane_layouts.len()];
     let mla_layouts = (0..devices.len()).map(|rank| CacheLayout::for_ranks(cfg, &placement, rank, cache_format, devices.len()))
         .collect::<Result<Vec<_>>>()?;
-    let admission = Admission { placement, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
+    let admission = Admission { placement, host_prefix, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
         devices: devices.to_vec(), lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: vec![false; devices.len()], kda_owners: vec![Weak::new(); devices.len()],
         mla_layouts, mla_allocated: vec![false; devices.len()], mla_owners: vec![Weak::new(); devices.len()],
@@ -1162,7 +1183,7 @@ pub(super) mod tests {
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 2048, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }, RANKS).unwrap()); 2],
             fixed: (0..RANKS).map(|rank| Demand::new(rank as u8, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
-            startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None, draft: None, verify_rows: 0 }
+            startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None, draft: None, verify_rows: 0, prefix: None }
     }
 
     fn context_layout(format: cuteafd_core::MlaCacheFormat) -> Result<cuteafd_loader::families::kimi_k3::context::ContextLayout> {

@@ -111,7 +111,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
         max_context: args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
-        ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
+        ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0, prefix: Some(&args.prefix),
     })
 }
 

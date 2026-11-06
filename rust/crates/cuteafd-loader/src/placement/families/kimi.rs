@@ -303,7 +303,7 @@ impl KimiRecipe {
             return Err(invalid("resolved onboarding is not the declared ordered prefix"));
         }
         let arena = self.arenas.iter().find(|arena| arena.count == count).expect("checked above");
-        if arena.peak.len() != self.gpus || arena.weights.len() != self.gpus {
+        if arena.peak.len() != self.gpus || arena.resident.len() != self.gpus || arena.weights.len() != self.gpus {
             return Err(invalid("arena rank geometry differs from the coordinator count"));
         }
         let whole = assignments.iter().any(|a| matches!(a.experts, ExpertHome::RtxWhole { .. }));
@@ -500,7 +500,7 @@ impl Recipe for KimiRecipe {
             contract.components.push(Component::allocation(owner,
                 ByteCurve::fixed(fixed.bytes, self.maximum_pages), false, self.maximum_pages));
         }
-        for (layer, &mode) in modes.iter().enumerate() {
+        for layer in 0..modes.len() {
             let domain = match &contract.variables[layer] {
                 Variable::Attention { values, .. } => values.clone(), _ => unreachable!(),
             };
@@ -549,7 +549,7 @@ impl Recipe for KimiRecipe {
         }
         for arena in &self.arenas {
             let choice = option(arena.count)?;
-            if arena.peak.len() != self.gpus || arena.weights.len() != self.gpus {
+            if arena.peak.len() != self.gpus || arena.resident.len() != self.gpus || arena.weights.len() != self.gpus {
                 return Err(invalid("arena rank geometry differs from the coordinator count"));
             }
             let group = match arena.count {

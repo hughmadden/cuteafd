@@ -23,6 +23,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     let shape = prefill.units();
     let admitted = shape;
+    report.prefill_reserve_rows = Some(prefill.span_rows);
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
@@ -376,7 +377,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
     let ceiling = target_pool.max(requested_pool.unwrap_or(0));
     let maximum_pages = ceiling.div_ceil(page_rows);
-    let draft_window_bytes = draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose().unwrap_or(None).unwrap_or(0) as u64;
+    let draft_window_bytes = match draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose() {
+        Ok(bytes) => bytes.unwrap_or(0) as u64,
+        Err(error) => {
+            report.refuse_placement(format!("Kimi draft window inventory refused: {error:#}"),
+                "Supply a supported native drafter window layout.");
+            return memory;
+        }
+    };
     let draft = match &draft {
         Some(layout) => match kimi::draft_facts(layout, page_rows, maximum_pages, head_rank as u8) {
             Ok(value) => Some(value),
@@ -430,9 +438,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let cache = crate::plan::FamilyModel::cache_geometry(model, crate::serving_capacity::CacheOptions {
             coordinator_ranks: gpus, attention_placement: Some(attention), mla_kv: opts.mla_kv, ..Default::default()
         })?.context("Kimi host cache geometry")?;
-        let page_bytes = if attention == AttentionPlacement::Heads && gpus == 2 {
-            cache.ranks[0].persistent_unit_bytes
-        } else { cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum() };
+        let page_bytes = cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>()
+            / if context_split { 2 } else { 1 };
         let mark_bytes = cache.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>()
             + draft_window_bytes;
         let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE,
