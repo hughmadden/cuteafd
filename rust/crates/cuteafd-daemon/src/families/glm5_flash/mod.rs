@@ -1788,7 +1788,8 @@ impl Opened {
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet,
             Option<cuteafd_hostcache::config::Config>,
             Option<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad>,
-            Option<cuteafd_loader::push_load::PushHostEnvelope>)> {
+            Option<cuteafd_loader::push_load::PushHostEnvelope>,
+            Option<cuteafd_loader::shared::dense_read::MountLoad>)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
         use cuteafd_loader::serving_capacity::{glmf_core_step_scratch, glmf_table_pages,
@@ -1974,6 +1975,9 @@ impl Opened {
             self.experts.as_ref(),
             native_admission.map(|native| (&native.facts, &native.metadata)))?;
         process.draft_push = self.draft_push(args)?;
+        if native_admission.is_none() && process.push_host.is_none() {
+            process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);
+        }
         let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
         admitted.validate_spark_topology(spark_ranks)?;
         tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
@@ -1998,7 +2002,7 @@ impl Opened {
             "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
         }), "GLM Flash startup plan");
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
-        Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host))
+        Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host, admitted.mount_load))
     }
 
     /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
@@ -2206,8 +2210,9 @@ impl Opened {
             cuteafd_loader::plan::families::glm::GLM5_FLASH.exlr8_execution()
                 .check(1 + usize::from(split_device.is_some()), false)?;
         }
-        let (placement, admitted_graphs, working, admitted_host, admitted_native_load, admitted_push_host) = self.admit(args, &programs, layers, index_cache, mark_slots,
+        let (placement, admitted_graphs, working, admitted_host, admitted_native_load, admitted_push_host, admitted_mount_load) = self.admit(args, &programs, layers, index_cache, mark_slots,
             split_device, automatic_context, remote_draft, attention, native_admission.as_ref())?;
+        if let Some(receipt) = admitted_mount_load { loader.dense.admit_mount(receipt)?; }
         let media = prepare_media()?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
         if native_admission.is_some() {

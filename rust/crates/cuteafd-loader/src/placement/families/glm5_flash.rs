@@ -648,6 +648,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mount_load_adds_only_host_load_owners_without_changing_device_plan() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for ranks in [1, 2] {
+            let input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            let before = contract(&input).unwrap();
+            let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            let receipt = crate::shared::dense_read::MountLoad { pinned_source: 32 << 20,
+                full_row_cache: 64 << 20, pinned_tables: 1 << 20 };
+            process.mount_load = Some(receipt);
+            let after = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
+            assert_eq!(before.solved.decisions, after.solved.decisions);
+            assert_eq!(before.solved.pool_tokens, after.solved.pool_tokens);
+            assert_eq!(before.placement.items, after.placement.items);
+            let existing = after.solved.facts.allocations.iter()
+                .filter(|owner| !owner.id.starts_with("glmf.load.mount.")).cloned().collect::<Vec<_>>();
+            assert_eq!(before.solved.facts.allocations, existing);
+            assert_eq!(after.mount_load, Some(receipt));
+            let added = after.solved.facts.allocations.iter()
+                .filter(|owner| owner.id.starts_with("glmf.load.mount.")).collect::<Vec<_>>();
+            assert_eq!(added.iter().map(|owner| owner.bytes).sum::<u64>(), 97 << 20);
+            assert!(added.iter().all(|owner| owner.lifetime.last == planner::Phase::Load));
+        }
+    }
+
+    #[test]
     fn contract_graph_bound_covers_exact_selected_shapes_without_pool_walk() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         for context in [2048, 2051, 4096, 65_536, 131_072, 262_144, 1_048_576] {

@@ -10,6 +10,7 @@ pub struct ProcessOwners {
     pub allocations: Vec<p::Allocation>,
     pub links: Vec<PreparedSparkLink>,
     pub native_load: Option<NativeLoad>,
+    pub mount_load: Option<crate::shared::dense_read::MountLoad>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
     pub auto_vision: bool,
     pub media_cache_bytes: u64,
@@ -178,7 +179,7 @@ impl NativeLoad {
 
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
-        Self { host, host_headroom, allocations: vec![], links: vec![], native_load: None,
+        Self { host, host_headroom, allocations: vec![], links: vec![], native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
             draft_push: None }
     }
@@ -229,6 +230,15 @@ pub fn host_geometry(i: &GlmfInputs<'_>) -> Result<cuteafd_core::prefix::HostCac
             * if i.attention.mode == AttentionPlacement::Context { 2 } else { 1 }
             + rank.glmf_pool_mark_backing_unit_bytes(i.pool_marks)).sum(),
         mark_bytes: geometry.ranks.iter().map(|rank| rank.retained_mark_bytes).sum(), draft_bytes: 0 })
+}
+
+/// One reused legacy dense reader; routed experts have independent owners.
+pub fn mount_load(checkpoint: &crate::plan::Checkpoint, ranks: usize)
+    -> anyhow::Result<crate::shared::dense_read::MountLoad> {
+    anyhow::ensure!((1..=2).contains(&ranks), "Flash mount rank count");
+    crate::shared::dense_read::MountLoad::from_headers(checkpoint.tensors.iter()
+        .filter(|tensor| !tensor.meta.name.contains(".experts."))
+        .map(|tensor| &tensor.meta), ranks)
 }
 
 /// Header-only estimate shared by offline planning and live startup. Exact
@@ -313,6 +323,7 @@ pub struct PreparedGlmf<'a> {
     arena: Vec<Vec<u64>>,
     sms: usize,
     native_load: Option<NativeLoad>,
+    mount_load: Option<crate::shared::dense_read::MountLoad>,
     push_host: Option<crate::push_load::PushHostEnvelope>,
     encoders: Vec<crate::plan::encoder::EncoderPlacement>,
 }
@@ -325,6 +336,7 @@ pub struct AdmittedGlmf {
     /// Unused estimate-minus-selected bytes; selection is never rerun to reclaim them.
     pub graph_slack: Vec<u64>,
     pub native_load: Option<NativeLoad>,
+    pub mount_load: Option<crate::shared::dense_read::MountLoad>,
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
     pub encoder: Option<crate::plan::encoder::EncoderPlacement>,
 }
@@ -592,7 +604,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 source: "Spark worker physical capacity; worker owners supplied by caller".into(), assumed: true } });
     }
     for owner in process.allocations.iter().cloned().chain(process.native_load.iter()
-        .flat_map(|load| load.allocations(process.push_host.is_some()))) {
+        .flat_map(|load| load.allocations(process.push_host.is_some())))
+        .chain(process.mount_load.iter().flat_map(|load| load.allocations("glmf.load.mount"))) {
         let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
         contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
     }
@@ -756,7 +769,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         resident_weight_limit: i.resident_weight_limit,
         spark_reply_formats: contract.spark_reply_formats.unwrap_or_default() };
     Ok(PreparedGlmf { started: std::time::Instant::now(), input: i, recipe: GlmfRecipe { contract }, budgets, request, counts, arena, sms,
-        native_load: process.native_load, push_host: process.push_host, encoders: process.encoders })
+        native_load: process.native_load, mount_load: process.mount_load, push_host: process.push_host, encoders: process.encoders })
 }
 
 fn hop_spec(i: &GlmfInputs<'_>) -> HopSpec {
@@ -825,7 +838,7 @@ impl PreparedGlmf<'_> {
         let encoder = solved.decisions.encoder.map(|index| self.encoders[index].clone());
         tracing::debug!(target: "cuteafd::planner", complete_solve_us = self.started.elapsed().as_micros() as u64,
             graph_slack = ?graph_slack, "Flash recipe preparation, search and exact reconciliation completed");
-        Ok(AdmittedGlmf { placement, graphs, working, solved, graph_slack, native_load: self.native_load, push_host: self.push_host, encoder })
+        Ok(AdmittedGlmf { placement, graphs, working, solved, graph_slack, native_load: self.native_load, mount_load: self.mount_load, push_host: self.push_host, encoder })
     }
 }
 
