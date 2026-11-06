@@ -8,7 +8,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::{verify_dspark_greedy_vocab, DraftCandidate, DraftPolicy, LayerResource, PolicyGeometry,
     PolicySeed, ResourceClass};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::{families::{glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation},
+use cuteafd_loader::{families::{glm5::draft_representation::GlmDraftRepresentation,
     qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint};
 use std::time::{Duration, Instant};
 
@@ -138,13 +138,9 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
         .context("dense draft context size overflow")?;
     ensure!(required <= cfg.max_context, "spec decode exceeds target checkpoint context");
     let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-    // Full checkpoint context is charged before target pool selection; no
-    // diagnostic-sized truncation is allowed to masquerade as serving admission.
-    let residency = block_dspark_paged_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
-        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context,
-        cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+    let demand = DrafterBytes::block_dspark(snapshot, &config, 1, library.sm_count()? as u64, cfg.max_context)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DrafterBytes { owned: residency.owned, weights: residency.weights, scratch: residency.scratch, ..Default::default() }), 1, None, args.kv_cache, false)?;
+        Some(demand), 1, None, args.kv_cache, false, None, args.verify_check)?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
     let plain = (|| -> Result<(Vec<u32>, Duration, Vec<(f32, Vec<u32>)>)> {
@@ -166,16 +162,10 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // than reconstructing the recurrent state or reusing a stale mark.
     drop(engine);
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DrafterBytes { owned: residency.owned, weights: residency.weights, scratch: residency.scratch, ..Default::default() }), 1, None, args.kv_cache, false)?;
+        Some(demand), 1, None, args.kv_cache, false, None, args.verify_check)?;
     let stream = engine.target_stream().raw;
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
-    let drafter = crate::shared::experts::rtx::push::load_alone(snapshot, &[engine.target_stream().device], || {
-        let tensors = if crate::shared::experts::rtx::dense::is_recording() { Default::default() }
-            else { block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))?? };
-        DsparkDrafter::load_admitted(library, programs, snapshot, tensors,
-            stream, 1, 1, mask, GlmDraftRepresentation::Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
-            cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
-    })?;
+    let drafter = load_drafter(&engine, programs, snapshot, 1, mask)?;
     drafter.prepare_workspace()?;
     let mut last = vec![];
     let mut position = 0;
@@ -323,13 +313,9 @@ mod tests {
         let programs = library.programs()?.with_manifest(&manifest)?;
         let config = serde_json::from_slice(&std::fs::read(draft.join("config.json"))?)?;
         let pool_tokens = cfg.max_context.max(16384).next_multiple_of(64);
-        let residency = block_dspark_paged_resident_bytes(&config, 2, 2, library.sm_count()? as u64,
-            GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context,
-            pool_tokens, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+        let demand = DrafterBytes::block_dspark(&draft, &config, 2, library.sm_count()? as u64, cfg.max_context)?;
         let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(), Some(pool_tokens as u64),
-            Some(DrafterBytes { owned: residency.owned, weights: residency.weights,
-                scratch: residency.scratch, ..Default::default() }), 2, None,
-            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, false)?;
+            Some(demand), 2, None, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, false, None, false)?;
         let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
         let drafter = load_drafter(&engine, &programs, &draft, 2, mask)?;
         drafter.prepare_workspace()?;

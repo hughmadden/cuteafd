@@ -543,6 +543,24 @@ fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
         &root);
 }
 
+/// Drive one shipped config through the real launcher and the real planner;
+/// only hardware and payload execution are stubbed.
+fn installed_real_planner_launch(root: &std::path::Path, capture: &str, snapshot: &std::path::Path,
+    example: &std::path::Path, programs: &std::path::Path, hf_home: &std::path::Path) {
+    let temporary = tempfile::tempdir().unwrap();
+    let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
+        .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
+    let output = Command::new(interpreter).args(["-I", "-c", r#"
+import importlib, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+getattr(importlib.import_module('test_run_family_dispatch'), sys.argv[2])(*map(Path, sys.argv[3:]))
+"#]).arg(root).arg(capture).arg(snapshot).arg(example).arg(env!("CARGO_BIN_EXE_cuteafd"))
+        .arg(programs).arg(hf_home).arg(temporary.path()).output().unwrap();
+    assert!(output.status.success(), "{} real launcher: {}", example.display(),
+        String::from_utf8_lossy(&output.stderr));
+}
+
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
     root: &std::path::Path) {
@@ -570,20 +588,14 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
         let name = example.file_name().unwrap().to_str().unwrap();
         let revision = config.get("MODEL_REVISION").copied();
         let snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
-        if ["glm53-exl3-min.config", "glm53-exl3-max.config",
-            "glm53-exlr8-min.config", "glm53-exlr8-max.config"].contains(&name) {
-            let temporary = tempfile::tempdir().unwrap();
-            let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
-                .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");
-            let output = Command::new(interpreter).args(["-I", "-c", r#"
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
-from test_run_family_dispatch import capture_glm_real_planner_launch
-capture_glm_real_planner_launch(*map(Path, sys.argv[2:]))
-"#]).arg(root).arg(&snapshot).arg(&example).arg(env!("CARGO_BIN_EXE_cuteafd"))
-                .arg(&programs).arg(&hf_home).arg(temporary.path()).output().unwrap();
-            assert!(output.status.success(), "{name} real launcher: {}", String::from_utf8_lossy(&output.stderr));
+        let capture = [
+            (&["glm53-exl3-min.config", "glm53-exl3-max.config",
+              "glm53-exlr8-min.config", "glm53-exlr8-max.config"][..], "capture_glm_real_planner_launch"),
+            (&["qwen35-9b-bf16-min.config", "qwen38-27b-bf16-min.config",
+              "qwen38-27b-fp8-min.config"][..], "capture_qwen_real_planner_launch"),
+        ].into_iter().find_map(|(names, capture)| names.contains(&name).then_some(capture));
+        if let Some(capture) = capture {
+            installed_real_planner_launch(root, capture, &snapshot, &example, &programs, &hf_home);
         }
         if name.starts_with("kimi-k3-") {
             let temporary = tempfile::tempdir().unwrap();

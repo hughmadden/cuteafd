@@ -1174,6 +1174,50 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
             context_items = [item for item in device["items"] if item["group"].startswith("context ")]
             assert bool(context_items) == (gpus == 2)
 
+def capture_qwen_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                     programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Exercise a shipped dense Qwen config -> real launcher argv -> real CPU Recipe admission."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    # The launcher resolves the default dSpark drafter from HF_HOME, which the
+    # sandbox replaces with a stub hub; link the installed snapshot into it so
+    # the real plan reads the actual drafter metadata.
+    if config.get("SPECULATOR") == "dspark":
+        name = config.get("SPECULATOR_MODEL_ID", "RadixArk/Qwen3.8-27B-DSpark")
+        revision = config.get("SPECULATOR_MODEL_REVISION") or "85ef153be924f17ce4bf62726954eeaa4a73e854"
+        installed = hf_home / "hub" / f"models--{name.replace('/', '--')}" / "snapshots" / revision
+        staged = temporary / "hf" / "hub" / f"models--{name.replace('/', '--')}" / "snapshots" / revision
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.symlink_to(installed)
+    # Fake only hardware and execution. The planner reads the actual snapshot
+    # and exporter metadata, not a canned deployment response.
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/qwen-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    deployment = json.loads(output.read_text())
+    assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
+    # The automatic pool still holds the checkpoint's selected context, and KV
+    # pages keep the planner's page geometry.
+    assert deployment["memory_layout"]["pool_tokens"] >= 262144, deployment
+    assert deployment["memory_layout"]["pool_tokens"] % 64 == 0, deployment
+    assert deployment["prefill_unit_rows"] == 4096 and deployment["prefill_waves"] == 1, deployment
+    assert deployment["spark_ranks"] == 0 and deployment["rtx_gpus"] == 1, deployment
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if "cuteafd plan " in line and "--deployment" in line]
+    assert len(plans) == 1, result.stderr
+    assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    assert "prefill reserve does not fit" not in result.stderr
+
+
 def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
     """Inspect actual launcher validation for declared native coordinator worlds."""
     deployment = json.loads(deployment_path.read_text())

@@ -1,0 +1,312 @@
+use super::*;
+use crate::families::qwen3_5::tests::native_planner_fixture;
+use crate::plan::checkpoint::Checkpoint;
+use crate::placement::planner::{self, Operation, Pin, Request};
+use crate::placement::ResidentWeights;
+
+fn fixture() -> (Qwen35Config, NativeWeights, NativeBuffers) {
+    let (dir, _, buffers, _) = native_planner_fixture();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let weights = NativeWeights::native(&checkpoint, &cfg, cuteafd_core::DType::F32).unwrap();
+    (cfg, weights, buffers)
+}
+
+fn budgets() -> Vec<Budget> {
+    forecast_budgets(&crate::placement::ARCH_CONTEXTS[1], 96 << 30, 0,
+        (128 << 30, 128 << 30)).unwrap()
+}
+
+fn request() -> Request {
+    Request { context: 262144, pool: Pin::Auto, onboard: Pin::Auto, prefill: Pin::Auto,
+        operation: Operation::Serving, resident_weight_limit: None,
+        spark_reply_formats: Default::default() }
+}
+
+fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers)
+    -> DenseFacts<'a> {
+    DenseFacts { cfg, weights, buffers, slots: 4, record_bytes: 4096, drafter: None, serving: None,
+        host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
+}
+
+#[test]
+fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
+    let (cfg, weights, buffers) = fixture();
+    let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers)).unwrap();
+    assert_eq!(plan.pool_tokens, 2 << 20);
+    assert_eq!(plan.pool_tokens % PAGE_ROWS, 0);
+    assert_eq!(plan.decisions.embedding, Some(planner::EmbeddingHome::Device(0)));
+    assert!(plan.decisions.onboard_layers.iter().all(Vec::is_empty));
+    assert!(plan.decisions.expert_homes.is_empty());
+    assert_eq!(plan.decisions.prefill, PrefillShape { rows: PREFILL_ROWS as u64, waves: 1 });
+    assert_eq!(plan.decisions.lanes, 1);
+    // The admitted plan's owners are exactly the physical declarations at the
+    // admitted page count, not a second estimate.
+    let declared = facts(&cfg, &weights, &buffers).owner_templates(plan.pool_tokens / PAGE_ROWS).unwrap();
+    let map = |facts: &Facts| {
+        facts.allocations.iter().map(|a| (a.id.clone(), (a.bytes, a.shape.clone(), a.view.clone(), a.lifetime)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let left = map(&plan.facts);
+    let right = map(&declared);
+    let staging = plan.facts.allowances.iter().find(|allowance|
+        allowance.location == Location::PINNED).unwrap();
+    assert_eq!(staging.bytes, 128 << 10);
+    assert!(staging.bytes >= 108_000 && staging.assumed);
+    assert_eq!(staging.lifetime, Lifetime::TARGET);
+    assert!(staging.source.starts_with("estimated:"));
+    assert_eq!(left.len(), plan.facts.allocations.len(), "duplicate owner id");
+    assert_eq!(left.len(), right.len());
+    for id in left.keys().chain(right.keys()).collect::<std::collections::BTreeSet<_>>() {
+        assert_eq!(left.get(id), right.get(id), "{id}");
+    }
+    let residency = |facts: &Facts| facts.resident_weights.iter()
+        .map(|owner| (owner.id.clone(), owner.weights.0)).collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(residency(&plan.facts), residency(&declared));
+    let resident: u64 = weights.layers.iter().sum::<u64>()
+        + weights.norm + weights.head + weights.embedding;
+    assert_eq!(plan.facts.resident_weights.iter().map(|owner| owner.weights.0).sum::<u64>(), resident);
+    let pages = plan.pool_tokens / PAGE_ROWS;
+    let kv: u64 = plan.facts.allocations.iter()
+        .filter(|owner| owner.id.starts_with("kv.") && owner.view.is_none())
+        .map(|owner| owner.bytes).sum();
+    let full = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Full).count() as u64;
+    assert_eq!(kv, full * pages * PAGE_ROWS * 4096);
+    // No drafter: the only compiled extent is the 64-row page table itself.
+    let contract = facts(&cfg, &weights, &buffers).prepare(&plan.request).unwrap();
+    assert_eq!(contract.maximum_pages, u32::MAX as u64 / PAGE_ROWS);
+}
+
+#[test]
+fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
+    let (cfg, weights, buffers) = fixture();
+    let drafter = DrafterBytes { owned: 4096, weights: ResidentWeights(1024), scratch: 512, pool_unit: 4096, host_prefetch: 2_720_000_000 };
+    let mut input = facts(&cfg, &weights, &buffers);
+    input.drafter = Some(drafter);
+    let contract = input.prepare(&request()).unwrap();
+    assert_eq!(contract.maximum_pages, i32::MAX as u64 / PAGE_ROWS);
+    let plan = admit(request(), budgets(), input).unwrap();
+    let pages = plan.pool_tokens / PAGE_ROWS;
+    let owner = |id: &str| plan.facts.allocations.iter().find(|owner| owner.id == id).unwrap();
+    assert_eq!(owner("draft.kv").bytes, pages * 4096);
+    assert_eq!(plan.decisions.draft_home, Some(0));
+    assert_eq!(owner("draft.prefetch").bytes, 2_720_000_000);
+    assert_eq!(owner("draft.prefetch").location, Location::HOST);
+    assert_eq!(owner("draft.prefetch").lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad });
+    assert_eq!(owner("draft.weights").bytes, 1024);
+    assert_eq!(owner("draft.runtime").bytes, owned_rest());
+    assert_eq!(owner("draft.scratch").bytes, 512);
+    assert_eq!(owner("draft.kv").lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::Growth });
+    assert!(plan.facts.resident_weights.contains(&ResidentWeight { id: "draft.weights".into(),
+        location: Location::coordinator(0), weights: ResidentWeights(1024) }));
+    // Draft KV is a page-linear extent, so a smaller explicit pool pays for
+    // fewer pages rather than a fixed full-context reservation.
+    let mut smaller = request();
+    smaller.context = 4 * PAGE_ROWS;
+    smaller.pool = Pin::Exact(4 * PAGE_ROWS);
+    let small = admit(smaller, budgets(), input).unwrap();
+    assert_eq!(small.pool_tokens, 4 * PAGE_ROWS);
+    assert_eq!(small.facts.allocations.iter().find(|owner| owner.id == "draft.kv").unwrap().bytes,
+        4 * 4096);
+}
+
+fn owned_rest() -> u64 { 4096 - 1024 }
+
+#[test]
+fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
+    let (cfg, weights, buffers) = fixture();
+    let input = facts(&cfg, &weights, &buffers);
+    for (pool, expected) in [
+        (Pin::Exact(PAGE_ROWS), "below context"),
+        (Pin::Exact(3 * PAGE_ROWS + 1), "misaligned"),
+        (Pin::Exact((32 << 20) * PAGE_ROWS), "beyond memory"),
+    ] {
+        let mut ask = request();
+        ask.pool = pool;
+        let refusal = admit(ask, budgets(), input).unwrap_err();
+        match expected {
+            "below context" => assert!(matches!(&refusal, Refusal::PoolBelowContext { .. }), "{refusal}"),
+            "misaligned" => assert!(matches!(&refusal, Refusal::MisalignedPool { .. }), "{refusal}"),
+            _ => assert!(matches!(&refusal, Refusal::Capacity { budget, .. } if budget == "coordinator.0"),
+                "{refusal}"),
+        }
+    }
+    // The compiled extent is a real ceiling, refused before any arithmetic.
+    let mut ask = request();
+    ask.pool = Pin::Exact((u32::MAX as u64 / PAGE_ROWS) * PAGE_ROWS + PAGE_ROWS);
+    assert!(matches!(admit(ask, budgets(), input).unwrap_err(), Refusal::InvalidPin(_)));
+}
+
+#[test]
+fn serving_selector_and_sampler_owners_keep_their_domains() {
+    let (cfg, weights, buffers) = fixture();
+    for device_sampling in [false, true] {
+        let mut input = facts(&cfg, &weights, &buffers);
+        input.serving = Some(ServingFacts { capacity: 64, device_sampling });
+        let plan = admit(request(), budgets(), input).unwrap();
+        let selector: Vec<_> = plan.facts.allocations.iter()
+            .filter(|owner| owner.id.starts_with("selector")).collect();
+        assert_eq!(selector.len(), if device_sampling { 24 } else { 2 });
+        assert_eq!(selector[0].id, "selector.output");
+        assert_eq!(selector[0].bytes, 64 * 12);
+        assert_eq!(selector[0].location, Location::coordinator(0));
+        assert_eq!(selector[1].id, "selector.landing");
+        assert_eq!(selector[1].location, Location::PINNED);
+        assert!(selector.iter().all(|owner| owner.lifetime == Lifetime { first: Phase::Warmup, last: Phase::Growth }));
+        let ready = plan.items(Location::coordinator(0)).unwrap();
+        assert!(ready.iter().any(|item| item.group == "token selector"));
+        // The pinned landing never charges the device budget.
+        let pinned: u64 = selector.iter().filter(|owner| owner.location == Location::PINNED)
+            .map(|owner| owner.bytes).sum();
+        let host = plan.phases.iter().filter(|row| row.budget == "host")
+            .map(|row| row.owned).max().unwrap();
+        assert!(host >= pinned);
+    }
+}
+
+#[test]
+fn gdn_slots_and_prefix_marks_are_exact_partitions_of_their_backings() {
+    let (cfg, weights, buffers) = fixture();
+    let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers)).unwrap();
+    let layers = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
+    let slots = 4u64;
+    let conv = (cfg.gdn.conv_kernel - 1) as u64 * cfg.gdn.conv_width() as u64 * 2;
+    for (backing, prefix, per_slot) in [
+        ("gdn.conv", "gdn.conv.", conv),
+        ("gdn.state", "gdn.state.", buffers.state_per_layer as u64 - conv),
+    ] {
+        let owner = plan.facts.allocations.iter().find(|owner| owner.id == backing).unwrap();
+        let mut views: Vec<_> = plan.facts.allocations.iter()
+            .filter(|view| view.id.starts_with(prefix)).collect();
+        views.sort_by_key(|view| view.view.as_ref().unwrap().offset);
+        assert_eq!(views.len() as u64, layers * slots);
+        let mut cursor = 0;
+        for view in &views {
+            assert_eq!(view.view.as_ref().unwrap().backing, backing);
+            assert_eq!(view.view.as_ref().unwrap().offset, cursor);
+            assert_eq!(view.bytes, per_slot);
+            assert_eq!(view.slot, Some((cursor / per_slot % slots) as u32));
+            assert!(view.lifetime == Lifetime::TARGET);
+            cursor += view.bytes;
+        }
+        assert_eq!(cursor, owner.bytes);
+    }
+    let marks: Vec<_> = plan.facts.allocations.iter().filter(|view| view.id.starts_with("prefix.mark."))
+        .collect();
+    assert_eq!(marks.len(), buffers.marks);
+    let prefix = plan.facts.allocations.iter().find(|owner| owner.id == "prefix").unwrap();
+    let end = marks.iter().filter_map(|view| view.view.as_ref().map(|view| view.offset + buffers.mark_bytes as u64))
+        .max().unwrap();
+    assert_eq!(end, prefix.bytes);
+    assert!(marks.iter().all(|view| view.view.as_ref().unwrap().backing == "prefix"));
+    // Every view's backing is a plain allocation of the same device domain.
+    for view in plan.facts.allocations.iter().filter(|owner| owner.view.is_some()) {
+        let backing = plan.facts.allocations.iter()
+            .find(|owner| owner.id == view.view.as_ref().unwrap().backing).unwrap();
+        assert_eq!(backing.location, view.location);
+        assert!(backing.view.is_none());
+    }
+}
+
+#[test]
+fn host_memory_is_a_required_fact_and_live_samples_replace_the_forecast() {
+    let (_, _, _) = fixture();
+    assert!(matches!(forecast_budgets(&crate::placement::ARCH_CONTEXTS[1], 96 << 30, 0, (0, 0)),
+        Err(Refusal::InvalidFact(_))));
+    // No CUDA total reported yet: the nominal 32 GiB class is explicit.
+    let forecast = forecast_budgets(&crate::placement::ARCH_CONTEXTS[0], 96 << 30, 0,
+        (128 << 30, 64 << 30)).unwrap();
+    assert_eq!(forecast[0].physical_bytes, 32 << 30);
+    assert!(matches!(forecast[0].baseline, Baseline::Forecast { assumed: true, .. }));
+    assert_eq!(forecast[1].locations, [Location::HOST, Location::PINNED]);
+    let sampled = sampled_budgets(90 << 30, 96 << 30, None, (128 << 30, 64 << 30)).unwrap();
+    assert_eq!(sampled[0].physical_bytes, 96 << 30);
+    assert_eq!(sampled[0].logical_bytes, 96 << 30);
+    assert!(matches!(sampled[0].baseline, Baseline::Sampled { free, phase: Phase::Load, .. }
+        if free == 90 << 30));
+    assert!(sampled_budgets(200 << 30, 96 << 30, None, (128 << 30, 64 << 30)).is_err());
+}
+
+#[test]
+fn onboarding_pins_are_auto_zero_and_refuse_random_layer_counts() {
+    let (cfg, weights, buffers) = fixture();
+    for onboard in [Pin::Auto, Pin::Exact(0)] {
+        let mut ask = request();
+        ask.onboard = onboard;
+        let plan = admit(ask, budgets(), facts(&cfg, &weights, &buffers)).unwrap();
+        assert!(plan.decisions.onboard_layers.iter().all(Vec::is_empty));
+        assert!(plan.decisions.expert_homes.is_empty());
+    }
+    for layers in [1, 2, u64::MAX] {
+        let mut ask = request();
+        ask.onboard = Pin::Exact(layers);
+        assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers)).unwrap_err(),
+            Refusal::InvalidPin("model has 0 routed-expert layers")));
+    }
+    // A resident-weight limit is a pure policy refusal, not a silent trim.
+    let mut ask = request();
+    ask.resident_weight_limit = Some(ResidentWeights(1));
+    assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers)).unwrap_err(),
+        Refusal::ResidentWeightLimit { gpu: 0, .. }));
+}
+
+#[test]
+fn operations_must_match_the_allocated_head_rows() {
+    let (cfg, weights, buffers) = fixture();
+    let mut ask = request();
+    ask.operation = Operation::Scoring;
+    assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers)).unwrap_err(),
+        Refusal::InvalidFact(_)));
+    let mut input = facts(&cfg, &weights, &buffers);
+    input.slots = 0;
+    assert!(matches!(admit(request(), budgets(), input).unwrap_err(), Refusal::InvalidFact(_)));
+    let mut input = facts(&cfg, &weights, &buffers);
+    input.record_bytes = 0;
+    assert!(matches!(admit(request(), budgets(), input).unwrap_err(), Refusal::InvalidFact(_)));
+}
+
+#[test]
+fn solved_allowances_are_the_only_estimates_in_the_ready_ledger() {
+    let (cfg, weights, buffers) = fixture();
+    let mut input = facts(&cfg, &weights, &buffers);
+    input.serving = Some(ServingFacts { capacity: 64, device_sampling: true });
+    let plan = admit(request(), budgets(), input).unwrap();
+    let ready = plan.items(Location::coordinator(0)).unwrap();
+    assert!(ready.iter().any(|item| item.basis == cuteafd_core::memory_layout::Basis::Estimated));
+    assert!(plan.facts.allowances.iter().all(|allowance| allowance.assumed));
+    // Every non-estimated item is a physical owner the executor allocates.
+    let exact: u64 = ready.iter().filter(|item| item.basis == cuteafd_core::memory_layout::Basis::Exact)
+        .map(|item| item.bytes).sum();
+    let declared: u64 = plan.facts.allocations.iter()
+        .filter(|owner| owner.view.is_none() && owner.location == Location::coordinator(0)
+            && owner.lifetime.contains(Phase::Ready, plan.facts.phase_order))
+        .map(|owner| owner.bytes).sum();
+    assert_eq!(exact, declared);
+    // Phase evaluation reconciles against the sample, never a second solve.
+    let row = planner::evaluate(&plan.facts, &plan.budgets).unwrap();
+    assert_eq!(row, plan.phases);
+}
+
+#[test]
+fn host_chunks_and_diagnostic_staging_are_physical_owners_not_allowances() {
+    let (cfg, weights, buffers) = fixture();
+    let mut input = facts(&cfg, &weights, &buffers);
+    input.host_prefix = serving::HostPrefixOwners { quota_bytes: (1 << 30) + 17, chunk_bytes: 256 << 20 };
+    input.verify_check = true;
+    let plan = admit(request(), budgets(), input).unwrap();
+    let owners = &plan.facts.allocations;
+    let chunks: Vec<_> = owners.iter().filter(|owner| owner.id.starts_with("host.prefix.")).collect();
+    assert_eq!(chunks.len(), 4);
+    assert!(chunks.iter().all(|owner| owner.location == Location::PINNED && owner.bytes == 256 << 20));
+    let reset: u64 = owners.iter().filter(|owner| owner.group == "diagnostic GDN reset staging")
+        .map(|owner| owner.bytes).sum();
+    let gdn = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count();
+    assert_eq!(reset, (buffers.state_per_layer * input.slots * gdn) as u64);
+    assert!(!owners.iter().any(|owner| owner.id.starts_with("selector")));
+    input.host_prefix.quota_bytes = 0;
+    input.host_prefix.chunk_bytes = 0;
+    input.verify_check = false;
+    let plain = admit(request(), budgets(), input).unwrap();
+    assert!(!plain.facts.allocations.iter().any(|owner|
+        owner.id.starts_with("host.prefix.") || owner.group == "diagnostic GDN reset staging"));
+}

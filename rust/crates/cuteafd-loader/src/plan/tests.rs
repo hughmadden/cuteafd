@@ -5608,12 +5608,45 @@ fn glm_auto_pool_and_count_admission_preserve_one_recipe() {
         unset.memory_layout.as_ref().unwrap().pool_tokens);
     assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
     zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let input = PlanInput::open(dir.path()).unwrap();
+    assert!(input.family_model().unwrap().contract_admission());
     let direct = plan(dir.path(), &zero).unwrap();
     let counted = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
     assert!(!counted.wip_launchable());
+    assert!(!direct.placement_supported);
+    assert!(direct.host_ledger.is_none());
+    assert!(counted.host_ledger.is_none());
+    assert!(counted.prefill_reserve_rows.is_none());
+    assert_eq!(serde_json::to_value(&direct.hints[0]).unwrap(), serde_json::to_value(&counted.hints[0]).unwrap());
     assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
     for hint in &direct.hints {
         assert!(counted.hints.iter().any(|other| other.what == hint.what));
     }
     assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}
+
+#[test]
+fn qwen_auto_pool_normalization_keeps_one_admission_and_its_refusal() {
+    let (dir, mut options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+    options.layout.as_mut().unwrap().pool_tokens = None;
+    let unset = plan(dir.path(), &options).unwrap();
+    assert!(unset.wip_launchable(), "{}", render(&unset));
+    let automatic_pool = unset.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(automatic_pool >= 262144, "{automatic_pool}");
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan(dir.path(), &zero).unwrap();
+    // An unset POOL_TOKENS and the launcher's explicit zero name one pool, one
+    // prefill shape and one admission.
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens, automatic_pool);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    assert_eq!(automatic.prefill_waves, unset.prefill_waves);
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let refused = plan(dir.path(), &zero).unwrap();
+    assert!(!refused.wip_launchable());
+    // The shared Recipe's typed refusal survives instead of a second solve with
+    // a smaller prefill reserve.
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")
+            && hint.what.contains("cannot hold selected context")), "{}", render(&refused));
+    assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }
