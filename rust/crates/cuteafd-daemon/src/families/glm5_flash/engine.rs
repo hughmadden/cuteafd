@@ -935,10 +935,12 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             native: GlmfCoreScratch {
                 kda: layers.iter().filter(|l| l.attention == GlmNextAttention::Kda)
                     .all(|l| ["q_proj", "k_proj", "v_proj", "o_proj"].iter()
-                        .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
+                        .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))
+                            || l.attention_native.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
                 mla: layers.iter().filter(|l| l.attention == GlmNextAttention::Mla && l.attention_share.present())
                     .all(|l| ["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"].iter()
-                        .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
+                        .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))
+                            || l.attention_native.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
                 ffn: layers.iter().all(|l| core::native_ffn(l) || native::is_native(l)),
             },
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),

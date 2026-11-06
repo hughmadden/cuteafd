@@ -150,12 +150,15 @@ impl CoreInventory {
         Ok(inventory)
     }
 
-    /// Remove a fused scratch class only when every served group is native.
+    /// Remove fused attention scratch only when every operand runs through the separately
+    /// admitted stage path, whether its projection is trellis, BF16 or FP8.
     pub fn scratch_mask(&self, cfg: &GlmNextConfig, layers: usize) -> crate::serving_capacity::GlmfCoreScratch {
         let has = |layer, leaf: &str| self.projections.contains_key(&format!("{PREFIX}{layer}.{leaf}"));
+        let staged = |layer, leaf: &str| has(layer, leaf)
+            || self.native.contains_key(&format!("{PREFIX}{layer}.{leaf}"));
         crate::serving_capacity::GlmfCoreScratch {
-            kda: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Kda).all(|l| attention_leaves(cfg.attention[l]).iter().all(|leaf| has(l, &format!("self_attn.{leaf}")))),
-            mla: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Mla).all(|l| attention_leaves(cfg.attention[l]).iter().all(|leaf| has(l, &format!("self_attn.{leaf}")))),
+            kda: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Kda).all(|l| attention_leaves(cfg.attention[l]).iter().all(|leaf| staged(l, &format!("self_attn.{leaf}")))),
+            mla: (0..layers).filter(|&l| cfg.attention[l] == GlmNextAttention::Mla).all(|l| attention_leaves(cfg.attention[l]).iter().all(|leaf| staged(l, &format!("self_attn.{leaf}")))),
             ffn: (0..layers).all(|l| has(l, if cfg.dense[l] { "mlp.down_proj" } else { "mlp.shared_experts.down_proj" })),
         }
     }
@@ -222,7 +225,7 @@ mod tests {
     use cuteafd_core::DType;
 
     #[test]
-    fn selected_mixed_attention_preserves_fused_scratch_and_owner_specific_fp8_receipts() -> Result<()> {
+    fn selected_mixed_attention_drops_fused_scratch_and_keeps_owner_specific_fp8_receipts() -> Result<()> {
         use crate::plan::checkpoint::{AttentionMode, CheckpointView};
         use super::super::core_admission::{CoreCharges, fp8_projection_name};
         let (cfg, mut checkpoint) = fixture();
@@ -244,7 +247,7 @@ mod tests {
             assert_eq!(core.projections.len(), 314);
             assert_eq!(core.native.len(), 2);
             assert_eq!(core.native.values().all(|p| p.fp8), mode == AttentionMode::Fp8Compact);
-            assert!(!core.scratch_mask(&cfg, cfg.layers).mla);
+            assert!(core.scratch_mask(&cfg, cfg.layers).mla);
             let mut manifest = executable_package(&cfg, &core)?;
             if mode == AttentionMode::Fp8Compact {
                 for layout in core.layer_native(&cfg, 3, 2, Some(0))?[0].values() {
@@ -677,6 +680,60 @@ mod tests {
                         + 2*(layout.shape[0]+layout.shape[1]));
                 } }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_native_attention_uses_staged_scratch_with_shipped_defaults() -> Result<()> {
+        use crate::serving_capacity::{glmf_core_step_scratch, GlmfScratchOptions};
+        use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+        let (cfg, checkpoint) = fixture();
+        let compact = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let compact_mask = compact.scratch_mask(&cfg, cfg.layers);
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&checkpoint.config)?)?;
+        // Shipped head-split flags must not reintroduce the fused KDA arena.
+        let options = GlmfScratchOptions { split: true, kda_w8: true,
+            kda_output_shard: true, kda_prefill_expanded: true, ..Default::default() };
+        let lookup = |name: &str| {
+            let stem = name.strip_prefix("glmf2_").or_else(|| name.strip_prefix("glmf_")).unwrap();
+            if stem.starts_with("kda_") || stem.starts_with("mla_producer_")
+                || stem.starts_with("o_") || stem.starts_with("ffn_i") { None }
+            else { Some(if stem.starts_with("index_topk_") { 17 } else { 23 }) }
+        };
+        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+            let (_, mut checkpoint) = fixture();
+            for (layer, leaf) in [(0, "o_proj"), (3, "q_b_proj"), (3, "o_proj")] {
+                let stem = format!("{PREFIX}{layer}.self_attn.{leaf}");
+                checkpoint.tensors.retain(|t| !t.meta.name.starts_with(&format!("{stem}.")));
+                let name = format!("{stem}.weight");
+                let shape = expected(&cfg).remove(&name).unwrap();
+                checkpoint.tensors.push(CheckpointTensor { shard: "native.safetensors".into(),
+                    meta: SafetensorsTensorMetadata { name, dtype: DType::Bf16, byte_offset: 0,
+                        byte_length: shape.iter().product::<usize>() as u64 * 2, shape } });
+            }
+            checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
+            checkpoint.view = Some(CheckpointView::select(dir.path(), mode)?);
+            let mut core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+            let mask = core.scratch_mask(&cfg, cfg.layers);
+            assert_eq!(mask, compact_mask);
+            assert_eq!(core.native.len(), 3);
+            assert!(core.native.values().all(|p| p.fp8 == (mode == AttentionMode::Fp8Compact)));
+            for (rows, decode) in [(64, true), (4096, false)] {
+                let scratch = glmf_core_step_scratch(lookup, &cfg, options, rows, decode, mask)?;
+                assert_eq!((scratch.programs, scratch.topk), (23, 17));
+                assert_eq!(scratch, glmf_core_step_scratch(lookup, &cfg, options, rows, decode, compact_mask)?);
+            }
+            // An operand absent from both staged inventories still belongs to a fused group.
+            core.projections.retain(|name, _| name != &format!("{PREFIX}1.self_attn.q_proj"));
+            let fused = core.scratch_mask(&cfg, cfg.layers);
+            assert!(!fused.kda && fused.mla && fused.ffn);
+            assert!(glmf_core_step_scratch(lookup, &cfg, options, 4096, false, fused).is_err());
+            let with_fused = |name: &str| lookup(name).or(Some(1_000_000));
+            assert!(glmf_core_step_scratch(with_fused, &cfg, options, 4096, false, fused)?.programs >= 1_000_000);
+            core.native.remove(&format!("{PREFIX}3.self_attn.q_b_proj"));
+            assert!(!core.scratch_mask(&cfg, cfg.layers).mla);
         }
         Ok(())
     }
