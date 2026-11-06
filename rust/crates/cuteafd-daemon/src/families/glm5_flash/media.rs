@@ -7,7 +7,15 @@ use std::sync::Arc;
 
 pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
     if mode == MediaMode::Off { return Ok(None); }
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+    let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+    vision_config_view(mode, &view)
+}
+
+pub(super) fn vision_config_view(mode: MediaMode, view: &cuteafd_loader::plan::checkpoint::CheckpointView)
+    -> Result<Option<serde_json::Value>> {
+    if mode == MediaMode::Off { return Ok(None); }
+    let config = view.config()?;
     Ok(config.get("vision_config").is_some().then_some(config))
 }
 
@@ -62,11 +70,12 @@ pub(super) struct ReadyVision {
     pub cache_bytes: usize,
 }
 impl ReadyVision {
-    pub fn plan(args: &super::EngineArgs, mode: MediaMode, remote: Option<&RemoteVision>)
+    pub fn plan(args: &super::EngineArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        mode: MediaMode, remote: Option<&RemoteVision>)
         -> Result<Option<cuteafd_loader::plan::encoder::EncoderPlacement>> {
         use cuteafd_loader::plan::encoder::{EncoderKind, EncoderPlacement};
-        if vision_config(mode, &args.snapshot)?.is_none() { return Ok(None); }
-        let spec = crate::shared::vision::TowerSpec::glm_flash(&args.snapshot, 4096)?;
+        if vision_config_view(mode, view)?.is_none() { return Ok(None); }
+        let spec = crate::shared::vision::TowerSpec::glm_flash_view(view, 4096)?;
         let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
         let (kind, replicas) = if let Some(remote) = remote {
             let peers = args.peers.as_deref().context("remote Flash encoder needs active Spark workers")?
@@ -87,13 +96,14 @@ impl ReadyVision {
             replicas, reason: "launcher-resolved bundled encoder".into(), shortfall: 0 }))
     }
 
-    pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
+    pub fn load(args: &super::EngineArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+        library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
         cache_bytes: usize, remote: Option<RemoteVision>) -> Result<Option<Self>> {
-        let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok(None); };
+        let Some(config) = vision_config_view(mode, view)? else { return Ok(None); };
         let admitted = args.serving_encoder.as_ref().context("Flash vision lacks admitted physical owners")?;
         let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::GlmFlash)?;
         // Header-only on the coordinator: remote tower payload stays on its Spark.
-        let spec = crate::shared::vision::TowerSpec::glm_flash(&args.snapshot, 4096)?;
+        let spec = crate::shared::vision::TowerSpec::glm_flash_view(view, 4096)?;
         let width = config["text_config"]["hidden_size"].as_u64().context("GLM Flash hidden_size")? as usize;
         if let Some(remote) = remote {
             anyhow::ensure!(matches!(mode, MediaMode::Auto | MediaMode::Spark(_)),

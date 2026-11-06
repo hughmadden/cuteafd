@@ -53,14 +53,20 @@ fn validate(config: &serde_json::Value, max_tokens: usize) -> Result<()> {
 
 impl TowerSpec {
     pub fn glm_flash(snapshot: &Path, max_tokens: usize) -> Result<Self> {
-        let config: serde_json::Value =
-            cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
+        let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+            cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)
+            .map_err(|error| VisionError::Unsupported(error.to_string()))?;
+        Self::glm_flash_view(&view, max_tokens)
+    }
+
+    pub fn glm_flash_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView, max_tokens: usize) -> Result<Self> {
+        let config = view.config().map_err(|error| VisionError::Unsupported(error.to_string()))?;
         validate(&config, max_tokens)?;
-        let checkpoint = cuteafd_loader::plan::Checkpoint::open_for_role(snapshot, "GLM Flash vision",
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open_view_for_role(view, "GLM Flash vision",
             |name| name.starts_with("model.visual."))
             .map_err(|error| VisionError::Unsupported(error.to_string()))?;
         let tensors: BTreeMap<_, _> = checkpoint.tensors.into_iter().map(|tensor|
-            (tensor.meta.name.clone(), (snapshot.join(tensor.shard), tensor.meta))).collect();
+            (tensor.meta.name.clone(), (view.snapshot().join(tensor.shard), tensor.meta))).collect();
         let mut reads = Vec::new();
         let mut cursor = 0usize;
         let mut put = |name: &str, shape: &[usize], vector: bool, align: bool| -> Result<u64> {
@@ -311,6 +317,7 @@ mod tests {
             assert_eq!(spec.native.blocks[i].gate_up, gate.destination as u64);
         }
         assert!(spec.native.weight_bytes > end);
+        let hf_index = std::fs::read(dir.path().join("model.safetensors.index.json")).unwrap();
         // Native EXLR8 keeps the same tower under dense/, without an HF index.
         std::fs::remove_file(dir.path().join("model.safetensors.index.json")).unwrap();
         std::fs::create_dir(dir.path().join("dense")).unwrap();
@@ -330,5 +337,21 @@ mod tests {
         assert!(native.reads.iter().all(|read|
             read.path == dir.path().join("dense/vision-bf16.safetensors")));
         super::super::push::tests::assert_vision_plan(dir.path(), &native);
+        // Restore the HF fixture before testing the selected compact bundle.
+        std::fs::rename(dir.path().join("dense/vision-bf16.safetensors"),
+            dir.path().join("vision.safetensors")).unwrap();
+        std::fs::remove_file(dir.path().join("experts/exlr8-layer-000.index.safetensors")).unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), hf_index).unwrap();
+        use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView, view::{COMPACT_CONFIG, COMPACT_INDEX, COMPACT_QUANT}};
+        std::fs::copy(dir.path().join("config.json"), dir.path().join(COMPACT_CONFIG)).unwrap();
+        std::fs::copy(dir.path().join("model.safetensors.index.json"), dir.path().join(COMPACT_INDEX)).unwrap();
+        std::fs::write(dir.path().join(COMPACT_QUANT), b"{}").unwrap();
+        let view = CheckpointView::select(dir.path(), AttentionMode::Compact).unwrap();
+        std::fs::write(dir.path().join("config.json"), b"invalid unselected config").unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), b"invalid unselected index").unwrap();
+        let compact = TowerSpec::glm_flash_view(&view, 4096).unwrap();
+        assert_eq!(compact.reads.len(), spec.reads.len());
+        assert_eq!(compact.native.weight_bytes, spec.native.weight_bytes);
+
     }
 }

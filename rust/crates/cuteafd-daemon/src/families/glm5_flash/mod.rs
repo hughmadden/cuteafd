@@ -63,6 +63,8 @@ use std::time::Instant;
 pub(crate) struct EngineArgs {
     #[command(flatten)]
     pub attention: crate::cli::AttentionArgs,
+    #[arg(skip)]
+    pub selected_view: Option<cuteafd_loader::plan::checkpoint::CheckpointView>,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
@@ -1663,7 +1665,8 @@ impl Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    let view = args.attention.select(&args.snapshot)?;
+    let view = args.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
     let format = cuteafd_loader::plan::checkpoint::CheckpointFormat::detect_view(&view)?;
     let native = format == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     let mut resolved = args.clone();
