@@ -27,15 +27,19 @@ use cuteafd_core::serving_capacity::{
 /// Decode rows a hop or route exchange carries at most.
 pub const DECODE_ROWS: u64 = 64;
 
-/// Measured post-module baseline for MiMo V2.6 Flash min on SM120, rounded up
-/// to MiB: 1,179,189,248 B, 8ce4ae066, planner-mimo-close-smoke 2026-11-06.
+/// Measured post-module baseline for MiMo V2.6 Flash min on SM120, observer
+/// subtracted: 1,179,189,248 - 576,716,800 = 602,472,448 B, rounded up to MiB.
+/// Source: 389a8037e, drop-occupancy-ceiling-mimo-smoke, 2026-11-06.
 /// Other shapes retain their own forecast; this is not a cross-family margin.
-pub const FLASH_MIN_BASELINE_BYTES: u64 = 1_179_648_000;
+pub const FLASH_MIN_BASELINE_BYTES: u64 = 575 << 20;
 
-/// Estimated first-use CUDA/runtime growth not attributed by MiMo receipts yet.
-/// The min-card corrected peak exceeded owned + sampled baseline by 20,500,736 B;
-/// target workspaces reconcile exactly. Whole-process attribution follows #1326.
-pub const FIRST_USE_RUNTIME_BYTES: u64 = 32 << 20;
+/// Measured unnamed post-ready CUDA/runtime growth, excluding tracked owners:
+/// corrected peak 99,185,393,664 - known owners 97,985,769,216 - observer-
+/// subtracted baseline 602,472,448 = 597,152,000 B, rounded up to MiB.
+/// Source: 389a8037e, drop-occupancy-ceiling-mimo-smoke, 2026-11-06, Flash min.
+/// This replaces (does not add to) the old 32 MiB allowance. Other MiMo layouts
+/// retain the same per-rank allowance policy; only Flash min was measured.
+pub const POST_READY_RUNTIME_BYTES: u64 = 570 << 20;
 
 fn invalid(detail: impl std::fmt::Display) -> Refusal {
     Refusal::InvalidFact(format!("MiMo component contract: {detail}"))
@@ -569,14 +573,21 @@ impl Recipe for MimoRecipe<'_> {
                 rank_sets: vec![(0..self.spark_ranks as u8).collect()],
             });
         }
+        let measured_runtime = matches!(self.cfg.program_family(), Ok("mimof"))
+            && self.gpus == 1 && self.spark_ranks == 2;
+        let runtime_source = if measured_runtime {
+            "measured MiMo post-ready runtime growth; Flash min, 389a8037e, observer subtracted, 2026-11-06"
+        } else {
+            "estimated MiMo post-ready runtime growth; same per-rank allowance as Flash min, 389a8037e, observer subtracted, 2026-11-06"
+        };
         for rank in 0..self.gpus {
             contract.components.push(Component {
                 activation: crate::placement::planner::Activation::always(),
-                bytes: ByteCurve::fixed(FIRST_USE_RUNTIME_BYTES, maximum),
+                bytes: ByteCurve::fixed(POST_READY_RUNTIME_BYTES, maximum),
                 kind: crate::placement::planner::ComponentKind::Allowance(crate::placement::planner::Allowance {
-                    location: Location::coordinator(rank as u8), bytes: FIRST_USE_RUNTIME_BYTES,
+                    location: Location::coordinator(rank as u8), bytes: POST_READY_RUNTIME_BYTES,
                     lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
-                    source: "estimated MiMo first-use CUDA/runtime growth; #1326".into(), assumed: true,
+                    source: runtime_source.into(), assumed: !measured_runtime,
                 }),
             });
         }
@@ -727,8 +738,8 @@ pub fn resolved_capacity(admitted: &AdmittedMimo, concurrency: u32, rings: u32)
             reservations.push(MemoryReservation { name: "transport.tp2_routes".into(),
                 bytes: admitted.route[rank] });
         }
-        reservations.push(MemoryReservation { name: "runtime.first_use_estimated".into(),
-            bytes: FIRST_USE_RUNTIME_BYTES });
+        reservations.push(MemoryReservation { name: "runtime.post_ready".into(),
+            bytes: POST_READY_RUNTIME_BYTES });
         let reserved = reservations.iter().try_fold(0u64, |sum, reservation|
             sum.checked_add(reservation.bytes))
             .ok_or(PlacementError::Overflow("MiMo reservations"))?;

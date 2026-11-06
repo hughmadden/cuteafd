@@ -656,7 +656,7 @@ mod tests {
                         for rank in 0..ranks {
                             let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
                                 + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes
-                                + crate::placement::families::mimo_v2::admission::FIRST_USE_RUNTIME_BYTES;
+                                + crate::placement::families::mimo_v2::admission::POST_READY_RUNTIME_BYTES;
                             assert_eq!(devices[rank].used_bytes(), total, "mapped planner items equal admission total");
                             assert_eq!(planned.steady.devices[rank].reservations, admitted.steady.devices[rank].reservations,
                                 "pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
@@ -851,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn flash_min_baseline_uses_rounded_measured_smoke_sample() {
+    fn flash_min_baseline_and_runtime_exclude_observer() {
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
         let report = crate::plan::plan(dir.path(), &crate::plan::PlanOptions {
@@ -861,14 +861,52 @@ mod tests {
         let ledger = report.phase_ledger.unwrap();
         let baseline = &ledger.budgets.iter().find(|b| b.id == "rtx0").unwrap().baseline;
         let crate::placement::planner::Baseline::Forecast { occupied, .. } = baseline else { panic!("forecast") };
-        assert_eq!(*occupied, 1_179_648_000);
+        assert_eq!(*occupied, 575 << 20);
         let ready = ledger.phases.iter().find(|row| row.budget == "rtx0"
             && row.phase == crate::placement::planner::Phase::Ready).unwrap();
-        assert_eq!(ready.opaque, 32 << 20);
-        let measured_owned = 94_563_217_152u64;
-        let measured_baseline = 1_179_189_248u64;
-        let corrected_peak = 95_762_907_136u64;
-        assert!(measured_owned + measured_baseline + ready.opaque >= corrected_peak);
+        assert_eq!(ready.opaque, 570 << 20);
+        let measured_baseline = 1_179_189_248u64 - 576_716_800;
+        let measured_owned = 97_985_769_216u64;
+        let corrected_peak = 99_185_393_664u64;
+        let measured_runtime = corrected_peak - measured_owned - measured_baseline;
+        assert_eq!(measured_baseline, 602_472_448);
+        assert_eq!(measured_runtime, 597_152_000);
+        assert_eq!(*occupied, measured_baseline.div_ceil(1 << 20) * (1 << 20));
+        assert_eq!(ready.opaque, measured_runtime.div_ceil(1 << 20) * (1 << 20));
+        assert_eq!(measured_owned + occupied + ready.opaque - corrected_peak, 995_072);
+    }
+
+    #[test]
+    fn post_ready_runtime_provenance_preserves_every_rank_allowance() {
+        use cuteafd_core::memory_layout::{Basis, DeviceKind};
+        for pro in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = if pro { mimo_pro_config() } else { mimo_flash_mopd_config() };
+            let tensors = if pro { mimo_pro_tensors() } else { mimo_flash_mopd_tensors() };
+            write_snapshot(dir.path(), &config, &tensors, Some(if pro { 8 } else { 4 }));
+            for (gpus, sparks) in [(1, 2), (1, 4), (2, 2), (2, 4)] {
+                let report = crate::plan::plan(dir.path(), &crate::plan::PlanOptions {
+                    placement: crate::plan::ExpertPlacement::Sparks { ranks: sparks },
+                    layout: Some(LayoutOptions {
+                        rtx_bytes: vec![95 * GIB; gpus], head_split: gpus == 2,
+                        host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+                    }),
+                    ..Default::default()
+                }).unwrap();
+                let layout = report.memory_layout.unwrap();
+                let devices = layout.devices.iter().filter(|device| device.kind == DeviceKind::Rtx)
+                    .collect::<Vec<_>>();
+                assert_eq!(devices.len(), gpus);
+                let measured = !pro && gpus == 1 && sparks == 2;
+                for device in devices {
+                    let item = device.items.iter().find(|item|
+                        item.group.contains("MiMo post-ready runtime growth")).unwrap();
+                    assert_eq!(item.bytes, 570 << 20);
+                    assert_eq!(item.basis, if measured { Basis::Calibrated } else { Basis::Estimated });
+                    assert!(item.group.starts_with(if measured { "measured " } else { "estimated " }));
+                }
+            }
+        }
     }
 
     #[test]

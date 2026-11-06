@@ -584,7 +584,14 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
         .find(|device| device["kind"] == "rtx" && device["index"] == 0).unwrap();
     let admitted = lead["items"].as_array().unwrap().iter()
         .map(|item| item["bytes"].as_u64().unwrap()).sum::<u64>();
-    assert!(admitted >= 95_762_907_136, "admission must cover measured corrected peak");
+    // Check named attribution, not a claim that one observed peak bounds traffic.
+    let items = lead["items"].as_array().unwrap();
+    assert!(items.iter().any(|item| item["group"] == "context+modules"
+        && item["bytes"] == 575u64 << 20), "observer-subtracted baseline missing");
+    assert!(items.iter().any(|item| item["bytes"] == 570u64 << 20
+        && item["basis"] == "calibrated"
+        && item["group"].as_str().is_some_and(|group| group.starts_with("measured MiMo post-ready runtime growth"))),
+        "measured runtime allowance missing");
     assert!(admitted <= lead["capacity_bytes"].as_u64().unwrap());
 }
 
