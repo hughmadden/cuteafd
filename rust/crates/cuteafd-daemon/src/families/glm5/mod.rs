@@ -28,8 +28,9 @@ pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillAc
 /// What every GLM command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
-    /// Count executed expert routes through the shared telemetry component.
-    #[arg(long)]
+    /// Count executed expert routes; --expert-usage=false disables telemetry.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub expert_usage: bool,
     #[arg(skip)]
     pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
@@ -647,6 +648,24 @@ mod draft_cli_tests {
         assert!(native_activation(&component, 3, 78, false).is_ok());
         assert!(native_activation(&component, 3, 78, true).is_err());
 
+    }
+
+    #[test]
+    fn expert_usage_defaults_on_and_explicit_off_or_skip_disables() {
+        for (flag, requested) in [(None, true), (Some("--expert-usage"), true),
+            (Some("--expert-usage=true"), true), (Some("--expert-usage=false"), false)] {
+            for skip in [false, true] {
+                let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native"];
+                argv.extend(flag);
+                if skip { argv.push("--skip-routed-experts"); }
+                let args = Parse::try_parse_from(argv).unwrap().engine;
+                assert_eq!(args.expert_usage, requested);
+                assert_eq!(args.expert_usage_reader.configure(args.expert_usage,
+                    args.skip_routed_experts).unwrap(), requested && !skip);
+            }
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--expert-usage=invalid"]).is_err());
     }
 
     #[test]

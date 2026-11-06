@@ -2208,7 +2208,7 @@ impl<'a> GlmEngine<'a> {
         }
         // SAFETY: selector produced all t top-k IDs; workspace retains replay row metadata.
         unsafe { record_glm_routes(self.expert_usage.as_ref(), self.device, rank, index,
-            w.route_ids.buffer.ptr, t, w.usage_rows.as_ref().map(|b| b.buffer.ptr.cast()), self.stream_of(rank))?; }
+            w.route_ids.buffer.ptr, t, w.usage_rows.as_ref().map(|b| b.buffer.ptr.cast::<i32>().cast_const()), self.stream_of(rank))?; }
         if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input())
             && !self.whole.as_ref().is_some_and(|owner| owner.uses_fp8_input()) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
