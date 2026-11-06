@@ -352,6 +352,9 @@ mod tests {
                     testing::write_snapshot(dir.path(), &config, &tensors, Some(4));
                 }
                 "muse_spark" => {
+                    // This fixture pins a 32K diagnostic pool; the shared
+                    // contract correctly refuses a larger compiled context.
+                    options.context_tokens = 32768;
                     testing::write_muse_vision_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
                     let path = testing::write_muse_exl3_capacities(&dir.path().join("image"));
                     let programs = crate::families::muse_spark::programs::required(2)?.into_iter()

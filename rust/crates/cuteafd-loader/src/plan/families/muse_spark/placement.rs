@@ -4,9 +4,7 @@
 //! onboarding of whole routed layers; Spark ranks hold intermediate slices of
 //! every expert and reply per-expert partials the coordinator combines.
 //!
-//! Header-only: coordinator graphs and step workspaces come from the family's
-//! installed PROGRAMS.json once its programs exist; until then this is a
-//! planning lower bound (stated in the notes), not serving admission.
+//! Coordinator code and workspaces come from the installed PROGRAMS.json.
 use super::Model;
 use anyhow::Context as _;
 use crate::placement::families::muse_spark as shared;
@@ -40,8 +38,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![
-        "Muse Spark header lower bound: coordinator graphs and step workspaces are charged from the family's \
-            PROGRAMS.json once its programs exist; NOT serving admission".into(),
+        "Muse Spark shared contract: exact physical owners and one admission".into(),
     ] };
     report.bytes_by_owner.clear();
     report.attention_placement = AttentionPlacement::Heads;
@@ -90,8 +87,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             if opts.prefix_slots.is_some() { " (explicit slot override)" } else { "" }));
     }
     let onboard = opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto);
-    let local = match shared::local_workspace(catalog, opts.workspace_manifest.as_deref()
-        .filter(|path| path.is_file()), gpus, prefill.unit_rows) {
+    let manifest_path = opts.workspace_manifest.as_deref().or_else(|| {
+        let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+        path.is_file().then_some(path) });
+    let cards = opts.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(bytes, opts.physical_sms))
+        .collect::<Vec<_>>();
+    if opts.physical_sms.is_none() { memory.notes.push("Physical GPU class assumed SM120 PRO; logical caps do not identify a card".into()); }
+    let local = match shared::local_workspace(catalog, manifest_path, gpus, prefill.unit_rows) {
         Ok(workspace) => workspace,
         Err(error) => {
             report.refuse_placement(format!("Muse coordinator EXL3 package refused: {error:#}"), "Install the matching package.");
@@ -102,7 +104,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let head = model.core.get_weight(crate::families::muse_spark::core::HEAD)
             .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
-        let sms = opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", opts.rtx_bytes[gpus - 1]).sms);
+        let sms = opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", cards[gpus - 1].physical_bytes).sms);
         crate::placement::families::muse_spark::drafter_inventory(cfg, &config, usize::try_from(slots)?,
             usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)
     }).transpose() {
@@ -113,7 +115,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
-    let fixed = match planned_code(opts, gpus) {
+    let fixed = match planned_code(input, opts, &cards) {
         Ok(fixed) => fixed,
         Err(error) => {
             report.refuse_placement(format!("Muse Spark program manifest refused: {error:#}"), "Supply the image's PROGRAMS.json.");
@@ -141,11 +143,27 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     // contract charges is the same fact list.
     let spark_budget_bytes = opts.spark_allocation_budget_bytes
         .unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES).min(opts.spark_bytes);
-    let mut budgets = opts.rtx_bytes.iter().enumerate().map(|(gpu, &bytes)| shared::planned_budget(gpu as u8,
-        bytes, opts.headroom_bytes, ArchContext::for_device("sm_120", bytes).context_bytes)).collect::<Vec<_>>();
+    let mut budgets = cards.iter().enumerate().map(|(gpu, card)| shared::planned_budget(gpu as u8,
+        card.physical_bytes, card.logical_bytes, opts.headroom_bytes,
+        ArchContext::for_device("sm_120", card.physical_bytes).context_bytes)).collect::<Vec<_>>();
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, spark_budget_bytes)));
-    let maximum_pool_tokens = shared::maximum_pool_tokens(&opts.rtx_bytes, context, opts.pool_tokens);
-    let facts = shared::ProductionInput { cfg, core: &model.core, catalog, budgets, prefill,
+    let maximum_pool_tokens = crate::placement::CoordinatorCard::maximum_pool(&cards, context, opts.pool_tokens, shared::PAGE_ROWS);
+    let (total, available) = match opts.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory) {
+        Ok(memory) => memory,
+        Err(error) => { report.refuse_placement(format!("Muse host inventory refused: {error:#}"), "Provide a host memory sample."); return memory; }
+    };
+    let host = shared::HostInput { total, available, reserve: 8 << 30,
+        prefix_bytes: opts.host_cache_bytes, prefix_entries: opts.mimo_prefix_entries,
+        media_bytes: opts.media_cache_bytes, device_sampling: true };
+    // Even a typed placement refusal carries the requested encoder facts.
+    for (component, mode, bytes) in [(Component::Vision, report.vision, media.vision_bytes),
+        (Component::Audio, report.audio, media.audio_bytes)] {
+        let encoder = crate::plan::encoder::EncoderPlacement { kind: crate::plan::encoder::EncoderKind::Off,
+            weights: bytes.0, scratch: bytes.1, replicas: vec![], shortfall: 0,
+            reason: format!("{mode:?} tower not admitted: joint memory contract refused") };
+        if component == Component::Vision { report.encoder = Some(encoder); } else { report.audio_encoder = Some(encoder); }
+    }
+    let facts = shared::ProductionInput { cfg, core: &model.core, catalog, budgets, host, prefill,
         full_prefill_logits: opts.full_prefill_logits, slots, mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
         local, drafter, fixed, media };
@@ -157,6 +175,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
+    if let Some((vision, audio)) = prepared.recipe.encoders.first() {
+        report.encoder = Some(vision.clone());
+        report.audio_encoder = Some(audio.clone());
+    }
     let request = shared::production_request(context, opts.pool_tokens, onboard,
         PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
         if opts.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
@@ -169,6 +191,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
+    report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
+    report.host_budget_bytes = admitted.host.prefix_bytes;
+    let mut host_items = admitted.solved.items(crate::placement::planner::Location::HOST).unwrap_or_default();
+    host_items.extend(admitted.solved.items(crate::placement::planner::Location::PINNED).unwrap_or_default());
+    host_items.retain(|item| item.category != Category::Prefix);
+    for item in &mut host_items { item.lifetime = cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve; }
+    report.host_ledger = cuteafd_core::memory_layout::HostLayout::new(total, available,
+        host.reserve.max(total / 10), admitted.host.prefix_bytes / admitted.host.prefix_chunk.max(1) * admitted.host.prefix_chunk,
+        host_items);
+    memory.notes.push(format!("Muse shared solve {} us; host ordinary residual {} B (estimated, #1326)",
+        admitted.solve_us, shared::HOST_RUNTIME.bytes));
     report.encoder = Some(admitted.media.vision.clone());
     report.audio_encoder = Some(admitted.media.audio.clone());
     if admitted.media.vision.kind == crate::plan::encoder::EncoderKind::Off {
@@ -195,7 +228,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         layers; sliding rings {} B/sequence over {} layers", placed.onboard_layers, placed.pool_tokens,
         cfg.kv_record_bytes() * cfg.full_layers(), cfg.full_layers(), rings, cfg.sliding_layers()));
     for gpu in 0..gpus {
-        let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu], worker_budget_bytes: 0,
+        let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: cards[gpu].physical_bytes.min(cards[gpu].logical_bytes), worker_budget_bytes: 0,
             items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
         device.items.push(Item::new(Category::Reserved, "coordinator headroom", "", opts.headroom_bytes, Basis::Formula)
             .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve));
@@ -219,7 +252,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for rank in 0..ranks {
         let resident = admitted.spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
         widest = widest.max(resident);
-        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes, worker_budget_bytes: opts.spark_bytes,
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: spark_budget_bytes, worker_budget_bytes: spark_budget_bytes,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (intermediate slices)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = usize::try_from(slots).map_err(anyhow::Error::from)
@@ -240,12 +273,17 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
 
 /// Loaded code charged exactly as live startup charges it (the full allowance
 /// offline, nothing yet resident), once the image's program manifest is known.
-fn planned_code(opts: &crate::plan::layout::LayoutOptions, gpus: usize) -> anyhow::Result<Vec<Demand>> {
-    let Some(path) = opts.workspace_manifest.as_deref().filter(|path| path.is_file()) else { return Ok(Vec::new()) };
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+fn planned_code(input: &crate::plan::PlanInput, opts: &crate::plan::layout::LayoutOptions,
+    cards: &[crate::placement::CoordinatorCard]) -> anyhow::Result<Vec<Demand>> {
+    let gpus = cards.len();
+    let path = opts.workspace_manifest.as_deref().or_else(|| {
+        let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+        path.is_file().then_some(path) });
+    let Some(path) = path else { return Ok(Vec::new()) };
+    let manifest = input.manifest(path)?;
     let programs = ProgramSet::from_manifest(&manifest, crate::placement::families::muse_spark::program_families(gpus));
     (0..gpus).map(|rank| {
-        let arch = ArchContext::for_device("sm_120", opts.rtx_bytes[rank]);
+        let arch = ArchContext::for_device("sm_120", cards[rank].physical_bytes);
         let code = crate::placement::inventory::loaded_code_allowance("muse", "exl3", gpus == 2, rank as u8,
             arch, Some(&programs));
         crate::placement::families::muse_spark::code_demand(rank, code.bytes)

@@ -13,9 +13,9 @@ fn snapshot(expert_layers: &[usize]) -> tempfile::TempDir {
 fn all_layers() -> Vec<usize> { (0..62).collect() }
 
 /// The min card's declared serving context (examples/configs/muse-spark-exl3-min.config):
-/// one RTX PRO 6000 cannot hold the checkpoint's compiled 1M pool — measured
-/// ceiling 984,768 tokens at 64 KiB/token — so the shipped 1-RTX card serves 768K.
-const MIN_CARD_CONTEXT: u64 = 786_432;
+/// one RTX PRO 6000 cannot hold the checkpoint's compiled 1M pool together
+/// with DFlash2 and the onboarding needed to keep both bundled towers on Sparks.
+const MIN_CARD_CONTEXT: u64 = 636_864;
 
 fn with_layout(rtx: usize, ranks: usize) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
@@ -344,14 +344,46 @@ fn muse_auto_pool_and_count_admission_preserve_one_recipe() {
     for hint in &direct.hints {
         assert!(counted.hints.iter().any(|other| other.what == hint.what));
     }
-    // Muse is not a contract family yet: its Recipe does not declare the host
-    // owners (transport rings/egress, spark intake, the media embedding cache)
-    // that `layout::charge_host` prices for it, so `contract_admission()` stays
-    // false and the count edge still runs the shared generic smaller-reserve
-    // retry. That retry adds its own follow-on hint here; the direct plan's
-    // typed refusal is what must survive, and it does. Declaring the host
-    // owners removes the retry (the close-stage item, #776).
-    assert!(counted.hints.iter().any(|hint| hint.what.contains("pool")), "{:?}", counted.hints);
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")), "{:?}", counted.hints);
+}
+
+/// HOST and PINNED share one sampled contract, including lazy retention and
+/// Load-only push owners. A failed host contract is never retried generically.
+#[test]
+fn host_contract_admits_all_phases_and_preserves_host_refusal() {
+    use crate::placement::planner::{Location, Phase};
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let package = tempfile::tempdir().unwrap();
+    let mut options = with_package(2, 6, package.path());
+    options.layout.as_mut().unwrap().host_cache_bytes = Some((1 << 30) + 123);
+    let report = input.plan(&options).unwrap();
+    assert!(report.fits, "{:?}", report.hints);
+    assert_eq!(report.host_budget_bytes, (1 << 30) + 123);
+    let host = report.host_ledger.as_ref().unwrap();
+    let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&input.checkpoint().config).unwrap();
+    let chunk = (256u64 << 20).max(crate::placement::families::muse_spark::mark_bytes(&cfg, 1));
+    assert_eq!(host.host_budget_bytes, ((1u64 << 30) + 123) / chunk * chunk,
+        "only whole retained chunks allocate");
+    for group in ["transport/rdma-rings", "transport/egress", "spark-intake", "token selector"] {
+        assert!(host.items.iter().any(|item| item.group == group), "missing {group}");
+    }
+    let ledger = report.phase_ledger.as_ref().unwrap();
+    let budget = ledger.budgets.iter().find(|budget| budget.id == "host").unwrap();
+    assert_eq!(budget.locations, [Location::HOST, Location::PINNED]);
+    let load = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Load).unwrap();
+    assert!(load.owned > 0 && load.opaque >= 4 << 30, "both estimated dense ranks are Load owners");
+    let ready = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Ready).unwrap();
+    assert_eq!(ready.owned + ready.opaque, host.deferred_bytes + host.host_budget_bytes);
+    options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
+    let direct = input.plan(&options).unwrap();
+    let counted = input.plan_spark_count(&options, 6, Some(6)).unwrap();
+    assert!(!direct.fits && !counted.fits);
+    assert!(direct.hints.iter().any(|hint| hint.what.contains("host")));
+    for hint in &direct.hints {
+        assert!(counted.hints.iter().any(|other| other.what == hint.what));
+    }
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }
 
 /// Each Spark's rings carry the shared Muse endpoint: the worst partial reply
@@ -582,7 +614,8 @@ fn explicit_unplaceable_tower_is_refused_by_name() {
     // exist across six Sparks.
     let refused = case(MediaMode::Rtx(Some(8)), MediaMode::Off);
     assert!(!refused.fits && !refused.placement_supported, "{:?}", refused.hints);
-    assert!(refused.encoder.is_none() && refused.audio_encoder.is_none(), "{:?}", refused.hints);
+    assert!(refused.encoder.as_ref().unwrap().reason.contains("not admitted"));
+    assert!(refused.audio_encoder.as_ref().unwrap().reason.contains("not admitted"));
     assert!(refused.hints.iter().any(|hint| hint.what
         .contains("requested vision tower (Rtx(Some(8))) has no executable device")), "{:?}", refused.hints);
     let refused = case(MediaMode::Off, MediaMode::Spark(Some(8)));

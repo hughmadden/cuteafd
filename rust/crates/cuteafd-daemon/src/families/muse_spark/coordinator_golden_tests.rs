@@ -98,7 +98,11 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         super::startup::Measured { total_bytes: 101_970_345_984, free_bytes: 101_375_541_248,
             untracked_bytes: 594_804_736 },
     ];
-    let built = super::startup::admit(super::startup::Options { cfg: &cfg, core: &core,
+    let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+    let built = super::startup::admit(super::startup::Options {
+        host: shared::HostInput { total: host_total, available: host_available, reserve: 8 << 30,
+            prefix_bytes: Some(0), prefix_entries: 0, media_bytes: Some(0), device_sampling: true },
+        cfg: &cfg, core: &core,
         catalog: &catalog, manifest: &manifest, measured, headroom_bytes: 2 << 30, spark_ranks: SPARKS,
         prefill, full_prefill_logits: false, slots: SEQUENCES as u64,
         mark_slots: mark.slots(shared::mark_bytes(&cfg, 1) as usize) as u64, max_context: None,

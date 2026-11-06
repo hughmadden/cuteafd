@@ -51,19 +51,18 @@ pub fn maximum_pool_tokens(capacities: &[u64], context: u64, requested: Option<u
 
 /// One coordinator GPU's planned budget: the CUDA context is the forecast
 /// charge; everything else the family states as an owner.
-pub fn planned_budget(gpu: u8, capacity_bytes: u64, headroom_bytes: u64, context_bytes: u64) -> Budget {
+pub fn planned_budget(gpu: u8, physical_bytes: u64, capacity_bytes: u64, headroom_bytes: u64, context_bytes: u64) -> Budget {
     Budget { id: format!("rtx{gpu}"), locations: vec![Location::coordinator(gpu)],
-        physical_bytes: capacity_bytes, logical_bytes: capacity_bytes, headroom: headroom_bytes,
+        physical_bytes, logical_bytes: capacity_bytes, headroom: headroom_bytes,
         baseline: Baseline::Forecast { occupied: context_bytes,
             source: "CUDA context and modules on the coordinator GPU".into(), assumed: false } }
 }
 
-/// A measured coordinator sample. `free` is clamped to the admitted capacity,
-/// so an operator cap below the sampled free memory cannot invert the charge.
-pub fn measured_budget(gpu: u8, capacity_bytes: u64, headroom_bytes: u64, free_bytes: u64) -> Budget {
+/// A measured sample keeps physical occupancy independent of the logical cap.
+pub fn measured_budget(gpu: u8, physical_bytes: u64, capacity_bytes: u64, headroom_bytes: u64, free_bytes: u64) -> Budget {
     Budget { id: format!("rtx{gpu}"), locations: vec![Location::coordinator(gpu)],
-        physical_bytes: capacity_bytes, logical_bytes: capacity_bytes, headroom: headroom_bytes,
-        baseline: Baseline::Sampled { free: free_bytes.min(capacity_bytes), phase: Phase::Load,
+        physical_bytes, logical_bytes: capacity_bytes, headroom: headroom_bytes,
+        baseline: Baseline::Sampled { free: free_bytes, phase: Phase::Load,
             source: "coordinator free memory at admission".into() } }
 }
 
@@ -87,6 +86,62 @@ pub fn production_request(context: u64, pool: Option<u64>, onboard: Onboard, pre
         prefill: Pin::Exact(prefill), operation, resident_weight_limit, spark_reply_formats }
 }
 
+/// One host sample and the operator's retention settings. HOST and PINNED
+/// consume the same physical budget; quotas are resolved before the solve.
+#[derive(Debug, Clone, Copy)]
+pub struct HostInput {
+    pub total: u64,
+    pub available: u64,
+    pub reserve: u64,
+    pub prefix_bytes: Option<u64>,
+    pub prefix_entries: u64,
+    pub media_bytes: Option<u64>,
+    pub device_sampling: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HostAdmission {
+    pub prefix_bytes: u64,
+    pub prefix_chunk: u64,
+    pub media_bytes: u64,
+}
+
+/// Explicit estimate until the first Muse host census (#1326), not a GLM
+/// measurement: ordinary scheduler, tokenizer, RPC metadata and allocator state.
+pub const HOST_RUNTIME: crate::placement::inventory::MemoryFigure = crate::placement::inventory::MemoryFigure {
+    bytes: 512 << 20,
+    attribution: crate::placement::inventory::FigureAttribution::Estimated {
+        derivation: "512 MiB ordinary process state pending the first Muse host census (#1326)" },
+    evidence: "Muse host owner inventory; unmeasured residual (#1326)",
+    producing_commit: "planner-muse_spark-close",
+    identity: crate::placement::inventory::FigureIdentity { declared_graphs: "Muse serving",
+        programs_sha256: "unmeasured", native_sha256: "unmeasured", toolchain: "unmeasured",
+        gpu_class: "sm120", driver: "unmeasured", layout: "Muse host ordinary residual" },
+};
+
+impl HostInput {
+    pub fn budget(self) -> Budget {
+        Budget { id: "host".into(), locations: vec![Location::HOST, Location::PINNED],
+            physical_bytes: self.total, logical_bytes: self.total, headroom: self.reserve.max(self.total / 10),
+            baseline: Baseline::Sampled { free: self.available, phase: Phase::Load,
+                source: "coordinator MemAvailable/cgroup working set before admission".into() } }
+    }
+
+    pub fn quotas(self, cfg: &MuseSparkConfig, context: u64, slots: u64) -> Result<HostAdmission, Refusal> {
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE_ROWS,
+            page_bytes: cfg.full_layers() as u64 * cfg.kv_record_bytes() as u64 * PAGE_ROWS,
+            mark_bytes: mark_bytes(cfg, 1), draft_bytes: 0 };
+        let prefix_bytes = if self.prefix_entries == 0 { 0 } else {
+            geometry.resolve(self.prefix_bytes, context, slots, self.total, geometry.chunk_bytes())
+                .ok_or_else(|| invalid("host prefix quota geometry overflow"))? };
+        if self.prefix_entries > 0 && self.prefix_bytes != Some(0) && prefix_bytes == 0 {
+            return Err(invalid("host prefix quota resolves to zero; disable explicitly or provide a positive quota"));
+        }
+        Ok(HostAdmission { prefix_bytes, prefix_chunk: geometry.chunk_bytes().min(prefix_bytes),
+            media_bytes: self.media_bytes.unwrap_or((8 << 30).min(self.total / 20)) })
+    }
+}
+
 /// Everything Muse knows before a solve: geometry, budgets and header-exact
 /// cost tables, identical on the planned and measured edges.
 pub struct ProductionInput<'a> {
@@ -95,6 +150,7 @@ pub struct ProductionInput<'a> {
     pub catalog: &'a crate::OfficialV41Catalog,
     /// One coordinator budget per RTX plus one managed budget per Spark rank.
     pub budgets: Vec<Budget>,
+    pub host: HostInput,
     pub prefill: PrefillPlan,
     pub full_prefill_logits: bool,
     /// Active sequence slots (each owns its sliding rings).
@@ -128,6 +184,8 @@ pub struct PreparedMuse<'a> {
     global: GlobalLayout,
     projections: Vec<crate::families::muse_spark::weight_layout::RankProjections>,
     spark_budget: SparkBudgetInventory,
+    host: HostAdmission,
+    push: Vec<crate::push_load::PushHostEnvelope>,
 }
 
 /// The one admitted answer. Both edges read the same fields.
@@ -148,6 +206,9 @@ pub struct AdmittedMuse {
     pub projections: Vec<crate::families::muse_spark::weight_layout::RankProjections>,
     /// Header-exact per-rank Spark arena slices for the selected onboarding.
     pub spark_budget: SparkBudgetInventory,
+    pub solve_us: u64,
+    pub host: HostAdmission,
+    pub push: crate::push_load::PushHostEnvelope,
 }
 
 impl AdmittedMuse {
@@ -236,7 +297,7 @@ fn tower_options(media: &MediaOptions, gpus: usize, sparks: usize)
 
 impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
-        let ProductionInput { cfg, core, catalog, budgets, prefill, full_prefill_logits, slots, mark_slots,
+        let ProductionInput { cfg, core, catalog, mut budgets, host, prefill, full_prefill_logits, slots, mark_slots,
             context, maximum_pool_tokens, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
             media } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
@@ -255,6 +316,8 @@ impl<'a> ProductionInput<'a> {
         if !catalog.per_expert_output_norm() {
             return Err(invalid("Spark experts must carry their post-expert norm"));
         }
+        let host_quotas = host.quotas(cfg, context, slots)?;
+        budgets.push(host.budget());
         let gpus = coordinator;
         let pair = gpus == 2;
         let (_, modes) = executor(gpus).map_err(anyhow_refusal)?;
@@ -287,16 +350,42 @@ impl<'a> ProductionInput<'a> {
                 usize::try_from(prefill.span_rows).map_err(|_| Refusal::Overflow("Muse span rows"))?,
                 cfg.vocab_size).map_err(anyhow_refusal)?
         } else { 0 };
-        // The transport cutoff the runtime seals: the reservation assumes one
-        // verify row without a drafter, as the planner has always sized it.
-        let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(partial_bf16_max_rows, 1,
+        // Validate the same widest verify step the runtime seals.
+        let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(partial_bf16_max_rows,
+            crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             partial_reply_formats).map_err(anyhow_refusal)?;
         let (_, planes) = intake(cfg, prefill, cutoff, slots_usize, spark_ranks).map_err(anyhow_refusal)?;
         let head_gpu = u8::try_from(gpus - 1).map_err(|_| Refusal::Overflow("Muse GPUs"))?;
 
         // Fixed owners: the list the request builder charged, now with real
         // lifetimes and one uniform charge path.
-        let mut components = Vec::new();
+        let mut components = crate::placement::planner::serving::ServingOwners {
+            selector: crate::placement::planner::serving::SelectorOwners {
+                location: Location::coordinator(head_gpu),
+                capacity: crate::families::muse_spark::lane::HEAD_ROWS, vocab: cfg.vocab_size,
+                device_sampling: host.device_sampling },
+            prefix: crate::placement::planner::serving::HostPrefixOwners {
+                quota_bytes: host_quotas.prefix_bytes, chunk_bytes: host_quotas.prefix_chunk },
+        }.components(maximum_pages)?;
+        let transport = super::host_transport(cfg, prefill, cutoff, slots_usize, spark_ranks)
+            .map_err(anyhow_refusal)?;
+        for (id, group, bytes) in [("rings", "transport/rdma-rings", transport.rings),
+            ("egress", "transport/egress", transport.egress),
+            ("intake", "spark-intake", transport.intake)] {
+            components.extend(buffer(format!("muse.host.{id}"), Location::PINNED, bytes,
+                Lifetime::RESIDENT, Category::Staging, group, maximum_pages));
+        }
+        if full_prefill_logits {
+            let bytes = cuteafd_core::memory_layout::host_logits_bytes(prefill.span_rows,
+                prefill.unit_rows, cfg.vocab_size as u64).ok_or(Refusal::Overflow("Muse scoring logits"))?;
+            components.extend(buffer("muse.host.scoring".into(), Location::HOST, bytes,
+                Lifetime { first: Phase::Warmup, last: Phase::Growth }, Category::Workspace,
+                "host scoring logits", maximum_pages));
+        }
+        components.push(Component { activation: Activation::always(),
+            bytes: ByteCurve::fixed(HOST_RUNTIME.bytes, maximum_pages),
+            kind: ComponentKind::Allowance(Allowance { location: Location::HOST, bytes: HOST_RUNTIME.bytes,
+                lifetime: Lifetime::RESIDENT, source: HOST_RUNTIME.evidence.into(), assumed: true }) });
         for gpu in 0..gpus {
             let location = Location::coordinator(gpu as u8);
             let layer = layouts.iter().try_fold(0u64, |sum, ranks| {
@@ -397,7 +486,19 @@ impl<'a> ProductionInput<'a> {
         let mut expert_cases = Vec::with_capacity(cfg.layers + 1);
         // Count zero is a case too: with every routed layer on the Sparks, the
         // slice ledger is the whole Spark charge and must bind their budgets.
+        let mut push = Vec::with_capacity(cfg.layers + 1);
+        let mut validation = vec![0u64; gpus];
+        let manifest = catalog.exl3().ok_or_else(|| invalid("Muse push requires EXL3 headers"))?;
         for count in 0..=cfg.layers {
+            if count > 0 {
+                for (gpu, bytes) in validation.iter_mut().enumerate() {
+                    let residency = manifest.residency(crate::V41Exl3Layer::Backbone(count - 1), gpus, gpu)
+                        .map_err(anyhow_refusal)?;
+                    *bytes = bytes.checked_add(residency.loads.iter()
+                        .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
+                        .ok_or(Refusal::Overflow("Muse push validation"))?;
+                }
+            }
             let mut sum = [0u64; 2];
             for layer in 0..count {
                 for gpu in 0..gpus {
@@ -431,6 +532,28 @@ impl<'a> ProductionInput<'a> {
                         Category::Runtime, "Spark I/O slots and runtime reserve", maximum_pages));
                 }
             }
+            // Historical for_steps bounds, not the smaller observed pinned peak:
+            // 1191-muse-min-pair: 1,042,284,032 B including its 128 MiB ring.
+            // muse-max-push-incast8: 1,643,027,968 B including two 128 MiB rings.
+            // Max's per-rank split was not logged, so each rank covers the whole
+            // dense bound rounded up. Header-only exact builder: #1274.
+            let dense_bound = if pair { 2 << 30 } else { 1 << 30 };
+            let envelope = crate::push_load::PushHostEnvelope::new(validation.clone(), vec![dense_bound; gpus],
+                cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64,
+                cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64)?;
+            for owner in envelope.allocations("muse.push")? {
+                if owner.id.ends_with(".dense") {
+                    components.push(Component { activation: Activation::always(),
+                        bytes: ByteCurve::fixed(owner.bytes, maximum_pages),
+                        kind: ComponentKind::Allowance(Allowance { location: owner.location, bytes: owner.bytes,
+                            lifetime: owner.lifetime, source: format!("Muse dense push staging: estimated {} GiB/rank from 1191-muse-min-pair / muse-max-push-incast8 for_steps bounds (#1274)", dense_bound >> 30),
+                            assumed: true }) });
+                } else {
+                    let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+                    components.push(Component::allocation(owner, bytes, false, maximum_pages));
+                }
+            }
+            push.push(envelope);
             expert_cases.push(Case { when: vec![When::Onboard(count)], value: components });
         }
 
@@ -439,6 +562,11 @@ impl<'a> ProductionInput<'a> {
         let mut encoder_cases = Vec::with_capacity(encoders.len());
         for (option, (vision, audio)) in encoders.iter().enumerate() {
             let mut components = Vec::new();
+            if vision.admitted_bytes() > 0 || audio.admitted_bytes() > 0 {
+                components.extend(buffer(format!("muse.host.media.{option}"), Location::HOST,
+                    host_quotas.media_bytes, Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                    Category::Embedding, "media/embedding-cache", maximum_pages));
+            }
             for (name, placement) in [("vision", vision), ("audio", audio)] {
                 let locations: Vec<Location> = match placement.kind {
                     crate::plan::encoder::EncoderKind::Off => Vec::new(),
@@ -470,7 +598,7 @@ impl<'a> ProductionInput<'a> {
             spark_ranks, encoders, modes: (media.vision, media.audio), cases, peaks, local: local.clone(),
             drafter: drafter.clone() };
         Ok(PreparedMuse { recipe, budgets, prefill_logits_bytes, local, drafter, layouts, global, projections,
-            spark_budget })
+            spark_budget, host: host_quotas, push })
     }
 }
 
@@ -562,7 +690,7 @@ impl MuseRecipe<'_> {
             attention_by_kind: vec![(AttentionClass::Gqa, AttentionPlacement::Heads),
                 (AttentionClass::Swa, AttentionPlacement::Heads)],
             peer_row_bytes: 0, onboard_layers: count, max_pool_tokens_no_onboard: None,
-            layers: assignments, movables: vec![], expert_ranges: ranges, residual, hops, tp2,
+            layers: assignments, movables: home.into_iter().map(|gpu| (crate::placement::MovableId::Drafter, gpu)).collect(), expert_ranges: ranges, residual, hops, tp2,
             items: (0..self.gpus).map(|gpu| solved.items(Location::coordinator(gpu as u8)))
                 .collect::<Result<_, _>>()? };
         MUSE_SPARK.check(&placement).map_err(|error| invalid(&error.to_string()))?;
@@ -597,7 +725,6 @@ impl MuseRecipe<'_> {
             if mode != MediaMode::Auto || placement.kind != EncoderKind::Off || placement.weights > 0 {
                 return;
             }
-            if placement.reason.is_empty() || placement.reason == "disabled or no checkpoint tower" { return; }
             placement.reason = format!("auto native tower disabled by shared admission: {}",
                 solved.encoder_diagnostics.iter().map(|(reason, _)| reason.as_str())
                     .collect::<Vec<_>>().join("; "));
@@ -710,11 +837,58 @@ impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
         let PreparedMuse { recipe, budgets, prefill_logits_bytes, local, drafter, layouts, global, projections,
-            spark_budget } = self;
+            spark_budget, mut host, push } = self;
+        let started = std::time::Instant::now();
         let solved = solve(request, budgets, &recipe)?;
+        let solve_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         let (placement, spark) = recipe.execution(&solved)?;
+        let push = push.get(placement.onboard_layers).ok_or_else(|| invalid("push onboarding extent"))?.clone();
         let media = recipe.media(&solved)?;
+        if media.vision.admitted_bytes() == 0 && media.audio.admitted_bytes() == 0 { host.media_bytes = 0; }
         Ok(AdmittedMuse { placement, spark, draft_home: solved.decisions.draft_home, solved, media, local,
-            drafter, prefill_logits_bytes, layouts, global, projections, spark_budget })
+            drafter, prefill_logits_bytes, layouts, global, projections, spark_budget, solve_us, host, push })
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    #[test]
+    fn capped_sample_keeps_physical_occupied_bytes() {
+        let budget = measured_budget(0, 96 << 30, 80 << 30, 2 << 30, 92 << 30);
+        assert_eq!(budget.available().unwrap(), 74 << 30);
+        let planned = planned_budget(0, 96 << 30, 80 << 30, 2 << 30, 4 << 30);
+        assert_eq!(planned.available().unwrap(), budget.available().unwrap());
+        assert!(measured_budget(0, 96 << 30, 2 << 30, 0, 92 << 30).available().is_err());
+    }
+
+    #[test]
+    fn host_prefix_quota_matches_runtime_chunk_geometry() {
+        let cfg = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config()).unwrap();
+        let mut input = HostInput { total: 256 << 30, available: 256 << 30, reserve: 8 << 30,
+            prefix_bytes: None, prefix_entries: 20, media_bytes: Some(123), device_sampling: true };
+        let quota = input.quotas(&cfg, 1 << 20, 16).unwrap();
+        let chunk = (256u64 << 20).max(mark_bytes(&cfg, 1));
+        assert_eq!(quota.prefix_bytes, (32u64 << 30) / chunk * chunk);
+        assert_eq!(quota.prefix_chunk, chunk);
+        assert_eq!(quota.media_bytes, 123);
+        input.prefix_bytes = Some(1234);
+        assert_eq!(input.quotas(&cfg, 1 << 20, 16).unwrap().prefix_chunk, 1234);
+        input.prefix_entries = 0;
+        assert_eq!(input.quotas(&cfg, 1 << 20, 16).unwrap().prefix_bytes, 0);
+        input.prefix_entries = 20;
+        input.prefix_bytes = None;
+        input.total = 1;
+        assert!(input.quotas(&cfg, 1 << 20, 16).is_err());
+    }
+
+    #[test]
+    fn host_and_pinned_share_one_sample_and_headroom() {
+        let host = HostInput { total: 128 << 30, available: 100 << 30, reserve: 8 << 30,
+            prefix_bytes: Some(0), prefix_entries: 20, media_bytes: Some(0), device_sampling: true };
+        let budget = host.budget();
+        assert_eq!(budget.locations, vec![Location::HOST, Location::PINNED]);
+        assert_eq!(budget.available().unwrap(), (100 << 30) - (128 << 30) / 10);
     }
 }

@@ -888,7 +888,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         shutil.copytree(checkpoint_source, staged, dirs_exist_ok=True, copy_function=os.link)
     if family_config.get("model_type") == "glm_moe_dsa":
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
-    if family_config.get("model_type") == "muse_spark":
+    if family_config.get("model_type") == "muse_spark" and not (
+            hf / "hub/models--nvidia--Muse-Spark-Open-816B-A42B-DFlash2").exists():
         # Muse's plan reads the drafter it charges, so stage the shipped
         # DFlash2 drafter's header-exact config (the same fixture the loader
         # test uses) at the revision the shipped config names.

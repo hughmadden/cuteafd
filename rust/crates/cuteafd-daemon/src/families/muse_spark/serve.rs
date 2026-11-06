@@ -158,7 +158,15 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     // SAFETY: every native owner drops on this worker before the library.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
     let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
-    let built = startup::admit(startup::Options { cfg: &cfg, core: &core, catalog: &catalog,
+    crate::shared::inventory::startup_probe(&library, &device_ids, "muse-preweight", Default::default())?;
+    let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+    let built = startup::admit(startup::Options { host: cuteafd_loader::placement::families::muse_spark::HostInput {
+        total: host_total, available: host_available, reserve: args.prefix.host_cache_headroom_bytes,
+        prefix_bytes: match args.prefix.host_cache_bytes {
+            crate::shared::prefix::budget::HostBudget::Auto => None,
+            crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes) },
+        prefix_entries: args.prefix.prefix_cache_entries as u64, media_bytes: args.media_cache_bytes,
+        device_sampling: args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device }, cfg: &cfg, core: &core, catalog: &catalog,
         manifest: &manifest,
         measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
             free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
@@ -186,11 +194,12 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                 args.draft_kv_cache)
         }).transpose()?, media: Some(super::media::inventory(&args.snapshot,
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
+    tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
     let placement = &built.placement;
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
-    let mut media = super::media::Ready::load(args, &library, &built.media)?;
+    let mut media = super::media::Ready::load(args, &library, &built.media, built.host)?;
     let prefill = args.prefill()?;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_formats(args.expert_partial_bf16_max_rows,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
@@ -227,10 +236,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         let experts = package.as_ref().map(|package| super::onboard::push_plan(&cfg, placement,
             gpus, &onboarded, usize::try_from(prefill.unit_rows)?, package)).transpose()?;
         if admission_plan.coordinator_pushes() {
-            let (push, streams, ranks) = CoordinatorPush::prepare(&args.snapshot, Some(&catalog), gpus, experts)?;
+            let (push, streams, ranks) = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), gpus, experts, built.push.clone())?;
             Ok((push, Some((streams, ranks)), args.peers.len()))
         } else {
-            Ok((CoordinatorPush::prepare_alone(&args.snapshot, Some(&catalog), gpus, experts)?, None, 0))
+            Ok((CoordinatorPush::prepare_alone_admitted(&args.snapshot, Some(&catalog), gpus, experts, built.push.clone())?, None, 0))
         }
     })?;
     let (push, coordinator, push_sparks) = match prepared {
@@ -311,7 +320,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     tracing::info!(drafter = ?args.draft, onboarded = onboarded.len(), "Muse Spark drafter");
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
-        served_context, pages, local, draft, pricing, super::media::Binding::from_snapshot(&args.snapshot, cfg.vocab_size)?, args.prefill_packing)?;
+        served_context, pages, local, draft, pricing, super::media::Binding::from_snapshot(&args.snapshot, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
+    crate::shared::inventory::startup_probe(&library, &device_ids, "muse-backend-ready", Default::default())?;
     // Engine teardown may block while joining exchange workers; preserve the
     // original scheduler error before any backend or native owners unwind.
     // Scheduler-owned selection, cache copies and timing live beside the target head.
@@ -341,7 +351,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         };
         scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, eos,
             args.decode_share, &prefix, args.loop_abort.config(), args.token_io.token_select, &mut media, None,
-            || initialized(api))
+            || {
+                crate::shared::inventory::startup_probe(backend.library(), &args.devices(), "muse-scheduler-ready", Default::default())?;
+                initialized(api)
+            })
     })
 }
 

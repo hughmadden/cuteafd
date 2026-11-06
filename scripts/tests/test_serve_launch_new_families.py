@@ -732,15 +732,23 @@ def test_muse_examples_and_smoke_pin_the_qualified_drafter(tmp_path: Path, size,
     assert values["SPECULATOR_MODEL_ID"] == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
     assert values["SPECULATOR_MODEL_REVISION"] == "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
     assert (values["RTX_GPUS"], values["SPARK_COUNT"], values["POOL_TOKENS"]) == (str(len(gpus)), str(ranks), "auto")
-    assert values["VISION"] == values["AUDIO"] == "auto"
-    assert not any(key in values for key in ("MAX_CONTEXT_TOKENS", "RTX_EXPERT_LAYERS", "CONCURRENCY", "SPARK_DEVICE_BUDGET_BYTES"))
+    assert values["VISION"] == values["AUDIO"] == ("spark" if size == "min" else "auto")
+    if size == "min":
+        assert int(values["MAX_CONTEXT_TOKENS"]) > 262144
+        assert int(values["MAX_CONTEXT_TOKENS"]) % 64 == 0
+    else:
+        assert "MAX_CONTEXT_TOKENS" not in values
+    assert not any(key in values for key in ("RTX_EXPERT_LAYERS", "CONCURRENCY", "SPARK_DEVICE_BUDGET_BYTES"))
     assert not any(needle in path.read_text().lower() for needle in PRIVATE)
     _snapshot(tmp_path / "hf", values["SPECULATOR_MODEL_ID"], {}, revision=values["SPECULATOR_MODEL_REVISION"])
     keys = "".join(f"{k}={v}\n" for k, v in values.items()
                    if k not in ("MODEL_ID", "MODEL_REVISION") and not k.startswith("SPARK_"))
     keys += f"SPARK_COUNT={ranks}\n" + _hosts(ranks)
+    plan = {**MUSE_PLANNED, "spark_ranks": ranks,
+            "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
+            "audio_encoder": {"kind": {"kind": "spark", "rank": 1}, "replicas": []}}
     result = _family_launch_result(tmp_path, MUSE, values["MODEL_ID"], keys,
-                                  extra_args=("--wip", "muse"), encoder_plan=MUSE_PLANNED)
+                                  extra_args=("--wip", "muse"), encoder_plan=plan)
     serve = _line(result, "cuteafd serve-muse --snapshot")
     assert "--draft" in serve.split() and "--pool-tokens" not in serve.split()
     matrix = json.loads((ROOT / "scripts/bench/release-smoke-muse.json").read_text())
