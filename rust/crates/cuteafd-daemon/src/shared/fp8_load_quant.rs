@@ -8,27 +8,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::ffi::c_void;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Segment { offset: u64, ptr: *const u8, bytes: u64 }
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Job {
-    segments: *const Segment,
-    count: i32,
-    rows: i32,
-    cols: i32,
-    layout: i32,
-    rule: i32,
-    pad: i32,
-    col0: i64,
-    pitch: i64,
-    q: *mut u8,
-    q_stride: i64,
-    scales: *mut f32,
-    scale_stride: i64,
-}
+use cuteafd_ffi::programs::{Fp8LoadJob as Job, Fp8LoadSegment as Segment};
 
 /// FP8 scale layout: 128x128 blocks, per row and 128-wide K block, or per row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,10 +104,7 @@ impl<'a> GpuQuantizer<'a> {
 /// Retained pinned table allocation, shared by load execution and admission.
 pub(crate) fn quant_table_bytes(rows: usize, layout: Layout) -> Result<usize> {
     let unit = if layout == Layout::Block { 128 } else { 1 };
-    ensure!(rows > 0 && rows % unit == 0, "quantization table needs whole scale units");
-    let bytes = std::mem::size_of::<Segment>().checked_add(std::mem::size_of::<Job>())
-        .and_then(|stride| stride.checked_mul(rows / unit)).context("quantization job table overflow")?;
-    Ok(bytes.max(1 << 20))
+    Ok(cuteafd_ffi::programs::fp8_load_table_bytes(rows, unit)?)
 }
 
 pub(crate) fn scale_code_table_bytes(targets: usize) -> Result<usize> {
