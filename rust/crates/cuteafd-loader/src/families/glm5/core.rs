@@ -660,6 +660,7 @@ mod tests {
                         byte_offset: 0, byte_length: shape.iter().product::<usize>() as u64 * 2, shape } });
             }
         }
+        checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         validate_native_attention(&cfg, &checkpoint)?;
         let mtp = format!("model.layers.{}.self_attn.o_proj", cfg.layers);
         assert_eq!(split(&cfg, &mtp), None);
@@ -699,6 +700,7 @@ mod tests {
                             byte_offset: 0, byte_length: shape.iter().product::<usize>() as u64 * 4, shape } });
                 }
             }
+            checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
             checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
             let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
             assert_eq!(core.native.len(), 2);
@@ -747,6 +749,7 @@ mod tests {
             }
         }
         let reindex = |checkpoint: &mut Checkpoint| {
+            checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
             checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
         };
         reindex(&mut checkpoint);
