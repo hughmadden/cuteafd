@@ -22,12 +22,12 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
-    def test_expert_usage_serve_flag_is_opt_in_for_supported_families(self) -> None:
+    def test_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
         text = FAMILY.read_text()
         start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 ]]; then')
         block = text[start:text.index('\nfi', start) + 3]
         for family in ['deepseek_v4', 'mimo_v2']:
-            for setting, expected in [('', ''), ('off', ''), ('on', '--expert-usage'), ('invalid', None)]:
+            for setting, expected in [('', '--expert-usage'), ('off', '--expert-usage=false'), ('on', '--expert-usage'), ('invalid', None)]:
                 with self.subTest(family=family, setting=setting):
                     script = '''set -euo pipefail
 family="$1"; setting="$2"; family_args=()
@@ -44,23 +44,63 @@ release_die() { echo "$*" >&2; exit 2; }
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(result.stdout, expected)
 
+    def test_unadapted_families_accept_policy_without_enabling_native_telemetry(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('case "$(get EXPERT_USAGE on)" in', text.index('family_args=(--embedding-placement'))
+        block = text[start:text.index('\nfi', start) + 3]
+        for family in ['kimi_k3', 'glm5', 'glm5_flash', 'muse_spark', 'step5', 'qwen4', 'qwen3_5']:
+            for setting in ['', 'on', 'off', 'invalid']:
+                with self.subTest(family=family, setting=setting):
+                    script = '''set -euo pipefail
+family="$1"; setting="$2"; family_args=()
+get() { printf '%s' "${setting:-$2}"; }
+release_die() { echo "$*" >&2; exit 2; }
+'''
+                    result = subprocess.run(['bash', '-c', script + block +
+                        '\nprintf \'%s\' "${family_args[*]}"', 'test', family, setting],
+                        cwd=ROOT, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2 if setting == 'invalid' else 0, result.stderr)
+                    self.assertEqual(result.stdout, '')
+
+    def test_v41_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
+        source = v41_source()
+        start = source.index('case "$(get EXPERT_USAGE on)" in')
+        block = source[start:source.index('\nesac', start) + len('\nesac')]
+        for setting, expected in [('', '--expert-usage'), ('off', '--expert-usage=false'), ('on', '--expert-usage'), ('invalid', None)]:
+            with self.subTest(setting=setting):
+                script = '''set -euo pipefail
+setting="$1"; args=()
+get() { printf '%s' "${setting:-$2}"; }
+release_die() { echo "$*" >&2; exit 2; }
+'''
+                result = subprocess.run(['bash', '-c', script + block +
+                    '\nprintf \'%s\' "${args[*]}"', 'test', setting],
+                    cwd=ROOT, capture_output=True, text=True)
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('EXPERT_USAGE must be on or off', result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected)
+
     def test_v41_planner_receives_normalized_effective_config(self) -> None:
         source = v41_source()
         block = source[source.index('count_args='):source.index('if [[ -n "$wip_layout" ]]; then', source.index('count_args='))]
-        for requested, expected in [(None, 'on'), ('off', 'off')]:
-            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as temporary:
+        for requested, expected, usage in [(None, 'on', None), (None, 'on', 'off'), ('off', 'off', 'on')]:
+            with self.subTest(requested=requested, usage=usage), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 config = root / 'sparse.config'
                 config.write_text('  SPECULATOR = "dspark" # draft mode\nDSPARK_DRAFT_LIMIT=\'7\' # width\n'
                                   'SPARK_0_HOST="ostrich" # first\nSPARK_1_HOST=\'dodo\'\n'
                                   'SPARK_0_LANE_A=10.55.0.1\nSPARK_1_LANE_A=10.55.0.2\n'
+                                  + (f'EXPERT_USAGE="{usage}" # telemetry policy\n' if usage else '')
                                   + (f'TP2_DSPARK_EXPERTS="{requested}" # explicit override\n' if requested else ''))
                 script = '''set -euo pipefail
 source scripts/lib/release-common.sh
 release_load_config "$1"
 release_resolve_tp2_dspark_experts deepseek_v41 2
 dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
-get() { printf '%s' "${2:-}"; }
+get() { if [[ "$1" == EXPERT_USAGE ]]; then printf '%s' "${EXPERT_USAGE:-${2:-}}"; else printf '%s' "${2:-}"; fi; }
 container_hf_home=/hf
 namespace_mount_args=()
 '''
@@ -74,11 +114,27 @@ printf 'mount=%s\\n' "${count_mounts[@]}"
                 lines = result.stdout.splitlines()
                 self.assertEqual(lines[:4], [expected, 'dspark', '7', '2'])
                 normalized = dict(line.split('=', 1) for line in lines[4:] if not line.startswith(('arg=', 'mount=')))
-                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DSPARK_DRAFT_LIMIT='7',
+                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DSPARK_DRAFT_LIMIT='7', EXPERT_USAGE=usage or 'on',
                     **{f'SPARK_{rank}_HOST': host for rank, host in enumerate(['ostrich', 'dodo'])}))
                 self.assertIn('arg=--config', lines)
                 self.assertIn('arg=/run/cuteafd-plan.config', lines)
                 self.assertTrue(any(line.startswith('mount=') and line.endswith(':/run/cuteafd-plan.config:ro') for line in lines))
+
+    def test_generic_planner_preserves_explicit_off(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('  case "$(get EXPERT_USAGE on)" in', text.index('plan_draft_args+=(--host-cache-bytes'))
+        block = text[start:text.index('\n  esac', start) + len('\n  esac')]
+        for setting, expected in [('', '--expert-usage'), ('on', '--expert-usage'), ('off', '--expert-usage=false')]:
+            with self.subTest(setting=setting):
+                script = '''set -euo pipefail
+setting="$1"; plan_draft_args=()
+get() { printf '%s' "${setting:-$2}"; }
+'''
+                result = subprocess.run(['bash', '-c', script + block +
+                    '\nprintf \'%s\' "${plan_draft_args[*]}"', 'test', setting],
+                    cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
 
     def test_cuda_capacity_matches_uuid_not_cuda_ordinal_and_creates_no_context(self) -> None:
         import contextlib

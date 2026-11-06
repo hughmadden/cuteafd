@@ -11,6 +11,7 @@ use crate::shared::experts::exlr8::dense_weights;
 pub(crate) mod push;
 pub(crate) mod weights;
 pub(crate) mod core_runtime;
+pub(crate) mod drafter;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
@@ -1201,12 +1202,6 @@ impl Opened {
                     chunk_bytes: host_config.as_ref().map_or(0, |config| config.chunk_bytes) },
             }.components(maximum_pages)?);
         }
-        if mark_bytes > 0 && args.draft_window_marks > 0 {
-            let bytes = mark_bytes.checked_mul(args.draft_window_marks).context("GLM draft marks overflow")? as u64;
-            let owner = Allocation::buffer("glm.draft.window_marks", Location::coordinator(0), bytes,
-                Lifetime::TARGET, cuteafd_core::memory_layout::Category::Prefix, "GLM draft window marks");
-            additional.push(Component::allocation(owner, ByteCurve::fixed(bytes, maximum_pages), false, maximum_pages));
-        }
         let frame_bytes = if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5,
             u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?)? } else { 64 << 20 };
         let (decode_link, prefill_link) = production_links(&self.cfg, spark_ranks, prefill,
@@ -1220,7 +1215,9 @@ impl Opened {
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
         let admitted = ProductionInput { cfg: &self.cfg, layers, context: args.max_context as u64,
-            maximum_pool_tokens, attention, gpus: devices.len(), prefill, target, draft: draft_facts,
+            maximum_pool_tokens, attention, gpus: devices.len(), prefill, target,
+            draft: draft_facts.clone().with_window_marks(mark_bytes.checked_mul(args.draft_window_marks)
+                .context("GLM draft marks overflow")? as u64),
             scratch: [scratch(true)?, scratch(false)?], context_scratch: context,
             exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: physical.peer_diagnostics,
             local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
@@ -1259,6 +1256,19 @@ impl Opened {
         let selected_peers = if working.spark_ranks > 0 { args.peers.as_deref() } else { None };
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
+        let draft_home = match cuteafd_loader::placement::draft::require_home(&placement, "glm5", &[0, 1])? {
+            None | Some(0) => DraftHome::Local,
+            Some(_) => {
+                let (device, stream) = peer_stream.context("admitted remote drafter needs the second GPU")?;
+                let rows = match (&ml4_draft, &provisional_drafter) {
+                    (Some(layout), _) => layout.capacity().block_rows,
+                    (None, Some(draft)) => args.draft_sequences.checked_mul(draft.block).context("GLM draft rows")?,
+                    (None, None) => anyhow::bail!("admitted remote drafter without a drafter"),
+                };
+                tracing::info!(device, rows, "GLM drafter admitted on GPU1 through the shared remote bridge");
+                DraftHome::Peer { device, stream, rows, bridge: draft_facts.bridge().to_vec() }
+            }
+        };
         let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
         let whole_range = (devices.len() == 1).then(|| placement.expert_ranges.first().copied())
             .flatten().filter(|range| range.layers > 0);
@@ -1325,7 +1335,7 @@ impl Opened {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                         planning.model(&self.cfg, layers, owners.as_deref(), native)
                     })?;
-                let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?;
+                let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home)?;
                 Ok((embedding, model, drafter))
             })?;
             let (dense_records, deferred) = sink.take();
@@ -1438,7 +1448,7 @@ impl Opened {
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, native_load.as_ref().context("native loader admission absent")?, records, &native_dense_records, owners.as_deref(), layers, &programs, &manifest, &loader, &devices, stream,
-                    peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file)?;
+                    peer_stream, native_push.take(), &media, &ml4_draft, &mut draft_file, &draft_home)?;
                 planned_drafter = loaded.3;
                 let tp2 = if let Some(range) = tp2_range.clone() {
                     Some(tp2_weights(range, loaded.2)?)
@@ -1531,7 +1541,7 @@ impl Opened {
         // admission peak is above the same resident target-weight baseline.
         let drafter = match planned_drafter {
             Some(drafter) => drafter,
-            None => self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file)?,
+            None => self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home)?,
         };
         if let Some(drafter) = &drafter { drafter.prepare_workspace()?; }
         self.startup_probe(&devices, "glm/draft-before-kv", None, false)?;
@@ -1598,6 +1608,10 @@ impl Opened {
             { args.draft_window_marks } else { 0 };
         cuteafd_bench::context::set_resolved("draft-window-marks", &engine.draft_window_marks.to_string());
         engine.bind_draft_core_head()?;
+        if let (Some(drafter), Some((device, stream))) = (&engine.drafter, peer_stream) {
+            drafter.bind_target(crate::shared::peer_split::RankDevice { device, stream }, &engine.embedding,
+                engine.draft_target_head()?)?;
+        }
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
             cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
         tracing::info!(plan_rows = engine.attention_plan.rows(),
@@ -1710,8 +1724,52 @@ impl Opened {
 }
 
 
+/// The drafter's admitted home: beside the target (GPU0), or GPU1 through the
+/// shared device-driven bridge with the admitted bridge owners.
+pub(crate) enum DraftHome {
+    Local,
+    Peer { device: i32, stream: *mut c_void, rows: usize, bridge: Vec<cuteafd_loader::placement::Demand> },
+}
+
 impl Opened {
+    /// The admitted single drafter copy. A GPU1 `home` loads the common executor
+    /// on the bridge's own GPU1 stream; GPU0 keeps the embedding and head.
+    #[allow(clippy::too_many_arguments)]
     fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
+        embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
+        ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
+        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+        home: &DraftHome) -> Result<Option<drafter::GlmDrafter<'s>>> {
+        let prepared = match home {
+            DraftHome::Local => None,
+            DraftHome::Peer { device, stream: peer_stream, rows, .. } => Some(crate::shared::draft::remote::Prepared::new(
+                &self.library, crate::shared::peer_split::RankDevice { device: args.device, stream },
+                crate::shared::peer_split::RankDevice { device: *device, stream: *peer_stream }, 0, drafter::IDENTITY,
+                crate::shared::draft::remote::decode_extent(*rows, self.cfg.hidden, self.cfg.vocab_size, 0)?)?),
+        };
+        let draft_stream = prepared.as_ref().map_or(stream, |prepared| prepared.stream.raw);
+        let draft_device = crate::shared::memory::device::Device { library: &self.library,
+            id: prepared.as_ref().map_or(args.device, |prepared| prepared.stream.device.id) };
+        let common = draft_device.own(|| self.load_common_drafter(args, programs, embedding, draft_stream, ml4_draft, draft_file))?;
+        let Some(common) = common.into_inner() else { return Ok(None) };
+        if let DraftHome::Peer { rows, bridge, .. } = home {
+            let c = &common.cfg;
+            let built = cuteafd_loader::placement::draft::remote_dflash_bridge_demands(c.hidden as u64,
+                c.vocab as u64, c.taps.len() as u64, (common.max_batch_sequences() * c.block) as u64, 0)?.demands;
+            ensure!(*rows == common.max_batch_sequences() * c.block && built == *bridge,
+                "GLM remote draft bridge differs from its admitted owners");
+            // Pooled draft pages route through the target's prefix copies; no GLM
+            // drafter has them (DFlash2 rings, mtp_dspark windows), so refuse one.
+            ensure!(common.mla_draft_page_bytes() == 0, "a remote GLM drafter cannot pool MLA draft pages");
+        }
+        Ok(Some(match prepared {
+            None => drafter::GlmDrafter::Local(common),
+            Some(prepared) => drafter::GlmDrafter::Remote(crate::shared::draft::remote_dflash::RemoteDflash::new(
+                draft_device.own(|| Ok(common))?, prepared)?),
+        }))
+    }
+
+    fn load_common_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
         embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
@@ -1773,9 +1831,9 @@ impl Opened {
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
         media: &crate::shared::experts::rtx::dense::Records,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
-        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
+        draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>, draft_home: &DraftHome)
         -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),
-            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<dflash::DflashDrafter<'s>>>)> {
+            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>, Option<Option<drafter::GlmDrafter<'s>>>)> {
         use crate::shared::token_io::native::{NativeVocabulary, VocabularyPlan};
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
         let world = devices.len();
@@ -1796,7 +1854,7 @@ impl Opened {
             Some((push, sparks)) => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::push(&self.library);
                 let model = loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?;
-                planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file)?);
+                planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file, draft_home)?);
                 let mut records = recorder.context("native push recorder")?.finish();
                 records.extend(load.sink.as_ref().context("push sink")?.take_all());
                 records.extend(media.clone());

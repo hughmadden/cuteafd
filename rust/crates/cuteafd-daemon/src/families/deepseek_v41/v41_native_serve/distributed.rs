@@ -73,6 +73,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
     cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
+    let usage = super::expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
     // Dense owners allocate exactly as through the mount; with coordinator push
     // possible their bytes are recorded and arrive in the Spark push group.
     let pushing = super::coordinator_push::wanted(&args, &catalog)?;
@@ -257,6 +258,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if args.tp2_attention { pass.enable_dual_attention()?; }
     let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    pass.install_expert_usage(usage.clone());
+    second.install_expert_usage(usage.clone());
     memory_checkpoint("decode lanes")?;
     // The prefill slots: one storage set per GPU (row planes at the reserve,
     // scratch at the unit cap), each slot's host objects on it.
@@ -315,6 +318,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             Duration::from_secs(120),
         )
     }).collect::<Result<Vec<_>>>().context("constructing distributed prefill slots")?;
+    for pass in &mut slot_passes { pass.install_expert_usage(usage.clone()); }
     // The slots hold their components' storage; the set itself owns nothing
     // more (WP7: a held LaneStorage would keep the replaced sparse arena alive).
     drop((lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage,
@@ -350,7 +354,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
     } else { None };
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
-    let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
+    // A local tower records on its owner thread and joins the coordinator group.
+    let (mut vision, vision_push) = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load_pushed(
+        &args, &catalog, records.is_some())?;
+    if let Some(records) = records.as_mut() { records.extend(vision_push.records()); }
     memory_checkpoint("vision")?;
     let prefix_arenas = super::prefix::Arenas::new(devices[0], None, snapshot_slots)?;
     let snapshot_bytes = super::prefix::Arenas::device_bytes(snapshot_slots, args.dspark);
@@ -426,6 +433,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         None => None,
     };
     if pushed.is_none() { if let Some(records) = &records { super::coordinator_push::fill(&lib, records)?; } }
+    // Either the group committed or its records (vision included) filled through the mount.
+    vision_push.commit()?;
     let pushed = if let Some(prepared) = prepared_draft {
         let [left, right] = pushed.context("V4.1 TP2 dSpark requires committed push")?;
         let mut weights = [left.native()?, right.native()?];

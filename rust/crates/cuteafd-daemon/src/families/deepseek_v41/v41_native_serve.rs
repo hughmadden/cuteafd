@@ -41,7 +41,7 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     // Identify the checkpoint before loading it: an unidentifiable directory fails in seconds.
     let mut profile = served_profile(args.model_id.clone(), &args.snapshot)?;
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
-    let Http { api, listen, snapshot, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
+    let Http { api, listen, snapshot, limits, http_queue_wait, console_hub, expert_usage } = http.expect("serving start loads the API");
     let vision_health = readiness
         .await
         .context("native target startup stopped")?
@@ -51,6 +51,7 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     cuteafd_bench::ready(&listener);
     tracing::info!(%listen,"native V4.1 target API ready");
     profile.vision_health = vision_health;
+    profile.expert_usage = expert_usage;
     let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
         api.serve(profile, &snapshot)?);
     axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -84,6 +85,25 @@ fn served_profile(model_id: Option<String>, snapshot: &std::path::Path) -> Resul
     Ok(ModelProfile::new(model_id.unwrap_or(checkpoint), ModelEncoding::DeepseekV41).with_v41_turns(turns))
 }
 
+impl crate::cli::NativeServeArgs {
+    fn expert_usage_enabled(&self) -> Result<bool> {
+        // This executor always runs routed experts: it has no skip-routed mode.
+        self.expert_usage_reader.configure(self.expert_usage, false).map_err(anyhow::Error::msg)
+    }
+}
+
+fn expert_usage<'a>(library: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
+    geometry: Option<&cuteafd_core::expert_usage::Geometry>)
+    -> Result<Option<std::rc::Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>> {
+    geometry.map(|geometry| {
+        let devices = (0..args.rtx_gpus).map(|rank| cuteafd_ffi::expert_usage::UsageDevice {
+            logical: rank as u8, cuda: rank as i32,
+        }).collect::<Vec<_>>();
+        cuteafd_ffi::expert_usage::ExpertUsage::new(library, geometry.clone(), &devices,
+            args.expert_usage_reader.clone()).map(std::rc::Rc::new)
+    }).transpose()
+}
+
 type Readiness = std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>;
 type Stats = std::sync::Arc<std::sync::Mutex<serde_json::Value>>;
 
@@ -96,6 +116,7 @@ struct Http {
     limits: cuteafd_api::openai::NativeLimits,
     http_queue_wait: Duration,
     console_hub: std::sync::Arc<cuteafd_api::openai::ConsoleHub>,
+    expert_usage: cuteafd_core::expert_usage::Reader,
 }
 
 /// The CUDA worker thread, its request queue and its startup readiness.
@@ -127,6 +148,7 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
 }
 
 fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
+    args.expert_usage_enabled()?;
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
     if args.prefix_cache_entries == u32::MAX {
         args.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(u64::from(args.concurrency)) as u32;
@@ -177,7 +199,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         Some(api) => {
             let console_hub = cuteafd_api::openai::ConsoleHub::new(args.console_text);
             console::install(console_hub.clone(), console::layout(&args))?;
-            Some(Http { api, listen, snapshot, limits, http_queue_wait, console_hub })
+            Some(Http { api, listen, snapshot, limits, http_queue_wait, console_hub, expert_usage: args.expert_usage_reader.clone() })
         }
         None => None,
     };
@@ -450,6 +472,7 @@ fn worker(
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
     cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
+    let usage = expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     admission::startup_phase(&lib, "v41/startup", device_total)?;
@@ -536,6 +559,8 @@ fn worker(
         Duration::from_secs(120),
     );
     let (mut pass, mut second) = (make_decode_pass()?, make_decode_pass()?);
+    pass.install_expert_usage(usage.clone());
+    second.install_expert_usage(usage.clone());
     admission::startup_phase(&lib, "v41/workspace:decode-lanes", device_total)?;
     // The prefill slots: one storage set (row planes at the reserve, scratch
     // at the unit), each slot's host objects on it (`shared::memory::row_window`).
@@ -567,6 +592,7 @@ fn worker(
         TargetTapWave::on_storage(slot_storage.taps.clone())?,
         Duration::from_secs(120),
     )).collect::<Result<Vec<_>>>()?;
+    for pass in &mut slot_passes { pass.install_expert_usage(usage.clone()); }
     // The slots hold their components' storage; the set itself is no owner.
     drop(slot_storage);
     let packed_suffix = admission::scoped(p, "encoder suffix", ||
@@ -640,7 +666,10 @@ fn worker(
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
     admission::startup_phase(&lib, "v41/drafter", device_total)?;
-    let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
+    // A local tower records on its owner thread and joins the coordinator group.
+    let (mut vision, vision_push) = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load_pushed(
+        &args, &catalog, records.is_some())?;
+    if let Some(records) = records.as_mut() { records.extend(vision_push.records()); }
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
@@ -700,6 +729,8 @@ fn worker(
     let mut pushed = coordinator.map(|planned| planned.receive(
         crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
         &catalog, &selected, resident_bytes)).transpose()?;
+    // Owners serve only after the whole group (vision weights included) committed.
+    vision_push.commit()?;
     drop(records);
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
@@ -1043,6 +1074,32 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
     Err(ScoringDone.into())
+}
+
+#[cfg(test)]
+mod expert_usage_policy_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn expert_usage_defaults_on_and_explicit_off_uses_the_shared_reader_policy() {
+        for requested in [None, Some(false), Some(true)] {
+            let mut argv = vec!["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+            if let Some(enabled) = requested {
+                argv.push(if enabled { "--expert-usage" } else { "--expert-usage=false" });
+            }
+            let requested = requested.unwrap_or(true);
+            let crate::cli::Commands::ServeNative(args) = crate::cli::Cli::try_parse_from(argv).unwrap().command else {
+                panic!("expected serve-native");
+            };
+            assert_eq!(args.expert_usage, requested);
+            assert_eq!(args.expert_usage_reader.snapshot()["enabled"], false);
+            assert_eq!(args.expert_usage_enabled().unwrap(), requested);
+            assert_eq!(args.expert_usage_reader.require_enabled().is_ok(), requested);
+            // Configuration alone never fabricates telemetry or allocates a native owner.
+            assert_eq!(args.expert_usage_reader.snapshot()["enabled"], false);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -38,6 +38,8 @@ pub(crate) struct ServeArgs {
     /// Opt in to a checkpoint-native MLA DFlash2 drafter.
     #[arg(long)] pub draft: Option<PathBuf>,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub draft_fp8: bool,
+    /// Split DFlash over the target pair (pending Context draft exports).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
     pub draft_fixed: Option<u8>,
@@ -79,6 +81,7 @@ impl ServeArgs {
     }
 
     fn validate(&self) -> Result<()> {
+        ensure!(!self.tp2_dflash, "Kimi TP2 DFlash requires draft Context attention exports");
         ensure!(self.device >= 0 && self.split_device.is_none_or(|peer| peer >= 0 && peer != self.device),
             "Kimi serving requires one device or two distinct coordinator devices");
         ensure!((1..=8).contains(&self.peers.len()) && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),

@@ -1,4 +1,4 @@
-//! Shared, opt-in expert telemetry owners, independent of family placement.
+//! Shared expert telemetry owners, independent of family placement.
 use super::planner::{Allocation, ByteCurve, Component, Lifetime, Location, Refusal};
 use cuteafd_core::{
     expert_usage::{device_owner, Geometry},

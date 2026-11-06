@@ -16,6 +16,8 @@ pub enum When {
     Prefill(PrefillShape),
     Lanes(u64),
     Embedding(EmbeddingHome),
+    /// The single drafter copy's coordinator GPU.
+    DraftHome(u8),
     Onboard { first: usize, last: usize },
     LocalLayer(usize),
     RemoteLayer(usize),
@@ -55,6 +57,9 @@ pub struct GlmRecipe<'a> {
     pub prefill: Vec<PrefillShape>,
     pub lanes: Vec<u64>,
     pub embedding: Vec<EmbeddingHome>,
+    /// Ordered coordinator homes of the single drafter copy; empty without a
+    /// drafter. GPU1 is offered only when its remote bridge owners are charged.
+    pub draft_homes: Vec<u8>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
     pub media_cache_bytes: u64,
     pub experts: Option<ExpertProfile>,
@@ -84,6 +89,8 @@ impl GlmRecipe<'_> {
             || !self.prefill.contains(&solved.decisions.prefill)
             || !self.lanes.contains(&solved.decisions.lanes)
             || solved.decisions.embedding.is_none_or(|home| !self.embedding.contains(&home))
+            || solved.decisions.draft_home.is_some() == self.draft_homes.is_empty()
+            || solved.decisions.draft_home.is_some_and(|home| !self.draft_homes.contains(&home))
         {
             return Err(invalid("resolved execution differs from prepared geometry"));
         }
@@ -184,7 +191,9 @@ impl GlmRecipe<'_> {
         let placement = Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: attention, attention_by_kind: vec![(AttentionClass::Dsa, attention)],
             peer_row_bytes, onboard_layers: local.len(), max_pool_tokens_no_onboard: None,
-            layers: assignments, movables: vec![], expert_ranges: ranges, residual, hops, tp2,
+            layers: assignments, movables: solved.decisions.draft_home
+                .map(|gpu| (crate::placement::MovableId::Drafter, gpu)).into_iter().collect(),
+            expert_ranges: ranges, residual, hops, tp2,
             items: (0..self.gpus).map(|rank| solved.items(Location::coordinator(rank as u8)))
                 .collect::<Result<_, _>>()? };
         super::super::GLM5.check(&placement).map_err(|error| invalid(&error.to_string()))?;
@@ -371,6 +380,10 @@ pub struct DraftFacts {
     weights: Vec<ResidentWeight>,
     loading: Vec<Sequential>,
     prefetch: Option<DflashPrefetch>,
+    /// Target-side staging and exchange controls of the shared device-driven
+    /// bridge that runs this drafter on GPU1 while GPU0 keeps the embedding and
+    /// head. Charged only when the solver selects the remote home.
+    bridge: Vec<crate::placement::Demand>,
     pub sync_upload_bytes: u64,
 }
 
@@ -384,6 +397,8 @@ impl DraftFacts {
             snapshot, representation, capacity, sm_count, fp8_mode, kv_cache)?;
         let mut facts = Self::from_gqa(&layout)?;
         facts.prefetch = Some(DflashPrefetch::from_snapshot(snapshot)?);
+        let cfg = crate::families::glm5::draft_physical::GlmDflashConfig::read(snapshot)?;
+        facts.bridge = Self::bridge_demands(cfg.hidden, cfg.vocab, cfg.taps.len(), capacity.block_rows)?;
         Ok(facts)
     }
 
@@ -468,19 +483,72 @@ impl DraftFacts {
                 Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
                 "ML4 bundled draft Mount bank"));
         }
+        facts.bridge = Self::bridge_demands(layout.target_hidden(), layout.target_vocab(),
+            layout.target_taps().len(), layout.capacity().block_rows)?;
         Ok(facts)
     }
 
-    pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+    /// The shared remote DFlash bridge with the head on GPU0: tap, input,
+    /// hidden and logit staging plus head scratch on GPU0, controls on both.
+    fn bridge_demands(hidden: usize, vocab: usize, taps: usize, rows: usize)
+        -> anyhow::Result<Vec<crate::placement::Demand>> {
+        Ok(crate::placement::draft::remote_dflash_bridge_demands(hidden as u64, vocab as u64,
+            taps as u64, rows as u64, 0)?.demands)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.owners.is_empty() && self.weights.is_empty() && self.loading.is_empty() && self.prefetch.is_none()
+    }
+
+    /// Ordered homes: GPU1 needs a second coordinator and the bridge inventory.
+    pub fn homes(&self, gpus: usize) -> Vec<u8> {
+        if self.is_empty() { vec![] } else if gpus == 2 && !self.bridge.is_empty() { vec![0, 1] } else { vec![0] }
+    }
+
+    /// Prefix window marks follow the drafter they snapshot.
+    pub fn with_window_marks(mut self, bytes: u64) -> Self {
+        if bytes > 0 {
+            self.owners.push(Allocation::buffer("glm.draft.window_marks", Location::coordinator(0), bytes,
+                Lifetime::TARGET, cuteafd_core::memory_layout::Category::Prefix, "GLM draft window marks"));
+        }
+        self
+    }
+
+    /// Owners in their GPU0-home form.
+    pub fn owners(&self) -> &[Allocation] { &self.owners }
+
+    /// The bridge's admitted owners for the runtime's exact allocation check.
+    pub fn bridge(&self) -> &[crate::placement::Demand] { &self.bridge }
+
+    /// Owners on `home`: device owners move with the drafter; host and pinned
+    /// owners stay. A GPU1 home adds the bridge owners named by their own GPU.
+    pub fn components(&self, home: u8, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
         if maximum_pages == 0 { return Err(invalid("zero draft fact pool extent")); }
-        let mut out = physical_components(self.owners.clone(), maximum_pages);
-        out.extend(self.weights.iter().cloned().map(|weight| {
+        if home > 1 || home == 1 && self.bridge.is_empty() { return Err(invalid("draft home has no executor")); }
+        let moved = |mut location: Location| {
+            if location == Location::coordinator(0) { location = Location::coordinator(home); }
+            location
+        };
+        let mut out = physical_components(self.owners.iter().cloned().map(|mut owner| {
+            owner.location = moved(owner.location); owner }), maximum_pages);
+        out.extend(self.weights.iter().cloned().map(|mut weight| {
+            weight.location = moved(weight.location);
             let bytes = ByteCurve::fixed(weight.weights.0, maximum_pages);
             Component::resident_weight(weight, bytes)
         }));
-        out.extend(self.loading.iter().cloned().map(|group| Component { activation: Activation::always(),
-            bytes: ByteCurve::fixed(group.peak(), maximum_pages), kind: ComponentKind::Sequential(group) }));
+        out.extend(self.loading.iter().cloned().map(|mut group| {
+            for member in &mut group.members { member.location = moved(member.location); }
+            Component { activation: Activation::always(),
+                bytes: ByteCurve::fixed(group.peak(), maximum_pages), kind: ComponentKind::Sequential(group) }
+        }));
         if let Some(prefetch) = &self.prefetch { out.extend(prefetch.components(maximum_pages)?); }
+        if home == 1 {
+            out.extend(physical_components(self.bridge.iter().enumerate().map(|(index, demand)| {
+                Allocation::buffer(format!("glm.draft.bridge.{index}.rank.{}", demand.gpu),
+                    Location::coordinator(demand.gpu), demand.bytes,
+                    Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, demand.category, demand.group.clone())
+            }), maximum_pages));
+        }
         Ok(out)
     }
 }
@@ -704,12 +772,16 @@ impl<'a> ProductionInput<'a> {
         let mut recipe = GlmRecipe { cfg: self.cfg, context: self.context, page_tokens,
             maximum_pages, attention, gpus: self.gpus, spark_links: self.spark_ranks > 0,
             prefill: vec![self.prefill], lanes: vec![1],
-            embedding: weights.iter().map(|(home, _)| *home).collect(), encoders: vec![], media_cache_bytes: 0, experts,
+            embedding: weights.iter().map(|(home, _)| *home).collect(), draft_homes: self.draft.homes(self.gpus),
+            encoders: vec![], media_cache_bytes: 0, experts,
             targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![], graphs: vec![],
             host: Some(host), owners: vec![], };
         recipe.owners.push(Case { when: vec![], value: self.owners });
         recipe.owners.push(Case { when: vec![], value: runtime.components(maximum_pages)? });
-        recipe.owners.push(Case { when: vec![], value: self.draft.components(maximum_pages)? });
+        for home in recipe.draft_homes.clone() {
+            recipe.owners.push(Case { when: vec![When::DraftHome(home)],
+                value: self.draft.components(home, maximum_pages)? });
+        }
         if let Some(load) = &native_load {
             recipe.owners.push(Case { when: vec![], value: load.components(maximum_pages) });
         }
@@ -1180,6 +1252,7 @@ struct Domains<'a> {
     prefill: (usize, &'a [PrefillShape]),
     lanes: (usize, &'a [u64]),
     embedding: (usize, &'a [EmbeddingHome]),
+    draft_home: Option<(usize, &'a [u8])>,
     onboard: Option<(usize, &'a ExpertProfile)>,
     remote: Option<usize>,
 }
@@ -1220,6 +1293,10 @@ impl Domains<'_> {
                         .filter_map(|(i, value)| (value == home).then_some(i))
                         .collect(),
                 ),
+                When::DraftHome(home) => {
+                    let (variable, homes) = self.draft_home.ok_or_else(|| invalid("draft home without a drafter"))?;
+                    (variable, homes.iter().enumerate().filter_map(|(i, value)| (value == home).then_some(i)).collect())
+                }
                 When::Onboard { first, last } => {
                     let (variable, profile) = self
                         .onboard
@@ -1411,6 +1488,14 @@ impl Recipe for GlmRecipe<'_> {
         contract
             .variables
             .push(Variable::Embedding(self.embedding.clone()));
+        if self.draft_homes.iter().enumerate().any(|(i, &gpu)|
+            usize::from(gpu) >= self.gpus || self.draft_homes[..i].contains(&gpu)) {
+            return Err(invalid("invalid or duplicate draft home"));
+        }
+        let draft_home = (!self.draft_homes.is_empty()).then(|| {
+            contract.variables.push(Variable::DraftHome(self.draft_homes.clone()));
+            (contract.variables.len() - 1, self.draft_homes.as_slice())
+        });
         let onboard = self
             .experts
             .as_ref()
@@ -1523,6 +1608,7 @@ impl Recipe for GlmRecipe<'_> {
             prefill: (prefill, &self.prefill),
             lanes: (lanes, &self.lanes),
             embedding: (embedding, &self.embedding),
+            draft_home,
             onboard,
             remote,
         };

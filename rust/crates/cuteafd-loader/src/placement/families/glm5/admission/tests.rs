@@ -120,7 +120,7 @@ fn draft_facts_preserve_owner_ids_resources_and_serial_fp8_sources() {
             assert!(facts.loading[0].members.iter().all(|owner| owner.location == Location::coordinator(0)
                 && owner.lifetime == Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }));
         }
-        assert!(facts.components(0).is_err());
+        assert!(facts.components(0, 0).is_err());
         let cfg = cfg();
         let mut input = production_input(&cfg, 1, 4, PrefillShape { rows: 128, waves: 3 });
         input.draft = facts.clone();
@@ -136,6 +136,53 @@ fn draft_facts_preserve_owner_ids_resources_and_serial_fp8_sources() {
         assert_eq!(solved.facts.sequential.iter().filter(|group| group.id == "glm.draft.load.sources").count(),
             usize::from(representation == Fp8Only));
     }
+}
+
+#[test]
+fn draft_home_is_one_solve_choice_that_balances_and_charges_its_bridge() {
+    use crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only;
+    let cfg = cfg();
+    let facts = DraftFacts::from_gqa(&gqa_layout(Fp8Only)).unwrap();
+    assert!(facts.bridge().is_empty() && facts.homes(2) == [0], "GPU1 needs the bridge inventory");
+    let mut facts = facts;
+    facts.bridge = DraftFacts::bridge_demands(256, 64, 2, 64).unwrap();
+    assert_eq!((facts.homes(1), facts.homes(2)), (vec![0], vec![0, 1]));
+    assert!(DraftFacts::default().homes(2).is_empty());
+    assert!(facts.components(1, 64).is_ok() && facts.components(2, 64).is_err());
+    let draft_bytes = facts.owners.iter().filter(|owner| owner.location == Location::coordinator(0))
+        .map(|owner| owner.bytes).sum::<u64>();
+    let bridge0 = facts.bridge().iter().filter(|demand| demand.gpu == 0).map(|demand| demand.bytes).sum::<u64>();
+    assert!(draft_bytes > bridge0, "fixture drafter must outweigh its GPU0 bridge staging");
+    let solve = |gpu: u8| {
+        let mut input = production_input(&cfg, 2, 2, PrefillShape { rows: 128, waves: 3 });
+        input.draft = facts.clone();
+        input.owners.push(Component::allocation(Allocation::buffer("test.pinned", Location::coordinator(gpu),
+            1 << 30, Lifetime::TARGET, Category::Weights, "single-copy owner pinned to one GPU"),
+            ByteCurve::fixed(1 << 30, 64), false, 64));
+        input.prepare().unwrap().admit(request()).unwrap()
+    };
+    // GPU1 already binds: the drafter stays beside its target head, no bridge.
+    let local = solve(1);
+    assert_eq!(local.solved.decisions.draft_home, Some(0));
+    assert_eq!(local.placement.movables, vec![(crate::placement::MovableId::Drafter, 0)]);
+    assert!(!local.solved.facts.allocations.iter().any(|owner| owner.id.starts_with("glm.draft.bridge.")));
+    // A GPU0-pinned owner makes GPU1 the home that lowers the binding GPU.
+    let remote = solve(0);
+    assert_eq!(remote.solved.decisions.draft_home, Some(1));
+    assert_eq!(remote.placement.movables, vec![(crate::placement::MovableId::Drafter, 1)]);
+    for owner in facts.owners.iter().filter(|owner| owner.location == Location::coordinator(0)) {
+        let moved = remote.solved.facts.allocations.iter().find(|a| a.id == owner.id).unwrap();
+        assert_eq!(moved.location, Location::coordinator(1));
+    }
+    for weight in &facts.weights {
+        assert!(remote.solved.facts.resident_weights.iter().any(|w| w.id == weight.id
+            && w.location == Location::coordinator(1) && w.weights == weight.weights));
+    }
+    let bridge = remote.solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("glm.draft.bridge."))
+        .map(|owner| (owner.location, owner.bytes)).collect::<Vec<_>>();
+    assert_eq!(bridge, facts.bridge().iter().map(|demand| (Location::coordinator(demand.gpu), demand.bytes))
+        .collect::<Vec<_>>());
+    assert!(bridge.iter().any(|(location, _)| *location == Location::coordinator(1)), "controls charged on both GPUs");
 }
 
 #[test]
@@ -484,6 +531,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         lanes: vec![1],
         encoders: vec![], media_cache_bytes: 0,
         embedding: vec![EmbeddingHome::Device(0), EmbeddingHome::HostPinned],
+        draft_homes: vec![],
         experts: Some(ExpertProfile {
             layers: vec![1],
             destination: vec![0, 1],

@@ -55,6 +55,7 @@ mod tests {
         for ranks in [1, 2] {
             let prefill = PrefillShape { rows: 128, waves: 1 };
             let placement = ProductionInput {
+            expert_usage: false,
                 config: &config, gpus: ranks, context: 4096, maximum_pool_tokens: 8192,
                 prefill, concurrency: 1, retained_turns: 0, replicated: false, spark_ranks: 4,
                 onboard_minimum: 0, onboard_counts: None,

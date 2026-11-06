@@ -127,7 +127,7 @@ pub(crate) fn check_cuda_room(library: &Path, device: i32, required: u64) -> Res
 }
 
 /// Cancellation may follow a failed receiver drain; media owns its allocations independently.
-pub(super) fn drain_external_weights(library: &Path, device: i32) -> Result<()> {
+pub(crate) fn drain_external_weights(library: &Path, device: i32) -> Result<()> {
     // SAFETY: the same architecture-matching library already owns these media arenas.
     let native = unsafe { cuteafd_ffi::NativeLibrary::load(library) }?;
     native.cuda_set_device(device)?;

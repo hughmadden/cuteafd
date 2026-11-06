@@ -156,6 +156,8 @@ pub struct LayoutOptions {
     pub dspark_draft_limit: u8,
     /// DeepSeek V4/V4.1 dSpark expert halves on both coordinator GPUs.
     pub tp2_dspark_experts: bool,
+    /// External DFlash attention/FFN split over the two target ranks.
+    pub tp2_dflash: bool,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
     pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
@@ -306,6 +308,7 @@ impl Default for LayoutOptions {
             draft_sequences: None,
             dspark_draft_limit: 5,
             tp2_dspark_experts: false,
+            tp2_dflash: false,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: false,
@@ -679,10 +682,20 @@ const fn gib(hundredths: u64) -> u64 {
 }
 
 fn mimo_draft_prefix_bytes(config: &serde_json::Value, marks: u64, rings: u64, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, u64), String> {
+    mimo_draft_prefix_bytes_tp(config, marks, rings, kv_cache, 1)
+}
+
+fn mimo_draft_prefix_bytes_tp(config: &serde_json::Value, marks: u64, rings: u64,
+    kv_cache: crate::families::qwen4::Qwen4KvCache, ranks: usize) -> Result<(u64, u64), String> {
+    if !matches!(ranks, 1 | 2) { return Err("invalid DFlash rank count".into()); }
     let field = |name| config[name].as_u64().filter(|&n| n > 0)
         .ok_or_else(|| format!("missing or zero {name}"));
-    let mark = crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(field("num_hidden_layers")?, field("num_key_value_heads")?, field("head_dim")?, kv_cache)
+    let heads = field("num_key_value_heads")?;
+    if heads % ranks as u64 != 0 { return Err("DFlash KV heads do not divide ranks".into()); }
+    let local = crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(field("num_hidden_layers")?, heads / ranks as u64, field("head_dim")?, kv_cache)
         .map_err(|e| e.to_string())?;
+    let mark = (local - 8).checked_mul(ranks as u64).and_then(|n| n.checked_add(8))
+        .ok_or("DFlash aggregate marks overflow")?;
     Ok((mark.checked_mul(marks).ok_or("DFlash marks overflow")?,
         rings.checked_mul(8).ok_or("DFlash floors overflow")?))
 }
@@ -808,6 +821,31 @@ mod draft_prefix_tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn tp2_draft_prefix_counts_rank_local_padding_and_one_floor() {
+        use crate::families::qwen4::Qwen4KvCache;
+        let config = serde_json::json!({"num_hidden_layers": 5, "num_key_value_heads": 2, "head_dim": 128});
+        for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+            let local = crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(
+                5, 1, 128, format).unwrap();
+            let aggregate = (local - 8) * 2 + 8;
+            assert_eq!(mimo_draft_prefix_bytes_tp(&config, 3, 18, format, 2).unwrap(),
+                (aggregate * 3, 144));
+            let whole = mimo_draft_prefix_bytes(&config, 1, 18, format).unwrap().0;
+            match format {
+                Qwen4KvCache::Bf16 => assert_eq!(aggregate, whole),
+                Qwen4KvCache::Fp8 => assert!(aggregate > whole),
+                _ => unreachable!(),
+            }
+            assert!(mimo_draft_prefix_bytes_tp(&config, u64::MAX, 18, format, 2).is_err());
+        }
+        for ranks in [0, 3] {
+            assert!(mimo_draft_prefix_bytes_tp(&config, 1, 1, Qwen4KvCache::Bf16, ranks).is_err());
+        }
+        let odd = serde_json::json!({"num_hidden_layers": 5, "num_key_value_heads": 3, "head_dim": 128});
+        assert!(mimo_draft_prefix_bytes_tp(&odd, 1, 1, Qwen4KvCache::Bf16, 2).is_err());
     }
 
     #[test]
@@ -1540,10 +1578,10 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         .then(|| mimo::mimo_dflash_dir(checkpoint, options)).flatten() {
         let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
             let cfg = crate::families::mimo_v2::draft_config::DflashConfig::read(&dir)?;
-            crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_heads as u64, cfg.head_dim as u64, options.draft_kv_cache)?
+            cfg.mark_bytes(if options.tp2_dflash { 2 } else { 1 }, options.draft_kv_cache)?
         } else if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings(), options.draft_kv_cache)
+            mimo_draft_prefix_bytes_tp(&config, 1, options.mimo_rings(), options.draft_kv_cache, if options.tp2_dflash { 2 } else { 1 })
                 .map_err(anyhow::Error::msg)?.0
         } else { 0 };
         mark_bytes = mark_bytes.checked_add(draft).context("MiMo draft mark overflow")?;

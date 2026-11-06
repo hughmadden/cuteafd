@@ -599,8 +599,7 @@ impl Opened {
             (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 256, false)
             .with_automatic_context(automatic_context).validate_explicit()?;
         if let Some(peer) = args.split_device {
-            ensure!(media.operands.is_empty() && media.steps.is_empty(), "Qwen dual media push requires its dense coordinator group");
-            return self.with_dual_engine(args, peer, automatic_context, body);
+            return self.with_dual_engine(args, peer, automatic_context, media, body);
         }
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;

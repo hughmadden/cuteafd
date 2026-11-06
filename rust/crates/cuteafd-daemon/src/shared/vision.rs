@@ -49,7 +49,7 @@ pub enum VisionError {
     #[error("vision encoding cancelled")]
     Cancelled,
 }
-type Result<T> = std::result::Result<T, VisionError>;
+pub(crate) type Result<T> = std::result::Result<T, VisionError>;
 
 #[derive(Clone, Debug, Deserialize)]
 struct MimoConfig {
@@ -140,6 +140,14 @@ struct TensorRead {
 pub struct TowerSpec {
     pub native: VisionSpec,
     reads: Vec<TensorRead>,
+}
+impl TowerSpec {
+    /// Header-only staged source windows of this tower's pushed contribution:
+    /// BF16 vectors widen in the same windows `push::Contribution` records.
+    pub(crate) fn staged_rects(&self) -> Vec<crate::shared::experts::rtx::dense::Rect> {
+        self.reads.iter().filter(|read| read.vector)
+            .flat_map(|read| push::widen_windows(&read.path, &read.metadata)).collect()
+    }
 }
 fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
     let mut files = BTreeSet::new();

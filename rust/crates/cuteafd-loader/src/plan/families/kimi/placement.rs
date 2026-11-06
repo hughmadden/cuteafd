@@ -33,6 +33,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         "Kimi K3 header lower bound: coordinator workspaces/graphs not charged; NOT serving admission".into(),
         "Spark budgets are offline estimates (including an explicit override), not load/steady census-qualified admission".into(),
     ] };
+    if opts.tp2_dflash {
+        report.refuse_placement("Kimi TP2 DFlash requires draft Context attention exports".into(),
+            "Disable --tp2-dflash until the draft window/noncausal Context kernel is installed.");
+        return memory;
+    }
     report.bytes_by_owner.clear();
     // One owner runs whole MLA layers, so its convention is Heads; a pair
     // resolves auto to Context.

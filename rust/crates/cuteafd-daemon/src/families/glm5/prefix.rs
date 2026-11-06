@@ -125,15 +125,27 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
         let paged = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |(records, index)| (rank, records, index)))
             .collect();
+        // A GPU1 drafter writes its window marks on its own bridge stream, so
+        // that stream is one of rank 1's readers: the copy fence orders it.
+        let draft_reader = engine.drafter.as_ref().and_then(|drafter| drafter.device().zip(drafter.stream()))
+            .map(|(device, stream)| Reader { device: device.id, stream });
         let copies = PrefixCopies::new(engine.library, (0..engine.ranks())
-            .map(|rank| Ok(vec![Reader { device: engine.on(rank, || engine.library.cuda_get_device())?,
-                stream: engine.stream_of(rank) }])).collect::<Result<_>>()?)?;
+            .map(|rank| {
+                let device = engine.on(rank, || engine.library.cuda_get_device())?;
+                Ok(std::iter::once(Reader { device, stream: engine.stream_of(rank) })
+                    .chain(draft_reader.filter(|reader| reader.device == device)).collect())
+            }).collect::<Result<_>>()?)?;
         let draft_marks = match engine.drafter.as_ref().filter(|d| d.mla_windows_only()) {
             Some(drafter) if mark_slots > 0 => {
                 let windows = drafter.mla_window_segments(0)?.iter().map(|w| w.bytes).sum::<usize>();
                 let bytes = draft_mark_bytes(true, windows).checked_mul(mark_slots)
                     .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
-                Some(DraftMarks { storage: DeviceAllocation::new(engine.library, bytes.max(256))?, windows, slots: mark_slots })
+                // Marks snapshot the drafter's rings and live on its admitted GPU.
+                let storage = match drafter.device() {
+                    Some(device) => device.run(|| DeviceAllocation::new(engine.library, bytes.max(256)))?,
+                    None => DeviceAllocation::new(engine.library, bytes.max(256))?,
+                };
+                Some(DraftMarks { storage, windows, slots: mark_slots })
             }
             _ => None,
         };
@@ -161,7 +173,7 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
     /// The drafter whose state a snapshot of `placement` carries (a window-ring MLA drafter
     /// with the placement's slot), if any.
     fn draft_of(&self, placement: &GlmPlacement)
-        -> Option<(&crate::shared::speculation::dflash::DflashDrafter<'a>, usize)> {
+        -> Option<(&super::drafter::GlmDrafter<'a>, usize)> {
         let drafter = self.engine.drafter.as_ref().filter(|d| d.mla_windows_only() || d.mla_draft_page_bytes() > 0)?;
         Some((drafter, placement.draft_slot?))
     }
@@ -180,18 +192,26 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
         drafter.copy_mla_windows(slot, &views, capture)
     }
 
+    /// Synchronous header copies run on the marks' (drafter's) device.
+    fn on_marks<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        match self.engine.drafter.as_ref().and_then(|drafter| drafter.device()) {
+            Some(device) => device.run(work),
+            None => work(),
+        }
+    }
+
     fn write_draft_header(&self, mark: MarkSlot, frontier: Option<usize>) -> Result<()> {
         let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
         let mut header = [0u8; DRAFT_MARK_HEADER];
         header[..8].copy_from_slice(&frontier.map_or(u64::MAX, |f| f as u64).to_le_bytes());
-        self.engine.library.copy_h2d(view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?, &header)?;
+        self.on_marks(|| self.engine.library.copy_h2d(view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?, &header))?;
         Ok(())
     }
 
     fn read_draft_header(&self, mark: MarkSlot) -> Result<Option<usize>> {
         let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
         let mut header = [0u8; DRAFT_MARK_HEADER];
-        self.engine.library.copy_d2h(&mut header, view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?)?;
+        self.on_marks(|| self.engine.library.copy_d2h(&mut header, view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?))?;
         let frontier = u64::from_le_bytes(header[..8].try_into().unwrap());
         Ok((frontier != u64::MAX).then_some(frontier as usize))
     }

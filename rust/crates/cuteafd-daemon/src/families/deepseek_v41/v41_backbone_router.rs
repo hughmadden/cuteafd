@@ -16,6 +16,20 @@ thread_local! {
 }
 const ROW_BYTES: [usize; 6] = [10240, 1, 1536, 24, 24, 5280];
 
+unsafe fn record_v41_routes(usage: Option<&cuteafd_ffi::expert_usage::ExpertUsage<'_>>,
+    device: i32, layer: usize, ids: *const std::ffi::c_void, rows: usize,
+    phase: cuteafd_ffi::expert_usage::UsagePhase, stream: *mut std::ffi::c_void) -> Result<()> {
+    let Some(usage) = usage else { return Ok(()); };
+    let tally = usage.routes(device, layer, phase)?;
+    // Bounded launches follow the real router, outside its phase-less graph.
+    for first in (0..rows).step_by(64) {
+        // SAFETY: the caller retains rows * 6 ids on the router's producer stream.
+        unsafe { tally.record(ids.cast::<u32>().add(first * 6).cast(),
+            (rows - first).min(64), None, 511, true, stream)?; }
+    }
+    Ok(())
+}
+
 /// Reserve planes: hidden, mask, scores, ids, routing, wire. These outputs
 /// may survive hooks or be read on fork streams. Pinned staging and the ring
 /// remain per-slot: host reads its [40][unit][6] ring only after its stream
@@ -128,6 +142,7 @@ impl<'a> BackboneRouterWeights<'a> {
                 Some(LoadStream { library: self.library, raw: self.library.cuda_stream_create()? })
             } else { None },
             storage,
+            expert_usage: None,
             window: RowWindow::NONE,
             kernel: self.library.v41_router()?,
             input_quantizer: self.library.v41_expert_input_quantizer()?,
@@ -386,6 +401,7 @@ mod reuse_tests {
     }
 }
 pub(crate) struct BackboneRouterWave<'w, 'a> {
+    expert_usage: Option<Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>,
     storage: Rc<BackboneRouterStorage<'a>>,
     #[cfg(test)]
     private_stream: Option<LoadStream<'a>>,
@@ -511,6 +527,16 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         );
         BackboneRouterStorage::storage_bytes(capacity, capacity)
     }
+    pub(crate) fn install_expert_usage(&mut self, usage: Option<Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>) {
+        self.expert_usage = usage;
+    }
+    unsafe fn record_routes(&self, rows: u32, phase: Option<cuteafd_ffi::expert_usage::UsagePhase>) -> Result<()> {
+        let (Some(usage), Some(phase)) = (&self.expert_usage, phase) else { return Ok(()); };
+        let ids = self.b(3);
+        // SAFETY: the wave owns the real router rows until this stream drains.
+        unsafe { record_v41_routes(Some(usage), ids.device_id, self.layer, ids.ptr,
+            rows as usize, phase, self.stream().raw) }
+    }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
         {
             #[cfg(test)]
@@ -573,9 +599,13 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     /// Hidden input is finite and initialized; mask bytes are 0 or 1 in the same
     /// row order. Both inputs are exclusively owned until the call drains.
     pub unsafe fn execute(&mut self, rows: u32) -> Result<RouterOutput<'_>> {
+        unsafe { self.execute_counted(rows, None) }
+    }
+    unsafe fn execute_counted(&mut self, rows: u32, phase: Option<cuteafd_ffi::expert_usage::UsagePhase>) -> Result<RouterOutput<'_>> {
         self.validate(rows)?;
         // The ring copy (if captured) completes with the host wait.
-        let launched = unsafe { self.enqueue(rows) }.and_then(|()| unsafe { self.ring_download(rows) });
+        let launched = unsafe { self.enqueue(rows) }.and_then(|()| unsafe { self.record_routes(rows, phase) })
+            .and_then(|()| unsafe { self.ring_download(rows) });
         launched.and(self.synchronize())?;
         self.ready = Some(rows);
         self.output()
@@ -654,6 +684,9 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     /// # Safety
     /// Same contract as execute; graph live row count must match.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<RouterOutput<'_>> {
+        unsafe { self.replay_counted(rows, None) }
+    }
+    unsafe fn replay_counted(&mut self, rows: u32, phase: Option<cuteafd_ffi::expert_usage::UsagePhase>) -> Result<RouterOutput<'_>> {
         self.validate(rows)?;
         let (graph, count) = self
             .graphs
@@ -668,7 +701,8 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         // Device-read routes ([`Self::device_read`]): later stages join the
         // chain; the remote layer's collect is its host wait.
         let device_read = self.device_read();
-        launched.and_then(|()| unsafe { self.ring_download(rows) })
+        launched.and_then(|()| unsafe { self.record_routes(rows, phase) })
+            .and_then(|()| unsafe { self.ring_download(rows) })
             .and_then(|()| if device_read { unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) } }
                 else { self.synchronize() })
             .or_else(|error| self.synchronize().and(Err(error)))?;
@@ -748,6 +782,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         &mut self,
         input: &FfnInput<'_>,
         image_mask: &[u8],
+        phase: cuteafd_ffi::expert_usage::UsagePhase,
     ) -> Result<RouterOutput<'_>> {
         self.invalidate();
         ensure!(
@@ -764,7 +799,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         let rows = input.tokens.len() as u32;
         let executed = (|| unsafe {
             self.stage_inputs(input.values, image_mask)?;
-            self.execute_captured(rows).map(|_| ())
+            self.execute_selected(rows, Some(phase)).map(|_| ())
         })();
         if executed.is_err() {
             // A staged copy may precede a graph preparation failure. Always
@@ -778,11 +813,14 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     /// # Safety
     /// Same initialized finite hidden and binary-mask contract as execute.
     pub unsafe fn execute_captured(&mut self, rows: u32) -> Result<RouterOutput<'_>> {
+        unsafe { self.execute_selected(rows, None) }
+    }
+    unsafe fn execute_selected(&mut self, rows: u32, phase: Option<cuteafd_ffi::expert_usage::UsagePhase>) -> Result<RouterOutput<'_>> {
         self.invalidate();
         if self.window.is_windowed() || !super::graph_policy::captures_shape(rows)
             || (self.graphs.get_shape(self.layer, self.weights, rows).is_none()
                 && !self.graphs.capture_allowed(self.layer, rows)) {
-            return unsafe { self.execute(rows) };
+            return unsafe { self.execute_counted(rows, phase) };
         }
         if self
             .graphs
@@ -793,12 +831,12 @@ impl<'a> BackboneRouterWave<'_, 'a> {
                 self.capture(rows)?;
             }
         }
-        unsafe { self.replay(rows) }
+        unsafe { self.replay_counted(rows, phase) }
     }
     /// # Safety
     /// Same input contract as execute_ffn; the future retains this wave and input
     /// until completion. Cancellation drains before their storage can be reused.
-    pub async unsafe fn execute_ffn_cooperative(&mut self, input: &FfnInput<'_>, image_mask: &[u8]) -> Result<RouterOutput<'_>> {
+    pub async unsafe fn execute_ffn_cooperative(&mut self, input: &FfnInput<'_>, image_mask: &[u8], phase: cuteafd_ffi::expert_usage::UsagePhase) -> Result<RouterOutput<'_>> {
         self.invalidate();
         ensure!(
             input.layer == self.layer
@@ -818,7 +856,8 @@ impl<'a> BackboneRouterWave<'_, 'a> {
             let graph = if self.window.is_windowed() { None } else { self.graphs.get_shape(self.layer, self.weights, rows).map(|(raw, _)| raw) };
             let library = self.stream().library; let stream = self.stream().raw;
             crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
-                graph, || self.enqueue(rows))
+                graph, || self.enqueue(rows))?;
+            self.record_routes(rows, Some(phase))
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         unsafe { self.ring_download(rows)?; }
@@ -1066,6 +1105,96 @@ mod host_order_tests {
         }))?;
         pass.drain()?;
         stream.require_complete()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod expert_usage_tests {
+    use super::*;
+    use cuteafd_core::expert_usage::{Geometry, Reader};
+    use cuteafd_ffi::expert_usage::{ExpertUsage, UsageDevice, UsagePhase};
+
+    #[test]
+    fn disabled_expert_usage_never_touches_router_operands_or_captures() {
+        let captures = cuteafd_ffi::graph_capture_sites();
+        for phase in [UsagePhase::Prefill, UsagePhase::Decode] {
+            // SAFETY: disabled telemetry must not inspect these deliberately invalid operands.
+            unsafe { record_v41_routes(None, -1, usize::MAX, std::ptr::null(),
+                usize::MAX, phase, std::ptr::null_mut()).unwrap(); }
+        }
+        assert_eq!(cuteafd_ffi::graph_capture_sites(), captures);
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA GPUs, CUTEAFD_NATIVE_LIB and CUTEAFD_SNAPSHOT"]
+    fn v41_expert_usage_real_router_phase_replay_and_bounded_rows() -> Result<()> {
+        // SAFETY: the matching native library outlives every fixture allocation and graph.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(
+            &std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let reader = Reader::default();
+        reader.configure(true, false).map_err(anyhow::Error::msg)?;
+        let usage = Rc::new(ExpertUsage::new(&library, Geometry { layers: 40, experts: 384,
+            topk: 6, routed_layers: (0..40).collect() },
+            &[UsageDevice { logical: 0, cuda: 0 }, UsageDevice { logical: 1, cuda: 1 }], reader.clone())?);
+        let mut expected_prefill = vec![0u64; 40 * 384];
+        let mut expected_decode = vec![0u64; 40 * 384];
+        for (device, layer) in [(0, 2), (1, 20)] {
+            library.cuda_set_device(device)?;
+            let weights = BackboneRouterWeights::load(&library, &catalog, layer, usize::MAX, 1 << 20)?;
+            let mut wave = weights.wave(144, usize::MAX)?;
+            wave.install_expert_usage(Some(usage.clone()));
+            wave.set_local_mode(true)?;
+            let [input, mask] = wave.inputs();
+            let hidden = (0..144 * 5120).flat_map(|i| {
+                let x = ((i * 7 % 31) as f32 - 15.0) / 128.0;
+                ((x.to_bits() >> 16) as u16).to_ne_bytes()
+            }).collect::<Vec<_>>();
+            library.copy_h2d(input, &hidden)?;
+            library.copy_h2d(mask, &[0; 144])?;
+            // Warmup and cold capture use the uncounted low-level entrypoint.
+            // SAFETY: all 144 input rows and masks are initialized and wave-owned.
+            unsafe { wave.execute_captured(13)?; }
+            let graph = wave.graphs.get_shape(layer, &weights, 13).unwrap().0;
+            let captures = cuteafd_ffi::graph_capture_sites();
+            for phase in [UsagePhase::Prefill, UsagePhase::Decode, UsagePhase::Decode, UsagePhase::Decode] {
+                // SAFETY: the real launch uses 13 initialized rows, never capacity 144.
+                let output = unsafe { wave.execute_selected(13, Some(phase))? };
+                let mut ids = vec![0; 13 * 24];
+                library.copy_d2h(&mut ids, output.ids)?;
+                let expected = match phase { UsagePhase::Prefill => &mut expected_prefill,
+                    UsagePhase::Decode => &mut expected_decode };
+                for bytes in ids.chunks_exact(4) {
+                    let expert = u32::from_ne_bytes(bytes.try_into().unwrap()) & 511;
+                    ensure!(expert < 384, "router selected invalid expert");
+                    expected[layer * 384 + expert as usize] += 1;
+                }
+                assert_eq!(wave.graphs.get_shape(layer, &weights, 13).unwrap().0, graph);
+            }
+            assert_eq!(cuteafd_ffi::graph_capture_sites(), captures);
+            // Known metadata-bearing IDs exercise three bounded <=64-row launches;
+            // the final capacity row is poison and must never count.
+            let words = (0..144 * 6).map(|i| if i < 129 * 6 {
+                (i % 384) as u32 | 0xa000_0000
+            } else { 383 }).collect::<Vec<_>>();
+            let bytes = words.iter().flat_map(|n| n.to_ne_bytes()).collect::<Vec<_>>();
+            library.copy_h2d(wave.b(3), &bytes)?;
+            // SAFETY: 129 complete ID rows remain live on this wave's stream.
+            unsafe { wave.record_routes(129, Some(UsagePhase::Prefill))?; }
+            wave.synchronize()?;
+            for &word in &words[..129 * 6] { expected_prefill[layer * 384 + (word & 511) as usize] += 1; }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let value = reader.snapshot();
+        ensure!(value["error"].is_null(), "snapshot worker failed");
+        let total = &value["windows"]["total"];
+        assert_eq!(total["prefill_routed_rows"], serde_json::json!(expected_prefill));
+        assert_eq!(total["decode_routed_rows"], serde_json::json!(expected_decode));
+        assert_eq!(expected_prefill.iter().sum::<u64>(), 2 * (13 + 129) * 6);
+        assert_eq!(expected_decode.iter().sum::<u64>(), 2 * 3 * 13 * 6);
+        library.cuda_set_device(0)?;
         Ok(())
     }
 }

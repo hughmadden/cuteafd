@@ -5,7 +5,35 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
-use std::{collections::HashMap, ffi::c_void, path::{Path, PathBuf}};
+use std::{borrow::Cow, collections::HashMap, ffi::c_void, path::{Path, PathBuf}};
+
+#[derive(Clone, Copy)]
+pub(crate) enum ShardAxis { Rows, Columns }
+
+fn shard(mut rect: Rect, axis: ShardAxis, rank: usize, ranks: usize) -> Result<Rect> {
+    ensure!(matches!(ranks, 1 | 2) && rank < ranks, "drafter shard rank {rank} of {ranks}");
+    let range = match axis { ShardAxis::Rows => &mut rect.rows, ShardAxis::Columns => &mut rect.cols };
+    let units = match axis { ShardAxis::Rows => 1, ShardAxis::Columns => 2 };
+    ensure!(range.len() % (ranks * units) == 0, "{}: drafter shard cuts a BF16 element", rect.name);
+    let local = range.len() / ranks;
+    let start = range.start + rank * local;
+    *range = start..start + local;
+    Ok(rect)
+}
+
+fn prefetched_rect<'b>(bytes: &'b [u8], base: usize, rect: &Rect) -> Result<Cow<'b, [u8]>> {
+    let start = base.checked_add(rect.rows.start.checked_mul(rect.row_bytes)
+        .context("drafter prefetched row overflow")?).context("drafter prefetched extent overflow")?;
+    let end = base.checked_add(rect.rows.end.checked_mul(rect.row_bytes)
+        .context("drafter prefetched row overflow")?).context("drafter prefetched extent overflow")?;
+    ensure!(!rect.rows.is_empty() && !rect.cols.is_empty() && rect.cols.end <= rect.row_bytes,
+        "{}: invalid prefetched rectangle", rect.name);
+    let rows = bytes.get(start..end).context("drafter tensor lies past prefetched source")?;
+    if rect.width() == rect.row_bytes { return Ok(Cow::Borrowed(rows)); }
+    let mut out = Vec::with_capacity(rect.bytes());
+    for row in rows.chunks_exact(rect.row_bytes) { out.extend_from_slice(&row[rect.cols.clone()]); }
+    Ok(Cow::Owned(out))
+}
 
 pub(crate) struct Source {
     path: PathBuf,
@@ -76,7 +104,11 @@ enum Prefetched {
 
 impl<'a> Load<'a> {
     pub fn open(library: &'a NativeLibrary, snapshot: &Path) -> Result<Self> {
-        Ok(Self { library, source: Source::open(snapshot)?, dense: DenseLoad::mount(library), prefetched: None })
+        Self::open_file(library, &snapshot.join("model.safetensors"))
+    }
+
+    pub fn open_file(library: &'a NativeLibrary, path: &Path) -> Result<Self> {
+        Ok(Self { library, source: Source::open_file(path)?, dense: DenseLoad::mount(library), prefetched: None })
     }
 
     /// Preserve the existing overlapped mount read when no Recorder is active.
@@ -110,6 +142,11 @@ impl<'a> Load<'a> {
         self.operand(vec![self.source.rect(name, shape)?])
     }
 
+    pub fn tensor_shard(&self, name: &str, shape: &[usize], axis: ShardAxis,
+        rank: usize, ranks: usize) -> Result<DeviceAllocation<'a>> {
+        self.operand(vec![shard(self.source.rect(name, shape)?, axis, rank, ranks)?])
+    }
+
     fn operand(&self, rects: Vec<Rect>) -> Result<DeviceAllocation<'a>> {
         let bytes = rects.iter().try_fold(0usize, |n, r| n.checked_add(r.bytes())).context("drafter operand overflow")?;
         let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
@@ -118,18 +155,16 @@ impl<'a> Load<'a> {
         if let Some(prefetched) = &self.prefetched {
             for (rect, offset) in &lands {
                 let data = match prefetched {
-                    Prefetched::File(bytes) => {
-                        let start = usize::try_from(rect.base)?;
-                        let end = start.checked_add(rect.bytes()).context("drafter prefetched extent overflow")?;
-                        bytes.get(start..end).context("drafter tensor lies past prefetched file")?
-                    }
+                    Prefetched::File(bytes) => prefetched_rect(bytes, usize::try_from(rect.base)?, rect)?,
                     Prefetched::Tensors(tensors) => {
                         let bytes = tensors.get(&rect.name).with_context(|| format!("{} was not prefetched", rect.name))?;
-                        ensure!(bytes.len() == rect.bytes(), "{}: prefetched tensor extent differs from its header", rect.name);
-                        bytes.as_slice()
+                        let tensor = self.source.tensors.get(&rect.name).context("drafter source metadata disappeared")?;
+                        ensure!(bytes.len() as u64 == tensor.byte_length,
+                            "{}: prefetched tensor extent differs from its header", rect.name);
+                        prefetched_rect(bytes, 0, rect)?
                     }
                 };
-                self.library.copy_h2d(view(allocation.buffer, *offset, data.len())?, data)?;
+                self.library.copy_h2d(view(allocation.buffer, *offset, data.len())?, &data)?;
             }
         } else {
             self.dense.operand(Operand { device: allocation.buffer.device_id, buffer: allocation.buffer, lands, bytes })?;
@@ -157,9 +192,23 @@ impl<'a> Load<'a> {
 
     pub fn matrix(&self, parts: &[(&str, usize)], cols: usize, fp8: bool, scales: Fp8Scales,
         stream: *mut c_void) -> Result<Weight<'a>> {
-        if !fp8 { return self.concat(parts, cols).map(Weight::Bf16); }
-        let rects = self.parts(parts, cols)?;
-        let rows = parts.iter().try_fold(0usize, |n, (_, rows)| n.checked_add(*rows)).context("drafter matrix overflow")?;
+        self.matrix_rects(self.parts(parts, cols)?, fp8, scales, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matrix_shard(&self, parts: &[(&str, usize)], cols: usize, axis: ShardAxis,
+        rank: usize, ranks: usize, fp8: bool, scales: Fp8Scales, stream: *mut c_void) -> Result<Weight<'a>> {
+        let rects = self.parts(parts, cols)?.into_iter().map(|rect| shard(rect, axis, rank, ranks))
+            .collect::<Result<Vec<_>>>()?;
+        self.matrix_rects(rects, fp8, scales, stream)
+    }
+
+    fn matrix_rects(&self, rects: Vec<Rect>, fp8: bool, scales: Fp8Scales,
+        stream: *mut c_void) -> Result<Weight<'a>> {
+        if !fp8 { return self.operand(rects).map(Weight::Bf16); }
+        let cols = rects.first().context("drafter matrix has no source parts")?.width() / 2;
+        ensure!(cols > 0 && rects.iter().all(|rect| rect.width() == cols * 2), "drafter matrix source widths differ");
+        let rows = rects.iter().try_fold(0usize, |n, rect| n.checked_add(rect.rows.len())).context("drafter matrix overflow")?;
         if self.prefetched.is_some() {
             let source = self.operand(rects)?;
             let packed = Fp8Weight::pack(self.library, source.buffer.ptr, rows, cols, scales, stream);
@@ -286,6 +335,28 @@ mod tests {
     use cuteafd_loader::plan::testing::{t, write_safetensors};
     use std::os::unix::fs::FileExt;
 
+    #[test]
+    fn draft_shards_select_exact_rows_and_strided_bf16_columns() -> Result<()> {
+        let rect = Rect { name: "weight".into(), path: PathBuf::new(), base: 7,
+            row_bytes: 8, rows: 0..4, cols: 0..8 };
+        let data: Vec<u8> = (0..32).collect();
+        let mut file = vec![255; 7];
+        file.extend_from_slice(&data);
+        for rank in 0..2 {
+            let rows = shard(rect.clone(), ShardAxis::Rows, rank, 2)?;
+            assert_eq!(prefetched_rect(&file, 7, &rows)?.as_ref(), &data[rank * 16..(rank + 1) * 16]);
+            let columns = shard(rect.clone(), ShardAxis::Columns, rank, 2)?;
+            let expected: Vec<u8> = data.chunks_exact(8).flat_map(|row| row[rank * 4..(rank + 1) * 4].iter().copied()).collect();
+            assert_eq!(prefetched_rect(&file, 7, &columns)?.as_ref(), expected);
+            assert_eq!(prefetched_rect(&data, 0, &columns)?.as_ref(), expected);
+        }
+        assert!(shard(rect.clone(), ShardAxis::Rows, 2, 2).is_err());
+        assert!(shard(rect.clone(), ShardAxis::Rows, 0, 0).is_err());
+        assert!(shard(Rect { cols: 0..6, ..rect.clone() }, ShardAxis::Columns, 0, 2).is_err());
+        assert!(prefetched_rect(&data[..31], 0, &rect).is_err());
+        Ok(())
+    }
+
     fn config() -> super::super::dflash::DflashConfig {
         super::super::dflash::DflashConfig { hidden: 128, intermediate: 128, layers: 2,
             heads: 1, kv_heads: 1, head_dim: 128, eps: 1e-6, theta: 10000., block: 8,
@@ -407,6 +478,40 @@ mod tests {
             packed_bytes += n * k;
         }
         assert_eq!(packed_bytes, 2 * rows * cols);
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_sharded_steps_preserve_source_windows_and_local_destinations() -> Result<()> {
+        let cols = 128;
+        let rows = STEP_BYTES / (cols * 2) + 32;
+        let source = Rect { name: "down".into(), path: "draft".into(), base: 31,
+            row_bytes: cols * 4, rows: 16..16 + rows * 2, cols: 0..cols * 4 };
+        let selected = shard(shard(source.clone(), ShardAxis::Rows, 1, 2)?, ShardAxis::Columns, 1, 2)?;
+        let mut values = vec![0u8; rows * cols];
+        let mut scales = vec![0u8; rows * cols / 128 * 4];
+        let buffer = |data: &mut [u8]| CuteafdDeviceBuffer { ptr: data.as_mut_ptr().cast(),
+            bytes: data.len(), device_id: 3, ..Default::default() };
+        let steps = pack_steps(vec![selected.clone()], cols, Fp8Scales::Amax,
+            buffer(&mut values), buffer(&mut scales))?;
+        assert_eq!(steps.len(), 2);
+        let mut completed = 0;
+        for step in steps {
+            assert_eq!(step.device, 3);
+            assert!(step.bytes() <= STEP_BYTES);
+            assert_eq!(step.rects.len(), 1);
+            let rect = &step.rects[0];
+            let Job::W8a16Pack { n, k, packed, scale, .. } = step.jobs[0] else { panic!("pack job") };
+            assert_eq!((rect.base, rect.row_bytes, rect.cols.clone()),
+                (source.base, source.row_bytes, cols * 2..cols * 4));
+            assert_eq!(rect.rows, selected.rows.start + completed..selected.rows.start + completed + n);
+            assert_eq!((n % 16, k), (0, cols));
+            assert_eq!(packed.ptr as usize - values.as_ptr() as usize, completed * cols);
+            assert_eq!(scale.ptr as usize - scales.as_ptr() as usize, completed * cols / 128 * 4);
+            assert_eq!((packed.bytes, scale.bytes), (n * cols, n * cols / 128 * 4));
+            completed += n;
+        }
+        assert_eq!(completed, rows);
         Ok(())
     }
 
