@@ -877,6 +877,39 @@ mod tests {
     }
 
     #[test]
+    fn post_ready_runtime_provenance_preserves_every_rank_allowance() {
+        use cuteafd_core::memory_layout::{Basis, DeviceKind};
+        for pro in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = if pro { mimo_pro_config() } else { mimo_flash_mopd_config() };
+            let tensors = if pro { mimo_pro_tensors() } else { mimo_flash_mopd_tensors() };
+            write_snapshot(dir.path(), &config, &tensors, Some(if pro { 8 } else { 4 }));
+            for (gpus, sparks) in [(1, 2), (1, 4), (2, 2), (2, 4)] {
+                let report = crate::plan::plan(dir.path(), &crate::plan::PlanOptions {
+                    placement: crate::plan::ExpertPlacement::Sparks { ranks: sparks },
+                    layout: Some(LayoutOptions {
+                        rtx_bytes: vec![95 * GIB; gpus], head_split: gpus == 2,
+                        host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+                    }),
+                    ..Default::default()
+                }).unwrap();
+                let layout = report.memory_layout.unwrap();
+                let devices = layout.devices.iter().filter(|device| device.kind == DeviceKind::Rtx)
+                    .collect::<Vec<_>>();
+                assert_eq!(devices.len(), gpus);
+                let measured = !pro && gpus == 1 && sparks == 2;
+                for device in devices {
+                    let item = device.items.iter().find(|item|
+                        item.group.contains("MiMo post-ready runtime growth")).unwrap();
+                    assert_eq!(item.bytes, 570 << 20);
+                    assert_eq!(item.basis, if measured { Basis::Calibrated } else { Basis::Estimated });
+                    assert!(item.group.starts_with(if measured { "measured " } else { "estimated " }));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn backend_slots_and_scope_categories_match_allocators() {
         assert_eq!(peer_slots(prefill_shape(6, None).unwrap().waves as usize), 16);
         assert_eq!(peer_slots(prefill_shape(6, None).unwrap().waves as usize), 16);

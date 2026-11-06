@@ -589,7 +589,8 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     assert!(items.iter().any(|item| item["group"] == "context+modules"
         && item["bytes"] == 575u64 << 20), "observer-subtracted baseline missing");
     assert!(items.iter().any(|item| item["bytes"] == 570u64 << 20
-        && item["group"].as_str().is_some_and(|group| group.contains("post-ready runtime growth"))),
+        && item["basis"] == "calibrated"
+        && item["group"].as_str().is_some_and(|group| group.starts_with("measured MiMo post-ready runtime growth"))),
         "measured runtime allowance missing");
     assert!(admitted <= lead["capacity_bytes"].as_u64().unwrap());
 }
