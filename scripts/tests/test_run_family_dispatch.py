@@ -1139,11 +1139,12 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     gpus = int(config["RTX_GPUS"])
     keys = "\n".join(line for line in raw.splitlines()
                      if not line.startswith(("MODEL_ID=", "MODEL_REVISION=", "ATTENTION_PLACEMENT="))) + "\nMODEL_REVISION=\n"
-    # Keep the actual drafter headers while the launcher uses its isolated HF root.
-    drafter = "models--" + config["SPECULATOR_MODEL_ID"].replace("/", "--")
-    hub = temporary / "hf" / "hub"
-    hub.mkdir(parents=True)
-    (hub / drafter).symlink_to((hf_home / "hub" / drafter).resolve(), target_is_directory=True)
+    # Keep actual drafter headers for speculating examples in the isolated HF root.
+    if drafter_id := config.get("SPECULATOR_MODEL_ID"):
+        drafter = "models--" + drafter_id.replace("/", "--")
+        hub = temporary / "hf" / "hub"
+        hub.mkdir(parents=True)
+        (hub / drafter).symlink_to((hf_home / "hub" / drafter).resolve(), target_is_directory=True)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/kimi-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
@@ -1157,7 +1158,8 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     # Single-owner placement retains the solver's Heads label with Whole-only modes.
     expected = "context" if gpus == 2 else "heads"
     assert deployment["report"]["attention_placement"] == expected, deployment
-    assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
+    context_floor = 1048576 if "-k6-" in example.name else 524288
+    assert deployment["memory_layout"]["pool_tokens"] >= context_floor, deployment
     plans = [shlex.split(line) for line in result.stderr.splitlines()
              if "cuteafd plan " in line and "--deployment" in line]
     assert len(plans) == 1
