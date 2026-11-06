@@ -5,19 +5,20 @@ use std::path::PathBuf;
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
 pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
-    family == "mimo_v2" && split && draft
+    matches!(family, "mimo_v2" | "kimi_k3") && split && draft
 }
 
 /// Resolve the topology-dependent bool once, without losing an explicit false.
 pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatches) {
-    let engine = match command {
-        Commands::ServeMimo(args) => &mut args.engine,
-        Commands::MimoGolden(args) => &mut args.engine,
+    let (enabled, family, split, draft) = match command {
+        Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
+        Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
+        Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
         _ => return,
     };
     let Some((_, sub)) = matches.subcommand() else { return };
     if sub.value_source("tp2_dflash") != Some(clap::parser::ValueSource::CommandLine) {
-        engine.tp2_dflash = tp2_dflash_default("mimo_v2", engine.split_device.is_some(), engine.draft.is_some());
+        *enabled = tp2_dflash_default(family, split, draft);
     }
 }
 

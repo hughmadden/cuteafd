@@ -982,29 +982,35 @@ mod tests {
     #[test]
     fn tp2_dflash_plan_and_direct_serve_defaults_agree() {
         use clap::{CommandFactory, FromArgMatches, Parser};
-        for split in [false, true] {
-            for draft in [false, true] {
-                for explicit in [None, Some(false), Some(true)] {
-                    let mut plan = vec!["cuteafd", "plan", "model", "--layout", "--rtx", if split { "2" } else { "1" },
-                        "--speculator", if draft { "dflash2" } else { "off" }];
-                    let mut serve = vec!["cuteafd", "serve-mimo", "--snapshot", "/model", "--native-lib", "/native.so"];
-                    if split { serve.extend(["--split-device", "1"]); }
-                    if draft { serve.extend(["--draft", "/draft"]); }
-                    if let Some(enabled) = explicit {
-                        let flag = if enabled { "true" } else { "false" };
-                        plan.extend(["--tp2-dflash", flag]);
-                        serve.extend(["--tp2-dflash", flag]);
+        for (family, command) in [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi")] {
+            for split in [false, true] {
+                for draft in [false, true] {
+                    for explicit in [None, Some(false), Some(true)] {
+                        let mut plan = vec!["cuteafd", "plan", "model", "--layout", "--rtx", if split { "2" } else { "1" },
+                            "--speculator", if draft { "dflash2" } else { "off" }];
+                        let mut serve = vec!["cuteafd", command, "--snapshot", "/model", "--native-lib", "/native.so"];
+                        if split { serve.extend(["--split-device", "1"]); }
+                        if draft { serve.extend(["--draft", "/draft"]); }
+                        if let Some(enabled) = explicit {
+                            let flag = if enabled { "true" } else { "false" };
+                            plan.extend(["--tp2-dflash", flag]);
+                            serve.extend(["--tp2-dflash", flag]);
+                        }
+                        let crate::cli::Commands::Plan(planned) = crate::cli::Cli::try_parse_from(plan).unwrap().command
+                            else { panic!("expected plan") };
+                        let matches = crate::cli::Cli::command().try_get_matches_from(serve).unwrap();
+                        let mut parsed = crate::cli::Cli::from_arg_matches(&matches).unwrap();
+                        crate::cli::resolve_tp2_dflash(&mut parsed.command, &matches);
+                        let served = match parsed.command {
+                            crate::cli::Commands::ServeMimo(args) => args.engine.tp2_dflash,
+                            crate::cli::Commands::ServeKimi(args) => args.tp2_dflash,
+                            _ => panic!("expected serve"),
+                        };
+                        let resolved = tp2_dflash(&planned, family, &Default::default());
+                        if explicit == Some(true) && !(split && draft) { assert!(resolved.is_err()); }
+                        else { assert_eq!(resolved.unwrap(), served); }
+                        assert_eq!(served, explicit.unwrap_or(split && draft));
                     }
-                    let crate::cli::Commands::Plan(planned) = crate::cli::Cli::try_parse_from(plan).unwrap().command
-                        else { panic!("expected plan") };
-                    let matches = crate::cli::Cli::command().try_get_matches_from(serve).unwrap();
-                    let mut parsed = crate::cli::Cli::from_arg_matches(&matches).unwrap();
-                    crate::cli::resolve_tp2_dflash(&mut parsed.command, &matches);
-                    let crate::cli::Commands::ServeMimo(served) = parsed.command else { panic!("expected serve") };
-                    let resolved = tp2_dflash(&planned, "mimo_v2", &Default::default());
-                    if explicit == Some(true) && !(split && draft) { assert!(resolved.is_err()); }
-                    else { assert_eq!(resolved.unwrap(), served.engine.tp2_dflash); }
-                    assert_eq!(served.engine.tp2_dflash, explicit.unwrap_or(split && draft));
                 }
             }
         }
@@ -1026,13 +1032,16 @@ mod tests {
         }
         let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
             else { panic!("expected plan") };
-        assert!(tp2_dflash(&request, "mimo_v2", &Default::default()).unwrap());
-        assert!(!tp2_dflash(&request, "kimi_k3", &Default::default()).unwrap());
-        assert!(!tp2_dflash(&request, "mimo_v2", &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
-        assert!(tp2_dflash(&request, "mimo_v2", &cfg).unwrap());
+        for family in ["mimo_v2", "kimi_k3"] {
+            assert!(tp2_dflash(&request, family, &Default::default()).unwrap());
+            assert!(!tp2_dflash(&request, family, &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
+            assert!(tp2_dflash(&request, family, &cfg).unwrap());
+        }
         request.rtx = 1;
-        assert!(!tp2_dflash(&request, "mimo_v2", &Default::default()).unwrap());
-        assert!(tp2_dflash(&request, "mimo_v2", &cfg).is_err());
+        for family in ["mimo_v2", "kimi_k3"] {
+            assert!(!tp2_dflash(&request, family, &Default::default()).unwrap());
+            assert!(tp2_dflash(&request, family, &cfg).is_err());
+        }
     }
 
     #[test]
