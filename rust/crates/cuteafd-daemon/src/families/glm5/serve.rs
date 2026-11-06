@@ -1140,7 +1140,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
 /// commit is the DFlash2 drafter's context update for the committed rows,
 /// enqueued on the drafter's stream and ordered before its next draft.
 struct DraftContext<'d, 'a> {
-    drafter: Option<&'d crate::shared::speculation::dflash::DflashDrafter<'a>>,
+    drafter: Option<&'d super::drafter::GlmDrafter<'a>>,
     context: Vec<ContextRow>,
 }
 

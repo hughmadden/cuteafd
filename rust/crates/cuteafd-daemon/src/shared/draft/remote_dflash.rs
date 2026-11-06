@@ -1,6 +1,8 @@
-//! One GPU1 DFlash2 owner; the target retains its single embedding and head.
-//! GLM Flash's binding of the shared device-driven draft bridge
-//! (`shared::draft::remote`): taps, input rows, hidden rows and logits.
+//! One GPU1 DFlash owner; the target retains its single embedding and head.
+//! The GLM families' binding of the shared device-driven draft bridge
+//! (`shared::draft::remote`): taps, input rows, hidden rows and logits. GLM
+//! Flash taps the mean of its mHC streams, GLM 5.3 and Mistral Large 4 their
+//! plain residual rows; both write only target-side staging on the target stream.
 use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, DflashDrafter, ReplayDrafter, TargetHead, TAP_ROWS};
 use crate::shared::draft::remote::{Prepared, RemoteBridge};
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
@@ -12,7 +14,6 @@ use cuteafd_ffi::programs::VocabularyHead;
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::ffi::c_void;
 
-pub(crate) const IDENTITY: &str = "glmf-remote-dflash:taps,input,hidden,logits";
 
 fn tap_frontier(rows: &[ContextRow]) -> Result<Option<(usize, usize)>> {
     let Some(first) = rows.iter().map(|r| r.tap_row).min() else { return Ok(None) };
@@ -46,8 +47,8 @@ impl<'a> RemoteDflash<'a> {
         let c = &draft.cfg;
         let rows = draft.max_batch_sequences().checked_mul(c.block)
             .ok_or_else(|| anyhow::anyhow!("remote draft rows overflow"))?;
-        let inventory = cuteafd_loader::placement::families::glm5_flash::remote_dflash_bridge_demands(
-            c.hidden as u64, c.vocab as u64, c.taps.len() as u64, rows as u64)?;
+        let inventory = cuteafd_loader::placement::draft::remote_dflash_bridge_demands(
+            c.hidden as u64, c.vocab as u64, c.taps.len() as u64, rows as u64, 0)?;
         let bridge = RemoteBridge::new(prepared);
         ensure!(bridge.head_rank() == 0 && bridge.head_device() == bridge.target_device(),
             "GLM Flash target head must remain on its owning rank 0");
@@ -66,7 +67,8 @@ impl<'a> RemoteDflash<'a> {
                 input: alloc("DFlash bridge gathered input")?, hidden: alloc("DFlash bridge normalized hidden")?,
                 logits: alloc("DFlash bridge logits")?, head, _head_workspace: workspace })
         })?;
-        draft.device.run(|| draft.prepare_workspace())?;
+        // Recorded (pushed) weights prime only after their commit lands.
+        if !crate::shared::experts::rtx::dense::is_recording() { draft.device.run(|| draft.prepare_workspace())?; }
         Ok(Self { draft, target, bridge, rows })
     }
 
@@ -130,6 +132,9 @@ impl<'a> RemoteDflash<'a> {
 
     pub fn require_live(&self) -> Result<()> { self.bridge.require_live() }
 
+    /// The drafter's stream on its own GPU.
+    pub fn draft_stream(&self) -> *mut c_void { self.bridge.stream.raw }
+
     pub fn publish_abort(&self) -> Result<()> { self.bridge.publish_abort() }
 
     pub fn synchronize(&self) -> Result<()> { self.bridge.synchronize() }
@@ -139,6 +144,29 @@ impl<'a> RemoteDflash<'a> {
     pub fn finish_terminal(&self, drained: bool) { self.bridge.finish_terminal(drained) }
 
     fn checked<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> { self.bridge.checked(work) }
+
+    /// [`Self::tap_streams_at`] for plain `[rows, hidden]` residual rows.
+    pub fn tap_at(&self, layer: usize, hidden: *const c_void, first: usize, n: usize, to: usize) -> Result<()> {
+        let Some(index) = self.draft.tap_index(layer) else { return Ok(()) };
+        let c = &self.draft.cfg;
+        let width = c.taps.len() * c.hidden;
+        ensure!(to.checked_add(n).is_some_and(|end| end <= TAP_ROWS), "remote tap rows exceed {TAP_ROWS}");
+        self.checked(|| self.bridge.exchange.on(0, || {
+            // SAFETY: target rows are final on its stream; admitted local tap
+            // storage outlives every captured graph and its queued reader.
+            unsafe { self.draft.device.library.glm_dflash_tap(
+                hidden.cast::<u8>().add(first * c.hidden * 2).cast(),
+                self.target.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(),
+                n, c.hidden, width, index * c.hidden, self.bridge.exchange.stream(0)) }
+        }))
+    }
+
+    /// The bridge's target-side owners, for the startup census.
+    pub(crate) fn bridge_buffers(&self) -> [(&'static str, CuteafdDeviceBuffer); 6] {
+        [("taps", self.target.taps.buffer), ("ids", self.target.ids.buffer),
+            ("input", self.target.input.buffer), ("hidden", self.target.hidden.buffer),
+            ("logits", self.target.logits.buffer), ("head_workspace", self.target._head_workspace.buffer)]
+    }
 
     /// Target graph segments write only their own staging. Remote work is
     /// enqueued by `update`, never while a rank0 segment is being captured.
@@ -293,7 +321,7 @@ mod tests {
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
             let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
-                RankDevice { device: 1, stream: peer_target.raw }, 0, IDENTITY, crate::shared::draft::remote::decode_extent(4 * cfg.block, cfg.hidden, cfg.vocab, 0)?)?;
+                RankDevice { device: 1, stream: peer_target.raw }, 0, "remote-dflash-component", crate::shared::draft::remote::decode_extent(4 * cfg.block, cfg.hidden, cfg.vocab, 0)?)?;
             let local = DflashDrafter::load(&library, &programs, &draft_path, file.clone(), lead.raw, 4, 4,
                 mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
             let draft_device = prepared.stream.device;
