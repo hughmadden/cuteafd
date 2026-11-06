@@ -548,6 +548,7 @@ impl Recipe for KimiRecipe {
             }
         }
         for arena in &self.arenas {
+            if self.experts.is_none() && arena.count == 0 { continue; }
             let choice = option(arena.count)?;
             if arena.peak.len() != self.gpus || arena.resident.len() != self.gpus || arena.weights.len() != self.gpus {
                 return Err(invalid("arena rank geometry differs from the coordinator count"));
