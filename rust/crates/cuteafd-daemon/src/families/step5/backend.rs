@@ -150,6 +150,7 @@ pub(super) struct Step5Backend<'e, 'a> {
     prefill: (usize, usize),
     depth: Option<crate::shared::prefill_depth::PrefillDepth>,
     packed_row_cap: Option<usize>,
+    admitted_host: Option<(u64, cuteafd_core::prefix::HostCacheGeometry)>,
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -182,7 +183,13 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
-            full_prefill_logits: false, prefill: (rows, 1), depth: None, packed_row_cap: None })
+            full_prefill_logits: false, prefill: (rows, 1), depth: None, packed_row_cap: None, admitted_host: None })
+    }
+
+    pub(super) fn with_admitted_host(mut self, bytes: u64,
+        geometry: cuteafd_core::prefix::HostCacheGeometry) -> Self {
+        self.admitted_host = Some((bytes, geometry));
+        self
     }
 
     /// Prefill units: `depth`'s waves of its unit, cut from the step's rows.
@@ -428,7 +435,21 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         let shape = self.geometry();
         let args = args.with_scoring(shape.decode_rows, shape.decode_rows, V)?;
         let layout = family.layout();
-        let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
+        let config = match self.admitted_host {
+            Some((0, _)) => None,
+            Some((bytes, geometry)) => {
+                ensure!(geometry.unit_rows == layout.page_rows as u64
+                    && geometry.page_bytes == layout.page_bytes as u64
+                    && geometry.mark_bytes == layout.mark_bytes as u64
+                    && geometry.draft_bytes == layout.draft_bytes as u64,
+                    "Step-5 live prefix geometry differs from admitted host owner");
+                let mut fixed = args.clone();
+                fixed.host_cache_bytes = crate::shared::prefix::budget::HostBudget::Bytes(bytes);
+                fixed.resolve_host_config(layout, shape.max_context, lanes)?
+            }
+            None => args.host_config(layout, shape.max_context, lanes)?,
+        };
+        let host = config.map(|config|
             CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),

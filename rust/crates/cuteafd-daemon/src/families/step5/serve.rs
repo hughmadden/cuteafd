@@ -297,7 +297,7 @@ fn with_backend<T>(args: &ServeArgs,
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
-    let mut inputs = RuntimeInputs { resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
+    let mut inputs = RuntimeInputs { host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         full_prefill_logits: args.full_prefill_logits,
@@ -310,6 +310,15 @@ fn with_backend<T>(args: &ServeArgs,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
     let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
+    inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs {
+        memory: cuteafd_loader::formats::mapped_preload::host_memory()?,
+        cache_bytes: match args.prefix.host_cache_bytes {
+            crate::shared::prefix::budget::HostBudget::Auto => None,
+            crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes),
+        },
+        headroom: args.prefix.host_cache_headroom_bytes,
+        push: Some(cuteafd_loader::plan::families::step5::admission::push_host_envelope(&contract, &cfg, ids.len())?),
+    };
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
     let planning = std::time::Instant::now();
     // One admission: the contract prices every retained owner, and native ABIs
@@ -405,7 +414,8 @@ fn with_backend<T>(args: &ServeArgs,
             let package = budget.package(&format, &args.native_lib)?;
             Some(budget.push_plan(&catalog, &package, ownership.onboarded_layers(), inputs.unit_rows(), devices.len())?)
         };
-        let prepared = CoordinatorPush::prepare(&args.snapshot, Some(&catalog), devices.len(), experts)?;
+        let prepared = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), devices.len(), experts,
+            inputs.host.push.clone().context("Step-5 admitted push host envelope")?)?;
         Ok((prepared, loaded, records, dense))
     })?;
     let (coordinator, ranks) = match planned {
@@ -471,6 +481,7 @@ fn with_backend<T>(args: &ServeArgs,
     let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
         Some(transport), 92, 1)?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
+        .with_admitted_host(admission.host_cache_bytes, admission.host_geometry)
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
             args.prefill_rows as usize)?)?
@@ -693,7 +704,7 @@ mod tests {
         let capacity = placement::inventory::PRO_TOTAL_BYTES;
         let arch = placement::inventory::ArchContext::coordinator(capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
-        let mut inputs = RuntimeInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+        let mut inputs = RuntimeInputs { host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },

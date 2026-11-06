@@ -164,6 +164,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// All demands are future to the pre-weight inventory. Startup phases are
 /// absolute additional peaks above that same sample, not steady-state deltas.
 pub struct RuntimeInputs {
+    pub host: HostInputs,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
@@ -206,6 +207,34 @@ impl Tp2Exchange {
     pub fn input_row_bytes(self, hidden: usize) -> usize {
         match self { Self::Exl3 => hidden + hidden / 32, Self::Fp8 => hidden * 2 }
     }
+}
+
+/// Host inventory is sampled once, before the single admission.
+#[derive(Debug, Clone)]
+pub struct HostInputs {
+    pub memory: (u64, u64),
+    pub cache_bytes: Option<u64>,
+    pub headroom: u64,
+    pub push: Option<crate::push_load::PushHostEnvelope>,
+}
+impl Default for HostInputs {
+    fn default() -> Self {
+        Self { memory: (128 << 30, 128 << 30), cache_bytes: Some(0), headroom: 8 << 30, push: None }
+    }
+}
+
+/// Header-derived upper bound for dense transforms and expert validation.
+/// Estimated staging until a Step-5 census supplies a tighter per-rank bound.
+pub fn push_host_envelope(contract: &super::coordinator::CoordinatorContract, cfg: &Config,
+    gpus: usize) -> Result<crate::push_load::PushHostEnvelope> {
+    let (target, draft) = contract.core.bytes(cfg.layers);
+    let dense = checked_sum([contract.weights.resident_bytes, target, draft])?
+        .checked_mul(2).and_then(|n| n.checked_add(64 << 20))
+        .context("Step-5 dense push host bound overflow")?;
+    let validation = (cfg.layers as u64).checked_mul(cfg.experts as u64)
+        .and_then(|n| n.checked_mul(3 * 4)).context("Step-5 expert validation overflow")?;
+    Ok(crate::push_load::PushHostEnvelope::new(vec![validation.max(4 << 20); gpus],
+        vec![dense; gpus], 128, 1 << 20)?)
 }
 
 /// One rank's Step TP2 onboarding exchange planes beside the package arena:
@@ -475,7 +504,7 @@ fn admit_depth_with(
             let clamped = matches!(error, Refusal::Capacity { .. }
                 | Refusal::FullContextShortfall { .. });
             let error = anyhow::Error::from(error);
-            if !inputs.marks.host && clamped {
+            if !inputs.marks.host && recipe.marks > 0 && clamped {
                 anyhow::anyhow!("{error}; Step-5 device-only prefix retention with HOST_CACHE_BYTES=0 does not fit at request context {}; enable --host-cache-bytes auto (HOST_CACHE_BYTES=auto), or lower --max-context/--context-tokens (MAX_CONTEXT_TOKENS), for example to 262144", inputs.context)
             } else {
                 error
@@ -517,7 +546,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+        RuntimeInputs { host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             full_prefill_logits: false, waves: 1, unit: 0,
             inventory: Inventory {
@@ -907,4 +936,44 @@ mod tests {
         assert_eq!(admission.cache.context, FLOOR);
         Ok(())
     }
+    #[test]
+    fn host_quota_and_push_share_one_capacity_before_allocation() -> Result<()> {
+        let mut inputs = inputs(1);
+        inputs.marks.host = true;
+        inputs.host.cache_bytes = Some(64 << 30);
+        inputs.host.memory = (1 << 30, 1 << 30);
+        let error = run(&inputs).expect_err("host quota must be admitted");
+        assert!(error.downcast_ref::<crate::placement::planner::Refusal>().is_some(), "{error:#}");
+        assert!(format!("{error:#}").contains("host"), "{error:#}");
+        inputs.host.memory = (128 << 30, 128 << 30);
+        inputs.host.push = Some(crate::push_load::PushHostEnvelope::new(vec![1024], vec![2048], 128, 1 << 20)?);
+        let admitted = run(&inputs)?;
+        assert_eq!(admitted.host_cache_bytes, 64 << 30);
+        let load = admitted.solved.phases.iter().find(|row| row.budget == "host"
+            && row.phase == crate::placement::planner::Phase::Load).unwrap();
+        assert!(load.owned >= inputs.host.push.as_ref().unwrap().bytes()?);
+        Ok(())
+    }
+
+    #[test]
+    fn full_onboard_option_charges_its_expert_arena() -> Result<()> {
+        let mut inputs = inputs(2);
+        let routed = config().moe[..92].iter().filter(|&&moe| moe).count();
+        inputs.onboard = Some(OnboardInputs {
+            costs: vec![ExpertCost { whole: Bytes2 { resident: 1024, staging: 0 },
+                half: [Bytes2 { resident: 512, staging: 0 }; 2], tp2: true,
+                whole_supported: true, spark_ok: true }; routed],
+            workspace: 12345, tp2_workspace: [23456, 34567], mode: Onboard::Layers(routed),
+        });
+        let admitted = run(&inputs)?;
+        assert_eq!(admitted.placement.onboard_layers, routed);
+        for rank in 0..2 {
+            let arena = admitted.placement.items[rank].iter()
+                .filter(|item| item.group == "Step-5 RTX expert arena").map(|item| item.bytes).sum::<u64>();
+            assert_eq!(arena, inputs.onboard.as_ref().unwrap().tp2_workspace[rank]);
+            assert_eq!(admitted.placement.tp2.as_ref().unwrap().peak_bytes[rank], arena + routed as u64 * 512);
+        }
+        Ok(())
+    }
+
 }

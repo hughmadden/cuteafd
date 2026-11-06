@@ -62,7 +62,8 @@ impl Figures {
         let pool = unit
             .checked_mul(pages)
             .context("Step-5 pool record total overflow")?;
-        fixed.checked_add(pool).context("Step-5 rank total overflow")
+        fixed.checked_add(pool).and_then(|bytes| bytes.checked_add(self.hops[usize::from(rank)]))
+            .context("Step-5 rank total overflow")
     }
 }
 
@@ -106,6 +107,8 @@ pub struct Step5Recipe<'a> {
     pub arena: Vec<u64>,
     pub expert: Vec<ExpertCost>,
     pub marks: u64,
+    pub host_geometry: cuteafd_core::prefix::HostCacheGeometry,
+    pub host_cache_bytes: u64,
     figures: Figures,
     /// Owners before onboarding: the executor's native binding.
     pub ownership: ExecutionOwnership,
@@ -178,7 +181,18 @@ impl<'a> Step5Recipe<'a> {
             .onboard
             .as_ref()
             .map_or_else(Vec::new, |onboard| onboard.costs.clone());
+        let host_geometry = cuteafd_core::prefix::HostCacheGeometry {
+            unit_rows: PAGE_ROWS,
+            page_bytes: checked_sum(figures.cache.geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes))?,
+            mark_bytes: checked_sum(figures.cache.ranks.iter().map(|rank| rank.bytes))?,
+            draft_bytes: 0,
+        };
+        let host_cache_bytes = if !inputs.marks.host || inputs.marks.entries == 0 { 0 } else {
+            host_geometry.resolve(inputs.host.cache_bytes, inputs.context, inputs.sequences as u64,
+                inputs.host.memory.0, host_geometry.chunk_bytes()).context("Step-5 host prefix geometry")?
+        };
         Ok(Self {
+            host_geometry, host_cache_bytes,
             cfg,
             inputs,
             depth,
@@ -388,7 +402,7 @@ impl<'a> Step5Recipe<'a> {
             }
         }
         // The arena plane is held by every count option that onboards a layer.
-        let clauses = (1..self.routes.len())
+        let clauses = (1..=self.routes.len())
             .map(|option| vec![Choice { variable: onboard, option }])
             .collect::<Vec<_>>();
         for gpu in 0..self.gpus {
@@ -507,6 +521,36 @@ impl Recipe for Step5Recipe<'_> {
             contract.components.push(Component::allocation(owner,
                 ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
         }
+        for (id, location, category, bytes, lifetime) in [
+            ("prefix", Location::HOST, Category::Prefix, self.host_cache_bytes,
+                Lifetime { first: Phase::Ready, last: Phase::Growth }),
+            ("logits", Location::HOST, Category::Staging,
+                cuteafd_core::memory_layout::host_logits_bytes(self.inputs.rows.min(64) as u64,
+                    if self.inputs.full_prefill_logits { self.inputs.rows as u64 } else { self.inputs.rows.min(64) as u64 },
+                    self.cfg.vocab as u64).ok_or(Refusal::Overflow("Step-5 host logits"))?,
+                Lifetime { first: Phase::Ready, last: Phase::Growth }),
+        ] {
+            let owner = Allocation::buffer(format!("step5.host.{id}"), location, bytes, lifetime,
+                category, format!("Step-5 host {id}"));
+            contract.components.push(Component::allocation(owner,
+                ByteCurve::fixed(bytes, self.maximum_pages), true, self.maximum_pages));
+        }
+        let transport = crate::serving_capacity::spark_host_transport(cuteafd_core::ExpertGeometry::STEP5,
+            1, self.inputs.inventory.spark_ranks, false, false, false,
+            self.inputs.unit_rows() as u64, self.inputs.unit_rows() as u64, self.inputs.waves as u64, None)
+            .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        for (kind, bytes) in ["rings", "egress", "intake"].into_iter().zip(transport) {
+            let owner = Allocation::buffer(format!("step5.host.transport.{kind}"), Location::PINNED,
+                bytes, Lifetime::RESIDENT, Category::Transport, format!("Step-5 host transport {kind}"));
+            contract.components.push(Component::allocation(owner,
+                ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
+        }
+        if let Some(push) = &self.inputs.host.push {
+            for owner in push.allocations("step5.push")? {
+                contract.components.push(Component::allocation(owner.clone(),
+                    ByteCurve::fixed(owner.bytes, self.maximum_pages), false, self.maximum_pages));
+            }
+        }
         self.expert_components(&mut contract, onboard)?;
         Ok(contract)
     }
@@ -560,6 +604,12 @@ pub fn budgets(inputs: &RuntimeInputs) -> Result<Vec<Budget>, Refusal> {
             headroom: 0,
         });
     }
+    let (total, available) = inputs.host.memory;
+    budgets.push(Budget { id: "host".into(), locations: vec![Location::HOST, Location::PINNED],
+        physical_bytes: total, logical_bytes: total,
+        baseline: Baseline::Forecast { occupied: total.saturating_sub(available),
+            source: "Step-5 pre-admission host MemAvailable".into(), assumed: false },
+        headroom: inputs.host.headroom.max(total / 10) });
     Ok(budgets)
 }
 
@@ -573,6 +623,9 @@ pub struct Admission {
     pub reservations: Vec<Reservation>,
     /// Exact fixed demands without the pool records.
     pub fixed: Vec<Demand>,
+    pub host_geometry: cuteafd_core::prefix::HostCacheGeometry,
+    pub host_cache_bytes: u64,
+    pub solved: ResolvedPlan,
 }
 
 impl Step5Recipe<'_> {
@@ -692,6 +745,9 @@ impl Step5Recipe<'_> {
             marks: usize::try_from(self.marks)?,
             reservations,
             fixed: self.figures.fixed.clone(),
+            host_geometry: self.host_geometry,
+            host_cache_bytes: self.host_cache_bytes,
+            solved: solved.clone(),
         })
     }
 }
