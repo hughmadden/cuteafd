@@ -66,7 +66,7 @@ impl CoreInventory {
         // Inventory-only planning has selected names but no native headers yet.
         let missing = expected(cfg).keys().filter(|name| name.contains(".self_attn.")
             && !name.contains(".gate_proj.") && checkpoint.contains_tensor(name)
-            && !checkpoint.tensors.iter().any(|tensor| tensor.meta.name == **name))
+            && !checkpoint.has_header(name))
             .cloned().collect::<std::collections::BTreeSet<_>>();
         let native_checkpoint;
         let native_source = if missing.is_empty() { checkpoint } else {
