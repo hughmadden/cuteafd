@@ -1283,6 +1283,17 @@ impl Opened {
         let dense_devices = devices.iter().map(|&id| crate::shared::memory::device::Device {
             library: &self.library, id }).collect::<Vec<_>>();
         let dense_push_experts = || -> Result<_> {
+            if let Some(range) = whole_range {
+                let local = local.as_ref().context("whole local inventory")?;
+                ensure!(local.format == glm::GlmLocalFormat::Exl3, "whole dense push requires EXL3");
+                return Ok(Some(crate::shared::experts::rtx::push::CoordinatorExperts::Whole {
+                    owners: vec![crate::shared::experts::rtx::push::WholeOwner { rank: 0,
+                        selections: (range.first..range.first + range.layers).map(|layer|
+                            crate::shared::experts::layer::ExpertLayer::BackboneFull { layer }).collect(),
+                        budget: usize::try_from(range.peak_bytes.checked_sub(local.backend_workspace)
+                            .context("whole workspace exceeds admission")?)? }],
+                }));
+            }
             tp2_range.as_ref().map(|range| -> Result<_> {
                 let local = local.as_ref().context("TP2 local inventory")?;
                 let workspace = match local.format {
@@ -1415,6 +1426,7 @@ impl Opened {
             })
         };
         let mut whole_weights = None;
+        let mut exl3_whole_weights = None;
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, native_load.as_ref().context("native loader admission absent")?, records, &native_dense_records, owners.as_deref(), layers, &programs, &manifest, &loader, &devices, stream,
@@ -1457,7 +1469,26 @@ impl Opened {
                     })?;
                 (embedding, model, None)
             };
-            let tp2 = tp2_range.clone().map(|range| tp2_weights(range, pushed)).transpose()?;
+            let tp2 = if let Some(range) = tp2_range.clone() {
+                Some(tp2_weights(range, pushed)?)
+            } else {
+                if let Some(range) = whole_range {
+                    use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy::CanonicalDecode};
+                    let local = local.as_ref().context("whole local inventory")?;
+                    let layers = (range.first..range.first + range.layers).collect();
+                    let budget = usize::try_from(range.peak_bytes)?;
+                    exl3_whole_weights = Some(match pushed {
+                        Some(mut pushed) => {
+                            ensure!(pushed.len() == 1, "one whole EXL3 coordinator rank required");
+                            Exl3Tp2::pushed_whole_weights(dense_devices[0], &self.catalog, &local.package,
+                                layers, max_rows, budget, CanonicalDecode, pushed.pop().unwrap().exl3()?)?
+                        }
+                        None => Exl3Tp2::load_whole_weights(dense_devices[0], &self.catalog, &local.package,
+                            layers, max_rows, budget, CanonicalDecode)?,
+                    });
+                }
+                None
+            };
             Ok((embedding, (model, tp2)))
         })?;
         let native_owners = native_plans.into_iter().zip(&devices).map(|(plan, &device)| {
@@ -1531,6 +1562,13 @@ impl Opened {
             for rank in &ranks { ensure!(rank.workspace_bytes() as u64 == local.backend_workspace,
                 "GLM loaded TP2 workspace differs from admission"); }
             engine.install_tp2(ranks)?;
+        }
+        if let Some(weights) = exl3_whole_weights {
+            let backend = weights.execution()?;
+            ensure!(crate::shared::experts::rtx::RtxExpertLayer::workspace_bytes(&backend) as u64
+                == local.as_ref().context("whole local inventory")?.backend_workspace,
+                "GLM whole EXL3 backend workspace differs from admission");
+            engine.install_whole(Box::new(backend))?;
         }
         if let Some(weights) = whole_weights {
             let backend = weights.execution()?;

@@ -78,7 +78,7 @@ impl LocalPhysicalSource {
         input: &LocalPhysicalInput, exlr8: Option<&MetadataInput>) -> Result<Self> {
         validate_input(cfg, input)?;
         ensure!((1..=2).contains(&local.world)
-            && (local.world == 2 || local.format == GlmLocalFormat::Exlr8),
+            && (local.world == 2 || matches!(local.format, GlmLocalFormat::Exlr8 | GlmLocalFormat::Exl3)),
             "GLM local physical source has no executor for this format/world");
         let mut source = Self { weights: Default::default(), backend: Default::default(),
             rows: input.max_rows, activations: input.activations, topk: cfg.topk, world: local.world };
@@ -94,7 +94,7 @@ impl LocalPhysicalSource {
                 let weight = match local.format {
                     GlmLocalFormat::Exl3 => {
                         let plan = catalog.exl3().context("EXL3 local headers missing")?
-                            .residency(V41Exl3Layer::Backbone(layer), 2, rank)?;
+                            .residency(V41Exl3Layer::Backbone(layer), local.world, rank)?;
                         let (offsets, bytes) = plan.device_arena_layout()?;
                         LayerStorage { bytes, mount: vec![("0".into(), bytes)],
                             views: plan.buffers.iter().zip(offsets).enumerate().map(|(index, (spec, offset))|
