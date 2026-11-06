@@ -172,7 +172,7 @@ impl<'a> Admission<'a> {
             let charges = self.placement.items[demand.gpu as usize].iter()
                 .filter(|item| item.group == demand.group).collect::<Vec<_>>();
             ensure!(charges.len() == 1 && charges[0].bytes == demand.bytes
-                && charges[0].category == demand.category && charges[0].basis == demand.basis,
+                && charges[0].category == demand.category && charges[0].basis == Basis::Exact,
                 "Kimi context allocation differs from accepted {} charge", demand.group);
         }
         let caches = [0, 1].map(|rank| self.mla_owners[rank].upgrade()
@@ -215,7 +215,7 @@ impl<'a> Admission<'a> {
         for demand in demand.owned {
             let charges = self.placement.items[head].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             ensure!(charges.len() == 1 && charges[0].category == demand.category
-                && charges[0].basis == demand.basis && charges[0].bytes == demand.bytes,
+                && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
                 "Kimi draft allocation differs from accepted {} charge", demand.group);
             ensure!(!self.placement.items.iter().enumerate().filter(|(rank, _)| *rank != head)
                 .any(|(_, items)| items.iter().any(|item| item.group == demand.group)),
@@ -575,7 +575,7 @@ impl<'a> Admission<'a> {
         let charges = self.placement.items[rank].iter().filter(|item| item.group == "records").collect::<Vec<_>>();
         ensure!(if layout.bytes() == 0 { charges.is_empty() } else {
             charges.len() == 1 && charges[0].category == Category::Kv
-                && charges[0].basis == Basis::Formula && charges[0].bytes == layout.bytes() as u64
+                && charges[0].basis == Basis::Exact && charges[0].bytes == layout.bytes() as u64
         }, "Kimi MLA allocation differs from accepted record charge");
         Ok(layout)
     }
@@ -663,50 +663,108 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         request.policy.expert_ownership = ExpertOwnership::Contiguous;
     }
     if let Some(budget) = &spark_budget { budget.constrain(&mut request)?; }
-    let groups = request.layers.iter().map(|layer|
-        (RANKS == 2 && layer.kind == AttentionClass::Mla
-            && !matches!(request.attention_placement, Some(AttentionPlacement::Heads | AttentionPlacement::Context)), layer.colocate))
-        .collect::<Vec<_>>();
-    let (placement, (mark_selection, graph_set, draft)) = attention::solve_owners(&groups,
-        LayerOwnership::Ranges, request.layers_first_gpu, |owners| -> Result<_> {
-            let mut candidate = request.clone();
-            for (layer, (&owner, &(selected, _))) in candidate.layers.iter_mut().zip(owners.iter().zip(&groups)) {
-                if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }
+    use cuteafd_loader::placement::{families::kimi::{self, ExpertProfile, FixedOwner,
+        KimiRecipe, SparkOwner}, planner as contract};
+    let placement_mode = request.attention_placement.unwrap_or(AttentionPlacement::Heads);
+    let attention = request.layers.iter().map(|layer| {
+        if RANKS == 1 { WHOLE }
+        else if layer.kind != AttentionClass::Mla { LayerMode::HeadSplit }
+        else { match placement_mode {
+            AttentionPlacement::Heads => LayerMode::HeadSplit,
+            AttentionPlacement::Context => LayerMode::ContextSplit,
+            AttentionPlacement::Layers => LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+        } }
+    }).collect::<Vec<_>>();
+    let page_rows = if placement_mode == AttentionPlacement::Context { 128 } else { 64 };
+    let maximum_pages = request.pool.ceiling.div_ceil(page_rows);
+    let routed = request.layers.iter().enumerate().filter_map(|(layer, demand)| demand.experts.is_some().then_some(layer)).collect::<Vec<_>>();
+    let counts = match request.onboard {
+        Onboard::Auto => (0..=routed.len()).collect::<Vec<_>>(),
+        Onboard::Layers(count) => vec![count],
+    };
+    let arenas = if RANKS == 2 {
+        let halves = routed.iter().map(|&layer| request.layers[layer].experts.as_ref().unwrap().half).collect::<Vec<_>>();
+        kimi::tp2_arenas(&counts, request.tp2_workspace, &halves)?
+    } else {
+        let parts = routed.iter().map(|&layer| request.layers[layer].experts.as_ref().unwrap().whole).collect::<Vec<_>>();
+        kimi::whole_arenas(&counts, request.expert_workspace, &parts)?
+    };
+    let mut records = vec![0; RANKS];
+    if RANKS == 2 && placement_mode == AttentionPlacement::Layers {
+        records.fill((MLA_PAGE_ROWS * cache_format.record_bytes()) as u64);
+    } else {
+        for (layer, mode) in request.layers.iter().zip(&attention) {
+            for rank in 0..RANKS {
+                records[rank] += match mode {
+                    LayerMode::Whole { gpu, .. } => if usize::from(*gpu) == rank { layer.kv_unit.unit_bytes_whole } else { 0 },
+                    LayerMode::HeadSplit | LayerMode::ContextSplit => layer.kv_unit.unit_bytes_split[rank],
+                };
             }
-            let graphs = graph_reserve.then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
-                graph_slots, graph_verify, RANKS, |rank, layer| !groups[layer].0 || usize::from(owners[layer]) == rank,
-                |layer| context.is_some() && cfg.attention[layer] == KimiAttention::Mla,
-                context.as_ref().map(|layout| layout.decode()))).transpose()?;
-            candidate.fixed.retain(|d| d.group != super::graphs::RESERVE);
-            if let Some(graphs) = &graphs {
-                candidate.fixed.extend((0..RANKS).map(|rank| super::graphs::demand(&graphs.inventory, rank)));
-            }
-            let admit_marks = |trial: &PlacementRequest| -> Result<_> {
-                if legacy_marks == 0 {
-                    Ok((solve(trial)?, MarkSelection { legacy_slots: 0, slots: 0, reduction_reason: None }))
-                } else { Ok(solve_with_marks(trial, legacy_marks as u64, 1, &mark_demands)?) }
-            };
-            let (placed, marks, layout) = if let Some(layout) = &draft {
-                let initial = candidate.pool.requested.unwrap_or(candidate.pool.target);
-                settle_pool((initial, ()), |tokens, _| -> Result<_> {
-                    let mut trial = candidate.clone();
-                    let layout = layout.with_pool_tokens(usize::try_from(tokens)?)?;
-                    let (demand, peak) = layout.demands((RANKS - 1) as u8)?;
-                    trial.movables = vec![demand.movable(RANKS)?];
-                    trial.startup.retain(|d| d.group != peak.group);
-                    trial.startup.push(peak);
-                    trial.pool.target = trial.pool.target.min(tokens);
-                    trial.pool.ceiling = trial.pool.ceiling.min(tokens);
-                    let (placed, marks) = admit_marks(&trial)?;
-                    Ok((placed.pool_tokens, (), (placed, marks, Some(layout))))
-                })?
-            } else {
-                let (placed, marks) = admit_marks(&candidate)?;
-                (placed, marks, None)
-            };
-            if let Some(graphs) = &graphs { super::graphs::check_placement_for_ranks(cfg, &placed, &graphs.keys, RANKS)?; }
-            Ok((placed, (marks, graphs, layout)))
-        })?;
+        }
+    }
+    let spark = spark_budget.iter().flat_map(|budget| (0..budget.resident.len()).flat_map(|rank|
+        counts.iter().map(move |&count| SparkOwner { count, rank,
+            experts: budget.resident[rank][count..].iter().sum(), overhead: budget.overhead[rank] }))).collect();
+    let mut fixed = request.fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
+    fixed.extend(request.context_buffers.demands()?.iter().map(FixedOwner::ready));
+    // The post-module sample is declared once as an existing physical owner;
+    // budgets are full capacities, not a second free-memory subtraction.
+    for rank in 0..RANKS {
+        let Baseline::Measured { free_bytes } = request.inventory.gpus[rank].baseline else { unreachable!() };
+        fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
+            group: "CUDA context and loaded modules".into(),
+            bytes: request.inventory.gpus[rank].capacity_bytes.saturating_sub(free_bytes), weights: 0,
+            lifetime: contract::Lifetime::RESIDENT });
+    }
+    let mut recipe = KimiRecipe { context: request.pool.compiled_context, gpus: RANKS,
+        placement: placement_mode, attention,
+        prefill: contract::PrefillShape { rows: unit_rows as u64, waves: inputs_waves as u64 },
+        lanes, spark_links: spark_ranks > 0, hop_spec: request.hops.clone(),
+        peer_row_bytes: request.context_buffers.query_row_bytes + request.context_buffers.partial_row_bytes,
+        maximum_pages, records_per_page: records,
+        layer_attention: request.layers.iter().map(|layer| layer.weights).collect(),
+        first_moe: routed.first().copied().unwrap_or(cfg.layers),
+        kinds: request.layers.iter().map(|layer| layer.kind).fold(Vec::new(), |mut kinds, kind| {
+            if !kinds.contains(&kind) { kinds.push(kind); } kinds
+        }),
+        experts: Some(ExpertProfile { layers: routed, destination: (0..RANKS as u8).collect(), counts,
+            rank_sets: vec![(0..spark_ranks as u8).collect()] }),
+        arenas, spark,
+        draft: draft.as_ref().map(|layout| kimi::draft_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
+        fixed, owners: Vec::new(),
+    };
+    let modes = recipe.resolved_attention();
+    let graph_set = graph_reserve.then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
+        graph_slots, graph_verify, RANKS,
+        |rank, layer| !matches!(modes[layer], LayerMode::Whole { gpu, .. } if usize::from(gpu) != rank),
+        |layer| modes[layer] == LayerMode::ContextSplit,
+        context.as_ref().map(|layout| layout.decode()))).transpose()?;
+    recipe.fixed.retain(|owner| owner.group != super::graphs::RESERVE);
+    if let Some(graphs) = &graph_set {
+        recipe.fixed.extend((0..RANKS).map(|rank| FixedOwner::ready(&super::graphs::demand(&graphs.inventory, rank))));
+    }
+    for demand in &request.startup {
+        if draft.as_ref().is_some_and(|layout| layout.demands((RANKS - 1) as u8).is_ok_and(|(_, peak)| peak.group == demand.group)) { continue; }
+        let mut owner = FixedOwner::ready(demand);
+        owner.lifetime = contract::Lifetime { first: contract::Phase::Load, last: contract::Phase::Load };
+        recipe.fixed.push(owner);
+    }
+    ensure!(request.pool_bounded.is_empty(), "Kimi has no pool-bounded native owners");
+    let cards = request.inventory.gpus.iter().map(|gpu| (gpu.capacity_bytes, gpu.capacity_bytes)).collect::<Vec<_>>();
+    let sparks = spark_budget.as_ref().map_or_else(Vec::new, |budget| vec![budget.budget; budget.resident.len()]);
+    let mut budgets = kimi::budgets(&cards, request.inventory.gpus[0].headroom_bytes, &vec![0; RANKS], &sparks)?;
+    let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+    recipe.owners.push(kimi::host_prefix_owner(0, maximum_pages));
+    budgets.push(kimi::host_budget(host_total, host_available));
+    let admitted = recipe.admit(kimi::request(request.pool.compiled_context, request.pool.requested, request.onboard,
+        recipe.prefill, contract::Operation::Serving, request.resident_weight_limit.unwrap_or(ResidentWeights::DEFAULT_LIMIT),
+        cuteafd_core::spark_reply::requested()), budgets)?;
+    tracing::info!(phases = ?admitted.solved.phases, "Kimi admitted per-phase physical ledger");
+    let placement = admitted.placement;
+    let mark_selection = MarkSelection { legacy_slots: legacy_marks as u64, slots: legacy_marks as u64, reduction_reason: None };
+    let pool_tokens = usize::try_from(placement.pool_tokens)?;
+    let draft = draft.map(|layout| layout.with_pool_tokens(pool_tokens)).transpose()?;
+    if let Some(graphs) = &graph_set { super::graphs::check_placement_for_ranks(cfg, &placement, &graphs.keys, RANKS)?; }
     if let Some(budget) = &spark_budget {
         for rank in 0..budget.resident.len() {
             let bytes = budget.rank_bytes(rank, placement.onboard_layers)?;

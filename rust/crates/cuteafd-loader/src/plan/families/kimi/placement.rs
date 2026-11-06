@@ -165,6 +165,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
                 usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
                 ranks, gpus, opts.resolved_spark_reply_format(false))?;
+            if let Some(context) = &context_layout {
+                demands.retain(|d| d.group != allocation::GRAPH_RESERVE);
+                let graphs = allocation::graphs_with_context(cfg, 1, unit, usize::try_from(slots)?, verify,
+                    gpus, |_, _| true, |layer| cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla,
+                    Some(context.decode()))?;
+                demands.extend((0..gpus).map(|rank| allocation::graph_demand(&graphs, rank)));
+            }
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
             for rank in 0..gpus {
@@ -300,7 +307,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let mode = if gpus == 1 { WHOLE } else if mla {
                 match attention {
                     AttentionPlacement::Context => LayerMode::ContextSplit,
-                    _ => LayerMode::HeadSplit,
+                    AttentionPlacement::Heads => LayerMode::HeadSplit,
+                    AttentionPlacement::Layers => LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
                 }
             } else { LayerMode::HeadSplit };
             if mla {
@@ -314,11 +322,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
         Ok((modes, layer_attention, records))
     })();
-    let (modes, layer_attention, records_per_page) = match fabricated {
+    let (modes, layer_attention, mut records_per_page) = match fabricated {
         Ok(value) => value,
         Err(error) => { report.refuse_placement(format!("Kimi packed layer inventory refused: {error:#}"),
             "Check checkpoint layer geometry."); return memory; }
     };
+    if gpus == 2 && attention == AttentionPlacement::Layers {
+        // One page of one MLA layer; the Recipe activates it on its owner.
+        records_per_page = vec![record; gpus];
+    }
     let onboard = opts.resolve_onboard(routed).unwrap_or(Onboard::Auto);
     let counts: Vec<usize> = match onboard {
         Onboard::Auto => (0..=routed).collect(),
@@ -364,6 +376,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let page_rows = if modes.iter().any(|mode| *mode == LayerMode::ContextSplit) { PAGE * 2 } else { PAGE };
     let ceiling = target_pool.max(requested_pool.unwrap_or(0));
     let maximum_pages = ceiling.div_ceil(page_rows);
+    let draft_window_bytes = draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose().unwrap_or(None).unwrap_or(0) as u64;
     let draft = match &draft {
         Some(layout) => match kimi::draft_facts(layout, page_rows, maximum_pages, head_rank as u8) {
             Ok(value) => Some(value),
@@ -380,7 +393,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     if cfg.attention.iter().any(|kind| *kind != crate::families::kimi_k3::config::KimiAttention::Mla) {
         kinds.push(AttentionClass::Kda);
     }
-    let recipe = KimiRecipe {
+    let mut recipe = KimiRecipe {
         context, gpus, placement: attention, attention: modes,
         prefill, lanes: LANES, spark_links: ranks > 0,
         hop_spec: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2,
@@ -394,21 +407,54 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         experts: Some(ExpertProfile { layers: spark_budget.layers.clone(),
             destination: if gpus == 2 { vec![0, 1] } else { vec![0] },
             counts, rank_sets: if ranks > 0 { vec![(0..ranks as u8).collect()] } else { Vec::new() } }),
-        arenas, spark, draft, fixed: fixed_owners,
+        arenas, spark, draft, fixed: fixed_owners, owners: Vec::new(),
     };
-    let mut occupied = vec![0u64; gpus];
+    let occupied = vec![0u64; gpus];
     for (rank, baseline) in baseline.iter().enumerate() {
         if let crate::placement::Baseline::Planned { context_bytes, loaded_bytes } = baseline {
-            occupied[rank] = context_bytes.saturating_add(*loaded_bytes);
+            recipe.fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
+                group: "CUDA context (estimated)".into(), bytes: context_bytes.saturating_add(*loaded_bytes),
+                weights: 0, lifetime: crate::placement::planner::Lifetime::RESIDENT });
         }
     }
     let sparks = vec![spark_budget.budget; ranks];
-    let budgets = match kimi::budgets(&opts.rtx_bytes.iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
+    let (host_total, host_available) = match opts.host_memory {
+        Some(memory) => memory,
+        None => match crate::formats::mapped_preload::host_memory() {
+            Ok(memory) => memory,
+            Err(error) => { report.refuse_placement(format!("Kimi host inventory refused: {error:#}"), "Supply host memory capacity."); return memory; }
+        },
+    };
+    let host_quota = (|| -> anyhow::Result<u64> {
+        if opts.host_cache_bytes == Some(0) || opts.mimo_prefix_entries == 0 { return Ok(0); }
+        let cache = crate::plan::FamilyModel::cache_geometry(model, crate::serving_capacity::CacheOptions {
+            coordinator_ranks: gpus, attention_placement: Some(attention), mla_kv: opts.mla_kv, ..Default::default()
+        })?.context("Kimi host cache geometry")?;
+        let page_bytes = if attention == AttentionPlacement::Heads && gpus == 2 {
+            cache.ranks[0].persistent_unit_bytes
+        } else { cache.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum() };
+        let mark_bytes = cache.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>()
+            + draft_window_bytes;
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE,
+            page_bytes, mark_bytes, draft_bytes: 0 };
+        geometry.resolve(opts.host_cache_bytes, context, opts.resolved_concurrency("kimi_k3"),
+            host_total, geometry.chunk_bytes()).context("Kimi retained host prefix quota")
+    })();
+    let host_quota = match host_quota {
+        Ok(bytes) => bytes,
+        Err(error) => { report.refuse_placement(format!("Kimi host prefix refused: {error:#}"), "Disable host retention or supply a supported quota."); return memory; }
+    };
+    recipe.owners.push(kimi::host_prefix_owner(host_quota, maximum_pages));
+    let mut budgets = match kimi::budgets(&opts.rtx_bytes.iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
         opts.headroom_bytes, &occupied, &sparks) {
         Ok(value) => value,
         Err(error) => { report.refuse_placement(format!("Kimi physical budgets refused: {error}"),
             "Check the requested card capacities."); return memory; }
     };
+    budgets.push(kimi::host_budget(host_total, host_available));
+    report.host_budget_bytes = host_quota;
+    report.host_ledger = cuteafd_core::memory_layout::HostLayout::new(host_total, host_available,
+        (8 << 30).max(host_total / 10), host_quota, vec![]);
     let resolved = recipe.admit(kimi::request(context, requested_pool, onboard, prefill,
         crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
     let onboarded = match resolved {

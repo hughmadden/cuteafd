@@ -310,6 +310,7 @@ impl Family for KimiK3 {
 }
 
 impl FamilyModel for Model {
+    fn contract_admission(&self) -> bool { true }
     fn spec(&self) -> &ModelSpec { &self.spec }
     /// Header-native K6 core tensors are served natively; there is no BF16 fallback.
     fn configure(&mut self) -> Result<(), ConfigError> {

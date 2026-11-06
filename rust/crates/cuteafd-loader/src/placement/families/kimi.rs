@@ -59,6 +59,7 @@ impl FixedOwner {
 pub struct Arena {
     pub count: usize,
     pub peak: Vec<u64>,
+    pub resident: Vec<u64>,
     pub weights: Vec<u64>,
 }
 
@@ -109,11 +110,12 @@ pub fn tp2_arenas(counts: &[usize], workspace: [u64; 2], halves: &[[Bytes2; 2]])
         if count > halves.len() {
             return Err(invalid("arena count exceeds the routed inventory"));
         }
-        let mut arena = Arena { count, peak: vec![0; 2], weights: vec![0; 2] };
+        let mut arena = Arena { count, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] };
         for gpu in 0..2 {
             let resident = halves[..count].iter().try_fold(workspace[gpu], |sum, pair|
                 sum.checked_add(pair[gpu].resident).ok_or(Refusal::Overflow("Kimi TP2 expert arena")))?;
             let staging = halves[..count].iter().map(|pair| pair[gpu].staging).max().unwrap_or(0);
+            arena.resident[gpu] = resident;
             arena.peak[gpu] = resident.checked_add(staging)
                 .ok_or(Refusal::Overflow("Kimi TP2 expert staging"))?;
             arena.weights[gpu] = resident.checked_sub(workspace[gpu])
@@ -139,7 +141,7 @@ pub fn whole_arenas(counts: &[usize], workspace: u64, parts: &[Bytes2])
             resident = resident.checked_add(part.resident)
                 .ok_or(Refusal::Overflow("Kimi expert arena"))?;
         }
-        Ok(Arena { count, peak: vec![peak], weights: vec![resident - workspace] })
+        Ok(Arena { count, peak: vec![peak], resident: vec![resident], weights: vec![resident - workspace] })
     }).collect()
 }
 
@@ -215,6 +217,8 @@ pub struct KimiRecipe {
     pub spark: Vec<SparkOwner>,
     pub draft: Option<Draft>,
     pub fixed: Vec<FixedOwner>,
+    /// Additional physical owners (context, host retention and loaded code).
+    pub owners: Vec<Component>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,7 +249,7 @@ impl KimiRecipe {
     /// from the admitted owners; nothing is re-sampled here.
     pub fn execution(&self, solved: &ResolvedPlan) -> Result<Placement, Refusal> {
         let modes = &solved.decisions.attention;
-        if modes != &self.attention
+        if modes != &self.resolved_attention()
             || solved.decisions.prefill != self.prefill
             || solved.decisions.lanes != self.lanes
             || solved.decisions.onboard_layers.len() != self.gpus
@@ -333,7 +337,7 @@ impl KimiRecipe {
             onboard_layers: count,
             max_pool_tokens_no_onboard: None,
             layers: assignments,
-            movables: self.draft.iter().map(|_| (MovableId::Drafter, (self.gpus - 1) as u8)).collect(),
+            movables: solved.decisions.draft_home.map(|gpu| (MovableId::Drafter, gpu)).into_iter().collect(),
             expert_ranges,
             residual,
             hops,
@@ -342,6 +346,24 @@ impl KimiRecipe {
                 .map(|rank| solved.items(Location::coordinator(rank as u8)))
                 .collect::<Result<_, _>>()?,
         })
+    }
+
+    /// Cheap balanced contiguous boundary; exact admission prices the selected
+    /// ownership once. Split KDA layers do not count toward the MLA boundary.
+    pub fn resolved_attention(&self) -> Vec<LayerMode> {
+        let mut modes = self.attention.clone();
+        if self.gpus == 2 && self.placement == AttentionPlacement::Layers {
+            let count = modes.iter().filter(|mode| matches!(mode, LayerMode::Whole { .. })).count();
+            let mut index = 0;
+            for mode in &mut modes {
+                if matches!(mode, LayerMode::Whole { .. }) {
+                    *mode = LayerMode::Whole { gpu: u8::from(index >= count.div_ceil(2)),
+                        ffn: crate::placement::FfnMode::Split };
+                    index += 1;
+                }
+            }
+        }
+        modes
     }
 
     fn kind_order(&self) -> Vec<AttentionClass> {
@@ -378,7 +400,7 @@ impl Recipe for KimiRecipe {
         }
         let mut contract = Contract {
             resident_weight_limit: request.resident_weight_limit,
-            phase_order: PhaseOrder::TARGET_THEN_DRAFT,
+            phase_order: PhaseOrder::DRAFT_THEN_TARGET,
             spark_reply_formats: self.spark_links.then(|| SparkReplyFormats {
                 prefill: Some(request.spark_reply_formats.prefill(
                     cuteafd_core::ExpertGeometry::KIMI_K3.partial_replies())),
@@ -388,11 +410,31 @@ impl Recipe for KimiRecipe {
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,
             variables: self.attention.iter().enumerate()
-                .map(|(layer, &mode)| Variable::Attention { layer, values: vec![mode] })
+                .map(|(layer, &mode)| Variable::Attention { layer, values: if self.gpus == 2 && self.placement == AttentionPlacement::Layers
+                    && matches!(mode, LayerMode::Whole { .. }) {
+                        vec![LayerMode::Whole { gpu: 0, ffn: crate::placement::FfnMode::Split },
+                            LayerMode::Whole { gpu: 1, ffn: crate::placement::FfnMode::Split }]
+                    } else { vec![mode] } })
                 .collect(),
             requires: vec![],
             components: vec![],
         };
+        let modes = self.resolved_attention();
+        let whole = modes.iter().enumerate().filter_map(|(layer, mode)|
+            (self.gpus == 2 && self.placement == AttentionPlacement::Layers
+                && matches!(mode, LayerMode::Whole { .. })).then_some(layer)).collect::<Vec<_>>();
+        // A 1 owner cannot be followed by a 0 owner. Anchor the cheap balanced
+        // boundary and let propagation enforce contiguity, not repeated solves.
+        for pair in whole.windows(2) {
+            contract.requires.push(Requires { when: Choice { variable: pair[0], option: 1 },
+                any_of: vec![Choice { variable: pair[1], option: 1 }] });
+        }
+        for &layer in &whole {
+            let LayerMode::Whole { gpu, .. } = modes[layer] else { unreachable!() };
+            contract.requires.push(Requires { when: Choice { variable: layer, option: 1 - usize::from(gpu) },
+                any_of: vec![] });
+        }
+        contract.components.extend(self.owners.clone());
         contract.variables.push(Variable::Prefill(vec![self.prefill]));
         contract.variables.push(Variable::Lanes(vec![self.lanes]));
         let onboard = self.experts.as_ref().map(|profile| -> Result<(usize, &ExpertProfile), Refusal> {
@@ -435,7 +477,7 @@ impl Recipe for KimiRecipe {
             Ok(Choice { variable, option })
         };
         for (rank, &bytes) in self.records_per_page.iter().enumerate() {
-            if bytes == 0 { continue; }
+            if bytes == 0 || !whole.is_empty() { continue; }
             let owner = Allocation::buffer(format!("records.{rank}"),
                 Location::coordinator(rank as u8), self.page_rows(), Lifetime::RESIDENT,
                 Category::Kv, "records");
@@ -458,24 +500,41 @@ impl Recipe for KimiRecipe {
             contract.components.push(Component::allocation(owner,
                 ByteCurve::fixed(fixed.bytes, self.maximum_pages), false, self.maximum_pages));
         }
-        for rank in 0..self.gpus {
-            let weights = self.attention.iter().enumerate()
-                .try_fold(0u64, |sum, (layer, &mode)| {
-                    sum.checked_add(attention_bytes(&self.layer_attention[layer], mode, rank))
-                        .ok_or(Refusal::Overflow("Kimi attention weights"))
-                })?;
-            if weights == 0 { continue; }
-            let owner = Allocation::buffer(format!("layers.{rank}"),
-                Location::coordinator(rank as u8),
-                weights, Lifetime::RESIDENT, Category::Weights, "layers");
-            contract.components.push(Component::resident_weight(
-                ResidentWeight::from_allocation(&owner, ResidentWeights(weights)),
-                ByteCurve::fixed(weights, self.maximum_pages)));
-            contract.components.push(Component::allocation(owner,
-                ByteCurve::fixed(weights, self.maximum_pages), false, self.maximum_pages));
+        for (layer, &mode) in modes.iter().enumerate() {
+            let domain = match &contract.variables[layer] {
+                Variable::Attention { values, .. } => values.clone(), _ => unreachable!(),
+            };
+            for (option, mode) in domain.into_iter().enumerate() {
+                for rank in 0..self.gpus {
+                    let weights = attention_bytes(&self.layer_attention[layer], mode, rank);
+                    if weights == 0 { continue; }
+                    let owner = Allocation::buffer(format!("layers.{layer}.{option}.{rank}"),
+                        Location::coordinator(rank as u8), weights, Lifetime::RESIDENT, Category::Weights, "layers");
+                    let mut weight = Component::resident_weight(
+                        ResidentWeight::from_allocation(&owner, ResidentWeights(weights)),
+                        ByteCurve::fixed(weights, self.maximum_pages));
+                    weight.activation = Activation::choice(layer, option);
+                    contract.components.push(weight);
+                    let mut allocation = Component::allocation(owner,
+                        ByteCurve::fixed(weights, self.maximum_pages), false, self.maximum_pages);
+                    allocation.activation = Activation::choice(layer, option);
+                    contract.components.push(allocation);
+                }
+                if whole.contains(&layer) {
+                    let LayerMode::Whole { gpu, .. } = mode else { unreachable!() };
+                    // Every whole MLA layer retains one full record on its owner.
+                    let bytes = self.records_per_page[0];
+                    let owner = Allocation::buffer(format!("records.{layer}.{option}"),
+                        Location::coordinator(gpu), bytes, Lifetime::RESIDENT, Category::Kv, "records");
+                    let mut allocation = Component::allocation(owner,
+                        ByteCurve::linear(bytes, bytes, self.maximum_pages), false, self.maximum_pages);
+                    allocation.activation = Activation::choice(layer, option);
+                    contract.components.push(allocation);
+                }
+            }
         }
         if self.hop_spec.row_bytes > 0 {
-            let hops = plan_hops(&self.attention, &self.hop_spec)
+            let hops = plan_hops(&modes, &self.hop_spec)
                 .map_err(|error| invalid(&error.to_string()))?;
             let buffers = hop_buffer_bytes(&hops, &self.hop_spec, self.gpus)
                 .ok_or(Refusal::Overflow("Kimi residual hop buffers"))?;
@@ -504,7 +563,7 @@ impl Recipe for KimiRecipe {
                 let peak = arena.peak[rank];
                 if peak == 0 { continue; }
                 let owner = Allocation::buffer(format!("experts.{}.{rank}", arena.count),
-                    Location::coordinator(rank as u8), peak, Lifetime::RESIDENT,
+                    Location::coordinator(rank as u8), arena.resident[rank], Lifetime::RESIDENT,
                     Category::Experts, group.clone());
                 if arena.weights[rank] > 0 {
                     if arena.weights[rank] > peak {
@@ -517,9 +576,18 @@ impl Recipe for KimiRecipe {
                     contract.components.push(weights);
                 }
                 let mut component = Component::allocation(owner,
-                    ByteCurve::fixed(peak, self.maximum_pages), false, self.maximum_pages);
+                    ByteCurve::fixed(arena.resident[rank], self.maximum_pages), false, self.maximum_pages);
                 component.activation = Activation::choice(choice.variable, choice.option);
                 contract.components.push(component);
+                let staging = peak.checked_sub(arena.resident[rank]).ok_or_else(|| invalid("expert peak below resident"))?;
+                if staging > 0 {
+                    let owner = Allocation::buffer(format!("experts.staging.{}.{rank}", arena.count),
+                        Location::coordinator(rank as u8), staging,
+                        Lifetime { first: Phase::Load, last: Phase::Load }, Category::Experts, "expert load staging");
+                    let mut component = Component::allocation(owner, ByteCurve::fixed(staging, self.maximum_pages), false, self.maximum_pages);
+                    component.activation = Activation::choice(choice.variable, choice.option);
+                    contract.components.push(component);
+                }
             }
         }
         for spark in &self.spark {
@@ -540,6 +608,7 @@ impl Recipe for KimiRecipe {
         }
         if let Some(draft) = &self.draft {
             let rank = (self.gpus - 1) as u8;
+            contract.variables.push(Variable::DraftHome(vec![rank]));
             let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
             for (index, owner) in draft.owners.iter().enumerate() {
                 let allocation = Allocation::buffer(format!("draft.{index}"),
@@ -601,6 +670,21 @@ pub fn budgets(cards: &[(u64, u64)], headroom: u64, occupied: &[u64],
     Ok(budgets)
 }
 
+/// HOST and PINNED are one physical capacity, even when retention uses ordinary RAM.
+pub fn host_budget(total: u64, available: u64) -> Budget {
+    Budget { id: "host".into(), locations: vec![Location::HOST, Location::PINNED],
+        physical_bytes: total, logical_bytes: total,
+        baseline: Baseline::Forecast { occupied: total.saturating_sub(available),
+            source: "host MemAvailable before retained owners".into(), assumed: true },
+        headroom: (8 << 30).max(total / 10) }
+}
+
+pub fn host_prefix_owner(bytes: u64, maximum: u64) -> Component {
+    Component::allocation(Allocation::buffer("kimi.host.prefix", Location::HOST, bytes,
+        Lifetime::RESIDENT, Category::Prefix, "Kimi retained host prefix quota"),
+        ByteCurve::fixed(bytes, maximum), true, maximum)
+}
+
 /// Zero and omission normalize identically; an explicit pin stays exact.
 pub fn request(context: u64, pool: Option<u64>, onboard: crate::placement::Onboard,
     prefill: PrefillShape, operation: Operation, weight_limit: ResidentWeights,
@@ -656,11 +740,12 @@ mod tests {
             experts: Some(ExpertProfile { layers: vec![1], destination: vec![0],
                 counts: vec![0, 1], rank_sets: vec![] }),
             arenas: vec![
-                Arena { count: 0, peak: vec![0], weights: vec![0] },
-                Arena { count: 1, peak: vec![1000], weights: vec![900] },
+                Arena { count: 0, peak: vec![0], resident: vec![0], weights: vec![0] },
+                Arena { count: 1, peak: vec![1000], resident: vec![1000], weights: vec![900] },
             ],
             spark: vec![],
             draft: None,
+            owners: vec![],
             fixed: vec![FixedOwner { rank: 0, category: Category::Prefix, group: "Kimi exact KDA marks".into(),
                 bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT }],
         }
@@ -704,10 +789,10 @@ mod tests {
         assert_eq!(admitted.placement.layers.len(), 2);
         assert_eq!(admitted.onboard,
             admitted.solved.decisions.onboard_layers.iter().map(Vec::len).max().unwrap_or(0));
-        let pinned = crate::placement::families::kimi::request(256, Some(0), crate::placement::Onboard::Auto,
+        let pinned = crate::placement::families::kimi::request(256, Some(320), crate::placement::Onboard::Auto,
             PrefillShape { rows: 64, waves: 1 }, crate::placement::planner::Operation::Serving,
             ResidentWeights(1 << 30), SparkReplyFormats::default());
-        assert_eq!(recipe.admit(pinned, budgets).unwrap().solved.pool_tokens, 256);
+        assert!(recipe.admit(pinned, budgets).is_err());
     }
 
     #[test]

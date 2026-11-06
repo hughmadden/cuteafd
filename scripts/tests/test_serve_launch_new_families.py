@@ -268,7 +268,7 @@ def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("recipe", ["example", "release", "gate"])
-def test_kimi_min_recipe_launches_one_physical_owner_with_automatic_admission(tmp_path: Path, recipe: str) -> None:
+def test_kimi_min_recipe_launches_one_physical_owner_with_pinned_prefill_shape(tmp_path: Path, recipe: str) -> None:
     path = ROOT / "examples/configs/kimi-k3-exl3-k6-min.config"
     values = _keys(path)
     if recipe != "example":
@@ -285,7 +285,8 @@ def test_kimi_min_recipe_launches_one_physical_owner_with_automatic_admission(tm
     assert (values["RTX_GPUS"], values["COORDINATOR_GPUS"], values["SPARK_COUNT"]) == ("1", "0", "6")
     assert values["SPARK_DEVICE_BUDGET_BYTES"] == str(110 << 30)
     assert values["POOL_TOKENS"] == "auto" and values["SPECULATOR"] == "dflash2"
-    assert not {"RTX_EXPERT_LAYERS", "PREFILL_ROWS", "PREFILL_WAVES", "PREFILL_SPAN_ROWS",
+    assert values["PREFILL_ROWS"] == "1024"
+    assert not {"RTX_EXPERT_LAYERS", "PREFILL_WAVES", "PREFILL_SPAN_ROWS",
                 "MAX_CONTEXT_TOKENS", "CONCURRENCY", "COORDINATOR_GPU_BUDGET_GIB"}.intersection(values)
     draft = values["SPECULATOR_MODEL_ID"]
     _snapshot(tmp_path / "hf", draft, {}, revision="e77935fb4804e17eb55085bffd045eae1d779769")
@@ -300,6 +301,8 @@ def test_kimi_min_recipe_launches_one_physical_owner_with_automatic_admission(tm
     assert _flag(plan, "--rtx") == "1" and _flag(plan, "--spark-ranks") == "6"
     assert _flag(plan, "--speculator") == "dflash2" and _flag(serve, "--draft") is not None
     assert _flag(plan, "--spark-budget-gib") == _flag(serve, "--spark-budget-gib") == "110.0"
+    assert _flag(plan, "--prefill-rows") == _flag(serve, "--prefill-rows") == "1024"
+    assert _flag(plan, "--prefill-waves") == _flag(serve, "--prefill-waves") == "3"
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
