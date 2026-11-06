@@ -654,7 +654,7 @@ fn compact_hqa_view_loads_without_native_shards_and_preserves_parent_owners() {
     let compact = CheckpointView::select(dir.path(), AttentionMode::Compact).unwrap();
     let hqa = CheckpointView::select(dir.path(), AttentionMode::Hqa).unwrap();
     assert_ne!(compact.fingerprint(), hqa.fingerprint());
-    assert!(Checkpoint::open_view(&hqa).is_err());
+    assert!(Checkpoint::open_view_for_role(&hqa, "native attention test", |_| true).is_err());
     let checkpoint = Checkpoint::open_view(&compact).unwrap();
     Model::open(&checkpoint).unwrap();
     assert!(checkpoint.tensors.iter().all(|tensor| !tensor.shard.starts_with("hqa-attention-")));
