@@ -13,6 +13,7 @@ impl Opened {
         ensure!(peer != args.device, "Qwen dual devices must differ");
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let mtp = args.mtp > 0 && layers == self.cfg.layers;
+        cuteafd_bench::context::set_resolved("mtp", &if mtp { args.mtp.min(engine::DECODE_ROWS - 1) } else { 0 }.to_string());
         let devices = [args.device, peer].map(|id| Device { library: &self.library, id });
         let _entry = devices[0].enter()?;
         for rank in 0..2 { devices[rank].run(|| self.library.cuda_enable_peer(devices[1-rank].id))?; }

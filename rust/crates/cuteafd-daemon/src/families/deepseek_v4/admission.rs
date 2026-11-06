@@ -121,6 +121,7 @@ pub(crate) fn admit(inputs: &v4::V4Inputs)
     let admitted = prepared.admit(request).map_err(anyhow::Error::msg)?;
     tracing::info!(solve_us = admitted.solve_us, admissions = 1,
         "V4 admission prepare + solve/execution (excludes checkpoint inventory)");
+    cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     Ok((admitted.placement, prefix, expert_usage))
 }
 

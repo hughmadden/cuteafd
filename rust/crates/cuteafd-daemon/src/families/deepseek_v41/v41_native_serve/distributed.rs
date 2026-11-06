@@ -72,6 +72,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("after native preload")?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
+    cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
     // Dense owners allocate exactly as through the mount; with coordinator push
     // possible their bytes are recorded and arrive in the Spark push group.
     let pushing = super::coordinator_push::wanted(&args, &catalog)?;

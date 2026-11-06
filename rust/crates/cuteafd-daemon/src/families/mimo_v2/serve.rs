@@ -1417,7 +1417,9 @@ fn select_draft_action(policy: &mut cuteafd_core::DraftPolicy, requests: &[(u64,
 }
 
 fn serving_queue_depth(explicit: Option<usize>, concurrency: usize) -> usize {
-    explicit.unwrap_or(cuteafd_core::concurrency::queue_depth(concurrency as u64) as usize)
+    let depth = explicit.unwrap_or(cuteafd_core::concurrency::queue_depth(concurrency as u64) as usize);
+    cuteafd_bench::context::set_resolved("http-queue-depth", &depth.to_string());
+    depth
 }
 
 fn serving_context_slots(sequences: usize, rings: usize, explicit: Option<usize>, warm: bool) -> usize {

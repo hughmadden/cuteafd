@@ -508,7 +508,9 @@ mod source_format_tests {
     #[test]
     fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
-        let automatic = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        let automatic = crate::commands::bench::assert_resolved_seam("mimo_v2",
+            &["fp8-head", "fp8-o-proj", "draft-fp8", "draft-representation"], ||
+            resolve_weight_formats(&args, &checkpoint, &cfg)).unwrap();
         assert_eq!(automatic.default_policy, MimoDefaultPolicy::Fp8);
         assert_eq!(automatic.head, MimoProjectionRepresentation::Fp8);
         assert_eq!(automatic.draft, MimoDraftRepresentation::Fp8Only);
@@ -1006,6 +1008,7 @@ impl Opened {
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
         let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, split_device)?;
+        cuteafd_bench::context::set_resolved("split-device", &split_device.map_or_else(|| "none".into(), |device| device.to_string()));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
         self.cfg.validate_program_manifest(&manifest, if split_device.is_some() { 2 } else { 1 })?;
         if split_device.is_some() {
@@ -1068,7 +1071,7 @@ impl Opened {
         cuteafd_bench::context::ResolvedSettings::default()
             .value("max-context", resolved.max_context).value("prefill-rows", resolved.prefill_rows)
             .value("prefill-waves", resolved.prefill_waves).value("prefill-span-rows", resolved.prefill_span_rows)
-            .value("embed-placement", format!("{:?}", resolved.token_io.embed_placement.unwrap()).to_lowercase()).publish();
+            .value("embedding-placement", format!("{:?}", resolved.token_io.embed_placement.unwrap()).to_lowercase()).publish();
         let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;

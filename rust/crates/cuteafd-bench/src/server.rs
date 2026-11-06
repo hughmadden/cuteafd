@@ -208,7 +208,7 @@ fn layout(hardware: &Hardware, settings: &[Setting]) -> String {
 }
 
 pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configuration {
-    let settings = context.settings.clone();
+    let settings = context.report_settings();
     let quant = context.snapshot.as_deref().map(|s| quant(s, hardware.sparks.len())).unwrap_or_default();
     Configuration {
         supports_thinking_off: context.supports_thinking_off,

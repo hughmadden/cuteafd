@@ -133,6 +133,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     if args.prefix_cache_entries == u32::MAX {
         args.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(u64::from(args.concurrency)) as u32;
     }
+    cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
     cuteafd_bench::context::set_resolved("decode-lanes", &lanes.to_string());
     cuteafd_bench::context::set_resolved("prefix-cache-entries", &args.prefix_cache_entries.to_string());
@@ -435,6 +436,7 @@ fn worker(
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
+    cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     admission::startup_phase(&lib, "v41/startup", device_total)?;
@@ -1042,7 +1044,8 @@ mod admitted_prefill_tests {
         let crate::cli::Commands::ServeNative(args) = crate::cli::Cli::try_parse_from(argv).unwrap().command else {
             panic!("expected serve-native");
         };
-        AdmittedPrefill::resolve(&args).unwrap()
+        crate::commands::bench::assert_resolved_seam("deepseek_v41",
+            &["prefill-batch-tokens", "prefill-waves", "prefill-reserve-rows"], || AdmittedPrefill::resolve(&args)).unwrap()
     }
     /// The deployment's shape (TJ 2026-10-28: fixed 3) resolves exactly; a
     /// pinned depth keeps its own shape.

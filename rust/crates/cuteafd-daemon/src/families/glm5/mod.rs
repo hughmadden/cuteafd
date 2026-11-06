@@ -372,7 +372,8 @@ mod draft_cli_tests {
             let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--peers", peers.as_str()];
             argv.extend_from_slice(extra);
             let mut args = Parse::try_parse_from(argv).unwrap().engine;
-            resolve_prefill(&mut args).unwrap();
+            crate::commands::bench::assert_resolved_seam("glm5",
+                &["prefill-rows", "prefill-waves", "prefill-span-rows"], || resolve_prefill(&mut args)).unwrap();
             (args.prefill_rows, args.prefill_waves, args.prefill_span_rows)
         };
         assert_eq!(resolve(&[]), (2752, 3, 8256));

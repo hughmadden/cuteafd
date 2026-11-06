@@ -803,6 +803,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         cuteafd_core::spark_reply::requested()), budgets)?;
     tracing::info!(phases = ?admitted.solved.phases, "Kimi admitted per-phase physical ledger");
     let placement = admitted.placement;
+    cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     let mark_selection = MarkSelection { legacy_slots: legacy_marks as u64, slots: legacy_marks as u64, reduction_reason: None };
     let pool_tokens = usize::try_from(placement.pool_tokens)?;
     let draft = draft.map(|layout| layout.with_pool_tokens(pool_tokens)).transpose()?;
@@ -1230,7 +1231,8 @@ pub(super) mod tests {
         let mut prefix = Cli::try_parse_from(["serve", "--host-cache-bytes", "0"])?.prefix;
         let mut i = inputs(&cfg);
         i.prefix = Some(&prefix);
-        admit(i)?;
+        crate::commands::bench::assert_resolved_seam("kimi_k3",
+            &["pool-tokens", "rtx-expert-layers", "onboard", "attention-placement"], || admit(i))?;
         prefix.host_cache_headroom_bytes = u64::MAX;
         let mut i = inputs(&cfg);
         i.prefix = Some(&prefix);

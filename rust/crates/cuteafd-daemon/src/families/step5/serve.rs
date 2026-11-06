@@ -129,11 +129,13 @@ impl ServeArgs {
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
+        let shape = prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
             span_rows: None, reserve_rows: None,
-        })?)
+        })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
+        Ok(shape)
     }
 
     fn validate(&self) -> Result<()> {
@@ -254,7 +256,6 @@ fn with_backend<T>(args: &ServeArgs,
     let mut resolved = args.clone();
     resolved.prefill_rows = u32::try_from(shape.unit_rows)?;
     resolved.prefill_waves = u8::try_from(shape.waves)?;
-    cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
     let args = &resolved;
     args.validate()?;
     let startup = std::time::Instant::now();
@@ -1170,7 +1171,8 @@ mod tests {
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
             args.validate()?;
-            let shape = args.shape()?;
+            let shape = crate::commands::bench::assert_resolved_seam("step5",
+                &["prefill-rows", "prefill-waves"], || args.shape())?;
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
             args.prefill_rows = unit as u32;
             let exports = [1, 16, 80, 256, 1024, 4096];

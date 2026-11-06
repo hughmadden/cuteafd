@@ -40,6 +40,15 @@ impl ServerContext {
         }
     }
 
+    /// No report caller may substitute a launch request for missing runtime evidence.
+    pub fn report_settings(&self) -> Vec<Setting> {
+        let mut context = self.clone();
+        if let Err(missing) = context.validate_resolved() {
+            for name in missing { context.require_resolved(&name); }
+        }
+        context.settings
+    }
+
     pub fn resolve(&mut self, name: &str, value: &str) {
         apply_resolved(&mut self.settings, name, value);
     }
@@ -119,7 +128,35 @@ fn apply_resolved(settings: &mut Vec<Setting>, name: &str, value: &str) {
     if !replaced { settings.push(resolved); }
 }
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static SEAM_SETTINGS: std::cell::RefCell<Option<ResolvedSettings>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Capture the production publication calls on this CPU fixture's thread.
+#[cfg(feature = "test-support")]
+pub fn capture_resolved<T>(seam: impl FnOnce() -> T) -> (T, ResolvedSettings) {
+    struct Reset;
+    impl Drop for Reset { fn drop(&mut self) { SEAM_SETTINGS.with(|slot| { slot.borrow_mut().take(); }); } }
+    SEAM_SETTINGS.with(|slot| {
+        assert!(slot.borrow().is_none(), "nested resolution capture");
+        *slot.borrow_mut() = Some(ResolvedSettings::default());
+    });
+    let _reset = Reset;
+    let result = seam();
+    let settings = SEAM_SETTINGS.with(|slot| slot.borrow_mut().take().unwrap());
+    (result, settings)
+}
+
 pub fn set_resolved(name: &str, value: &str) {
+    #[cfg(feature = "test-support")]
+    if SEAM_SETTINGS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(settings) = slot.as_mut() {
+            settings.0.push((name.into(), value.into()));
+            true
+        } else { false }
+    }) { return; }
     if let Ok(mut slot) = state().context.lock() {
         apply_resolved(&mut slot.settings, name, value);
     }
@@ -140,6 +177,17 @@ impl ResolvedSettings {
         self.0.push((name.into(), value.to_string()));
         self
     }
+    /// A seam test exercises the very records the serving path publishes.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn assert_resolved(&self) {
+        let mut context = ServerContext::default();
+        for (name, _) in &self.0 { context.require_resolved(name); }
+        assert!(context.validate_resolved().is_err(), "fixture must require runtime facts");
+        self.apply(&mut context);
+        assert_eq!(context.validate_resolved(), Ok(()));
+        assert!(context.report_settings().iter().all(|setting| setting.source == "resolved"));
+    }
+
     pub fn apply(&self, context: &mut ServerContext) {
         for (name, value) in &self.0 { context.resolve(name, value); }
     }
@@ -277,6 +325,29 @@ pub const DEPLOYMENT: [&str; 16] = ["snapshot", "native-lib", "native_lib", "pee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_derived_values_fail_closed_for_every_launch_source() {
+        for source in ["default", "cli", "env", "unset"] {
+            let mut context = ServerContext { settings: vec![Setting {
+                name: "slots".into(), value: Some("8".into()), default: Some("8".into()), source: source.into(),
+            }], ..Default::default() };
+            context.require_resolved("slots");
+            context.require_resolved("index-cache");
+            assert_eq!(context.validate_resolved().unwrap_err(), ["slots", "index-cache"]);
+            let settings = context.report_settings();
+            assert!(settings.iter().all(|s| s.source == "unresolved" && s.value.is_none()));
+            ResolvedSettings::default().value("slots", 16).value("index-cache", "compact").apply(&mut context);
+            assert_eq!(context.validate_resolved(), Ok(()));
+            assert_eq!(context.settings[0].value.as_deref(), Some("16"));
+            assert_eq!(context.settings[0].default.as_deref(), Some("8"));
+        }
+    }
+
+    #[test]
+    fn configuration_panel_labels_non_derived_defaults_as_launch_defaults() {
+        assert!(include_str!("../assets/bench.html").contains("s.source === 'default' ? 'launch default' : s.source"));
+    }
 
     #[test]
     fn kv_capacity_maximum_is_optional_in_old_records() {
