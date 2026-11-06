@@ -107,7 +107,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 # MiMo defaults to the qualified TP2 drafter on split pairs.
                 tp2_dflash = ("true" if "--split-device" in before["command"]
                               and "--draft" in before["command"] else "false")
-                position = before["command"].index("--embedding-placement") + 2
+                # The launcher emits it after the telemetry switch.
+                position = before["command"].index("--embedding-placement") + 3
                 before["command"][position:position] = ["--tp2-dflash", tp2_dflash]
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
