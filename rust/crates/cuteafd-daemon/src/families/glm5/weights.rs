@@ -934,7 +934,10 @@ impl<'a> GlmLoader<'a> {
                     }
                     // SAFETY: this rank owns the load stream and every destination
                     // remains live until its queued load/transform work completes.
-                    unsafe { self.library.cuda_stream_synchronize(stream)?; }
+                    if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
+                        self.library.quarantine_module_after_failed_drain();
+                        return Err(drain.context("GLM native attention owners quarantined after failed load drain"));
+                    }
                     Ok(NativeAttentionWeights { layout, values, scales })
                 }))?;
                 let mut actual = vec![(format!("glm.weights.gpu.{rank}.layer.{layer}.native.{}.values", route.key), weights.values.buffer)];

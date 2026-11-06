@@ -15,6 +15,7 @@ pub(crate) struct CorePrograms<'a> {
     native_bf16: [cuteafd_ffi::draft_projection::DraftProjections<'a>; 2],
     native_fp8: [[cuteafd_ffi::native_attention::Fp8Projections<'a>; 2]; 2],
     native_scratch: [usize; 2],
+    native_programs: Vec<String>,
     pub f32_add: cuteafd_ffi::F32Add<'a>,
     pub add: Bf16F32Add<'a>,
     pub narrow: F32Bf16Narrow<'a>,
@@ -54,10 +55,24 @@ impl<'a> CorePrograms<'a> {
         }
         use cuteafd_ffi::draft_projection::{DraftProjections, ProjectionOutput};
         use cuteafd_ffi::native_attention::Fp8Projections;
-        let shapes = |fp8, f32| layers.iter().flat_map(|layer| layer.attention_native.values())
-            .filter(|w| w.layout.fp8 == fp8 && (w.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input
-                && w.layout.ranks > 1) == f32)
-            .map(|w| (w.layout.shape[1], w.layout.shape[0])).collect::<Vec<_>>();
+        use cuteafd_loader::{families::glm5::core::native_output,
+            placement::planner::native_attention::{NativeProgram, NativePrograms}};
+        let native_layouts = layers.iter().flat_map(|layer| layer.attention_native.values())
+            .map(|weight| &weight.layout).collect::<Vec<_>>();
+        let requests = native_layouts.iter().map(|&layout| NativeProgram { layout,
+            output: native_output(layout) }).collect::<Vec<_>>();
+        let mut native_programs = std::collections::BTreeSet::new();
+        for capacity in [super::engine::DECODE_ROWS, unit] {
+            let selected = NativePrograms::resolve(&requests, capacity, None)?;
+            for name in &selected.programs {
+                ensure!(programs.contains(name), "GLM native projection export {name} missing before capture");
+            }
+            native_programs.extend(selected.programs);
+        }
+        let native_programs = native_programs.into_iter().collect();
+        let shapes = |fp8, f32| native_layouts.iter()
+            .filter(|layout| layout.fp8 == fp8 && (native_output(layout) == ProjectionOutput::F32) == f32)
+            .map(|layout| (layout.shape[1], layout.shape[0])).collect::<Vec<_>>();
         let native_bf16 = [DraftProjections::load_with_output(programs, &shapes(false, false), rows, ProjectionOutput::Bf16)?,
             DraftProjections::load_with_output(programs, &shapes(false, true), rows, ProjectionOutput::F32)?];
         let fp8 = |capacity| -> Result<_> { Ok([
@@ -91,7 +106,7 @@ impl<'a> CorePrograms<'a> {
         let stages = [cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, super::engine::DECODE_ROWS, ranks, owned)?,
             cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, unit, ranks, owned)?];
         ensure!(admitted.stages.as_ref() == Some(&stages), "GLM K6 loaded BF16 stages differ from admission");
-        Ok(Some(Self { projections, layouts, stages, native_bf16, native_fp8, native_scratch,
+        Ok(Some(Self { projections, layouts, stages, native_bf16, native_fp8, native_scratch, native_programs,
             f32_add: programs.library().f32_add()?,
             add: programs.library().bf16_f32_add()?, narrow: programs.library().f32_bf16_narrow()?, copy: programs.library().v41_peer_copy()? }))
     }
@@ -101,7 +116,7 @@ impl<'a> CorePrograms<'a> {
         self.projections.values().flat_map(|projection| {
             let p = projection.program.policy();
             [p.native_input.as_str(), p.native.as_str(), p.output_program.as_str()]
-        })
+        }).chain(self.native_programs.iter().map(String::as_str))
     }
 
     pub(crate) fn projection(&self, weights: &CoreWeights<'_>) -> Result<&Projection<'a>> {
@@ -111,8 +126,8 @@ impl<'a> CorePrograms<'a> {
     pub(crate) fn native(&self, weights: &crate::shared::native_attention::NativeAttentionWeights<'_>,
         scratch: &CoreScratch<'_>, input: Buffer, output: Buffer, rows: usize, stream: *mut c_void) -> Result<()> {
         let [n, k] = weights.layout.shape;
-        let f32 = usize::from(weights.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input
-            && weights.layout.ranks > 1);
+        let f32 = usize::from(cuteafd_loader::families::glm5::core::native_output(&weights.layout)
+            == cuteafd_ffi::draft_projection::ProjectionOutput::F32);
         // SAFETY: rank-local admitted owners and scratch outlive the ordered stream;
         // typed projection wrappers validate output extents before launch.
         unsafe {

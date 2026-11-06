@@ -1990,6 +1990,16 @@ fn mean_kl(logits: &[f32], golden: &[f32], vocab: usize) -> f64 {
     }).sum::<f64>() / rows.max(1) as f64
 }
 
+fn write_attention_identity(dir: &Path, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<()> {
+    std::fs::write(dir.join("attention.json"), serde_json::to_vec_pretty(&serde_json::json!({
+        "mode": view.mode(), "bundle_fingerprint": view.fingerprint(),
+        "config": view.config_name(), "index": view.index_name(),
+        "fp8_recipe": (view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact)
+            .then_some(cuteafd_loader::plan::checkpoint::view::FP8_RECIPE),
+    }))?)?;
+    Ok(())
+}
+
 /// --nll: score one retained prefill unit per call, downloading its logits
 /// before the next call reuses the workspace: mean NLL, top-1 agreement, KL.
 fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
@@ -2010,12 +2020,7 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
         std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
-        std::fs::write(dir.join("attention.json"), serde_json::to_vec_pretty(&serde_json::json!({
-            "mode": opened.view.mode(), "bundle_fingerprint": opened.view.fingerprint(),
-            "config": opened.view.config_name(), "index": opened.view.index_name(),
-            "fp8_recipe": (opened.view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact)
-                .then_some(cuteafd_loader::plan::checkpoint::view::FP8_RECIPE),
-        }))?)?;
+        write_attention_identity(dir, &opened.view)?;
     }
     let nll_of = |l: &[f32], next: u32| {
         let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
@@ -2471,6 +2476,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
             std::fs::create_dir_all(dir)?;
             std::fs::write(dir.join("decode-logits.bin"),
                 decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            write_attention_identity(dir, &opened.view)?;
         }
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");

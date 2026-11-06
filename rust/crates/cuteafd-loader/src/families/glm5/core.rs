@@ -163,6 +163,12 @@ pub struct CoreInventory {
 
 pub use crate::formats::native_attention::{NativeLayout, NativeProjection};
 
+pub fn native_output(layout: &NativeLayout) -> cuteafd_ffi::draft_projection::ProjectionOutput {
+    use cuteafd_ffi::draft_projection::ProjectionOutput;
+    if layout.split == CoreSplit::Input && layout.ranks > 1 { ProjectionOutput::F32 }
+    else { ProjectionOutput::Bf16 }
+}
+
 impl CoreInventory {
     pub fn from_checkpoint(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) -> Result<Self> {
         validate_native_attention(cfg, checkpoint)?;
@@ -375,23 +381,17 @@ impl CoreCharges {
                 for name in policy_programs(weight, manifest)? { programs.insert(name); }
             }
         }
+        use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
+        let native_manifest = native.iter().any(|weights| !weights.is_empty())
+            .then(|| crate::placement::inventory::ProgramsManifest::from_manifest(manifest)).transpose()?;
         let mut native_scratch = vec![[0usize; 2]; ranks];
         for (rank, weights) in native.iter().enumerate() {
-            for weight in weights {
-                let [n, k] = weight.shape;
-                let output = if weight.split == CoreSplit::Input && weight.ranks > 1 {
-                    cuteafd_ffi::draft_projection::ProjectionOutput::F32
-                } else { cuteafd_ffi::draft_projection::ProjectionOutput::Bf16 };
-                for (index, rows) in [64, unit].into_iter().enumerate() {
-                    if weight.fp8 {
-                        let (name, bytes) = cuteafd_ffi::native_attention::validate_package_geometry(manifest, k, n, rows, output)?;
-                        programs.insert(name);
-                        native_scratch[rank][index] = native_scratch[rank][index].max(bytes);
-                    } else {
-                        programs.insert(cuteafd_ffi::draft_projection::validate_package_geometry_with_output(
-                            manifest, k, n, rows, output)?);
-                    }
-                }
+            let requests = weights.iter().map(|layout| NativeProgram { layout,
+                output: native_output(layout) }).collect::<Vec<_>>();
+            for (index, rows) in [64, unit].into_iter().enumerate() {
+                let selected = NativePrograms::resolve(&requests, rows, native_manifest.as_ref())?;
+                programs.extend(selected.programs);
+                native_scratch[rank][index] = usize::try_from(selected.fp8_scratch_bytes)?;
             }
         }
         if bodies.iter().any(|body| !body.is_empty()) && cfg.variant.ml4().is_some() {
@@ -586,6 +586,35 @@ mod tests {
         Checkpoint {view: None, snapshot:Default::default(),config,quantize_config:None,
             weight_map:tensors.iter().map(|t|(t.meta.name.clone(),t.shard.clone())).collect(),tensors,
             missing_shards:Vec::new(),shard_bytes:0}
+    }
+
+    #[test]
+    fn native_program_selection_preserves_glm_output_and_scratch_contracts() -> Result<()> {
+        use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        for fp8 in [false, true] {
+            for (split, ranks, output) in [
+                (CoreSplit::Whole, 1, ProjectionOutput::Bf16),
+                (CoreSplit::Output, 2, ProjectionOutput::Bf16),
+                (CoreSplit::Input, 2, ProjectionOutput::F32),
+            ] {
+                let layout = NativeLayout { stem: "model.layers.0.self_attn.o_proj".into(),
+                    shape: [6144, 8192], fp8, rank: 0, ranks, split };
+                assert_eq!(native_output(&layout), output);
+                let request = [NativeProgram { layout: &layout, output: native_output(&layout) }];
+                for rows in [1, 4, 8, 16, 64, 128, 2048] {
+                    let selected = NativePrograms::resolve(&request, rows, None)?;
+                    let expected = if fp8 {
+                        let stage = if rows <= 64 { 64 } else { 4096 };
+                        format!("native_attention_n6144_k8192_m{stage}{}",
+                            if output == ProjectionOutput::F32 { "_f32" } else { "" })
+                    } else { output.program_name(8192, 6144) };
+                    assert_eq!(selected.programs, [expected]);
+                    assert_eq!(selected.fp8_scratch_bytes, if fp8 { 256 } else { 0 });
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
