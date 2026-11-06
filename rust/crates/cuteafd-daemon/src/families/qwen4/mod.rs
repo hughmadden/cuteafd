@@ -577,6 +577,8 @@ impl Opened {
         let mut context_args = args.clone();
         let resolved = args.resolved_prefill()?;
         let prefill_shape = args.prefill_shape()?;
+        cuteafd_bench::context::ResolvedSettings::prefill(resolved).publish();
+        cuteafd_bench::context::set_resolved("prefill-units", &prefill_shape.map_or(resolved.unit_rows, |shape| shape.unit_rows).to_string());
         context_args.prefill_rows = usize::try_from(resolved.span_rows)?;
         context_args.prefill_waves = u8::try_from(resolved.waves)?;
         if let Some(shape) = prefill_shape {
@@ -635,6 +637,8 @@ impl Opened {
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let source = self.embed_source()?;
         let with_mtp = args.mtp > 0 && layers == self.cfg.layers;
+        cuteafd_bench::context::set_resolved("mtp", &if with_mtp { args.mtp } else { 0 }.to_string());
+        if args.peers.is_none() { cuteafd_bench::context::set_rtx_expert_layers(if args.local_experts { layers } else { 0 }); }
         let admitted_target = admission::single_weights(args, &self.checkpoint, &self.cfg, layers, with_mtp)?;
         // The coordinator's dense records push in a group of this GPU alone when
         // the checkpoint is SparkNest's; records are planned from headers first,

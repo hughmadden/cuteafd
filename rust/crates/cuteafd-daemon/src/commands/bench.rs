@@ -230,6 +230,27 @@ fn reply_settings(context: &mut cuteafd_bench::context::ServerContext,
     (prefill, decode)
 }
 
+/// Startup-derived argument definitions. This typed registry is shared by
+/// capture and the rewrite inventory gate; adding a normalizer requires an entry.
+#[derive(Clone, Copy)]
+struct DerivedArguments { family: Option<&'static str>, names: &'static [&'static str] }
+const DERIVED_ARGUMENTS: &[DerivedArguments] = &[
+    DerivedArguments { family: None, names: &["max-context", "pool-tokens", "prefill-rows", "prefill-waves",
+        "prefill-span-rows", "prefill-units", "rtx-expert-layers", "onboard", "attention-placement",
+        "prefix-cache-entries", "spark-prefill-reply-format", "spark-decode-reply-format"] },
+    DerivedArguments { family: Some("glm5"), names: &["max-sequences", "draft-context-slots", "draft-window-marks"] },
+    DerivedArguments { family: Some("glm5_flash"), names: &["max-sequences", "slots", "draft-sequences", "draft-context-slots",
+        "index-cache", "prefix-marks", "kda-output-shard", "kda-prefill-expanded", "kda-fp32-partials", "fp8-head",
+        "kda-fp8", "kda-nvfp4-gate", "fp8-prefill"] },
+    DerivedArguments { family: Some("mimo_v2"), names: &["max-sequences", "rings", "draft-sequences", "draft-context-slots",
+        "embed-placement", "fp8-head", "fp8-o-proj", "draft-fp8", "draft-representation"] },
+    DerivedArguments { family: Some("qwen4"), names: &["slots", "mtp"] },
+    DerivedArguments { family: Some("deepseek_v41"), names: &["prefill-batch-tokens", "prefill-reserve-rows", "decode-lanes"] },
+];
+fn derived_argument(family: &str, name: &str) -> bool {
+    DERIVED_ARGUMENTS.iter().any(|rule| rule.family.is_none_or(|id| id == family) && rule.names.contains(&name))
+}
+
 /// The serve command's resolved settings, without publishing them. Tests read
 /// this directly: `capture` stores one process-wide context, so a test that
 /// called it would replace whatever another test was asserting.
@@ -241,6 +262,7 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     let Some(definition) = command.find_subcommand(name) else { return Ok(None) };
     let mut settings: Vec<Setting> = Vec::new();
     let mut snapshot = None;
+    let mut derived = Vec::new();
     for arg in definition.get_arguments() {
         let id = arg.get_id().as_str();
         if matches!(id, "help" | "version" | "coordinator_gpu_budget_gib") {
@@ -254,9 +276,9 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
             Some(clap::parser::ValueSource::DefaultValue) => "default",
             _ => "unset",
         };
-        if value.is_none() && source == "unset" {
-            continue;
-        }
+        let name = arg.get_long().map(str::to_string).unwrap_or_else(|| id.replace('_', "-"));
+        if derived_argument(family, &name) { derived.push(name.clone()); }
+        if value.is_none() && source == "unset" && !derived_argument(family, &name) { continue; }
         let mut defaults: Vec<String> = arg.get_default_values().iter().map(|v| v.to_string_lossy().into_owned())
             .collect();
         if defaults.is_empty() {
@@ -297,8 +319,10 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
         default: None, source: "resolved".into() });
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
-    Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: None, snapshot, settings, supports_thinking_off: None }))
+    let mut context = cuteafd_bench::context::ServerContext { command: name.to_string(),
+        family: None, snapshot, settings, supports_thinking_off: None, derived: Vec::new() };
+    for name in derived { context.require_resolved(&name); }
+    Ok(Some(context))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs

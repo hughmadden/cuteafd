@@ -16,9 +16,34 @@ pub struct ServerContext {
     pub snapshot: Option<PathBuf>,
     pub settings: Vec<Setting>,
     pub supports_thinking_off: Option<bool>,
+    /// Argument definitions whose launch values are not runtime facts.
+    pub derived: Vec<String>,
 }
 
 impl ServerContext {
+    /// Fail closed when a startup-normalized option has not been published.
+    pub fn validate_resolved(&self) -> Result<(), Vec<String>> {
+        let missing: Vec<_> = self.derived.iter().filter(|name| !self.settings.iter()
+            .any(|s| &s.name == *name && s.source == "resolved" && s.value.is_some())).cloned().collect();
+        if missing.is_empty() { Ok(()) } else { Err(missing) }
+    }
+
+    /// Require runtime evidence even for an explicitly supplied launch value.
+    pub fn require_resolved(&mut self, name: &str) {
+        if !self.derived.iter().any(|n| n == name) { self.derived.push(name.into()); }
+        for setting in self.settings.iter_mut().filter(|s| s.name == name && s.source != "resolved") {
+            setting.source = "unresolved".into();
+            setting.value = None;
+        }
+        if !self.settings.iter().any(|s| s.name == name) {
+            self.settings.push(Setting { name: name.into(), source: "unresolved".into(), ..Default::default() });
+        }
+    }
+
+    pub fn resolve(&mut self, name: &str, value: &str) {
+        apply_resolved(&mut self.settings, name, value);
+    }
+
     /// Publish the canonical identity from the engine's validated target configuration.
     pub fn set_family(&mut self, family: &str) {
         self.family = Some(family.to_owned());
@@ -103,6 +128,33 @@ pub fn set_resolved(name: &str, value: &str) {
 /// Publish the accepted expert placement, including zero onboarded layers.
 pub fn set_rtx_expert_layers(layers: usize) {
     set_resolved("rtx-expert-layers", &layers.to_string());
+    if get().derived.iter().any(|name| name == "onboard") { set_resolved("onboard", &layers.to_string()); }
+}
+
+/// Runtime facts emitted by a normalization/admission seam. Kept local until
+/// publication so CPU fixtures can validate them without process-global state.
+#[derive(Debug, Default)]
+pub struct ResolvedSettings(pub Vec<(String, String)>);
+impl ResolvedSettings {
+    pub fn value(mut self, name: &str, value: impl ToString) -> Self {
+        self.0.push((name.into(), value.to_string()));
+        self
+    }
+    pub fn apply(&self, context: &mut ServerContext) {
+        for (name, value) in &self.0 { context.resolve(name, value); }
+    }
+    pub fn publish(&self) {
+        for (name, value) in &self.0 { set_resolved(name, value); }
+    }
+    pub fn prefill(plan: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan) -> Self {
+        Self::default().value("prefill-rows", plan.unit_rows).value("prefill-waves", plan.waves)
+            .value("prefill-span-rows", plan.span_rows)
+    }
+    pub fn placement(placement: &cuteafd_loader::placement::Placement) -> Self {
+        Self::default().value("pool-tokens", placement.pool_tokens)
+            .value("rtx-expert-layers", placement.onboard_layers).value("onboard", placement.onboard_layers)
+            .value("attention-placement", placement.attention_summary())
+    }
 }
 
 pub fn set_thinking_off(supported: bool) {
@@ -110,11 +162,17 @@ pub fn set_thinking_off(supported: bool) {
 }
 
 pub fn get() -> ServerContext {
-    state().context.lock().map(|c| c.clone()).unwrap_or_default()
+    let mut context = state().context.lock().map(|c| c.clone()).unwrap_or_default();
+    if let Err(missing) = context.validate_resolved() {
+        for name in missing { context.require_resolved(&name); }
+    }
+    context
 }
 
 /// The engine's resolved device KV pool (tokens, pages, record format) and host cache bytes.
 pub fn set_kv(tokens: u64, max_tokens: Option<u64>, pages: u64, format: &str, host_bytes: u64) {
+    set_resolved("pool-tokens", &tokens.to_string());
+    set_resolved("kv-format", format);
     if let Ok(mut slot) = state().kv.lock() {
         *slot = Some(KvCapacity { tokens: Some(tokens), max_tokens, pages: Some(pages), format: Some(format.to_string()),
             host_bytes: Some(host_bytes) });
@@ -141,6 +199,9 @@ pub fn phases() -> Vec<(String, f64)> {
 
 /// The API accepts requests on `listen` from now on.
 pub fn mark_ready(listen: SocketAddr) {
+    if let Err(missing) = get().validate_resolved() {
+        for setting in missing { tracing::warn!(%setting, "derived report setting was not resolved at readiness"); }
+    }
     let placement = get().settings.iter().find(|s| s.name == "attention-placement").and_then(|s| s.value.clone());
     if let Some(placement) = placement { tracing::info!(attention_placement = placement, "ready attention placement"); }
     phase("API listening");

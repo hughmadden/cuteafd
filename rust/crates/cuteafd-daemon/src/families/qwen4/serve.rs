@@ -102,6 +102,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     engine_args.slots = cuteafd_core::concurrency::state_slots(args.max_sequences as u64) as usize;
+    cuteafd_bench::context::set_resolved("slots", &engine_args.slots.to_string());
+    cuteafd_bench::context::set_resolved("mtp", &engine_args.mtp.min(DECODE_ROWS - 1).to_string());
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let drafts = if engine_args.mtp > 0 {
         Drafts::Neural { depth: engine_args.mtp.min(DECODE_ROWS - 1), fixed: args.mtp_fixed }

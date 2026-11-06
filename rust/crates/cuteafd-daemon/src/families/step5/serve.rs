@@ -254,6 +254,7 @@ fn with_backend<T>(args: &ServeArgs,
     let mut resolved = args.clone();
     resolved.prefill_rows = u32::try_from(shape.unit_rows)?;
     resolved.prefill_waves = u8::try_from(shape.waves)?;
+    cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
     let args = &resolved;
     args.validate()?;
     let startup = std::time::Instant::now();
@@ -325,7 +326,8 @@ fn with_backend<T>(args: &ServeArgs,
     // One admission: the contract prices every retained owner, and native ABIs
     // are validated against the ownership it selected.
     let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract)?;
-    cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
+    cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
+    cuteafd_bench::context::set_resolved("max-context", &args.max_context.to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup planning complete");
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());

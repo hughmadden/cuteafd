@@ -97,6 +97,7 @@ impl PrefixArgs {
         if self.prefix_cache_entries == cuteafd_core::concurrency::AUTO_ENTRIES {
             self.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(concurrency as u64) as usize;
         }
+        cuteafd_bench::context::set_resolved("prefix-cache-entries", &self.prefix_cache_entries.to_string());
     }
 
     pub fn with_scoring(&self, rows: usize, lane_rows: usize, vocab: usize) -> Result<Self> {

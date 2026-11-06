@@ -807,6 +807,14 @@ pub(crate) struct ResolvedWeightFormats {
 }
 
 impl ResolvedWeightFormats {
+    fn resolved_settings(&self) -> cuteafd_bench::context::ResolvedSettings {
+        cuteafd_bench::context::ResolvedSettings::default()
+            .value("fp8-head", self.head == MimoProjectionRepresentation::Fp8)
+            .value("fp8-o-proj", if self.output.values().all(|v| *v == MimoProjectionRepresentation::Fp8) { "true" }
+                else if self.any_fp8_output() { "mixed" } else { "false" })
+            .value("draft-fp8", self.draft == MimoDraftRepresentation::Fp8Only)
+            .value("draft-representation", if self.draft == MimoDraftRepresentation::Fp8Only { "fp8-only" } else { "bf16-only" })
+    }
     pub fn any_fp8_output(&self) -> bool {
         self.output.values().any(|&format| format == MimoProjectionRepresentation::Fp8)
     }
@@ -893,7 +901,9 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
             native => native,
         }
     } else { args.draft_storage()? };
-    Ok(ResolvedWeightFormats { default_policy, head, output, draft })
+    let selected = ResolvedWeightFormats { default_policy, head, output, draft };
+    selected.resolved_settings().publish();
+    Ok(selected)
 }
 
 pub(crate) struct Opened {
@@ -1054,6 +1064,11 @@ impl Opened {
         cuteafd_bench::context::set_rtx_expert_layers(preflight.placement.onboard_layers);
         resolved.prefill_rows = preflight.prefill_rows;
         resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
+        cuteafd_bench::context::ResolvedSettings::placement(&preflight.placement).publish();
+        cuteafd_bench::context::ResolvedSettings::default()
+            .value("max-context", resolved.max_context).value("prefill-rows", resolved.prefill_rows)
+            .value("prefill-waves", resolved.prefill_waves).value("prefill-span-rows", resolved.prefill_span_rows)
+            .value("embed-placement", format!("{:?}", resolved.token_io.embed_placement.unwrap()).to_lowercase()).publish();
         let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;

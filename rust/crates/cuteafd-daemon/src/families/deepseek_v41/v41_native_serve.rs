@@ -133,7 +133,9 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     if args.prefix_cache_entries == u32::MAX {
         args.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(u64::from(args.concurrency)) as u32;
     }
-    cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
+    let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
+    cuteafd_bench::context::set_resolved("decode-lanes", &lanes.to_string());
+    cuteafd_bench::context::set_resolved("prefix-cache-entries", &args.prefix_cache_entries.to_string());
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
@@ -432,6 +434,7 @@ fn worker(
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     admission::startup_phase(&lib, "v41/startup", device_total)?;
@@ -864,6 +867,8 @@ impl AdmittedPrefill {
         let shape = Self { unit_cap: usize::try_from(plan.unit_rows)?, waves: usize::try_from(plan.waves)? };
         ensure!(shape.reserve_rows() <= crate::shared::memory::row_window::MAX_RESERVE_ROWS,
             "V4.1 prefill reserve {} exceeds the row planes", shape.reserve_rows());
+        cuteafd_bench::context::ResolvedSettings::default().value("prefill-batch-tokens", shape.unit_cap)
+            .value("prefill-waves", shape.waves).value("prefill-reserve-rows", shape.reserve_rows()).publish();
         Ok(shape)
     }
     /// Rows every shared row plane spans: the slots' units.

@@ -159,6 +159,7 @@ fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = u8::try_from(shape.waves)?;
     args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
     Ok(())
 }
 
@@ -1588,6 +1589,7 @@ impl Opened {
         engine.drafter = drafter;
         engine.draft_window_marks = if engine.drafter.as_ref().is_some_and(|d| d.mla_windows_only())
             { args.draft_window_marks } else { 0 };
+        cuteafd_bench::context::set_resolved("draft-window-marks", &engine.draft_window_marks.to_string());
         engine.bind_draft_core_head()?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(),

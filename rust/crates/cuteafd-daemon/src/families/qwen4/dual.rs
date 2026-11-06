@@ -92,7 +92,7 @@ impl Opened {
         tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
             "Qwen dual admitted phase ledger");
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
+        cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
             "Qwen dual shared solver admission before allocation");
         let owners = placement.layers.iter().map(|layer| match layer.mode {

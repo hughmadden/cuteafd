@@ -261,6 +261,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         tracing::info!("GLM 5.3 Flash prefix cache off (no entries): no prefix marks, no reserved unit");
         args.prefix_marks = marks;
     }
+    cuteafd_bench::context::set_resolved("prefix-marks", match args.prefix_marks { PrefixMarks::Arena => "arena", PrefixMarks::Pool => "pool" });
     // Either KV admission reserves the mark arena `prefix_cache` will allocate (none: marks in pool units),
     // counted once the engine's layout is known (`with_engine`).
     args.mark_arena = match args.prefix_marks {

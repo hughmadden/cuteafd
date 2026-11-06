@@ -47,6 +47,7 @@ fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = usize::try_from(shape.waves)?;
     args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
     Ok(())
 }
 
@@ -1670,6 +1671,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
+    for (name, value) in native::resolved_settings(&resolved) { cuteafd_bench::context::set_resolved(name, &value); }
     let args = &resolved;
     check_options(args)?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
@@ -2230,6 +2232,8 @@ impl Opened {
         probe("admission-programs")?;
         let mut selected_args = args.clone();
         selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;
+        cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
+        cuteafd_bench::context::set_resolved("prefill-waves", &selected_args.prefill_waves.to_string());
         let args = &selected_args;
 
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
