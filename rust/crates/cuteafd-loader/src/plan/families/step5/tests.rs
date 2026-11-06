@@ -1944,6 +1944,58 @@ fn hqa_o_dispatch_and_exact_rank_charges_include_all_predictors() -> anyhow::Res
 }
 
 #[test]
+fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Result<()> {
+    use crate::placement::{inventory, Baseline, GpuBudget, Inventory};
+    use super::admission::{self, MarkRule, RuntimeInputs};
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    for mode in [AttentionMode::Hqa, AttentionMode::Compact] {
+        let view = CheckpointView::select(fixture.path(), mode)?;
+        let checkpoint = Checkpoint::open_view(&view)?;
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let inputs = RuntimeInputs {
+            host: Default::default(), resident_weight_limit: None,
+            spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
+            inventory: Inventory { gpus: vec![GpuBudget {
+                capacity_bytes: inventory::PRO_TOTAL_BYTES,
+                baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
+                headroom_bytes: 0,
+            }; 2], spark_ranks: 6, peer_access: true },
+            rows: 64, waves: 1, unit: 64, full_prefill_logits: false,
+            sequences: 1, context: 262_144, requested_pool: Some(262_144),
+            marks: MarkRule { lanes: 1, entries: 0, budget_bytes: 0, host: false },
+            peer_diagnostics: false, pending_code: vec![0; 2], onboard: None,
+        };
+        for depth in [0, 3] {
+            let admitted = admission::forecast_mtp(&checkpoint, &inputs, depth)?;
+            let mtp = coordinator::RankWeightLayout::mtp_from_contract(&checkpoint, &contract, depth)?;
+            for rank in 0..2 {
+                let layout = coordinator::RankWeightLayout::for_execution(&checkpoint, rank, &admitted.ownership)?;
+                let resident = layout.operands.iter().filter(|w| w.name != "model.embed_tokens.weight")
+                    .map(|w| w.allocation_bytes).chain(layout.core.values().map(|w| w.bytes as u64)).sum::<u64>();
+                let target = native::rank_admission(&checkpoint, &admitted.ownership, rank, 64, 64, 64)?;
+                assert_eq!(target.resident_weights.0, resident);
+                let head = rank == usize::from(admitted.ownership.execution().spec().head_gpu);
+                let expected_resident = resident + if head { mtp.resident_bytes } else { 0 };
+                let predictor = if head { mtp.resident_bytes
+                    + native::mtp_native_scratch_from_contract(&checkpoint, &contract, depth, 64)? } else { 0 };
+                let owner = admitted.fixed.iter().find(|owner| owner.gpu == rank as u8
+                    && owner.group == "Step-5 native target and head").expect("named weight owner");
+                assert_eq!(owner.resident_weights.0, expected_resident, "{mode:?} depth {depth} rank {rank}");
+                assert_eq!(owner.bytes, target.immutable + predictor);
+                let id = format!("step5.owner.{rank}.Step-5.native.target.and.head");
+                let fact = admitted.solved.facts.allocations.iter().find(|owner| owner.id == id
+                    && owner.bytes == target.immutable + predictor);
+                assert!(fact.is_some(), "missing exact selected-mode allocation");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn hqa_modes_bind_distinct_identities_and_compact_needs_no_native_shard() -> anyhow::Result<()> {
     use crate::plan::checkpoint::{identity::CheckpointIdentity, AttentionMode, CheckpointView};
     let fixture = hqa_snapshot();
