@@ -104,6 +104,34 @@ def test_construct_captures_recipe_and_scratch_callback_sources(tmp_path):
     assert "recipe.py" in recorder.reads()
 
 
+def test_local_package_policy_is_a_recorded_input(tmp_path):
+    import sys
+    import types
+    package = types.ModuleType("package_policy")
+    package_path = tmp_path / "package_policy.py"
+    package_path.write_text("TILE = 64\n")
+    package.__file__ = str(package_path)
+    recipe = tmp_path / "recipe.py"
+    recipe.write_text("def caller(package):\n    import sys\n    return sys._getframe()\n")
+    spec = importlib.util.spec_from_file_location("local_recipe", recipe)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    recorder = records.Recorder(tmp_path, tmp_path / "output")
+    recorder.imported = set(sys.modules)
+    recorder._profile(module.caller(package), "call", None)
+    assert "package_policy.py" in recorder.reads()
+
+
+def test_package_tuning_and_arguments_change_job_global_identity():
+    context = {key: None for key in (
+        "exporter", "exporter_sha256", "args", "comparison_script_sha256", "export_sources_sha256",
+        "sms", "capability", "toolchain", "environment", "build_kind")}
+    context.update(exporter="package_exl3_aot.py", exporter_sha256="old", args=["--bits", "4"])
+    before = records.stable_hash(records.job_global_inputs(context))
+    assert before != records.stable_hash(records.job_global_inputs({**context, "exporter_sha256": "new"}))
+    assert before != records.stable_hash(records.job_global_inputs({**context, "args": ["--bits", "3"]}))
+
+
 def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})

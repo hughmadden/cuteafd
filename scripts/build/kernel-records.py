@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import types
 import weakref
 
 
@@ -18,6 +19,13 @@ def digest(data):
 
 def stable_hash(value):
     return digest(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+
+
+def job_global_inputs(context):
+    """The exporter and arguments are inputs even when policy ran before tracing."""
+    return {key: context[key] for key in (
+        "exporter", "exporter_sha256", "args", "comparison_script_sha256",
+        "export_sources_sha256", "sms", "capability", "toolchain", "environment", "build_kind")}
 
 
 def source_name(path, root):
@@ -151,17 +159,25 @@ class Recorder:
             if path:
                 self.frames.add(path)
                 self.functions.add((path, frame.f_code.co_qualname))
+                # Active callers can hold function-local package imports that
+                # do not execute again inside the measured constructor.
+                names = (*frame.f_code.co_names, *frame.f_code.co_varnames, *frame.f_code.co_freevars)
+                self._record_dependencies(frame.f_locals.get(name) for name in names)
                 if frame.f_code not in self.seen_codes:
                     self.seen_codes.add(frame.f_code)
-                    # A referenced imported class/function/module can contribute
-                    # constants without executing a function in its source file.
-                    for name in frame.f_code.co_names:
-                        value = frame.f_globals.get(name)
-                        module = sys.modules.get(getattr(value, "__module__", ""))
-                        for dependency in (module, value):
-                            source = source_name(getattr(dependency, "__file__", None), self.root)
-                            if source:
-                                self.frames.add(source)
+                    self._record_dependencies(frame.f_globals.get(name) for name in frame.f_code.co_names)
+
+    def _record_dependencies(self, values):
+        for value in values:
+            if not isinstance(value, (types.ModuleType, types.FunctionType, type)):
+                continue
+            module = sys.modules.get(getattr(value, "__module__", ""))
+            for dependency in (module, value):
+                filename = getattr(dependency, "__file__", None)
+                if filename is not None:
+                    source = source_name(filename, self.root)
+                    if source:
+                        self.frames.add(source)
 
     def reads(self):
         paths = self.opened | self.frames
@@ -269,7 +285,8 @@ class Recorder:
             resources = [{"cubin_sha256": digest(image), "kernels": elf_resources(image)} for image in images]
             key = {"ir_sha256": record["ir_sha256"], "target": context["capability"],
                    "toolchain": context["toolchain"], "environment": context["environment"],
-                   "abi_sha256": abi, "build_kind": context["build_kind"]}
+                   "abi_sha256": abi, "build_kind": context["build_kind"],
+                   "job_global_inputs": job_global_inputs(context)}
             records[relative] = {**record, "object_sha256": digest(blob),
                                  "cubin_sha256": [digest(image) for image in images],
                                  "resources": resources, "abi_sha256": abi,
