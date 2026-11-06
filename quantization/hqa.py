@@ -1395,9 +1395,13 @@ def publish(run, inv, plan, state, results):
     snapshot = Path(cached['snapshot'])
     # Retire staging links; blobs keep every object alive.
     blobs = run.root / 'blobs'
+    # Files with identical content share one blob, backed by one of their staged objects.
+    by_blob = {}
     for name, record in prepared.items():
-        if not os.path.samefile(staging / name, blobs / record['blob']):
-            raise HqaError(f'cache blob is not the staged object: {name}')
+        by_blob.setdefault(record['blob'], []).append(name)
+    for blob_id, names in by_blob.items():
+        if not any(os.path.samefile(staging / n, blobs / blob_id) for n in names):
+            raise HqaError(f'cache blob is not a staged object: {names}')
     new_blobs = sorted({prepared[n]['blob'] for n in state['new']})
     _remove_tree(staging)
     stage_parent = run.root / '.hqa-staging'
