@@ -146,6 +146,12 @@ def refresh_replay_provenance(directory, lock):
             if "source_tree_sha256" in data:
                 data["source_tree_sha256"] = lock["source_tree_sha256"]
             path.write_text(json.dumps(data, indent=2) + "\n")
+    for path in directory.rglob("v41_exl3.json"):
+        data = json.loads(path.read_text())
+        route = data.get("route_preparation")
+        if route:
+            route["sha256"] = compare.sha((path.parent / route["manifest"]).read_bytes())
+            path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def publish(destination, staging, timeout, workers, reuse_workers=None, previous=None, expect=None,
