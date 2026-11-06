@@ -800,7 +800,9 @@ def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) ->
         assert config["SPECULATOR"] == "dflash2"
         assert config["SPECULATOR_MODEL_ID"] == "incoai/GLM-5.3-Flash-DFlash2"
         assert config["POOL_TOKENS"] == config["ATTENTION_PLACEMENT"] == "auto"
-        assert config["VISION"] == config["AUDIO"] == "off"
+        assert "VISION" not in config
+        assert values.get("VISION", "auto") == "auto"
+        assert config["AUDIO"] == "off"
         assert config["EXPERT_BACKEND"] == ("spark" if sparks else "local")
         for key in ("RTX_EXPERT_LAYERS", "EXLR8_DENSE_FROM", "SPARK_TP", "SPARK_EP"):
             assert key not in values

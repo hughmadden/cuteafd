@@ -199,7 +199,9 @@ the launcher derives from them.
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
 
 Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
-GLM Flash, MiMo, Qwen4 and Muse carry their own towers.
+GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8
+K4 min/max examples use automatic bundled vision; the planner admits its resident
+weights and scratch alongside the KV pool and routed experts.
 
 ## Precision
 
