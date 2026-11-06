@@ -91,8 +91,10 @@ def test_glm_native_attention_reaches_plan_and_coordinator(tmp_path, gpus, atten
 @pytest.mark.parametrize("mode,flag", [("hqa", None), ("compact", "--compact-attention"),
                                         ("fp8-compact", "--fp8-compact-attention")])
 def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, flag):
-    config = {"model_type": "glm5_next", "num_hidden_layers": 45, "first_k_dense_replace": 3}
-    keys = (f"ATTENTION_MODE={mode}\nSPARK_COUNT=4\nRTX_GPUS=2\n"
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = (f"ATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=2\n"
             "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
     result = _family_launch_result(tmp_path, config, "test/hqa-flash", keys)
     assert result.returncode == 0, result.stderr
@@ -110,7 +112,7 @@ def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, f
 @pytest.mark.parametrize("mode", ["compact", "fp8-compact", "unknown"])
 def test_attention_bundle_refuses_unsupported_modes_and_families(tmp_path, mode):
     result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa"}, "test/no-hqa",
-                                  f"ATTENTION_MODE={mode}\nSPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+                                  f"ATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     assert result.returncode != 0
     assert "ATTENTION_MODE" in result.stderr
 
