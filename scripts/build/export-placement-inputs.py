@@ -120,6 +120,9 @@ def verified_metadata_bytes(path, lock):
         data["sparkinfer_revision"] = lock.get("revision")
         if "source_tree_sha256" in data:
             data["source_tree_sha256"] = lock.get("source_tree_sha256")
+    if path.name == "program-records.json":
+        for record in data.values():
+            record.pop("sm170_object_sha256", None)
     if path.name == "comparison-context.json":
         for key in ("seconds", "backend_reuse", "execution_stats"):
             data.pop(key, None)
@@ -139,6 +142,45 @@ def verify_job_metadata(previous, current, lock, name):
                      or verified_metadata_bytes(old[path], lock) != verified_metadata_bytes(new[path], lock))
     if changed:
         raise ValueError(f"--verify-skips changed IR or placement metadata in skipped job {name}: {changed}")
+
+
+def check_job_sm170(job, staging, previous, timeout, env, verify_all=False):
+    name, exporter, extra = job
+    directory = staging / name
+    records_path = directory / "program-records.json"
+    if not records_path.exists():
+        return {"sm170_seconds": 0, "sm170_programs": 0}
+    records = json.loads(records_path.read_text())
+    current = publication_records(staging, [job])
+    old = publication_records(previous / ".workers", [job]) if previous else {}
+    report = kernel_records.change_report(old, current)
+    selected = {entry["program"].removeprefix(name + "/")
+                for category in ("added", "changed") for entry in report[category]}
+    if verify_all:
+        selected = set(records)
+    for path, record in records.items():
+        prior = old.get(name + "/" + path, {})
+        if path not in selected and prior.get("object_sha256") == record["object_sha256"]:
+            if "sm170_object_sha256" in prior:
+                record["sm170_object_sha256"] = prior["sm170_object_sha256"]
+    started = time.monotonic()
+    if selected:
+        output = staging / ".sm170" / name
+        output.mkdir(parents=True)
+        payload = dict(sms=170, exporter=exporter, args=extra, output=str(output), program_records=True)
+        if exporter in ("export_b12x_dsv4_aot.py", "package_fp8_moe_aot.py"):
+            payload["selected_objects"] = sorted(Path(path).stem for path in selected)
+        # EXL3 exports multiple objects within one fork call: recompile its whole
+        # touched job, but only compare and publish the requested changed records.
+        with (output / "export.log").open("w") as log:
+            subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
+                            "--_worker", json.dumps(payload)], env=env, stdout=log,
+                           stderr=subprocess.STDOUT, check=True, timeout=timeout)
+        secondary = json.loads((output / "program-records.json").read_text())
+        for path in selected:
+            records[path]["sm170_object_sha256"] = secondary[path]["object_sha256"]
+    records_path.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
+    return {"sm170_seconds": round(time.monotonic() - started, 3), "sm170_programs": len(selected)}
 
 
 def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verify_skips=False):
@@ -179,8 +221,10 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
         verify_job_metadata(prior_directory, output, lock, name)
     summary = json.loads((output / "comparison-context.json").read_text())
     reuse = summary.get("backend_reuse", {})
+    sm170 = check_job_sm170(job, staging, previous, timeout, env, verify_all=verify_skips)
     summary["execution_stats"] = {"stage0_skipped": skipped, "verified_skip": skipped and verify_skips,
-                                  "backend_hits": reuse.get("hits", 0), "backend_misses": reuse.get("misses", 0)}
+                                  "backend_hits": reuse.get("hits", 0), "backend_misses": reuse.get("misses", 0),
+                                  **sm170}
     return summary
 
 
@@ -256,6 +300,10 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
                       exports=summaries, files=files, wall_seconds=round(time.monotonic() - started, 3))
     provenance["program_records"] = records
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    sm_report = kernel_records.change_report({}, records)
+    if sm_report["sm170_mismatches"]:
+        kernel_records.write_report(destination, sm_report)
+        raise ValueError(f"SM 170 / 188 OBJECT MISMATCH: {sm_report['sm170_mismatches']}")
     if report_previous:
         old = json.loads((report_previous / "INPUTS.json").read_text()).get("program_records")
         if old is None:

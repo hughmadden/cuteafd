@@ -440,7 +440,7 @@ def routed_core_variants(package, role, weights):
     return variants
 
 
-def export_routed(extra, output):
+def export_routed(extra, output, selected_objects=None):
     """Use the package's exact compiler/form policy without linking its DSOs."""
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
     from b12x.integration.cuteafd.fp8_moe import (
@@ -485,6 +485,8 @@ def export_routed(extra, output):
                 stem += "_segments"
             if core_only:
                 stem += "_core"
+            if selected_objects is not None and stem not in selected_objects:
+                continue
             def construct():
                 with exportable_compilation():
                     program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
@@ -691,7 +693,7 @@ def worker(payload):
     start = time.monotonic()
     path = ROOT / "python/tools/aot" / payload["exporter"]
     if payload["exporter"] == "package_fp8_moe_aot.py":
-        export_routed(payload["args"], output)
+        export_routed(payload["args"], output, payload.get("selected_objects"))
     elif payload["exporter"] == "package_exl3_aot.py":
         export_exl3(payload["args"], output)
     elif payload["exporter"] == "export_b12x_exl3_routes_aot.py":
@@ -712,7 +714,8 @@ def worker(payload):
                 compile_pool._initialize_worker = _initialize_worker
         else:
             runpy.run_path(str(path), run_name="__main__", init_globals={
-                "_record_construction": recorded_construction})
+                "_record_construction": recorded_construction,
+                "_selected_object_labels": payload.get("selected_objects")})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
         raise RuntimeError("exporter changed the synthetic SM count")
     if torch.cuda.is_initialized():
@@ -1046,6 +1049,10 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
                       source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
                       exports=summaries, files=files, program_records=records)
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    sm_report = publisher.kernel_records.change_report({}, records)
+    if sm_report["sm170_mismatches"]:
+        publisher.kernel_records.write_report(destination, sm_report)
+        raise ValueError(f"SM 170 / 188 OBJECT MISMATCH: {sm_report['sm170_mismatches']}")
     if previous:
         records_module = load_file("v4_change_records", ROOT / "scripts/build/kernel-records.py")
         old = json.loads((previous / "INPUTS.json").read_text())["program_records"]

@@ -460,7 +460,10 @@ class Recorder:
 
 
 def change_report(previous, current, expected=None):
-    changes = {"schema": 1, "added": [], "removed": [], "changed": [], "leaks": []}
+    changes = {"schema": 1, "added": [], "removed": [], "changed": [], "leaks": [],
+               "sm170_mismatches": sorted(name for name, record in current.items()
+                                         if "sm170_object_sha256" in record
+                                         and record["sm170_object_sha256"] != record.get("object_sha256"))}
     for name in sorted(previous.keys() | current.keys()):
         old, new = previous.get(name), current.get(name)
         group = (new or old).get("group", name.split("/", 1)[0])
@@ -513,6 +516,9 @@ def numeric_deltas(old, new, prefix=""):
 def write_report(destination, report):
     (destination / "CHANGES.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     lines = ["# Kernel Changes", "", "Program groups are the publication's export job names.", ""]
+    if report.get("sm170_mismatches"):
+        lines += ["## HARD FAILURE: SM 170 / 188 OBJECT MISMATCH", "",
+                  *[f"- `{name}`" for name in report["sm170_mismatches"]], ""]
     if report["leaks"]:
         lines += ["## UNEXPECTED CHANGES OUTSIDE DECLARED TARGETS", "", *[f"- `{name}`" for name in report["leaks"]], ""]
     for category in ("added", "removed", "changed"):

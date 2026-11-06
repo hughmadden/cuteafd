@@ -230,12 +230,50 @@ def test_verify_skips_rejects_same_ir_metadata_drift(tmp_path, filename):
     current.mkdir()
     metadata = {"ir_sha256": "same", "scratch_bytes": 64, "abi": ["ptr", "i32"],
                 "geometry": {"rows": 80}, "params": {"tile": 128}}
-    (previous / filename).write_text(json.dumps(metadata))
-    (current / filename).write_text(json.dumps(metadata))
+    def document(record):
+        return {"kernel.o": record} if filename == "program-records.json" else record
+    (previous / filename).write_text(json.dumps(document(metadata)))
+    (current / filename).write_text(json.dumps(document(metadata)))
     publisher.verify_job_metadata(previous, current, {}, "test")
-    (current / filename).write_text(json.dumps({**metadata, "scratch_bytes": 128}))
+    (current / filename).write_text(json.dumps(document({**metadata, "scratch_bytes": 128})))
     with pytest.raises(ValueError, match="placement metadata"):
         publisher.verify_job_metadata(previous, current, {}, "test")
+
+
+def test_sm170_mismatch_is_reported_as_hard_failure(tmp_path):
+    report = records.change_report({}, {"programs/kernel.o": {
+        "object_sha256": "188", "sm170_object_sha256": "170"}})
+    assert report["sm170_mismatches"] == ["programs/kernel.o"]
+    records.write_report(tmp_path, report)
+    assert "HARD FAILURE" in (tmp_path / "CHANGES.md").read_text()
+
+
+def test_sm170_recompiles_only_changed_routed_objects(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("sm170_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    job = ("fp8/test", "package_fp8_moe_aot.py", [])
+    previous, staging = tmp_path / "previous", tmp_path / "staging"
+    directory = staging / job[0]
+    directory.mkdir(parents=True)
+    programs = {"same.o": {"object_sha256": "same"}, "changed.o": {"object_sha256": "new"}}
+    (directory / "program-records.json").write_text(json.dumps(programs))
+    def publication(path, jobs):
+        return {job[0] + "/" + name: {**record, "object_sha256": "old" if path != staging and name == "changed.o"
+                                     else record["object_sha256"]} for name, record in programs.items()}
+    monkeypatch.setattr(publisher, "publication_records", publication)
+    calls = []
+    def worker(command, **kwargs):
+        payload = json.loads(command[-1])
+        calls.append(payload)
+        (Path(payload["output"]) / "program-records.json").write_text(json.dumps({"changed.o": {"object_sha256": "new"}}))
+    monkeypatch.setattr(publisher.subprocess, "run", worker)
+    result = publisher.check_job_sm170(job, staging, previous, 1, {})
+    assert result["sm170_programs"] == 1
+    assert calls[0]["sms"] == 170 and calls[0]["selected_objects"] == ["changed"]
+    output = json.loads((directory / "program-records.json").read_text())
+    assert output["changed.o"]["sm170_object_sha256"] == "new"
+    assert "sm170_object_sha256" not in output["same.o"]
 
 
 def test_identity_and_reports_are_deterministic():
