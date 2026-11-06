@@ -2949,7 +2949,8 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
             let intake = 2 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(2 * 4096 * cfg.dim as u64 * 2).unwrap()
                 + 2 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * cfg.dim as u64 * 2).unwrap();
-            assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
+            // Shared Recipe allocations are exact against the admitted facts.
+            assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Exact));
             let records = device.items.iter().find(|i| i.group == "records").unwrap();
             let cache = crate::serving_capacity::deepseek_v4_cache_geometry(&cfg, 1, 4096, 0).unwrap();
             assert_eq!(runtime[0].pool_unit_device_bytes, (2 * crate::serving_capacity::V4_PACKED_MEMBERS as u64 + 64) * 4);
@@ -3002,11 +3003,12 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
     assert!(rejected.memory_layout.as_ref().unwrap().notes.iter().any(|n|
         n.contains("4 RTX expert layers do not fit beside the fixed demands")),
         "{:?}", rejected.memory_layout.as_ref().unwrap().notes);
-    // A fixed onboard alone makes the pool the output: above the 1M target here.
+    // A fixed onboard leaves the automatic pool at the card's target (1M below
+    // the small-card threshold); the memory beyond it stays free by contract.
     let fixed = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30],
         onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default() }), ..sparks(2) }).unwrap();
     assert!(fixed.placement_supported);
-    assert!(fixed.memory_layout.unwrap().pool_tokens > 1 << 20);
+    assert_eq!(fixed.memory_layout.unwrap().pool_tokens, 1 << 20);
 }
 
 #[test]
@@ -5734,4 +5736,31 @@ fn qwen_auto_pool_is_one_recipe_and_keeps_its_typed_refusal() {
         hint.what.contains("Qwen admission: pool 1024 cannot hold selected context 65536")),
         "{:?}", refused.hints);
     assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}
+
+#[test]
+fn v4_auto_pool_and_count_admission_preserve_one_recipe() {
+    let dir = v4_snapshot();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536,
+        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        ..Default::default()
+    }), ..sparks(4) };
+    let unset = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert!(automatic.wip_launchable(), "{}", render(&automatic));
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens,
+        unset.memory_layout.as_ref().unwrap().pool_tokens);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let direct = plan(dir.path(), &zero).unwrap();
+    let counted = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert!(!counted.wip_launchable());
+    assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
+    for hint in &direct.hints {
+        assert!(counted.hints.iter().any(|other| other.what == hint.what));
+    }
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }

@@ -5,7 +5,7 @@
 use super::EngineArgs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
-use cuteafd_loader::placement::{families::deepseek_v4 as v4, Baseline, Onboard, PlacementRequest};
+use cuteafd_loader::placement::{families::deepseek_v4 as v4, planner::Pin, Baseline, Onboard};
 
 pub(crate) struct Inputs<'a> {
     pub cfg: &'a DeepseekV4Config,
@@ -245,7 +245,21 @@ pub(crate) fn host_memory(engine: &super::engine::Engine<'_>, args: &EngineArgs,
     Ok(config)
 }
 
-pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<PlacementRequest> {
+/// Admit one placement from these inputs. `pin` fixes the pool and onboard
+/// prefix for the post-load cross-check against the frozen pre-load plan.
+pub(crate) fn admit(inputs: &v4::V4Inputs, pin: Option<(u64, u64)>)
+    -> Result<cuteafd_loader::placement::Placement> {
+    let prepared = v4::prepare(inputs).map_err(anyhow::Error::msg)?;
+    let mut request = v4::production_request(inputs);
+    if let Some((pool, layers)) = pin {
+        request.pool = Pin::Exact(pool);
+        request.onboard = Pin::Exact(layers);
+    }
+    prepared.admit(request).map(|admitted| admitted.placement).map_err(anyhow::Error::msg)
+}
+
+/// The family facts serve-dsv4 admits: the same inputs `plan --layout` builds.
+pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inputs> {
     let gpus = inputs.gpus.len();
     let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
         inputs.cfg, gpus, args.dspark, inputs.catalog.tensors().iter().map(|t| &t.metadata))?;
@@ -323,8 +337,8 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         cuteafd_core::memory_layout::Category::Embedding, "loaded embedding weights", 0,
         cuteafd_core::memory_layout::Basis::Exact)
         .with_resident_weights(cuteafd_loader::placement::ResidentWeights(embedding_weights)));
-    let request = v4::request(&v4::V4Inputs {
-        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), automatic_context: args.max_context == 0, cfg: &cache_cfg, weights, cache_stages: inputs.cache_stages,
+    Ok(v4::V4Inputs {
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), automatic_context: args.max_context == 0, cfg: cache_cfg, weights, cache_stages: inputs.cache_stages,
         gpus: baselines, headroom_floor: 0, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: shape.waves, decode_rows: decode,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
@@ -333,6 +347,5 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
         full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, v4::code_experts(inputs.catalog), gpus),
-        context, attention })?;
-    Ok(request)
+        context, attention, extra: Vec::new() })
 }

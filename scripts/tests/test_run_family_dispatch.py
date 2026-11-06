@@ -1174,6 +1174,37 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
             context_items = [item for item in device["items"] if item["group"].startswith("context ")]
             assert bool(context_items) == (gpus == 2)
 
+def capture_v4_real_planner_launch(snapshot: Path, example: Path, binary: Path,
+                                   programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Exercise a shipped DeepSeek V4 config -> real launcher argv -> real CPU Recipe admission."""
+    raw = example.read_text()
+    config = dict(line.split("=", 1) for line in raw.splitlines()
+                  if line and not line.startswith("#") and "=" in line)
+    gpus = int(config["RTX_GPUS"])
+    # Fake only hardware and execution: the planner reads the real checkpoint,
+    # drafter and exporter metadata through the shared V4 Recipe.
+    keys = "\n".join(line for line in raw.splitlines()
+                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/v4-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+        extra_args=("--wip", "real-planner-test"), extra_env={
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    deployment = json.loads(output.read_text())
+    assert deployment["family"] == "deepseek_v4", deployment
+    assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
+    assert deployment["memory_layout"]["pool_tokens"] >= 1048576, deployment
+    plans = [shlex.split(line) for line in result.stderr.splitlines()
+             if "cuteafd plan " in line and "--deployment" in line]
+    assert len(plans) == 1, result.stderr
+    assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
+    assert plans[0][plans[0].index("--spark-ranks") + 1] == config["SPARK_COUNT"]
+    assert "prefill reserve does not fit" not in result.stderr
+
+
 def capture_qwen_real_planner_launch(snapshot: Path, example: Path, binary: Path,
                                      programs: Path, hf_home: Path, temporary: Path) -> None:
     """Exercise a shipped dense Qwen config -> real launcher argv -> real CPU Recipe admission."""

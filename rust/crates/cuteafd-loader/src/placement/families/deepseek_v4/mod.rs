@@ -1,10 +1,14 @@
 //! DeepSeek V4 (Flash/Pro) onto the shared solver: the one place that turns
 //! V4's cache geometry, workspace formulas, exchange slots and expert
-//! residency into a [`PlacementRequest`]. `plan --layout` and serve-dsv4
-//! both call [`request`]; they differ only in [`V4Inputs::baseline`].
+//! residency into a [`Contract`]. `plan --layout` and serve-dsv4 both call
+//! [`prepare`] and [`production_request`]; they differ only in a
+//! [`V4Inputs::gpus`] baseline.
 //!
 //! V4's reserve envelope, the 262K legacy expert reserve and the per-device
 //! pool sizing live here, once.
+mod admission;
+pub use admission::{prepare, production_request, AdmittedV4, PreparedV4};
+
 use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::placement::*;
 use crate::placement::inventory::GraphSet;
@@ -33,12 +37,12 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 /// Everything V4 admission depends on, gathered by the caller from the
 /// checkpoint, the program manifest and the CLI.
 #[derive(Debug, Clone)]
-pub struct V4Inputs<'a> {
+pub struct V4Inputs {
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
-    pub cfg: &'a DeepseekV4Config,
+    pub cfg: DeepseekV4Config,
     /// Header-derived uploads; no attention weights hidden in the baseline.
     pub weights: crate::families::deepseek_v4::resident::WeightInventory,
     /// dSpark stages that hold caches (all the checkpoint's stages).
@@ -88,6 +92,9 @@ pub struct V4Inputs<'a> {
     pub context: Option<V4Context>,
     /// `--attention-placement`: `None` is auto (the family's recorded default).
     pub attention: Option<AttentionPlacement>,
+    /// Owners a caller adds after the family's own facts (an RTX media tower).
+    /// They are priced exactly like a fixed demand, so the same admission runs.
+    pub extra: Vec<Demand>,
 }
 
 /// Native C4 context kernel scratch, read from the selected AOT manifest.
@@ -183,9 +190,9 @@ pub fn draft_probe_bytes(cfg: &DeepseekV4Config, decode_rows: u64) -> Result<u64
 
 /// Fixed V4 demands and pool overhead per GPU plus each GPU's reserve, the
 /// ones both sides previously computed apart.
-pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Vec<u64>), PlacementError> {
+pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>, Vec<u64>), PlacementError> {
     let gpus = inputs.gpus.len();
-    let geometry = deepseek_v4_cache_geometry(inputs.cfg, gpus, inputs.prefill_rows, inputs.cache_stages)
+    let geometry = deepseek_v4_cache_geometry(&inputs.cfg, gpus, inputs.prefill_rows, inputs.cache_stages)
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
     let hidden = inputs.cfg.dim as u64;
     let topk = inputs.cfg.n_activated_experts as u64;
@@ -212,7 +219,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
             deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)
                 .map_err(|_| PlacementError::Overflow("V4 expert exchange"))?
         } else { 0 };
-        let probe = if rank == 0 && !inputs.draft.is_empty() { draft_probe_bytes(inputs.cfg, inputs.decode_rows)? } else { 0 };
+        let probe = if rank == 0 && !inputs.draft.is_empty() { draft_probe_bytes(&inputs.cfg, inputs.decode_rows)? } else { 0 };
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
             .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake + probe;
         let headroom = if inputs.workspace.is_some() {
@@ -249,110 +256,6 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
     Ok((demands, overhead, reserves))
 }
 
-/// The complete V4 request: CSA layers (replicated latent under the head
-/// split), TP2 backbone halves on two RTX, dSpark stage experts in
-/// GPU0's arena. The pool unit sums each layer's records plus the overhead.
-pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError> {
-    let gpus = inputs.gpus.len();
-    if gpus == 2 && inputs.attention.unwrap_or(AttentionPlacement::Context) == AttentionPlacement::Context
-        && inputs.context.is_none() {
-        let family = if inputs.cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
-        let rows = inputs.decode_rows;
-        let mut programs: Vec<String> = ["dsa_candidate_merge", "lse_combine2",
-            "paged_staging_gather_c4", "paged_staging_gather_index"].iter()
-            .map(|suffix| format!("{family}_{suffix}")).collect();
-        programs.push(format!("{family}_scored_index_topk_decode_m{rows}"));
-        for begin in [0, inputs.cfg.n_heads / 2] {
-            programs.push(format!("{family}_sparse_mla_partial_h{begin}_s*_m{rows}"));
-        }
-        return Err(PlacementError::MissingContextPrograms { family: inputs.cfg.family_id(),
-            programs: programs.join(", ") });
-    }
-    let (mut fixed, pool_overhead, reserves) = fixed_demands(inputs)?;
-    if inputs.weights.c4_attention.len() != inputs.cfg.n_layers {
-        return Err(PlacementError::Inventory("V4 attention weight inventory per layer"));
-    }
-    fixed.extend(inputs.weights.fixed.iter().cloned());
-    let budgets = inputs.gpus.iter().zip(&reserves).map(|(&(capacity_bytes, baseline), &headroom_bytes)|
-        GpuBudget { capacity_bytes, headroom_bytes, baseline }).collect::<Vec<_>>();
-    let first = inputs.first_routed;
-    let context = inputs.context.filter(|_| gpus == 2);
-    let layers = (0..inputs.cfg.n_layers).map(|layer| {
-        let unit = deepseek_v4_layer_unit_bytes(inputs.cfg.compress_ratios[layer]);
-        let experts = layer.checked_sub(first).and_then(|i| inputs.experts.get(i)).map(|cost| ExpertCost {
-            whole: Bytes2 { resident: cost.resident_bytes, staging: cost.staging_bytes },
-            half: inputs.experts_half.get(layer - first).map(|halves| halves.map(|h| Bytes2 { resident: h.resident_bytes, staging: h.staging_bytes })).unwrap_or_default(),
-            tp2: gpus == 2 && inputs.experts_half.get(layer - first).is_some(), whole_supported: true, spark_ok: true });
-        LayerDemand {
-            kind: AttentionClass::Csa,
-            weights: inputs.weights.c4_attention[layer],
-            kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
-                unit_bytes_context: (inputs.cfg.compress_ratios[layer] == 4).then_some([unit.div_ceil(2), unit / 2]) },
-            colocate: None, fixed_bytes: ModeBytes::default(), extra: Vec::new(),
-            context_indexer: inputs.cfg.compress_ratios[layer] == 4,
-            experts,
-            // Only C4 layers token-split; C128 and window-only layers stay head-split.
-            modes: match (gpus, context.is_some() && inputs.cfg.compress_ratios[layer] == 4) {
-                (2, true) => vec![LayerMode::HeadSplit, LayerMode::ContextSplit],
-                (2, false) => vec![LayerMode::HeadSplit],
-                _ => vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
-            },
-        }
-    }).collect();
-    // dSpark reads the head GPU's taps every step, so it stays beside the head (no bridge).
-    let movables = if inputs.draft.is_empty() { Vec::new() } else {
-        vec![crate::placement::draft::DrafterDemand::local(MovableId::DsparkExperts,
-            inputs.draft.iter().map(|c| MovablePart::new(
-                Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes },
-                ResidentWeights(c.resident_bytes))).collect(), 0)
-            .movable(gpus)?]
-    };
-    let payload = crate::serving_capacity::deepseek_v4_tp2_payload_bytes(inputs.cfg.dim as u64,
-        inputs.prefill_rows, inputs.decode_rows, inputs.prefill_waves)
-        .map_err(|_| PlacementError::Overflow("V4 TP2 payload"))?;
-    let mut tp2_workspace = inputs.tp2_workspace;
-    for bytes in &mut tp2_workspace {
-        *bytes = bytes.checked_add(payload).ok_or(PlacementError::Overflow("V4 TP2 workspace"))?;
-    }
-    let geometry_unit = 256;
-    Ok(PlacementRequest {
-        resident_weight_limit: inputs.resident_weight_limit,
-        pool_bounded: Vec::new(),
-        attention_placement: inputs.attention,
-        layers_first_gpu: 0,
-        // Exactly what the engine allocates under context (charged only when a layer runs it).
-        context_buffers: context_buffers(inputs.cfg, inputs.max_context, inputs.prefill_rows, inputs.decode_rows,
-            inputs.prefill_waves, context.unwrap_or_default()),
-        inventory: Inventory { gpus: budgets, spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
-        pool: PoolPolicy { ceiling: POOL_CEILING_TOKENS, ..PoolPolicy::resolve(
-            &inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.max_context, inputs.requested_pool,
-            geometry_unit, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context) },
-        layers,
-        pool_overhead,
-        fixed,
-        // All dense destinations remain alive while transforms replay. Separate
-        // entries would check each allocation alone, not their simultaneous peak.
-        startup: inputs.weights.startup.device_phases(gpus)
-            .map_err(|_| PlacementError::Overflow("V4 dense loading phase"))?,
-        movables,
-        expert_workspace: inputs.expert_workspace,
-        tp2_workspace,
-        onboard: inputs.onboard,
-        minimum_expert_layers: 0,
-        expert_gpus: if gpus == 2 && inputs.experts_half.is_empty() { 0 } else { 1 },
-        // `context` is V4's default on two GPUs (#58/#59: no context-scaling KV replicated): the C4
-        // layers token-split their records; `--attention-placement heads` stays an explicit option.
-        policy: LayerPolicy { default: vec![LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
-            by_kind: Vec::new(), attention: if context.is_some() { vec![(AttentionClass::Csa, AttentionPlacement::Context)] }
-                else { Vec::new() }, ..LayerPolicy::default() },
-        // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
-        // broadcast of the embedding rows into GPU1's step input.
-        hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
-            lanes: inputs.prefill_waves, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head },
-        executor: super::DEEPSEEK_V4,
-    })
-}
-
 /// The `LoadedCode::experts` key of a V4 catalog: EXL3 packages load their own modules (the
 /// coordinator holds dSpark and any RTX layers in them), native MXFP4 does not.
 pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
@@ -377,6 +280,7 @@ pub fn default_onboard() -> Onboard {
 #[cfg(test)]
 mod default_tests {
     use super::*;
+    use crate::placement::planner::Refusal;
 
     #[test]
     fn default_onboard_is_pool_first_for_every_v4_layout() {
@@ -405,9 +309,9 @@ mod default_tests {
             cfg.index_topk = topk;
             for gpus in [1, 2] {
                 let mut input = V4Inputs {
-        resident_weight_limit: None,
+                    resident_weight_limit: None,
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
-                    cfg: &cfg, weights: crate::families::deepseek_v4::resident::WeightInventory {
+                    cfg: cfg.clone(), weights: crate::families::deepseek_v4::resident::WeightInventory {
                         c4_attention: Vec::new(), fixed: Vec::new(), startup: Default::default() },
                     cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned {
                         context_bytes: 0, loaded_bytes: 0 }); gpus], headroom_floor: 0,
@@ -417,6 +321,7 @@ mod default_tests {
                     tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
                     first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
                     full_prefill_logits: 0, code_bytes: Vec::new(), context: None, attention: None,
+                    extra: Vec::new(),
                 };
                 let baseline = fixed_demands(&input).unwrap().0;
                 for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
@@ -475,10 +380,10 @@ mod default_tests {
         assert_eq!(context_commit_units(257), 2);
     }
 
-    fn plan_inputs(cfg: &DeepseekV4Config) -> V4Inputs<'_> {
+    fn plan_inputs(cfg: &DeepseekV4Config) -> V4Inputs {
         V4Inputs {
             resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
-            automatic_context: false, cfg,
+            automatic_context: false, cfg: cfg.clone(),
             weights: crate::families::deepseek_v4::resident::WeightInventory {
                 c4_attention: vec![ModeBytes::default(); cfg.n_layers], fixed: Vec::new(), startup: Default::default() },
             cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2],
@@ -487,8 +392,14 @@ mod default_tests {
             workspace: None, experts: Vec::new(), draft: Vec::new(), experts_half: Vec::new(),
             tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0, first_routed: 0,
             requested_pool: Some(262144), onboard: Onboard::Layers(0), full_prefill_logits: 0,
-            code_bytes: Vec::new(), context: None, attention: None,
+            code_bytes: Vec::new(), context: None, attention: None, extra: Vec::new(),
         }
+    }
+
+    fn admitted(input: &V4Inputs) -> Result<Placement, Refusal> {
+        let prepared = prepare(input)?;
+        let request = production_request(input);
+        prepared.admit(request).map(|admitted| admitted.placement)
     }
 
     #[test]
@@ -520,20 +431,20 @@ mod default_tests {
                 assert!(input.context.is_none());
                 for attention in [None, Some(AttentionPlacement::Context)] {
                     input.attention = attention;
-                    let error = request(&input).unwrap_err();
-                    let PlacementError::MissingContextPrograms { programs, .. } = error else {
-                        panic!("expected missing programs, got {error}")
+                    let Refusal::InvalidFact(message) = admitted(&input).unwrap_err() else {
+                        panic!("expected the missing context programs, got {:?}", admitted(&input))
                     };
-                    assert!(programs.contains(&format!("{family}_sparse_mla_partial_h{}_s*_m64", heads / 2)));
+                    assert!(message.contains(&format!(
+                        "deepseek_v4_sparse_mla_partial_h{}_s*_m64", heads / 2)), "{message}");
                 }
                 input.attention = Some(AttentionPlacement::Heads);
-                let heads_plan = solve(&request(&input).unwrap()).unwrap();
+                let heads_plan = admitted(&input).unwrap();
                 input.context = manifest_context(&complete, family, heads, 64);
-                assert_eq!(heads_plan, solve(&request(&input).unwrap()).unwrap(),
+                assert_eq!(heads_plan, admitted(&input).unwrap(),
                     "explicit heads replicates and charges the same KV regardless of context programs");
                 assert!(heads_plan.layers.iter().all(|layer| layer.mode == LayerMode::HeadSplit));
                 input.attention = None;
-                let auto = solve(&request(&input).unwrap()).unwrap();
+                let auto = admitted(&input).unwrap();
                 assert_eq!(auto.attention_placement, AttentionPlacement::Context);
                 for gpu in 0..2 {
                     let records = |plan: &Placement| plan.items[gpu].iter().filter(|item| item.group == "records")
@@ -543,7 +454,7 @@ mod default_tests {
             }
             let mut one = plan_inputs(&cfg);
             one.gpus.truncate(1);
-            assert_eq!(solve(&request(&one).unwrap()).unwrap().attention_placement, AttentionPlacement::Heads);
+            assert_eq!(admitted(&one).unwrap().attention_placement, AttentionPlacement::Heads);
             assert!(super::super::DEEPSEEK_V4.check_attention(Some(AttentionPlacement::Layers), 2, true).is_err());
         }
     }

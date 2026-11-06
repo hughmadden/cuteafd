@@ -507,8 +507,8 @@ pub(crate) fn with_engine<T>(
             family: loaded.family, gpus, loaded_modes: None, cache_stages,
             prefill_rows, decode_rows, max_context, prefix,
             expert_workspace, tp2_workspace, exchange_f32 };
-        let request = admission::request(args, &inputs)?;
-        let placement = cuteafd_loader::placement::solve(&request)
+        let facts = admission::inputs(args, &inputs)?;
+        let placement = admission::admit(&facts, None)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
         if !skip {
@@ -583,10 +583,9 @@ pub(crate) fn with_engine<T>(
         inventory.record(loaded.family, &measured_gpus.iter().map(|(_, b)| match b {
             Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
         let measured_inputs = admission::Inputs { gpus: measured_gpus, loaded_modes: Some(&loaded_modes), ..inputs };
-        let mut measured_request = admission::request(args, &measured_inputs)?;
-        measured_request.pool.pin_selected(placement.pool_tokens);
-        measured_request.onboard = cuteafd_loader::placement::Onboard::Layers(placement.onboard_layers);
-        let checked = cuteafd_loader::placement::solve_frozen(&measured_request, &placement)
+        let measured_facts = admission::inputs(args, &measured_inputs)?;
+        let checked = admission::admit(&measured_facts,
+            Some((placement.pool_tokens, placement.onboard_layers as u64)))
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 measured frozen admission: {error}"))?;
         ensure!(checked.layers == placement.layers && checked.pool_tokens == placement.pool_tokens
             && checked.movables == placement.movables && checked.tp2 == placement.tp2
