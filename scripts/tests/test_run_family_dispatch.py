@@ -1167,7 +1167,7 @@ def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary:
     assert deployment["prefill_waves"] == (1 if local else 3), deployment
     assert deployment["report"]["phase_ledger"], deployment
     if example.name == "glm53f-exl3-k4-core-k6-max.config":
-        assert deployment["report"]["encoder"]["kind"] != "off", deployment
+        assert deployment["report"]["encoder"]["kind"]["kind"] != "off", deployment
         strict_dir = temporary / "vision-on"
         strict_dir.mkdir()
         strict_output = strict_dir / "real-deployment.json"
@@ -1188,7 +1188,7 @@ def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary:
         assert strict.returncode == 0, strict.stderr
         vision_on = json.loads(strict_output.read_text())
         assert deployment["memory_layout"]["pool_tokens"] == vision_on["memory_layout"]["pool_tokens"]
-        assert deployment["report"]["solver_placement"]["onboard_layers"] == 42
+        assert deployment["report"]["onboard_layers"] == 42
 
 
 def capture_muse_real_planner_launch(snapshot: Path, example: Path, binary: Path,
