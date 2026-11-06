@@ -284,7 +284,6 @@ class Recorder:
         self.construction = False
         self.latest = []
         self.monitoring_id = None
-        self.stack_codes = set()
 
     def _start(self, code, offset):
         frame = sys._getframe(1)
@@ -392,9 +391,9 @@ class Recorder:
             def wrapped(dsl, *args, **kwargs):
                 frame = sys._getframe().f_back
                 while frame is not None:
-                    if frame.f_code not in self.stack_codes:
-                        self.stack_codes.add(frame.f_code)
-                        self._profile(frame, "call", None)
+                    # Recipe locals/closures can change between capacities even
+                    # when PY_START has already disabled this code object's event.
+                    self._profile(frame, "call", None)
                     frame = frame.f_back
                 result = original(dsl, *args, **kwargs)
                 module = result[0]

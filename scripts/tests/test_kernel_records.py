@@ -149,6 +149,43 @@ def test_stage0_candidates_require_globals_and_all_recorded_reads(tmp_path):
     assert records.job_candidates(tmp_path, {"stage0_inputs": inputs}, inputs) == ["missing-recorded-reads"]
 
 
+def test_each_program_rescans_recipe_local_tuning_modules(tmp_path, monkeypatch):
+    import sys
+    import types
+    BaseDSL = pytest.importorskip("cutlass.base_dsl.dsl").BaseDSL
+    JitCompiledFunction = pytest.importorskip("cutlass.base_dsl.jit_executor").JitCompiledFunction
+    source = tmp_path / "recipe.py"
+    source.write_text("def recipe(policy, compile):\n    return compile(None)\n")
+    spec = importlib.util.spec_from_file_location("repeated_recipe", source)
+    recipe_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recipe_module)
+    policies = []
+    for name in ("tuning_a", "tuning_b"):
+        path = tmp_path / (name + ".py")
+        path.write_text("TILE = 64\n")
+        policy = types.ModuleType(name)
+        policy.__file__ = str(path)
+        monkeypatch.setitem(sys.modules, name, policy)
+        policies.append(policy)
+    del policy
+    monkeypatch.setattr(BaseDSL, "generate_original_ir", lambda *args, **kwargs: ("same IR",))
+    monkeypatch.setattr(BaseDSL, "compile_and_cache", lambda *args, **kwargs: None)
+    monkeypatch.setattr(JitCompiledFunction, "export_to_c", lambda *args, **kwargs: None)
+    recorder = records.Recorder(tmp_path, tmp_path / "output").install()
+    try:
+        recipe_module.recipe(policies[0], BaseDSL.generate_original_ir)
+        first = next(iter(recorder.modules.values()))["source_reads_sha256"]
+        assert "tuning_a.py" in first and "tuning_b.py" not in first
+        recipe_module.recipe(policies[1], BaseDSL.generate_original_ir)
+        second = next(iter(recorder.modules.values()))["source_reads_sha256"]
+        assert "tuning_b.py" in second
+    finally:
+        recorder.stop_monitoring()
+        recorder.active = False
+        for cls, method, original in reversed(recorder.restores):
+            setattr(cls, method, original)
+
+
 def test_monitoring_disables_repeated_code_entry_and_releases_tool(tmp_path):
     source = tmp_path / "recipe.py"
     source.write_text("def recipe():\n    return 5\n")
