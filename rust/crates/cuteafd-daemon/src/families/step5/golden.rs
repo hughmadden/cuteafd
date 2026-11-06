@@ -35,6 +35,7 @@ const FP8_REVISION: &str = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc";
 const NVFP4_REVISION: &str = "bc246cc2848e17b37f377eda8fd825c5b3018d1f";
 /// wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6, immutable published revision.
 const EXL3_REVISION: &str = "83d47a384eabc07ea6fcfaac4779b0e5f013ce89";
+const HQA_REVISION: &str = "61f9275e7f604cb11a5ae9a64a07ff1c600174b7";
 const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
@@ -929,7 +930,8 @@ fn checkpoint_identity(revision: Option<&str>, format: &super::experts::StepExpe
     let pinned = match format {
         StepExperts::Native(ExpertFormat::Fp8Block128) => revision == Some(FP8_REVISION),
         StepExperts::Native(ExpertFormat::Nvfp4) => revision == Some(NVFP4_REVISION),
-        StepExperts::Exl3(tiers) => tiers == &[4, 6] && revision == Some(EXL3_REVISION),
+        StepExperts::Exl3(tiers) => tiers == &[4, 6]
+            && matches!(revision, Some(EXL3_REVISION | HQA_REVISION)),
         StepExperts::Native(_) => false,
     };
     ensure!(pinned, "Step-5 golden requires a matching pinned FP8, NVFP4 or EXL3 K4/K6 revision and expert headers");
@@ -1591,6 +1593,7 @@ mod tests {
         checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), true)?;
         checkpoint_identity(Some(NVFP4_REVISION), &native(ExpertFormat::Nvfp4), false)?;
         checkpoint_identity(Some(EXL3_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
+        checkpoint_identity(Some(HQA_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
         for (revision, format, diagnostic) in [
             (Some(FP8_REVISION), native(ExpertFormat::Nvfp4), false),
             (Some(NVFP4_REVISION), native(ExpertFormat::Fp8Block128), false),
@@ -1601,6 +1604,8 @@ mod tests {
             // Only the published revision and matching expert tiers qualify.
             (Some("0123456789abcdef0123456789abcdef01234567"), StepExperts::Exl3(vec![4, 6]), false),
             (Some(EXL3_REVISION), StepExperts::Exl3(vec![4, 6]), true),
+            (Some(HQA_REVISION), StepExperts::Exl3(vec![4, 6]), true),
+            (Some(HQA_REVISION), StepExperts::Exl3(vec![3, 4]), false),
             (Some(EXL3_REVISION), StepExperts::Exl3(vec![3, 4]), false),
             (None, StepExperts::Exl3(vec![4, 6]), false),
         ] {

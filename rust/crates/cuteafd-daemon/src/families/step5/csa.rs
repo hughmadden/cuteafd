@@ -185,6 +185,7 @@ struct CsaWeights<'a> {
     residual: Program<'a>,
     epsilon: f32,
     native: Option<super::native::NativeAttention<'a>>,
+    hqa_output: Option<cuteafd_ffi::draft_projection::DraftProjections<'a>>,
 }
 
 pub(super) struct CsaLayer<'a> {
@@ -501,6 +502,10 @@ impl<'a> CsaLayer<'a> {
             residual_spec.geometry["width"] == H,
             "CSA residual geometry"
         );
+        let hqa_output = if native_layer && !native_o {
+            Some(device.run(|| Ok(cuteafd_ffi::draft_projection::DraftProjections::load_with_output(
+                programs, &[(Q, H)], rows.min(4096), cuteafd_ffi::draft_projection::ProjectionOutput::Bf16)?))?)
+        } else { None };
         let resolved = DEFS
             .iter()
             .map(|(name, pointers, _)| device.run(|| programs.program(&selected_name(name), pointers)))
@@ -531,7 +536,7 @@ impl<'a> CsaLayer<'a> {
             .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w)).transpose())
             .collect::<Result<Vec<_>>>()?;
         let mut owner = Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { kv_format, rope, layer: layer_id, weights,
-            programs: resolved, residual, epsilon: contract.norms.input, native }), ffn, arena)?;
+            programs: resolved, residual, epsilon: contract.norms.input, native, hqa_output }), ffn, arena)?;
         owner.native_scratch = match (&owner.immutable.native, native_scratch) {
             (None, _) => None,
             (Some(_), Some(shared)) => Some(shared),
@@ -1077,6 +1082,15 @@ impl<'a> CsaLayer<'a> {
             let view = |plane: usize, width: usize| CuteafdDeviceBuffer {
                 ptr: self.ptr(plane, start * width * 2), bytes: rows * width * 2, ..self.planes[plane].buffer };
             output.launch(rows, view(GATED, Q), view(DELTA, H), scratch, stream.raw)?;
+        } else if let Some(output) = &self.immutable.hqa_output {
+            let delta = CuteafdDeviceBuffer { ptr: self.ptr(DELTA, start * H * 2),
+                bytes: rows * H * 2, ..self.planes[DELTA].buffer };
+            stream.device.run(|| {
+                // SAFETY: the admitted BF16 tile and whole output weight survive stream drainage.
+                unsafe { output.launch_checked(self.ptr(GATED, start * Q * 2), self.weight(7),
+                    delta, rows, Q, H, stream.raw)?; }
+                Ok(())
+            })?;
         } else {
             self.launch_on(
                 stream,
