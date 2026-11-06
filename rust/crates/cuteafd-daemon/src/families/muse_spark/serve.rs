@@ -157,6 +157,19 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     cuteafd_bench::context::set_family(cfg.family_id());
+    let mode = match view.mode() {
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa => "hqa",
+        cuteafd_loader::plan::checkpoint::AttentionMode::Compact => "compact",
+        cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact => "fp8-compact",
+    };
+    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact {
+        cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
+    } else { "none" };
+    cuteafd_bench::context::set_resolved("attention-mode", mode);
+    cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
+    cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
+    tracing::info!(attention_mode = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+        "selected immutable Muse attention bundle");
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
     let device_ids = args.devices();
     let gpus = device_ids.len();
@@ -217,7 +230,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
                 usize::from(args.max_sequences), usize::from(args.max_sequences), head, sms as u64,
                 args.draft_kv_cache)
-        }).transpose()?, media: Some(super::media::inventory(&args.snapshot,
+        }).transpose()?, media: Some(super::media::inventory(&view,
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
     let placement = &built.placement;
@@ -226,7 +239,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
-    let mut media = super::media::Ready::load(args, &library, &built.media, built.host)?;
+    let mut media = super::media::Ready::load(args, &view, &library, &built.media, built.host)?;
     let prefill = args.prefill()?;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_formats(args.expert_partial_bf16_max_rows,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, cuteafd_core::spark_reply::requested())?;
@@ -343,7 +356,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     tracing::info!(drafter = ?args.draft, onboarded = onboarded.len(), "Muse Spark drafter");
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
-        served_context, pages, local, draft, pricing, super::media::Binding::from_snapshot(&args.snapshot, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
+        served_context, pages, local, draft, pricing, super::media::Binding::from_view(&view, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
     crate::shared::inventory::startup_probe(&library, &device_ids, "muse-backend-ready", Default::default())?;
     // Engine teardown may block while joining exchange workers; preserve the
     // original scheduler error before any backend or native owners unwind.

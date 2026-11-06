@@ -114,7 +114,8 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         partial_reply_formats: Default::default(),
         local: shared::local_workspace(&catalog, Some(&manifest_path), GPUS, prefill.unit_rows)?,
-        drafter, media: Some(super::media::inventory(&snapshot, MediaMode::Off, MediaMode::Off, 1)?) })?;
+        drafter, media: Some(super::media::inventory(checkpoint.view.as_ref()
+            .context("Muse push dump requires its selected checkpoint view")?, MediaMode::Off, MediaMode::Off, 1)?) })?;
     let placement = &built.placement;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
