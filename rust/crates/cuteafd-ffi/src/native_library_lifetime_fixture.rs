@@ -187,6 +187,24 @@ impl Fixture {
         Ok(())
     }
 
+    /// Opt-in current-device checking; a rejected free leaves its allocation live.
+    pub fn strict_device_free(&self, library: &NativeLibrary, enabled: bool) -> Result<()> {
+        // SAFETY: the private fixture export updates only its device-free controls.
+        unsafe { library.lib.get::<unsafe extern "C" fn(i32)>(b"fixture_strict_device_free")?(i32::from(enabled)); }
+        Ok(())
+    }
+
+    /// Number of rejected frees and the last (owning device, current device).
+    pub fn device_free_mismatch(&self, library: &NativeLibrary) -> Result<(usize, i32, i32)> {
+        let (mut owner, mut current) = (-1, -1);
+        // SAFETY: the private export writes two live i32 slots synchronously.
+        let count = unsafe {
+            library.lib.get::<unsafe extern "C" fn(*mut i32, *mut i32) -> usize>(b"fixture_device_free_mismatch")?(
+                &mut owner, &mut current)
+        };
+        Ok((count, owner, current))
+    }
+
     pub fn block_first_stream(&self, library: &NativeLibrary, block: bool) -> Result<()> {
         // SAFETY: the CPU fixture owns this mutex-protected injection control.
         unsafe {
@@ -392,5 +410,46 @@ impl Fixture {
         // SAFETY: the fixture's stream synchronizer accepts a null stream and
         // performs no CUDA work. Only use with this fixture's NativeLibrary.
         unsafe { library.cuda_stream_synchronize(std::ptr::null_mut()) }
+    }
+}
+
+#[cfg(test)]
+mod device_free_tests {
+    use super::*;
+
+    #[test]
+    fn strict_device_free_records_mismatch_and_preserves_the_live_owner() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        // Use private DSO calls, not the process-global allocation ledger.
+        // SAFETY: both exports belong to this fixture and the buffer lives until its matching free.
+        let (allocate, free) = unsafe {
+            (*library.lib.get::<unsafe extern "C" fn(usize, *mut CuteafdDeviceBuffer) -> i32>(b"cuteafd_alloc_device_buffer")?,
+             *library.lib.get::<unsafe extern "C" fn(*mut CuteafdDeviceBuffer) -> i32>(b"cuteafd_free_device_buffer")?)
+        };
+        for strict in [false, true] {
+            fixture.strict_device_free(&library, strict)?;
+            library.cuda_set_device(1)?;
+            let mut buffer = CuteafdDeviceBuffer::default();
+            // SAFETY: this CPU fixture writes a fresh host-backed device buffer.
+            assert_eq!(unsafe { allocate(256, &mut buffer) }, 0);
+            let pointer = buffer.ptr;
+            library.cuda_set_device(0)?;
+            // SAFETY: the fixture either frees its own buffer or rejects without modifying it.
+            let status = unsafe { free(&mut buffer) };
+            if strict {
+                assert_ne!(status, 0, "wrong-device free must fail");
+                assert_eq!(fixture.device_free_mismatch(&library)?, (1, 1, 0));
+                assert_eq!(buffer.ptr, pointer, "failed free must leave its owner live");
+                library.cuda_set_device(1)?;
+                // SAFETY: the rejected free retained this live allocation; the owning device is current.
+                assert_eq!(unsafe { free(&mut buffer) }, 0);
+            } else {
+                assert_eq!(status, 0, "legacy tests keep permissive frees");
+                assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+            }
+            assert!(buffer.ptr.is_null());
+        }
+        Ok(())
     }
 }
