@@ -527,15 +527,18 @@ mod draft_cli_tests {
     #[test]
     fn resolved_flash_capacity_and_native_flags_are_runtime_facts() {
         let mut args = Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l"]).unwrap().engine;
-        crate::commands::bench::assert_resolved_seam("glm5_flash",
-            &["max-sequences", "slots", "draft-sequences", "draft-context-slots"], ||
-            serve::resolve_serving_capacity(&mut args, 16));
+        crate::commands::bench::assert_resolved_family_seam("glm5_flash",
+            &["max-context", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device"], || {
+                crate::commands::bench::fixture_prefix().resolve_entries(16);
+                serve::resolve_serving_capacity(&mut args, 16);
+                native::normalize(&mut args);
+                native::publish_resolved(&args);
+                resolve_prefill(&mut args, true)?;
+                served_index_cache(args.index_cache, false,
+                    cuteafd_loader::placement::AttentionPlacement::Heads);
+                Ok(())
+            }).unwrap();
         assert_eq!(args.slots, 16);
-        native::normalize(&mut args);
-        let facts = cuteafd_bench::context::ResolvedSettings(native::resolved_settings(&args).into_iter()
-            .map(|(name, value)| (name.to_owned(), value)).collect());
-        facts.assert_resolved();
-        assert!(facts.0.iter().any(|(name, value)| name == "kda-fp8" && value == "off"));
         assert_eq!(served_index_cache(engine::IndexCache::Keys, true,
             cuteafd_loader::placement::AttentionPlacement::Context), engine::IndexCache::Compact);
     }
@@ -1684,7 +1687,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
-    for (name, value) in native::resolved_settings(&resolved) { cuteafd_bench::context::set_resolved(name, &value); }
+    native::publish_resolved(&resolved);
     let args = &resolved;
     check_options(args)?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
@@ -1739,11 +1742,14 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 pub(crate) fn served_index_cache(requested: engine::IndexCache, split: bool,
     attention: cuteafd_loader::placement::AttentionPlacement) -> engine::IndexCache {
     use cuteafd_loader::placement::AttentionPlacement;
-    match attention {
+    let cache = match attention {
         AttentionPlacement::Context => engine::IndexCache::Compact,
         AttentionPlacement::Heads if split => engine::IndexCache::Keys,
         _ => requested,
-    }
+    };
+    cuteafd_bench::context::set_resolved("index-cache", match cache {
+        engine::IndexCache::Keys => "keys", engine::IndexCache::Compact => "compact" });
+    cache
 }
 
 /// The MLA placement an engine serves (`glm5_flash::resolve_attention` over the requested mode and
@@ -2047,7 +2053,7 @@ impl Opened {
             resolved.kda_prefill_expanded = false;
         }
         probe("peer-enabled")?;
-        for (name, value) in native::resolved_settings(&resolved) { cuteafd_bench::context::set_resolved(name, &value); }
+        native::publish_resolved(&resolved);
         cuteafd_bench::context::set_resolved("split-device", &resolved.split_device.map_or_else(|| "none".into(), |device| device.to_string()));
         let args = &resolved;
         let automatic_context = args.max_context == 0;

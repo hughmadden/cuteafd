@@ -1225,14 +1225,21 @@ pub(super) mod tests {
         #[derive(Parser)]
         struct Cli {
             #[command(flatten)]
-            prefix: crate::shared::prefix::PrefixArgs,
+            serve: super::super::serve::ServeArgs,
         }
         let cfg = cfg();
-        let mut prefix = Cli::try_parse_from(["serve", "--host-cache-bytes", "0"])?.prefix;
-        let mut i = inputs(&cfg);
-        i.prefix = Some(&prefix);
-        crate::commands::bench::assert_resolved_seam("kimi_k3",
-            &["pool-tokens", "rtx-expert-layers", "onboard", "attention-placement"], || admit(i))?;
+        let mut args = Cli::try_parse_from(["serve", "--snapshot", "/fixture", "--native-lib", "/native",
+            "--peers", "127.0.0.1:19000,127.0.0.1:19001,127.0.0.1:19002,127.0.0.1:19003,127.0.0.1:19004,127.0.0.1:19005",
+            "--prefill-rows", "4096", "--prefill-waves", "2", "--host-cache-bytes", "0"])?.serve;
+        crate::commands::bench::assert_resolved_family_seam("kimi_k3", &["max-context"], || {
+            args.prefix.resolve_entries(args.max_sequences as usize);
+            let shape = args.prefill()?;
+            let mut i = inputs(&cfg);
+            assert_eq!((shape.unit_rows as usize, shape.waves as usize), (i.rows, i.waves));
+            i.prefix = Some(&args.prefix);
+            admit(i)
+        })?;
+        let mut prefix = args.prefix;
         prefix.host_cache_headroom_bytes = u64::MAX;
         let mut i = inputs(&cfg);
         i.prefix = Some(&prefix);

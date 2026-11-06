@@ -31,6 +31,10 @@ pub(super) fn normalize(args: &mut EngineArgs) {
     args.fp8_prefill.push(super::Fp8PrefillGroup::None);
 }
 
+pub(super) fn publish_resolved(args: &EngineArgs) {
+    for (name, value) in resolved_settings(args) { cuteafd_bench::context::set_resolved(name, &value); }
+}
+
 pub(super) fn resolved_settings(args: &EngineArgs) -> Vec<(&'static str, String)> {
     vec![("kda-output-shard", args.kda_output_shard.to_string()),
         ("kda-prefill-expanded", args.kda_prefill_expanded.to_string()),

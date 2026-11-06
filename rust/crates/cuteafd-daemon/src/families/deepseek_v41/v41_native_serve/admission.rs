@@ -714,6 +714,7 @@ pub(super) fn resolve_with_owners(
             "shared V4.1 cache demand differs from allocator"
         );
     }
+    cuteafd_bench::context::set_resolved("kv-pool-size", &(groups * (5 * 256 * 356)).to_string());
     Ok(Admitted {
         host, host_ledger,
         pages: [groups, groups, groups, 2 * groups],
@@ -943,10 +944,13 @@ mod admission_tests {
                     args.concurrency = concurrency;
                     args.prefix_cache_entries = turns;
                     args.rtx_expert_layers = onboard;
-                    let admitted = crate::commands::bench::assert_resolved_seam("deepseek_v41",
-                        &["pool-tokens", "rtx-expert-layers", "onboard", "attention-placement"], ||
+                    let admitted = crate::commands::bench::assert_resolved_family_seam("deepseek_v41", &[], || {
+                        super::normalize_serving(&mut args)?;
+                        super::AdmittedPrefill::resolve(&args)?;
+                        embedding_placement(args.embedding_placement, memory[0].1);
                         resolve_with_owners(&args, &memory, experts.clone(), workspace,
-                            &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], None))?;
+                            &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], None)
+                    })?;
                     assert!(admitted.placement.pool_tokens >= 262_144);
                     if let Some(pool) = pool_tokens.filter(|&n| n > 0) {
                         assert_eq!(admitted.placement.pool_tokens, pool);

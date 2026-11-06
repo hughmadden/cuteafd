@@ -119,6 +119,20 @@ pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 
 
+pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_sequences: usize, prefix_draft: bool) {
+    engine_args.rings = cuteafd_core::concurrency::request_slots(max_sequences as u64, engine_args.rings as u64) as usize;
+    engine_args.draft_sequences = engine_args.draft_sequences.max(max_sequences);
+    engine_args.draft_context_slots = Some(serving_context_slots(
+        engine_args.draft_sequences, engine_args.rings, engine_args.draft_context_slots, prefix_draft));
+    for (name, value) in [("max-sequences", max_sequences), ("rings", engine_args.rings),
+        ("draft-sequences", engine_args.draft_sequences)] {
+        cuteafd_bench::context::set_resolved(name, &value.to_string());
+    }
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
+    }
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
@@ -144,18 +158,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.rings = cuteafd_core::concurrency::request_slots(max_sequences as u64, engine_args.rings as u64) as usize;
+    resolve_serving_capacity(&mut engine_args, max_sequences, args.prefix.mimo_prefix_draft);
     let (worker_stats, max_sequences) = (stats.clone(), max_sequences);
-    engine_args.draft_sequences = engine_args.draft_sequences.max(max_sequences);
-    engine_args.draft_context_slots = Some(serving_context_slots(
-        engine_args.draft_sequences, engine_args.rings, engine_args.draft_context_slots, args.prefix.mimo_prefix_draft));
-    for (name, value) in [("max-sequences", max_sequences), ("rings", engine_args.rings),
-        ("draft-sequences", engine_args.draft_sequences)] {
-        cuteafd_bench::context::set_resolved(name, &value.to_string());
-    }
-    if let Some(slots) = engine_args.draft_context_slots {
-        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
-    }
     let draft = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s,
         snapshot_wait: args.mimo_snapshot_wait };
@@ -1416,7 +1420,7 @@ fn select_draft_action(policy: &mut cuteafd_core::DraftPolicy, requests: &[(u64,
     Ok(run)
 }
 
-fn serving_queue_depth(explicit: Option<usize>, concurrency: usize) -> usize {
+pub(super) fn serving_queue_depth(explicit: Option<usize>, concurrency: usize) -> usize {
     let depth = explicit.unwrap_or(cuteafd_core::concurrency::queue_depth(concurrency as u64) as usize);
     cuteafd_bench::context::set_resolved("http-queue-depth", &depth.to_string());
     depth

@@ -9,7 +9,7 @@ DAEMON = ROOT / 'rust/crates/cuteafd-daemon/src'
 def production(source):
     """Mask comments and test items, retaining offsets and later production items."""
     tokens = re.compile(r'''//[^\n]*|/\*[\s\S]*?\*/|\b(?:br|r)(\#*)"[\s\S]*?"\1|"(?:\\[\s\S]|[^"\\])*"|'(?:\\.|[^'\\])' '''.rstrip())
-    masked = tokens.sub(lambda m: ' ' * len(m[0]), source)
+    masked = tokens.sub(lambda m: re.sub(r'[^\n]', ' ', m[0]), source)
     # Attributes contain no strings here; keep them available for cfg discovery.
     for match in reversed(list(re.finditer(r'#\[cfg\(test\)\]', masked))):
         item = masked[match.end():].lstrip()
@@ -35,7 +35,7 @@ def production(source):
 
 def argument_fields(source):
     fields = {}
-    for match in re.finditer(r'#\[arg\((.*?)\)\]\s*pub(?:\([^)]*\))?\s+(\w+)\s*:', source, re.S):
+    for match in re.finditer(r'#\[arg\((.*?)\)\]\s*(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:', source, re.S):
         attributes, field = match.groups()
         if re.search(r'\bskip\b', attributes) or not re.search(r'\blong\b', attributes):
             continue
@@ -117,4 +117,4 @@ def test_registry_names_have_runtime_publication_and_family_seam_coverage():
     for directory in (DAEMON / 'families').iterdir():
         if directory.is_dir() and (directory / 'serve.rs').exists() or directory.name == 'deepseek_v41':
             source = '\n'.join(path.read_text() for path in directory.rglob('*.rs'))
-            assert 'assert_resolved_seam(' in source, f'{directory.name}: exercise a CPU startup seam'
+            assert 'assert_resolved_family_seam(' in source, f'{directory.name}: exercise a CPU startup seam'

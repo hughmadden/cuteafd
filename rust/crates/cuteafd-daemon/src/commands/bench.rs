@@ -337,6 +337,38 @@ fn attention_mode(family: &str, sub: &ArgMatches, requested: &str)
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_prefix() -> crate::shared::prefix::PrefixArgs {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli { #[command(flatten)] prefix: crate::shared::prefix::PrefixArgs }
+    Cli::try_parse_from(["fixture"]).unwrap().prefix
+}
+
+#[cfg(test)]
+pub(crate) fn assert_resolved_family_seam<T>(family: &str, later: &[&str],
+    seam: impl FnOnce() -> Result<T>) -> Result<T> {
+    let command = crate::commands::family::FAMILIES.iter()
+        .find(|(id, _, _)| *id == family).unwrap().1;
+    let mut argv = vec!["cuteafd", command, "--snapshot", "/fixture", "--native-lib", "/native"];
+    if family == "step5" { argv.extend(["--peers", "127.0.0.1:19000"]); }
+    let matches = crate::cli::Cli::command().try_get_matches_from(argv)?;
+    let mut context = serve_context(&matches, None)?.unwrap();
+    reply_settings(&mut context, Default::default());
+    let (result, facts) = cuteafd_bench::context::capture_resolved(seam);
+    // A refused admission has no effective serving configuration to report.
+    let result = result?;
+    facts.apply(&mut context);
+    let missing = context.validate_resolved().err().unwrap_or_default()
+        .into_iter().collect::<std::collections::BTreeSet<_>>();
+    let later = later.iter().map(|name| name.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(missing, later, "{family}: update CPU coverage or later-stage inventory; facts={facts:?}");
+    context.derived.retain(|name| !later.contains(name));
+    assert_eq!(context.validate_resolved(), Ok(()), "{family}: missing CPU runtime facts");
+    Ok(result)
+}
+
+#[cfg(test)]
 pub(crate) fn assert_resolved_seam<T>(family: &str, names: &[&str], seam: impl FnOnce() -> T) -> T {
     let (result, facts) = cuteafd_bench::context::capture_resolved(seam);
     let mut context = cuteafd_bench::context::ServerContext::default();

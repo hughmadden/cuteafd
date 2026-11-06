@@ -190,8 +190,9 @@ mod tests {
                 shared::drafter_inventory(&cfg, &config, 16, 16, 202_112, u64::from(sms), draft_kv)
             }).transpose()?;
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
-            let live = crate::commands::bench::assert_resolved_seam("muse_spark",
-                &["pool-tokens", "onboard", "attention-placement", "prefill-rows", "prefill-waves", "max-context"], || admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+            let live = crate::commands::bench::assert_resolved_family_seam("muse_spark", &[], || {
+                crate::commands::bench::fixture_prefix().resolve_entries(16);
+                admit(Options { host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &preflight(&path, gpus)?,
@@ -205,7 +206,8 @@ mod tests {
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cutoff_rows, partial_reply_formats: formats,
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
-                drafter: served_drafter, media: None }))?.placement;
+                drafter: served_drafter, media: None })
+            })?.placement;
             // Coordinator ledgers, item by item (then the whole placement).
             for gpu in 0..gpus {
                 assert_eq!(live.items[gpu], planned.items[gpu], "{label}: GPU {gpu} ledger");

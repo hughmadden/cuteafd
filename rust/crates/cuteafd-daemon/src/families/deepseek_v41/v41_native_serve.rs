@@ -126,9 +126,7 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
     Ok((send, WorkerHandle { worker_thread }))
 }
 
-/// Validate and normalize the launch, then spawn the CUDA worker thread.
-/// With `http`, the API and live console load where `serve-native` always loaded them.
-fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
+fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
     if args.prefix_cache_entries == u32::MAX {
         args.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(u64::from(args.concurrency)) as u32;
@@ -137,6 +135,13 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
     cuteafd_bench::context::set_resolved("decode-lanes", &lanes.to_string());
     cuteafd_bench::context::set_resolved("prefix-cache-entries", &args.prefix_cache_entries.to_string());
+    Ok(lanes)
+}
+
+/// Validate and normalize the launch, then spawn the CUDA worker thread.
+/// With `http`, the API and live console load where `serve-native` always loaded them.
+fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
+    let lanes = normalize_serving(&mut args)?;
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),

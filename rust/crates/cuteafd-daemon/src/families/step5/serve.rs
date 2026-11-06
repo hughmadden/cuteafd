@@ -1171,12 +1171,16 @@ mod tests {
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
             args.validate()?;
-            let shape = crate::commands::bench::assert_resolved_seam("step5",
-                &["prefill-rows", "prefill-waves"], || args.shape())?;
+            let (shape, model) = crate::commands::bench::assert_resolved_family_seam("step5",
+                &["max-context", "pool-tokens", "rtx-expert-layers"], || {
+                    args.prefix.resolve_entries(args.max_sequences as usize);
+                    let shape = args.shape()?;
+                    args.prefill_rows = unit as u32;
+                    let exports = [1, 16, 80, 256, 1024, 4096];
+                    let model = spark_model(&exports, args.endpoint(SparkIngress::Native), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
+                    Ok((shape, model))
+                })?;
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
-            args.prefill_rows = unit as u32;
-            let exports = [1, 16, 80, 256, 1024, 4096];
-            let model = spark_model(&exports, args.endpoint(SparkIngress::Native), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
             // One prefill owner at the selected unit's covering export; the k units only buffer I/O.
             assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit as u32,
                 compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });

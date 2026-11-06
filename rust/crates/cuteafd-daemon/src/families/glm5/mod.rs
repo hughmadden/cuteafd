@@ -372,8 +372,14 @@ mod draft_cli_tests {
             let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--peers", peers.as_str()];
             argv.extend_from_slice(extra);
             let mut args = Parse::try_parse_from(argv).unwrap().engine;
-            crate::commands::bench::assert_resolved_seam("glm5",
-                &["prefill-rows", "prefill-waves", "prefill-span-rows"], || resolve_prefill(&mut args)).unwrap();
+            crate::commands::bench::assert_resolved_family_seam("glm5",
+                &["max-context", "pool-tokens", "rtx-expert-layers", "draft-window-marks"], || {
+                    crate::commands::bench::fixture_prefix().resolve_entries(16);
+                    serve::resolve_serving_capacity(&mut args, 16);
+                    resolve_prefill(&mut args)?;
+                    spark_model("glm5", SparkBackend::Fp8, usize::from(args.prefill_waves), args.prefill_rows as u32, true)?;
+                    Ok(())
+                }).unwrap();
             (args.prefill_rows, args.prefill_waves, args.prefill_span_rows)
         };
         assert_eq!(resolve(&[]), (2752, 3, 8256));

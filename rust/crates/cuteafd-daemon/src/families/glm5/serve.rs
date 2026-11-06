@@ -111,6 +111,17 @@ fn chat_encoding(snapshot: &std::path::Path, thinking_off: GlmThinkingOff) -> Re
     })
 }
 
+pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_sequences: usize) {
+    if engine_args.draft_context_slots.is_none() {
+        engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
+            engine_args.draft_sequences, max_sequences, None));
+    }
+    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
+    if let Some(slots) = engine_args.draft_context_slots {
+        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
+    }
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
@@ -130,14 +141,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    if engine_args.draft_context_slots.is_none() {
-        engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
-            engine_args.draft_sequences, max_sequences, None));
-    }
-    cuteafd_bench::context::set_resolved("max-sequences", &max_sequences.to_string());
-    if let Some(slots) = engine_args.draft_context_slots {
-        cuteafd_bench::context::set_resolved("draft-context-slots", &slots.to_string());
-    }
+    resolve_serving_capacity(&mut engine_args, max_sequences);
     let mut engine_args = super::ResolvedEngineArgs::new(&engine_args)?;
     size_draft_window_marks(&mut engine_args, &args.prefix, max_sequences)?;
     let (worker_stats, max_sequences) = (stats.clone(), max_sequences);

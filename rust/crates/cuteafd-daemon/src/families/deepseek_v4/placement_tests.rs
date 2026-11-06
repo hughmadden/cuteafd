@@ -129,6 +129,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     if host { argv.extend(["--host-cache-bytes".into(), "auto".into()]); }
     if let Some(attention) = case.attention { argv.extend(["--attention-placement".into(), attention.to_string()]); }
     let mut cli = Cli::try_parse_from(argv)?;
+    crate::commands::bench::assert_resolved_family_seam("deepseek_v4", &[], || {
     cli.prefix.resolve_entries(cli.engine.max_sequences);
     // The selected model owns caches only for its retained dSpark stages.
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
@@ -153,8 +154,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
     let facts = admission::inputs(&cli.engine, &inputs)?;
-    let (placement, _, _) = crate::commands::bench::assert_resolved_seam("deepseek_v4",
-        &["pool-tokens", "rtx-expert-layers", "onboard", "attention-placement"], || admission::admit(&facts))?;
+    let (placement, _, _) = admission::admit(&facts)?;
     assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
         "V4 final residual must live on the rank0 head, not on both ranks");
     assert!(placement.hops.iter().all(|hop| hop.row_bytes == 4 * cfg.dim as u64 * 2),
@@ -175,6 +175,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
         assert_eq!(rebased.gpus, facts.gpus, "loaded weights rebase to the pre-upload sample");
     }
     Ok(placement)
+    })
 }
 
 /// serve-dsv4's `local::workspace_bytes` without CUDA: the EXL3 package's

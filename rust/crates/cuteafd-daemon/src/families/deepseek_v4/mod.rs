@@ -293,11 +293,13 @@ impl EngineArgs {
         let ranks = if self.skip_routed_experts { 0 } else {
             self.peers.split(',').filter(|peer| !peer.is_empty()).count()
         };
-        prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
+        let shape = prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
             max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES }, ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
             PrefillOverrides { unit_rows: self.prefill_rows.map(|rows| rows as u64),
                 waves: self.prefill_waves.map(|waves| waves as u64), span_rows,
-                reserve_rows: None })
+                reserve_rows: None })?;
+        cuteafd_bench::context::ResolvedSettings::prefill(shape).publish();
+        Ok(shape)
     }
 
     /// The resolved `--rtx-expert-layers`. Pool

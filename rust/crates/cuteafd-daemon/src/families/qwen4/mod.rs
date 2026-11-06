@@ -364,8 +364,13 @@ mod weight_representation_tests {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
-            let shape = crate::commands::bench::assert_resolved_seam("qwen4",
-                &["prefill-rows", "prefill-waves", "prefill-units"], || parsed.prefill_shape())?.unwrap();
+            let shape = crate::commands::bench::assert_resolved_family_seam("qwen4",
+                &["max-context", "pool-tokens", "slots", "mtp"], || {
+                    crate::commands::bench::fixture_prefix().resolve_entries(16);
+                    let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
+                    let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
+                    Ok(inputs.prefill_shape)
+                })?.unwrap();
             assert_eq!((shape.unit_rows, shape.waves), (rows, waves));
             assert_eq!(parsed.prefill_rows, 0);
         }
