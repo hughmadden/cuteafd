@@ -106,9 +106,16 @@ impl Drop for Health {
     }
 }
 /// Queue storage stays owned until CUDA drains, including after cancellation.
+/// A mounted owner is joined here; a pushed owner is shared with its pending
+/// contribution, whose last reference joins it.
+enum OwnerHandle {
+    Joined(Option<thread::JoinHandle<()>>),
+    Shared(Arc<crate::shared::vision::push::OwnerThread>),
+}
+
 pub(crate) struct LocalEncoder {
     queue: Option<mpsc::SyncSender<Work>>,
-    owner: Option<thread::JoinHandle<()>>,
+    owner: OwnerHandle,
     pending: HashMap<EncoderTicket, Pending>,
     next: u64,
     healthy: Arc<AtomicBool>,
@@ -116,8 +123,27 @@ pub(crate) struct LocalEncoder {
 }
 impl LocalEncoder {
     pub fn start(snapshot: PathBuf, library: PathBuf, device: i32, budget: usize) -> Result<Self> {
+        Self::start_owner(snapshot, library, device, budget, false).map(|(encoder, _)| encoder)
+    }
+
+    /// Coordinator push: the owner thread allocates its weights through its own
+    /// mount-mode loader under the shared recorder (payload unread) and returns
+    /// those records; the family appends them to its coordinator group before
+    /// planning and commits the returned contribution after that group commits.
+    /// The owner serves nothing until committed; a dropped contribution drains it.
+    pub fn start_pushed(snapshot: PathBuf, library: PathBuf, device: i32, budget: usize)
+        -> Result<(Self, crate::shared::vision::push::Contribution)> {
+        let (encoder, contribution) = Self::start_owner(snapshot, library, device, budget, true)?;
+        Ok((encoder, contribution.context("V4.1 pushed vision owner returned no contribution")?))
+    }
+
+    fn start_owner(snapshot: PathBuf, library: PathBuf, device: i32, budget: usize, defer: bool)
+        -> Result<(Self, Option<crate::shared::vision::push::Contribution>)> {
         let (queue, jobs) = mpsc::sync_channel::<Work>(2);
         let (ready, readiness) = mpsc::sync_channel(1);
+        let (commit, committed) = mpsc::channel::<bool>();
+        let (ack, acknowledgement) = mpsc::sync_channel::<crate::shared::vision::Result<()>>(1);
+        let drain_library = library.clone();
         let healthy = Arc::new(AtomicBool::new(false));
         let health = healthy.clone();
         let owner = thread::Builder::new()
@@ -148,7 +174,11 @@ impl LocalEncoder {
                     let available_before = lib.cuda_memory_info()?.0;
                     crate::shared::vision::worker::require_allocatable(admitted as u64, available_before as u64)?;
                     let _scope = cuteafd_ffi::memory_ledger::scope("v41/vision");
-                    let mut runtime = VisionRuntime::new(&lib, &catalog, CAPACITY, bytes)?;
+                    let (mut runtime, records) = if defer {
+                        let (runtime, records) = crate::shared::experts::rtx::dense::recording(||
+                            VisionRuntime::new(&lib, &catalog, CAPACITY, bytes))?;
+                        (runtime, Some(crate::shared::vision::push::Contribution::send_records(records)?))
+                    } else { (VisionRuntime::new(&lib, &catalog, CAPACITY, bytes)?, None) };
                     // Cache reclamation changes raw CUDA free independently of
                     // allocations on GB10; retain the delta as telemetry only.
                     let free_after = lib.cuda_physical_memory_info()?.0;
@@ -164,8 +194,22 @@ impl LocalEncoder {
                         observed_device_delta = free_before.saturating_sub(free_after),
                         "V4.1 vision owner admitted and allocated"
                     );
-                    health.store(true, Ordering::Release);
-                    ready.send(Ok(admitted)).ok();
+                    if !defer { health.store(true, Ordering::Release); }
+                    if ready.send(Ok((admitted, records))).is_err() { return Ok(()); }
+                    if defer {
+                        // Bytes land in this owner's allocations only through the
+                        // family group; serve only after its whole-group commit.
+                        if committed.recv() != Ok(true) {
+                            if let Err(error) = crate::shared::vision::worker::drain_external_weights(&drain_library, device) {
+                                tracing::error!(%error, "quarantining cancelled V4.1 vision owner after failed device drain");
+                                std::mem::forget(runtime);
+                            }
+                            return Ok(());
+                        }
+                        health.store(true, Ordering::Release);
+                        tracing::info!(device, "V4.1 vision weights committed through the coordinator push group");
+                        if ack.send(Ok(())).is_err() { return Ok(()); }
+                    }
                     while let Ok(work) = jobs.recv() {
                         if work.cancelled.load(Ordering::Acquire) {
                             continue;
@@ -202,18 +246,21 @@ impl LocalEncoder {
                 }
             })?;
         match readiness.recv() {
-            Ok(Ok(bytes)) => Ok(Self {
-                queue: Some(queue),
-                owner: Some(owner),
-                pending: HashMap::new(),
-                next: 0,
-                healthy,
-                bytes,
-            }),
+            Ok(Ok((bytes, records))) => {
+                let (owner, contribution) = match records {
+                    Some(records) => {
+                        let (contribution, owner) = crate::shared::vision::push::Contribution::recorded(
+                            records, commit, acknowledgement, owner)?;
+                        (OwnerHandle::Shared(owner), Some(contribution))
+                    }
+                    None => (OwnerHandle::Joined(Some(owner)), None),
+                };
+                Ok((Self { queue: Some(queue), owner, pending: HashMap::new(), next: 0, healthy, bytes }, contribution))
+            }
             failed => {
                 drop(queue);
                 let _ = owner.join();
-                anyhow::bail!("V4.1 vision owner startup failed: {failed:?}")
+                anyhow::bail!("V4.1 vision owner startup failed: {:?}", failed.map(|r| r.map(|(bytes, _)| bytes)))
             }
         }
     }
@@ -264,8 +311,8 @@ impl EncoderClient for LocalEncoder {
 impl Drop for LocalEncoder {
     fn drop(&mut self) {
         self.queue.take();
-        if let Some(owner) = self.owner.take() {
-            let _ = owner.join();
+        if let OwnerHandle::Joined(owner) = &mut self.owner {
+            if let Some(owner) = owner.take() { let _ = owner.join(); }
         }
     }
 }
@@ -313,6 +360,17 @@ impl Encoder {
             0,
             VisionRuntime::device_bytes(catalog, CAPACITY)?,
         )?))
+    }
+    /// [`Self::load`], with a local tower's weights joining the coordinator push
+    /// group when `push` (the family's required dense recording) is set.
+    pub fn load_pushed(args: &crate::cli::NativeServeArgs, catalog: &OfficialV41Catalog, push: bool)
+        -> Result<(Self, crate::shared::vision::push::Contribution)> {
+        if !push || !cuteafd_api::openai::vision_input_enabled() || args.vision_peers.is_some() {
+            return Ok((Self::load(args, catalog)?, Default::default()));
+        }
+        let (encoder, contribution) = LocalEncoder::start_pushed(args.snapshot.clone(), args.native_lib.clone(), 0,
+            VisionRuntime::device_bytes(catalog, CAPACITY)?)?;
+        Ok((Self::Local(encoder), contribution))
     }
     /// Connect after coordinator-authoritative Spark admission completes.
     pub fn connect(&mut self) -> Result<()> {
@@ -543,7 +601,7 @@ mod tests {
         assert!(validate_job(&job(3, 3, 1)).is_err());
         let mut encoder = LocalEncoder {
             queue: None,
-            owner: None,
+            owner: OwnerHandle::Joined(None),
             pending: HashMap::new(),
             next: 0,
             healthy: Arc::new(AtomicBool::new(true)),

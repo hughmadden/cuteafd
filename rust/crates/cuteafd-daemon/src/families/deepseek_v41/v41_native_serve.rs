@@ -624,7 +624,10 @@ fn worker(
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
     admission::startup_phase(&lib, "v41/drafter", device_total)?;
-    let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
+    // A local tower records on its owner thread and joins the coordinator group.
+    let (mut vision, vision_push) = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load_pushed(
+        &args, &catalog, records.is_some())?;
+    if let Some(records) = records.as_mut() { records.extend(vision_push.records()); }
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
@@ -684,6 +687,8 @@ fn worker(
     let mut pushed = coordinator.map(|planned| planned.receive(
         crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
         &catalog, &selected, resident_bytes)).transpose()?;
+    // Owners serve only after the whole group (vision weights included) committed.
+    vision_push.commit()?;
     drop(records);
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;

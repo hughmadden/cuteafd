@@ -49,7 +49,7 @@ pub enum VisionError {
     #[error("vision encoding cancelled")]
     Cancelled,
 }
-type Result<T> = std::result::Result<T, VisionError>;
+pub(crate) type Result<T> = std::result::Result<T, VisionError>;
 
 #[derive(Clone, Debug, Deserialize)]
 struct MimoConfig {

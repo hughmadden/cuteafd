@@ -5,7 +5,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::{sync::{mpsc, Arc, Mutex}, thread::JoinHandle};
 
-pub(super) struct OwnerThread {
+pub(crate) struct OwnerThread {
     thread: Mutex<Option<JoinHandle<()>>>,
     cancel: mpsc::Sender<bool>,
 }
@@ -17,7 +17,7 @@ impl OwnerThread {
     pub(super) fn new(thread: JoinHandle<()>, cancel: mpsc::Sender<bool>) -> Self {
         Self { thread: Mutex::new(Some(thread)), cancel }
     }
-    pub(super) fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.thread.lock().unwrap().as_ref().is_none_or(JoinHandle::is_finished)
     }
 }
@@ -27,6 +27,10 @@ impl Drop for OwnerThread {
         if let Some(thread) = self.thread.get_mut().unwrap().take() { let _ = thread.join(); }
     }
 }
+
+/// Address-only operand descriptors of [`Records`], movable between threads.
+#[allow(clippy::type_complexity)]
+pub(crate) struct SentRecords(Vec<(i32, usize, usize, u64, usize, Vec<(Rect, usize)>)>);
 
 struct Completion {
     commit: mpsc::Sender<bool>,
@@ -76,6 +80,26 @@ impl Contribution {
         }
         check_destinations(&out.records, reserved)?;
         Ok(out)
+    }
+    /// [`Records`] as plain addresses: a family media thread's recorded owners
+    /// cross to the startup thread (one process, one primary context per device).
+    pub(crate) fn send_records(records: Records) -> Result<SentRecords> {
+        ensure!(records.steps.is_empty() && records.finishes.is_empty() && records.peer_copies.is_empty(),
+            "sent media records carry only direct operands");
+        Ok(SentRecords(records.operands.into_iter().map(|operand| (operand.device, operand.buffer.ptr as usize,
+            operand.buffer.bytes, operand.buffer.flags, operand.bytes, operand.lands)).collect()))
+    }
+    /// A family-owned media thread's recorded owners (its own mount-mode loader
+    /// under the shared recorder, payload unread) with the same commit protocol:
+    /// `commit` releases the owner only after the family group has committed.
+    pub(crate) fn recorded(records: SentRecords, commit: mpsc::Sender<bool>,
+        acknowledgement: mpsc::Receiver<super::Result<()>>, thread: JoinHandle<()>) -> Result<(Self, Arc<OwnerThread>)> {
+        let records = Records { operands: records.0.into_iter().map(|(device, ptr, buffer_bytes, flags, bytes, lands)|
+            Operand { device, buffer: CuteafdDeviceBuffer { ptr: ptr as *mut _, bytes: buffer_bytes, device_id: device, flags },
+                lands, bytes }).collect(), ..Default::default() };
+        check_destinations(&records, Vec::new())?;
+        let owner = Arc::new(OwnerThread::new(thread, commit.clone()));
+        Ok((Self { records, completions: vec![Completion { commit, acknowledgement, _owner: owner.clone() }] }, owner))
     }
     pub(crate) fn extend(&mut self, mut other: Self) {
         self.records.extend(std::mem::take(&mut other.records));
