@@ -3,6 +3,6 @@
   "glm5": true,
   "mistral_large4": false,
   "kimi_k3": false,
-  "step5": false,
+  "step5": true,
   "muse_spark": true
 }
