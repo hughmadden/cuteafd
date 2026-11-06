@@ -140,7 +140,19 @@ pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std:
     if mode != MediaMode::Auto || template_from.is_some() || super::media::vision_config(mode, snapshot)?.is_none() {
         return Ok((mode, None));
     }
-    Ok(match GlmEncoding::vision_template_gap(snapshot)? {
+    let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+    auto_vision_view(mode, &view, template_from)
+}
+
+pub(crate) fn auto_vision_view(mode: cuteafd_loader::plan::MediaMode,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView, template_from: Option<&str>)
+    -> Result<(cuteafd_loader::plan::MediaMode, Option<String>)> {
+    use cuteafd_loader::plan::MediaMode;
+    if mode != MediaMode::Auto || template_from.is_some() || super::media::vision_config_view(mode, view)?.is_none() {
+        return Ok((mode, None));
+    }
+    Ok(match GlmEncoding::vision_template_gap_with_config(view.snapshot(), &view.config()?)? {
         Some(gap) => (MediaMode::Off, Some(format!("VISION=auto serves text only (vision off): {gap}; \
             set CHAT_TEMPLATE_FROM=<HF id or snapshot> to the vendor template to serve images"))),
         None => (mode, None),
@@ -154,10 +166,13 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     args.prefix.resolve_entries(max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
-        GlmEncoding::from_snapshot(&snapshot)?
+    let selected_view = args.engine.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.engine.attention.select(&snapshot))?;
+    args.engine.selected_view = Some(selected_view.clone());
+    let encoding = if super::media::vision_config_view(args.vision, &selected_view)?.is_none() {
+        GlmEncoding::from_snapshot_with_config(&snapshot, &selected_view.config()?)?
     } else {
-        GlmEncoding::from_snapshot_for_vision(&snapshot, args.chat_template_from.as_deref(), None)?
+        GlmEncoding::from_snapshot_for_vision_with_config(&snapshot, &selected_view.config()?, args.chat_template_from.as_deref(), None)?
     }.with_thinking_off(args.thinking_off);
     if let Some(provenance) = encoding.template_provenance() {
         tracing::info!(chat_template = %serde_json::to_string(provenance)?, "GLM Flash chat template selected");
@@ -274,7 +289,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             return Ok(());
         }
     };
-    args.serving_encoder = match super::media::ReadyVision::plan(&args, vision, remote.as_ref()) {
+    args.serving_encoder = match super::media::ReadyVision::plan(&args, &opened.view, vision, remote.as_ref()) {
         Ok(encoder) => encoder,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };
@@ -287,7 +302,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let prepared = std::cell::RefCell::new(None);
     let mut ready = Some(ready);
     let result = opened.with_engine_media(&args, || {
-        let vision = super::media::ReadyVision::load(&args, &opened.library, vision, bytes, remote)?;
+        let vision = super::media::ReadyVision::load(&args, &opened.view, &opened.library, vision, bytes, remote)?;
         let records = vision.as_ref().map(|vision| vision.push.records()).unwrap_or_default();
         *prepared.borrow_mut() = vision;
         Ok(records)

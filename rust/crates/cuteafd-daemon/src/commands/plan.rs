@@ -398,7 +398,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         }
         return Ok(());
     }
-    options.vision = glm_flash_vision(&args, family, &snapshot);
+    options.vision = glm_flash_vision_view(&args, family, &view);
     let input = input.context("full planner input missing after role-inventory dispatch")?;
     if args.spark_range {
         let columns = input.spark_ranges(&options)?;
@@ -440,8 +440,13 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
 /// cannot mark images; the note goes to stderr once. Chat files a plan cannot read leave the policy
 /// as given: a plan needs only the checkpoint's config and tensor headers.
 fn glm_flash_vision(args: &PlanArgs, family: &str, snapshot: &std::path::Path) -> cuteafd_loader::plan::MediaMode {
+    args.attention.select(snapshot).map(|view| glm_flash_vision_view(args, family, &view)).unwrap_or(args.vision)
+}
+
+fn glm_flash_vision_view(args: &PlanArgs, family: &str,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> cuteafd_loader::plan::MediaMode {
     if family != "glm5_flash" { return args.vision; }
-    match crate::families::glm5_flash::serve::auto_vision(args.vision, snapshot, args.chat_template_from.as_deref()) {
+    match crate::families::glm5_flash::serve::auto_vision_view(args.vision, view, args.chat_template_from.as_deref()) {
         Ok((vision, note)) => {
             if let Some(note) = note { eprintln!("note: {note}"); }
             vision

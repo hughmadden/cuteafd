@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn directory_additions_preserve_selected_bundle_and_auxiliary_snapshots() -> Result<()> {
         let root = tempfile::tempdir()?;
-        std::fs::write(root.path().join("config.json"), b"default")?;
+        std::fs::write(root.path().join("config.json"), b"{}")?;
         std::fs::write(root.path().join("config.compact-attention.json"), b"compact")?;
         std::fs::create_dir(root.path().join("aux"))?;
         std::fs::write(root.path().join("aux/vector.bin"), b"123")?;
