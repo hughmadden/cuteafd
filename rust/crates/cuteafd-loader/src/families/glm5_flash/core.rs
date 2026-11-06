@@ -72,25 +72,7 @@ pub struct CoreInventory {
     pub native: BTreeMap<String, NativeProjection>,
 }
 
-/// Unrotated selected-view attention with the same logical TP axes as K6.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeProjection { pub shape: [usize; 2], pub fp8: bool, pub split: CoreSplit }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeLayout {
-    pub stem: String, pub shape: [usize; 2], pub fp8: bool,
-    pub rank: usize, pub ranks: usize, pub split: CoreSplit,
-}
-impl NativeLayout {
-    pub fn bytes(&self) -> Result<u64> {
-        let [n, k] = self.shape;
-        let values = n.checked_mul(k).and_then(|n| n.checked_mul(if self.fp8 { 1 } else { 2 }))
-            .context("Flash native projection extent overflow")?.max(256);
-        let scales = if self.fp8 { n.div_ceil(128).checked_mul(k.div_ceil(128)).and_then(|n| n.checked_mul(4))
-            .context("Flash native scale extent overflow")?.max(256) } else { 0 };
-        Ok(values.checked_add(scales).context("Flash native projection byte overflow")? as u64)
-    }
-}
+pub use crate::formats::native_attention::{NativeLayout, NativeProjection};
 
 impl CoreInventory {
     pub fn from_checkpoint(cfg: &GlmNextConfig, checkpoint: &Checkpoint) -> Result<Self> {

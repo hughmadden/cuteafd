@@ -319,6 +319,17 @@ impl AttentionContract {
         Ok(())
     }
 
+    pub(crate) fn check_fp8_conversion(&self) -> Result<()> {
+        for (module, entry) in &self.native {
+            if entry.format != NativeAttentionFormat::Bf16 {
+                return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
+                    tensor: format!("{module}.weight"), found: format!("{:?}", entry.format),
+                }.into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_selection(&self, config: &str, index: &str, quant: &[String],
         weights: Option<&BTreeMap<String, String>>) -> Result<()> {
         let bundle = &self.view.views.hqa;

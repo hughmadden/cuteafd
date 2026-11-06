@@ -282,6 +282,10 @@ impl OfficialV41Catalog {
     pub fn routed_experts(&self) -> &RoutedExpertShape {
         &self.experts
     }
+    pub fn selected_view(&self) -> Option<&crate::plan::checkpoint::CheckpointView> {
+        match &self.source { CatalogSource::Selected(view) => Some(view), CatalogSource::Legacy => None }
+    }
+
     pub fn snapshot(&self) -> &Path {
         &self.snapshot
     }
