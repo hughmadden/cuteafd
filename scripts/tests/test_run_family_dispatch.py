@@ -1249,6 +1249,19 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     groups = {item["group"] for item in devices[0]["items"]}
     # The shared Recipe filled the layout: pool, step workspaces and graphs.
     assert {"records", "state", "decode step", "prefill step", "startup graphs"} <= groups, groups
+    report = deployment["report"]
+    # The tower is the solve's choice: at the automatic 2M target one RTX keeps
+    # the pool and Auto turns vision off (pool first), no pre-solve guess.
+    encoder = report["encoder"]
+    assert encoder["kind"]["kind"] == "off", encoder
+    assert "pool-first" in encoder["reason"], encoder
+    assert "vision tower" not in groups, groups
+    # Host owners come from the same recipe (no charge_host pass): PLE staging
+    # and row cache, retained upload bounds and logits, against a host budget.
+    host = {item["group"] for item in report["host_ledger"]["items"]}
+    assert {"staging/mapped-table", "mapped-table/row-cache", "staging/tables-and-sync",
+            "workspace/logits-host"} <= host, host
+    assert any(budget["id"] == "host" for budget in report["phase_ledger"]["budgets"]), report["phase_ledger"]
     plans = [shlex.split(line) for line in result.stderr.splitlines()
              if "cuteafd plan " in line and "--deployment" in line]
     assert len(plans) == 1, result.stderr
