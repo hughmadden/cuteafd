@@ -2049,8 +2049,8 @@ split_opt_in=""
 case "$family:$model_type" in
   deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*) ;;
   qwen4:*)
-    if [[ "$ranks" == 0 ]]; then
-      : # Qualified Spark-free pairs default to native TP2 and whole-layer ownership.
+    if [[ "$ranks" == 0 || "$explicit_split" == 1 ]]; then
+      : # The planner checks expert ownership; inventory may contain only media.
     else
       split_hint="Qwen dual requires a Spark-free local TP2 layout"
     fi ;;
@@ -2591,6 +2591,9 @@ audio_encoder_hash=""
   # admission policy and endpoints come from the typed deployment above.
   deployment_json="$plan_json"
   release_deployment_spark_roles "$deployment_json" "$ranks"
+  if [[ "$family" == qwen4 && "$head_split" == 1 && "$spark_expert_world" != 0 ]]; then
+    release_die "Qwen dual requires a Spark-free local TP2 layout"
+  fi
   if ((spark_expert_world == 0)); then
     case "$family" in
       glm5_flash|mimo_v2|qwen4) family_args+=(--local-experts) ;;

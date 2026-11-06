@@ -3333,14 +3333,34 @@ def test_full_prefill_logits_rejects_invalid_setting_before_launch(tmp_path):
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
-def test_explicit_split_without_kernels_serves_from_the_first_gpu(
+def test_qwen_explicit_pair_checks_admitted_expert_world(
         tmp_path: Path, checkpoint: str, keys: str) -> None:
-    model = "zai-org/GLM-5.3-Flash" if checkpoint == "glm5_flash" else "test/model"
-    result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, keys)
-    assert result.returncode == 0, result.stderr
-    assert "has no head split yet" in result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert _coordinator_gpus(launch) == [0] and "--split-device" not in launch
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], "test/model", keys)
+    assert result.returncode != 0, result.stderr
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert "--rtx 2" in planner and "--attention-placement layers" in planner
+    assert "Qwen dual requires a Spark-free local TP2 layout" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
+def test_qwen_tower_only_pair_reaches_typed_planner_refusal(tmp_path: Path, keys: str) -> None:
+    placement = {"kind": {"kind": "spark", "rank": 2}, "replicas": []}
+    result = _family_launch_result(tmp_path,
+        {**SPLIT_CONFIGS["qwen4"], "vision_config": {"depth": 2}}, "test/model",
+        keys + "SPARK_COUNT=3\nSPECULATOR=off\nVISION=spark:2\nAUDIO=off\n",
+        encoder_plan={"placement_supported": False, "fits": False, "spark_expert_world": 0,
+                      "spark_roles": [dict(rank=2, experts=False, layers=[], encoder=placement,
+                                           audio_encoder=None, drafter=None)],
+                      "encoder": placement,
+                      "hints": ["vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS"]})
+    assert result.returncode != 0, result.stderr
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert "--rtx 2" in planner and "--attention-placement layers" in planner
+    assert "vision-only Spark workers are not supported" in result.stderr
+    assert "invalid deployment specification" in result.stderr
+    assert "Qwen dual requires a Spark-free" not in result.stderr
+    assert "docker run -d" not in result.stderr
 
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
