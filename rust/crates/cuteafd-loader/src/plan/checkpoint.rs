@@ -143,13 +143,19 @@ impl Checkpoint {
         self.view.as_ref().map_or(AttentionMode::Hqa, CheckpointView::mode)
     }
 
+    /// Whether this role has loaded a tensor header, independent of index membership.
+    pub fn has_header(&self, name: &str) -> bool {
+        self.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name)).is_ok()
+    }
+
     /// Per-projection classification shared by runtime and push planning.
     /// Call on a role-opened checkpoint so all selected projection headers exist.
     pub fn projection(&self, stem: &str) -> Result<SelectedProjection> {
         let prefix = format!("{stem}.");
-        let tensors: Vec<_> = self.tensors.iter().filter(|tensor|
-            tensor.meta.name.starts_with(&prefix)
-                && !tensor.meta.name[prefix.len()..].contains('.')
+        let start = self.tensors.partition_point(|tensor| tensor.meta.name.as_str() < prefix.as_str());
+        let tensors: Vec<_> = self.tensors[start..].iter()
+            .take_while(|tensor| tensor.meta.name.starts_with(&prefix))
+            .filter(|tensor| !tensor.meta.name[prefix.len()..].contains('.')
                 && self.contains_tensor(&tensor.meta.name)).cloned().collect();
         let weight = tensors.iter().find(|tensor| tensor.meta.name == format!("{stem}.weight"));
         let trellis = tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.trellis"));
@@ -215,6 +221,7 @@ impl Checkpoint {
             }
         }
         checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        debug_assert!(checkpoint.tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
         Ok(checkpoint)
     }
 
@@ -255,6 +262,7 @@ impl Checkpoint {
         if CheckpointFormat::detect_view(view)? == CheckpointFormat::Exlr8 {
             let mut checkpoint = super::exlr8::inventory(snapshot, config, needed)?;
             checkpoint.view = Some(view.clone());
+            debug_assert!(checkpoint.tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
             return Ok(checkpoint);
         }
         let quantize_config = view.quantize_config();
@@ -331,6 +339,7 @@ impl Checkpoint {
         }
         view.check_attention_headers(tensors.iter().map(|tensor| &tensor.meta))?;
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        debug_assert!(tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
         Ok(Self {
             view: Some(view.clone()),
             snapshot: snapshot.to_path_buf(),
@@ -352,7 +361,7 @@ impl Checkpoint {
 
     pub fn contains_tensor(&self, name: &str) -> bool {
         if !self.weight_map.is_empty() { return self.weight_map.contains_key(name); }
-        self.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name)).is_ok()
+        self.has_header(name)
     }
 
     /// Select each module's declared arithmetic. Ignore rules take precedence;
@@ -595,6 +604,84 @@ mod sliced_tests {
     use super::*;
     use crate::plan::testing::{t, write_safetensors};
     use serde_json::json;
+
+    #[test]
+    fn header_presence_is_distinct_from_index_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        write_safetensors(&dir.path().join("model.safetensors"), &[
+            t("a.weight", "BF16", &[8, 8]), t("z.weight", "BF16", &[8, 8]),
+        ]);
+        let mut checkpoint = Checkpoint::open(dir.path()).unwrap();
+        checkpoint.weight_map.remove("a.weight");
+        checkpoint.weight_map.insert("missing.weight".into(), "absent.safetensors".into());
+        for name in ["", "a", "a.weight", "a.weight.child", "missing.weight", "z.weight", "zz"] {
+            assert_eq!(checkpoint.has_header(name),
+                checkpoint.tensors.iter().any(|tensor| tensor.meta.name == name), "{name}");
+        }
+        assert!(checkpoint.has_header("a.weight"));
+        assert!(!checkpoint.contains_tensor("a.weight"));
+        assert!(!checkpoint.has_header("missing.weight"));
+        assert!(checkpoint.contains_tensor("missing.weight"));
+        checkpoint.weight_map.clear();
+        assert!(checkpoint.contains_tensor("a.weight"));
+        checkpoint.tensors.clear();
+        assert!(!checkpoint.has_header("a.weight"));
+    }
+
+    #[test]
+    fn projection_prefix_lookup_matches_full_scan() {
+        for mixed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+            let mut tensors = crate::plan::testing::exl3("a", 128, 128, 6);
+            tensors.extend(crate::plan::testing::exl3("a_sibling", 128, 128, 6));
+            tensors.extend([t("a.child.weight", "BF16", &[8, 8]), t("a.weight", "BF16", &[8, 8])]);
+            if mixed {
+                tensors.extend([t("native.weight", "F8_E4M3", &[128, 128]),
+                    t("native.weight_scale_inv", "F32", &[1, 1]),
+                    t("native.child.weight", "BF16", &[8, 8]),
+                    t("collision.weight", "BF16", &[8, 8]),
+                    t("collision.trellis", "I16", &[8])]);
+            }
+            write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+            let mut checkpoint = Checkpoint::open(dir.path()).unwrap();
+            // Retain an unindexed header to exercise the authoritative index filter.
+            checkpoint.weight_map = checkpoint.tensors.iter().filter(|tensor|
+                tensor.meta.name != "a.weight" && !tensor.meta.name.ends_with(".child.weight"))
+                .map(|tensor| (tensor.meta.name.clone(), tensor.shard.clone())).collect();
+            for stem in ["a", "a_sibling", "native", "collision", "missing"] {
+                let prefix = format!("{stem}.");
+                let scan: Vec<_> = checkpoint.tensors.iter().filter(|tensor|
+                    tensor.meta.name.starts_with(&prefix)
+                        && !tensor.meta.name[prefix.len()..].contains('.')
+                        && checkpoint.contains_tensor(&tensor.meta.name)).collect();
+                let weight = scan.iter().find(|tensor| tensor.meta.name == format!("{stem}.weight"));
+                let trellis = scan.iter().any(|tensor| tensor.meta.name == format!("{stem}.trellis"));
+                let actual = checkpoint.projection(stem);
+                if (weight.is_some() && trellis) || (weight.is_none() && !trellis) {
+                    assert!(actual.is_err(), "{mixed}/{stem}");
+                    continue;
+                }
+                let actual = actual.unwrap();
+                let expected = if trellis { ProjectionStorage::Exl3 } else {
+                    let weight = weight.unwrap();
+                    ProjectionStorage::Native { dtype: weight.meta.dtype.clone(), shape: weight.meta.shape.clone() }
+                };
+                assert_eq!(actual.storage, expected, "{mixed}/{stem}");
+                assert_eq!(actual.source_bytes, scan.iter().map(|tensor| tensor.meta.byte_length).sum::<u64>());
+                assert_eq!(actual.tensors.len(), scan.len());
+                for (actual, expected) in actual.tensors.iter().zip(scan) {
+                    assert_eq!(actual.shard, expected.shard);
+                    assert_eq!(actual.meta.name, expected.meta.name);
+                    assert_eq!(actual.meta.dtype, expected.meta.dtype);
+                    assert_eq!(actual.meta.shape, expected.meta.shape);
+                    assert_eq!(actual.meta.byte_offset, expected.meta.byte_offset);
+                    assert_eq!(actual.meta.byte_length, expected.meta.byte_length);
+                }
+            }
+        }
+    }
 
     #[test]
     fn spark_input_agrees_between_coordinator_and_worker_for_every_family_and_format() {
