@@ -51,8 +51,6 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
     pub(crate) fn note_failure(&mut self, error: &anyhow::Error) { self.failure.record(error); }
     /// A terminal draft is not a reusable target-only fallback.
     pub fn require_live(&self) -> Result<()> { self.failure.check("distributed dSpark draft chain") }
-    /// Copy a draft output buffer to the host on this chain's stream.
-
     /// Drop a pending replay so its requests can be released.
     pub fn cancel_replay(&mut self) { self.cancel(); }
     pub fn width(&self) -> usize { self.chain.width }

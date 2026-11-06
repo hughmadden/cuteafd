@@ -190,6 +190,13 @@ int cuteafd_vocabulary_head_launch_width(void *opaque, const uint16_t *input,
     output[0] = (float)input[0];
     return 0;
 }
+int cuteafd_v41_vocabulary_shard_create(void *workspace, uint64_t bytes, int vocab, void **out) {
+    return cuteafd_vocabulary_head_create_vocab(workspace, bytes, 5120, 128, vocab, out);
+}
+int cuteafd_v41_vocabulary_head_launch(void *head, const uint16_t *input,
+        const uint16_t *weight, float *output, int rows, void *stream) {
+    return cuteafd_vocabulary_head_launch_width(head, input, weight, output, rows, stream);
+}
 int cuteafd_v41_markov_destroy(void *head) { free(head); return 0; }
 
 
