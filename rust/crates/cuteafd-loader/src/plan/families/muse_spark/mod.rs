@@ -235,8 +235,10 @@ impl Family for MuseSpark {
 }
 
 impl FamilyModel for Model {
-    fn contract_admission(&self) -> bool { true }
-
+    // Muse's contract does not yet declare its host owners (transport/rdma-rings,
+    // transport/egress, spark-intake, media/embedding-cache), so the shared host
+    // charge and the generic smaller-reserve retry stay on. Declaring them in the
+    // Recipe is the first close-stage item.
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn native_serving_admission(&self) -> bool { true }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
