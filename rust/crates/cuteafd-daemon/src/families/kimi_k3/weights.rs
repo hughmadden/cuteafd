@@ -155,7 +155,7 @@ pub(crate) struct LayerLayout {
     operands: BTreeMap<&'static str, usize>,
     pub(crate) attention: AttentionShare,
     core: BTreeMap<&'static str, CoreWeightLayout>,
-    pub(crate) native: BTreeMap<&'static str, cuteafd_loader::families::glm5_flash::core::NativeLayout>,
+    pub(crate) native: BTreeMap<&'static str, cuteafd_loader::formats::native_attention::NativeLayout>,
 }
 
 impl LayerLayout {
@@ -430,7 +430,7 @@ pub(crate) struct LayerWeights<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
     pub(crate) attention: AttentionShare,
     core: BTreeMap<&'static str, CoreWeights<'a>>,
-    pub(crate) native: BTreeMap<&'static str, crate::families::glm5_flash::weights::NativeAttention<'a>>,
+    pub(crate) native: BTreeMap<&'static str, crate::shared::native_attention::NativeAttentionWeights<'a>>,
 }
 
 impl<'a> LayerWeights<'a> {
@@ -463,7 +463,7 @@ impl<'a> LayerWeights<'a> {
         let native = packed.native.into_iter().map(|(name, bytes)| device.run(|| {
             let values = crate::shared::memory::DeviceAllocation::new(device.library, bytes.len())?;
             device.library.copy_h2d(values.buffer, &bytes)?;
-            Ok((name, crate::families::glm5_flash::weights::NativeAttention {
+            Ok((name, crate::shared::native_attention::NativeAttentionWeights {
                 layout: layout.native[name].clone(), values, scales: None }))
         })).collect::<Result<_>>()?;
         Ok(Self { operands, attention: packed.attention, core, native })

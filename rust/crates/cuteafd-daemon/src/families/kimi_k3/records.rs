@@ -263,7 +263,7 @@ impl<'a> KimiRecords<'_, 'a> {
         }
         let native = layouts.iter().zip(devices).map(|(layout, &device)| {
             layout.native.iter().map(|(&name, layout)| {
-                use crate::families::glm5_flash::weights::{attention_records, AttentionRecord, NativeAttention};
+                use crate::shared::native_attention::{attention_records, AttentionRecord, NativeAttentionWeights};
                 use crate::shared::memory::DeviceAllocation;
                 let selected = self.checkpoint.projection(&layout.stem)?;
                 let [n, k] = layout.shape;
@@ -289,7 +289,7 @@ impl<'a> KimiRecords<'_, 'a> {
                         }
                     }
                 }
-                Ok((name, NativeAttention { layout: layout.clone(), values, scales }))
+                Ok((name, NativeAttentionWeights { layout: layout.clone(), values, scales }))
             }).collect::<Result<BTreeMap<_, _>>>()
         }).collect::<Result<Vec<_>>>()?;
         let weights = ops.into_iter().zip(core).zip(shares).zip(native)
@@ -504,8 +504,8 @@ impl LayerLayout {
 #[cfg(test)]
 mod native_record_tests {
     use super::*;
-    use crate::families::glm5_flash::weights::{attention_records, AttentionRecord};
-    use cuteafd_loader::{families::glm5_flash::core::{CoreSplit, NativeLayout, NativeProjection},
+    use crate::shared::native_attention::{attention_records, AttentionRecord};
+    use cuteafd_loader::{formats::{native_attention::{NativeLayout, NativeProjection}, trellis_core::CoreSplit},
         plan::checkpoint::{AttentionMode, CheckpointTensor, ProjectionStorage, SelectedProjection},
         SafetensorsTensorMetadata};
 

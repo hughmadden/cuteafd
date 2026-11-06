@@ -107,7 +107,7 @@ impl CoreInventory {
     }
 
     pub fn native_layouts(&self, ranks: usize)
-        -> Result<Vec<crate::families::glm5_flash::core::NativeLayout>> {
+        -> Result<Vec<crate::formats::native_attention::NativeLayout>> {
         ensure!(matches!(ranks, 1 | 2), "Kimi native attention physical rank count");
         let mut layouts = Vec::new();
         for (stem, projection) in &self.native {
@@ -122,7 +122,7 @@ impl CoreInventory {
                     CoreSplit::Output => n /= world,
                     CoreSplit::Whole => {},
                 }
-                layouts.push(crate::families::glm5_flash::core::NativeLayout {
+                layouts.push(crate::formats::native_attention::NativeLayout {
                     stem: stem.clone(), shape: [n, k], fp8: projection.fp8,
                     rank: 0, ranks: world, split: projection.split });
             }
@@ -372,7 +372,7 @@ pub fn draft_head_demand(core: &CoreInventory, rows: usize, metadata: &serde_jso
 #[derive(Debug, Default, Clone)]
 pub struct CoreInventory {
     pub projections: BTreeMap<String, CoreProjection>,
-    pub native: BTreeMap<String, crate::families::glm5_flash::core::NativeProjection>,
+    pub native: BTreeMap<String, crate::formats::native_attention::NativeProjection>,
     pub largest_selected_dense_bytes: Option<u64>,
 }
 
@@ -404,7 +404,7 @@ impl CoreInventory {
                 "{stem}: Kimi native mixed attention only supports q_b_proj/o_proj; grouped inputs require K6");
             ensure!(actual == *shape && shape.len() == 2 && dtype == cuteafd_core::DType::Bf16,
                 "{stem}: Kimi native attention requires BF16 {shape:?}, found {dtype:?} {actual:?}");
-            native.insert(stem.into(), crate::families::glm5_flash::core::NativeProjection {
+            native.insert(stem.into(), crate::formats::native_attention::NativeProjection {
                 shape: [shape[0], shape[1]], split: split(stem).unwrap(),
                 fp8: checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact });
         }
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn native_layouts_cover_mla_ownership_and_only_physical_kda_shards() -> Result<()> {
-        use crate::families::glm5_flash::core::NativeProjection;
+        use crate::formats::native_attention::NativeProjection;
         let mla = "language_model.model.layers.3.self_attn";
         let kda = "language_model.model.layers.0.self_attn";
         let qa = format!("{mla}.q_a_proj");
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn native_stages_validate_selected_capacity_precision_and_exact_scratch() -> Result<()> {
-        use crate::families::glm5_flash::core::NativeProjection;
+        use crate::formats::native_attention::NativeProjection;
         use cuteafd_ffi::draft_projection::ProjectionOutput;
         for fp8 in [false, true] { for ranks in [1, 2] { for unit in [64, 2752] {
             let core = CoreInventory { native: BTreeMap::from([

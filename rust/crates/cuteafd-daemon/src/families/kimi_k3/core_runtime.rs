@@ -180,7 +180,7 @@ impl<'a> CorePrograms<'a> {
             copy:programs.library().v41_peer_copy()?,narrow:programs.library().f32_bf16_narrow()?,
             core_add:programs.library().bf16_f32_add()?}))
     }
-    pub(crate) fn native_projection(&self, weight:&crate::families::glm5_flash::weights::NativeAttention<'_>,
+    pub(crate) fn native_projection(&self, weight:&crate::shared::native_attention::NativeAttentionWeights<'_>,
         rows:usize, input:Buffer, output:Buffer, scratch:Option<Buffer>, stream:*mut c_void)->Result<()> {
         use cuteafd_loader::families::kimi_k3::core::CoreSplit;
         let layout = &weight.layout;

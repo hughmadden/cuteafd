@@ -1918,8 +1918,8 @@ mod packing_inventory_tests {
 
     #[test]
     fn native_packing_uses_only_resolver_selected_names() -> Result<()> {
-        use cuteafd_loader::families::{glm5_flash::core::NativeProjection,
-            kimi_k3::core::{CoreInventory, CoreSplit}};
+        use cuteafd_loader::{formats::native_attention::NativeProjection,
+            families::kimi_k3::core::{CoreInventory, CoreSplit}};
         for fp8 in [false, true] { for ranks in [1, 2] { for rows in [64, 2752] {
             let core = CoreInventory { native: BTreeMap::from([
                 ("language_model.model.layers.0.self_attn.o_proj".into(),

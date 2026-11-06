@@ -84,7 +84,7 @@ pub struct LayerLayout {
     pub operands: BTreeMap<&'static str, usize>,
     pub attention: WeightAttention,
     pub core: BTreeMap<&'static str, CoreWeightLayout>,
-    pub native: BTreeMap<&'static str, crate::families::glm5_flash::core::NativeLayout>,
+    pub native: BTreeMap<&'static str, crate::formats::native_attention::NativeLayout>,
 }
 impl LayerLayout {
     pub fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode) -> Result<[Self; 2]> {
@@ -237,7 +237,7 @@ impl LayerLayout {
             match side { TrellisSide::Output => n /= ranks, TrellisSide::Input => k /= ranks }
             if let Some(projection) = inventory.native.get(stem) {
                 ensure!(projection.shape == shape, "Kimi {stem} native inventory differs from layer geometry");
-                self.native.insert(name, crate::families::glm5_flash::core::NativeLayout {
+                self.native.insert(name, crate::formats::native_attention::NativeLayout {
                     stem: stem.into(), shape: [n, k], fp8: projection.fp8,
                     rank, ranks, split: projection.split });
             } else {
