@@ -153,6 +153,7 @@ the launcher derives from them.
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
 | `SPECULATOR_DRAFTS` | engine default | positive int | Drafts per step. |
+| `TP2_DFLASH` | `off` | `on`, `off` | Kimi DFlash2 Context-split attention on two RTX GPUs; producer weights and FFN stay on GPU1. Explicit CLI false overrides config on. |
 | `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo drafter precision: `on` converts to single-copy FP8. |
 | `DSPARK_DRAFT_POLICY` | `adaptive` | `full`, `adaptive` | V4.1 dSpark policy. |
 | `DSPARK_DRAFT_LIMIT` | engine 5 | 1–7 | V4.1 dSpark draft width; requires dSpark. |
@@ -411,6 +412,7 @@ accept/refuse behaviour. `✓` means the family's config validation accepts it;
 | `SPECULATOR_MODEL_REVISION` | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✓ |
 | `SPECULATOR_DEPTH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |
 | `SPECULATOR_DRAFTS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
+| `TP2_DFLASH` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ |
 | `SPECULATOR_FP8` | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
 | `DSPARK_DRAFT_POLICY` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DSPARK_DRAFT_LIMIT` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |

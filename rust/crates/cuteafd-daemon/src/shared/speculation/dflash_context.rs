@@ -82,11 +82,15 @@ impl<'a> ContextOwner<'a> {
 
     // One producer edge and one completion edge per Context transaction. The
     // lead stream waits on the event, never on a host acknowledgement.
-    fn begin(&self) -> Result<()> {
+    fn begin_lead(&self) -> Result<()> {
         self.streams[1].device.run(|| unsafe {
             self.streams[1].device.library.cuda_event_record(self.ready.raw, self.lead_stream)?;
             self.streams[1].device.library.cuda_stream_wait_event(self.peer.stream(1), self.ready.raw)
-        })?;
+        })
+    }
+
+    fn begin(&self) -> Result<()> {
+        self.begin_lead()?;
         self.peer.signal(1, DIRECT)?;
         self.peer.wait(0, DIRECT)
     }
@@ -135,7 +139,7 @@ impl<'a> ContextOwner<'a> {
         Ok(())
     }
 
-    fn scatter(&self, index: usize, head: Buffer, slots: &[i64]) -> Result<()> {
+    fn scatter(&self, index: usize, head: Buffer, slots: &[i64], query_follows: bool) -> Result<()> {
         let source = self.buffer(1, "producer_cache")?;
         let mut remote: Vec<PeerPlane> = Vec::new();
         for (row, &slot) in slots.iter().enumerate() {
@@ -165,14 +169,24 @@ impl<'a> ContextOwner<'a> {
                 }
             }
         }
-        self.remote_planes(1, &remote)
+        if query_follows {
+            // Query publication follows every scatter on stream 1. Its wait on
+            // stream 0 orders cache reads; the partial reply retires all copies.
+            for planes in remote.chunks(cuteafd_ffi::peer_exchange::PEER_MAX_PLANES) {
+                self.peer.push_planes(1, DIRECT, planes)?;
+                self.peer.wait(0, DIRECT)?;
+            }
+            Ok(())
+        } else {
+            self.remote_planes(1, &remote)
+        }
     }
 
     pub(super) fn scatter_update(&self, index: usize, head: Buffer, slots: &[i64], timing: &DraftTiming) -> Result<()> {
         self.checked(|| {
             self.begin()?;
             let span = timing.begin("context_scatter", Some(index), slots.len(), self.peer.stream(1))?;
-            self.scatter(index, head, slots)?;
+            self.scatter(index, head, slots, false)?;
             timing.end(span, self.peer.stream(1))?;
             self.end()
         })
@@ -211,9 +225,9 @@ impl<'a> ContextOwner<'a> {
         let rows = metadata.positions.len();
         let shards = metadata.context_shards(window, cache_pages)?;
         self.checked(|| {
-            self.begin()?;
+            self.begin_lead()?;
             let scatter = timing.begin("scatter", Some(index), rows, self.peer.stream(1))?;
-            self.scatter(index, layer.cache.buffer, &metadata.slots)?;
+            self.scatter(index, layer.cache.buffer, &metadata.slots, true)?;
             timing.end(scatter, self.peer.stream(1))?;
             let broadcast = timing.begin("query_broadcast", Some(index), rows, self.peer.stream(1))?;
             let peer_query = self.buffer(0, "query")?;
@@ -381,51 +395,60 @@ mod tests {
             let draft = devices[1].own(|| super::super::DflashDrafter::load_mla(&library, &programs,
                 "kimik3", &snapshot, std::fs::read(snapshot.join("model.safetensors"))?, lead.raw,
                 layout, GlmDraftRepresentation::Fp8Only, Fp8Scales::Amax, Fp8Rows::W8a16, Some(split)))?;
-            // Exercise partials/combine at startup before isolating exact cache state.
-            devices[1].run(|| draft.prime_remote())?;
-            devices[1].run(|| draft.drain_mla())?;
-            let super::super::DraftContext::Mla(context) = &draft.context else { unreachable!() };
-            // Priming recycles arbitrary page IDs. Start a fresh, fully drained
-            // host pool so capture 1->2 and restore 2->3 prove both directions.
-            *context.state.borrow_mut() = super::super::MlaPagedState::new(&context.layout)?;
-            devices[1].run(|| draft.reset_context(0, 0))?;
-            let rows = 67;
-            let taps: Vec<u8> = (0..rows * draft.cfg.taps.len() * draft.cfg.hidden)
-                .flat_map(|i| (0x3d00u16 + (i % 127) as u16).to_le_bytes()).collect();
-            let fill = |slot| devices[1].run(|| {
-                draft.put_taps(&taps)?;
-                draft.update(&(0..rows).map(|position| super::super::ContextRow {
-                    tap_row: position, slot, position }).collect::<Vec<_>>())
-            });
-            fill(0)?;
-            let saved = devices[1].run(|| draft.capture_mla_pages(0, rows, rows)
-                .map_err(|error| anyhow::anyhow!("{error}")))?;
-            let super::super::DraftContext::Mla(context) = &draft.context else { unreachable!() };
-            let source_tail = context.state.borrow().pool.committed_page_table(
-                context.state.borrow().bindings[0].unwrap())?[1] as usize;
-            let saved_tail = saved.pages[1].index as usize;
-            assert_ne!(source_tail % 2, saved_tail % 2, "capture must cross physical owners");
-            let before = devices[1].run(|| draft.mla_readback(0, 0))?;
-            let marks = devices[1].run(|| draft.mla_window_buffers(0)?.iter()
-                .map(|buffer| Allocation::new(devices[1], buffer.bytes)).collect::<Result<Vec<_>>>())?;
-            let mark_buffers = marks.iter().map(|owner| owner.buffer).collect::<Vec<_>>();
-            devices[1].run(|| draft.copy_mla_windows(0, &mark_buffers, true))?;
-            devices[1].run(|| draft.copy_mla_windows(1, &mark_buffers, false))?;
-            devices[1].run(|| draft.restore_mla_pages(1, &saved, rows)
-                .map_err(|error| anyhow::anyhow!("{error}")))?;
-            let restored_tail = context.state.borrow().pool.committed_page_table(
-                context.state.borrow().bindings[1].unwrap())?[1] as usize;
-            // Readback above may recycle a temporary snapshot page; ownership
-            // crossing is mandatory, not merely an unverified allocator hope.
-            assert_ne!(saved_tail % 2, restored_tail % 2, "restore tail must cross physical owners");
-            let restored = devices[1].run(|| draft.mla_readback(1, 0))?;
-            assert_eq!(before, restored, "both owner caches and odd-slot window marks restore exactly");
-            devices[1].run(|| draft.reset_context(1, 0))?;
-            fill(1)?;
-            let fresh = devices[1].run(|| draft.mla_readback(1, 0))?;
-            assert_eq!(restored, fresh, "cross-owner restore equals fresh committed state byte for byte");
-            devices[1].run(|| draft.release_mla_pages(&saved))?;
-            devices[1].run(|| draft.drain_mla())?;
+            let iterations = if cache_format == cuteafd_core::MlaCacheFormat::Fp8 {
+                std::env::var("CUTEAFD_KIMI_DRAFT_COW_ITERATIONS").ok()
+                    .map(|value| value.parse::<usize>()).transpose()?.unwrap_or(1)
+            } else { 1 };
+            ensure!((1..=1000).contains(&iterations), "Context COW iterations must be 1..=1000");
+            for iteration in 0..iterations {
+                // Exercise partials/combine and staging reuse on every iteration.
+                draft.startup_primed.set(false);
+                devices[1].run(|| draft.prime_remote())?;
+                devices[1].run(|| draft.drain_mla())?;
+                let super::super::DraftContext::Mla(context) = &draft.context else { unreachable!() };
+                // Priming recycles arbitrary page IDs. Start a fresh, fully drained
+                // host pool so capture 1->2 and restore 2->3 prove both directions.
+                *context.state.borrow_mut() = super::super::MlaPagedState::new(&context.layout)?;
+                devices[1].run(|| draft.reset_context(0, 0))?;
+                let rows = 67;
+                let taps: Vec<u8> = (0..rows * draft.cfg.taps.len() * draft.cfg.hidden)
+                    .flat_map(|i| (0x3d00u16 + (i % 127) as u16).to_le_bytes()).collect();
+                let fill = |slot| devices[1].run(|| {
+                    draft.put_taps(&taps)?;
+                    draft.update(&(0..rows).map(|position| super::super::ContextRow {
+                        tap_row: position, slot, position }).collect::<Vec<_>>())
+                });
+                fill(0)?;
+                let saved = devices[1].run(|| draft.capture_mla_pages(0, rows, rows)
+                    .map_err(|error| anyhow::anyhow!("{error}")))?;
+                let super::super::DraftContext::Mla(context) = &draft.context else { unreachable!() };
+                let source_tail = context.state.borrow().pool.committed_page_table(
+                    context.state.borrow().bindings[0].unwrap())?[1] as usize;
+                let saved_tail = saved.pages[1].index as usize;
+                assert_ne!(source_tail % 2, saved_tail % 2, "capture must cross physical owners");
+                let before = devices[1].run(|| draft.mla_readback(0, 0))?;
+                let marks = devices[1].run(|| draft.mla_window_buffers(0)?.iter()
+                    .map(|buffer| Allocation::new(devices[1], buffer.bytes)).collect::<Result<Vec<_>>>())?;
+                let mark_buffers = marks.iter().map(|owner| owner.buffer).collect::<Vec<_>>();
+                devices[1].run(|| draft.copy_mla_windows(0, &mark_buffers, true))?;
+                devices[1].run(|| draft.copy_mla_windows(1, &mark_buffers, false))?;
+                devices[1].run(|| draft.restore_mla_pages(1, &saved, rows)
+                    .map_err(|error| anyhow::anyhow!("{error}")))?;
+                let restored_tail = context.state.borrow().pool.committed_page_table(
+                    context.state.borrow().bindings[1].unwrap())?[1] as usize;
+                // Readback above may recycle a temporary snapshot page; ownership
+                // crossing is mandatory, not merely an unverified allocator hope.
+                assert_ne!(saved_tail % 2, restored_tail % 2, "restore tail must cross physical owners");
+                let restored = devices[1].run(|| draft.mla_readback(1, 0))?;
+                assert_eq!(before, restored, "both owner caches and odd-slot window marks restore exactly");
+                devices[1].run(|| draft.reset_context(1, 0))?;
+                fill(1)?;
+                let fresh = devices[1].run(|| draft.mla_readback(1, 0))?;
+                assert_eq!(restored, fresh, "cross-owner restore equals fresh committed state byte for byte");
+                devices[1].run(|| draft.release_mla_pages(&saved))?;
+                devices[1].run(|| draft.drain_mla())?;
+                eprintln!("Context COW {cache_format:?} iteration {} exact", iteration + 1);
+            }
         }
         Ok(())
     }

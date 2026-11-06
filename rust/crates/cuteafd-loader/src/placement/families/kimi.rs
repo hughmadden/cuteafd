@@ -1042,8 +1042,10 @@ mod tests {
             assert_eq!(owners.len(), 1);
             assert_eq!(owners[0].bytes, 128);
         }
-        assert!(recipe.admit(request_with(Some(192)), budget.clone()).is_err());
-        assert_eq!(recipe.admit(request_with(Some(128)), budget).unwrap().solved.pool_tokens, 128);
+        let request = |pool| Request { context: 128, ..request_with(Some(pool)) };
+        recipe.context = 128;
+        assert!(recipe.admit(request(192), budget.clone()).is_err());
+        assert_eq!(recipe.admit(request(128), budget).unwrap().solved.pool_tokens, 128);
     }
 
     #[test]
