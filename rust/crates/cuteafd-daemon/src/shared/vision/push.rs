@@ -149,6 +149,18 @@ fn check_destinations(records: &Records, mut ranges: Vec<(i32, usize, usize)>) -
     Ok(())
 }
 
+/// One BF16 media vector's widen windows (one staged step each), shared by the
+/// recorded contribution and the header-only host admission of its staging.
+pub(crate) fn widen_windows(path: &std::path::Path, metadata: &cuteafd_loader::SafetensorsTensorMetadata) -> Vec<Rect> {
+    let bytes = metadata.byte_length as usize;
+    let window = crate::shared::experts::rtx::dense::TRANSFORM_BYTES & !1;
+    (0..bytes).step_by(window).map(|at| {
+        let count = (bytes - at).min(window);
+        Rect { name: metadata.name.clone(), path: path.into(), base: metadata.byte_offset + at as u64,
+            row_bytes: count, rows: 0..1, cols: 0..count }
+    }).collect()
+}
+
 fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize,
     path: &std::path::Path, metadata: &cuteafd_loader::SafetensorsTensorMetadata,
     destination: usize, widen: bool) -> Result<()> {
@@ -163,13 +175,12 @@ fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize
     };
     if widen {
         ensure!(bytes % 2 == 0, "media BF16 tensor has an odd byte extent");
-        let window = crate::shared::experts::rtx::dense::TRANSFORM_BYTES & !1;
-        for at in (0..bytes).step_by(window) {
-            let count = (bytes - at).min(window);
-            let rect = Rect { name: metadata.name.clone(), path: path.into(), base: metadata.byte_offset + at as u64,
-                row_bytes: count, rows: 0..1, cols: 0..count };
+        let mut at = 0;
+        for rect in widen_windows(path, metadata) {
+            let count = rect.bytes();
             records.steps.push(Step { device, rects: vec![rect],
                 jobs: vec![Job::Widen { at: 0, bytes: count, dst: buffer(destination + at * 2, count * 2) }] });
+            at += count;
         }
     } else {
         let rect = Rect { name: metadata.name.clone(), path: path.into(), base: metadata.byte_offset,
@@ -183,6 +194,10 @@ fn append(records: &mut Records, device: i32, address: usize, arena_bytes: usize
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    /// A tower's header-only contribution at a synthetic arena address on `device`.
+    pub(crate) fn vision_records(device: i32, spec: &TowerSpec) -> Result<Records> {
+        Ok(Contribution::prepare(device, Some((spec, 1 << 40)), None, None, None)?.records())
+    }
     pub(crate) fn assert_vision_plan(snapshot: &std::path::Path, spec: &TowerSpec) {
         let contribution = Contribution::prepare(0, Some((spec, 4096)), None, None, None).unwrap();
         let records = contribution.records();

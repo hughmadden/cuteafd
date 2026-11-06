@@ -80,7 +80,7 @@ impl Opened {
         let dense_envelope = push_policy.plan(|| {
             let owners = qwen4::dual_owners(layers);
             let staging = admission::dual_dense_staging(&self.checkpoint, &self.cfg, &owners, mtp,
-                args.fp8_decode, args.mtp_fp8_head)?;
+                args.fp8_decode, args.mtp_fp8_head, &media, [args.device, peer])?;
             admission::dual_push_envelope(staging)
         }).context("Qwen dual coordinator push admission")?;
         let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, 0, false,

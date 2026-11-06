@@ -318,7 +318,8 @@ pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan:
 /// `HostStaging::for_steps` the receiving rank applies, plus its job table.
 /// The executor validates the recorded ranks against this before offers.
 pub(super) fn dual_dense_staging(checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &Qwen4Config,
-    owners: &[usize], mtp: bool, fp8_decode: bool, fp8_head: bool) -> Result<[u64; 2]> {
+    owners: &[usize], mtp: bool, fp8_decode: bool, fp8_head: bool,
+    media: &crate::shared::experts::rtx::dense::Records, devices: [i32; 2]) -> Result<[u64; 2]> {
     use anyhow::{ensure, Context};
     use cuteafd_core::DType;
     use crate::shared::experts::rtx::dense::{windows, windows_with_tail, HostStaging, Rect};
@@ -377,6 +378,13 @@ pub(super) fn dual_dense_staging(checkpoint: &cuteafd_loader::plan::Checkpoint, 
         }
     }
     if mtp { layer("mtp.layers.0", Qwen4Attention::Full, false, &mut steps[0])?; }
+    // A coordinator tower's own recorded (header-derived) widen steps join its GPU.
+    ensure!(media.finishes.is_empty() && media.peer_copies.is_empty(), "Qwen media records only operands and steps");
+    for step in &media.steps {
+        let rank = devices.iter().position(|&device| device == step.device)
+            .context("Qwen media step outside the dual group")?;
+        steps[rank].push(step.rects.clone());
+    }
     let mut out = [0u64; 2];
     for rank in 0..2 {
         out[rank] = u64::try_from(HostStaging::for_steps(steps[rank].iter().map(Vec::as_slice), tables[rank])?.bytes()?)?;
@@ -1155,6 +1163,10 @@ mod dual_push_tests {
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, true, true)?;
         let cfg = Qwen4Config::read(&snapshot)?;
         let owners = qwen4::dual_owners(cfg.layers);
+        // The bundled tower's contribution (header-only, on GPU1 as the smoke places it).
+        let spec = crate::shared::vision::TowerSpec::qwen(&snapshot, cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)?;
+        let tower = crate::shared::vision::push::tests::vision_records(1, &spec)?;
+        anyhow::ensure!(!tower.steps.is_empty(), "the Qwen tower widens BF16 vectors");
         let mut arms = 0;
         for (fp8_decode, fp8_head) in [(false, false), (true, false), (false, true), (true, true)] {
             let load = std::rc::Rc::new(DenseLoad::push(&library));
@@ -1162,8 +1174,10 @@ mod dual_push_tests {
                 fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(), dense: load.clone() };
             let ranks: Vec<_> = (0..2).map(|id| (Device { library: &library, id }, std::ptr::null_mut())).collect();
             let model = loader.model_placed(&cfg, &owners, &ranks, true, fp8_head)?;
-            let records = load.sink.as_ref().context("push sink")?.take_all();
-            let charged = dual_dense_staging(&checkpoint, &cfg, &owners, true, fp8_decode, fp8_head)?;
+            let mut records = load.sink.as_ref().context("push sink")?.take_all();
+            records.extend(tower.clone());
+            let charged = dual_dense_staging(&checkpoint, &cfg, &owners, true, fp8_decode, fp8_head,
+                &tower, [0, 1])?;
             for rank in 0..2 {
                 let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), rank as i32)?;
                 let actual = layout.host_staging.bytes()? as u64;
