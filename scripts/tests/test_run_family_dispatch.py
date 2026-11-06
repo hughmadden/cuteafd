@@ -1166,6 +1166,29 @@ def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary:
     assert deployment["prefill_unit_rows"] == (4096 if local else 2752), deployment
     assert deployment["prefill_waves"] == (1 if local else 3), deployment
     assert deployment["report"]["phase_ledger"], deployment
+    if example.name == "glm53f-exl3-k4-core-k6-max.config":
+        assert deployment["report"]["encoder"]["kind"] != "off", deployment
+        strict_dir = temporary / "vision-on"
+        strict_dir.mkdir()
+        strict_output = strict_dir / "real-deployment.json"
+        raw = example.read_text()
+        config = dict(line.split("=", 1) for line in raw.splitlines()
+                      if line and not line.startswith("#") and "=" in line)
+        keys = "\n".join(line for line in raw.splitlines()
+                          if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+        gpus = int(config["RTX_GPUS"])
+        strict_keys = "\n".join(line for line in keys.splitlines()
+                                if not line.startswith("VISION=")) + "\nVISION=rtx\n"
+        strict = _family_launch_result(strict_dir, json.loads((snapshot / "config.json").read_text()),
+            "test/glm-real-plan", strict_keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
+            extra_args=("--wip", "real-planner-test"), extra_env={
+                "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+                "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+                "STUB_REAL_PLAN_OUTPUT": str(strict_output), "CUTEAFD_CDI_CHECK": "off"})
+        assert strict.returncode == 0, strict.stderr
+        vision_on = json.loads(strict_output.read_text())
+        assert deployment["memory_layout"]["pool_tokens"] == vision_on["memory_layout"]["pool_tokens"]
+        assert deployment["report"]["solver_placement"]["onboard_layers"] == 42
 
 
 def capture_muse_real_planner_launch(snapshot: Path, example: Path, binary: Path,

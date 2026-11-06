@@ -5129,7 +5129,8 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
     assert!(auto.fits && auto.placement_supported, "{}", render(&auto));
     assert_eq!(auto.vision, MediaMode::Auto);
     assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Off);
-    assert!(auto.encoder.as_ref().unwrap().reason.contains("pool"));
+    assert_eq!(auto.encoder.as_ref().unwrap().reason,
+        "auto vision disabled to preserve the GLM Flash KV pool floor");
     assert_eq!(auto.memory_layout.as_ref().unwrap().pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);
     assert!(auto.memory_layout.as_ref().unwrap().devices.iter().flat_map(|device| &device.items)
         .all(|item| !item.group.starts_with("vision ")));

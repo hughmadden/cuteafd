@@ -11,6 +11,7 @@ pub struct ProcessOwners {
     pub links: Vec<PreparedSparkLink>,
     pub native_load: Option<NativeLoad>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
+    pub auto_vision: bool,
     pub media_cache_bytes: u64,
     pub alternate_resident: Option<Vec<GlmfResidentRank>>,
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
@@ -106,7 +107,7 @@ impl NativeLoad {
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
         Self { host, host_headroom, allocations: vec![], links: vec![], native_load: None,
-            encoders: vec![], media_cache_bytes: 0, alternate_resident: None, push_host: None }
+            encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None }
     }
 
     pub fn serving(&mut self, i: &GlmfInputs<'_>, quota: u64, chunk: u64, host_embedding: u64,
@@ -437,6 +438,11 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         use crate::plan::encoder::EncoderKind;
         let variable = contract.variables.len();
         contract.variables.push(p::Variable::Encoder((0..process.encoders.len()).collect()));
+        if process.auto_vision {
+            if let Some(option) = process.encoders.iter().position(|encoder| encoder.kind == EncoderKind::Off) {
+                contract.floor_fallback = Some(p::Choice { variable, option });
+            }
+        }
         for (option, encoder) in process.encoders.iter().enumerate() {
             let when = p::Choice { variable, option };
             let locations = match &encoder.kind {

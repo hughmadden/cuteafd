@@ -328,9 +328,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 idle: false, expert_bytes: 0, free_bytes: options.spark_allocation_budget_bytes.unwrap_or(121 << 30) }).collect() };
         process.encoders = encoder::candidates(&EncoderRequest { mode: report.vision, weights, scratch,
             copies: options.vision_replicas }, &hardware);
-        if report.vision == crate::plan::MediaMode::Auto && weights > 0 {
+        process.auto_vision = report.vision == crate::plan::MediaMode::Auto;
+        if process.auto_vision && weights > 0 {
             process.encoders.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
-                replicas: vec![], reason: "no admitted native tower without reducing the pool".into(), shortfall: 0 });
+                replicas: vec![], reason: "auto vision disabled to preserve the GLM Flash KV pool floor".into(), shortfall: 0 });
         }
         anyhow::ensure!(!process.encoders.is_empty(), "requested Flash encoder has no executable owner");
         process.media_cache_bytes = options.media_cache_bytes.unwrap_or((8 << 30).min(host.0 / 20));
