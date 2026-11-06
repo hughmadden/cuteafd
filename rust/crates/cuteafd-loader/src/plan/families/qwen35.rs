@@ -224,7 +224,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     report.host_budget_bytes = quota;
     let mut notes = vec![
         format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv),
-        format!("shared planner: pool {pool_tokens} tokens ({} pages of {} rows), {} prefill row unit, {} lanes, {} resident weight bytes, {} physical owners", 
+        format!("shared planner: pool {pool_tokens} tokens ({} pages of {} rows), {} prefill row unit, {} lanes, {} resident weight bytes, {} physical owners",
             pool_tokens / qwen3_5::PAGE_ROWS, qwen3_5::PAGE_ROWS, prefill.unit_rows, prefill.waves,
             plan.facts.resident_weights.iter().map(|owner| owner.weights.0).sum::<u64>(),
             plan.facts.allocations.iter().filter(|owner| owner.view.is_none()).count()),
