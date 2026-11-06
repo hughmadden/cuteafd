@@ -43,7 +43,7 @@ fn require(checkpoint: &Checkpoint, name: String, dtype: DType, shape: Vec<usize
     Ok(())
 }
 
-fn block(checkpoint: &Checkpoint, name: String, rows: usize, cols: usize,
+pub(super) fn block(checkpoint: &Checkpoint, name: String, rows: usize, cols: usize,
     consumer: &'static str) -> Result<(), ProjectionInputError> {
     let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.cmp(&name))
         .map_err(|_| ProjectionInputError::Missing { name: name.clone() })?;
