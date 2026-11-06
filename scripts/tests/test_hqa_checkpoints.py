@@ -301,3 +301,74 @@ def test_redirect_changes_only_references():
     assert json.loads(out) == {"a": "quantize_config.compact-attention.json:tensor_storage",
                                "b": "quantize_config.json is here", "c": ["config.compact-attention.json"]}
     assert hqa.redirect(out, {v: k for k, v in mapping.items()})[0] == raw
+
+
+def test_fp8_scales_and_index_alias(tmp_path):
+    """Mistral shape: FP8 weight + F32 block scale, a byte-identical declared index alias."""
+    hub = tmp_path / "hub"
+    parent = hub / "models--wrldsuksgo2mars--Fp8-EXL3" / "snapshots" / PARENT_REV
+    source = hub / "models--org--Fp8" / "snapshots" / SOURCE_REV
+    blobs = hub / "models--org--Fp8" / "blobs"
+    for d in (parent, source, blobs):
+        d.mkdir(parents=True)
+    storage, weight_map, tensors = {}, {}, {}
+    for leaf in ("wq", "wo"):
+        stem = f"layers.0.attention.{leaf}"
+        t, storage[stem] = exl3(stem, 256, 128)
+        tensors.update(t)
+    tensors["layers.0.attention.norm.weight"] = ("BF16", [8], b"\x00" * 16)
+    safetensors(parent / "model-00001-of-00001.safetensors", tensors)
+    weight_map = {n: "model-00001-of-00001.safetensors" for n in tensors}
+    total = sum(len(v[2]) for v in tensors.values())
+    index = (json.dumps(dict(metadata=dict(total_size=total), weight_map=weight_map)) + "\n").encode()
+    (parent / "model.safetensors.index.json").write_bytes(index)
+    (parent / "consolidated.safetensors.index.json").write_bytes(index)
+    (parent / "quantize_config.json").write_text(json.dumps(dict(
+        quant_method="exl3", per_module_metadata="quantize_config.json:tensor_storage", tensor_storage=storage)))
+    (parent / "config.json").write_text(json.dumps(dict(
+        n_layers=1, transformers_weights="consolidated.safetensors.index.json",
+        quantization_config=dict(quant_method="exl3", per_module_metadata="quantize_config.json:tensor_storage"))))
+    (parent / "README.md").write_text("# fp8\n")
+    (parent / ".gitattributes").write_text("*.safetensors filter=lfs diff=lfs merge=lfs -text\n")
+    src = {}
+    for leaf in ("wq", "wo"):
+        src[f"layers.0.attention.{leaf}.weight"] = ("F8_E4M3", [256, 128], bytes(i % 256 for i in range(256 * 128)))
+        src[f"layers.0.attention.{leaf}.qscale_weight"] = ("F32", [2, 1], b"\x00\x00\x80\x3f" * 2)
+    tmp = tmp_path / "s.safetensors"
+    safetensors(tmp, src)
+    sha = hashlib.sha256(tmp.read_bytes()).hexdigest()
+    shutil.move(tmp, blobs / sha)
+    (source / "consolidated-00001-of-00001.safetensors").symlink_to(f"../../blobs/{sha}")
+    sidx = json.dumps(dict(weight_map={n: "consolidated-00001-of-00001.safetensors" for n in src})).encode()
+    (source / "consolidated.safetensors.index.json").write_bytes(sidx)
+    source_tree = {"consolidated-00001-of-00001.safetensors": dict(bytes=(blobs / sha).stat().st_size, blob=sha),
+                   "consolidated.safetensors.index.json": dict(bytes=len(sidx), blob=blob(sidx))}
+    parent_tree = {p.name: dict(bytes=p.stat().st_size, blob=(hashlib.sha256(p.read_bytes()).hexdigest()
+                   if p.name.endswith(".safetensors") else blob(p.read_bytes()))) for p in parent.iterdir()}
+    family = hqa.Family("fp8", "Fp8-EXL3", PARENT_REV, "org/Fp8", SOURCE_REV, SOURCE_REV,
+                        r"^layers\.(\d+)\.attention\.(wq|wo)$", {"wq": 1, "wo": 1}, "F8_E4M3",
+                        ("qscale_weight",), 128, ("consolidated.safetensors.index.json",),
+                        "consolidated.safetensors.index.json")
+    remote = {("wrldsuksgo2mars/Fp8-EXL3", PARENT_REV): parent_tree, ("org/Fp8", SOURCE_REV): source_tree}
+    run = hqa.Run(family, hub=hub, state=tmp_path / "state", remote=remote)
+    inv, plan, state = hqa.build(run)
+    staging = Path(state["staging"])
+    hqa_view, compact = hqa.open_view(staging, "hqa"), hqa.open_view(staging, "compact")
+    assert set(hqa_view.dispatch.values()) == {"fp8_e4m3_block_scaled"}
+    assert "layers.0.attention.wq.qscale_weight" in hqa_view.index["weight_map"]
+    assert (staging / "consolidated.safetensors.index.json").read_bytes() == \
+        (staging / "model.safetensors.index.json").read_bytes()
+    assert (staging / "consolidated.compact-attention.safetensors.index.json").read_bytes() == index
+    assert json.loads((staging / "config.compact-attention.json").read_bytes())["transformers_weights"] == \
+        "consolidated.compact-attention.safetensors.index.json"
+    assert compact.dispatch["layers.0.attention.wq"] == "exl3-K6"
+    native = hqa_view.quantize["native_attention"]["layers.0.attention.wo"]
+    assert native["scale"]["block_size"] == [128, 128]
+    assert hqa.validate(run, inv, plan, state)["status"] == "passed"
+    config = staging / "config.compact-attention.json"
+    data = json.loads(config.read_bytes())
+    data["transformers_weights"] = "consolidated.safetensors.index.json"
+    config.unlink()
+    config.write_text(json.dumps(data))
+    with pytest.raises(hqa.SelectionError, match="transformers_weights"):
+        hqa.open_view(staging, "compact")

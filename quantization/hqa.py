@@ -73,6 +73,8 @@ class Family:
     native_dtype: str
     scales: tuple = ()      # required native scale suffixes beside `weight`
     block: int = 0          # FP8 scale block size
+    index_aliases: tuple = ()   # parent indexes byte-identical to model.safetensors.index.json
+    source_index: str = 'model.safetensors.index.json'
 
     @property
     def parent(self):
@@ -109,8 +111,23 @@ FAMILIES = {f.key: f for f in [
     Family('mistral-large4', 'Mistral-Large-4-EXL3-K4-Core-K6', '03c80aebaa483d55760703ae5bc0c9734c9d67d6',
            'mistralai/Mistral-Large-4-1T-A52B', 'f12dabdc0c1e99e7f7924461a6f308859b05af4d',
            'f12dabdc0c1e99e7f7924461a6f308859b05af4d',
-           r'^layers\.(\d+)\.attention\.(wq|wo)$', {'wq': 72, 'wo': 72}, 'F8_E4M3', ('qscale_weight',), 128),
+           r'^layers\.(\d+)\.attention\.(wq|wo)$', {'wq': 72, 'wo': 72}, 'F8_E4M3', ('qscale_weight',), 128,
+           ('consolidated.safetensors.index.json',), 'consolidated.safetensors.index.json'),
 ]}
+
+
+def compact_name(index):
+    """`<stem>.safetensors.index.json` -> `<stem>.compact-attention.safetensors.index.json`."""
+    suffix = '.safetensors.index.json'
+    if not index.endswith(suffix) or '/' in index:
+        raise ValueError(f'not an index filename: {index}')
+    return index[:-len(suffix)] + '.compact-attention' + suffix
+
+
+def view_mapping(aliases, reverse=False):
+    mapping = {VIEWS['hqa'][k]: VIEWS['compact'][k] for k in ('index', 'config', 'quantize')}
+    mapping.update({a: compact_name(a) for a in aliases})
+    return {v: k for k, v in mapping.items()} if reverse else mapping
 
 
 class HqaError(ValueError):
@@ -334,8 +351,15 @@ def inventory(run):
            for name in ('config.json', 'quantize_config.json', 'model.safetensors.index.json')}
     config, quantize, index = (json.loads(raw[n]) for n in
                                ('config.json', 'quantize_config.json', 'model.safetensors.index.json'))
-    if 'transformers_weights' in config and config['transformers_weights'] != 'model.safetensors.index.json':
-        raise HqaError('parent declares another authoritative index; family needs explicit handling')
+    for alias in fam.index_aliases:
+        if (run.parent / alias).read_bytes() != raw['model.safetensors.index.json']:
+            raise HqaError(f'parent {alias} is not byte-identical to model.safetensors.index.json')
+    declared = config.get('transformers_weights')
+    if declared not in (None, 'model.safetensors.index.json', *fam.index_aliases):
+        raise HqaError(f'parent declares an undeclared authoritative index {declared}')
+    others = {n for n in parent_files if n.endswith('.index.json')} - {'model.safetensors.index.json', *fam.index_aliases}
+    if others:
+        raise HqaError(f'parent has unhandled index files {sorted(others)}')
     remote = run.remote(fam.parent, fam.parent_rev)
     if set(remote) - {'.gitattributes'} != set(parent_files) - {'.gitattributes'}:
         raise HqaError('local parent snapshot inventory differs from the pinned Hub revision')
@@ -362,7 +386,7 @@ def inventory(run):
             raise HqaError(f'parent stores a matching projection outside EXL3: {name}')
     parent_shards = sorted(set(weight_map.values()))
     parent_headers = headers_for(run.parent, parent_shards)
-    source_index = json.loads((run.source / 'model.safetensors.index.json').read_bytes())
+    source_index = json.loads((run.source / fam.source_index).read_bytes())
     source_map = source_index['weight_map']
     source_names = {}
     for name in source_map:
@@ -435,11 +459,11 @@ def verify_source(run, files):
         weights = {n for n in pinned if n.endswith('.safetensors')}
         if ({n for n in cached if n.endswith('.safetensors')} != weights
                 or any(cached[n] != pinned[n] for n in weights)
-                or cached['model.safetensors.index.json'] != pinned['model.safetensors.index.json']):
+                or cached[fam.source_index] != pinned[fam.source_index]):
             raise HqaError('cached source revision is not tensor-equivalent to the pinned revision')
         evidence['equivalence'] = f'index and all {len(weights)} safetensors LFS SHA256 values equal'
-    index = (run.source / 'model.safetensors.index.json').read_bytes()
-    if pinned['model.safetensors.index.json']['blob'] not in (digest(index), git_blob(index)):
+    index = (run.source / fam.source_index).read_bytes()
+    if pinned[fam.source_index]['blob'] not in (digest(index), git_blob(index)):
         raise HqaError('cached source index differs from the pinned revision')
     for name in files:
         path = run.source / name
@@ -563,10 +587,13 @@ def write_shard(run, inv, shard, staging, records, plan_digest, *, fault_after=N
 
 # ------------------------------------------------------------------- metadata
 
-def attention_view():
-    return dict(schema='cuteafd-attention-views-v1', mode='hqa',
+def attention_view(aliases=()):
+    view = dict(schema='cuteafd-attention-views-v1', mode='hqa',
                 views={'hqa': dict(VIEWS['hqa']), 'compact-attention': dict(VIEWS['compact'])},
                 native_modules='quantize_config.json:native_attention')
+    if aliases:
+        view['index_aliases'] = {'hqa': list(aliases), 'compact-attention': [compact_name(a) for a in aliases]}
+    return view
 
 
 def native_description(fam, module, shard):
@@ -627,7 +654,7 @@ def build_metadata(run, inv, plan, shard_records):
                     additions[name] = dict(dtype=tensor['dtype'], shape=tensor['shape'])
         merged = dict(declared, **additions)
         hqa_quant[key] = dict(sorted(merged.items())) if list(declared) == sorted(declared) else merged
-    view = attention_view()
+    view = attention_view(fam.index_aliases)
     hqa_quant['attention_view'] = view
     hqa_quant['native_attention'] = {m['module']: native_description(fam, m, shard_of[m['module']])
                                      for m in inv['modules']}
@@ -637,12 +664,14 @@ def build_metadata(run, inv, plan, shard_records):
     hqa_config['quantization_config']['attention_view'] = view
     hqa_quant, hqa_config = ordered(hqa_quant, quantize), ordered(hqa_config, config)
     hqa_config['quantization_config'] = ordered(hqa_config['quantization_config'], config['quantization_config'])
+    hqa_index_bytes = dumps(hqa_index, json_style(raw['model.safetensors.index.json']))
     files = {
-        VIEWS['hqa']['index']: dumps(hqa_index, json_style(raw['model.safetensors.index.json'])),
+        VIEWS['hqa']['index']: hqa_index_bytes,
+        **{alias: hqa_index_bytes for alias in fam.index_aliases},
         VIEWS['hqa']['quantize']: dumps(hqa_quant, json_style(raw['quantize_config.json'])),
         VIEWS['hqa']['config']: dumps(hqa_config, json_style(raw['config.json'])),
     }
-    mapping = {VIEWS['hqa'][k]: VIEWS['compact'][k] for k in ('index', 'config', 'quantize')}
+    mapping = view_mapping(fam.index_aliases)
     compact_config, config_refs = redirect(raw['config.json'], mapping)
     compact_quant, quant_refs = redirect(raw['quantize_config.json'], mapping)
     compact = dict(config=dict(redirected=config_refs), quantize=dict(redirected=quant_refs))
@@ -651,10 +680,9 @@ def build_metadata(run, inv, plan, shard_records):
         files[VIEWS['compact']['quantize']] = compact_quant
     attributes = (run.parent / '.gitattributes').read_text()
     lines = attributes.rstrip('\n').split('\n')
-    for role in ('index', 'config', 'quantize'):
-        parent_name, compact_name = VIEWS['hqa'][role], VIEWS['compact'][role]
+    for parent_name, compact in mapping.items():
         if any(line.split()[:1] == [parent_name] and 'filter=lfs' in line for line in lines):
-            entry = f'{compact_name} filter=lfs diff=lfs merge=lfs -text'
+            entry = f'{compact} filter=lfs diff=lfs merge=lfs -text'
             if entry not in lines:
                 lines.append(entry)
     files['.gitattributes'] = ('\n'.join(lines) + '\n').encode()
@@ -703,11 +731,14 @@ def provenance(run, inv, plan, shard_records, summary):
 def plan_files(run, inv, plan, metadata):
     """Published inventory: inherited {dest: parent name} and new names."""
     parent = file_inventory(run.parent)
+    aliases = run.family.index_aliases
     replaced = {'config.json', 'quantize_config.json', 'model.safetensors.index.json', 'README.md',
-                '.gitattributes'}
+                '.gitattributes', *aliases}
     inherited = {n: n for n in parent if n not in replaced}
     inherited[PARENT_CARD] = 'README.md'
     inherited[VIEWS['compact']['index']] = 'model.safetensors.index.json'
+    for alias in aliases:
+        inherited[compact_name(alias)] = alias
     if VIEWS['compact']['quantize'] not in metadata:
         inherited[VIEWS['compact']['quantize']] = 'quantize_config.json'
     new = sorted({*metadata, PROVENANCE, 'README.md', *(s['file'] for s in plan['shards'])})
@@ -839,6 +870,13 @@ def open_view(root, mode, *, read=read_header):
         if 'native_attention' in quantize:
             raise SelectionError('compact bundle carries native attention modules (mixed view)')
         native = {}
+    aliases = marker.get('index_aliases', {}).get('hqa' if mode == 'hqa' else 'compact-attention', [])
+    for alias in aliases:
+        if not (root / alias).is_file() or (root / alias).read_bytes() != raw['index']:
+            raise SelectionError(f'{mode}: index alias {alias} missing or differs from {files["index"]}')
+    declared = config.get('transformers_weights')
+    if declared is not None and declared not in (files['index'], *aliases):
+        raise SelectionError(f'{mode} bundle mixes views: transformers_weights is {declared}')
     weight_map, storage = index['weight_map'], quantize['tensor_storage']
     dispatch = {}
     for stem, entry in storage.items():
@@ -894,7 +932,9 @@ def materialize_view(root, mode, target, *, canonical_names=True):
     root, target = Path(root), Path(target)
     view = open_view(root, mode)
     target.mkdir(parents=True, exist_ok=False)
-    others = {n for v in VIEWS.values() for n in v.values()}
+    marker = view.config if mode == 'hqa' else json.loads((root / 'config.json').read_bytes())
+    aliases = marker['quantization_config']['attention_view'].get('index_aliases', {}).get('hqa', [])
+    others = {n for v in VIEWS.values() for n in v.values()} | set(aliases) | {compact_name(a) for a in aliases}
     for path in sorted(root.rglob('*')):
         name = path.relative_to(root).as_posix()
         if path.is_dir() or name in others or name.endswith('.safetensors'):
@@ -903,12 +943,14 @@ def materialize_view(root, mode, target, *, canonical_names=True):
         (target / name).symlink_to(path)
     for shard in sorted(view.opened):
         (target / shard).symlink_to(root / shard)
-    reverse = {VIEWS['compact'][k]: VIEWS['hqa'][k] for k in ('index', 'config', 'quantize')}
+    reverse = view_mapping(aliases, reverse=True)
     for role in ('index', 'config', 'quantize'):
         data = (root / VIEWS[mode][role]).read_bytes()
         if mode == 'compact' and canonical_names:
             data = redirect(data, reverse)[0]
         (target / VIEWS['hqa'][role]).write_bytes(data)
+    for alias in aliases:
+        (target / alias).write_bytes((target / VIEWS['hqa']['index']).read_bytes())
     return view
 
 
@@ -984,7 +1026,12 @@ def validate(run, inv, plan, state, *, planner=None):
     compact, hqa = views['compact'], views['hqa']
     parent_quant = json.loads((run.parent / 'quantize_config.json').read_bytes())
     parent_config = json.loads((run.parent / 'config.json').read_bytes())
-    mapping = {VIEWS['compact'][k]: VIEWS['hqa'][k] for k in ('index', 'config', 'quantize')}
+    mapping = view_mapping(fam.index_aliases, reverse=True)
+    for alias in fam.index_aliases:
+        if (staging / compact_name(alias)).read_bytes() != parent_index_raw:
+            raise HqaError(f'compact {compact_name(alias)} is not the parent {alias}')
+        if (staging / alias).read_bytes() != (staging / VIEWS['hqa']['index']).read_bytes():
+            raise HqaError(f'hqa {alias} differs from the hqa index')
     if _unredirect(compact.quantize, mapping) != parent_quant or _unredirect(compact.config, mapping) != parent_config:
         raise HqaError('compact metadata differs from the parent beyond filename references')
     for role in ('config', 'quantize'):
