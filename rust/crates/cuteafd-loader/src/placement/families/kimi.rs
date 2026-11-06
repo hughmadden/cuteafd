@@ -293,7 +293,8 @@ impl KimiRecipe {
     pub fn admit(&self, request: Request, budgets: Vec<Budget>) -> Result<AdmittedKimi, Refusal> {
         let solved = solve(request, budgets, self)?;
         let placement = self.execution(&solved)?;
-        if self.experts.is_some() && !placement.layers.iter().any(|layer| layer.experts == ExpertHome::Spark) {
+        if self.spark_links && self.experts.is_some()
+            && !placement.layers.iter().any(|layer| layer.experts == ExpertHome::Spark) {
             return Err(LOCAL_ONLY_REFUSAL);
         }
         let onboard = solved.decisions.onboard_layers.iter().map(Vec::len).max().unwrap_or(0);
@@ -993,6 +994,16 @@ mod tests {
             PrefillShape { rows: 64, waves: 1 }, crate::placement::planner::Operation::Serving,
             ResidentWeights(1 << 30), SparkReplyFormats::default());
         assert!(recipe.admit(pinned, budgets).is_err());
+    }
+
+    #[test]
+    fn linked_executor_refuses_all_local_but_pure_solver_still_admits() {
+        let mut recipe = recipe();
+        let budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[]).unwrap();
+        let admitted = recipe.admit(single(), budgets.clone()).unwrap();
+        assert!(!admitted.placement.layers.iter().any(|layer| layer.experts == ExpertHome::Spark));
+        recipe.spark_links = true;
+        assert!(matches!(recipe.admit(single(), budgets), Err(Refusal::MissingExecutor { issue: 1395, .. })));
     }
 
     #[test]
