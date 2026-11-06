@@ -1,14 +1,14 @@
 //! `planner_equals_runtime_deepseek_v4`: `cuteafd plan --layout` and
 //! serve-dsv4's admission build their placement requests on separate paths
 //! (planned charges vs one measured sample per GPU) and must solve to the
-//! same placement. The runtime side runs serve-dsv4's own `admission::request`
-//! from parsed serve arguments with a fake CUDA sample: each GPU's total
+//! same placement. The runtime side runs serve-dsv4's own `admission::inputs`
+//! and `admission::admit` from parsed serve arguments with a fake CUDA sample: each GPU's total
 //! minus exactly what the planner says is already loaded at that point
 //! (context, modules, weights, embedding, drafter).
 use super::{admission, EngineArgs};
 use clap::Parser;
 use cuteafd_core::memory_layout::{Category, MemoryLayout};
-use cuteafd_loader::placement::{solve, Baseline, Onboard, OnboardSetting, Placement};
+use cuteafd_loader::placement::{Baseline, Onboard, OnboardSetting, Placement};
 use cuteafd_loader::plan::{layout::LayoutOptions, ExpertPlacement, PlanInput, PlanOptions};
 use cuteafd_loader::serving_capacity::Exl3Epilogue;
 use std::path::{Path, PathBuf};
@@ -149,29 +149,27 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
-        exchange_f32: case.exchange_f32 };
-    let request = admission::request(&cli.engine, &inputs)?;
-    assert_eq!(request.hops.terminal, cuteafd_loader::placement::TerminalHome::Head);
-    let placement = solve(&request)?;
+        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
+    let facts = admission::inputs(&cli.engine, &inputs)?;
+    let (placement, _) = admission::admit(&facts)?;
     assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
         "V4 final residual must live on the rank0 head, not on both ranks");
-    cuteafd_loader::placement::LayerExecutionPlan::new(&placement, request.hops)?;
+    assert!(placement.hops.iter().all(|hop| hop.row_bytes == 4 * cfg.dim as u64 * 2),
+        "V4 hop plan: every point carries the admitted row geometry");
     if check_upload {
+        // The loaded-mode rebase is the inverse of the uploads it credits back.
         let modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
             &cfg, case.rtx, case.dspark, catalog.tensors().iter().map(|t| &t.metadata))?;
         let loaded = weights.loaded_bytes(&modes, case.rtx)?;
-        let measured = inputs.gpus.iter().zip(loaded).map(|(&(total, baseline), bytes)| {
+        let measured = inputs.gpus.iter().zip(&loaded).map(|(&(total, baseline), &bytes)| {
             let Baseline::Measured { free_bytes } = baseline else { unreachable!() };
             Ok((total, Baseline::Measured { free_bytes: free_bytes.checked_sub(bytes)
                 .ok_or_else(|| anyhow::anyhow!("fixture weight uploads exceed free memory"))? }))
         }).collect::<anyhow::Result<Vec<_>>>()?;
         let after = admission::Inputs { gpus: measured, loaded_modes: Some(&modes), ..inputs };
-        let mut request = admission::request(&cli.engine, &after)?;
-        request.pool.pin_selected(placement.pool_tokens);
-        request.onboard = Onboard::Layers(placement.onboard_layers);
-        let checked = cuteafd_loader::placement::solve_frozen(&request, &placement)?;
-        assert_eq!(checked, placement, "pre-upload/frozen measured admission differs");
+        let rebased = admission::inputs(&cli.engine, &after)?;
+        assert_eq!(rebased.gpus, facts.gpus, "loaded weights rebase to the pre-upload sample");
     }
     Ok(placement)
 }
@@ -229,7 +227,9 @@ fn assert_equal(shared: &Shared, case: &Case<'_>, label: &str) -> Placement {
         assert!(runtime.expert_ranges.iter().all(|r| r.layers == 0));
         assert!(layout.notes.contains(&format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers)));
         for gpu in 0..2 {
-            let bytes: u64 = layout.devices[gpu].items.iter().filter(|i| i.format == "tp2").map(|i| i.bytes).sum();
+            // The shared planner carries the owner group; `format` names a
+            // resident weight format and stays empty for an arena.
+            let bytes: u64 = layout.devices[gpu].items.iter().filter(|i| i.group == "tp2").map(|i| i.bytes).sum();
             assert_eq!(bytes, t.peak_bytes[gpu], "{label}: rtx{gpu} TP2 arena");
         }
     }
@@ -864,8 +864,9 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
-        exchange_f32: case.exchange_f32 };
-    Ok(solve(&admission::request(&cli.engine, &inputs)?)?)
+        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
+    let facts = admission::inputs(&cli.engine, &inputs)?;
+    Ok(admission::admit(&facts)?.0)
 }
 
 /// P2's two-RTX fixture predates TP2 and its deleted GPU0-only routed layout.

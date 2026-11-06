@@ -818,13 +818,21 @@ mod tests {
             let host = HostCacheGeometry { unit_rows: runtime.page_rows as u64,
                 page_bytes: runtime.page_bytes as u64, mark_bytes: runtime.mark_bytes as u64, draft_bytes: 0 };
             for concurrency in [16, 64] {
+                // A context launch carries the build's C4 token-split programs.
+                let programs = dir.path().join("PROGRAMS.json");
+                let names = ["dsv4f_scored_index_topk_decode_m64",
+                    "dsv4f_dsa_candidate_merge", "dsv4f_lse_combine2", "dsv4f_paged_staging_gather_c4",
+                    "dsv4f_paged_staging_gather_index", "dsv4f_sparse_mla_partial_h0_s4_m64",
+                    "dsv4f_sparse_mla_partial_h32_s4_m64"].map(|name| serde_json::json!({"name": name}));
+                std::fs::write(&programs, serde_json::json!({"programs": names}).to_string()).unwrap();
                 let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 4096,
                     pool_tokens: Some(8192), concurrency, native_mtp_layers: stages,
+                    workspace_manifest: Some(programs),
                     host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
                 let report = plan::plan(dir.path(), &PlanOptions { layout: Some(options),
                     attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).unwrap();
                 let expected = host.resolve(None, 4096, concurrency, 128 << 30, host.chunk_bytes()).unwrap();
-                assert_eq!(report.host_budget_bytes, expected, "stages={stages}, C={concurrency}");
+                assert_eq!(report.host_budget_bytes, expected, "stages={stages}, C={concurrency}: {}", plan::render(&report));
                 let note = format!("host prefix: {} B per mark;", marks[0]);
                 assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.starts_with(&note)),
                     "{}", plan::render(&report));

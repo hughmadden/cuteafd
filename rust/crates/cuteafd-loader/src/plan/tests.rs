@@ -2875,43 +2875,39 @@ fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
 }
 
 #[test]
-fn v4_egress_is_exact_registered_host_memory_not_a_gpu_demand() {
-    use cuteafd_core::ExpertGeometry;
+fn v4_contract_owns_exact_host_tier_and_refuses_host_shortfall() {
+    use crate::placement::planner::{Location, Phase};
     let dir = v4_snapshot();
-    let input = PlanInput::open(dir.path()).unwrap();
-    let mut report = input.plan(&sparks(4)).unwrap();
-    let spec = report.spec.as_ref().unwrap();
-    let moe = spec.moe.as_ref().unwrap();
-    let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
-        topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-    let path = dir.path().join("PROGRAMS.json");
-    for decode in [32, 64] {
-        std::fs::write(&path, json!({"capacities": {"decode_rows": decode}}).to_string()).unwrap();
-        // Each installed-artifact version belongs to a fresh planning input.
-        let input = PlanInput::open(dir.path()).unwrap();
-        for (unit, waves) in [(2752, 3), (4096, 2)] {
-            let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-                host_cache_bytes: Some(0), prefill_unit_rows: Some(unit), prefill_waves: waves,
-                workspace_manifest: Some(path.clone()), ..Default::default() };
-            report.spark_ranks = 4;
-            layout::charge_host(&mut report, &options, &input, false).unwrap();
-            let egress = report.host_ledger.as_ref().unwrap().items.iter()
-                .find(|i| i.group == "transport/egress").unwrap().bytes;
-            let expected = geometry.compact_wire_bytes(unit as u32, false).unwrap().0 as u64 * waves
-                + geometry.compact_wire_bytes(decode, false).unwrap().0 as u64;
-            assert_eq!(egress, expected);
-            assert_ne!(egress, geometry.compact_wire_bytes(unit as u32, false).unwrap().0 as u64 * waves * 2,
-                "the decode endpoint must not reserve another prefill-sized slot per wave");
-            report.spark_ranks = 0;
-            layout::charge_host(&mut report, &options, &input, false).unwrap();
-            assert!(!report.host_ledger.as_ref().unwrap().items.iter().any(|i| i.group == "transport/egress"));
-        }
-    }
-    let planned = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-        host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768),
-        ..Default::default() }), ..sparks(4) }).unwrap();
+    let options = |host: (u64, u64), cache: Option<u64>| PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some(host), host_cache_bytes: cache, pool_tokens: Some(32768), ..Default::default() }),
+        ..sparks(4) };
+    let planned = plan(dir.path(), &options((128 << 30, 128 << 30), Some(0))).unwrap();
+    assert!(planned.placement_supported, "{}", render(&planned));
+    // The contract declares the host tier; no generic estimate runs beside it.
+    assert!(planned.host_ledger.is_none());
+    let ledger = planned.phase_ledger.as_ref().expect("V4 solved phase ledger");
+    let host = ledger.budgets.iter().find(|budget| budget.id == "coordinator host RAM").unwrap();
+    assert_eq!(host.locations, [Location::HOST, Location::PINNED]);
+    let owned = |ledger: &crate::plan::SolvedPhaseLedger, phase| ledger.phases.iter()
+        .find(|row| row.budget == "coordinator host RAM" && row.phase == phase).unwrap().owned;
+    // Dense staging and push rings own the Load phase; pinned tables, logits
+    // and link storage own Ready.
+    let push = (cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES) as u64;
+    assert!(owned(ledger, Phase::Load) >= push);
+    assert!(owned(ledger, Phase::Ready) > 0);
     assert!(planned.memory_layout.unwrap().devices.iter().all(|device|
         device.items.iter().all(|item| item.group != "Spark egress")));
+    // A retained prefix quota is a host owner resolved before admission.
+    let quota = 4 << 30;
+    let prefixed = plan(dir.path(), &options((128 << 30, 128 << 30), Some(quota))).unwrap();
+    assert!(prefixed.placement_supported, "{}", render(&prefixed));
+    assert_eq!(prefixed.host_budget_bytes, quota);
+    let ready = owned(prefixed.phase_ledger.as_ref().unwrap(), Phase::Ready);
+    assert_eq!(ready - owned(ledger, Phase::Ready), quota);
+    // Host memory that cannot hold every owner refuses in the one solve.
+    let tight = plan(dir.path(), &options((16 << 30, 8 << 30), Some(quota))).unwrap();
+    assert!(!tight.placement_supported);
+    assert!(tight.hints.iter().any(|hint| hint.what.contains("coordinator host RAM")), "{}", render(&tight));
 }
 
 #[test]
@@ -2949,7 +2945,8 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
             let intake = 2 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(2 * 4096 * cfg.dim as u64 * 2).unwrap()
                 + 2 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * cfg.dim as u64 * 2).unwrap();
-            assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
+            // Shared Recipe allocations are exact against the admitted facts.
+            assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Exact));
             let records = device.items.iter().find(|i| i.group == "records").unwrap();
             let cache = crate::serving_capacity::deepseek_v4_cache_geometry(&cfg, 1, 4096, 0).unwrap();
             assert_eq!(runtime[0].pool_unit_device_bytes, (2 * crate::serving_capacity::V4_PACKED_MEMBERS as u64 + 64) * 4);
@@ -2995,18 +2992,26 @@ fn v4_pool_first_defaults_and_explicit_layer_failure() {
     let explicit = solve(24 << 30, Some(262144), Some(2));
     assert!(explicit.placement_supported);
     assert_eq!(explicit.memory_layout.unwrap().pool_tokens, 262144);
-    // Explicit layers that do not fit beside the fixed demands are refused,
-    // naming how many would.
+    // Explicit layers that do not fit beside the fixed demands keep the
+    // solver's typed refusal, not a counterfactual second solve.
     let rejected = solve(16 << 30, Some(2 << 20), Some(4));
     assert!(!rejected.placement_supported);
     assert!(rejected.memory_layout.as_ref().unwrap().notes.iter().any(|n|
-        n.contains("4 RTX expert layers do not fit beside the fixed demands")),
+        n.starts_with("V4 pool-first placement:") && n.contains("memory budget 'rtx0'")),
         "{:?}", rejected.memory_layout.as_ref().unwrap().notes);
-    // A fixed onboard alone makes the pool the output: above the 1M target here.
+    // A count beyond the routed layers is refused, never clamped.
+    let routed = PlanInput::open(dir.path()).unwrap().expert_catalog().unwrap().routed_experts().routed_layers();
+    let beyond = solve(96 << 30, None, Some(routed + 1));
+    assert!(!beyond.placement_supported);
+    assert!(beyond.memory_layout.as_ref().unwrap().notes.iter().any(|n|
+        n.contains(&format!("--rtx-expert-layers {} exceeds the {routed} routed layers", routed + 1))),
+        "{:?}", beyond.memory_layout.as_ref().unwrap().notes);
+    // A fixed onboard leaves the automatic pool at the card's target (1M below
+    // the small-card threshold); the memory beyond it stays free by contract.
     let fixed = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30],
         onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default() }), ..sparks(2) }).unwrap();
     assert!(fixed.placement_supported);
-    assert!(fixed.memory_layout.unwrap().pool_tokens > 1 << 20);
+    assert_eq!(fixed.memory_layout.unwrap().pool_tokens, 1 << 20);
 }
 
 #[test]
@@ -5734,4 +5739,31 @@ fn qwen_auto_pool_is_one_recipe_and_keeps_its_typed_refusal() {
         hint.what.contains("Qwen admission: pool 1024 cannot hold selected context 65536")),
         "{:?}", refused.hints);
     assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}
+
+#[test]
+fn v4_auto_pool_and_count_admission_preserve_one_recipe() {
+    let dir = v4_snapshot();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 65536,
+        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        ..Default::default()
+    }), ..sparks(4) };
+    let unset = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert!(automatic.wip_launchable(), "{}", render(&automatic));
+    assert_eq!(automatic.memory_layout.as_ref().unwrap().pool_tokens,
+        unset.memory_layout.as_ref().unwrap().pool_tokens);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let direct = plan(dir.path(), &zero).unwrap();
+    let counted = plan_spark_count(dir.path(), &zero, 4, Some(4)).unwrap();
+    assert!(!counted.wip_launchable());
+    assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
+    for hint in &direct.hints {
+        assert!(counted.hints.iter().any(|other| other.what == hint.what));
+    }
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }

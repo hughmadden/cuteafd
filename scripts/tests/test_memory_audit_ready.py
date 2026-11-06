@@ -228,16 +228,27 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
 def test_v4_admits_tables_and_frozen_prefix_quota_before_first_reservation():
     root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4"
     startup = (root / "mod.rs").read_text().split("pub(crate) fn with_engine", 1)[1]
-    assert startup.index("engine.attach_peer(") < startup.index("admission::host_memory(")
-    assert startup.index("admission::host_memory(") < startup.index("engine.attach_context(")
-    assert startup.index("admission::host_memory(") < startup.index("engine.prepare_workspaces()")
+    # One contract admission prices every device and host owner (pinned tables,
+    # the frozen prefix quota, logits, link storage) before the first upload.
+    admit = startup.index("admission::admit(&facts)")
+    assert startup.count("admission::admit(") == 1
+    assert startup.index("host_memory: cuteafd_loader::formats::mapped_preload::host_memory()?") < admit
+    assert admit < startup.index("push::load_alone(")
+    assert admit < startup.index("engine::Engine::new(")
+    assert admit < startup.index("engine.attach_peer(")
+    # The retained config is built from the admitted quota, never re-admitted live.
+    config = startup.index("admission::host_config(prefix,")
+    assert config < startup.index("engine.attach_context(")
+    assert config < startup.index("engine.prepare_workspaces()")
+    assert "host_prefix)?" in startup[config:config + 200]
+    assert "admit_host_memory(" not in startup
     assert "body(&engine, &mut transports, &runtime, host_config)" in startup
-    admission = (root / "admission.rs").read_text().split("pub(crate) fn host_memory(", 1)[1]
-    admission = admission.split("pub(crate) fn request(", 1)[0]
-    assert admission.count("resolve_host_config(") == 1
-    assert admission.count("admit_host_memory(") == 1
-    assert "config.as_ref().map_or(0, |c| c.bytes)" in admission
-    assert "&tables, logits" in admission
+    admission = (root / "admission.rs").read_text()
+    assert "admit_host_memory(" not in admission
+    assert "PinnedTables" not in admission
+    host_config = admission.split("pub(crate) fn host_config(", 1)[1].split("\npub(crate) fn ", 1)[0]
+    assert host_config.count("resolve_host_config(") == 1
+    assert "HostBudget::Bytes(admitted.quota_bytes)" in host_config
     serve = (root / "serve.rs").read_text()
     cache = serve.split("fn prefix_cache", 1)[1].split("/// Gives a finished", 1)[0]
     assert "host_config.map(|config|" in cache
