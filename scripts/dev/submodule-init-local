@@ -25,7 +25,9 @@ fi
 
 root="${1:-}"
 if [ -z "$root" ]; then
-  root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
+  # The checkout this script lives in, not the caller's cwd: an absolute-path
+  # call from another checkout must not initialize that one instead.
+  root="$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel 2>/dev/null)" ||
     { warn "not inside a git repository and no WORKTREE given"; exit 2; }
 fi
 cd "$root"

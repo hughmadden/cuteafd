@@ -1407,6 +1407,7 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA; nonzero deterministic BF16 route oracle"]
     fn bf16_route_reducers_match_exact_nonzero_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
         let compact = library.v41_compact_reducer()?;
@@ -1466,6 +1467,7 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA; local BF16 route/shared oracle"]
     fn local_bf16_routes_preserve_compact_boundary() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
         let reducer = library.v41_local_expert_reducer()?;
@@ -1542,6 +1544,7 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA; TP2/TP4 compact BF16 oracle"]
     fn compact_planes_sum_in_fp32_before_shared_and_final_rounding() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
         let reducer = library.v41_compact_reducer()?;

@@ -6386,6 +6386,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_greedy_matches_cpu_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
         // Five tiny rows, exercising ties, a mask, and a strict-finites row.
         let vocab = 6_usize;
@@ -6722,6 +6723,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_fast_path_matches_cpu_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
 
         // ---- small deterministic rows, vocab 6 ----
@@ -7228,6 +7230,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_topk_set_and_order_matches_cpu_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
 
         // ---- small deterministic rows, vocab 8 ----
@@ -7490,6 +7493,7 @@ mod tests {
 
     #[test]
     fn allocate_copy_free_roundtrip() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
@@ -7509,6 +7513,7 @@ mod tests {
 
     #[test]
     fn managed_device_buffer_copy_free_roundtrip() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
@@ -7531,6 +7536,7 @@ mod tests {
 
     #[test]
     fn copy_h2d_reuses_synchronous_pinned_staging() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
@@ -7563,6 +7569,7 @@ mod tests {
 
     #[test]
     fn device_to_device_copy_roundtrip() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
@@ -7583,6 +7590,7 @@ mod tests {
 
     #[test]
     fn pinned_host_buffer_copy_roundtrip() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
@@ -7872,6 +7880,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_nucleus_ordered_matches_cpu_oracle() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
 
         // ---- small deterministic rows, vocab 8 ----
@@ -8012,6 +8021,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU and a built libcuteafd_native.so; run with --ignored"]
     fn v41_sampler_device_nucleus_reports_internal_for_unsupported_rows() -> Result<()> {
+        let _ledger = crate::memory_ledger::test_guard();
         let library = load_device_test_library()?;
         let vocab = 400_usize;
         let logits: Vec<f32> = (0..vocab).map(|token| -0.01 * token as f32).collect();

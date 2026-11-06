@@ -242,6 +242,7 @@ pub fn draft_facts(layout: &MlaDraftRuntimeLayout, page_rows: u64, maximum_pages
 /// attention modes, retention, expert inventory and the transient load peaks.
 #[derive(Debug, Clone)]
 pub struct KimiRecipe {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub context: u64,
     pub gpus: usize,
     /// Executor attention placement this recipe was prepared for.
@@ -278,6 +279,18 @@ pub struct AdmittedKimi {
     pub placement: Placement,
     pub solved: ResolvedPlan,
     pub onboard: usize,
+}
+
+/// Exact checkpoint geometry; only canonical routed-layer producers own counters.
+pub fn usage_geometry(cfg: &crate::families::kimi_k3::config::KimiK3Config, enabled: bool)
+    -> Option<cuteafd_core::expert_usage::Geometry> {
+    enabled.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers, experts: cfg.experts,
+        topk: cfg.topk, routed_layers: cfg.dense.iter().enumerate()
+            .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect() })
+}
+
+pub fn usage_devices(geometry: &cuteafd_core::expert_usage::Geometry, ranks: usize) -> Vec<u8> {
+    (0..ranks.min(geometry.routed_layers.len())).map(|rank| rank as u8).collect()
 }
 
 impl KimiRecipe {
@@ -521,6 +534,10 @@ impl Recipe for KimiRecipe {
         let whole = modes.iter().enumerate().filter_map(|(layer, mode)|
             (profiled && matches!(mode, LayerMode::Whole { .. })).then_some(layer)).collect::<Vec<_>>();
         contract.components.extend(self.owners.clone());
+        if let Some(geometry) = &self.expert_usage {
+            contract.components.extend(crate::placement::expert_usage::components(
+                geometry, &usage_devices(geometry, self.gpus), self.maximum_pages)?);
+        }
         // Intake GPU planes are already fixed owners. Only the transport's
         // future host/pinned storage joins the shared physical RAM budget here.
         for link in &self.links {
@@ -840,6 +857,40 @@ mod tests {
     use super::*;
     use crate::placement::FfnMode;
 
+    #[test]
+    fn expert_usage_recipe_charges_exact_canonical_device_and_host_owners() {
+        use cuteafd_core::expert_usage::{device_owner, Geometry};
+        for ranks in [1, 2] {
+            let mut recipe = recipe();
+            recipe.gpus = ranks;
+            recipe.records_per_page = vec![64; ranks];
+            for arena in &mut recipe.arenas {
+                arena.peak.resize(ranks, 0);
+                arena.resident.resize(ranks, 0);
+                arena.weights.resize(ranks, 0);
+            }
+            let off = recipe.prepare(&single()).unwrap();
+            assert!(!off.components.iter().any(|component| matches!(&component.kind, ComponentKind::Allocation { template, .. } if template.id.starts_with("expert-usage."))));
+            let geometry = Geometry { layers: 5, experts: 896, topk: 16, routed_layers: vec![1, 2, 3, 4] };
+            // The ownership split is by routed-layer ordinal, not global layer parity.
+            assert_eq!(usage_devices(&geometry, ranks), (0..ranks as u8).collect::<Vec<_>>());
+            recipe.expert_usage = Some(geometry.clone());
+            let on = recipe.prepare(&single()).unwrap();
+            let owners = on.components.iter().filter(|component| matches!(&component.kind, ComponentKind::Allocation { template, .. } if template.id.starts_with("expert-usage.")))
+                .collect::<Vec<_>>();
+            assert_eq!(owners.len(), ranks * 3 + 1);
+            for rank in 0..ranks {
+                for suffix in ["counters", "snapshot", "pinned"] {
+                    let component = owners.iter().find(|owner| matches!(&owner.kind, ComponentKind::Allocation { template, .. } if template.id == device_owner(rank as u8, suffix))).unwrap();
+                    assert_eq!(component.bytes.at(1).unwrap(), geometry.table_bytes().unwrap() as u64);
+                    assert_eq!(component.bytes.at(recipe.maximum_pages).unwrap(), geometry.table_bytes().unwrap() as u64);
+                }
+            }
+            let history = owners.iter().find(|owner| matches!(&owner.kind, ComponentKind::Allocation { template, .. } if template.id == "expert-usage.history")).unwrap();
+            assert_eq!(history.bytes.at(1).unwrap(), geometry.host_bytes(ranks).unwrap() as u64);
+        }
+    }
+
     fn single() -> Request {
         request_with(Some(0))
     }
@@ -853,6 +904,7 @@ mod tests {
 
     fn recipe() -> KimiRecipe {
         KimiRecipe {
+            expert_usage: None,
             context: 256,
             gpus: 1,
             placement: AttentionPlacement::Heads,

@@ -24,9 +24,9 @@ def v41_source() -> str:
 class NativeReleaseLauncherTest(unittest.TestCase):
     def test_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
         text = FAMILY.read_text()
-        start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 ]]; then')
+        start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == kimi_k3 ]]; then')
         block = text[start:text.index('\nfi', start) + 3]
-        for family in ['deepseek_v4', 'mimo_v2']:
+        for family in ['deepseek_v4', 'mimo_v2', 'kimi_k3']:
             for setting, expected in [('', '--expert-usage'), ('off', '--expert-usage=false'), ('on', '--expert-usage'), ('invalid', None)]:
                 with self.subTest(family=family, setting=setting):
                     script = '''set -euo pipefail
@@ -48,7 +48,7 @@ release_die() { echo "$*" >&2; exit 2; }
         text = FAMILY.read_text()
         start = text.index('case "$(get EXPERT_USAGE on)" in', text.index('family_args=(--embedding-placement'))
         block = text[start:text.index('\nfi', start) + 3]
-        for family in ['kimi_k3', 'glm5', 'glm5_flash', 'muse_spark', 'step5', 'qwen4', 'qwen3_5']:
+        for family in ['glm5', 'glm5_flash', 'muse_spark', 'step5', 'qwen4', 'qwen3_5']:
             for setting in ['', 'on', 'off', 'invalid']:
                 with self.subTest(family=family, setting=setting):
                     script = '''set -euo pipefail
