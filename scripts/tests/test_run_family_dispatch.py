@@ -111,8 +111,9 @@ def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, f
 
 @pytest.mark.parametrize("mode", ["compact", "fp8-compact", "unknown"])
 def test_attention_bundle_refuses_unsupported_modes_and_families(tmp_path, mode):
-    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa"}, "test/no-hqa",
-                                  f"MODEL_REVISION=\nATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/no-hqa",
+                                  f"EXLR8_MANIFEST=up1\nATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     assert result.returncode != 0
     assert "ATTENTION_MODE" in result.stderr
 
