@@ -583,7 +583,7 @@ mod tests {
         let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
         let programs = library.programs()?.with_manifest(&manifest)?;
         let cache_format = cuteafd_core::MlaCacheFormat::Fp8;
-        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
+        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
             cache_format, attention: None, devices: [0], native_lib: &native, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
             spark_budget_gib: Some(110.), rows: 2048, waves: 2, prefill_rows: Some(1024),
@@ -669,7 +669,7 @@ mod tests {
         // SAFETY: golden-run supplies the sealed library; all borrowers drop before it.
         let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
         let programs = library.programs()?.with_manifest(&manifest)?;
-        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
+        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
             cache_format,
             attention: None, devices: [0, 1], native_lib: &native, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers), spark_budget_gib: None,

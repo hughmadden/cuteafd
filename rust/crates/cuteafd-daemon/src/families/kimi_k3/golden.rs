@@ -428,7 +428,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
     full: &KimiK3Config, cfg: &KimiK3Config, devices: [i32; RANKS],
     prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan, graphs: bool, verify: usize)
     -> Result<super::startup::Loaded<'a>> {
-    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options {
+    super::startup::load(library, programs, checkpoint, full, cfg, super::startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
         cache_format: args.kv_cache, devices,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         native_lib: args.native_lib.as_deref().context("--native-lib required")?,
@@ -867,7 +867,7 @@ mod tests {
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::spark::reserve_bytes(6, 2, rows as u64)?)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots, 0)?;
-        let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(),
+        let admitted = admission::admit(admission::Inputs { expert_usage: false, cfg: &cfg, core: Default::default(),
             resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
