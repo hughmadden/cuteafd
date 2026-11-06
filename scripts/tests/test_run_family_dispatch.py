@@ -897,6 +897,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                   json.loads((ROOT / "rust/crates/cuteafd-daemon/src/families/muse_spark/fixtures"
                               "/drafters/nvidia.json").read_text()),
                   "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6")
+    if family_config.get("model_type") == "glm5_next" and (extra_env or {}).get("STUB_REAL_PLANNER"):
+        _snapshot(hf, "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     audio_backend = ("pcm-bf16-aot-v1" if family_config.get("model_type") == "muse_spark" else
