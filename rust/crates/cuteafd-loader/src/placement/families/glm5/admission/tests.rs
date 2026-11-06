@@ -143,14 +143,11 @@ fn draft_home_is_one_solve_choice_that_balances_and_charges_its_bridge() {
     use crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only;
     let cfg = cfg();
     let facts = DraftFacts::from_gqa(&gqa_layout(Fp8Only)).unwrap();
-    assert!(facts.bridge().is_empty() && facts.homes(2, None).unwrap() == [0], "GPU1 needs the bridge inventory");
-    assert!(facts.homes(2, Some(1)).is_err(), "a GPU1 pin needs the bridge");
+    assert!(facts.bridge().is_empty() && facts.homes(2) == [0], "GPU1 needs the bridge inventory");
     let mut facts = facts;
     facts.bridge = DraftFacts::bridge_demands(256, 64, 2, 64).unwrap();
-    assert_eq!((facts.homes(1, None).unwrap(), facts.homes(2, None).unwrap()), (vec![0], vec![0, 1]));
-    assert_eq!((facts.homes(2, Some(0)).unwrap(), facts.homes(2, Some(1)).unwrap()), (vec![0], vec![1]));
-    assert!(facts.homes(1, Some(1)).is_err());
-    assert!(DraftFacts::default().homes(2, None).unwrap().is_empty());
+    assert_eq!((facts.homes(1), facts.homes(2)), (vec![0], vec![0, 1]));
+    assert!(DraftFacts::default().homes(2).is_empty());
     assert!(facts.components(1, 64).is_ok() && facts.components(2, 64).is_err());
     let draft_bytes = facts.owners.iter().filter(|owner| owner.location == Location::coordinator(0))
         .map(|owner| owner.bytes).sum::<u64>();

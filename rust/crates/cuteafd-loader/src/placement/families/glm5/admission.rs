@@ -501,27 +501,8 @@ impl DraftFacts {
     }
 
     /// Ordered homes: GPU1 needs a second coordinator and the bridge inventory.
-    /// `pin` (private diagnostic `CUTEAFD_DIAG_GLM_DRAFT_HOME`, read identically
-    /// by planner and server) restricts the domain to one executable home.
-    pub fn homes(&self, gpus: usize, pin: Option<u8>) -> Result<Vec<u8>, Refusal> {
-        let homes = if self.is_empty() { vec![] }
-            else if gpus == 2 && !self.bridge.is_empty() { vec![0, 1] } else { vec![0] };
-        match pin {
-            None => Ok(homes),
-            Some(_) if homes.is_empty() => Ok(homes),
-            Some(gpu) if homes.contains(&gpu) => Ok(vec![gpu]),
-            Some(_) => Err(Refusal::InvalidPin("draft home is not executable on this deployment")),
-        }
-    }
-
-    /// `CUTEAFD_DIAG_GLM_DRAFT_HOME`: unset (solver's choice), `0` or `1`.
-    pub fn home_pin() -> Result<Option<u8>, Refusal> {
-        match std::env::var("CUTEAFD_DIAG_GLM_DRAFT_HOME").as_deref() {
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Ok("0") => Ok(Some(0)),
-            Ok("1") => Ok(Some(1)),
-            _ => Err(Refusal::InvalidPin("CUTEAFD_DIAG_GLM_DRAFT_HOME must be unset, 0 or 1")),
-        }
+    pub fn homes(&self, gpus: usize) -> Vec<u8> {
+        if self.is_empty() { vec![] } else if gpus == 2 && !self.bridge.is_empty() { vec![0, 1] } else { vec![0] }
     }
 
     /// Prefix window marks follow the drafter they snapshot.
@@ -791,7 +772,7 @@ impl<'a> ProductionInput<'a> {
         let mut recipe = GlmRecipe { cfg: self.cfg, context: self.context, page_tokens,
             maximum_pages, attention, gpus: self.gpus, spark_links: self.spark_ranks > 0,
             prefill: vec![self.prefill], lanes: vec![1],
-            embedding: weights.iter().map(|(home, _)| *home).collect(), draft_homes: self.draft.homes(self.gpus, DraftFacts::home_pin()?)?,
+            embedding: weights.iter().map(|(home, _)| *home).collect(), draft_homes: self.draft.homes(self.gpus),
             encoders: vec![], media_cache_bytes: 0, experts,
             targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![], graphs: vec![],
             host: Some(host), owners: vec![], };
