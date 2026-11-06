@@ -127,7 +127,7 @@ mod selection_tests {
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), r#"{"weight_map":{}}"#).unwrap();
         let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
         let identity = WorkerIdentity::from_snapshot(dir.path(), geometry, cuteafd_transport::expert::SparkWorld::canonical(6).unwrap()).unwrap();
         // Every backend consumes the same exact selected IDs within checkpoint bounds.

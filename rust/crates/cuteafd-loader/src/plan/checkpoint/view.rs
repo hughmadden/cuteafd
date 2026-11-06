@@ -36,6 +36,7 @@ pub struct CheckpointView {
     config: Arc<Value>,
     quantize_config: Option<Arc<Value>>,
     weight_map: Option<Arc<BTreeMap<String, String>>>,
+    attention: Option<Arc<crate::formats::exl3_contract::AttentionContract>>,
 }
 
 fn metadata_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -124,9 +125,15 @@ impl CheckpointView {
             ensure!(mode != AttentionMode::Compact, "compact attention requires {COMPACT_INDEX}");
             None
         };
+        let attention = crate::formats::exl3_contract::AttentionContract::parse(
+            config.get("quantization_config").unwrap_or(&Value::Null),
+            quantize_config.as_deref().unwrap_or(&Value::Null))?.map(Arc::new);
+        if let Some(contract) = &attention {
+            contract.check_selection(config_name, &index_name, &quant_names, weight_map.as_deref())?;
+        }
         Ok(Self { snapshot: snapshot.into(), mode, config_name: config_name.into(), index_name,
             quant_names, fingerprint: format!("{:x}", hash.finalize()), config: Arc::new(config),
-            quantize_config, weight_map })
+            quantize_config, weight_map, attention })
     }
 
     pub fn snapshot(&self) -> &Path { &self.snapshot }
@@ -138,6 +145,17 @@ impl CheckpointView {
     pub fn config(&self) -> Result<Value> { Ok(self.config.as_ref().clone()) }
     pub(super) fn quantize_config(&self) -> Option<Value> { self.quantize_config.as_deref().cloned() }
     pub(super) fn weight_map(&self) -> Option<&BTreeMap<String, String>> { self.weight_map.as_deref() }
+    pub(crate) fn check_attention_headers<'a>(&self,
+        headers: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>) -> Result<()> {
+        if let Some(contract) = &self.attention { contract.check_headers(headers)?; }
+        Ok(())
+    }
+    pub(crate) fn check_attention_manifest(&self, manifest: &Value) -> Result<()> {
+        let parsed = crate::formats::exl3_contract::AttentionContract::parse(
+            self.config.get("quantization_config").unwrap_or(&Value::Null), manifest)?;
+        ensure!(parsed.as_ref() == self.attention.as_deref(), "attention metadata changed after bundle selection");
+        Ok(())
+    }
     pub fn index_path(&self) -> PathBuf { self.snapshot.join(&self.index_name) }
 }
 
@@ -206,6 +224,35 @@ mod tests {
         assert_eq!(view.config().unwrap(), config);
         assert_eq!(view.weight_map().unwrap()["a.weight"], "a.safetensors");
         assert!(CheckpointView::select(root.path(), AttentionMode::Compact).is_err());
+    }
+
+    #[test]
+    fn published_hqa_metadata_matches_native_headers_and_compact_parent() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("CUTEAFD_HQA_TEST_SNAPSHOT") else { return Ok(()); };
+        let snapshot = PathBuf::from(snapshot);
+        ensure!(snapshot.is_dir(), "CUTEAFD_HQA_TEST_SNAPSHOT is not a directory");
+        let hqa = CheckpointView::select(&snapshot, AttentionMode::Hqa)?;
+        let fp8 = CheckpointView::select(&snapshot, AttentionMode::Fp8Compact)?;
+        let compact = CheckpointView::select(&snapshot, AttentionMode::Compact)?;
+        ensure!(hqa.fingerprint() != fp8.fingerprint() && hqa.fingerprint() != compact.fingerprint(),
+            "published attention identities collide");
+        ensure!(hqa.weight_map() == fp8.weight_map(), "FP8 must select the same native source tensors");
+        let contract = hqa.attention.as_ref().context("published HQA has no attention contract")?;
+        let quant = hqa.quantize_config().context("published HQA has no quantization metadata")?;
+        let native = quant["native_attention"].as_object().context("published native_attention")?;
+        ensure!(native.len() == 58, "GLM Flash publication must declare 12 q_b and 46 o projections");
+        let names: std::collections::BTreeSet<_> = native.values().flat_map(|entry|
+            entry["tensors"].as_object().unwrap().keys().cloned()).collect();
+        let checkpoint = super::super::Checkpoint::open_view_for_role(&hqa, "HQA metadata gate", |name| names.contains(name))?;
+        ensure!(checkpoint.tensors.len() == 58, "published native header count");
+        contract.check_headers(checkpoint.tensors.iter().map(|tensor| &tensor.meta))?;
+        ensure!(compact.weight_map().context("compact index")?.values().all(|shard| !shard.starts_with("hqa-attention-")),
+            "compact index references native attention shard");
+        for view in [&hqa, &fp8, &compact] {
+            crate::read_expert_catalog_view(view).with_context(|| format!("published {:?} EXL3 contract", view.mode()))?;
+        }
+        eprintln!("published HQA metadata gate: 58 native headers; all three selected catalogs validated at {}", snapshot.display());
+        Ok(())
     }
 
     #[test]

@@ -193,6 +193,173 @@ pub(crate) fn check_retained_native_tensors(
     Ok(())
 }
 
+/// Publication metadata is optional, but a declared attention view is a complete,
+/// typed contract. The selected index and tensor headers remain authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttentionBundle { config: String, index: String, quantize: String }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttentionViews {
+    hqa: AttentionBundle,
+    #[serde(rename = "compact-attention")]
+    compact: AttentionBundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttentionViewDeclaration {
+    schema: String,
+    mode: String,
+    views: AttentionViews,
+    native_modules: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttentionTensor { dtype: String, shape: Vec<usize> }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+enum NativeAttentionFormat {
+    #[serde(rename = "bf16")]
+    Bf16,
+    #[serde(rename = "fp8_e4m3_block_scaled")]
+    Fp8Block,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttentionScale {
+    tensor: String,
+    dtype: String,
+    block_size: [usize; 2],
+    semantics: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeAttention {
+    format: NativeAttentionFormat,
+    tensors: BTreeMap<String, AttentionTensor>,
+    shard: String,
+    compact_attention_bits: usize,
+    scale: Option<AttentionScale>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttentionContract {
+    view: AttentionViewDeclaration,
+    native: BTreeMap<String, NativeAttention>,
+}
+
+impl AttentionContract {
+    pub(crate) fn parse(config_quant: &Value, manifest: &Value) -> Result<Option<Self>> {
+        let declared = config_quant.get("attention_view");
+        let published = manifest.get("attention_view");
+        let native = manifest.get("native_attention");
+        if declared.is_none() && published.is_none() && native.is_none() { return Ok(None); }
+        ensure!(declared.is_some() && declared == published,
+            "compact/full EXL3 metadata disagree at attention_view");
+        let view: AttentionViewDeclaration = serde_json::from_value(published.unwrap().clone())
+            .context("EXL3 attention_view schema")?;
+        let native: BTreeMap<String, NativeAttention> = serde_json::from_value(
+            native.context("EXL3 attention_view requires native_attention")?.clone())
+            .context("EXL3 native_attention schema")?;
+        let contract = Self { view, native };
+        contract.validate()?;
+        Ok(Some(contract))
+    }
+
+    fn validate(&self) -> Result<()> {
+        use crate::plan::checkpoint::view::{COMPACT_CONFIG, COMPACT_INDEX, COMPACT_QUANT};
+        ensure!(self.view.schema == "cuteafd-attention-views-v1" && self.view.mode == "hqa",
+            "unsupported EXL3 attention_view schema or mode");
+        for (bundle, names) in [(&self.view.views.hqa,
+            ["config.json", "model.safetensors.index.json", "quantize_config.json"]),
+            (&self.view.views.compact, [COMPACT_CONFIG, COMPACT_INDEX, COMPACT_QUANT])] {
+            ensure!([bundle.config.as_str(), bundle.index.as_str(), bundle.quantize.as_str()] == names,
+                "EXL3 attention_view references an inconsistent bundle");
+        }
+        ensure!(self.view.native_modules == "quantize_config.json:native_attention",
+            "EXL3 attention_view native_modules must name the selected native_attention map");
+        ensure!(!self.native.is_empty(), "EXL3 native_attention is empty");
+        for (module, entry) in &self.native {
+            ensure!(!module.is_empty() && !module.ends_with('.') && (2..=8).contains(&entry.compact_attention_bits),
+                "EXL3 native_attention {module}: invalid module or compact_attention_bits");
+            ensure!(entry.shard.ends_with(".safetensors") && !entry.shard.starts_with('.')
+                && !entry.shard.contains(['/', '\\']), "EXL3 native_attention {module}: invalid shard");
+            let weight_name = format!("{module}.weight");
+            let weight = entry.tensors.get(&weight_name)
+                .with_context(|| format!("EXL3 native_attention {module}: missing weight"))?;
+            ensure!(weight.shape.len() == 2 && weight.shape.iter().all(|&dim| dim > 0),
+                "EXL3 native_attention {module}: weight must be a nonempty matrix");
+            match entry.format {
+                NativeAttentionFormat::Bf16 => ensure!(entry.tensors.len() == 1
+                    && weight.dtype == "BF16" && entry.scale.is_none(),
+                    "EXL3 native_attention {module}: BF16 requires one BF16 weight and no scales"),
+                NativeAttentionFormat::Fp8Block => {
+                    let scale = entry.scale.as_ref()
+                        .with_context(|| format!("EXL3 native_attention {module}: missing block scale contract"))?;
+                    ensure!(weight.dtype == "F8_E4M3" && entry.tensors.len() == 2
+                        && scale.tensor.starts_with(&format!("{module}.")) && scale.tensor != weight_name
+                        && scale.dtype == "F32" && scale.block_size == [128, 128]
+                        && scale.semantics == "checkpoint-native: original FP8 weight with its original per-block FP32 scale",
+                        "EXL3 native_attention {module}: unsupported FP8 block scale contract");
+                    let tensor = entry.tensors.get(&scale.tensor)
+                        .with_context(|| format!("EXL3 native_attention {module}: missing scale tensor {}", scale.tensor))?;
+                    ensure!(tensor.dtype == "F32" && tensor.shape == weight.shape.iter()
+                        .map(|&dim| dim.div_ceil(128)).collect::<Vec<_>>(),
+                        "EXL3 native_attention {module}: scale dtype/shape disagrees with weight geometry");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_selection(&self, config: &str, index: &str, quant: &[String],
+        weights: Option<&BTreeMap<String, String>>) -> Result<()> {
+        let bundle = &self.view.views.hqa;
+        ensure!(config == bundle.config && index == bundle.index && quant.contains(&bundle.quantize),
+            "EXL3 attention_view does not describe the selected bundle");
+        let weights = weights.context("EXL3 attention_view requires a selected tensor index")?;
+        for (module, entry) in &self.native {
+            for name in entry.tensors.keys() {
+                ensure!(weights.get(name) == Some(&entry.shard),
+                    "EXL3 native_attention {name}: declared shard disagrees with selected index");
+            }
+            let prefix = format!("{module}.");
+            for (name, _) in weights.range(prefix.clone()..) {
+                if !name.starts_with(&prefix) { break; }
+                ensure!(entry.tensors.contains_key(name),
+                    "EXL3 native_attention {module}: selected index also exposes {name}");
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_headers<'a>(&self,
+        headers: impl IntoIterator<Item = &'a crate::SafetensorsTensorMetadata>) -> Result<()> {
+        use cuteafd_core::DType;
+        // A role may read only some of the selected native projections. Missing
+        // indexed tensors are checked by the shard reader, not invented here.
+        for header in headers {
+            let Some((module, _)) = header.name.rsplit_once('.') else { continue; };
+            let Some(entry) = self.native.get(module) else { continue; };
+            let declaration = entry.tensors.get(&header.name).with_context(||
+                format!("EXL3 native_attention {}: undeclared selected tensor", header.name))?;
+            let dtype = DType::from_safetensors(&declaration.dtype);
+            let width = match dtype { DType::Bf16 => 2u64, DType::F32 => 4,
+                DType::F8E4M3 => 1, _ => anyhow::bail!("EXL3 native_attention unsupported dtype") };
+            let bytes = declaration.shape.iter().try_fold(width, |bytes, &dim| bytes.checked_mul(dim as u64))
+                .context("EXL3 native_attention byte extent overflow")?;
+            ensure!(dtype == header.dtype && declaration.shape == header.shape && bytes == header.byte_length,
+                "EXL3 native_attention {}: dtype/shape/bytes disagree with selected safetensors header", header.name);
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn check_gptqmodel_manifest(
     compact: &Value, manifest: &Value, derived: &Exl3StorageMap, backbone_layers: usize,
 ) -> Result<()> {
@@ -223,7 +390,8 @@ pub(crate) fn check_gptqmodel_manifest(
             | "desc_act" | "format" | "group_size" | "lm_head" | "meta" | "method" | "module_include"
             | "out_scales" | "pack_dtype" | "quant_method" | "tensor_storage" | "per_module_metadata"
             | "sym" | "calibration" | "native_quantization_config" | "mcg_multiplier" | "expert_bits" | "expert_bits_by_layer"
-            | "kept_tensors" | "fused_expert_layout" | "retained_native_tensors"), "EXL3 manifest has unexpected key {key}");
+            | "kept_tensors" | "fused_expert_layout" | "retained_native_tensors"
+            | "attention_view" | "native_attention"), "EXL3 manifest has unexpected key {key}");
     }
     if let Some(layout) = manifest.get("fused_expert_layout") {
         check_fused_expert_layout(layout, derived, backbone_layers)?;
@@ -235,6 +403,7 @@ pub(crate) fn check_gptqmodel_manifest(
     if let Some(kept) = manifest.get("kept_tensors") {
         ensure!(kept.is_object(), "EXL3 kept_tensors must map tensor names to native dtypes/shapes");
     }
+    AttentionContract::parse(compact, manifest)?;
     check_native_quantization_config(manifest)?;
     ensure!(compact.get("native_quantization_config") == manifest.get("native_quantization_config"),
         "compact/full EXL3 metadata disagree at native_quantization_config");
@@ -299,6 +468,94 @@ mod tests {
             "calibration":{"samples":1426, "tokens":1097737}, "meta":{}, "module_include":[],
             "tensor_storage":true}).as_object().unwrap().clone());
         (compact, manifest)
+    }
+
+    fn attention_publication() -> (Value, Value, BTreeMap<String, String>) {
+        let (mut config, mut manifest) = publication();
+        let view = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
+            "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json",
+                "quantize":"quantize_config.json"}, "compact-attention":{
+                "config":"config.compact-attention.json", "index":"model.compact-attention.safetensors.index.json",
+                "quantize":"quantize_config.compact-attention.json"}},
+            "native_modules":"quantize_config.json:native_attention"});
+        config["attention_view"] = view.clone();
+        manifest["attention_view"] = view;
+        manifest["native_attention"] = serde_json::json!({"model.layers.0.self_attn.o_proj":{
+            "format":"bf16", "shard":"native.safetensors", "compact_attention_bits":6,
+            "tensors":{"model.layers.0.self_attn.o_proj.weight":{"dtype":"BF16", "shape":[128,256]}}}});
+        let weights = BTreeMap::from([("model.layers.0.self_attn.o_proj.weight".into(), "native.safetensors".into())]);
+        (config, manifest, weights)
+    }
+
+    #[test]
+    fn hqa_contract_checks_selected_index_headers_and_strict_schema() {
+        let (config, manifest, weights) = attention_publication();
+        let contract = AttentionContract::parse(&config, &manifest).unwrap().unwrap();
+        check_gptqmodel_manifest(&config, &manifest, &storage(), 2).unwrap();
+        let check = |contract: &AttentionContract, weights: &BTreeMap<String, String>| contract.check_selection(
+            "config.json", "model.safetensors.index.json", &["quantize_config.json".into()], Some(weights));
+        check(&contract, &weights).unwrap();
+        assert!(contract.check_selection("config.compact-attention.json", "model.safetensors.index.json",
+            &["quantize_config.json".into()], Some(&weights)).is_err());
+        let mut wrong = weights.clone();
+        wrong.values_mut().for_each(|shard| *shard = "wrong.safetensors".into());
+        assert!(check(&contract, &wrong).is_err());
+        wrong = weights.clone();
+        wrong.insert("model.layers.0.self_attn.o_proj.trellis".into(), "parent.safetensors".into());
+        assert!(check(&contract, &wrong).is_err());
+        assert!(check(&contract, &BTreeMap::new()).is_err());
+        let header = crate::SafetensorsTensorMetadata { name: weights.keys().next().unwrap().clone(),
+            dtype: cuteafd_core::DType::Bf16, shape: vec![128,256], byte_offset: 0, byte_length: 65536 };
+        contract.check_headers([&header]).unwrap();
+        for variant in 0..3 {
+            let mut wrong = header.clone();
+            match variant { 0 => wrong.dtype = cuteafd_core::DType::F16,
+                1 => wrong.shape = vec![256,128], _ => wrong.byte_length -= 1 }
+            assert!(contract.check_headers([&wrong]).is_err());
+        }
+        for pointer in ["/attention_view/schema", "/attention_view/native_modules",
+            "/attention_view/views/hqa/index", "/native_attention/model.layers.0.self_attn.o_proj/format",
+            "/native_attention/model.layers.0.self_attn.o_proj/tensors/model.layers.0.self_attn.o_proj.weight/dtype"] {
+            let mut bad = manifest.clone();
+            *bad.pointer_mut(pointer).unwrap() = Value::from("wrong");
+            let mut bad_config = config.clone(); bad_config["attention_view"] = bad["attention_view"].clone();
+            assert!(AttentionContract::parse(&bad_config, &bad).is_err(), "accepted {pointer}");
+        }
+        for pointer in ["/attention_view", "/attention_view/views/hqa",
+            "/native_attention/model.layers.0.self_attn.o_proj",
+            "/native_attention/model.layers.0.self_attn.o_proj/tensors/model.layers.0.self_attn.o_proj.weight"] {
+            let mut bad = manifest.clone();
+            bad.pointer_mut(pointer).unwrap()["unknown"] = Value::Bool(true);
+            let mut bad_config = config.clone(); bad_config["attention_view"] = bad["attention_view"].clone();
+            assert!(AttentionContract::parse(&bad_config, &bad).is_err(), "accepted unknown field at {pointer}");
+        }
+        let mut bad = manifest.clone(); bad["future_storage_key"] = Value::Bool(true);
+        assert!(check_gptqmodel_manifest(&config, &bad, &storage(), 2).unwrap_err().to_string()
+            .contains("unexpected key future_storage_key"));
+        bad = manifest.clone(); bad.as_object_mut().unwrap().remove("native_attention");
+        assert!(AttentionContract::parse(&config, &bad).is_err());
+        bad = manifest.clone(); bad.as_object_mut().unwrap().remove("attention_view");
+        assert!(AttentionContract::parse(&config, &bad).is_err());
+    }
+
+    #[test]
+    fn hqa_native_fp8_scale_contract_is_not_an_untyped_annotation() {
+        let (config, mut manifest, mut weights) = attention_publication();
+        let module = "model.layers.0.self_attn.o_proj";
+        let scale = format!("{module}.qscale_weight");
+        let native = &mut manifest["native_attention"][module];
+        native["format"] = Value::from("fp8_e4m3_block_scaled");
+        native["tensors"][format!("{module}.weight")]["dtype"] = Value::from("F8_E4M3");
+        native["tensors"][&scale] = serde_json::json!({"dtype":"F32", "shape":[1,2]});
+        native["scale"] = serde_json::json!({"tensor":scale, "dtype":"F32", "block_size":[128,128],
+            "semantics":"checkpoint-native: original FP8 weight with its original per-block FP32 scale"});
+        weights.insert(scale.clone(), "native.safetensors".into());
+        let contract = AttentionContract::parse(&config, &manifest).unwrap().unwrap();
+        contract.check_selection("config.json", "model.safetensors.index.json", &["quantize_config.json".into()],
+            Some(&weights)).unwrap();
+        let native = &mut manifest["native_attention"][module];
+        native["tensors"][&scale]["shape"] = serde_json::json!([2,1]);
+        assert!(AttentionContract::parse(&config, &manifest).is_err());
     }
 
     #[test]

@@ -794,6 +794,7 @@ mod tests {
     #[test]
     fn exlr8_native_cli_resolves_default_config_and_opt_out_before_admission() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"glm_moe_dsa"}"#).unwrap();
         let experts = dir.path().join("experts");
         std::fs::create_dir(&experts).unwrap();
         let header = br#"{"__metadata__":{"format":"exlr8-v2"}}"#;
