@@ -187,8 +187,7 @@ def test_peer_watchdog_reports_counters_and_opt_in_exchange_identity():
     engine = (family / "engine.rs").read_text()
     assert 'routes.trace_identity("glmf-tp2-routes")' in engine
     assert 'exchange.trace_identity("glmf-target-main")' in engine
-    assert 'IDENTITY: &str = "glmf-remote-dflash:taps,input,hidden,logits"' in (
-        family / "remote_dflash.rs").read_text()
+    assert '"glmf-remote-dflash:taps,input,hidden,logits"' in (family / "mod.rs").read_text()
     assert "exchange.trace_identity(identity)" in (
         family.parent.parent / "shared/draft/remote.rs").read_text()
 
@@ -233,7 +232,7 @@ static_assert(sizeof(cuteafd_peer_diagnostic_t) == 64);
 
 def test_remote_context_wait_is_ordered_after_cooperative_target_producer():
     family = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
-    remote = (family / "remote_dflash.rs").read_text()
+    remote = (family.parent.parent / "shared/draft/remote_dflash.rs").read_text()
     update = remote.split("pub fn update(&self", 1)[1].split("pub fn put_taps", 1)[0]
     assert "self.synchronize()?" not in update
     assert "cuda_stream_synchronize" not in update

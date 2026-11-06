@@ -104,7 +104,7 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
     wrapper = (source / 'glm5_flash/dspark.rs').read_text().split("impl<'a> Drafter<'a>", 1)[1]
     diagnostic = wrapper.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
     assert 'Self::RemoteDflash(d) => d.draft_device_diagnostic(sequences, embedding, head)' in diagnostic
-    remote = (source / 'glm5_flash/remote_dflash.rs').read_text()
+    remote = (source.parent / 'shared/draft/remote_dflash.rs').read_text()
     adapter = remote.split('fn launch_head(', 1)[1].split('\n    }', 1)[0]
     assert 'self.launch_head_at(head, self.target.hidden.buffer.ptr.cast_const(),' in adapter
     assert 'self.target.logits.buffer.ptr, rows, serving, self.bridge.exchange.stream(0))' in adapter
