@@ -1056,6 +1056,7 @@ impl Recipe for PreparedV4<'_> {
             spark_reply_formats: None,
             resident_weight_limit: request.resident_weight_limit,
             page_rows: self.page_rows,
+            pool_page_multiple: 1,
             maximum_pages: self.maximum_pages,
             gpus,
             variables,

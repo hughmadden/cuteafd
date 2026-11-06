@@ -413,6 +413,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         phase_order: p::PhaseOrder::TARGET_THEN_DRAFT, allocations: vec![], deferred: vec![],
         sequential: vec![], reservations: vec![], allowances: vec![], resident_weights: vec![],
     });
+    contract.pool_page_multiple = if i.attention.mode == AttentionPlacement::Context { 2 } else { 1 };
     contract.spark_reply_formats = (i.spark_ranks > 0).then_some(cuteafd_core::spark_reply::SparkReplyFormats {
         prefill: Some(i.spark_reply_format), decode: Some(cuteafd_core::SparkReplyFormat::Bf16),
     });

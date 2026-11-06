@@ -788,6 +788,7 @@ impl Recipe for MuseRecipe<'_> {
                 decode: Some(request.spark_reply_formats.decode()),
             }),
             page_rows: PAGE_ROWS,
+            pool_page_multiple: 1,
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,
             variables: self.attention.iter().enumerate()

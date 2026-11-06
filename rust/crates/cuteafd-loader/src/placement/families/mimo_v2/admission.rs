@@ -549,6 +549,7 @@ impl Recipe for MimoRecipe<'_> {
                 prefill: Some(self.spark_reply_formats.prefill(false)), decode: Some(self.spark_reply_formats.decode()) }),
             resident_weight_limit: request.resident_weight_limit,
             page_rows: self.page_rows,
+            pool_page_multiple: 1,
             maximum_pages: maximum,
             gpus: self.gpus,
             variables: vec![],

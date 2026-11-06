@@ -277,6 +277,8 @@ pub struct Contract {
     pub spark_reply_formats: Option<SparkReplyFormats>,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub page_rows: u64,
+    /// Legal pool sizes are multiples of this many physical pages.
+    pub pool_page_multiple: u64,
     pub maximum_pages: u64,
     pub gpus: usize,
     pub variables: Vec<Variable>,
@@ -332,6 +334,7 @@ impl Contract {
             spark_reply_formats: None,
             resident_weight_limit: None,
             page_rows,
+            pool_page_multiple: 1,
             maximum_pages,
             gpus,
             variables: vec![],
@@ -555,6 +558,8 @@ impl Contract {
     }
     pub(super) fn validate(&self) -> Result<(), Refusal> {
         if self.page_rows == 0
+            || self.pool_page_multiple == 0
+            || self.page_rows.checked_mul(self.pool_page_multiple).is_none()
             || self.maximum_pages == 0
             || self.maximum_pages == u64::MAX
             || self.gpus == 0
