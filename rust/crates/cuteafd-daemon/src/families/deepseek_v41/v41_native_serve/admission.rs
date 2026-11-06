@@ -476,6 +476,10 @@ pub(super) fn resolve(
 
 /// `startup` contains full sequential peaks above `memory`, never staging-only
 /// deltas. Draft owners supplied separately must not also appear in `owners`.
+///
+/// One typed request over the sampled owners: the same component contract the
+/// offline planner admits decides the pool and the local expert prefix, and
+/// execution consumes that placement without sampling memory again.
 pub(super) fn resolve_with_owners(
     args: &crate::cli::NativeServeArgs,
     memory: &[(usize, usize)],
@@ -487,7 +491,11 @@ pub(super) fn resolve_with_owners(
     startup: &[Demand],
     draft: Option<&families::deepseek_v41::DraftInventory>,
 ) -> Result<Admitted> {
-    use cuteafd_core::memory_layout::{Basis, Category};
+    use families::deepseek_v41::admission::{
+        self, live_budgets, production_request, Owner, ProductionInput,
+    };
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_loader::placement::planner::{Operation, PrefillShape};
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
     let ranks = memory.len();
     ensure!(
@@ -499,52 +507,40 @@ pub(super) fn resolve_with_owners(
         "invalid V4.1 context limit"
     );
     let onboard = args.rtx_expert_layers.onboard(experts.len());
-    if let cuteafd_loader::placement::Onboard::Layers(count) = onboard {
+    if let Onboard::Layers(count) = onboard {
         ensure!(
             count <= experts.len(),
             "explicit V4.1 prefix exceeds available expert inventory"
         );
     }
     let automatic = args.pool_tokens == Some(0);
-    let mut ceilings = Vec::new();
-    let gpus = memory
-        .iter()
-        .enumerate()
-        .map(|(gpu, &(free, total))| {
-            ensure!(
-                total > 0 && free <= total,
-                "invalid GPU {gpu} memory sample"
-            );
-            let mut ceiling = args
-                .memory_reservation
-                .map(|r| r.bytes(total))
-                .transpose()?
-                .unwrap_or(total);
-            let small = total <= 32usize << 30;
-            if small {
-                ceiling = ceiling.min(cuteafd_core::serving_capacity::admission_ceiling(
-                    total as u64,
-                    97,
-                    cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64),
-                )? as usize);
-            } else if automatic {
-                ceiling = ceiling.min((total as u128 * 97 / 100) as usize);
-            }
-            ceilings.push(ceiling);
-            let headroom = total - ceiling;
-            Ok(GpuBudget {
-                capacity_bytes: total as u64,
-                headroom_bytes: headroom as u64,
-                baseline: Baseline::Measured {
-                    free_bytes: free as u64,
-                },
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let cards = memory.iter().map(|m| m.1 as u64).collect::<Vec<_>>();
+    // A reservation is a logical ceiling; automatic plans keep the 97% and
+    // small-card admission margins on top of the sampled free bytes.
+    let mut ceilings = Vec::with_capacity(ranks);
+    let mut cards = Vec::with_capacity(ranks);
+    for (gpu, &(free, total)) in memory.iter().enumerate() {
+        ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory sample");
+        let mut ceiling = args
+            .memory_reservation
+            .map(|r| r.bytes(total))
+            .transpose()?
+            .unwrap_or(total);
+        if total <= 32 << 30 {
+            ceiling = ceiling.min(cuteafd_core::serving_capacity::admission_ceiling(
+                total as u64,
+                97,
+                cuteafd_core::serving_capacity::small_card_headroom_bytes(total as u64),
+            )? as usize);
+        } else if automatic {
+            ceiling = ceiling.min((total as u128 * 97 / 100) as usize);
+        }
+        ceilings.push(ceiling);
+        cards.push((total as u64, ceiling as u64, free as u64));
+    }
+    let totals = memory.iter().map(|&(_, total)| total as u64).collect::<Vec<_>>();
     let tails = args.concurrency as u64 + 2 * args.resolved_prefix_entries() as u64;
     let mut pool = PoolPolicy::resolve(
-        &cards,
+        &totals,
         args.max_context_tokens as u64,
         args.pool_tokens,
         512,
@@ -556,64 +552,94 @@ pub(super) fn resolve_with_owners(
             groups > tails && groups <= 131072,
             "explicit KV byte pool is outside physical/admission limits"
         );
-        pool = PoolPolicy::resolve(&cards, args.max_context_tokens as u64,
-            Some((groups - tails) * 512), 512, args.peers.is_empty());
-    }
-    if pool.requested.is_none() {
-        pool.floor = pool.floor.max(
-            (args.max_context_tokens as u64).div_ceil(512) * 512 + args.concurrency as u64 * 512,
+        pool = PoolPolicy::resolve(
+            &totals,
+            args.max_context_tokens as u64,
+            Some((groups - tails) * 512),
+            512,
+            args.peers.is_empty(),
         );
-        pool.target = pool.target.max(pool.floor);
     }
-    pool.ceiling = pool.requested.unwrap_or(pool.target).div_ceil(512) * 512;
-    let mut fixed = owners.to_vec();
-    for gpu in 0..ranks {
-        fixed.extend(families::deepseek_v41::growth_demands(memory[gpu].1 as u64, ranks,
-            automatic, gpu as u8));
-        if deferred[gpu] > 0 {
-            fixed.push(Demand::new(
-                gpu as u8,
-                Category::Transport,
-                "deferred serving lanes and setup",
-                deferred[gpu],
-                Basis::Exact,
-            ));
-        }
-    }
-    let inventory = Inventory {
-        gpus,
-        spark_ranks: args.peers.len(),
-        peer_access: ranks == 2,
+    // An explicit pool below the compiled context is the first typed refusal;
+    // zero and an omitted pool both selected automatic admission above.
+    pool.validate_explicit()?;
+    // The compiled context is the pool minimum. Only an automatic Spark-free
+    // pool keeps the shared agentic floor; nothing else is clamped.
+    let context = if pool.requested.is_none() {
+        pool.floor.max(args.max_context_tokens as u64)
+    } else {
+        args.max_context_tokens as u64
     };
-    let mut req = families::deepseek_v41::request(
-        inventory,
-        pool,
-        vec![0; ranks],
+    // The family executor's shape: the live capacity the chunk rounds to and
+    // the configured units in flight.
+    let prefill = PrefillShape {
+        rows: u64::from(
+            cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
+                .context("invalid V4.1 prefill batch")?,
+        ),
+        waves: u64::from(args.prefill_waves),
+    };
+    // Future owners beside the pool: the calibrated lazy-graph envelope, the
+    // runtime growth reserve and the small-card margin. None is live at ready,
+    // so each prices only the post-ready phases.
+    let mut allowances = Vec::new();
+    for (gpu, sample) in memory.iter().enumerate() {
+        allowances.extend(admission::growth_allowances(
+            sample.1 as u64,
+            ranks,
+            automatic,
+            gpu as u8,
+        ));
+    }
+    let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
+    for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
+        retained.push(Owner::charged(
+            gpu as u8,
+            Category::Transport,
+            "deferred serving lanes and setup",
+            bytes as u64,
+        ));
+    }
+    let config = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
+    let limit = crate::shared::memory::budget::resident_weight_limit().0;
+    let formats = cuteafd_core::spark_reply::requested();
+    let sparks =
+        vec![cuteafd_loader::plan::layout::DEFAULT_SPARK_DEVICE_BYTES; args.peers.len()];
+    let input = ProductionInput {
+        config: &config,
+        gpus: ranks,
+        context,
+        maximum_pool_tokens: pool.maximum_tokens(),
+        prefill,
+        concurrency: args.concurrency as u64,
+        retained_turns: args.resolved_prefix_entries() as u64,
+        replicated: args.tp2_attention,
+        spark_ranks: args.peers.len(),
+        onboard_minimum: minimum,
+        onboard_counts: None,
         experts,
         workspace,
+        owners: retained,
+        startup: startup.iter().map(Owner::from_demand).collect(),
+        allowances,
+        draft: draft.cloned(),
+        encoders: Vec::new(),
+        media_cache_bytes: 0,
+        resident_weight_limit: limit,
+        spark_reply_formats: formats,
+        operation: Operation::Serving,
+        budgets: live_budgets(&cards, &sparks)?,
+    };
+    let request = production_request(
+        context,
+        pool.requested,
         onboard,
+        prefill,
+        Operation::Serving,
+        limit,
+        formats,
     );
-    req.resident_weight_limit = Some(crate::shared::memory::budget::resident_weight_limit());
-    req.fixed = fixed;
-    req.startup = startup.to_vec();
-    if let Some(draft) = draft {
-        req.movables.push(families::deepseek_v41::drafter(draft, ranks)?);
-    }
-    req.minimum_expert_layers = minimum;
-    let config = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
-    families::deepseek_v41::cache_demands(
-        &mut req,
-        &config,
-        args.concurrency as u64,
-        args.resolved_prefix_entries() as u64,
-        args.tp2_attention,
-    )?;
-    let placement = solve(&req)?;
-    families::deepseek_v41::validate_pool_floor(&req.pool, &placement)?;
-    ensure!(
-        placement.onboard_layers >= minimum,
-        "mandatory V4.1 expert prefix does not fit"
-    );
+    let placement = input.prepare()?.admit(request)?.placement;
     let groups = usize::try_from(placement.pool_tokens.div_ceil(512) + tails)?;
     let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
         &config,
@@ -841,6 +867,18 @@ mod admission_tests {
         args
     }
 
+    /// Routed inventory for pool, owner and drafter tests: forty zero-cost
+    /// layers, so only the pool, the retained owners and the cache are charged.
+    fn no_experts() -> Vec<ExpertCost> {
+        vec![ExpertCost {
+            whole: Bytes2 { resident: 0, staging: 0 },
+            half: [Bytes2 { resident: 0, staging: 0 }; 2],
+            tp2: false,
+            whole_supported: true,
+            spark_ok: true,
+        }; 40]
+    }
+
     #[test]
     fn v41_admission_contract_synthetic_inventory() -> Result<()> {
         use cuteafd_core::memory_layout::{Basis, Category};
@@ -895,7 +933,9 @@ mod admission_tests {
                     if let Some(pool) = pool_tokens.filter(|&n| n > 0) {
                         assert_eq!(admitted.placement.pool_tokens, pool);
                     }
-                    for owner in &fixed {
+                    for owner in fixed.iter()
+                        .filter(|d| d.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident)
+                    {
                         let expected = fixed.iter().filter(|d| d.gpu == owner.gpu
                             && d.category == owner.category && d.group == owner.group)
                             .map(|d| d.bytes).sum::<u64>();
@@ -954,7 +994,10 @@ mod admission_tests {
             let short = vec![(8usize << 30, 96usize << 30); ranks];
             let refused = resolve(&args, &short, experts, 64 << 20,
                 &vec![0; ranks], usize::from(ranks == 2), None).map(|_| ()).unwrap_err();
-            assert!(refused.to_string().contains("40"), "{refused}");
+            assert!(matches!(
+                refused.downcast_ref::<cuteafd_loader::placement::planner::Refusal>(),
+                Some(cuteafd_loader::placement::planner::Refusal::FullContextShortfall {
+                    context: 262_144, .. })), "{refused}");
         }
         Ok(())
     }
@@ -987,7 +1030,7 @@ mod admission_tests {
                 loader_peak: [0; 2],
             };
             let memory = vec![(80usize << 30, 96usize << 30); ranks];
-            let moved = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, Some(&draft))?;
+            let moved = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, Some(&draft))?;
             assert_eq!(draft::home(&moved.placement), Some(home));
             assert_eq!(moved.placement.items[home as usize].iter()
                 .filter(|item| item.group == "dSpark weights").map(|item| item.bytes).sum::<u64>(), draft.resident);
@@ -997,9 +1040,22 @@ mod admission_tests {
                 assert_eq!(moved.placement.items[gpu].iter().filter(|item| item.group == "draft runtime")
                     .map(|item| item.bytes).sum::<u64>(), 64 << 20);
             }
-            let movable = families::deepseek_v41::drafter(&draft, ranks)?;
-            let fixed = &movable.conditional.iter().find(|c| c.placement_gpu == home).unwrap().demands;
-            let original = resolve_with_owners(&args, &memory, vec![], 0, &vec![0; ranks], 0, fixed, &[], None)?;
+            // The same owners as an already-loaded inventory: retained draft
+            // weights and marks on the home GPU, its peer half on GPU0, and the
+            // request runtime lanes.
+            let mut fixed = vec![
+                Demand::new(home, Category::Drafter, "dSpark weights", draft.resident, Basis::Exact)
+                    .with_resident_weights(ResidentWeights(draft.resident)),
+                Demand::new(home, Category::Prefix, "dSpark marks", draft.marks, Basis::Exact),
+            ];
+            if draft.peer_half > 0 {
+                fixed.push(Demand::new(0, Category::Drafter, "dSpark TP2 expert half",
+                    draft.peer_half, Basis::Exact).with_resident_weights(
+                    ResidentWeights(draft.peer_half)));
+            }
+            fixed.extend(draft.runtime.iter().cloned());
+            let original = resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; ranks], 0,
+                &fixed, &[], None)?;
             assert_eq!(moved.cache_bytes, original.cache_bytes);
             for gpu in 0..ranks {
                 let total = |items: &[cuteafd_core::memory_layout::Item]| items.iter().map(|i| i.bytes).sum::<u64>();
@@ -1008,12 +1064,12 @@ mod admission_tests {
             // A pre-draft sample does not yet contain these bytes. Omitting
             // the movable would incorrectly admit this constrained inventory.
             let constrained = vec![(8usize << 30, 96usize << 30); ranks];
-            assert!(resolve(&args, &constrained, vec![], 0, &vec![0; ranks], 0, None).is_ok());
-            assert!(resolve(&args, &constrained, vec![], 0, &vec![0; ranks], 0, Some(&draft)).is_err());
+            assert!(resolve(&args, &constrained, no_experts(), 0, &vec![0; ranks], 0, None).is_ok());
+            assert!(resolve(&args, &constrained, no_experts(), 0, &vec![0; ranks], 0, Some(&draft)).is_err());
             // Only the caller's full coexistence peak gates the load phase.
             let peak = [Demand::new(home, Category::Staging, "full draft load phase",
                 81 << 30, Basis::Exact)];
-            assert!(resolve_with_owners(&args, &memory, vec![], 0, &vec![0; ranks], 0,
+            assert!(resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; ranks], 0,
                 &[], &peak, Some(&draft)).is_err());
         }
         Ok(())
@@ -1034,7 +1090,7 @@ mod admission_tests {
         for tokens in [32_768, 131_072] {
             args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(
                 (tokens / 512 + tails) * 5 * 256 * 356));
-            let result = resolve(&args, &memory, vec![], 0, &[0], 0, None);
+            let result = resolve(&args, &memory, no_experts(), 0, &[0], 0, None);
             if tokens < args.max_context_tokens as usize {
                 let error = result.err().context("small explicit byte pool was admitted")?;
                 assert_eq!(error.downcast_ref::<PlacementError>(), Some(&PlacementError::RequestedBelowContext {
@@ -1064,18 +1120,18 @@ mod admission_tests {
             args.tp2_attention = replicas;
             args.rtx_expert_layers = LocalLayers::Count(0);
             let memory = vec![(80usize << 30, 96usize << 30); ranks];
-            let admitted = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, None)?;
+            let admitted = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
             assert_eq!(admitted.placement.pool_tokens, 2 << 20);
             assert_eq!(admitted.pages, [4152, 4152, 4152, 8304]);
             args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(
                 (4152 * 5 * 256 * 356) + 1,
             ));
-            let exact = resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, None)?;
+            let exact = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None)?;
             assert_eq!(exact.pages, admitted.pages);
             assert_eq!(exact.cache_bytes, admitted.cache_bytes);
             args.kv_pool_size = None;
             args.pool_tokens = Some(67_108_864);
-            assert!(resolve(&args, &memory, vec![], 0, &vec![0; ranks], 0, None).is_err());
+            assert!(resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, None).is_err());
             args.pool_tokens = Some(2 << 20);
             assert!(
                 resolve(
@@ -1112,7 +1168,7 @@ mod admission_tests {
             args.memory_reservation = Some("80.000001GiB".parse()?);
             let deferred = vec![64u64 << 20; ranks];
             let roomy = vec![(80usize << 30, total); ranks];
-            let admitted = resolve(&args, &roomy, vec![], 0, &deferred, 0, None)?;
+            let admitted = resolve(&args, &roomy, no_experts(), 0, &deferred, 0, None)?;
             let ceiling = args.memory_reservation.unwrap().bytes(total)?;
             let exact = admitted
                 .cache_bytes
@@ -1127,14 +1183,14 @@ mod admission_tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
-                resolve(&args, &exact, vec![], 0, &deferred, 0, None)?.pages,
+                resolve(&args, &exact, no_experts(), 0, &deferred, 0, None)?.pages,
                 admitted.pages
             );
             for gpu in 0..ranks {
                 let mut short = exact.clone();
                 short[gpu].0 -= 1;
                 assert!(
-                    resolve(&args, &short, vec![], 0, &deferred, 0, None).is_err(),
+                    resolve(&args, &short, no_experts(), 0, &deferred, 0, None).is_err(),
                     "rank {gpu} cannot borrow the other owner's free bytes"
                 );
             }
@@ -1147,12 +1203,12 @@ mod admission_tests {
                 .map(|&(free, total)| (free - occupied, total))
                 .collect::<Vec<_>>();
             assert_eq!(
-                resolve(&args, &with_snapshots, vec![], 0, &deferred, 0, None)?.pages,
+                resolve(&args, &with_snapshots, no_experts(), 0, &deferred, 0, None)?.pages,
                 admitted.pages
             );
             args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(1 << 20));
             args.pool_tokens = None;
-            assert!(resolve(&args, &roomy, vec![], 0, &deferred, 0, None).is_err());
+            assert!(resolve(&args, &roomy, no_experts(), 0, &deferred, 0, None).is_err());
         }
         Ok(())
     }
@@ -1185,24 +1241,24 @@ mod admission_tests {
         args.rtx_expert_layers = LocalLayers::Count(0);
         for context in [0, 1_048_577, u32::MAX] {
             args.max_context_tokens = context;
-            assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
+            assert!(resolve(&args, &memory, no_experts(), 0, &[0], 0, None).is_err());
         }
         args.max_context_tokens = 262_144;
         for concurrency in [0, 65, u32::MAX] {
             args.concurrency = concurrency;
-            assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
+            assert!(resolve(&args, &memory, no_experts(), 0, &[0], 0, None).is_err());
         }
         for concurrency in [17, 32, 33, 64] {
             args.concurrency = concurrency;
-            let admitted = resolve(&args, &memory, vec![], 0, &[0], 0, None)?;
+            let admitted = resolve(&args, &memory, no_experts(), 0, &[0], 0, None)?;
             assert!(admitted.placement.pool_tokens >= args.max_context_tokens as u64);
         }
         args.concurrency = 16;
         args.prefix_cache_entries = 129;
-        assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
+        assert!(resolve(&args, &memory, no_experts(), 0, &[0], 0, None).is_err());
         args.prefix_cache_entries = 20;
-        assert!(resolve(&args, &[(97usize << 30, 96usize << 30)], vec![], 0, &[0], 0, None).is_err());
-        assert!(resolve(&args, &[(0, 0)], vec![], 0, &[0], 0, None).is_err());
+        assert!(resolve(&args, &[(97usize << 30, 96usize << 30)], no_experts(), 0, &[0], 0, None).is_err());
+        assert!(resolve(&args, &[(0, 0)], no_experts(), 0, &[0], 0, None).is_err());
         Ok(())
     }
 
@@ -1224,13 +1280,13 @@ mod admission_tests {
         let mut args = args(dir.path());
         args.rtx_expert_layers = LocalLayers::Count(0);
         args.max_context_tokens = 262_144;
-        let admitted = resolve(&args, &[(30usize << 30, 32usize << 30)], vec![], 0, &[0], 0, None)?;
+        let admitted = resolve(&args, &[(30usize << 30, 32usize << 30)], no_experts(), 0, &[0], 0, None)?;
         assert_eq!(admitted.placement.pool_tokens, 1 << 20);
         assert_eq!(admitted.pages[0], 2048 + 56);
         args.memory_reservation = Some(crate::shared::memory::budget::Reservation::Percent(
             1_000_000,
         ));
-        assert!(resolve(&args, &[(30usize << 30, 32usize << 30)], vec![], 0, &[0], 0, None).is_err());
+        assert!(resolve(&args, &[(30usize << 30, 32usize << 30)], no_experts(), 0, &[0], 0, None).is_err());
         Ok(())
     }
 }

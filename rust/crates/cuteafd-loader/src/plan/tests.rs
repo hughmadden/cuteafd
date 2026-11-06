@@ -1731,8 +1731,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             }).unwrap() as u64).sum::<u64>());
                     }
                     DeviceKind::Rtx => {
-                        let local = device.items.iter().find(|item| item.group.starts_with("resident routed")
-                            || item.group.starts_with("TP2 expert layer halves")).unwrap();
+                        let local = device.items.iter().find(|item| item.group == "routed experts").unwrap();
                         let (costs, workspace) = crate::placement::families::deepseek_v41::expert_inventory(
                             &catalog, &dir.path().join("share/PROGRAMS.json"),
                             report.prefill_unit_rows.unwrap(), gpus, 188, report.prefill_waves.unwrap() as usize,
@@ -4360,7 +4359,7 @@ fn v41_small_card_graph_envelope_preserves_pro_allowance() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
-        let graph = memory.devices[0].items.iter().find(|item| item.group == "graph growth").unwrap();
+        let graph = memory.devices[0].items.iter().find(|item| item.group == "V4.1 lazy graph capture envelope").unwrap();
         assert_eq!(graph.bytes, expected);
     }
 }
@@ -4374,7 +4373,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
     let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100);
-    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "runtime growth").unwrap().bytes, 3 << 30);
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group == "V4.1 runtime growth reserve").unwrap().bytes, 3 << 30);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();
@@ -4383,7 +4382,39 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
     let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert_eq!(explicit.devices[0].capacity_bytes, 96u64 << 30);
-    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group == "runtime growth").unwrap().bytes, 2 << 30);
+    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group == "V4.1 runtime growth reserve").unwrap().bytes, 2 << 30);
+}
+
+#[test]
+fn v41_auto_pool_and_count_admission_preserve_one_recipe() {
+    let dir = strict_v41_snapshot(false);
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30],
+        context_tokens: 262_144, workspace_manifest: v41_workspace(dir.path()),
+        ..Default::default()
+    }), ..sparks(4) };
+    let unset = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
+    assert!(unset.executable(), "{}", render(&unset));
+    // CLI zero selects automatic admission, identically to an omitted pool.
+    let mut zero = options.clone();
+    zero.layout.as_mut().unwrap().pool_tokens = Some(0);
+    let automatic = plan_spark_count(dir.path(), &zero, 6, Some(4)).unwrap();
+    assert!(automatic.wip_launchable(), "{}", render(&automatic));
+    assert_eq!(automatic.memory_layout, unset.memory_layout);
+    assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
+    assert_eq!(automatic.prefill_reserve_rows, unset.prefill_reserve_rows);
+    // A pool below the context keeps the family's first typed refusal with the
+    // same hints whether the plan runs directly or through the count selector.
+    zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let direct = plan(dir.path(), &zero).unwrap();
+    let counted = plan_spark_count(dir.path(), &zero, 6, Some(4)).unwrap();
+    assert!(!counted.wip_launchable());
+    assert_eq!(direct.prefill_unit_rows, counted.prefill_unit_rows);
+    assert_eq!(direct.prefill_reserve_rows, counted.prefill_reserve_rows);
+    for hint in &direct.hints {
+        assert!(counted.hints.iter().any(|other| other.what == hint.what));
+    }
+    assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }
 
 #[test]
@@ -4553,7 +4584,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // TJ 2026-10-27: the reserve is sized first, the largest that fits the
     // card (8192, else a multiple of 64 rows), split into roundup64(R / k)
     // units; the pool takes what remains. Only an explicit pin changes it.
-    use crate::serving_capacity::prefill_waves::{unit_rows_in, ROW_PAGE as RESERVE_STEP_ROWS};
+    use crate::serving_capacity::prefill_waves::unit_rows_in;
     let dir = strict_v41_snapshot(false);
     let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
@@ -4566,17 +4597,20 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
         (Some(8192), Some(2752), Some(3)));
     let options = PlanOptions { layout: Some(layout.clone()), ..sparks(4) };
     let capped = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
-    assert!(capped.executable(), "{}", render(&capped));
-    let reserve = capped.prefill_reserve_rows.unwrap();
-    assert_eq!(capped.prefill_waves, Some(3));
-    assert_eq!(capped.prefill_unit_rows, Some(unit_rows_in(3, reserve)), "{}", render(&capped));
-    if reserve < 8192 {
-        assert_eq!(reserve % RESERVE_STEP_ROWS, 0);
-        // The next larger reserve does not fit: the cap is the largest.
-        let larger = PlanOptions { layout: Some(layout::LayoutOptions {
-            prefill_reserve_rows: Some(reserve + RESERVE_STEP_ROWS), ..layout.clone() }), ..sparks(4) };
-        assert!(!plan_spark_count(dir.path(), &larger, 6, Some(4)).unwrap().executable());
-    }
+    // The reserve is sized once: 8192 rows is what the family asks for, and
+    // its first typed refusal stands instead of the generic second solve
+    // shrinking the reserve for KV. A 32 GiB card with a 1M context therefore
+    // refuses with the pool/context shortfall; the operator's lever is an
+    // explicit smaller reserve, which keeps the fixed three-wave cut.
+    assert!(!capped.executable(), "{}", render(&capped));
+    assert_eq!(capped.prefill_reserve_rows, Some(8192));
+    assert!(capped.hints.iter().any(|hint| hint.what.contains("cannot fit")), "{}", render(&capped));
+    let explicit = PlanOptions { layout: Some(layout::LayoutOptions {
+        prefill_reserve_rows: Some(4096), ..layout.clone() }), ..sparks(4) };
+    let explicit = plan_spark_count(dir.path(), &explicit, 6, Some(4)).unwrap();
+    assert!(explicit.executable(), "{}", render(&explicit));
+    assert_eq!((explicit.prefill_reserve_rows, explicit.prefill_unit_rows, explicit.prefill_waves),
+        (Some(4096), Some(unit_rows_in(3, 4096)), Some(3)), "{}", render(&explicit));
     // An explicit pin keeps its shape whether or not it fits.
     let pinned = PlanOptions { layout: Some(layout::LayoutOptions { prefill_rows: 1024, prefill_waves: 2, ..layout }), ..sparks(4) };
     let pinned = plan_spark_count(dir.path(), &pinned, 6, Some(4)).unwrap();

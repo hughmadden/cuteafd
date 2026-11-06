@@ -595,8 +595,7 @@ mod tests {
         assert_eq!(single.draft_load_phases(&draft)?[0].bytes, 682_599_765);
         assert_eq!(single.fixed.iter().map(|d| d.bytes).sum::<u64>(), 688_039_877);
         assert!(single.fixed.iter().all(|d| d.lifetime == ItemLifetime::ReadyResident));
-        let draft_owner = super::super::drafter(&draft, 1)?;
-        assert_eq!(draft_owner.conditional.iter().flat_map(|home| &home.demands).map(|d| d.bytes).sum::<u64>(), 720);
+        assert_eq!(super::super::admission::draft_owners(&draft, 1)?.iter().map(|o| o.bytes).sum::<u64>(), 720);
 
         let mut dual = TargetOwners::new(vec![demand(0, "weights", 100), demand(1, "weights", 200)],
             vec![demand(0, "target", 30), demand(1, "target", 40)], 2, 200, 2)?;
