@@ -362,12 +362,16 @@ fn check_storage_maps_view(view: &crate::plan::checkpoint::CheckpointView, confi
     let mut source = None;
     let paths = view.quant_names().iter().filter(|name| name.as_str() != "hf_quant_config.json")
         .map(|file| view.snapshot().join(file)).collect::<Vec<_>>();
-    let present = paths.iter().filter(|path| path.is_file()).collect::<Vec<_>>();
+    let present = paths.iter().collect::<Vec<_>>();
     let first = present.first().map(|path| read_bytes(path, MAX_MANIFEST_BYTES)).transpose()?;
+    if let (Some(path), Some(bytes)) = (present.first(), first.as_ref()) {
+        view.check_metadata_bytes(path.file_name().unwrap().to_str().context("metadata file name")?, bytes)?;
+    }
     if let [left, right] = present.as_slice() {
         ensure!(left.metadata()?.len() == right.metadata()?.len(),
             "quantize_config.json and quantization_config.json differ in size");
         let other = read_bytes(right, MAX_MANIFEST_BYTES)?;
+        view.check_metadata_bytes(right.file_name().unwrap().to_str().context("metadata file name")?, &other)?;
         ensure!(Sha256::digest(first.as_ref().unwrap()) == Sha256::digest(&other),
             "quantize_config.json and quantization_config.json differ in SHA256");
     }
