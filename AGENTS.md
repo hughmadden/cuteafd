@@ -154,6 +154,13 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;
   `wip.sh` and `run.sh --wip` refuse a stale dev image and say so.
+- Batch kernel landings: kernel PRs merge to fork master as soon as their own
+  correctness oracles and benchmarks pass. At most one dev fork-pin bump is
+  in flight; snapshot fork master when it starts, and leave subsequent fork
+  merges for the next bump. Each bump publishes `CHANGES.md`, includes the
+  report in its pin PR body, and checks changed program groups against the
+  union of the batch's declared targets (`--expect`). Use the default CPU
+  gate for merges and pin bumps; the full tier is for releases.
 - Kernels: CuTe-DSL/Triton AOT exports from the b12x fork are the default;
   hand CUDA only where measured to pay. SM120 and SM121 are both targets.
 - Run CUDA/PyTorch checks inside the matching architecture's container.
