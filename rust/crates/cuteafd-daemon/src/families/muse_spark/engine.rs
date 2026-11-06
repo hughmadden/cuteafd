@@ -13,14 +13,14 @@ use crate::shared::{memory::device::Device, rope::{RotaryTables, Table}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::Programs;
 use cuteafd_loader::families::muse_spark::{cache::MuseCacheLayout, lane::LanePlanes, MuseSparkConfig};
-use cuteafd_loader::placement::{families::muse_spark::{self as shared, MuseRequest}, Placement};
+use cuteafd_loader::placement::{families::muse_spark::{self as shared, AdmittedMuse}, Placement};
 use std::{ffi::c_void, rc::Rc};
 
 /// What one rank's load needs from startup.
 pub(crate) struct RankLoad<'c> {
     pub cfg: &'c MuseSparkConfig,
     pub checkpoint: &'c cuteafd_loader::plan::Checkpoint,
-    pub built: &'c MuseRequest,
+    pub built: &'c AdmittedMuse,
     pub placement: &'c Placement,
     pub rank: usize,
     /// Active sequence slots (each owns its sliding rings).

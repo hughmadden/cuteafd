@@ -326,11 +326,15 @@ impl ApiReady {
 
 impl Ready {
     pub fn load(args: &super::serve::ServeArgs, library: &cuteafd_ffi::NativeLibrary,
-        admitted: &cuteafd_loader::placement::families::muse_spark::MediaAdmission) -> Result<Self> {
+        admitted: &cuteafd_loader::placement::families::muse_spark::MediaAdmission,
+        host: cuteafd_loader::placement::families::muse_spark::HostAdmission) -> Result<Self> {
         use crate::shared::{qwen::Encoder, vision::{self, EncoderService, local::LocalEncoder, remote::*}};
         use cuteafd_loader::{media::{ImageFamily, ProcessorConfig}, plan::encoder::EncoderKind};
         use std::{sync::Arc, time::Duration};
         args.validate()?;
+        tracing::info!(vision = %admitted.vision.reason, audio = %admitted.audio.reason,
+            vision_shortfall = admitted.vision.shortfall, audio_shortfall = admitted.audio.shortfall,
+            "Muse admitted bundled towers");
         let image_on = admitted.vision.admitted_bytes() > 0;
         let audio_on = admitted.audio.admitted_bytes() > 0;
         ensure!(image_on || args.vision_peers.is_empty(), "disabled vision cannot have encoder peers");
@@ -339,8 +343,9 @@ impl Ready {
             ensure!(args.audio_peers.len() == admitted.audio.spark_ranks().len(),
                 "Muse audio replica peers differ from admission");
         }
-        let (prefix, cache_bytes) = if image_on || audio_on { args.prefix.with_media_headroom(args.media_cache_bytes)? }
-            else { (args.prefix.clone(), 0) };
+        let mut prefix = args.prefix.clone();
+        prefix.host_cache_bytes = crate::shared::prefix::budget::HostBudget::Bytes(host.prefix_bytes);
+        let cache_bytes = usize::try_from(host.media_bytes)?;
         if !image_on && !audio_on {
             ensure!(args.vision_peers.is_empty() && args.audio_peers.is_empty(), "disabled media cannot have encoder peers");
             return Ok(Self { push: Default::default(), encoder: Encoder::Off, image: None, audio: None, cache_bytes, prefix });

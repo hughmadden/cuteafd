@@ -235,6 +235,7 @@ impl Family for MuseSpark {
 }
 
 impl FamilyModel for Model {
+    fn contract_admission(&self) -> bool { true }
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn native_serving_admission(&self) -> bool { true }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
