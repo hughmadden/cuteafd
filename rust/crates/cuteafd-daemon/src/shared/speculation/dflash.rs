@@ -917,16 +917,27 @@ pub(crate) fn check_checkpoint(snapshot: &Path, fp8: Option<bool>, context_slots
 /// Admit the target's single resident BF16 head or native K6 launcher before allocation.
 pub(crate) fn check_snapshot_target_head(snapshot: &Path, head_stem: &str, hidden: usize, vocab: usize,
     explicit_fp8_head: bool) -> Result<()> {
+    let prefix = format!("{head_stem}.");
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open_for_role(snapshot, "DFlash target head",
+        |name| name.starts_with(&prefix))?;
+    check_checkpoint_target_head(&checkpoint, head_stem, hidden, vocab, explicit_fp8_head)
+}
+
+pub(crate) fn check_view_target_head(view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    head_stem: &str, hidden: usize, vocab: usize, explicit_fp8_head: bool) -> Result<()> {
+    let prefix = format!("{head_stem}.");
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open_view_for_role(view, "DFlash selected target head",
+        |name| name.starts_with(&prefix))?;
+    check_checkpoint_target_head(&checkpoint, head_stem, hidden, vocab, explicit_fp8_head)
+}
+
+fn check_checkpoint_target_head(checkpoint: &cuteafd_loader::plan::Checkpoint, head_stem: &str,
+    hidden: usize, vocab: usize, explicit_fp8_head: bool) -> Result<()> {
     use cuteafd_loader::formats::trellis_core::{read_projections, CoreContract, CoreSplit};
     use std::collections::BTreeMap;
-
-    // Routed-expert catalogs need not contain coordinator tensors. Resolve the
-    // head through its own index/header contract without reading weight data.
     ensure!(!head_stem.is_empty(), "DFlash target head stem must be explicit");
     let prefix = format!("{head_stem}.");
     let weight = format!("{prefix}weight");
-    let checkpoint = cuteafd_loader::plan::Checkpoint::open_for_role(snapshot, "DFlash target head",
-        |name| name.starts_with(&prefix))?;
     let expected = BTreeMap::from([(weight.clone(), vec![vocab, hidden])]);
     let native = read_projections(&checkpoint, &expected, |name| name.starts_with(&prefix),
         |stem| (stem == head_stem).then_some(CoreContract {

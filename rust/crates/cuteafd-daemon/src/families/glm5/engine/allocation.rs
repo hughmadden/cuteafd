@@ -91,6 +91,10 @@ impl Census<'_> {
                     lifetime,
                     Category::Workspace,
                 )?;
+                if let Some(native) = &core.native {
+                    actual.record(&format!("{kind}.core.native.scratch"), native.buffer, lifetime,
+                        Category::Workspace, "GLM target hooks")?;
+                }
                 for (name, buffer) in core.allocation_stages() {
                     actual.record(
                         &format!("{kind}.core.stage.{name}"),

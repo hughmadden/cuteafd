@@ -1,4 +1,31 @@
 use super::*;
+
+#[test]
+fn native_attention_mount_separates_native_and_converted_read_owners() -> Result<()> {
+    use crate::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
+        shared::dense_read::{MountLoad, STEP_BYTES}};
+    let mut layout = NativeLayout { stem: "o_proj".into(), shape: [6144, 8192],
+        fp8: false, rank: 0, ranks: 2, split: CoreSplit::Input };
+    let bf16 = native_attention_mount(&layout, [6144, 16384], false)?;
+    assert_eq!(bf16, MountLoad { pinned_source: STEP_BYTES as u64,
+        full_row_cache: (2 * STEP_BYTES) as u64, pinned_tables: 0 });
+    layout.fp8 = true;
+    let fp8 = native_attention_mount(&layout, [6144, 16384], false)?;
+    assert_eq!(fp8, bf16);
+    let converted = native_attention_mount(&layout, [6144, 16384], true)?;
+    assert!(converted.pinned_source <= STEP_BYTES as u64);
+    assert_eq!(converted.full_row_cache, 2 * converted.pinned_source);
+    assert!(converted.pinned_tables > 0);
+    let inventory = WeightInventory { ranks: 2, owners: vec![], core_loading: Default::default(),
+        kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: converted };
+    let components = inventory.loading_components(1)?;
+    assert_eq!(components.len(), 3);
+    for owner in converted.allocations("glm.load.native_attention") {
+        assert!(owner.id.starts_with("glm.load.native_attention."));
+        assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+    }
+    Ok(())
+}
 use crate::plan::exlr8::dense::{
     DenseAxis, DenseComponent, DenseEncoding, DenseExecution, DenseOwnership, DenseRange,
     DenseRecord, KvBGeometry, ShardSide,

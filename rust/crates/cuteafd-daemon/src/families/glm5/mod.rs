@@ -828,6 +828,7 @@ pub(crate) struct GoldenArgs {
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
     pub snapshot: PathBuf,
+    pub view: cuteafd_loader::plan::checkpoint::CheckpointView,
     pub catalog: cuteafd_loader::OfficialV41Catalog,
     /// An EXLR8 checkpoint: its own dense records run natively.
     pub native: bool,
@@ -836,15 +837,34 @@ pub(crate) struct Opened {
     startup_audit: std::cell::RefCell<Option<cuteafd_ffi::memory_ledger::AllocationAudit>>,
 }
 
+pub(crate) fn validate_selected_attention(view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    cfg: &GlmDsaConfig) -> Result<()> {
+    if let Some(ml4) = cfg.variant.ml4() {
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open_view_for_role(view,
+            "Mistral Large 4 selected attention", |name| name.contains(".attention.wq.")
+                || name.contains(".attention.wo."))?;
+        cuteafd_loader::families::mistral_large4::attention::validate(&checkpoint, ml4)?;
+    } else {
+        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(view)?;
+        cuteafd_loader::families::glm5::core::validate_native_attention(cfg, &checkpoint)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let startup_audit = crate::shared::inventory::startup_probe_enabled()
         .then(cuteafd_ffi::memory_ledger::AllocationAudit::begin);
-    let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let mut catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let draft_ownership = catalog.bundled_dspark_ownership(args.dspark)?;
     catalog.select_draft(draft_ownership)?;
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
-    let cfg = GlmDsaConfig::read(&args.snapshot)?;
+    let cfg = GlmDsaConfig::from_hf(&view.config()?)?;
+    validate_selected_attention(&view, &cfg)?;
+    cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
     cuteafd_bench::context::set_family(cfg.family_id());
     let native = catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     if native {
@@ -856,16 +876,16 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
             "EXLR8 options require a native EXLR8 checkpoint");
     }
     if args.dspark {
-        dflash::check_snapshot_target_head(&args.snapshot, cfg.head(), cfg.hidden, cfg.vocab_size, false)?;
+        dflash::check_view_target_head(&view, cfg.head(), cfg.hidden, cfg.vocab_size, false)?;
     }
     if let Some(snapshot) = &args.draft {
         // A native EXLR8 target lends its row-FP8 head through a launcher.
-        if !native { dflash::check_snapshot_target_head(&args.snapshot, cfg.head(), cfg.hidden, cfg.vocab_size, false)?; }
+        if !native { dflash::check_view_target_head(&view, cfg.head(), cfg.hidden, cfg.vocab_size, false)?; }
         dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
     }
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
-    let opened = Opened { snapshot: args.snapshot.clone(), catalog, native, cfg, library,
+    let opened = Opened { snapshot: args.snapshot.clone(), view, catalog, native, cfg, library,
         startup_audit: std::cell::RefCell::new(startup_audit) };
     opened.startup_probe(&std::iter::once(args.device).chain(args.split_device).collect::<Vec<_>>(),
         "glm/open", None, false)?;
@@ -1044,8 +1064,10 @@ impl Opened {
         let mut draft_file = None;
         use cuteafd_loader::placement::{families::glm5 as glm, planner::*};
         use glm::{admission::*, local_physical::*};
-        let checkpoint = (!native).then(|| cuteafd_loader::plan::Checkpoint::coordinator(dense_catalog.snapshot(), false, false))
-            .transpose()?;
+        let checkpoint = (!native).then(|| {
+            let view = dense_catalog.selected_view().context("GLM dense catalog has no selected view")?;
+            cuteafd_loader::plan::Checkpoint::coordinator_view(view, false, false)
+        }).transpose()?;
         // The EXLR8 checkpoint's own dense records, per coordinator rank.
         let native_plans = if native {
             (0..devices.len()).map(|rank| crate::shared::experts::exlr8::NativePlan::new(&self.snapshot,
@@ -1201,7 +1223,20 @@ impl Opened {
                 page_owners: if attention == cuteafd_loader::placement::AttentionPlacement::Context {
                     cuteafd_engine::prefix::PageOwners::Parity } else { cuteafd_engine::prefix::PageOwners::Uniform },
             }, args.max_context, concurrency)).transpose()?.flatten() };
+        let push_headers = checkpoint.is_none().then(|| cuteafd_loader::plan::Checkpoint::coordinator_view(
+            self.catalog.selected_view().context("GLM push selected view")?, false, args.dspark)).transpose()?;
+        let push_headers = checkpoint.as_ref().or(push_headers.as_ref()).context("GLM selected push headers")?;
+        let largest_native = native_records.iter().flatten().flat_map(|record| &record.components)
+            .map(|component| component.source.bytes as u64).max().unwrap_or(0);
+        let admitted_push_host = push_host_envelope(&push_headers, &self.cfg, layers, devices.len(),
+            &self.catalog, metadata.as_ref(), largest_native)?;
         let mut additional = Vec::new();
+        if let Some(envelope) = &admitted_push_host {
+            additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
+                let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+                Component::allocation(owner, bytes, false, maximum_pages)
+            }));
+        }
         if let Some((device, weights, total)) = media_owners.0 {
             let rank = devices.iter().position(|&id| id == device).context("vision device absent from GLM placement")?;
             let location = Location::coordinator(rank as u8);
@@ -1386,8 +1421,9 @@ impl Opened {
                 push_policy.plan(|| {
                     let experts = dense_push_experts()?;
                     let planned = plan_dense(peers.len())?;
-                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(
-                        &self.snapshot, Some(&self.catalog), devices.len(), experts)?;
+                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare_view_admitted(
+                        self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
+                        admitted_push_host.clone().context("GLM push host receipt")?)?;
                     Ok((prepared, planned))
                 }).context("GLM coordinator dense push planning")?
             } else { None };
@@ -1401,8 +1437,9 @@ impl Opened {
                 (None, Some(_)) if admission.coordinator_pushes() => {
                     let planned = push_policy.plan(|| {
                         let experts = native_push_experts()?;
-                        crate::shared::experts::rtx::push::CoordinatorPush::prepare(
-                            &self.snapshot, Some(&self.catalog), devices.len(), experts)
+                        crate::shared::experts::rtx::push::CoordinatorPush::prepare_view_admitted(
+                            self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
+                            admitted_push_host.clone().context("GLM push host receipt")?)
                     }).context("GLM native coordinator push planning")?;
                     planned.map(|(push, streams, ranks)| {
                         native_push = Some((push, peers.len()));
@@ -1418,8 +1455,9 @@ impl Opened {
             coordinator_push = push_policy.plan(|| {
                 let experts = dense_push_experts()?;
                 let planned = plan_dense(0)?;
-                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
-                    &self.snapshot, Some(&self.catalog), devices.len(), experts)?;
+                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_view_admitted(
+                    self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), experts,
+                    admitted_push_host.clone().context("GLM push host receipt")?)?;
                 Ok((push, 0, planned))
             }).context("GLM coordinator dense push planning")?;
         }
@@ -1427,8 +1465,9 @@ impl Opened {
         // Idle Spark peers acknowledge identity while these destinations push alone.
         if native_records.is_some() && native_push.is_none() {
             native_push = push_policy.plan(|| {
-                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(
-                    &self.snapshot, Some(&self.catalog), devices.len(), native_push_experts()?)?;
+                let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone_view_admitted(
+                    self.catalog.selected_view().context("GLM push selected view")?, Some(&self.catalog), devices.len(), native_push_experts()?,
+                    admitted_push_host.clone().context("GLM push host receipt")?)?;
                 Ok((push, 0))
             }).context("GLM native coordinator push planning")?;
         }
@@ -1971,6 +2010,12 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
         std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        std::fs::write(dir.join("attention.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "mode": opened.view.mode(), "bundle_fingerprint": opened.view.fingerprint(),
+            "config": opened.view.config_name(), "index": opened.view.index_name(),
+            "fp8_recipe": (opened.view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact)
+                .then_some(cuteafd_loader::plan::checkpoint::view::FP8_RECIPE),
+        }))?)?;
     }
     let nll_of = |l: &[f32], next: u32| {
         let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;

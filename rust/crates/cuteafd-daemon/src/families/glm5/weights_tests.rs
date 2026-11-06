@@ -90,7 +90,7 @@ fn attention_residency_does_not_depend_on_optional_operand_names() {
                 mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
                 split: true, attention_split: owner.is_none(), attention_owner: owner,
                 attention_resident: resident, operands: HashMap::new(), native: HashMap::new(),
-                core: Default::default(), native_projections: HashMap::new(),
+                core: Default::default(), native_projections: HashMap::new(), attention_native: Default::default(),
             };
             assert_eq!(layer.holds_attention(), resident, "owner={owner:?}, rank={rank}");
             assert!(layer.range("q_a_norm").is_none());

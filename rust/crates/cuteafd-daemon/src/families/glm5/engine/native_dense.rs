@@ -221,9 +221,16 @@ impl<'a> GlmEngine<'a> {
         w.core.as_deref().context("GLM K6 scratch not admitted")
     }
 
+    fn core_shape(layer: &GlmLayer<'_>, key: &str) -> Result<[usize; 2]> {
+        layer.core.get(key).map(|w| w.shape).or_else(|| layer.attention_native.get(key).map(|w| w.layout.shape))
+            .with_context(|| format!("GLM missing staged projection {key}"))
+    }
+
     pub(super) fn core_split(layer: &GlmLayer<'_>, key: &str) -> bool {
         layer.core.get(key).is_some_and(|weight|
             weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
+            || layer.attention_native.get(key).is_some_and(|w| w.layout.ranks > 1
+                && w.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input)
     }
 
     /// Remote routed output already includes the complete shared down-core
@@ -234,10 +241,10 @@ impl<'a> GlmEngine<'a> {
 
     /// Native cores occupy a disjoint partition of each existing receive slot:
     /// the following routed/BF16 publication must not overwrite a live core.
-    fn core_received(&self, rank: usize, slot: usize, rows: usize) -> Result<Buffer> {
+    fn core_received(&self, rank: usize, slot: usize, rows: usize, element_bytes: usize) -> Result<Buffer> {
         let exchange = self.exchange()?;
         let offset = self.prefill_rows.max(DECODE_ROWS) * self.cfg.hidden * self.tp2_exchange.element_bytes();
-        let bytes = rows * self.cfg.hidden * 2;
+        let bytes = rows * self.cfg.hidden * element_bytes;
         ensure!(offset + bytes <= exchange.slot_bytes(), "GLM K6 peer core exceeds admitted receive slot");
         let base = Buffer { ptr: exchange.recv(rank, slot)?, bytes: exchange.slot_bytes(),
             device_id: exchange.device(rank), flags: 0 };
@@ -249,8 +256,9 @@ impl<'a> GlmEngine<'a> {
         let at = slot(index, key == "down", lane);
         if Self::core_split(layer, key) {
             let core = &w.core_rows.as_ref().context("GLM K6 retained core rows")?[usize::from(key == "down")];
+            let element_bytes = if layer.attention_native.contains_key(key) { 4 } else { 2 };
             self.exchange()?.push_to(rank, at, core.buffer.ptr,
-                self.core_received(1 - rank, at, rows)?.ptr, rows * self.cfg.hidden * 2)
+                self.core_received(1 - rank, at, rows, element_bytes)?.ptr, rows * self.cfg.hidden * element_bytes)
         } else {
             self.exchange()?.push(rank, at, w.delta.buffer.ptr, rows * self.cfg.hidden * 2)
         }
@@ -258,14 +266,23 @@ impl<'a> GlmEngine<'a> {
 
     fn reduce_projection(&self, rank: usize, index: usize, lane: usize, w: &Workspace<'_>,
         layer: &GlmLayer<'_>, key: &str, rows: usize, output: Buffer) -> Result<()> {
-        let weights = layer.core.get(key).context("GLM K6 split weights")?;
         let programs = self.core_programs(rank)?;
         let retained = w.core_rows.as_ref().context("GLM K6 retained core rows")?;
         let local = retained[usize::from(key == "down")].buffer;
-        let peer = self.core_received(rank, slot(index, key == "down", lane), rows)?;
+        let native = layer.attention_native.contains_key(key);
+        let peer = self.core_received(rank, slot(index, key == "down", lane), rows, if native { 4 } else { 2 })?;
         // Widen retained BF16 cores for rank-ordered F32 addition, then run
         // the one complete H128/svh egress.
         let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
+        if native {
+            // SAFETY: both rank-ordered F32 partials have completed their exchange;
+            // distinct admitted reduction/output owners survive stream completion.
+            return self.on(rank, || unsafe {
+                programs.f32_add.launch(first, second, retained[2].buffer, rows * self.cfg.hidden, self.stream_of(rank))?;
+                programs.narrow.launch(retained[2].buffer.ptr, output.ptr, rows * self.cfg.hidden, self.stream_of(rank))
+            });
+        }
+        let weights = layer.core.get(key).context("GLM K6 split weights")?;
         self.on(rank, || programs.projection(weights)?.reduced(&programs.add, rows,
             first, second, retained[2].buffer, weights, output, self.stream_of(rank)))
     }
@@ -319,6 +336,13 @@ impl<'a> GlmEngine<'a> {
     /// following projection reuses the accumulator. Their caller owns the meet.
     fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, key: &str,
         input: Buffer, output: Buffer, rows: usize, retained: Option<Buffer>) -> Result<()> {
+        if let Some(weights) = layer.attention_native.get(key) {
+            let output = if Self::core_split(layer, key) {
+                retained.context("GLM native split projection has no retained F32 storage")?
+            } else { output };
+            return self.on(rank, || self.core_programs(rank)?.native(weights,
+                self.core_scratch(w)?, input, output, rows, self.stream_of(rank)));
+        }
         let weights = layer.core.get(key).with_context(|| format!("GLM K6 missing {key}"))?;
         let programs = self.core_programs(rank)?;
         let scratch = self.core_scratch(w)?;
@@ -344,7 +368,7 @@ impl<'a> GlmEngine<'a> {
         let pitch = self.cfg.q_lora_rank + self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim;
         for (key, logical, column) in [("q_a", self.cfg.q_lora_rank, 0),
             ("kv_a", self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim, self.cfg.q_lora_rank)] {
-            let stored = layer.core[key].shape[0];
+            let stored = Self::core_shape(layer, key)?[0];
             self.core_linear(rank, w, layer, key, w.x.buffer, q, rows, None)?;
             let (source_pitch, destination_pitch, width, offset) = super::super::core_runtime::pack_layout(
                 rows, stored, logical, pitch, column)?;
@@ -399,9 +423,9 @@ impl<'a> GlmEngine<'a> {
             ("s", layer.ptr("query_scale_s")?), ("b", layer.ptr("query_scale_b")?), ("query", query)], &[row])?;
         self.run_on(rank, &format!("{family}_absorb{tag}{placed}_{cap}"), &[("a", q.ptr), ("w", layer.ptr("w_uk")?),
             ("out", query)], &[row])?;
-        if layer.core.contains_key("kv_a") {
+        if layer.core.contains_key("kv_a") || layer.attention_native.contains_key("kv_a") {
             let width = self.cfg.kv_lora_rank + if rope { self.cfg.qk_rope_head_dim } else { 0 };
-            let stored = layer.core["kv_a"].shape[0];
+            let stored = Self::core_shape(layer, "kv_a")?[0];
             self.core_linear(rank, w, layer, "kv_a", w.x.buffer, q, rows, None)?;
             let (source_pitch, destination_pitch, bytes, _) = super::super::core_runtime::pack_layout(
                 rows, stored, width, width, 0)?;

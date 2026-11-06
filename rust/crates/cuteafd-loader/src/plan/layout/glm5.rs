@@ -534,8 +534,14 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         storage: LocalStorage::for_snapshot(&checkpoint.snapshot)?,
         route_checks: true, peer_diagnostics: false, activations: options.exlr8_prefill_activations };
     let source = local.as_ref().map(|local| LocalPhysicalSource::read(&cfg, &catalog, local, &physical, None)).transpose()?;
-    let (draft, additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
+    let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpus, maximum_pages)?;
+    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpus, &catalog, None, 0)? {
+        additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }));
+    }
     use crate::plan::encoder::{EncoderRequest, EncoderHardware, EncoderGpuBudget, EncoderSparkBudget, EncoderKind};
     let towers = towers(report, checkpoint);
     let (weights, encoder_scratch) = match towers.vision {

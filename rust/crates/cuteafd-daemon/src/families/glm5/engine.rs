@@ -875,6 +875,9 @@ impl<'a> GlmEngine<'a> {
             "attach_peer needs the head-split shares of every loaded layer");
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let core_bytes = if layers.iter().chain(&self.weights.layers).any(|layer|
+            layer.attention_native.values().any(|w| w.layout.ranks > 1
+                && w.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input)) { 4 }
+        else if layers.iter().chain(&self.weights.layers).any(|layer|
             layer.core.values().any(|weight| weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)) { 2 } else { 0 };
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 4 * self.prefill_lanes.max(1),
@@ -1148,9 +1151,9 @@ impl<'a> GlmEngine<'a> {
             } else { vec![] },
             page_tables: (0..slots).map(|_| self.alloc(tables).map(Buf::owned)).collect::<Result<_>>()?,
             core_rows: if self.core_programs.get(rank).is_some_and(Option::is_some) {
-                // Attention/down retain BF16; their ordered sum remains F32.
+                // Native TP2 attention retains F32; K6 down keeps its BF16 ABI.
                 let allocate = |element_bytes| self.alloc(rows * self.cfg.hidden * element_bytes).map(Buf::owned);
-                Some([allocate(2)?, allocate(2)?, allocate(4)?])
+                Some([allocate(self.core_admission.as_ref().context("GLM missing core admission")?.ranks[rank].attention_partial_bytes)?, allocate(2)?, allocate(4)?])
             } else { None } })
     }
 
@@ -2913,7 +2916,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
         kv: cuteafd_ffi::CuteafdDeviceBuffer, query: *mut c_void) -> Result<()> {
-        if layer.core.contains_key("q_a") {
+        if layer.core.contains_key("q_a") || layer.attention_native.contains_key("q_a") {
             let context = self.context.is_some() && query != w.query.buffer.ptr;
             return self.core_producer(rank, w, layer, scalar_rows(rows)?, cap, kv, query, context);
         }
@@ -2966,7 +2969,7 @@ impl<'a> GlmEngine<'a> {
         if self.cfg.variant.ml4().is_some() {
             return self.ml4_core_o_proj(rank, w, layer, scalar_rows(rows)?, cap);
         }
-        if layer.core.contains_key("o") {
+        if layer.core.contains_key("o") || layer.attention_native.contains_key("o") {
             return self.core_o_proj(rank, w, layer, scalar_rows(rows)?, cap);
         }
         if layer.is_native() {
