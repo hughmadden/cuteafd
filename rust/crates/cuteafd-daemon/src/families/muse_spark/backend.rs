@@ -135,6 +135,7 @@ pub(crate) struct MuseBackend<'r, 'a> {
     waves: usize,
     slots: usize,
     context: usize,
+    host_prefix_bytes: u64,
     pages: usize,
     ring_rows: usize,
     /// Each rank's onboarded experts (empty: every layer on the Sparks).
@@ -153,7 +154,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         table: &'r TokenEmbedding<'a>, experts: &'r mut dyn SparkExperts, peer: Option<&'r super::peer::MusePeer<'a>>,
         unit_rows: usize, waves: usize, slots: usize, context: usize, pages: usize,
         local: Vec<super::onboard::OnboardedExperts<'a>>, draft: Option<super::draft::MuseDraft<'a>>,
-        pricing: Option<DraftPricing>, media_binding: super::media::Binding, packing: crate::shared::prefill_packing::PackingMode) -> Result<Self> {
+        pricing: Option<DraftPricing>, media_binding: super::media::Binding, packing: crate::shared::prefill_packing::PackingMode, host_prefix_bytes: u64) -> Result<Self> {
         ensure!(draft.is_some() == pricing.is_some(), "Muse drafter and its policy pricing come together");
         // Every Muse layer is MoE; the probe rings the head rank's route ids per layer.
         let head = ranks.last().context("Muse backend without ranks")?.device;
@@ -178,7 +179,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             (Some(0), reason)
         } else { (None, String::new()) };
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
-            profile: RefCell::new([0.0; 2]), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, context, pages, ring_rows,
+            profile: RefCell::new([0.0; 2]), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, context, host_prefix_bytes, pages, ring_rows,
             local: RefCell::new(local), draft, pricing, probe: RefCell::new(probe) })
     }
 
@@ -280,7 +281,9 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             args.mark_rule(lanes).slots(super::prefix::mark_bytes(self.cfg, self.ranks.len())?))?;
         let layout = family.layout();
         // The host tier copies the registered record pools and mark arenas.
-        let host = args.host_config(layout, self.context, lanes)?.map(|config|
+        let mut admitted = args.clone();
+        admitted.host_cache_bytes = crate::shared::prefix::budget::HostBudget::Bytes(self.host_prefix_bytes);
+        let host = admitted.resolve_host_config(layout, self.context, lanes)?.map(|config|
             CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy)))
             .transpose()?;
         let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);

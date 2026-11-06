@@ -624,6 +624,8 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
               "mimo-v26-pro-mxfp4-min.config", "mimo-v26-pro-mxfp4-max.config"][..], "capture_mimo_real_planner_launch"),
             (&["deepseek-v4-flash-mxfp4-min.config", "deepseek-v4-pro-exl3-max.config"][..],
               "capture_v4_real_planner_launch"),
+            (&["muse-spark-exl3-min.config", "muse-spark-exl3-max.config"][..],
+              "capture_muse_real_planner_launch"),
         ].into_iter().find_map(|(names, capture)| names.contains(&name).then_some(capture));
         if let Some(capture) = capture {
             installed_real_planner_launch(root, capture, &snapshot, &example, &programs, &hf_home);

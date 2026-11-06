@@ -7,6 +7,30 @@ pub const AGENTIC_FLOOR_TOKENS: u64 = 262_144;
 const SMALL_CARD_BYTES: u64 = 32 << 30;
 const SMALL_CARD_POOL_TOKENS: u64 = 1 << 20;
 
+/// Physical card identity and an independent operator memory ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatorCard {
+    pub physical_bytes: u64,
+    pub logical_bytes: u64,
+}
+
+impl CoordinatorCard {
+    /// Offline caps are not card identities. Absent physical facts, assume
+    /// the architecture's default PRO class, and report that assumption.
+    pub fn planned(logical_bytes: u64, physical_sms: Option<u32>) -> Self {
+        let class = physical_sms.and_then(|sms| super::inventory::ARCH_CONTEXTS.iter()
+            .find(|class| class.arch == "sm_120" && class.sms == sms));
+        let physical_bytes = class.map_or(super::inventory::PRO_TOTAL_BYTES, |class|
+            if class.total_bytes == 0 { SMALL_CARD_BYTES } else { class.total_bytes });
+        Self { physical_bytes, logical_bytes }
+    }
+
+    pub fn maximum_pool(cards: &[Self], context: u64, requested: Option<u64>, page_rows: u64) -> u64 {
+        let physical = cards.iter().map(|card| card.physical_bytes).collect::<Vec<_>>();
+        PoolPolicy::resolve(&physical, context, requested, page_rows, false).maximum_tokens()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolPolicy {
     /// Fixed or operator-set context requirement; zero for automatic context.
@@ -92,6 +116,20 @@ impl PoolPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_pro_has_the_same_planned_and_sampled_pool_extent() {
+        let planned = CoordinatorCard::planned(32 << 30, Some(188));
+        let sampled = CoordinatorCard { physical_bytes: super::super::inventory::PRO_TOTAL_BYTES,
+            logical_bytes: 32 << 30 };
+        assert_eq!(planned, sampled);
+        assert_eq!(CoordinatorCard::maximum_pool(&[planned], 262_144, None, 64), 2 << 20);
+        assert_eq!(CoordinatorCard::maximum_pool(&[planned], 262_144, Some(0), 64),
+            CoordinatorCard::maximum_pool(&[sampled], 262_144, None, 64));
+        assert_eq!(CoordinatorCard::planned(32 << 30, None), planned);
+        assert_eq!(CoordinatorCard::maximum_pool(&[CoordinatorCard::planned(28 << 30, Some(170))],
+            262_144, None, 64), 1 << 20);
+    }
 
     #[test]
     fn targets_follow_the_smallest_card_and_the_context() {

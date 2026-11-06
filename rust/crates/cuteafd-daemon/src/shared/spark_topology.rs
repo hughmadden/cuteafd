@@ -252,7 +252,7 @@ mod tests {
                 .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
             assert_eq!(spark_devices.len(), 8, "{key}");
             for device in spark_devices {
-                assert_eq!(device.worker_budget_bytes, 108 << 30, "{key}");
+                assert_eq!(device.worker_budget_bytes, (if family == "muse" { 100 } else { 108 }) << 30, "{key}");
                 assert!(device.worker_budget_bytes <= device.capacity_bytes && device.worker_budget_bytes <= 121 << 30,
                     "{key}: worker ceiling exceeds device capacity");
             }
