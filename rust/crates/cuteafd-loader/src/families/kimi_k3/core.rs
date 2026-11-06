@@ -101,8 +101,15 @@ impl CoreInventory {
     /// All native projection routes that placement may select, resolved before allocation.
     /// Tuple fields are (K, N, FP8 storage, F32 TP2 partial output).
     pub fn native_geometries(&self, ranks: usize) -> Result<Vec<(usize, usize, bool, bool)>> {
+        Ok(self.native_layouts(ranks)?.iter().map(|layout| (layout.shape[1], layout.shape[0], layout.fp8,
+            layout.ranks == 2 && layout.split == CoreSplit::Input))
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect())
+    }
+
+    pub fn native_layouts(&self, ranks: usize)
+        -> Result<Vec<crate::families::glm5_flash::core::NativeLayout>> {
         ensure!(matches!(ranks, 1 | 2), "Kimi native attention physical rank count");
-        let mut shapes = std::collections::BTreeSet::new();
+        let mut layouts = Vec::new();
         for (stem, projection) in &self.native {
             let mla = stem.ends_with(".q_b_proj") || (stem.ends_with(".o_proj")
                 && self.projections.contains_key(&format!("{}.q_a_proj", stem.rsplit_once('.').unwrap().0)));
@@ -115,10 +122,12 @@ impl CoreInventory {
                     CoreSplit::Output => n /= world,
                     CoreSplit::Whole => {},
                 }
-                shapes.insert((k, n, projection.fp8, world == 2 && projection.split == CoreSplit::Input));
+                layouts.push(crate::families::glm5_flash::core::NativeLayout {
+                    stem: stem.clone(), shape: [n, k], fp8: projection.fp8,
+                    rank: 0, ranks: world, split: projection.split });
             }
         }
-        Ok(shapes.into_iter().collect())
+        Ok(layouts)
     }
 
     /// Serialized native records reuse one mapped BF16 source and quant table.
@@ -526,6 +535,7 @@ mod tests {
             "programs":names.into_iter().map(|name| serde_json::json!({"name":name,
                 "scratch_bytes_at_capacity":{"scratch":256}})).collect::<Vec<_>>()});
         let compact_index = std::fs::read(dir.path().join("model.safetensors.index.json"))?;
+        std::fs::write(dir.path().join("quantize_config.json"), "{}")?;
         for (source, target) in [("config.json", "config.compact-attention.json"),
             ("model.safetensors.index.json", "model.compact-attention.safetensors.index.json"),
             ("quantize_config.json", "quantize_config.compact-attention.json")] {
