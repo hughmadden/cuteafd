@@ -28,6 +28,7 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
     cards.bench_panels.cache_clear()
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda *args: None)
     bin_dir = tmp_path / '.cuteafd-test-bin'
     bin_dir.mkdir(exist_ok=True)
     cuteafd_bin = bin_dir / 'cuteafd'
@@ -3181,3 +3182,27 @@ def test_layer_timing_reported_in_result_and_summary(entry, tmp_path, profile, p
     cards.write_summary(tmp_path, [row], {'a': {}})
     assert f'| {expected} |' in (tmp_path / 'summary.md').read_text()
     assert json.loads((tmp_path / 'summary.json').read_text())['rows'][0]['instrumentation']['per_layer_timing'] == expected
+
+
+def test_deployment_preflight_uses_the_same_launcher_admission(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    arm = dict(instance="test-base", slot="s", repo=str(ROOT))
+    # Bypass only the autouse sandbox stub for this bounded command-contract test.
+    original = importlib.util.module_from_spec(SPEC)
+    SPEC.loader.exec_module(original)
+    calls = []
+    def launch(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(stdout="admitted deployment")
+    monkeypatch.setattr(original, "run", launch)
+    assert original.preflight_deployment(job, arm) == "admitted deployment"
+    cmd, kwargs = calls[0]
+    assert cmd[:3] == [str(ROOT / "run.sh"), "--config", job["entry"]["config"]]
+    assert "--dry-run" in cmd and "--total-capacity" in cmd
+    assert "--restart" not in cmd and kwargs["timeout"] == 300
+    assert "--wip" in cmd and "SPARK_COUNT=3" in cmd
+    def refused(cmd, **kwargs):
+        raise subprocess.CalledProcessError(2, cmd, stderr="planner: does not fit")
+    monkeypatch.setattr(original, "run", refused)
+    with pytest.raises(ValueError, match="planner: does not fit"):
+        original.preflight_deployment(job, arm)

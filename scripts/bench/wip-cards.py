@@ -683,6 +683,24 @@ def preflight_at_grant(job, arm):
     return preflight_job(job, arm)
 
 
+def preflight_deployment(job, arm):
+    """Use the launcher's CPU deployment admission, not a second family policy."""
+    repo = Path(arm.get('repo', REPO))
+    entry = job['entry']
+    cmd = [str(repo / 'run.sh'), '--config', entry['config'],
+           *entry.get('run_args', []), '--dry-run', '--total-capacity']
+    for key, value in sorted(entry.get('set', {}).items()):
+        cmd += ['--set', f'{key}={value}']
+    try:
+        result = run(cmd, timeout=300)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or str(error)).strip()
+        raise ValueError('launcher deployment preflight refused: ' + detail) from None
+    except subprocess.TimeoutExpired:
+        raise ValueError('launcher deployment preflight timed out after 300 seconds') from None
+    return result.stdout
+
+
 def preflight_job(job, arm):
     """Everything about one job that is checkable before its turn: the arm is
     sealed on every host it runs on, the slot holds the packages and audio entry
@@ -726,6 +744,7 @@ def preflight_job(job, arm):
                 problems.append(f'{key} directory {directory} is not writable')
     if problems:
         raise ValueError('; '.join(problems))
+    preflight_deployment(job, arm)
     return artifacts
 
 

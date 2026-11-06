@@ -188,13 +188,13 @@ def test_flash_native_tp2_without_sparks_leaves_attention_to_planner(tmp_path, a
     assert "--split-device 1" in coordinators[0]
 
 
-def test_glm_native_without_sparks_still_refuses(tmp_path):
+def test_glm_native_without_sparks_defers_to_planner(tmp_path):
     config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
     keys = ("EXLR8_MANIFEST=up1\nSPARK_COUNT=0\nRTX_GPUS=2\nCOORDINATOR_GPUS=0,1\n"
             "EXPERT_BACKEND=local\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     result = _family_launch_result(tmp_path, config, "test/glm-exlr8-local", keys)
-    assert result.returncode != 0
-    assert "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "cuteafd plan" in result.stderr and "cuteafd expertd-native" not in result.stderr
 
 
 @pytest.mark.parametrize("manifest", ["../k4", "k4.json", "k4/other", "k4;false", "k4 space"])
@@ -254,7 +254,7 @@ def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_pat
             assert "--spark-budget-gib" not in plan
         else:
             assert float(plan[plan.index("--spark-budget-gib") + 1]) == explicit / 2**30
-    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    workers = [line for line in result.stderr.splitlines() if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
     assert len(workers) == 4
     assert all(f"--device-budget-bytes {device_budget} " in worker for worker in workers)
 
@@ -947,7 +947,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s \\n" "$(basename "$0") $*" >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
+                                    'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; echo "vision encoder ready"; '
                                     'printf "audio encoder ready \\033[3mbackend\\033[0m\\033[2m=\\033[0m%s\\n" '
                                     '"${STUB_AUDIO_BACKEND:-' + audio_backend + '}" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
@@ -970,7 +970,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      if tool == "docker" and previous_peers is not None else ''))
         if tool == "ssh" and execute_workers:
             with (bin_dir / tool).open("a") as stream:
-                stream.write('if [[ "$*" == *"release_hub_mounts ()"* ]]; then shift; command="$*"; '
+                stream.write('if [[ "$*" == *"release_hub_mounts ()"* ]]; then while [[ "$1" == -* ]]; do shift 2; done; shift; command="$*"; '
                              'if [[ -n "${STUB_REMOTE_HF_HOME:-}" ]]; then command="${command//${HF_HOME}/${STUB_REMOTE_HF_HOME}}"; fi; '
                              'exec bash -c "$command"; fi\n')
         if tool == "ssh" and native_v41:
@@ -1080,9 +1080,20 @@ if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
     decode_lanes = 1
 report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
     decode_lanes=decode_lanes)
-deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
-    topology=dict(tp=tp, ep=ep,
-                  wire="native_ownership" if explicit else "canonical"), peers=peers,
+expert_world = int(report.get("spark_expert_world", ranks))
+roles = report.get("spark_roles", [dict(rank=i, experts=i < expert_world, layers=[], encoder=None, audio_encoder=None, drafter=None) for i in range(ranks)])
+for key, field in (("encoder", "encoder"), ("audio_encoder", "audio_encoder")):
+    placement = report.get(key)
+    if placement and placement["kind"]["kind"] == "spark":
+        for rank in [placement["kind"]["rank"], *placement.get("replicas", [])]:
+            next(role for role in roles if role["rank"] == rank)[field] = placement
+ranks = len(roles)
+report["spark_ranks"] = ranks
+peers = peers[:expert_world]
+deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio_encoder"),
+    encoder_plan_hash=report.get("encoder_plan_hash", "ab" * 32), spark_expert_world=expert_world, spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
+    topology=dict(tp=expert_world, ep=ep,
+                  wire="native_ownership" if explicit and expert_world else "canonical"), peers=peers,
     speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
@@ -1090,7 +1101,7 @@ deployment = dict(version=1, family=family, executable=family != "qwen3_5" and p
     artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report,
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
                                                                  dict(category="kv", bytes=64 << 30)]) for i in range(gpus)] +
-                               [dict(kind="spark", index=i, capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for i in range(ranks)]))
+                               [dict(kind="spark", index=role["rank"], capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for role in roles]))
 deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
 if deployment.get("wip_launchable") == "absent":
     deployment.pop("wip_launchable")
@@ -1098,7 +1109,8 @@ print(json.dumps(deployment))
 """)
     config = repo / "f.config"
     initial_count = 0 if "EXPERT_BACKEND=local" in keys else 1
-    config.write_text(f"MODEL_ID={model}\nSPARK_COUNT={initial_count}\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
+    config.write_text(f"MODEL_ID={model}\nSPARK_COUNT={initial_count}\n" + "".join(
+        f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n" for rank in range(8)) + keys)
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "STUB_PROGRAMS": str(tmp_path / "PROGRAMS.json"), "STUB_SPARK_COUNT": str(exact_count),
            "STUB_DEPLOYMENT": str(deployment_stub), "STUB_CHECKPOINT": json.dumps(family_config),
@@ -1129,7 +1141,8 @@ print(json.dumps(deployment))
 
     # V4.1 launches its experts through a heredoc (the command line is stdin, so
     # it prints no worker argv); every other family prints one per host.
-    expected = 0 if native_v41 or completed.returncode else exact_count
+    active_count = len(encoder_plan.get("spark_roles", range(exact_count))) if encoder_plan else exact_count
+    expected = 0 if native_v41 or completed.returncode else active_count
     deadline = time.monotonic() + 10
     while True:
         text = read(stderr_path)
@@ -1973,7 +1986,7 @@ def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, con
         "EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + keys,
         extra_env=env)
     assert result.returncode == 0, result.stderr
-    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    workers = [line for line in result.stderr.splitlines() if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
     assert workers
     assert all("--rdma-endpoints" not in line and "--capacity" not in line for line in workers)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
@@ -2029,7 +2042,7 @@ def test_generic_custom_hosts_reach_workers_from_config(tmp_path, count):
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 4},
                                   "test/model", keys, root_launcher=True)
     assert result.returncode == 0, result.stderr
-    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    workers = [line for line in result.stderr.splitlines() if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
     assert len(workers) == count
     for rank, host in enumerate(reversed(hosts)):
         worker = next(line for line in workers if f"--rank {rank} --world {count}" in line)
@@ -3739,9 +3752,15 @@ def test_qwen_preferred_experts_use_the_planner_before_launch(tmp_path: Path, ba
                                                              preferred: int, local: bool) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
                                   f"EXPERT_BACKEND={backend}\n", preferred_ranks=preferred)
-    assert result.returncode != 0
-    assert "planner changed exact Spark count" in result.stderr
-    assert "cuteafd serve-qwen4" not in result.stderr
+    if preferred == 0:
+        assert result.returncode == 0, result.stderr
+        launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+        assert "--local-experts" in launch
+        assert "cuteafd expertd-native" not in result.stderr
+    else:
+        assert result.returncode != 0
+        assert "planner requested more Spark ranks than configured" in result.stderr
+        assert "cuteafd serve-qwen4" not in result.stderr
 
 
 def test_qwen_preferred_local_allows_native_mtp(tmp_path: Path) -> None:
@@ -4946,3 +4965,73 @@ def test_tp2_dflash_rejects_inapplicable_launch(tmp_path, keys):
                                   "test/tp2-dflash", keys + "TP2_DFLASH=on\n")
     assert result.returncode == 2, result.stderr
     assert "TP2_DFLASH requires" in result.stderr
+
+@pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41", "step5", "kimi_k3"])
+@pytest.mark.parametrize("fits", [True, False])
+def test_zero_spark_is_admitted_by_planner_not_family(tmp_path, family, fits):
+    config = {"model_type": family}
+    if family == "kimi_k3":
+        config["num_hidden_layers"] = 2
+    elif family == "step5":
+        config.update(num_hidden_layers=92, moe_layer_list=list(range(3, 91)))
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    keys = "MODEL_REVISION=\nSPARK_COUNT=0\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    result = _family_launch_result(tmp_path, config, model, keys,
+        extra_args=("--wip", "zero-spark"),
+        encoder_plan={"placement_supported": fits, "fits": fits, "hints": ["does not fit"]})
+    assert (result.returncode == 0) == fits, result.stderr
+    assert " plan " in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+    if not fits:
+        assert "does not fit" in result.stderr and "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("media", ["off", "spark:0", "spark:2"])
+@pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
+def test_expertless_deployment_starts_only_assigned_media(tmp_path, media, family):
+    config = {"model_type": family, "vision_config": {"depth": 2}}
+    if family == "mimo_v2":
+        config["moe_layer_freq"] = [0, 1]
+        config["num_hidden_layers"] = 2
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    rank = int(media.split(":")[1]) if media != "off" else 0
+    placement = {"kind": {"kind": "spark", "rank": rank} if media != "off" else {"kind": "off"}, "replicas": []}
+    ranks = 1 if media != "off" else 0
+    roles = [dict(rank=rank, experts=False, layers=[], encoder=placement, audio_encoder=None, drafter=None)] if ranks else []
+    result = _family_launch_result(tmp_path, config, model,
+        f"MODEL_REVISION=\nSPARK_COUNT=3\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\nSPARK_2_HOST=h2\nSPARK_2_LANE_A=10.0.0.3\nRTX_GPUS=1\nSPECULATOR=off\nVISION={media}\nAUDIO=off\n",
+        extra_args=("--wip", "media-only"), execute_workers=True,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_expert_world": 0,
+                      "spark_roles": roles, "encoder": placement, "encoder_plan_hash": "ab" * 32})
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    assert len(workers) == ranks, result.stderr
+    if ranks:
+        worker = workers[0]
+        assert "--encoder-only" in worker and "--encoder-listen" in worker
+        assert "--world" not in worker and "--listen 0.0.0.0:19441" not in worker
+        assert "--spark-tp" not in worker
+    else:
+        assert "docker run -d --name cuteafd-spark-expert" not in result.stderr
+    coordinator = next(line for line in result.stderr.splitlines()
+                       if "docker run -d" in line and "--max-output-tokens" in line)
+    if family == "mimo_v2":
+        assert "--local-experts" in coordinator
+    assert "127.0.0.1:1,127.0.0.1:2" not in coordinator
+    for unused in set(range(3)) - ({rank} if ranks else set()):
+        assert f"cuteafd-spark-expert-h{unused}-19441" not in result.stderr
+
+
+@pytest.mark.parametrize("role,world,diagnostic", [
+    (dict(rank=3, experts=False, encoder={"kind": {"kind": "spark", "rank": 3}}), 0, "inconsistent Spark roles"),
+    (dict(rank=1, experts=True), 1, "inconsistent Spark roles"),
+    (dict(rank=0, experts=False, drafter={"kind": {"kind": "spark", "rank": 0}}), 0, "unsupported Spark drafter role"),
+])
+def test_spark_roles_reject_unlaunchable_rank_contracts(tmp_path, role, world, diagnostic):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}, "test/model",
+        "SPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        encoder_plan={"placement_supported": True, "fits": True, "spark_expert_world": world,
+                      "spark_roles": [dict(layers=[], encoder=None, audio_encoder=None, drafter=None) | role]})
+    assert result.returncode != 0 and diagnostic in result.stderr, result.stderr
+    assert "docker run -d" not in result.stderr

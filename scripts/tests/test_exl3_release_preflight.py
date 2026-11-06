@@ -39,7 +39,8 @@ if tool == 'docker':
         tp, ep = int(value('--spark-tp', str(ranks))), int(value('--spark-ep', '1'))
         explicit = '--spark-tp' in args or ranks == 3
         gpus = int(value('--rtx', '1'))
-        print(json.dumps(dict(spark_ranks=ranks, prefill_unit_rows=rows or 1024,
+        print(json.dumps(dict(spark_expert_world=ranks,
+            spark_roles=[dict(rank=i, experts=True, layers=[], encoder=None, audio_encoder=None, drafter=None) for i in range(ranks)], spark_ranks=ranks, prefill_unit_rows=rows or 1024,
             prefill_waves=1, prefill_span_rows=rows or 1024, prefill_reserve_rows=8192, decode_lanes=2,
             version=1, family='deepseek_v41', executable=True, wip_launchable=True,
             launch=dict(family='deepseek_v41'),
