@@ -310,10 +310,12 @@ async fn run() -> Result<()> {
     };
     // GLM 5.3 Flash: automatic vision serves text when the checkpoint's own chat template cannot
     // mark images. Planner-resolved peers are an explicit placement and keep serving's refusal.
-    let vision = match &command {
+    let vision = match &mut command {
         Commands::ServeGlmf(args) if args.vision_peers.is_none() => {
-            let (vision, note) = families::glm5_flash::serve::auto_vision(vision, &args.engine.snapshot,
+            let view = args.engine.attention.select(&args.engine.snapshot)?;
+            let (vision, note) = families::glm5_flash::serve::auto_vision_view(vision, &view,
                 args.chat_template_from.as_deref())?;
+            args.engine.selected_view = Some(view);
             if let Some(note) = note { tracing::warn!("{note}"); }
             vision
         }

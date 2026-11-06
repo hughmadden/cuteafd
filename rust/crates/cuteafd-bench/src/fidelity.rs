@@ -321,7 +321,9 @@ const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-f
     "fp8-decode", "mtp-fp8-head", "kv-cache", "kv-format", "expert-input", "kda-state", "target-head",
     "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "CUTEAFD_SPARK_DECODE_REPLY_FORMAT",
     "spark-prefill-reply-format", "spark-decode-reply-format",
-    "spark-prefill-reply-format-explicit", "spark-decode-reply-format-explicit"];
+    "spark-prefill-reply-format-explicit", "spark-decode-reply-format-explicit",
+    "compact-attention", "fp8-compact-attention", "attention-mode", "attention-bundle-fingerprint",
+    "attention-fp8-recipe", "CUTEAFD_COMPACT_ATTENTION", "CUTEAFD_FP8_COMPACT_ATTENTION"];
 
 /// Quant selection: settings a cross-checkpoint pair may also change, beside the precision
 /// switches. Exact names only; each one picks which weights serve, nothing else.
@@ -937,6 +939,25 @@ mod tests {
         a = b.clone(); a.settings["settings"] = serde_json::json!({});
         assert!(compare(&a, &a, 0.005, 0.005, 100, 1).is_err());
         a = b.clone(); a.settings["family"] = serde_json::json!("other");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
+    }
+
+    #[test]
+    fn attention_modes_are_precision_only_not_layout_or_code_changes() {
+        let mut b = run(3, 8);
+        b.settings = serde_json::json!({"snapshot": "/snapshots/revision", "model": "checkpoint", "settings": [
+            {"name": "attention-mode", "value": "hqa"},
+            {"name": "attention-bundle-fingerprint", "value": "bf16-identity"},
+            {"name": "attention-fp8-recipe", "value": "none"}]});
+        let mut a = b.clone();
+        a.settings["settings"][0]["value"] = serde_json::json!("fp8-compact");
+        a.settings["settings"][1]["value"] = serde_json::json!("fp8-identity");
+        a.settings["settings"][2]["value"] = serde_json::json!("recipe-v1");
+        assert!(compare(&a, &b, 0.005, 0.005, 100, 1).unwrap().pass);
+        assert!(layout_comparison(&a, &b).is_err());
+        assert_ne!(layout_settings(&a.settings).unwrap(), layout_settings(&b.settings).unwrap());
+        a.settings["settings"].as_array_mut().unwrap().push(serde_json::json!({
+            "name": "attention-placement", "value": "context"}));
         assert!(compare(&a, &b, 0.005, 0.005, 100, 1).is_err());
     }
 

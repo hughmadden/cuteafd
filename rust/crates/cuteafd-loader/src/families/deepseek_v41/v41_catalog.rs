@@ -874,6 +874,11 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
 /// Opens the routed experts of any supported checkpoint: the strict V4.1
 /// contract, or a DeepSeek V4 (Flash/Pro) checkpoint whose experts share the
 /// V4.1 storage (packed FP4 in I8, E8M0 scales per 32 values).
+pub fn read_expert_catalog_view(view: &crate::plan::checkpoint::CheckpointView) -> Result<OfficialV41Catalog> {
+    let (checkpoint, validation) = crate::plan::Checkpoint::open_view_with_header_validation(view)?;
+    expert_catalog_from_checkpoint(&checkpoint, &validation)
+}
+
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
         crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
@@ -1033,7 +1038,11 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
         draft_stages: 0,
         draft_experts: 0,
     };
-    if crate::plan::checkpoint::CheckpointFormat::detect(snapshot)? == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+    let format = match checkpoint.and_then(|checkpoint| checkpoint.view.as_ref()) {
+        Some(view) => crate::plan::checkpoint::CheckpointFormat::detect_view(view)?,
+        None => crate::plan::checkpoint::CheckpointFormat::detect(snapshot)?,
+    };
+    if format == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
         let (_, _, family) = crate::plan::exlr8::native::family_geometry(config)?;
         crate::plan::Checkpoint::inventory(snapshot)?;
         let draft_layers = crate::plan::exlr8::draft_layers(snapshot, config)?;
@@ -1286,7 +1295,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path,
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
         crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
-        for tensor in metadata {
+        for tensor in metadata.into_iter().filter(|tensor| names.contains(tensor.name.as_str())) {
             let placement = match expect(&tensor.name) {
                 Some((dtype, shape)) => {
                     ensure!(
@@ -1354,7 +1363,7 @@ fn read_index_headers(
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
         crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
-        for tensor in metadata {
+        for tensor in metadata.into_iter().filter(|tensor| names.contains(tensor.name.as_str())) {
             headers.push((shard.to_string(), tensor));
         }
     }
@@ -1382,12 +1391,17 @@ fn deepseek_v4_exl3_catalog_input(snapshot: &Path, weight_map: &BTreeMap<String,
         Some(checkpoint) => checkpoint.tensors.iter().map(|tensor| (tensor.shard.clone(), tensor.meta.clone())).collect(),
         None => read_index_headers(snapshot, weight_map)?,
     };
-    let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(
-        snapshot,
-        backbone,
-        headers.iter().map(|(_, tensor)| tensor),
-        tiers,
-    )?;
+    let default_view;
+    let view = match checkpoint.and_then(|checkpoint| checkpoint.view.as_ref()) {
+        Some(view) => view,
+        None => {
+            default_view = crate::plan::checkpoint::CheckpointView::select(snapshot,
+                crate::plan::checkpoint::AttentionMode::Hqa)?;
+            &default_view
+        }
+    };
+    let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest_view(
+        view, backbone, headers.iter().map(|(_, tensor)| tensor), tiers)?;
     let mut tensors = Vec::with_capacity(headers.len());
     let mut routed = 0usize;
     for (shard, tensor) in headers {

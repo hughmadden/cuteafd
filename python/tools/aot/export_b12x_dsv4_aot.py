@@ -82,6 +82,12 @@ def exl3_reply_programs(max_rows):
             for width, topk in shapes for format in (1, 2)]
 
 
+def hqa_bf16_shapes():
+    # GLM Flash q_b and MLA/KDA o, whole and ordinary TP2 slices (K, N).
+    return {(1536, 16384), (1536, 8192), (16384, 4096),
+            (8192, 4096), (4096, 4096)}
+
+
 def draft_bf16_shapes():
     # hidden, query heads, KV heads, head width, MLP width, tap count
     families = {
@@ -114,6 +120,8 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    for shape in hqa_bf16_shapes():
+        result.setdefault(shape, []).append("hqa-glmf")
     return result
 
 
@@ -290,7 +298,8 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     from b12x.integration.cuteafd.glmf_split import (
         compile_glmf_kda_core_aot, compile_glmf_stage_aot,
         compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
-        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot)
+        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot,
+        compile_glmf_fp8_linear_aot)
     out = []
     # Wide decode still selects the narrow stage for batches of at most 64 rows.
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
@@ -324,6 +333,15 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
         params = dict(max_rows=rows)
         out.append((f"index_projected_keys_m{rows}", "index_producer", params,
                     partial(compile_glmf_projected_index_keys_aot, g, **params)))
+    # Append standalone seams; never reorder the existing fused exports.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        shapes = {(g.q_lora_rank, g.heads*g.qk_nope_dim), (g.heads*g.v_head_dim, g.hidden),
+                  (g.hidden, g.kda_width), (g.kda_width, g.hidden),
+                  (g.hidden, g.q_lora_rank), (g.hidden, g.kv_lora_rank)}
+        for k, n in sorted(shapes):
+            params = dict(input_features=k, output_features=n, max_rows=rows, decode=rows in decode_caps)
+            out.append((f"fp8_linear_k{k}_n{n}_m{rows}", "attention_projection", params,
+                        partial(compile_glmf_fp8_linear_aot, **params)))
     return out
 
 
@@ -1458,7 +1476,8 @@ def main() -> None:
             work += [(family, *item) for item in exlr8_work]
     # Append shared drafter exports after all existing objects: table indices stay stable.
     if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
-        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},
+        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection",
+                  {"max_rows": 4096 if (k, n) in hqa_bf16_shapes() else 2048},
                   lambda k=k, n=n: compile_draft_bf16_projection(k, n))
                  for k, n in sorted(draft_bf16_shapes())]
     for family, suffix, op, params, thunk in work:

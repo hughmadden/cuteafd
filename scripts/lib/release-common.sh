@@ -908,7 +908,7 @@ release_known_key() {
     GLM5_FLASH_DECODE_ROWS) return 0 ;;
     GLM5_FLASH_PREFILL_BATCH|PREFILL_PACKING) return 0 ;;
     GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
-    PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
+    PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|ATTENTION_MODE|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
@@ -986,7 +986,7 @@ release_validate_coordinator_gpu_budget() {
 # here, is DeepSeek V4.1, the release default; its own validation reports a
 # missing snapshot.
 release_config_family() {
-  local config="$1" model="" revision="" line key value hub dir
+  local config="$1" model="" revision="" attention="hqa" line key value hub dir
   [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(release_trim "${line%%#*}")"
@@ -995,16 +995,20 @@ release_config_family() {
     case "$key" in
       MODEL_ID) model="$value" ;;
       MODEL_REVISION) revision="$value" ;;
+      ATTENTION_MODE) attention="$value" ;;
     esac
   done < "$config"
   [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
   hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
   dir="$hub/models--${model//\//--}"
   [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
+  [[ -z "${2:-}" ]] || attention="$2"
+  local selected_config=config.json
+  [[ "$attention" != compact ]] || selected_config=config.compact-attention.json
   local described=""
-  if [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
+  if [[ -n "$revision" && -f "$dir/snapshots/$revision/$selected_config" ]]; then
     described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" \
-      "$dir/snapshots/$revision/config.json" 2>/dev/null)" || described=""
+      "$dir/snapshots/$revision/$selected_config" 2>/dev/null)" || described=""
   fi
   # Unrecognized configs stay on the DeepSeek V4.1 path, whose checks name the problem.
   [[ -n "$described" ]] || described=deepseek_v41

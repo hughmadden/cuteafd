@@ -14,7 +14,7 @@ use std::{ffi::c_void, ops::Range, os::unix::fs::FileExt, path::PathBuf};
 pub(crate) use cuteafd_loader::shared::dense_read::STEP_BYTES;
 /// Preferred transform window; indivisible scale units still fit STEP_BYTES.
 pub(crate) const TRANSFORM_BYTES: usize = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES;
-use cuteafd_loader::shared::dense_read::{ReadBatch, PINNED_FLOOR_BYTES};
+use cuteafd_loader::shared::dense_read::{MountLoad, ReadBatch, PINNED_FLOOR_BYTES};
 
 /// Rows `rows` of a checkpoint tensor (rows of `row_bytes` at `base` in `path`),
 /// bytes `cols` of each, packed row by row.
@@ -306,8 +306,39 @@ pub(crate) struct Step {
     pub jobs: Vec<Job>,
 }
 
+impl Operand {
+    pub fn mount_load(&self) -> Result<MountLoad> {
+        let mut owner = MountLoad::default();
+        for (rect, _) in &self.lands {
+            owner.merge(MountLoad::read(ReadBatch::new(rect.rows.len(), rect.row_bytes, rect.width(), STEP_BYTES)?));
+        }
+        Ok(owner)
+    }
+}
+
 impl Step {
     pub fn bytes(&self) -> usize { self.rects.iter().map(Rect::bytes).sum() }
+
+    pub fn mount_load(&self) -> Result<MountLoad> {
+        let mut owner = MountLoad { pinned_source: self.bytes().max(PINNED_FLOOR_BYTES) as u64,
+            ..Default::default() };
+        for rect in &self.rects {
+            owner.merge(MountLoad::read(ReadBatch::new(rect.rows.len(), rect.row_bytes, rect.width(), usize::MAX)?));
+        }
+        for job in &self.jobs {
+            let bytes = match job {
+                Job::Quant { rows, layout, .. } => crate::shared::fp8_load_quant::quant_table_bytes(rows.len(), *layout)?,
+                Job::ScaleCodes { .. } => crate::shared::fp8_load_quant::scale_code_table_bytes(1)?,
+                // These transforms own additional non-retained host scratch;
+                // a MountLoad receipt must not silently claim to cover it.
+                Job::ResidualGate { .. } | Job::NarrowI64I32 { .. } =>
+                    anyhow::bail!("dense mount receipt does not cover this transform's host scratch"),
+                _ => 0,
+            };
+            owner.pinned_tables = owner.pinned_tables.max(bytes as u64);
+        }
+        Ok(owner)
+    }
 
     /// Runs the jobs on the current device (`device`) from `staged`; jobs that
     /// gather (expert and W8A16 packs) first copy the step into `scratch`, a
@@ -770,13 +801,22 @@ impl Records {
 pub(crate) struct DenseLoad<'a> {
     library: &'a NativeLibrary,
     mount: std::cell::RefCell<Option<Mount<'a>>>,
+    admitted: std::cell::Cell<Option<MountLoad>>,
     pub sink: Option<DenseSink>,
 }
 
 impl<'a> DenseLoad<'a> {
-    pub fn mount(library: &'a NativeLibrary) -> Self { Self { library, mount: Default::default(), sink: None } }
+    pub fn mount(library: &'a NativeLibrary) -> Self {
+        Self { library, mount: Default::default(), admitted: Default::default(), sink: None }
+    }
     pub fn push(library: &'a NativeLibrary) -> Self {
-        Self { library, mount: Default::default(), sink: Some(Default::default()) }
+        Self { library, mount: Default::default(), admitted: Default::default(), sink: Some(Default::default()) }
+    }
+    pub fn admit_mount(&self, receipt: MountLoad) -> Result<()> {
+        ensure!(self.sink.is_none() && self.mount.borrow().is_none() && self.admitted.get().is_none(),
+            "dense mount receipt must be bound exactly once before loading");
+        self.admitted.set(Some(receipt));
+        Ok(())
     }
     pub fn pushing(&self) -> bool { self.sink.is_some() }
 
@@ -794,6 +834,7 @@ impl<'a> DenseLoad<'a> {
         let mut pending = Some(operand);
         if recorded(|r| r.operands.push(pending.take().expect("one operand"))) { return Ok(()); }
         let operand = pending.take().context("operand")?;
+        if let Some(receipt) = self.admitted.get() { receipt.validate(operand.mount_load()?)?; }
         let device = Device { library: self.library, id: operand.device };
         device.run(|| self.runner()?.operand(&operand))
     }
@@ -807,6 +848,7 @@ impl<'a> DenseLoad<'a> {
         let mut pending = Some(step);
         if recorded(|r| r.steps.push(pending.take().expect("one step"))) { return Ok(()); }
         let step = pending.take().context("step")?;
+        if let Some(receipt) = self.admitted.get() { receipt.validate(step.mount_load()?)?; }
         let device = Device { library: self.library, id: step.device };
         device.run(|| self.runner()?.step(&step, stream))
     }
@@ -923,6 +965,27 @@ pub(crate) fn fill_records_by_mount(library: &NativeLibrary, records: &Records,
 
 #[cfg(test)]
 mod window_tests {
+    #[test]
+    fn mount_load_records_charge_partial_rows_and_quant_tables() -> anyhow::Result<()> {
+        use super::*;
+        let rect = Rect { name: "o_proj.weight".into(), path: "/not-opened".into(), base: 0,
+            row_bytes: 32768, rows: 0..2048, cols: 0..16384 };
+        let buffer = CuteafdDeviceBuffer { bytes: 32 << 20, device_id: 0, ..Default::default() };
+        let operand = Operand { device: 0, buffer, lands: vec![(rect.clone(), 0)], bytes: 32 << 20 };
+        let expected = MountLoad { pinned_source: 32 << 20, full_row_cache: 64 << 20, pinned_tables: 0 };
+        assert_eq!(operand.mount_load()?, expected);
+        let step = Step { device: 0, rects: vec![rect], jobs: vec![Job::Quant {
+            rows: 0..2048, pitch: 8192, col0: 0, cols: 8192,
+            layout: crate::shared::fp8_load_quant::Layout::Block,
+            rule: crate::shared::fp8_linear::Fp8Scales::Amax,
+            target: Target { q: buffer, q_stride: 8192, scales: buffer, kmajor: None },
+        }] };
+        let actual = step.mount_load()?;
+        assert_eq!(actual, MountLoad { pinned_tables: 1 << 20, ..expected });
+        assert!(expected.validate(actual).is_err());
+        actual.validate(operand.mount_load()?)?;
+        Ok(())
+    }
     use super::*;
 
     #[test]
