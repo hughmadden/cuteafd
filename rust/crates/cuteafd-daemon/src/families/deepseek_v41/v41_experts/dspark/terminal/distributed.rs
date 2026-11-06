@@ -126,7 +126,9 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
                 match (queued, captured) {
                     (Ok(()), Ok(graph)) => Ok(graph),
                     (Err(error), Ok(graph)) => { device.library.cuda_graph_exec_destroy(graph)?; Err(error) }
-                    (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+                    (Ok(()), Err(error)) => Err(error),
+                    // A plain enqueue error must not hide a tagged capture error.
+                    (Err(queued), Err(captured)) => Err(super::super::chain::prefer_device(queued, captured)),
                 }
             })?;
             // SAFETY: terminal pins all storage and Drop drains its device stream.

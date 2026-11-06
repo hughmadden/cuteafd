@@ -315,10 +315,7 @@ impl V41Fp8Kernel<'_> {
                 stream,
             )
         };
-        ensure!(
-            status == 0,
-            "native FP8 projection failed with CUDA status {status}"
-        );
+        self._library.status_to_result("native FP8 projection", status)?;
         Ok(())
     }
 }
@@ -367,7 +364,7 @@ impl V41SharedSwiGlu<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "native shared SwiGLU CUDA status {status}");
+        self._library.status_to_result("native shared SwiGLU CUDA status", status)?;
         Ok(())
     }
 }
@@ -375,4 +372,26 @@ impl V41SharedSwiGlu<'_> {
 // The official WO-A projection is block diagonal over eight head groups.
 fn groups(input: u32, output: u32) -> u64 {
     if (input, output) == (32768, 8192) { 8 } else { 1 }
+}
+
+#[cfg(test)]
+mod draft_failure_tests {
+    use super::*;
+    #[test]
+    fn fp8_projection_native_failure_is_tagged() -> Result<()> {
+        let library = crate::tests::draft_failure_library()?;
+        unsafe extern "C" fn scratch(_: *mut c_void, _: *mut c_void, _: u64, _: *mut f32, _: *mut c_void) -> i32 { 0 }
+        unsafe extern "C" fn pack(_: *const u8, _: *mut u8, _: i32, _: i32, _: *mut c_void) -> i32 { 0 }
+        unsafe extern "C" fn launch(_: *mut c_void, _: *const u16, _: *const f32, _: *const u8,
+            _: *const u8, _: *mut c_void, _: u64, _: *const f32, _: *mut u16, _: i32, _: *mut c_void) -> i32 { 98 }
+        let kernel = V41Fp8Kernel { _library: &library, handle: NonNull::dangling(),
+            info: V41Fp8Info { capacity_rows: 1, input_dim: 5120, output_dim: 512,
+                packed_weight_scale_bytes: 81920, ..Default::default() }, scratch, pack, launch };
+        let buffer = CuteafdDeviceBuffer { ptr: NonNull::<u16>::dangling().as_ptr().cast(),
+            bytes: 4 << 20, device_id: 0, flags: 0 };
+        // SAFETY: the injected native entry point never dereferences the synthetic buffers.
+        crate::tests::assert_draft_native_failure(unsafe { kernel.launch(buffer, buffer, buffer,
+            buffer, buffer, buffer, 1, std::ptr::null_mut()) });
+        Ok(())
+    }
 }

@@ -66,7 +66,7 @@ impl NativeLibrary {
                 .get::<unsafe extern "C" fn() -> i32>(b"cuteafd_v41_hc_project_initialize")?
         };
         let status = unsafe { initialize() };
-        ensure!(status == 0, "mHC AOT initialization CUDA status {status}");
+        self.status_to_result("mHC AOT initialization CUDA status", status)?;
         Ok(V41Hc {
             _library: self,
             begin: unsafe {
@@ -162,7 +162,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC begin CUDA status {status}");
+        self._library.status_to_result("mHC begin CUDA status", status)?;
         Ok(true)
     }
 
@@ -200,7 +200,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC mixes CUDA status {status}");
+        self._library.status_to_result("mHC mixes CUDA status", status)?;
         Ok(())
     }
 
@@ -245,7 +245,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC mixes CUDA status {status}");
+        self._library.status_to_result("mHC mixes CUDA status", status)?;
         Ok(())
     }
 
@@ -270,7 +270,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC pre CUDA status {status}");
+        self._library.status_to_result("mHC pre CUDA status", status)?;
         Ok(())
     }
     /// # Safety
@@ -307,7 +307,7 @@ impl V41Hc<'_> {
                 stream,
             )
         };
-        ensure!(status == 0, "mHC post CUDA status {status}");
+        self._library.status_to_result("mHC post CUDA status", status)?;
         Ok(())
     }
 }

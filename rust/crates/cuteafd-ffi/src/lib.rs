@@ -519,6 +519,17 @@ pub fn graph_capture_sites() -> Vec<(String, u64)> {
 
 pub type CuteafdStatus = c_int;
 
+/// A native-library call returned a non-OK status. This is a device/driver
+/// failure (CUDA, RDMA or NCCL), not a host-side invariant failure: callers
+/// that keep device state alive across calls must treat it as terminal.
+#[derive(Debug, thiserror::Error)]
+#[error("{context} returned status {status}: {detail}")]
+pub struct NativeStatusError {
+    pub context: String,
+    pub status: CuteafdStatus,
+    pub detail: String,
+}
+
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
 pub const CUTEAFD_STATUS_CUDA_UNAVAILABLE: CuteafdStatus = 3;
 pub const CUTEAFD_STATUS_RDMA_UNAVAILABLE: CuteafdStatus = 7;
@@ -5076,7 +5087,11 @@ impl NativeLibrary {
         let last_error = self
             .last_error()
             .unwrap_or_else(|err| format!("last error unavailable: {err}"));
-        anyhow::bail!("{context} returned status {status}: {last_error}");
+        Err(anyhow::Error::new(NativeStatusError {
+            context: context.to_string(),
+            status,
+            detail: last_error,
+        }))
     }
 }
 
@@ -5865,6 +5880,26 @@ mod tests {
     use std::env;
     use std::path::PathBuf;
     use std::slice;
+
+    pub(super) fn draft_failure_library() -> Result<NativeLibrary> {
+        let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        fixture.load()
+    }
+
+    pub(super) fn assert_draft_native_failure(result: Result<()>) {
+        let error = result.unwrap_err();
+        let tagged = error.downcast_ref::<NativeStatusError>().expect("draft launch must retain the native tag");
+        assert_ne!(tagged.status, 0);
+        assert_eq!(tagged.detail, "injected CPU fixture failure");
+    }
+
+    #[test]
+    fn native_status_keeps_driver_diagnostics_and_success() -> Result<()> {
+        let library = draft_failure_library()?;
+        library.status_to_result("draft test", 0)?;
+        assert_draft_native_failure(library.status_to_result("draft test", 98));
+        Ok(())
+    }
 
     fn native_library_path() -> Option<PathBuf> {
         if let Ok(path) = env::var("CUTEAFD_NATIVE_LIB") {

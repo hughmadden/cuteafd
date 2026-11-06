@@ -8,7 +8,8 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     pub(crate) fn capture_startup(&mut self) -> Result<()> {
         ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
             "draft startup requires no admitted requests");
-        for chain in &mut self.chains { chain.capture_startup(self.windows.each_ref())?; }
+        let windows = self.windows.each_ref();
+        for chain in &mut self.chains { chain.capture_startup(windows)?; }
         Ok(())
     }
     /// The returned owner scopes destruction to GPU1. Synchronous runtime methods
@@ -38,7 +39,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
                 request_limit: requests as usize, draft_limit: 5, draft_width: weights.draft_width(),
                 confidence_trace: Default::default(), neural_lengths: Default::default(), fixed: false, policy: None,
                 published: None,
-                lanes: std::array::from_fn(|_| LaneRound::new(policy::LAYERS, policy::TOPK)),
+                lanes: (0..lane_count).map(|_| LaneRound::new(policy::LAYERS, policy::TOPK)).collect(),
             })
         })
     }

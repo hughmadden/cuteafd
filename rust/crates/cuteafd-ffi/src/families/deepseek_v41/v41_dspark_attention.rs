@@ -46,10 +46,7 @@ impl NativeLibrary {
                 b"cuteafd_v41_dspark_attention_initialize_width")? };
             unsafe { initialize_width(width as i32) }
         };
-        ensure!(
-            status == 0,
-            "dSpark attention initialization CUDA status {status}"
-        );
+        self.status_to_result("dSpark attention initialization", status)?;
         Ok(V41DsparkAttention {
             _library: self,
             width,
@@ -115,7 +112,7 @@ impl V41DsparkAttention<'_> {
                 stream,
             ) }
         };
-        ensure!(status == 0, "dSpark attention CUDA status {status}");
+        self._library.status_to_result("dSpark attention CUDA status", status)?;
         Ok(())
     }
 }

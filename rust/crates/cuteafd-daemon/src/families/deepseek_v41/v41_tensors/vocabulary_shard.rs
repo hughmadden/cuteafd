@@ -10,6 +10,10 @@ pub(crate) struct VocabularyShard<'a> {
     packed: Option<crate::shared::packed_head::PackedHead<'a>>,
 }
 impl<'a> VocabularyShard<'a> {
+    #[cfg(test)]
+    pub(crate) fn without_resident_weights_for_test() -> Self {
+        Self { allocation: None, device_id: 0, tokens: 0..16, fp8: None, packed: None }
+    }
     const VOCAB: usize = 129280;
     const ROW_BYTES: usize = 5120 * 2;
 

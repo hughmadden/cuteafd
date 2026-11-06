@@ -11,6 +11,54 @@ use std::ffi::c_void;
 mod distributed;
 pub(crate) use distributed::DistributedDsparkChain;
 
+/// Whether an error is a device/driver failure (a native-library status return)
+/// rather than a host-side invariant failure. Only device failures are terminal
+/// for a draft chain: a CPU-side guard must not latch the lane.
+pub(crate) fn is_device_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<cuteafd_ffi::NativeStatusError>())
+}
+
+/// Keep the device-tagged cause when only one side has it, and carry the other
+/// as context so neither failure is lost.
+pub(crate) fn prefer_device(first: anyhow::Error, second: anyhow::Error) -> anyhow::Error {
+    if is_device_failure(&second) && !is_device_failure(&first) {
+        second.context(format!("first failure: {first:#}"))
+    } else {
+        first.context(format!("second failure: {second:#}"))
+    }
+}
+
+/// Combine a launch result with the drain or capture result that follows it.
+/// Both are inspected: a plain launch error must not hide a tagged device error
+/// from the drain, which is what the liveness gate classifies on.
+pub(crate) fn settle(launched: Result<()>, drained: Result<()>) -> Result<()> {
+    match (launched, drained) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(prefer_device(first, second)),
+    }
+}
+
+/// A sticky terminal failure for a draft chain. A CUDA or replay error is not
+/// recoverable in-process, so the lane must fail the round instead of falling
+/// back to anchors forever with the error masked. Host-side invariant failures
+/// are deliberately not recorded: they are recoverable and must not latch.
+#[derive(Default)]
+pub(crate) struct DraftFailure(Option<String>);
+impl DraftFailure {
+    pub(crate) fn record(&mut self, error: &anyhow::Error) {
+        if self.0.is_none() && is_device_failure(error) { self.0 = Some(format!("{error:#}")); }
+    }
+    pub(crate) fn check(&self, what: &str) -> Result<()> {
+        match &self.0 {
+            Some(reason) => anyhow::bail!("{what} failed until restart: {reason}"),
+            None => Ok(()),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn is_failed(&self) -> bool { self.0.is_some() }
+}
+
 pub(crate) struct DsparkChain<'weights, 'library> {
     stream: LoadStream<'library>,
     timing: crate::shared::draft::timing::DraftTiming<'library>,
@@ -29,6 +77,8 @@ pub(crate) struct DsparkChain<'weights, 'library> {
     token_count: Option<usize>,
     terminal: Option<DsparkTerminal<'weights, 'library>>,
     ops: V41AttentionOps<'library>,
+    /// A CUDA/replay failure is terminal for this chain.
+    failure: DraftFailure,
 }
 /// Own reservations before the first upload. Errors and unwinding drain before
 /// pinned inputs or cache ring slots may be reused. Successful polls disarm it.
@@ -136,6 +186,7 @@ impl<'library> DsparkWeights<'library> {
             token_count: None,
             terminal: None,
             ops: library.v41_attention_ops_width(self.draft_width)?,
+            failure: DraftFailure::default(),
         })
     }
 }
@@ -396,7 +447,7 @@ impl DsparkChain<'_, '_> {
         self.upload(&reads, bindings)?;
         let launched = unsafe { self.enqueue(&reads, bindings[0].len()) };
         let drained = self.synchronize();
-        if let Err(error) = launched.and(drained) {
+        if let Err(error) = settle(launched, drained) {
             self.invalidate();
             return Err(error);
         }
@@ -451,7 +502,8 @@ impl DsparkChain<'_, '_> {
                 }
                 Err(error)
             }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(launched), Err(captured)) => Err(prefer_device(launched, captured)),
         }
     }
     /// # Safety
@@ -476,7 +528,7 @@ impl DsparkChain<'_, '_> {
                 .cuda_graph_launch(graph, self.stream.raw)
         };
         let drained = self.synchronize();
-        launched.and(drained)?;
+        settle(launched, drained)?;
         self.ready = Some(count);
         self.output()
     }
@@ -552,11 +604,21 @@ impl DsparkChain<'_, '_> {
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
         Ok(Some((tokens, confidence)))
     }
-    #[cfg(test)]
-    pub fn cancel_pending_for_test(&mut self) {
+    /// Record a CUDA/replay failure as terminal for this chain.
+    pub(crate) fn note_failure(&mut self, error: &anyhow::Error) { self.failure.record(error); }
+    /// A terminal draft is not a reusable target-only fallback.
+    pub fn require_live(&self) -> Result<()> { self.failure.check("dSpark draft chain") }
+    /// Copy a draft output buffer to the host on this chain's stream.
+    pub fn copy_d2h(&self, dst: &mut [u8], buffer: CuteafdDeviceBuffer) -> Result<()> {
+        self.stream.library.copy_d2h(dst, buffer)
+    }
+    /// Drop a pending replay so its requests can be released.
+    pub fn cancel_replay(&mut self) {
         self.pending = None; // guard drains before releasing reads
         self.invalidate();
     }
+    #[cfg(test)]
+    pub fn cancel_pending_for_test(&mut self) { self.cancel_replay(); }
     pub fn output(&self) -> Result<[CuteafdDeviceBuffer; 2]> {
         let requests = self.ready.context("dSpark chain output incomplete")?;
         let mut output = self.stages[2].output_storage();
@@ -572,5 +634,35 @@ impl Drop for DsparkChain<'_, '_> {
         self.pending = None; // GPU work has drained before read reservations release.
         self.graphs.retire_all();
         fatal_drain(self.graphs.drain_retired(|| Ok(())).map(drop), "dSpark chain graphs");
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    fn device() -> anyhow::Error {
+        anyhow::Error::new(cuteafd_ffi::NativeStatusError { context: "capture".into(), status: 98,
+            detail: "invalid device function".into() }).context("capture failed")
+    }
+    #[test]
+    fn settling_never_masks_a_device_failure_in_either_order() -> Result<()> {
+        settle(Ok(()), Ok(()))?;
+        for (launch, drain) in [(Err(anyhow::anyhow!("host guard")), Err(device())),
+            (Err(device()), Err(anyhow::anyhow!("host drain"))), (Ok(()), Err(device())),
+            (Err(device()), Ok(()))] {
+            let error = settle(launch, drain).unwrap_err();
+            assert!(is_device_failure(&error));
+            let mut failure = DraftFailure::default();
+            failure.record(&error);
+            assert!(failure.check("draft").is_err());
+        }
+        let mut failure = DraftFailure::default();
+        failure.record(&settle(Err(anyhow::anyhow!("host")), Err(anyhow::anyhow!("host drain"))).unwrap_err());
+        failure.check("draft")?;
+        failure.record(&device());
+        let first = failure.check("draft").unwrap_err().to_string();
+        failure.record(&anyhow::anyhow!("later host failure"));
+        assert_eq!(failure.check("draft").unwrap_err().to_string(), first);
+        Ok(())
     }
 }
