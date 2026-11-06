@@ -573,7 +573,7 @@ impl Recipe for MimoRecipe<'_> {
                 rank_sets: vec![(0..self.spark_ranks as u8).collect()],
             });
         }
-        let measured_runtime = self.cfg.program_family() == "mimof"
+        let measured_runtime = matches!(self.cfg.program_family(), Ok("mimof"))
             && self.gpus == 1 && self.spark_ranks == 2;
         let runtime_source = if measured_runtime {
             "measured MiMo post-ready runtime growth; Flash min, 389a8037e, observer subtracted, 2026-11-06"
