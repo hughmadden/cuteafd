@@ -114,6 +114,10 @@ impl ConsoleHub {
     pub fn set_gate(&self, gate: crate::console_gate::ConsoleGate) {
         let _ = self.gate.set(gate);
     }
+    /// Admin pages require the signed console cookie, even during a benchmark.
+    pub(super) fn admin_unlocked(&self, headers: &HeaderMap) -> bool {
+        self.gate.get().is_some_and(|gate| gate.unlocked(headers))
+    }
     /// The bench's synthetic prompts are public; otherwise text needs the cookie.
     pub fn bench_text_active(&self) -> bool {
         self.bench_text.load(Ordering::Relaxed)

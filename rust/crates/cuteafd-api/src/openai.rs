@@ -247,6 +247,7 @@ mod images;
 pub mod media;
 mod literals;
 pub mod console;
+mod expert_usage;
 pub use console::ConsoleHub;
 pub mod probe;
 pub mod engine;
@@ -403,6 +404,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
     let tables = cuteafd_loader::MappedTableStatsReader::registered();
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
+    let expert_routes = expert_usage::routes(console.clone(), profile.expert_usage.clone());
     let console_routes = Router::new()
         .route("/", get(console::page))
         .route("/v1/console", get(console::socket))
@@ -431,7 +433,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
     // official aliases) owns /v1/models; the served model's entry keeps the
     // chat route's fields, so existing readers see the same record first.
     if mount.is_none() { routes = routes.route("/v1/models", get(models)); }
-    let mut router = routes.layer(body_limit).with_state(state.clone()).merge(console_routes);
+    let mut router = routes.layer(body_limit).with_state(state.clone()).merge(console_routes).merge(expert_routes);
     if let Some(mount) = mount {
         let backend = engine::backend(state.clone(), mount.snapshot.clone(), mount.options);
         let mut gateway = crate::gateway::Gateway::new(backend, mount.models.clone());

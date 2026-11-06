@@ -720,18 +720,23 @@ impl Bench {
                 self.begin(active, panel.id(), estimate, remaining, total, pass, planned.passes, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: baseline.as_ref(), rates, progress, pass,
                     history: &earlier, max_context, max_output, lossless_set, lossless_dump, context_load };
-                let table_before = panels::common::mapped_counters(&client);
+                let counters_before = panels::common::phase_counters(&client);
                 let thermal_mark = client.thermal_mark();
                 let fabric_mark = client.fabric_mark();
                 let outcome = panel.run(&ctx);
                 let fabric = client.fabric_since(fabric_mark, &format!("{}/pass{pass}", panel.id()), false);
                 let thermal = client.thermal_since(thermal_mark);
-                let table_after = panels::common::mapped_counters(&client);
+                let counters_after = panels::common::phase_counters(&client);
                 remaining -= estimate;
                 let mut r = report.lock().expect("report lock");
                 match outcome {
                     Ok(mut value) => {
-                        let tables = panels::common::mapped_interval(&table_before, &table_after);
+                        let tables = panels::common::mapped_interval(&counters_before.mapped_tables, &counters_after.mapped_tables);
+                        if let Some(usage) = panels::common::expert_usage_interval(
+                            counters_before.expert_usage.as_ref(), counters_after.expert_usage.as_ref()) {
+                            value["expert_usage"] = usage;
+                            value["expert_usage_scope"] = json!("whole panel pass, including panel-internal priming; approximate snapshot boundaries");
+                        }
                         if !tables.is_empty() {
                             value["mapped_tables"] = json!(tables);
                             value["mapped_tables_scope"] = json!("whole panel pass, including panel-internal priming");
