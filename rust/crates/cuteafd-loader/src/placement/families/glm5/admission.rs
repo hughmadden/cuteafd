@@ -45,6 +45,7 @@ pub struct ExpertProfile {
 /// solve once per count. Additional owners use the same named finite domains.
 #[derive(Debug, Clone)]
 pub struct GlmRecipe<'a> {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub cfg: &'a GlmDsaConfig,
     pub context: u64,
     pub page_tokens: u64,
@@ -557,6 +558,7 @@ impl DraftFacts {
 /// Topology, programs and the host availability sample are resolved before this
 /// assembler runs; none of them may be changed by a failed allocation.
 pub struct ProductionInput<'a> {
+    pub expert_usage: bool,
     pub cfg: &'a GlmDsaConfig,
     pub layers: usize,
     pub context: u64,
@@ -597,6 +599,7 @@ pub struct PreparedGlm<'a> {
 }
 
 pub struct AdmittedGlm {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub placement: crate::placement::Placement,
     pub spark: crate::placement::SparkWorkingSet,
     pub solved: ResolvedPlan,
@@ -769,7 +772,11 @@ impl<'a> ProductionInput<'a> {
         let reference = if self.gpus == 1 { MIN_LAYOUT } else { MAX_LAYOUT };
         let runtime = RuntimeFigures::new(self.gpus, reference)?;
         let host = HostFigures::for_layout(self.gpus, reference)?;
-        let mut recipe = GlmRecipe { cfg: self.cfg, context: self.context, page_tokens,
+        let expert_usage = (self.expert_usage && !self.skip_routed_experts && routed > 0)
+            .then(|| cuteafd_core::expert_usage::Geometry { layers: self.layers,
+                experts: self.cfg.experts, topk: self.cfg.topk,
+                routed_layers: (self.cfg.first_moe_layer..self.layers).collect() });
+        let mut recipe = GlmRecipe { expert_usage, cfg: self.cfg, context: self.context, page_tokens,
             maximum_pages, attention, gpus: self.gpus, spark_links: self.spark_ranks > 0,
             prefill: vec![self.prefill], lanes: vec![1],
             embedding: weights.iter().map(|(home, _)| *home).collect(), draft_homes: self.draft.homes(self.gpus),
@@ -777,6 +784,11 @@ impl<'a> ProductionInput<'a> {
             targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![], graphs: vec![],
             host: Some(host), owners: vec![], };
         recipe.owners.push(Case { when: vec![], value: self.owners });
+        if let Some(geometry) = &recipe.expert_usage {
+            let mut owners = crate::placement::expert_usage::components(geometry, &[0], maximum_pages)?;
+            owners.extend(super::usage_metadata_components(self.prefill.waves, maximum_pages)?);
+            recipe.owners.push(Case { when: vec![], value: owners });
+        }
         recipe.owners.push(Case { when: vec![], value: runtime.components(maximum_pages)? });
         for home in recipe.draft_homes.clone() {
             recipe.owners.push(Case { when: vec![When::DraftHome(home)],
@@ -923,7 +935,7 @@ impl PreparedGlm<'_> {
             matches!(condition, When::Onboard { first, last } if *first <= count && count <= *last)))
             .ok_or_else(|| invalid("selected startup graph set was not prepared"))?.value;
         let remote = !spark.spark_layers.is_empty();
-        Ok(AdmittedGlm { placement, spark, solved, local,
+        Ok(AdmittedGlm { expert_usage: self.recipe.expert_usage.clone(), placement, spark, solved, local,
             decode_link: self.decode_link.filter(|_| remote),
             prefill_link: self.prefill_link.filter(|_| remote),
             graphs: graph, runtime: self.runtime, host: self.recipe.host.unwrap(),

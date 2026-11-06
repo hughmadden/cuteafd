@@ -32,7 +32,7 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
             baseline: Baseline::Forecast { occupied: 0, source: "test physical witness".into(), assumed: false },
             headroom: 0 });
     }
-    ProductionInput { cfg, layers: cfg.layers, context: 4096, maximum_pool_tokens: 8192,
+    ProductionInput { expert_usage: false, cfg, layers: cfg.layers, context: 4096, maximum_pool_tokens: 8192,
         attention: if gpus == 2 { AttentionPlacement::Context } else { AttentionPlacement::Heads },
         gpus, prefill,
         target: TargetFacts {
@@ -520,6 +520,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         },
     ];
     let mut recipe = GlmRecipe {
+        expert_usage: None,
         cfg,
         context: 4096,
         page_tokens: 128,
@@ -2088,4 +2089,50 @@ fn optional_encoder_is_selected_jointly_and_never_uses_absent_spark_workers() {
     pinned.onboard = Pin::Exact(recipe.experts.as_ref().unwrap().layers.len() as u64);
     let solved = planner::solve(pinned, budgets(), &recipe).unwrap();
     assert_eq!(solved.decisions.encoder, Some(1));
+}
+
+#[test]
+fn expert_usage_recipe_is_canonical_fixed_and_off_or_skip_has_no_owners() {
+    use cuteafd_core::expert_usage::{device_owner, Geometry};
+    use crate::placement::planner::ComponentKind;
+    let cfg = cfg();
+    let shape = PrefillShape { rows: 64, waves: 3 };
+    for enabled in [false, true] {
+        let mut input = production_input(&cfg, 2, 4, shape);
+        input.expert_usage = enabled;
+        let prepared = input.prepare().unwrap();
+        let owners = prepared.recipe.owners.iter().flat_map(|case| &case.value)
+            .filter_map(|component| if let ComponentKind::Allocation { template, .. } = &component.kind {
+                (template.id.starts_with("expert-usage.") || template.id.starts_with("glm.usage.")).then_some(template)
+            } else { None }).collect::<Vec<_>>();
+        if !enabled {
+            assert!(prepared.recipe.expert_usage.is_none());
+            assert!(owners.is_empty());
+            continue;
+        }
+        let geometry = Geometry { layers: cfg.layers, experts: cfg.experts, topk: cfg.topk,
+            routed_layers: (cfg.first_moe_layer..cfg.layers).collect() };
+        assert_eq!(prepared.recipe.expert_usage, Some(geometry.clone()));
+        let table = geometry.table_bytes().unwrap() as u64;
+        for suffix in ["counters", "snapshot", "pinned"] {
+            let owner = owners.iter().find(|owner| owner.id == device_owner(0, suffix)).unwrap();
+            assert_eq!(owner.bytes, table);
+            assert_eq!(owner.location, if suffix == "pinned" { Location::PINNED } else { Location::coordinator(0) });
+        }
+        assert!(!owners.iter().any(|owner| owner.id.starts_with("expert-usage.gpu1")));
+        assert_eq!(owners.iter().find(|owner| owner.id == "expert-usage.history").unwrap().bytes,
+            geometry.host_bytes(1).unwrap() as u64);
+        assert_eq!(owners.iter().find(|owner| owner.id == "glm.usage.lookup").unwrap().bytes,
+            super::super::USAGE_LOOKUP_BYTES as u64);
+        assert_eq!(owners.iter().filter(|owner| owner.location == Location::coordinator(0)
+            && owner.id.starts_with("glm.usage.")).count(), 4);
+    }
+    let mut input = production_input(&cfg, 2, 0, PrefillShape { rows: 64, waves: 1 });
+    input.expert_usage = true;
+    input.skip_routed_experts = true;
+    let prepared = input.prepare().unwrap();
+    assert!(prepared.recipe.expert_usage.is_none());
+    assert!(!prepared.recipe.owners.iter().flat_map(|case| &case.value).any(|component|
+        matches!(&component.kind, ComponentKind::Allocation { template, .. }
+            if template.id.starts_with("expert-usage.") || template.id.starts_with("glm.usage."))));
 }
