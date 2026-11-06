@@ -180,12 +180,12 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let host_contract = super::coordinator::CoordinatorContract::from_checkpoint(input.checkpoint())?;
+    let contract = super::coordinator::CoordinatorContract::from_model(input.checkpoint(), model)?;
     let inputs = RuntimeInputs { host: super::admission::HostInputs {
             memory: crate::plan::layout::recipe_host_memory(opts)?, cache_bytes: opts.host_cache_bytes,
             headroom: 8 << 30,
-            retained_sync_h2d_bytes: host_contract.retained_sync_h2d_bytes()?,
-            push: Some(super::admission::push_host_envelope(&host_contract, &model.cfg, coordinators)?),
+            retained_sync_h2d_bytes: contract.retained_sync_h2d_bytes()?,
+            push: Some(super::admission::push_host_envelope(&contract, &model.cfg, coordinators)?),
         }, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
                 kv_format: opts.step5_kv,
         inventory,
@@ -207,7 +207,7 @@ pub(super) fn layout(
         onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
             checked_rows, coordinators, waves, opts.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto))?,
     };
-    let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
+    let admitted = admission::admit_mtp_with_contract(input.checkpoint(), &inputs, opts.native_mtp_layers, &contract)?;
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     let mut host_items: Vec<_> = [planner::Location::HOST, planner::Location::PINNED].into_iter()
         .map(|location| admitted.solved.items(location)).collect::<Result<Vec<_>, _>>()?
