@@ -2,7 +2,7 @@
 //! so malformed or truncated calls cannot become partial OpenAI tool calls.
 //!
 //! Streamed requests emit each argument delta as it arrives instead of holding
-//! the whole call (`CUTEAFD_STREAM_TOOLCALL_ARGS=0` is the kill switch). The
+//! the whole call. The
 //! assembled call is byte-identical to the non-streamed one; a call that turns
 //! out unreadable has already been streamed, so it is counted and the validator
 //! rejects its arguments with a clean 400/SSE error rather than a 500.
@@ -51,10 +51,10 @@ struct Call {
     values: Map<String, Value>,
     /// The call's raw wire text, from its opener (content again if lost).
     text: String,
-    /// The call carries one `<|open|>json` object instead of arguments: it is
-    /// buffered and emitted whole, so the streamed bytes are the same compact
-    /// JSON the hold path sends.
+    /// The call carries one raw `<|open|>json` object instead of arguments.
     object_call: bool,
+    /// Bytes emitted from the raw JSON body; its final brace waits for call close.
+    streamed_json_len: usize,
     /// The call has read at least one `<|open|>argument`: a call is one form or
     /// the other, never both.
     saw_argument: bool,
@@ -84,8 +84,7 @@ pub struct KimiOutputParser {
     calls: usize,
     stop: Option<GlmStop>,
     /// Emit tool-call argument deltas as they arrive instead of holding the
-    /// whole call until it closes (on for streamed requests;
-    /// `CUTEAFD_STREAM_TOOLCALL_ARGS=0` is the kill switch).
+    /// whole call until it closes (on for streamed requests).
     stream_args: ArgStream,
     /// The open call's `ToolCall` was emitted to the client: a call that turns
     /// out unreadable has already been streamed and cannot be retracted.
@@ -401,7 +400,7 @@ impl KimiOutputParser {
                     call.text.push_str(&text);
                     call.value.push_str(&text);
                     if self.streamed {
-                        self.stream_args.delta(&text, out);
+                        Self::stream_json(call, &self.stream_args, out);
                     }
                     return true;
                 };
@@ -412,7 +411,7 @@ impl KimiOutputParser {
                 call.text.push_str(&end);
                 call.value.push_str(&raw);
                 if self.streamed {
-                    self.stream_args.delta(&raw, out);
+                    Self::stream_json(call, &self.stream_args, out);
                 }
                 let Some(values) = crate::openai::tools::unique_json(&call.value).ok()
                     .and_then(|value| value.as_object().cloned()) else {
@@ -557,7 +556,7 @@ impl KimiOutputParser {
         let call = self.call.take().expect("a call is open");
         if self.streamed {
             if call.object_call {
-                // The raw JSON body was streamed as it arrived; nothing is owed.
+                self.stream_args.delta(&call.value[call.streamed_json_len..], out);
             } else if call.args_open {
                 // The deltas were emitted as they arrived; only the close is owed.
                 self.stream_args.delta("}", out);
@@ -579,6 +578,17 @@ impl KimiOutputParser {
         self.calls += 1;
         self.mode = Mode::Calls;
     }
+
+    fn stream_json(call: &mut Call, stream: &ArgStream, out: &mut Vec<OutputChunk>) {
+        // Never publish a complete object before its XTML envelope closes.
+        // Keep the last brace and trailing whitespace even across chunk splits;
+        // a lost envelope then remains incomplete for CompletionValidator.
+        let trimmed = call.value.trim_end();
+        let end = if trimmed.ends_with('}') { trimmed.len() - 1 } else { call.value.len() };
+        stream.delta(&call.value[call.streamed_json_len..end], out);
+        call.streamed_json_len = end;
+    }
+
 }
 
 fn unescape(text: &str) -> String {

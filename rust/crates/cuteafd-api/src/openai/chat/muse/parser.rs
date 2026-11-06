@@ -100,7 +100,7 @@ pub struct MuseOutputParser {
     held_whitespace: String,
     stop: Option<GlmStop>,
     /// Emit tool-call argument deltas as they arrive instead of holding the
-    /// whole call until it closes (`CUTEAFD_STREAM_TOOLCALL_ARGS=0` disables).
+    /// whole call until it closes.
     stream_args: ArgStream,
     /// Any call was streamed to the client (a call that turns out unreadable
     /// has already been streamed and cannot be retracted).
@@ -396,10 +396,9 @@ impl MuseOutputParser {
                             self.stream_state = StreamState::Done;
                             return;
                         };
-                    let at = 0;
                     match kind {
                         0 => {
-                            let after = &trimmed[at + PARAMETER.len()..];
+                            let after = &trimmed[PARAMETER.len()..];
                             let Some(end) = after.find("\">") else { return; };
                             let key = match muse_attribute(&after[..end]) {
                                 Ok(key) => key,
@@ -409,7 +408,7 @@ impl MuseOutputParser {
                                     return;
                                 }
                             };
-                            self.stream_pos += skipped + at + PARAMETER.len() + end + 2;
+                            self.stream_pos += skipped + PARAMETER.len() + end + 2;
                             if self.stream_seen_keys.iter().any(|seen| *seen == key) {
                                 // Hold mode rejects a duplicated parameter.
                                 self.stream_failed = true;
@@ -429,12 +428,12 @@ impl MuseOutputParser {
                             self.stream_state = StreamState::InValue;
                         }
                         1 => {
-                            self.stream_pos += skipped + at + INVOKE_END.len();
+                            self.stream_pos += skipped + INVOKE_END.len();
                             if self.stream_args_open { self.stream_call_complete = true; }
                             self.stream_state = StreamState::SeekInvoke;
                         }
                         _ => {
-                            self.stream_pos += skipped + at + CALLS_END.len();
+                            self.stream_pos += skipped + CALLS_END.len();
                             self.stream_block_closed = true;
                             self.stream_state = StreamState::Done;
                             return;

@@ -956,7 +956,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     // Streamed requests may emit argument deltas as they arrive; a non-streamed
     // request always buffers, so a call cut at `max_tokens` never returns
     // partial JSON in `arguments`.
-    let stream_args = chat::stream_args::stream_toolcall_args_enabled(streaming);
+    let stream_args = streaming;
     let stop_sequences = converted.parsing_options.stop_sequences.clone();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let tap = Arc::new(Mutex::new(Tap::default()));

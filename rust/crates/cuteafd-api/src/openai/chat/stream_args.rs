@@ -5,8 +5,8 @@
 //! `close()` validates it exactly as the hold path does. The assembled call is
 //! byte-identical to the non-streamed one.
 //!
-//! Streaming is ON for every streamed request; `CUTEAFD_STREAM_TOOLCALL_ARGS=0`
-//! is the kill switch. A non-streamed response always buffers, so a call cut at
+//! Streaming is on for every streamed request. A non-streamed response
+//! always buffers, so a call cut at
 //! `max_tokens` never returns partial JSON in `arguments`.
 //!
 //! A call whose name is unreadable is never streamed as a tool call (the name
@@ -16,15 +16,6 @@
 //! assembled arguments with a clean 400/SSE error rather than a 500.
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
-
-/// Whether to stream tool-call argument deltas for this request.
-///
-/// `streaming` is the request's own `stream` flag: a non-streamed request
-/// always buffers. `CUTEAFD_STREAM_TOOLCALL_ARGS=0` is the kill switch; any
-/// other value (or unset) leaves streaming on.
-pub fn stream_toolcall_args_enabled(streaming: bool) -> bool {
-    streaming && !matches!(std::env::var("CUTEAFD_STREAM_TOOLCALL_ARGS").as_deref(), Ok("0"))
-}
 
 /// Whether a call's name may be emitted as a `ToolCall`.
 ///

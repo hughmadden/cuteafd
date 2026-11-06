@@ -177,14 +177,17 @@ impl ToolConstraints {
     }
 
     fn validate(&self, calls: &BTreeMap<u64, Call>, reason: &str) -> Result<()> {
+        ensure!(self.parallel || calls.len() <= 1, "native response violated parallel_tool_calls=false");
         if !matches!(reason, "stop" | "tool_calls") {
             // A call cut at `max_tokens` (finish `length`) may have streamed
-            // argument deltas that cannot be retracted. Such a call is dropped
-            // rather than failing the response: the client sees
-            // `finish_reason: "length"` and no call. Complete calls are still
-            // held to the index, schema and parallel rules below.
+            // argument deltas that cannot be retracted. Ignore only a trailing
+            // incomplete call so the validator does not fail the response.
+            // Malformed and truncated arguments are indistinguishable here;
+            // earlier calls still obey the index, schema and parallel rules.
+            let count = calls.len() - usize::from(calls.last_key_value()
+                .is_some_and(|(_, call)| unique_json(&call.arguments).is_err()));
             let complete: BTreeMap<u64, Call> = calls.iter()
-                .filter(|(_, call)| unique_json(&call.arguments).is_ok())
+                .take(count)
                 .map(|(index, call)| (*index, Call { name: call.name.clone(), arguments: call.arguments.clone() }))
                 .collect();
             // A truncated response is not a protocol violation: an omitted or
@@ -200,6 +203,7 @@ impl ToolConstraints {
             ensure!(!(required && self.required), "native response omitted a required tool call");
             return Ok(());
         }
+        ensure!(!required || reason == "tool_calls", "native response emitted tool calls without tool_calls finish");
         ensure!(self.parallel || calls.len() <= 1, "native response violated parallel_tool_calls=false");
         for (expected, (index, call)) in calls.iter().enumerate() {
             ensure!(*index == expected as u64, "native tool call indices are not contiguous");
@@ -397,11 +401,16 @@ mod tests {
             ("unknown-name", json!("auto"), false, block(&[invoke("unknown", &parameter("n","42",false))]), false, false),
             ("parallel-disabled", json!("auto"), false, block(&[good_call.clone(),good_call.clone()]), false, false),
             ("parallel-enabled", json!("auto"), true, block(&[good_call.clone(),good_call.clone()]), true, false),
+            ("parallel-truncated-disabled", json!("auto"), false,
+                format!("<｜DSML｜ calls>\n{}\n<｜DSML｜ invoke name=\"lookup\">", good_call), false, true),
+            ("parallel-truncated-enabled", json!("auto"), true,
+                format!("<｜DSML｜ calls>\n{}\n<｜DSML｜ invoke name=\"lookup\">", good_call), true, true),
             ("truncated", json!("required"), false, "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">".into(), true, true),
         ];
         for (name, choice, parallel, text, valid, truncated) in scenarios {
             for thinking in [false, true] {
                 for streaming in [false, true] {
+                    let valid = valid || (!streaming && name == "parallel-truncated-disabled");
                     let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(1);
                     let text = if thinking { format!("I will choose carefully.\n</think>{text}") } else { text.clone() };
                     let audit_text = text.clone();
@@ -436,13 +445,12 @@ mod tests {
                     }
                     else {
                         let bytes = bytes.unwrap_or_else(|error| panic!("{name}/{thinking}: {error}"));
+                        let text = String::from_utf8_lossy(&bytes);
+                        assert!(!text.contains("\"error\""), "{name}/{thinking}: unexpected error: {text}");
                         if truncated {
                             // A truncated response is a 200 whose stream ends with
                             // `length`; an SSE `error` inside it would still pass a
                             // status-only check, so assert on the body.
-                            let text = String::from_utf8_lossy(&bytes);
-                            assert!(!text.contains("\"error\""),
-                                "{name}/{thinking}: a truncated response must not stream an error: {text}");
                             assert!(text.contains("\"finish_reason\":\"length\""),
                                 "{name}/{thinking}: a truncated response must finish with length: {text}");
                         }
@@ -452,4 +460,34 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn stop_with_calls_is_a_terminal_sse_error() {
+        // Engine parsers normally promote Stop to tool_calls. Inject an
+        // inconsistent terminal protocol chunk to guard the validator contract,
+        // then drive the real SSE responder rather than asserting its helper.
+        let tool = ToolDefinition { name: "lookup".into(), description: None,
+            parameters: json!({"type":"object"}), strict: None };
+        let mut validator = CompletionValidator::new(None,
+            ToolConstraints::new(&[tool], ToolChoice::Auto, false, true, false, ToolSyntax::Dsml).unwrap());
+        let values = vec![
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function",
+                "function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        ];
+        let chunks = values.into_iter().map(move |mut value| {
+            value["id"] = json!("test"); value["object"] = json!("chat.completion.chunk");
+            value["created"] = json!(0); value["model"] = json!(MODEL);
+            validator.observe(&value)?;
+            Ok(serde_json::from_value::<ChatChunk>(value).unwrap())
+        }).collect::<Vec<_>>();
+        let response = respond(Running { chunks: Box::pin(futures::stream::iter(chunks)),
+            failure: Default::default(), image_tokens: 0, audio_tokens: 0,
+            prefix_cache_source: Default::default(), finish_detail: Default::default(),
+            tap: Default::default(), streaming: true, include_usage: false, id: "test".into(), model: MODEL.into(),
+        }).await;
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        crate::openai::tests::terminal_sse_error(&bytes);
+    }
+
 }

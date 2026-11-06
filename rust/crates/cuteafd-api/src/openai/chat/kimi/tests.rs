@@ -528,3 +528,85 @@ fn a_malformed_head_is_returned_as_content() {
     assert_eq!(count, 0);
     assert!(parsed.content.contains("call tool=lookup"), "{:?}", parsed.content);
 }
+
+
+#[tokio::test]
+async fn malformed_object_envelopes_fail_chat_and_gateway_streams() {
+    use crate::openai::*;
+    use axum::{body::{to_bytes, Body}, http::{Request, StatusCode}};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    let head = open("call", &[("tool", "lookup".into()), ("index", "1".into())]);
+    let object = format!("{}{{\"q\":{{\"s\":\"brace }}\"}}}} \n{}",
+        open("json", &[("type", "object".into())]), close("json"));
+    for suffix in [String::new(), close("argument"),
+        format!("{}cats{}{}", open("argument", &[("key", "q".into()), ("type", "string".into())]),
+            close("argument"), close("call")), close("call")] {
+        let valid = suffix == close("call");
+        let wire = format!("{}{}{head}{object}{suffix}{}{}", close("response"), open("tools", &[]),
+            close("tools"), close("message"));
+        for path in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+            // Both a whole body and character-wise delivery must retain the
+            // object's final brace until the outer call envelope is verified.
+            for characterwise in [false, true] {
+                let mut profile = ModelProfile::new("kimi-fixture",
+                    ModelEncoding::Kimi(Arc::new(KimiEncoding { eos: vec![163586] })));
+                profile.gateway = Some(Arc::new(GatewayMount {
+                    models: crate::gateway::ModelMap::single("kimi-fixture"), snapshot: None,
+                    options: engine::EngineOptions::default(), search: None, gate: None, origins: Default::default(),
+                }));
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+                let wire = wire.clone();
+                let worker = tokio::spawn(async move {
+                    let job = rx.recv().await.unwrap();
+                    let _ = job.events.send(Ok(InferenceChunk::Ready {
+                        system_fingerprint: None, prompt_usage: PromptUsage::default(),
+                    }));
+                    let parts = if characterwise { wire.chars().map(|ch| ch.to_string()).collect() } else { vec![wire] };
+                    for content in parts {
+                        if job.events.send(Ok(InferenceChunk::Text { content, content_tokens: 1 })).is_err() { return; }
+                    }
+                    let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop }));
+                });
+                let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                    std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+                let schema = json!({"type":"object"});
+                let mut body = match path {
+                    "/v1/messages" => json!({"messages":[{"role":"user","content":"lookup"}], "max_tokens":128,
+                        "thinking":{"type":"disabled"}, "tools":[{"name":"lookup","input_schema":schema}]}),
+                    "/v1/responses" => json!({"input":"lookup", "store":false, "reasoning":{"effort":"none"},
+                        "tools":[{"type":"function","name":"lookup","parameters":schema}]}),
+                    _ => json!({"messages":[{"role":"user","content":"lookup"}], "thinking":{"type":"disabled"},
+                        "tools":[{"type":"function","function":{"name":"lookup","parameters":schema}}]}),
+                };
+                body["model"] = json!("kimi-fixture");
+                body["stream"] = json!(true);
+                let response = app.oneshot(Request::post(path).header("content-type", "application/json")
+                    .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let events: Vec<Value> = text.split("\n\n").filter_map(|frame| frame.lines()
+                    .find_map(|line| line.strip_prefix("data: ")))
+                    .filter(|data| *data != "[DONE]").map(|data| serde_json::from_str(data).unwrap()).collect();
+                let failed = events.iter().any(|event| event.get("error").is_some()
+                    || event["type"] == "response.failed");
+                assert_eq!(failed, !valid, "{path}/{characterwise}/{suffix}: {text}");
+                if !valid && path == "/v1/chat/completions" {
+                    crate::openai::tests::terminal_sse_error(&bytes);
+                }
+                if valid {
+                    let arguments: String = events.iter().filter_map(|event| match path {
+                        "/v1/messages" => event["delta"]["partial_json"].as_str(),
+                        "/v1/responses" if event["type"] == "response.function_call_arguments.delta" => event["delta"].as_str(),
+                        "/v1/chat/completions" => event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str(),
+                        _ => None,
+                    }).collect();
+                    assert_eq!(arguments, "{\"q\":{\"s\":\"brace }\"}} \n", "{path}: {text}");
+                }
+                worker.await.unwrap();
+            }
+        }
+    }
+}
