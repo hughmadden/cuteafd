@@ -140,7 +140,7 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
         assert all(flag not in plan.split() for flag in ("--drafter-snapshot", "--draft-fp8"))
 
 
-@pytest.mark.parametrize("selection,expected", [(None, "false"), ("off", "false"), ("on", "true")])
+@pytest.mark.parametrize("selection,expected", [(None, "true"), ("off", "false"), ("on", "true")])
 def test_kimi_tp2_dflash_plan_matches_serve_and_keeps_explicit_false(tmp_path: Path, selection, expected) -> None:
     model, revision = "lightseekorg/kimi-k3-dflash2", "e77935fb4804e17eb55085bffd045eae1d779769"
     _snapshot(tmp_path / "hf", model, {}, revision=revision)

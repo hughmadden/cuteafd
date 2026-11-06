@@ -1666,7 +1666,7 @@ if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family
   esac
 fi
 tp2_dflash_default=off
-if [[ "$family" == mimo_v2 && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
+if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
   tp2_dflash_default=on
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
