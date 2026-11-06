@@ -317,6 +317,9 @@ def release_checkpoint(family: str, model: str) -> dict:
 
 
 def normalize(value: str, root: Path) -> str:
+    # The capture seeds the host power governor's directory (see capture()); the
+    # recorded state path is the one a real gpu-powerd host mounts.
+    value = value.replace(str(root / "gpu-powerd"), "/run/gpu-powerd")
     return value.replace(str(root / "namespace"), "/mnt/sparknest").replace(str(root), "<root>")
 
 
@@ -407,6 +410,10 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         rtx = next(int(line.split("=", 1)[1]) for line in text.splitlines() if line.startswith("RTX_GPUS="))
         spec = root / "nvidia.yaml"
         spec.write_text("devices:\n" + "".join(f"  - name: {name}\n" for name in (*GPU_UUIDS, "0", "1", "all")))
+        # A host power governor's state directory is mounted when it exists; seed
+        # one so the recorded line carries the mount on every host (normalize).
+        powerd = root / "gpu-powerd"
+        powerd.mkdir()
         log = root / "log.jsonl"
         env = {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "HOME": str(home), "HF_HOME": str(root / "hf"),
                "CUTEAFD_NAMESPACE_ROOT": str(namespace), "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host,
@@ -417,6 +424,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
                "CAPTURE_FIRST_LAYER": first, "CAPTURE_LAST_LAYER": last, "CAPTURE_RELEASE": "1" if release_entry else "",
                "CAPTURE_SERVED_MODEL": served,
                "CUTEAFD_CDI_CHECK": "on", "CUTEAFD_CDI_SPECS": str(spec),
+               "CUTEAFD_GPU_POWERD_DIR": str(powerd),
                "CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS": "30", "TMPDIR": str(root),
                "LANG": "C.UTF-8", "USER": "test-user" if release_entry else "tj", "LOGNAME": "test-user" if release_entry else "tj"}
         args = ["--config", str(config), "--dry-run" if dry_run else "--restart"]

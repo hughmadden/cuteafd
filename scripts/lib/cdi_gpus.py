@@ -17,9 +17,15 @@ from pathlib import Path
 SPECS = (Path('/var/run/cdi/nvidia.yaml'), Path('/etc/cdi/nvidia.yaml'))
 
 
-def cdi_names(specs: Iterable[Path] = SPECS) -> set[str]:
+def spec_paths() -> tuple[Path, ...]:
+    """The specs to read; CUTEAFD_CDI_SPECS overrides the system paths (script tests only)."""
+    override = os.environ.get('CUTEAFD_CDI_SPECS')
+    return tuple(Path(path) for path in override.split()) if override else SPECS
+
+
+def cdi_names(specs: Iterable[Path] | None = None) -> set[str]:
     names: set[str] = set()
-    for spec in specs:
+    for spec in spec_paths() if specs is None else specs:
         try:
             text = spec.read_text()
         except OSError:
@@ -38,7 +44,7 @@ def single_gpu_host() -> bool:
     return result.returncode == 0 and len(result.stdout.splitlines()) == 1
 
 
-def cdi_gpu_args(gpus: Iterable[object] | str, specs: Iterable[Path] = SPECS) -> list[str]:
+def cdi_gpu_args(gpus: Iterable[object] | str, specs: Iterable[Path] | None = None) -> list[str]:
     """`--device nvidia.com/gpu=X` per GPU (index, GPU-uuid, or 'all'); raises if the spec lacks one."""
     wanted = [g.strip() for g in (gpus.split(',') if isinstance(gpus, str) else map(str, gpus))]
     if not wanted or not all(wanted):

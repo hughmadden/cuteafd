@@ -131,6 +131,27 @@ def no_real_cdi_spec(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
+def hermetic_launcher_host(tmp_path_factory):
+    """Fix the two host probes a launcher makes, so a launch line is the same on every host.
+
+    run-family.sh mounts a host power governor's state directory when it exists,
+    and the CDI helpers read the host's spec to decide whether a single per-GPU
+    request may collapse to `all` (WSL2's all-only spec). Script tests mock
+    Docker and name fake GPUs, so both inputs are fixtures here: a seeded
+    governor directory and a per-GPU spec shaped like raptor's."""
+    import launcher_sandbox
+    powerd = tmp_path_factory.mktemp("gpu-powerd")
+    spec = tmp_path_factory.mktemp("cdi") / "nvidia.yaml"
+    names = (*launcher_sandbox.FAKE_GPU_UUIDS, "0", "1", "all")
+    spec.write_text("devices:\n" + "".join(f"  - name: {name}\n" for name in names))
+    patch = pytest.MonkeyPatch()
+    patch.setenv("CUTEAFD_GPU_POWERD_DIR", str(powerd))
+    patch.setenv("CUTEAFD_CDI_SPECS", str(spec))
+    yield
+    patch.undo()
+
+
+@pytest.fixture(scope="session", autouse=True)
 def launcher_inputs(tmp_path_factory):
     """One private template per xdist worker; sandbox directory entries stay test-local."""
     import launcher_sandbox
