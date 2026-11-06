@@ -988,6 +988,7 @@ if ((dry_run)); then
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]] || echo "  RDMA device map: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" ]] || echo "  RDMA execution lanes: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"
   echo "  release identity: $fingerprint"
+  printf '%s\n' "$count_plan"
   exit 0
 fi
 shared_api_state "$COORDINATOR_DOCKER_INFERENCE" "${INSTANCE:-default}"

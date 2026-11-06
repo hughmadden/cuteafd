@@ -28,7 +28,10 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
     cards.bench_panels.cache_clear()
-    monkeypatch.setattr(cards, 'preflight_deployment', lambda *args: None)
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
+        'spark_roles': [dict(rank=i, experts=True, audio_encoder=bool((job.get('needs') or {}).get('audio')))
+                        for i in range(len(job['entry'].get('sparks', [])))],
+        'artifact_requirements': {'spark_tp_role': (job.get('needs') or {}).get('tp_role')}})
     bin_dir = tmp_path / '.cuteafd-test-bin'
     bin_dir.mkdir(exist_ok=True)
     cuteafd_bin = bin_dir / 'cuteafd'
@@ -3193,9 +3196,9 @@ def test_deployment_preflight_uses_the_same_launcher_admission(entry, tmp_path, 
     calls = []
     def launch(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return SimpleNamespace(stdout="admitted deployment")
+        return SimpleNamespace(stdout='launcher summary\n{"spark_roles": []}\n')
     monkeypatch.setattr(original, "run", launch)
-    assert original.preflight_deployment(job, arm) == "admitted deployment"
+    assert original.preflight_deployment(job, arm) == {"spark_roles": []}
     cmd, kwargs = calls[0]
     assert cmd[:3] == [str(ROOT / "run.sh"), "--config", job["entry"]["config"]]
     assert "--dry-run" in cmd and "--total-capacity" in cmd
@@ -3206,3 +3209,18 @@ def test_deployment_preflight_uses_the_same_launcher_admission(entry, tmp_path, 
     monkeypatch.setattr(original, "run", refused)
     with pytest.raises(ValueError, match="planner: does not fit"):
         original.preflight_deployment(job, arm)
+
+
+@pytest.mark.parametrize("media_rank", [None, 2])
+def test_deployment_preflight_checks_only_assigned_spark_roles(entry, tmp_path, monkeypatch, media_rank):
+    job = make(entry, tmp_path)
+    job['needs'] = dict(coordinator=[], spark=['experts-not-needed'], audio=False, tp_role='tp3')
+    roles = [] if media_rank is None else [dict(rank=media_rank, experts=False, encoder={}, audio_encoder=None)]
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda *args: dict(spark_roles=roles))
+    checked = []
+    def seal(arm, host):
+        checked.append(host)
+        return json.dumps(dict(slot='s', contents=dict(packages=[], tp_roles=[])))
+    monkeypatch.setattr(cards, 'slot_check', seal)
+    cards.preflight_job(job, dict(instance='test-base', slot='s'))
+    assert checked == ['raptor'] + ([] if media_rank is None else [job['entry']['sparks'][media_rank]])
