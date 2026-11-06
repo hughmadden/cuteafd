@@ -145,6 +145,26 @@ mod tests {
         quant.as_object_mut().unwrap().extend(config["quantization_config"].as_object().unwrap().clone());
         let quant = testing::exl3_manifest(&quant, &projections);
         std::fs::write(dir.join(crate::plan::checkpoint::view::COMPACT_QUANT), quant.to_string()).unwrap();
+        let attention_view = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
+            "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json",
+                "quantize":"quantize_config.json"}, "compact-attention":{
+                "config":crate::plan::checkpoint::view::COMPACT_CONFIG,
+                "index":crate::plan::checkpoint::view::COMPACT_INDEX,
+                "quantize":crate::plan::checkpoint::view::COMPACT_QUANT}},
+            "native_modules":"quantize_config.json:native_attention"});
+        config["quantization_config"]["attention_view"] = attention_view.clone();
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let native_projections = projections.into_iter().filter(|(name, ..)|
+            !name.ends_with(".self_attn.o_proj")).collect::<Vec<_>>();
+        let mut manifest = testing::exl3_manifest(&config["quantization_config"], &native_projections);
+        manifest["attention_view"] = attention_view;
+        manifest["native_attention"] = serde_json::Value::Object((0..62).map(|layer| {
+            let module = format!("{PREFIX}{layer}.self_attn.o_proj");
+            let weight = format!("{module}.weight");
+            (module, serde_json::json!({"format":"bf16", "shard":"hqa.safetensors",
+                "compact_attention_bits":6, "tensors":{weight:{"dtype":"BF16", "shape":[8192,8192]}}}))
+        }).collect());
+        testing::write_quantize_config(dir, &manifest);
     }
 
     #[test]
