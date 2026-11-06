@@ -62,7 +62,7 @@ pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) ->
     let names = (0..layers).flat_map(|layer| ["q_b_proj", "o_proj"].map(|leaf|
         format!("model.layers.{layer}.self_attn.{leaf}.weight"))).collect::<std::collections::BTreeSet<_>>();
     let headers = checkpoint.view.as_ref().filter(|_| names.iter()
-        .any(|name| !checkpoint.tensors.iter().any(|tensor| &tensor.meta.name == name)))
+        .any(|name| checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.cmp(name)).is_err()))
         .map(|view| Checkpoint::open_view_for_role(view, "GLM complete native attention publication", |name|
             name.rsplit_once('.').is_some_and(|(stem, _)| names.contains(&format!("{stem}.weight")))))
         .transpose()?;
@@ -201,8 +201,10 @@ impl CoreInventory {
                         && checkpoint.config.pointer("/quantization_config/attention_view").is_some();
                 operands.into_iter().filter(|stem| staged && !inventory.projections.contains_key(stem)).collect::<Vec<_>>()
             }).collect::<std::collections::BTreeSet<_>>();
-            let missing_headers = native_stems.iter().any(|stem| !checkpoint.tensors.iter()
-                .any(|tensor| tensor.meta.name == format!("{stem}.weight")));
+            let missing_headers = native_stems.iter().any(|stem| {
+                let weight = format!("{stem}.weight");
+                checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.cmp(&weight)).is_err()
+            });
             let native_headers = missing_headers.then(|| Checkpoint::open_view_for_role(view,
                 "GLM selected native attention", |name| name.rsplit_once('.')
                     .is_some_and(|(stem, _)| native_stems.contains(stem)))).transpose()?;
