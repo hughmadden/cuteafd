@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn unsupported_layouts_refuse_before_any_device_access() -> Result<()> {
-        assert!(args(&[])?.validate().is_err(), "experts need Spark ranks");
+        args(&[])?.validate()?;
         let nine = (1..=9).map(|n| format!("127.0.0.1:{n}")).collect::<Vec<_>>().join(",");
         // Worlds 5, 7 and 8 come from the shared range data (#941).
         for world in [5, 7, 8] {

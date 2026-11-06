@@ -1675,6 +1675,8 @@ pub(super) mod tests {
         };
         let admitted = admit(make(Onboard::Auto))?;
         assert!(admitted.placement.onboard_layers >= 2);
+        assert!(admitted.placement.onboard_layers < 4);
+        assert!(!admitted.working_set().spark_layers.is_empty());
         assert!(admitted.placement.pool_tokens >= 1 << 20);
         assert!(admitted.mark_selection.slots > 0);
         let error = admit(make(Onboard::Layers(1))).err().context("strict override must refuse")?.to_string();

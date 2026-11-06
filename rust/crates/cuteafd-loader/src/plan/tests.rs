@@ -846,7 +846,22 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
             let report = plan(dir.path(), &options).unwrap();
             assert_eq!(report.family.as_deref(), Some(family));
             let descriptor = family::registry().iter().find(|entry| entry.id() == family).unwrap().prefill_limits();
-            let expected = crate::serving_capacity::prefill_waves::prefill_shape(ranks, descriptor, Default::default()).unwrap();
+            let expert_world = if family == "glm5_flash" {
+                let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(
+                    &Checkpoint::open(dir.path()).unwrap().config).unwrap();
+                let remote = ranks > 0 && report.experts.as_ref().is_some_and(|contract|
+                    experts::frozen_refusal(&contract.package, ranks).is_none()
+                        && experts::spark_recipe(&contract.package, cfg.moe_intermediate, ranks).is_ok());
+                if !remote {
+                    assert!(!report.executable() && !report.native_serving_admitted,
+                        "the incomplete header fixture has no local expert package: {}", render(&report));
+                    assert!(report.hints.iter().any(|hint|
+                        hint.what.contains("GLM Flash pool-first placement")), "{}", render(&report));
+                    assert_eq!(report.prefill_transports, Some(0));
+                }
+                if remote { ranks } else { 0 }
+            } else { ranks };
+            let expected = crate::serving_capacity::prefill_waves::prefill_shape(expert_world, descriptor, Default::default()).unwrap();
             let (unit, waves) = (expected.unit_rows, expected.waves);
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
@@ -859,7 +874,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
                 layout.prefill_lanes = waves;
                 layout.prefill_span_rows = Some(unit * waves);
                 let report = plan(dir.path(), &options).unwrap();
-                let max_waves = if ranks == 0 { 1 } else { descriptor.max_waves };
+                let max_waves = if expert_world == 0 { 1 } else { descriptor.max_waves };
                 if waves > max_waves {
                     assert!(!report.placement_supported, "{family} ranks={ranks}: {}", render(&report));
                     assert!(report.hints.iter().any(|hint| hint.what.contains("unsupported prefill shape")),
@@ -3445,12 +3460,6 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             workspace_manifest: Some(path.clone()), ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
         let report = plan(dir.path(), &options).unwrap();
-        if peers > 0 && expected_rtx == 3 {
-            assert!(!report.placement_supported && report.solver_placement.is_none());
-            assert!(report.hints.iter().any(|hint| hint.what.contains(
-                "all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")), "{}", render(&report));
-            continue;
-        }
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {

@@ -358,7 +358,7 @@ mod tests {
         for budget in ["0", "NaN", "inf"] {
             assert!(args(&["--peers", peers, "--spark-budget-gib", budget])?.validate().is_err());
         }
-        assert!(args(&[])?.validate().is_err());
+        args(&[])?.validate()?;
         for extra in [["--split-device", "0"], ["--max-context", "1048577"],
             ["--embedding-placement", "host"], ["--prefix-partial", "on"]] {
             assert!(args(&["--peers", peers, extra[0], extra[1]])?.validate().is_err());

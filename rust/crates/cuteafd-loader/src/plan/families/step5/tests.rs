@@ -697,7 +697,12 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted);
-        assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
+        if ranks == 0 {
+            assert!(r.hints.iter().any(|h| h.what.contains("no local expert package for step5")), "{:?}", r.hints);
+            assert!(r.hints.iter().any(|h| h.what.contains("memory budget 'rtx0'")), "{:?}", r.hints);
+        } else {
+            assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
+        }
     }
     let r = report(dir.path(), 2, 96, 6, Some(32_768));
     assert!(!r.wip_launchable());
