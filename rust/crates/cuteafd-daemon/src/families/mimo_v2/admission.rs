@@ -542,7 +542,7 @@ fn preflight_shape(
         args.onboard.resolve(routed_layers), prefill, operation,
         crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
     let prepared = ProductionInput {
-        expert_usage: args.expert_usage,
+        expert_usage: args.expert_usage_enabled()?,
         cfg, layers, kv, mtp_stages: args.mtp, context: args.max_context as u64,
         maximum_pool_tokens, prefill, lanes: transport_lanes as u64, embedding, gpus: ranks,
         spark_ranks, experts: expert_costs, expert_workspace, tp2_workspace,

@@ -3222,6 +3222,8 @@ mod tests {
                 ids.ptr, weights.ptr, 4, 8, 2, 1.0, true, fixture.stream) }
         };
         route()?;
+        // SAFETY: a Spark-served backbone layer uses the same full canonical top-k.
+        unsafe { record_mimo_routes(Some(&usage), 0, 0, 2, ids.ptr, 3, false, fixture.stream)?; }
         // SAFETY: two packed members cover three real rows; the fourth router row is padding.
         unsafe {
             record_mimo_routes(Some(&usage), 0, 0, 1, ids.ptr, 2, false, fixture.stream)?;
@@ -3249,12 +3251,24 @@ mod tests {
         ensure!(value["error"].is_null(), "snapshot failed: {value}");
         let mut prefill = vec![0u64; 24];
         prefill[8..12].copy_from_slice(&[1, 2, 2, 1]);
+        prefill[16..20].copy_from_slice(&[1, 2, 2, 1]);
         let mut decode = vec![0u64; 24];
         decode[16..20].copy_from_slice(&[3, 6, 6, 3]);
         ensure!(value["windows"]["total"]["prefill_routed_rows"] == serde_json::json!(prefill),
             "packed/padding/replica counts: {value}");
         ensure!(value["windows"]["total"]["decode_routed_rows"] == serde_json::json!(decode),
             "verify/replay counts: {value}");
+        let total = &value["windows"]["total"];
+        let selections = |phase: &str, layer: usize| -> u64 {
+            total[phase].as_array().unwrap()[layer * 8..(layer + 1) * 8]
+                .iter().map(|n| n.as_u64().unwrap()).sum()
+        };
+        // One TP2 logical selection (both GPU halves), one Spark layer; never twice for replicas.
+        ensure!(selections("prefill_routed_rows", 1) == 3 * 2, "TP2 full top-k missing");
+        ensure!(selections("prefill_routed_rows", 2) == 3 * 2, "Spark full top-k missing");
+        ensure!(selections("decode_routed_rows", 2) == 3 * 3 * 2, "verify rows x replays x top-k");
+        ensure!(total["prefill_routed_rows"].as_array().unwrap().iter().map(|n| n.as_u64().unwrap()).sum::<u64>()
+            == 2 * 3 * 2, "all-owner prefill rows x top-k");
         Ok(())
     }
 

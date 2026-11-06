@@ -225,6 +225,10 @@ pub(crate) enum DraftRepresentationArg {
 pub(crate) enum WeightPolicyArg { Auto, Checkpoint }
 
 impl EngineArgs {
+    fn expert_usage_enabled(&self) -> Result<bool> {
+        self.expert_usage_reader.configure(self.expert_usage, self.skip_experts).map_err(anyhow::Error::msg)
+    }
+
     fn draft_storage(&self) -> Result<MimoDraftRepresentation> {
         match self.draft_representation {
             Some(DraftRepresentationArg::Checkpoint) => {
@@ -284,6 +288,10 @@ mod draft_storage_tests {
         assert!(!off.expert_usage);
         assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
         assert!(args(&["--expert-usage"]).expert_usage);
+        let skipped = args(&["--expert-usage", "--skip-experts"]);
+        assert!(!skipped.expert_usage_enabled().unwrap());
+        assert!(skipped.expert_usage_reader.require_enabled().is_err());
+        assert_eq!(skipped.expert_usage_reader.snapshot()["enabled"], false);
     }
 
     #[test]
