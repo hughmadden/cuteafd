@@ -119,9 +119,18 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     let catalog = shared.catalog(case.dspark)?;
     let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1)?;
     let family = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let peers = (0..case.sparks).map(|r| format!("10.0.0.{}:1970{r}", r + 1)).collect::<Vec<_>>().join(",");
+    // Match the launcher's boundary: inventory is an upper bound, while the
+    // solved deployment supplies actual peers and exact prefill geometry.
+    let report = shared.input.plan(&plan_options(case, host))?;
+    let world = if report.solver_placement.as_ref().is_some_and(|placement|
+        placement.layers.iter().all(|layer| layer.experts != cuteafd_loader::placement::ExpertHome::Spark)) {
+        0
+    } else { case.sparks };
+    let peers = (0..world).map(|r| format!("10.0.0.{}:1970{r}", r + 1)).collect::<Vec<_>>().join(",");
     let mut argv = vec!["serve".to_string(), "--snapshot".into(), case.snapshot.display().to_string(),
-        "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers];
+        "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers,
+        "--prefill-rows".into(), report.prefill_unit_rows.unwrap().to_string(),
+        "--prefill-waves".into(), report.prefill_waves.unwrap().to_string()];
     if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     if case.dspark { argv.push("--dspark".into()); }
@@ -428,6 +437,27 @@ fn planner_equals_runtime_deepseek_v4_fixture() {
             }
         }
     }
+}
+
+#[test]
+fn planner_all_local_auto_pool_matches_forwarded_runtime_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic_context(dir.path());
+    let shared = Shared::open(dir.path()).unwrap();
+    let case = Case { snapshot: dir.path(), manifest: &manifest, rtx: 1, sparks: 4,
+        context: 131_072, budget: 32 << 30, onboard: Some(OnboardSetting::All),
+        dspark: false, tp2_draft: false, exchange_f32: false,
+        peer_budget: None, physical_sms: None, attention: None };
+    let report = shared.input.plan(&plan_options(&case, false)).unwrap();
+    assert!(report.placement_supported, "{:?}", report.hints);
+    assert_eq!((report.prefill_unit_rows, report.prefill_waves), (Some(4096), Some(1)));
+    assert!(report.solver_placement.as_ref().unwrap().layers.iter().all(|layer|
+        layer.experts != cuteafd_loader::placement::ExpertHome::Spark));
+    assert!(plan_options(&case, false).layout.unwrap().pool_tokens.is_none());
+    let layout = report.memory_layout.unwrap();
+    let runtime = runtime(&shared, &case, &layout).unwrap();
+    assert_eq!(layout.pool_tokens, runtime.pool_tokens);
+    assert!(runtime.pool_tokens > 1 << 20, "auto pool must remain maximized for explicit all");
 }
 
 #[test]

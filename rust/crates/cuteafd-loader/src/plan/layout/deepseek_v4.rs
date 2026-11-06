@@ -41,9 +41,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     // Re-admit the entire local geometry, never just rewrite the published rows.
     let mut local_report = original_report.clone();
     let mut local_options = original_options.clone();
-    if let Some(placement) = &report.solver_placement {
-        local_options.pool_tokens = Some(placement.pool_tokens);
-    }
     let local = layout_for_experts(&mut local_report, model, input, &mut local_options, 0, false);
     if local_report.placement_supported && local_report.solver_placement.is_some() {
         *report = local_report;
