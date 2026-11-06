@@ -152,7 +152,7 @@ pub struct LayoutOptions {
     pub draft_sequences: Option<u64>,
     /// V4.1 configured proposal limit; loaded neural width is five or seven.
     pub dspark_draft_limit: u8,
-    /// V4.1 native dSpark expert halves on both coordinator GPUs.
+    /// DeepSeek V4/V4.1 dSpark expert halves on both coordinator GPUs.
     pub tp2_dspark_experts: bool,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
     pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,

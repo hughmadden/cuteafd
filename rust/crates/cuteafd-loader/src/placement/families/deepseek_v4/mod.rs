@@ -70,8 +70,10 @@ pub struct V4Inputs {
     /// Per-layer whole-layer residency (backbone routed layers in order),
     /// empty when routed experts never stay on RTX.
     pub experts: Vec<V4ExpertCost>,
-    /// dSpark stage experts loaded into GPU0's arena (`--dspark`).
+    /// Whole dSpark costs; used on GPU0 unless `draft_half` selects TP2.
     pub draft: Vec<V4ExpertCost>,
+    /// dSpark halves in stage order; empty for the single-GPU/explicit-off arena.
+    pub draft_half: Vec<[V4ExpertCost; 2]>,
     /// Half-layer residency per routed backbone layer and rank.
     pub experts_half: Vec<[V4ExpertCost; 2]>,
     pub tp2_workspace: [u64; 2],
@@ -324,7 +326,7 @@ mod default_tests {
                         context_bytes: 0, loaded_bytes: 0 }); gpus], headroom_floor: 0,
                     spark_ranks: 6, sequences: 16, prefill_rows: 2752, prefill_waves: 3,
                     decode_rows: 64, max_context: 262144, reserve_bytes: 3 << 30, mark_slots: 0,
-                    workspace: None, experts: Vec::new(), draft: Vec::new(), experts_half: Vec::new(),
+                    workspace: None, experts: Vec::new(), draft: Vec::new(), draft_half: Vec::new(), experts_half: Vec::new(),
                     tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
                     first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
                     full_prefill_logits: 0, code_bytes: Vec::new(), context: None, attention: None,
@@ -396,7 +398,7 @@ mod default_tests {
             cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2],
             headroom_floor: 0, spark_ranks: 6, sequences: 1, prefill_rows: 4096, prefill_waves: 3,
             decode_rows: 64, max_context: 262144, reserve_bytes: RESERVE_BYTES, mark_slots: 0,
-            workspace: None, experts: Vec::new(), draft: Vec::new(), experts_half: Vec::new(),
+            workspace: None, experts: Vec::new(), draft: Vec::new(), draft_half: Vec::new(), experts_half: Vec::new(),
             tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0, first_routed: 0,
             requested_pool: Some(262144), onboard: Onboard::Layers(0), full_prefill_logits: 0,
             code_bytes: Vec::new(), context: None, attention: None, extra: Vec::new(),
@@ -408,6 +410,46 @@ mod default_tests {
         let prepared = prepare(input)?;
         let request = production_request(input);
         prepared.admit(request).map(|admitted| admitted.placement)
+    }
+
+    #[test]
+    fn tp2_draft_is_mandatory_at_zero_onboarding_and_shares_one_workspace() {
+        let mut input = plan_inputs(&context_cfg());
+        input.attention = Some(AttentionPlacement::Heads);
+        input.expert_workspace = 1024;
+        input.tp2_workspace = [2048; 2];
+        let full = V4ExpertCost { resident_bytes: 8 << 20, staging_bytes: 4096 };
+        let half = V4ExpertCost { resident_bytes: 4 << 20, staging_bytes: 2048 };
+        input.draft = vec![full; 3];
+        input.experts = vec![full; 2];
+        input.experts_half = vec![[half; 2]; 2];
+        let off = admitted(&input).unwrap();
+        assert!(off.tp2.is_none());
+        assert!(off.expert_ranges[0].peak_bytes > 0);
+        input.draft_half = vec![[half; 2]; 3];
+        let payload = crate::serving_capacity::deepseek_v4_tp2_payload_bytes(
+            input.cfg.dim as u64, input.prefill_rows, input.decode_rows, input.prefill_waves).unwrap();
+        for count in 0..=2 {
+            input.onboard = Onboard::Layers(count);
+            let prepared = prepare(&input).unwrap();
+            let result = prepared.admit(production_request(&input)).unwrap();
+            let tp2 = result.placement.tp2.unwrap();
+            let expected = 2048 + payload + (3 + count as u64) * half.resident_bytes + half.staging_bytes;
+            assert_eq!(tp2.peak_bytes, [expected; 2]);
+            assert_eq!(tp2.layers, count);
+            assert!(result.placement.expert_ranges.iter().all(|r| r.peak_bytes == 0));
+            for gpu in 0..2 {
+                let actual: u64 = result.placement.items[gpu].iter().filter(|i| i.group == "tp2").map(|i| i.bytes).sum();
+                assert_eq!(actual, expected);
+            }
+            let ids = result.solved.facts.allocations.iter().map(|a| &a.id).collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(ids.len(), result.solved.facts.allocations.len());
+        }
+        input.draft_half.pop();
+        assert!(prepare(&input).is_err());
+        input.draft_half.push([half; 2]);
+        input.gpus.truncate(1);
+        assert!(prepare(&input).is_err());
     }
 
     #[test]
@@ -495,6 +537,15 @@ pub fn expert_half_costs(catalog: &crate::OfficialV41Catalog) -> anyhow::Result<
         crate::serving_capacity::deepseek_v4_tp2_expert_cost(catalog, layer, 0)?,
         crate::serving_capacity::deepseek_v4_tp2_expert_cost(catalog, layer, 1)?,
     ])).collect()
+}
+
+/// Stage halves use V4's backbone TP2 package and exact same-geometry residency.
+pub fn draft_half_costs(catalog: &crate::OfficialV41Catalog, stages: usize) -> anyhow::Result<Vec<[V4ExpertCost; 2]>> {
+    (0..stages).map(|stage| {
+        let layer = catalog.routed_experts().layers + stage;
+        Ok([crate::serving_capacity::deepseek_v4_tp2_expert_cost(catalog, layer, 0)?,
+            crate::serving_capacity::deepseek_v4_tp2_expert_cost(catalog, layer, 1)?])
+    }).collect()
 }
 
 /// Whole-layer residency of every routed backbone layer and `stages` dSpark

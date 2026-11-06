@@ -170,7 +170,7 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
     let expert_workspace = match inputs.expert_workspace {
         Some(bytes) => bytes,
         // TP2 backbone executors do not need the TP1/dSpark package.
-        None if gpus == 2 && stages == 0 => 0,
+        None if gpus == 2 && (stages == 0 || args.tp2_dspark_experts) => 0,
         None => {
             ensure!(stages == 0 && !args.fixed_onboard(),
                 "V4 local expert kernels are missing: export the matching rtx_backbone package for explicit local layers/dSpark");
@@ -183,7 +183,7 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
         match inputs.tp2_workspace {
             Some(workspace) => (v4::expert_half_costs(inputs.catalog)?, workspace),
             None => {
-                ensure!(onboard == Onboard::Auto || onboard.layers(routed.layers - routed.first_layer) == Some(0), "V4 TP2 expert kernels are missing: export the matching rtx_tp2 package for explicit local layers");
+                ensure!(!args.tp2_dspark_experts && (onboard == Onboard::Auto || onboard.layers(routed.layers - routed.first_layer) == Some(0)), "V4 TP2 expert kernels are missing: export the matching rtx_tp2 package for explicit local layers");
                 tracing::warn!("V4 TP2 expert kernels unavailable; routing all backbone layers to Sparks");
                 (Vec::new(), [0; 2])
             }
@@ -203,7 +203,8 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
         gpus: baselines, headroom_floor: 0, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: shape.waves, decode_rows: decode,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
-        workspace: Some(workspace), experts, draft, expert_workspace, first_routed: routed.first_layer,
+        workspace: Some(workspace), draft_half: if args.tp2_dspark_experts { v4::draft_half_costs(inputs.catalog, stages)? } else { Vec::new() },
+        experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },

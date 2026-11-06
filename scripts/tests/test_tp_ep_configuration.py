@@ -66,11 +66,14 @@ class TopologyConfigTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), 'on')
 
     def test_tp2_dspark_default_follows_resolved_layout(self) -> None:
-        for family, gpus, speculator in [('deepseek_v41', 2, 'dspark'),
+        for family, gpus, speculator in [('deepseek_v4', 2, 'dspark'),
+                                         ('deepseek_v4', 1, 'dspark'),
+                                         ('deepseek_v4', 2, 'off'),
+                                         ('deepseek_v41', 2, 'dspark'),
                                          ('deepseek_v41', 1, 'dspark'),
                                          ('deepseek_v41', 2, 'off'),
                                          ('glm5', 2, 'dspark')]:
-            eligible = family == 'deepseek_v41' and gpus == 2 and speculator == 'dspark'
+            eligible = family in {'deepseek_v4', 'deepseek_v41'} and gpus == 2 and speculator == 'dspark'
             for requested in ['', 'off', 'on']:
                 with self.subTest(family=family, gpus=gpus, speculator=speculator, requested=requested):
                     result = load(f'SPECULATOR={speculator}\nTP2_DSPARK_EXPERTS={requested}',
@@ -78,7 +81,7 @@ class TopologyConfigTest(unittest.TestCase):
                                   'printf "%s\\n" "$TP2_DSPARK_EXPERTS"')
                     if requested == 'on' and not eligible:
                         self.assertNotEqual(result.returncode, 0)
-                        self.assertIn('requires V4.1, two selected RTX GPUs and dSpark', result.stderr)
+                        self.assertIn('requires V4/V4.1, two selected RTX GPUs and dSpark', result.stderr)
                     else:
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(result.stdout.strip(), 'on' if eligible and requested != 'off' else 'off')
@@ -1409,6 +1412,31 @@ def run_sh_block(start: str, end: str) -> str:
     """Extract one literal run.sh block so a test can execute the real code."""
     source = (ROOT / "scripts/launch/run-family.sh").read_text()
     return source[source.index(start):source.index(end, source.index(start))]
+
+
+class V4DraftPlanConfigTest(unittest.TestCase):
+    def test_resolved_draft_mode_reaches_container_planner(self) -> None:
+        block = run_sh_block('  plan_config_mounts=()', '  release_validate_deployment "$plan_json"')
+        for mode in ("on", "off"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                env = os.environ | {"HOME": temporary, "TP2_DSPARK_EXPERTS": mode}
+                setup = '''
+family=deepseek_v4
+available_sparks=2
+get() { printf '%s' "host-${1}"; }
+count_args=()
+'''
+                staging = block[:block.index('  # Keep checkpoint paths unchanged')]
+                check = '''
+[[ "${count_args[*]}" == '--config /run/cuteafd-plan.config' ]]
+[[ "${plan_config_mounts[0]}" == -v ]]
+[[ "${plan_config_mounts[1]}" == "$plan_config:/run/cuteafd-plan.config:ro" ]]
+[[ "$(cat "$plan_config")" == "$(printf '%s\\n' "TP2_DSPARK_EXPERTS=$TP2_DSPARK_EXPERTS" 'SPARK_0_HOST=host-SPARK_0_HOST' 'SPARK_1_HOST=host-SPARK_1_HOST')" ]]
+'''
+                result = subprocess.run(["bash", "-euc", setup + staging + check], env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"${plan_config_mounts[@]}"', block)
 
 
 class PublishedImageReferenceTest(unittest.TestCase):

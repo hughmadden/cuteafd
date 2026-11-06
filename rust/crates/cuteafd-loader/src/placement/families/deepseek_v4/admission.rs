@@ -318,7 +318,10 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
     }
     let routed =
         (inputs.first_routed..inputs.first_routed + inputs.experts.len()).collect::<Vec<_>>();
-    let tp2 = inputs.gpus.len() == 2 && !inputs.experts_half.is_empty();
+    let tp2 = inputs.gpus.len() == 2 && (!inputs.experts_half.is_empty() || !inputs.draft_half.is_empty());
+    if !inputs.draft_half.is_empty() && (!tp2 || inputs.draft_half.len() != inputs.draft.len()) {
+        return Err(invalid("V4 dSpark TP2 stage halves require both GPUs and every stage"));
+    }
     if tp2 && inputs.experts_half.len() != routed.len() {
         return Err(invalid("V4 TP2 expert halves per routed layer"));
     }
@@ -542,10 +545,10 @@ impl<'a> PreparedV4<'a> {
         self.prefix
     }
 
-    /// dSpark's stage experts open GPU0's TP1 arena. In TP2 mode they keep a
-    /// peak of their own; in whole mode they precede the backbone layers in
-    /// the same arena.
+    /// Whole dSpark stages open GPU0's TP1 arena unless their halves share
+    /// the TP2 arena. In whole mode they precede the backbone layers.
     fn dspark_peak(&self) -> Result<u64, Refusal> {
+        if !self.inputs.draft_half.is_empty() { return Ok(0); }
         arena_peak(
             self.inputs.expert_workspace,
             self.inputs
@@ -556,12 +559,14 @@ impl<'a> PreparedV4<'a> {
     }
 
     fn dspark_resident(&self) -> Result<u64, Refusal> {
+        if !self.inputs.draft_half.is_empty() { return Ok(0); }
         sum(self.inputs.draft.iter().map(|cost| cost.resident_bytes))
     }
 
     /// Whole-layer arena peak on GPU0 for `count` onboarded layers, including
     /// dSpark's stages ahead of them. Zero on every other GPU.
     fn whole_peak(&self, count: usize) -> Result<u64, Refusal> {
+        if !self.inputs.draft_half.is_empty() { return Ok(0); }
         arena_peak(
             self.inputs.expert_workspace,
             self.inputs
@@ -585,7 +590,7 @@ impl<'a> PreparedV4<'a> {
     /// TP2 half-arena peak for `count` layers on `gpu`. The staged order is
     /// per step, so the peak is the resident total plus the largest staging.
     fn tp2_peak(&self, gpu: usize, count: usize) -> Result<u64, Refusal> {
-        if count == 0 {
+        if count == 0 && self.inputs.draft_half.is_empty() {
             return Ok(0);
         }
         // The arena's ordered-exchange payload is allocated only while it holds
@@ -598,10 +603,9 @@ impl<'a> PreparedV4<'a> {
             self.inputs.prefill_waves,
         )
         .map_err(|_| Refusal::Overflow("V4 TP2 payload"))?;
-        let halves = &self.inputs.experts_half[..count];
-        let resident = sum(halves.iter().map(|half| half[gpu].resident_bytes))?;
+        let halves = self.inputs.experts_half[..count].iter().chain(&self.inputs.draft_half);
+        let resident = sum(halves.clone().map(|half| half[gpu].resident_bytes))?;
         let staging = halves
-            .iter()
             .map(|half| half[gpu].staging_bytes)
             .max()
             .unwrap_or(0);
@@ -613,8 +617,7 @@ impl<'a> PreparedV4<'a> {
     }
 
     fn tp2_resident(&self, gpu: usize, count: usize) -> Result<u64, Refusal> {
-        sum(self.inputs.experts_half[..count]
-            .iter()
+        sum(self.inputs.experts_half[..count].iter().chain(&self.inputs.draft_half)
             .map(|half| half[gpu].resident_bytes))
     }
 
@@ -691,12 +694,11 @@ impl<'a> PreparedV4<'a> {
             };
             gpus
         ];
-        // Under TP2 the TP1 arena (dSpark's stages) stays alive beside the
-        // distinct halves, so GPU0 reports it and the halves are their own
-        // range. A whole-layer prefix shares the arena and reports one peak.
+        // Explicit-off stages retain their TP1 arena beside the backbone halves.
+        // Split stages instead share the TP2 arena, even at zero onboarding.
         let tp2 = if self.tp2 {
             expert_ranges[0].peak_bytes = self.dspark_peak()?;
-            (count > 0)
+            (count > 0 || !self.inputs.draft_half.is_empty())
                 .then(|| {
                     Ok::<_, Refusal>(Tp2Range {
                         first: self.inputs.first_routed,
@@ -945,8 +947,8 @@ impl Recipe for PreparedV4<'_> {
         for demand in inputs.weights.startup.device_phases(gpus).map_err(invalid)? {
             owners.loading(demand.gpu, demand.bytes, &demand.group);
         }
-        // dSpark's TP1 arena exists with or without onboarded layers; the
-        // backbone's marginal arena cost is priced per onboard count.
+        // Mandatory dSpark residency exists without onboarded layers; the
+        // backbone adds only its marginal arena cost per onboard count.
         let dspark = self.dspark_peak()?;
         owners.owner(
             "v4.tp1.0".into(),
@@ -963,6 +965,13 @@ impl Recipe for PreparedV4<'_> {
             Activation::always(),
         );
 
+        for gpu in 0..2 {
+            if !inputs.draft_half.is_empty() {
+                owners.owner(format!("v4.tp2.draft.{gpu}"), gpu as u8, self.tp2_peak(gpu, 0)?,
+                    Category::Experts, "tp2", Activation::always());
+                owners.weights(format!("v4.tp2.draft.{gpu}"), gpu as u8, self.tp2_resident(gpu, 0)?, Activation::always());
+            }
+        }
         let mut variables = self
             .modes
             .iter()
@@ -999,7 +1008,7 @@ impl Recipe for PreparedV4<'_> {
                         owners.owner(
                             format!("v4.tp2.{gpu}"),
                             gpu as u8,
-                            self.tp2_peak(gpu, count)?,
+                            self.tp2_peak(gpu, count)?.saturating_sub(self.tp2_peak(gpu, 0)?),
                             Category::Experts,
                             "tp2",
                             activation.clone(),
@@ -1007,7 +1016,7 @@ impl Recipe for PreparedV4<'_> {
                         owners.weights(
                             format!("v4.tp2.{gpu}"),
                             gpu as u8,
-                            self.tp2_resident(gpu, count)?,
+                            self.tp2_resident(gpu, count)?.saturating_sub(self.tp2_resident(gpu, 0)?),
                             activation.clone(),
                         );
                     }

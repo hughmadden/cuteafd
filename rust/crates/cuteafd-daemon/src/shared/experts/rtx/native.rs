@@ -29,12 +29,16 @@ pub(super) fn output_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usiz
 }
 
 pub(super) fn validate_layers(layers: &[usize], rank: u8) -> Result<()> {
-    ensure!(
-        rank < 2 && !layers.is_empty()
-            && layers.windows(2).all(|ids| ids[0] < ids[1])
-            && layers.iter().all(|&layer| layer < expert_geometry().layers as usize),
-        "invalid TP2 rank or ordered absolute layer IDs"
-    );
+    validate_layers_for(expert_geometry(), layers, rank)
+}
+
+fn validate_layers_for(geometry: ExpertGeometry, layers: &[usize], rank: u8) -> Result<()> {
+    // V4 uses the backbone package for its three same-geometry draft stages.
+    let stages = if matches!(geometry.family(), Some("dsv4f" | "dsv4p")) { 3 } else { 0 };
+    ensure!(rank < 2 && !layers.is_empty()
+        && layers.windows(2).all(|ids| ids[0] < ids[1])
+        && layers.iter().all(|&layer| layer < geometry.layers as usize + stages),
+        "invalid TP2 rank or ordered absolute layer IDs");
     Ok(())
 }
 
@@ -970,6 +974,20 @@ mod tests {
             }
         }
         assert!(validate_layers(&[0], 2).is_err());
+    }
+
+    #[test]
+    fn only_v4_backbone_packages_accept_absolute_stage_ids() {
+        for geometry in [ExpertGeometry::DEEPSEEK_V4_FLASH, ExpertGeometry::DEEPSEEK_V4_PRO] {
+            let first = geometry.layers as usize;
+            for rank in 0..2 {
+                assert!(validate_layers_for(geometry, &[0, first, first + 1, first + 2], rank).is_ok());
+                assert!(validate_layers_for(geometry, &[first, first + 1, first + 2], rank).is_ok());
+                assert!(validate_layers_for(geometry, &[first + 3], rank).is_err());
+            }
+        }
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        assert!(validate_layers_for(geometry, &[geometry.layers as usize], 0).is_err());
     }
 
     #[test]

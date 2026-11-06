@@ -146,7 +146,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 placement = admitted.placement;
             }
         }
-        startup.add_experts(input.expert_catalog()?, shape.native_layers, &placement)?;
+        startup.add_experts(input.expert_catalog()?, shape.native_layers, &placement, options.tp2_dspark_experts)?;
         Ok((placement, reserves, startup.notes()?, solved, prefix))
     })();
     match admitted {
@@ -248,6 +248,8 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
     let cfg = DeepseekV4Config::read(&checkpoint.snapshot, shape.native_layers)?;
     let catalog = input.expert_catalog()?;
     let routed = *catalog.routed_experts();
+    anyhow::ensure!(!options.tp2_dspark_experts || (devices.len() == 2 && shape.native_layers > 0),
+        "V4 TP2 dSpark requires two coordinator GPUs and retained stages");
     let (experts, draft) = v4::expert_costs(catalog, shape.native_layers)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let expert_workspace = if catalog.exl3().is_some() { exl3_workspace.unwrap_or(160 * MIB * shape.prefill_rows / 4096) }
@@ -267,12 +269,12 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
         else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
             shape.native_layers, shape.concurrency, options.prefix_entries("deepseek_v4"), options.mimo_prefix_mark_bytes, host_marks)? };
     let onboard = options.resolve_onboard(routed.routed_layers()).unwrap_or_else(v4::default_onboard);
-    let tp2_workspace = if devices.len() == 2 && onboard.layers(routed.layers - routed.first_layer) != Some(0) {
+    let tp2_workspace = if devices.len() == 2 && (options.tp2_dspark_experts || onboard.layers(routed.layers - routed.first_layer) != Some(0)) {
         crate::serving_capacity::deepseek_v4_tp2_workspace(catalog, options.workspace_manifest.as_deref(),
             shape.prefill_rows.max(shape.decode_rows)).ok()
     } else { None };
-    if devices.len() == 2 && tp2_workspace.is_none() && onboard != Onboard::Auto && onboard.layers(routed.layers - routed.first_layer) != Some(0) {
-        anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for explicit local layers");
+    if devices.len() == 2 && tp2_workspace.is_none() && (options.tp2_dspark_experts || (onboard != Onboard::Auto && onboard.layers(routed.layers - routed.first_layer) != Some(0))) {
+        anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for dSpark or explicit local layers");
     }
     let mut weights = crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg,
         devices.len(), shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?;
@@ -293,6 +295,7 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
         cache_stages: shape.native_layers, gpus, headroom_floor: options.headroom_bytes,
         spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, prefill_waves: options.prefill_waves, decode_rows: shape.decode_rows,
         max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace,
+        draft_half: if options.tp2_dspark_experts { v4::draft_half_costs(catalog, shape.native_layers)? } else { Vec::new() },
         experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half: if tp2_workspace.is_some() { v4::expert_half_costs(catalog)? } else { Vec::new() },
         tp2_workspace: tp2_workspace.map_or([0; 2], |bytes| [bytes; 2]),

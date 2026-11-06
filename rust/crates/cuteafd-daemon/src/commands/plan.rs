@@ -149,9 +149,9 @@ fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &P
         else { 4096 };
 }
 
-fn v41_tp2_dspark_experts(args: &PlanArgs, family: &str,
+fn tp2_dspark_experts(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
-    let applicable = args.layout && family == "deepseek_v41" && args.rtx == 2 && args.speculator == "dspark";
+    let applicable = args.layout && matches!(family, "deepseek_v41" | "deepseek_v4") && args.rtx == 2 && args.speculator == "dspark";
     let enabled = args.tp2_dspark_experts || match cfg.get("TP2_DSPARK_EXPERTS").map(String::as_str) {
         None | Some("") => applicable,
         Some("off") => false,
@@ -159,7 +159,7 @@ fn v41_tp2_dspark_experts(args: &PlanArgs, family: &str,
         Some(_) => anyhow::bail!("TP2_DSPARK_EXPERTS must be on or off"),
     };
     anyhow::ensure!(!enabled || applicable,
-        "--tp2-dspark-experts requires V4.1, --layout, --rtx 2 and dSpark");
+        "--tp2-dspark-experts requires V4/V4.1, --layout, --rtx 2 and dSpark");
     Ok(enabled)
 }
 
@@ -289,7 +289,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
-    let tp2_dspark_experts = v41_tp2_dspark_experts(&args, family, &cfg)?;
+    let tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
     if let Some(layout) = &mut options.layout {
         layout.tp2_dspark_experts = tp2_dspark_experts;
@@ -910,36 +910,39 @@ mod tests {
     }
 
     #[test]
-    fn v41_tp2_dspark_cli_and_config_resolve_before_layout() {
+    fn v4_and_v41_tp2_dspark_cli_and_config_resolve_before_layout() {
         use clap::Parser;
         let argv = ["cuteafd", "plan", "model", "--layout", "--rtx", "2", "--speculator", "dspark"];
         let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
             else { panic!("expected plan") };
         for (configured, expected) in [(None, true), (Some(""), true), (Some("off"), false), (Some("on"), true)] {
             let cfg = configured.map(|value| [("TP2_DSPARK_EXPERTS".into(), value.into())].into()).unwrap_or_default();
-            assert_eq!(v41_tp2_dspark_experts(&request, "deepseek_v41", &cfg).unwrap(), expected);
+            for family in ["deepseek_v4", "deepseek_v41"] {
+                assert_eq!(tp2_dspark_experts(&request, family, &cfg).unwrap(), expected);
+            }
         }
         let cfg = [("TP2_DSPARK_EXPERTS".into(), "on".into())].into();
         for (family, rtx, layout, speculator) in [("glm5_flash", 2, true, "dspark"),
             ("deepseek_v41", 1, true, "dspark"), ("deepseek_v41", 2, false, "dspark"),
-            ("deepseek_v41", 2, true, "off")] {
+            ("deepseek_v41", 2, true, "off"), ("deepseek_v4", 1, true, "dspark"),
+            ("deepseek_v4", 2, false, "dspark"), ("deepseek_v4", 2, true, "off")] {
             request.rtx = rtx;
             request.layout = layout;
             request.speculator = speculator.into();
-            assert!(!v41_tp2_dspark_experts(&request, family, &Default::default()).unwrap());
+            assert!(!tp2_dspark_experts(&request, family, &Default::default()).unwrap());
             let off = [("TP2_DSPARK_EXPERTS".into(), "off".into())].into();
-            assert!(!v41_tp2_dspark_experts(&request, family, &off).unwrap());
-            assert!(v41_tp2_dspark_experts(&request, family, &cfg).is_err());
+            assert!(!tp2_dspark_experts(&request, family, &off).unwrap());
+            assert!(tp2_dspark_experts(&request, family, &cfg).is_err());
         }
         let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
             argv.into_iter().chain(["--tp2-dspark-experts"])).unwrap().command else { panic!("expected plan") };
         assert!(options(&request).unwrap().layout.unwrap().tp2_dspark_experts);
-        assert!(v41_tp2_dspark_experts(&request, "deepseek_v41", &Default::default()).unwrap());
+        assert!(tp2_dspark_experts(&request, "deepseek_v41", &Default::default()).unwrap());
         assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "model", "--tp2-dspark-experts"]).is_err());
         let mut request = request;
         request.tp2_dspark_experts = false;
         let invalid = [("TP2_DSPARK_EXPERTS".into(), "invalid".into())].into();
-        assert!(v41_tp2_dspark_experts(&request, "deepseek_v41", &invalid).is_err());
+        assert!(tp2_dspark_experts(&request, "deepseek_v41", &invalid).is_err());
     }
 
     #[test]

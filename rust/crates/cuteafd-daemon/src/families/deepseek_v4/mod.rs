@@ -80,6 +80,9 @@ pub(crate) struct EngineArgs {
     /// backbone layers) so the engine can draft.
     #[arg(long)]
     pub dspark: bool,
+    /// Split dSpark expert stages across the two coordinator GPUs.
+    #[arg(long, requires_all = ["dspark", "split_device"], conflicts_with = "skip_routed_experts")]
+    pub tp2_dspark_experts: bool,
     /// GiB kept free on the coordinator GPU for workspaces and headroom.
     #[arg(long, default_value_t = 10)]
     pub reserve_gib: usize,
@@ -482,11 +485,11 @@ pub(crate) fn with_engine<T>(
         let stages = if args.dspark && !args.skip_routed_experts { cache_stages } else { 0 };
         let max_rows = prefill_rows.max(decode_rows);
         let expert_workspace = if args.skip_routed_experts
-            || (stages == 0 && (split_device.is_some() || onboard.layers(loaded.cfg.n_layers) == Some(0))) { Some(0) }
+            || ((stages == 0 || args.tp2_dspark_experts) && (split_device.is_some() || onboard.layers(loaded.cfg.n_layers) == Some(0))) { Some(0) }
             else { local::workspace_bytes(&loaded.library, &args.native_lib, &loaded.catalog,
                 max_rows)?.map(|bytes| bytes as u64) };
         let tp2_workspace = if split_device.is_some() && !args.skip_routed_experts
-            && onboard.layers(loaded.cfg.n_layers) != Some(0) {
+            && (args.tp2_dspark_experts || onboard.layers(loaded.cfg.n_layers) != Some(0)) {
             use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2};
             let measured = if let Some(manifest) = loaded.catalog.exl3() {
                 let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
@@ -549,7 +552,7 @@ pub(crate) fn with_engine<T>(
             let peak = CoordinatorExpertPlan::admit_host(&vec![None; devices.len()], &host,
                 cuteafd_ffi::push_ring::DEFAULT_SLOTS, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, available)?;
             ensure!(peak as u64 == startup.host_bytes()?, "V4 startup host inventory disagrees with admission");
-            startup.add_experts(&loaded.catalog, stages, &placement)?;
+            startup.add_experts(&loaded.catalog, stages, &placement, args.tp2_dspark_experts)?;
             let bound = startup.host_bytes()?;
             ensure!(bound <= available, "V4 dense and expert startup need {bound} host bytes, available {available}");
             for note in startup.notes()? { tracing::info!("{note}"); }
@@ -626,7 +629,7 @@ pub(crate) fn with_engine<T>(
     let mut transports = Vec::new();
     let result = (|| -> Result<T> {
         if let Some((device, stream)) = peer_stream {
-            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
+            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.is_some() })?;
         }
         crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-kv-pool", Default::default())?;
         // The host prefix quota and every pinned table were admitted with the placement.
@@ -643,17 +646,18 @@ pub(crate) fn with_engine<T>(
         let layers: Vec<_> = (range.first..range.first + range.layers).collect();
         let local = if skip { None } else { local::LocalExperts::load_pushed(
             crate::shared::memory::device::Device { library: &loaded.library, id: args.device },
-            &loaded.snapshot, &args.native_lib, &loaded.catalog, stages, &layers,
+            &loaded.snapshot, &args.native_lib, &loaded.catalog, if args.tp2_dspark_experts { 0 } else { stages }, &layers,
             max_rows, usize::try_from(range.peak_bytes)?, stream)? };
         ensure!(local.as_ref().map_or(&[][..], |l| l.layers()) == layers,
             "DeepSeek V4 TP1 allocation differs from admitted placement");
         engine.install_local(local)?;
-        if let Some(tp2) = placement.tp2.as_ref().filter(|t| t.layers > 0 && !skip) {
+        if let Some(tp2) = placement.tp2.as_ref().filter(|_| !skip) {
             use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2, RtxExpertLayer};
             use crate::shared::memory::device::Device;
             let devices = [Device { library: &loaded.library, id: args.device },
                 Device { library: &loaded.library, id: split_device.context("TP2 needs a head split")? }];
-            let layers: Vec<_> = (tp2.first..tp2.first + tp2.layers).collect();
+            let layers: Vec<_> = (tp2.first..tp2.first + tp2.layers)
+                .chain(loaded.cfg.n_layers..loaded.cfg.n_layers + if args.tp2_dspark_experts { stages } else { 0 }).collect();
             let budgets = [usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?];
             use crate::shared::experts::rtx::{dense::DenseArena,
                 push::{CoordinatorExperts, CoordinatorPush, PushPolicy}, RtxSelectionPolicy};

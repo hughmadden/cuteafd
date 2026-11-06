@@ -160,6 +160,10 @@ mod tp2_tests {
             for rank in 0..2 {
                 let cost = deepseek_v4_tp2_expert_cost(&catalog, catalog.routed_experts().first_layer, rank).unwrap();
                 assert_eq!((cost.resident_bytes, cost.staging_bytes), (resident, staging));
+                for stage in 0..catalog.routed_experts().draft_stages {
+                    let draft = deepseek_v4_tp2_expert_cost(&catalog, catalog.routed_experts().layers + stage, rank).unwrap();
+                    assert_eq!(draft, cost, "{family} stage {stage} uses the backbone geometry");
+                }
                 let workspace = deepseek_v4_tp2_workspace(&catalog, Some(&manifest), 4096).unwrap();
                 let expected = if family == "flash" {
                     let shape = catalog.routed_experts();

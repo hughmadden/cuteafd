@@ -49,7 +49,8 @@ impl<'a> Engine<'a> {
     /// Stages whose experts are resident here (drafting needs all of them).
     pub(super) fn draft_ready(&self) -> bool {
         let stages = self.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
-        stages > 0 && self.local.borrow().as_ref().is_some_and(|l| l.stages() == stages)
+        stages > 0 && (self.local.borrow().as_ref().is_some_and(|l| l.stages() == stages)
+            || self.tp2.as_ref().is_some_and(|tp2| tp2.has_stages(self.cfg.n_layers, stages)))
     }
 
     /// Records `layer`'s output for the lane's last rows when it is a target.
@@ -117,6 +118,11 @@ impl<'a> Engine<'a> {
 
     /// Runtime width uses the same installed stages and decode-sized workspace.
     pub fn draft_width(&self, requests: &[DraftRequest<'_>], inputs: &[u32], block: usize) -> Result<Vec<Vec<u32>>> {
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(),
+            || self.shutdown_submission(&mut []), || self.draft_width_inner(requests, inputs, block))
+    }
+
+    fn draft_width_inner(&self, requests: &[DraftRequest<'_>], inputs: &[u32], block: usize) -> Result<Vec<Vec<u32>>> {
         let dspark = self.weights.dspark.as_ref().context("the checkpoint has no dSpark drafter")?;
         ensure!(self.draft_ready(), "dSpark stage experts are not resident on the coordinator");
         let h = self.cfg.dim;
@@ -213,16 +219,20 @@ impl<'a> Engine<'a> {
                 ("scale_rows_ptr", offset(&w.wire, h)), ("scale_mma_ptr", w.dummy.buffer.ptr),
             ], &[scalar, Scalar::I32(grid as i32)])?;
             self.shared_ffn(layer, w, lane, scalar, cap, weights)?;
-            {
-                let mut local = self.local.borrow_mut();
-                let local = local.as_mut().context("local experts")?;
+            if self.tp2.as_ref().is_some_and(|tp2| tp2.has_stages(self.cfg.n_layers, dspark.stages.len())) {
+                self.draft_tp2_experts(layer, rows, w, lane)?;
+                self.post(w, lane, 1, scalar, layer)?;
+            } else {
+                let mut owner = self.local.borrow_mut();
+                let local = owner.as_mut().context("local experts")?;
                 // SAFETY: wire, routes and shared rows are complete in stream order.
                 unsafe {
                     local.run(LocalLayer::Stage(stage), rows, w.wire.buffer.ptr, w.route_ids.buffer.ptr,
                         w.route_weights.buffer.ptr, lane.shared.buffer.ptr, self.stream)?;
                 }
+                drop(owner);
+                self.post(w, lane, LOCAL_EXPERTS, scalar, layer)?;
             }
-            self.post(w, lane, LOCAL_EXPERTS, scalar, layer)?;
         }
         self.run("mhc_head", &[
             ("residual", lane.stream_a.buffer.ptr), ("fn", dspark.head_fn.buffer.ptr),
