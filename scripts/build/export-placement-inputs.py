@@ -83,46 +83,6 @@ def export_jobs():
     return jobs
 
 
-def reusable_workers(previous, staging, jobs, sources, lock):
-    metadata = json.loads((previous / "INPUTS.json").read_text())
-    # A publisher-only refinement can repackage identical compiler outputs. All
-    # actual compiler inputs, including added/removed source files, must match.
-    ignored = {"scripts/build/export-placement-inputs.py", "benchmarks/current-matrix.json",
-               "installed_live_configs"}
-    retired = {entry["config"] for entry in json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]}
-    # Older publications also hashed retired examples. Drop only those legacy
-    # entries; live content and every compiler-source fingerprint still match.
-    compiler_sources = lambda hashes: {key: value for key, value in hashes.items()
-                                      if key not in ignored and key not in retired}
-    if (metadata.get("schema") != 1 or metadata.get("sparkinfer_revision") != lock["revision"]
-            or metadata.get("source_tree_sha256") != lock["source_tree_sha256"]
-            or compiler_sources(metadata.get("engine_sources_sha256", {})) != compiler_sources(sources)):
-        raise ValueError("reused placement compiler source provenance mismatch; run a full export")
-    files = metadata.get("files", {})
-    if "PROGRAMS.json" not in files:
-        raise ValueError("reused placement file inventory missing")
-    for path, checksum in files.items():
-        if Path(path).is_absolute() or any(part in (".", "..") for part in Path(path).parts):
-            raise ValueError(f"invalid reused placement path {path}")
-        if compare.sha((previous / path).read_bytes()) != checksum:
-            raise ValueError(f"reused placement checksum mismatch: {path}")
-    summaries = metadata.get("exports", [])
-    if len(summaries) != len(jobs):
-        raise ValueError("reused placement worker inventory mismatch")
-    for (name, exporter, args), recorded in zip(jobs, summaries):
-        actual = json.loads((staging / name / "comparison-context.json").read_text())
-        expected = dict(exporter=exporter, args=args, sparkinfer_revision=lock["revision"],
-                        source_tree_sha256=lock["source_tree_sha256"], cuda_initialized=False,
-                        sms=188, capability=[12, 0],
-                        exporter_sha256=compare.sha((ROOT / "python/tools/aot" / exporter).read_bytes()),
-                        comparison_script_sha256=compare.sha((ROOT / "scripts/build/compare-sm-exports.py").read_bytes()),
-                        export_sources_sha256={str(path.relative_to(ROOT)): compare.sha(path.read_bytes())
-                            for path in sorted((ROOT / "python/tools/aot").glob("*.py"))})
-        if actual != recorded or any(actual.get(key) != value for key, value in expected.items()):
-            raise ValueError(f"reused placement worker provenance mismatch: {name}; run a full export")
-    return metadata
-
-
 def verified_job_files(previous, name):
     metadata = json.loads((previous / "INPUTS.json").read_text())
     prefix = ".workers/" + name + "/"
@@ -154,7 +114,54 @@ def refresh_replay_provenance(directory, lock):
             path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def publish(destination, staging, timeout, workers, reuse_workers=None, previous=None, expect=None,
+def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verify_skips=False):
+    name, exporter, extra = job
+    output = staging / name
+    output.mkdir(parents=True)
+    payload = dict(sms=188, exporter=exporter, args=extra, output=str(output), program_records=True)
+    if backend_cache:
+        payload["backend_cache"] = str(backend_cache)
+    prior = verified_job_files(previous, name) if previous else None
+    skipped = False
+    if prior:
+        prior_directory, prior_files = prior
+        prior_context = json.loads((prior_directory / "comparison-context.json").read_text())
+        current_inputs = kernel_records.stage0_inputs(ROOT, payload, (12, 0))
+        triggers = kernel_records.job_candidates(ROOT, prior_context, current_inputs)
+        print(f"Placement job {name}: candidate triggers={triggers}", flush=True)
+        skipped = not triggers
+        if skipped and not verify_skips:
+            for relative in prior_files:
+                target = output / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(prior_directory / relative, target)
+            refresh_replay_provenance(output, lock)
+            summary = json.loads((output / "comparison-context.json").read_text())
+            summary["execution_stats"] = {"stage0_skipped": True, "verified_skip": False,
+                                          "backend_hits": 0, "backend_misses": 0}
+            return summary
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
+               CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
+               CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
+    print(f"Placement export {name}: {extra}", flush=True)
+    with (output / "export.log").open("w") as log:
+        subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
+                        "--_worker", json.dumps(payload)], env=env, stdout=log,
+                       stderr=subprocess.STDOUT, check=True, timeout=timeout)
+    if skipped:
+        old_records = json.loads((prior_directory / "program-records.json").read_text())
+        new_records = json.loads((output / "program-records.json").read_text())
+        if ({key: record["ir_sha256"] for key, record in old_records.items()}
+                != {key: record["ir_sha256"] for key, record in new_records.items()}):
+            raise ValueError(f"--verify-skips changed IR in skipped job {name}")
+    summary = json.loads((output / "comparison-context.json").read_text())
+    reuse = summary.get("backend_reuse", {})
+    summary["execution_stats"] = {"stage0_skipped": skipped, "verified_skip": skipped and verify_skips,
+                                  "backend_hits": reuse.get("hits", 0), "backend_misses": reuse.get("misses", 0)}
+    return summary
+
+
+def publish(destination, staging, timeout, workers, previous=None, expect=None,
             backend_cache=None, verify_skips=False):
     filesystem = compare.load_file("placement_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
     if backend_cache:
@@ -162,7 +169,7 @@ def publish(destination, staging, timeout, workers, reuse_workers=None, previous
     verify_skips = verify_skips or os.environ.get("CUTEAFD_BUILD_KIND") == "release"
     for path in (destination, staging):
         filesystem.check_path(str(path))
-        if path.exists() and any(path.iterdir()) and not (reuse_workers and path == staging):
+        if path.exists() and any(path.iterdir()):
             raise ValueError(f"output is not empty: {path}")
         path.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -172,51 +179,11 @@ def publish(destination, staging, timeout, workers, reuse_workers=None, previous
     jobs = export_jobs()
 
     def compile_one(job):
-        name, exporter, extra = job
-        output = staging / name
-        output.mkdir(parents=True)
-        payload = dict(sms=188, exporter=exporter, args=extra, output=str(output), program_records=True)
-        if backend_cache:
-            payload["backend_cache"] = str(backend_cache)
-        prior = verified_job_files(report_previous, name) if report_previous else None
-        skipped = False
-        if prior:
-            prior_directory, prior_files = prior
-            prior_context = json.loads((prior_directory / "comparison-context.json").read_text())
-            current_inputs = kernel_records.stage0_inputs(ROOT, payload, (12, 0))
-            triggers = kernel_records.job_candidates(ROOT, prior_context, current_inputs)
-            print(f"Placement job {name}: candidate triggers={triggers}", flush=True)
-            skipped = not triggers
-            if skipped and not verify_skips:
-                for relative in prior_files:
-                    target = output / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(prior_directory / relative, target)
-                refresh_replay_provenance(output, lock)
-                return json.loads((output / "comparison-context.json").read_text())
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
-                   CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
-                   CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
-        print(f"Placement export {name}: {extra}", flush=True)
-        with (output / "export.log").open("w") as log:
-            subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
-                            "--_worker", json.dumps(payload)], env=env, stdout=log,
-                           stderr=subprocess.STDOUT, check=True, timeout=timeout)
-        if skipped:
-            old_records = json.loads((prior_directory / "program-records.json").read_text())
-            new_records = json.loads((output / "program-records.json").read_text())
-            if ({key: record["ir_sha256"] for key, record in old_records.items()}
-                    != {key: record["ir_sha256"] for key, record in new_records.items()}):
-                raise ValueError(f"--verify-skips changed IR in skipped job {name}")
-        return json.loads((output / "comparison-context.json").read_text())
+        return compile_job(job, staging, previous, lock, timeout, backend_cache, verify_skips)
 
     report_previous = previous
-    previous = reusable_workers(reuse_workers, staging, jobs, sources, lock) if reuse_workers else None
-    if previous:
-        summaries = previous["exports"]
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            summaries = list(pool.map(compile_one, jobs))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        summaries = list(pool.map(compile_one, jobs))
     if sources != source_hashes() or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
         raise ValueError("placement export sources changed during compilation")
     if any(summary.get("sparkinfer_revision") != lock["revision"]
@@ -261,15 +228,9 @@ def publish(destination, staging, timeout, workers, reuse_workers=None, previous
         programs_path.write_text(json.dumps(programs, indent=2) + "\n")
     files = {str(path.relative_to(destination)): compare.sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
-    if previous and files != previous["files"]:
-        raise ValueError("reused placement worker output checksum mismatch; run a full export")
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
                       source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
                       exports=summaries, files=files, wall_seconds=round(time.monotonic() - started, 3))
-    if previous:
-        provenance.update(reused_workers_from=str(reuse_workers),
-                          compiler_engine_commit=previous.get("compiler_engine_commit", previous["engine_commit"]),
-                          compiler_wall_seconds=previous.get("compiler_wall_seconds", previous["wall_seconds"]))
     provenance["program_records"] = records
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
     if report_previous:
@@ -295,7 +256,7 @@ def publication_records(staging, jobs):
         directory = staging / name
         path = directory / "program-records.json"
         if not path.exists():
-            continue  # Legacy --reuse-workers publications have no identities.
+            continue  # Test fixtures can represent metadata-only workers.
         job_records = json.loads(path.read_text())
         if (directory / "dsv4_programs.json").exists():
             manifest = json.loads((directory / "dsv4_programs.json").read_text())
@@ -334,8 +295,6 @@ def main():
     parser.add_argument("--staging", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--reuse-workers", type=Path,
-                        help="verified prior publication; reuse its exact retained --staging worker outputs")
     parser.add_argument("--previous", type=Path, help="previous publication to compare; writes CHANGES.json and CHANGES.md")
     parser.add_argument("--expect", type=Path, help="JSON list of export job groups expected to change")
     parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache on NVMe")
@@ -346,7 +305,6 @@ def main():
     if args.workers < 1 or args.timeout < 1:
         parser.error("--workers and --timeout must be positive")
     publish(args.output.expanduser().resolve(), args.staging.expanduser().resolve(), args.timeout, args.workers,
-            args.reuse_workers.expanduser().resolve() if args.reuse_workers else None,
             args.previous.expanduser().resolve() if args.previous else None,
             args.expect.expanduser().resolve() if args.expect else None,
             args.backend_cache.expanduser().resolve() if args.backend_cache else None, args.verify_skips)

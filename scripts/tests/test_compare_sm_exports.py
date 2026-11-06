@@ -1411,7 +1411,8 @@ def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp
     assert len(commands) == 3
     assert all(command['sms'] == 188 for command in commands)
     assert len(list(target.glob('*/PROGRAMS.json'))) == 8
-    assert len(list(target.rglob('v41_exl3.json'))) == 64
+    assert len(list(target.glob('pro-*/exl3/**/v41_exl3.json'))) == 64
+    assert len(list((target / '.workers').rglob('v41_exl3.json'))) == 16
     for relative, checksum in provenance['files'].items():
         assert compare_sm.sha((target / relative).read_bytes()) == checksum
     for context in (131072, 1048576):
@@ -1490,33 +1491,6 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
     for path, checksum in metadata['files'].items():
         assert publisher.compare.sha((target / path).read_bytes()) == checksum
     assert not list(target.rglob('*.o'))
-    reused = tmp_path / 'republished'
-    publisher.publish(reused, staging, 1, 1, target)
-    assert len(calls) == 3  # Re-publication never invokes a compiler.
-    assert json.loads((reused / 'INPUTS.json').read_text())['files'] == metadata['files']
-    legacy = json.loads((target / 'INPUTS.json').read_text())
-    retired = json.loads((ROOT / 'benchmarks/current-matrix.json').read_text())['retired'][0]['config']
-    legacy['engine_sources_sha256'][retired] = 'old-retired-content'
-    (target / 'INPUTS.json').write_text(json.dumps(legacy))
-    publisher.publish(tmp_path / 'legacy-republished', staging, 1, 1, target)
-    assert len(calls) == 3
-    live = publisher.live_configs()[0]
-    legacy['engine_sources_sha256'][live] = 'changed-live-content'
-    (target / 'INPUTS.json').write_text(json.dumps(legacy))
-    with pytest.raises(ValueError, match='compiler source provenance mismatch'):
-        publisher.publish(tmp_path / 'bad-live-source', staging, 1, 1, target)
-    (target / 'INPUTS.json').write_text(json.dumps(metadata))
-    context = staging / 'programs/comparison-context.json'
-    original = context.read_text()
-    invalid = json.loads(original)
-    invalid['args'] = ['wrong-selection']
-    context.write_text(json.dumps(invalid))
-    with pytest.raises(ValueError, match='worker provenance mismatch'):
-        publisher.publish(tmp_path / 'bad-worker', staging, 1, 1, target)
-    context.write_text(original)
-    (staging / 'programs/dsv4_programs.json').write_text('{"tampered":true}')
-    with pytest.raises(ValueError, match='output checksum mismatch'):
-        publisher.publish(tmp_path / 'bad-output', staging, 1, 1, target)
     with pytest.raises(ValueError, match='not empty'):
         publisher.publish(target, tmp_path / 'other-staging', 1, 1)
 

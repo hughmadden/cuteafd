@@ -115,7 +115,11 @@ def compiler_identity(root, payload, capability):
     version = subprocess.check_output([ptxas, "--version"], text=True, timeout=30)
     exporter = Path(root) / "python/tools/aot" / payload["exporter"]
     return {"schema": 1, "image_id": image, "runtime": compiler._runtime_toolchain_key(),
-            "environment": compiler._compile_environment_key(), "ptxas_version": version,
+            "environment": compiler._compile_environment_key(),
+            "export_environment": {**{name: value for name, value in sorted(os.environ.items())
+                                      if name.startswith("CUTEAFD_EXPORT_") and name != "CUTEAFD_EXPORT_IMAGE_ID"},
+                                   "CUTEAFD_EXPORT_NARROW_AOT": "1", "CUTEAFD_EXPORT_HC_LAGGED": "1"},
+            "ptxas_version": version,
             "ptxas_sha256": digest(Path(ptxas).read_bytes()), "sms": payload["sms"],
             "capability": list(capability), "exporter": payload["exporter"], "args": payload["args"],
             "exporter_sha256": digest(exporter.read_bytes()),
@@ -313,11 +317,12 @@ class Recorder:
             path = source_name(getattr(module, "__file__", None), self.root)
             if path:
                 paths.add(path)
+        active = self.active
         self.active = False
         try:
             return {path: digest((self.root / path).read_bytes()) for path in sorted(paths)}
         finally:
-            self.active = True
+            self.active = active
 
     def patch(self, cls, method, replacement):
         original = getattr(cls, method)
