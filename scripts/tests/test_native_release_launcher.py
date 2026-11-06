@@ -22,6 +22,28 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_expert_usage_serve_flag_is_opt_in_for_supported_families(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 ]]; then')
+        block = text[start:text.index('\nfi', start) + 3]
+        for family in ['deepseek_v4', 'mimo_v2']:
+            for setting, expected in [('', ''), ('off', ''), ('on', '--expert-usage'), ('invalid', None)]:
+                with self.subTest(family=family, setting=setting):
+                    script = '''set -euo pipefail
+family="$1"; setting="$2"; family_args=()
+get() { printf '%s' "${setting:-$2}"; }
+release_die() { echo "$*" >&2; exit 2; }
+'''
+                    result = subprocess.run(['bash', '-c', script + block +
+                        '\nprintf \'%s\' "${family_args[*]}"', 'test', family, setting],
+                        cwd=ROOT, capture_output=True, text=True)
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('EXPERT_USAGE must be on or off', result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, expected)
+
     def test_v41_planner_receives_normalized_effective_config(self) -> None:
         source = v41_source()
         block = source[source.index('count_args='):source.index('if [[ -n "$wip_layout" ]]; then', source.index('count_args='))]

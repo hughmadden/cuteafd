@@ -115,16 +115,37 @@ struct History {
     samples: VecDeque<Snapshot>,
     error: Option<String>,
 }
+#[derive(Debug, Default)]
+struct ReaderState {
+    disabled: bool,
+    history: Option<History>,
+}
 /// Cloneable API reader; no CUDA access, process globals or serving-loop locks.
 #[derive(Clone, Debug, Default)]
-pub struct Reader(Arc<RwLock<Option<History>>>);
+pub struct Reader(Arc<RwLock<ReaderState>>);
 impl Reader {
+    /// Startup-only policy shared by every adapter and its allocation admission.
+    /// Skipping routed experts always disables usage, even when explicitly requested.
+    pub fn configure(&self, requested: bool, skip_routed: bool) -> Result<bool, &'static str> {
+        let mut state = self.0.write().unwrap_or_else(|e| e.into_inner());
+        if state.history.is_some() { return Err("expert usage reader already initialized"); }
+        state.disabled = !requested || skip_routed;
+        Ok(!state.disabled)
+    }
+    /// Check before creating native owners, not after any CUDA allocation.
+    pub fn require_enabled(&self) -> Result<(), &'static str> {
+        let state = self.0.read().unwrap_or_else(|e| e.into_inner());
+        if state.disabled { return Err("expert usage disabled for this execution"); }
+        if state.history.is_some() { return Err("expert usage reader already initialized"); }
+        Ok(())
+    }
     pub fn initialize(&self, geometry: Geometry) -> Result<(), &'static str> {
         if !geometry.validate() {
             return Err("invalid expert usage geometry");
         }
-        let mut history = self.0.write().unwrap_or_else(|e| e.into_inner());
-        if history.is_some() {
+        let mut state = self.0.write().unwrap_or_else(|e| e.into_inner());
+        if state.disabled { return Err("expert usage disabled for this execution"); }
+        if state.history.is_some() {
             return Err("expert usage reader already initialized");
         }
         let cells = geometry.cells().unwrap();
@@ -135,7 +156,7 @@ impl Reader {
         };
         let mut samples = VecDeque::with_capacity(SNAPSHOTS);
         samples.push_back(zero);
-        *history = Some(History {
+        state.history = Some(History {
             geometry,
             samples,
             error: None,
@@ -144,7 +165,7 @@ impl Reader {
     }
     pub fn publish(&self, sample: Snapshot) -> Result<(), &'static str> {
         let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
-        let history = guard.as_mut().ok_or("expert usage not initialized")?;
+        let history = guard.history.as_mut().ok_or("expert usage not initialized")?;
         let cells = history.geometry.cells().unwrap();
         let previous = history.samples.back().unwrap();
         if !sample.elapsed_s.is_finite()
@@ -167,13 +188,13 @@ impl Reader {
         Ok(())
     }
     pub fn fail(&self, error: String) {
-        if let Some(history) = self.0.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some(history) = self.0.write().unwrap_or_else(|e| e.into_inner()).history.as_mut() {
             history.error = Some(error);
         }
     }
     pub fn snapshot(&self) -> serde_json::Value {
         let guard = self.0.read().unwrap_or_else(|e| e.into_inner());
-        let Some(history) = guard.as_ref() else {
+        let Some(history) = guard.history.as_ref() else {
             return serde_json::json!({"enabled": false});
         };
         let latest = history.samples.back().unwrap();
@@ -231,6 +252,27 @@ mod tests {
         }
     }
     #[test]
+    fn skipped_experts_disable_shared_reader_and_prevent_initialization() {
+        for requested in [false, true] {
+            for skipped in [false, true] {
+                let reader = Reader::default();
+                let clone = reader.clone();
+                let enabled = requested && !skipped;
+                assert_eq!(reader.configure(requested, skipped).unwrap(), enabled);
+                assert_eq!(clone.require_enabled().is_ok(), enabled);
+                assert_eq!(clone.initialize(geometry()).is_ok(), enabled);
+                assert_eq!(reader.snapshot()["enabled"], enabled);
+                if enabled {
+                    assert!(reader.configure(false, true).is_err());
+                } else {
+                    assert!(reader.publish(sample(1.0, 1)).is_err());
+                    assert!(reader.0.read().unwrap().history.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn independent_geometry_and_bounded_windows() {
         let a = Reader::default();
         let b = Reader::default();
@@ -246,7 +288,7 @@ mod tests {
             a.publish(sample(n as f64, n)).unwrap();
         }
         assert_eq!(
-            a.0.read().unwrap().as_ref().unwrap().samples.len(),
+            a.0.read().unwrap().history.as_ref().unwrap().samples.len(),
             SNAPSHOTS
         );
         let value = a.snapshot();

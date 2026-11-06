@@ -195,6 +195,7 @@ impl HostOwners {
 
 /// Everything both entries know about MiMo's physical owners before admission.
 pub struct ProductionInput<'a> {
+    pub expert_usage: bool,
     pub cfg: &'a MimoV2Config,
     pub layers: usize,
     pub kv: MimoKvFormats,
@@ -248,6 +249,7 @@ impl AdmittedMimo {
 
 /// MiMo's resolved physical facts, priced by the shared planner.
 pub struct MimoRecipe<'a> {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub cfg: &'a MimoV2Config,
     pub gpus: usize,
     pub layers: usize,
@@ -298,6 +300,14 @@ impl<'a> ProductionInput<'a> {
         {
             return Err(invalid("incomplete production geometry"));
         }
+        let expert_usage = self.expert_usage.then(|| cuteafd_core::expert_usage::Geometry {
+            layers: self.layers, experts: self.cfg.experts, topk: self.cfg.topk,
+            routed_layers: self.cfg.dense.iter().take(self.layers).enumerate()
+                .filter_map(|(layer, &dense)| (!dense).then_some(layer)).collect(),
+        }).filter(|geometry| !geometry.routed_layers.is_empty());
+        if expert_usage.as_ref().is_some_and(|geometry| !geometry.validate()) {
+            return Err(invalid("invalid expert usage geometry"));
+        }
         let page_rows = self.spark.steady.pool_unit_rows;
         let cache = mimo_cache_geometry(self.cfg, self.layers, self.gpus, self.kv, self.mtp_stages)
             .map_err(|error| invalid(error))?;
@@ -334,7 +344,7 @@ impl<'a> ProductionInput<'a> {
         let maximum_pages = self.maximum_pool_tokens.div_ceil(page_rows);
         Ok(PreparedMimo {
             recipe: MimoRecipe {
-                cfg: self.cfg, gpus: self.gpus, layers: self.layers, routed, counts,
+                expert_usage, cfg: self.cfg, gpus: self.gpus, layers: self.layers, routed, counts,
                 experts: self.experts, expert_workspace: self.expert_workspace,
                 tp2_workspace: self.tp2_workspace, route, spark_ranks: self.spark_ranks,
                 context: self.context, page_rows, maximum_pages, prefill: self.prefill,
@@ -556,6 +566,9 @@ impl Recipe for MimoRecipe<'_> {
             requires: vec![],
             components: vec![],
         };
+        if let Some(geometry) = &self.expert_usage {
+            contract.components.extend(crate::placement::expert_usage::components(geometry, &[0], maximum)?);
+        }
         for (layer, mode) in self.attention.iter().enumerate() {
             contract.variables.push(Variable::Attention { layer, values: vec![*mode] });
         }

@@ -227,6 +227,18 @@ mod prefill_shape_tests {
     }
 
     #[test]
+    fn skipped_routed_experts_disable_usage_before_admission() {
+        for skip in [false, true] {
+            let mut args = Cli::try_parse_from(["v4", "--snapshot", "/missing", "--native-lib", "/missing.so",
+                "--expert-usage"]).unwrap().engine;
+            args.skip_routed_experts = skip;
+            assert_eq!(args.expert_usage_enabled().unwrap(), !skip);
+            assert_eq!(args.expert_usage_reader.require_enabled().is_ok(), !skip);
+            assert_eq!(args.expert_usage_reader.snapshot()["enabled"], false);
+        }
+    }
+
+    #[test]
     fn runtime_shape_matches_planner_policy_and_preserves_explicit_pins() -> Result<()> {
         let base = Cli::try_parse_from(["v4", "--snapshot", "/missing", "--native-lib", "/missing.so"])?.engine;
         assert_eq!(base.prefill_waves, None);
@@ -270,6 +282,10 @@ mod prefill_shape_tests {
 }
 
 impl EngineArgs {
+    fn expert_usage_enabled(&self) -> Result<bool> {
+        self.expert_usage_reader.configure(self.expert_usage, self.skip_routed_experts).map_err(anyhow::Error::msg)
+    }
+
     fn prefill_shape(&self, compiled_rows: u64, span_rows: Option<u64>)
         -> std::result::Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan,
             cuteafd_loader::serving_capacity::prefill_waves::PrefillError> {

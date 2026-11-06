@@ -582,23 +582,23 @@ impl UnitHooks<'_, '_> {
                 e.dense_ffn(1, w1, weight, rows, "m4096", false)?;
                 e.push(1, unit_slot(layer, true, unit.slot), w1.delta.buffer.ptr, bytes)?;
             } else if e.tp2_layer(layer) {
-                self.member_routes(1, w1, weight, unit.rows.len(), true)?;
+                self.member_routes(1, layer, w1, weight, unit.rows.len(), true)?;
                 e.tp2_experts(1, layer, unit.slot, w1, unit.rows.len())?;
             }
             Ok(())
         } else { e.norm(w, e.weights.layers[layer].ptr("post_norm")?, 1, rows) }
     }
 
-    fn member_routes(&self, rank: usize, w: &Workspace<'_>, weight: &MimoLayer<'_>, rows: usize,
+    fn member_routes(&self, rank: usize, index: usize, w: &Workspace<'_>, weight: &MimoLayer<'_>, rows: usize,
         bf16: bool) -> Result<()> {
         let e = self.engine;
         if let Some(members) = self.packed {
             for member in members {
                 let s = member.segment;
-                e.moe_front_on(rank, &member.views[rank], weight, s.rows, bf16)?;
+                e.moe_front_on(rank, index, &member.views[rank], weight, s.rows, false, bf16)?;
             }
             Ok(())
-        } else { e.moe_front_on(rank, w, weight, rows, bf16) }
+        } else { e.moe_front_on(rank, index, w, weight, rows, false, bf16) }
     }
 
     fn after_ffn(&self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
@@ -703,7 +703,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
             e.dense_ffn(0, w, weight, Scalar::I32(t as i32), "m4096", false)?;
             if self.peer_work.is_some() { e.push(0, unit_slot(layer, true, unit.slot), w.delta.buffer.ptr, t * e.cfg.hidden * 2)?; }
         } else {
-            self.member_routes(0, w, weight, t, e.expert_bf16_input(false))?;
+            self.member_routes(0, layer, w, weight, t, e.expert_bf16_input(false))?;
             if e.tp2_layer(layer) { e.tp2_experts(0, layer, unit.slot, w, t)?; }
             else {
                 e.moe_run(w, layer, t, false)?;
@@ -719,7 +719,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         let w = &self.work[unit.index];
         let Some(Experts::Spark { prefill: transport, .. }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
         let bf16 = e.expert_input.bf16(false);
-        self.member_routes(0, w, &e.weights.layers[layer], unit.rows.len(), bf16)?;
+        self.member_routes(0, layer, w, &e.weights.layers[layer], unit.rows.len(), bf16)?;
         e.wave_send(w, layer, unit.rows.len(), ExpertV2SourceKind::Prefill, bf16, transport.borrow_mut().exchange()?, unit.reply_origins()?)
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: crate::shared::spark_waves::WaveTicket) -> Result<()> {
@@ -806,6 +806,7 @@ pub(crate) struct MimoEngine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
+    pub(super) expert_usage: Option<cuteafd_ffi::expert_usage::ExpertUsage<'a>>,
     packed_row_cap: Cell<Option<usize>>,
     packed_programs: crate::shared::prefill_packing::ProgramInventory,
     tp2: Option<Tp2<'a>>,
@@ -923,7 +924,7 @@ impl<'a> MimoEngine<'a> {
             submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
             max_context, prefill_rows, prefill_span_rows, prefill_unit_waves: 1, unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            prefill_kv_wide: RefCell::new(None), experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, rtx_local: None,
+            prefill_kv_wide: RefCell::new(None), experts: None, expert_usage: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
             drafter: None, mtp: None, l2: None, embedding,
@@ -2223,7 +2224,7 @@ impl<'a> MimoEngine<'a> {
             Ok(())
         } else {
             let local = self.tp2_layer(index) || self.rtx_local_layer(index);
-            self.moe_front(w, layer, t, local || bf16_input)
+            self.moe_front(w, index, layer, t, tables.decode, local || bf16_input)
         }
     }
 
@@ -2269,7 +2270,7 @@ impl<'a> MimoEngine<'a> {
                 self.dense_ffn(1, w1, share, rows, "m64", true)?;
                 self.push(1, slot(index, true, tables.decode), w1.delta.buffer.ptr, bytes)?;
             } else if self.tp2_layer(index) {
-                self.moe_front_on(1, w1, share, t, true)?;
+                self.moe_front_on(1, index, w1, share, t, tables.decode, true)?;
             }
             Ok(())
         })
@@ -2431,7 +2432,7 @@ impl<'a> MimoEngine<'a> {
             self.push(1, ffn, w1.delta.buffer.ptr, bytes)?;
             self.wait(1, ffn)?;
         } else if self.tp2_layer(index) {
-            self.moe_front_on(1, w1, share, tables.positions.len(), true)?;
+            self.moe_front_on(1, index, w1, share, tables.positions.len(), tables.decode, true)?;
             self.tp2_experts(1, index, 0, w1, tables.positions.len())?;
             self.tp2_post(1, index, 0, w1, tables.positions.len())?;
         } else if next.is_some() {
@@ -2463,7 +2464,7 @@ impl<'a> MimoEngine<'a> {
             self.dense_ffn(1, w, layer, rows, "m4096", false)?;
             self.push(1, unit_slot(index, true, lane), w.delta.buffer.ptr, bytes)?;
         } else if self.tp2_layer(index) {
-            self.moe_front_on(1, w, layer, tables.positions.len(), true)?;
+            self.moe_front_on(1, index, w, layer, tables.positions.len(), false, true)?;
             self.tp2_experts(1, index, lane, w, tables.positions.len())?;
         }
         Ok(())
@@ -2925,12 +2926,12 @@ impl<'a> MimoEngine<'a> {
         forward: Option<usize>) -> Result<()> {
         let bytes = t * self.cfg.hidden * 2;
         if self.tp2_layer(index) {
-            self.moe_front(w, layer, t, true)?;
+            self.moe_front(w, index, layer, t, decode, true)?;
             self.probe_ring(w, index, t)?;
             return self.tp2_experts(0, index, 0, w, t);
         }
         if self.rtx_local_layer(index) {
-            self.moe_front(w, layer, t, true)?;
+            self.moe_front(w, index, layer, t, decode, true)?;
             self.moe_run(w, index, t, decode)?;
             return match forward { Some(slot) => self.push(0, slot, w.delta.buffer.ptr, bytes), None => Ok(()) };
         }
@@ -2944,11 +2945,11 @@ impl<'a> MimoEngine<'a> {
 
     /// Router scores, the top-k selection and (unless the ranks take BF16
     /// rows) the FP8 wire rows, all on the stream.
-    fn moe_front(&self, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, bf16_input: bool) -> Result<()> {
-        self.moe_front_on(0, w, layer, t, bf16_input)
+    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool, bf16_input: bool) -> Result<()> {
+        self.moe_front_on(0, index, w, layer, t, decode, bf16_input)
     }
 
-    fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, bf16_input: bool) -> Result<()> {
+    fn moe_front_on(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, decode: bool, bf16_input: bool) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
         self.run_on(rank, false, "mimo_router_scores", &[("x", w.x.buffer.ptr), layer.router_operand()?,
@@ -2959,6 +2960,9 @@ impl<'a> MimoEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
+        // SAFETY: selection produced exactly t real rows on this stream; peer routers are replicas.
+        unsafe { record_mimo_routes(self.expert_usage.as_ref(), self.device, rank, index,
+            w.route_ids.buffer.ptr, t, decode, self.stream_of(rank))?; }
         let grid = self.quantize_grid.blocks(t, h);
         if !bf16_input {
             self.run("mimo_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -2984,7 +2988,7 @@ impl<'a> MimoEngine<'a> {
             "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
              (run --layers 1 for the dense layer alone)"))?;
         let bf16_input = self.expert_bf16_input(decode);
-        self.moe_front(w, layer, t, bf16_input)?;
+        self.moe_front(w, index, layer, t, decode, bf16_input)?;
         match experts {
             Experts::Spark { decode: decode_link, prefill } => {
                 let transport = if decode { decode_link } else { prefill };
@@ -3107,6 +3111,21 @@ impl<'a> MimoEngine<'a> {
     }
 }
 
+/// Records the real rows selected by a backbone router, never its workspace capacity.
+///
+/// # Safety
+/// Canonical ids contain `rows * topk` live u32 entries on `device`/`stream` and
+/// remain valid until the stream drains. Replica and disabled calls read nothing.
+unsafe fn record_mimo_routes(usage: Option<&cuteafd_ffi::expert_usage::ExpertUsage<'_>>,
+    device: i32, rank: usize, layer: usize, ids: *const c_void, rows: usize,
+    decode: bool, stream: *mut c_void) -> Result<()> {
+    let Some(usage) = usage.filter(|_| rank == 0) else { return Ok(()); };
+    let phase = if decode { cuteafd_ffi::expert_usage::UsagePhase::Decode }
+        else { cuteafd_ffi::expert_usage::UsagePhase::Prefill };
+    // SAFETY: the caller retains the selected real rows on this stream.
+    unsafe { usage.routes(device, layer, phase)?.record(ids, rows, None, u32::MAX, true, stream) }
+}
+
 /// A wave's request from its route entries and input rows (`wire` views the
 /// wave slot's pinned staging).
 #[allow(clippy::too_many_arguments)]
@@ -3130,6 +3149,128 @@ mod terminal_fault_tests;
 #[cfg(test)]
 mod tests {
     use super::{attention_workspace_geometry, expert_capacity, prefill_span_rows, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn disabled_expert_usage_never_queries_cuda_or_captures() {
+        let captures = cuteafd_ffi::graph_capture_sites();
+        for decode in [false, true] {
+            // SAFETY: disabled accounting must return without inspecting any operand.
+            unsafe { super::record_mimo_routes(None, -1, 0, usize::MAX,
+                std::ptr::null(), usize::MAX, decode, std::ptr::null_mut()).unwrap(); }
+        }
+        assert_eq!(cuteafd_ffi::graph_capture_sites(), captures);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA and the matching CUTEAFD_NATIVE_LIB"]
+    fn mimo_expert_usage_known_router_packed_rows_verify_and_graph_replay() -> anyhow::Result<()> {
+        use super::*;
+        use cuteafd_core::expert_usage::{Geometry, Reader};
+        use cuteafd_ffi::expert_usage::{ExpertUsage, UsageDevice};
+        use cuteafd_ffi::CuteafdDeviceBuffer;
+        struct Fixture<'a> {
+            library: &'a NativeLibrary, stream: *mut c_void,
+            graph: *mut c_void, buffers: Vec<CuteafdDeviceBuffer>,
+        }
+        impl Fixture<'_> {
+            fn upload(&mut self, words: &[u32]) -> Result<CuteafdDeviceBuffer> {
+                let data = words.iter().flat_map(|n| n.to_ne_bytes()).collect::<Vec<_>>();
+                let buffer = self.library.alloc_device_buffer(data.len())?;
+                self.buffers.push(buffer);
+                self.library.copy_h2d(buffer, &data)?;
+                Ok(buffer)
+            }
+        }
+        impl Drop for Fixture<'_> {
+            fn drop(&mut self) {
+                // SAFETY: retain every operand until this fixture's private stream drains.
+                unsafe {
+                    if self.library.cuda_stream_synchronize(self.stream).is_err() { std::process::abort(); }
+                    if !self.graph.is_null() { let _ = self.library.cuda_graph_exec_destroy(self.graph); }
+                    for buffer in &mut self.buffers { let _ = self.library.free_device_buffer(buffer); }
+                    let _ = self.library.cuda_stream_destroy(self.stream);
+                }
+            }
+        }
+        // SAFETY: matching native module is retained through all fixture and counter teardown.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let reader = Reader::default();
+        let usage = ExpertUsage::new(&library, Geometry { layers: 3, experts: 8, topk: 2,
+            routed_layers: vec![1, 2] }, &[UsageDevice { logical: 0, cuda: 0 }], reader.clone())?;
+        for suffix in ["counters", "snapshot", "pinned"] {
+            let name = format!("expert-usage.gpu0.{suffix}");
+            let owners = cuteafd_ffi::memory_ledger::allocations().into_iter()
+                .filter(|owner| owner.key.owner == Some(name.as_str())).collect::<Vec<_>>();
+            ensure!(owners.len() == 1 && owners[0].bytes == 3 * 8 * 16,
+                "MiMo telemetry owner extent mismatch: {name}");
+        }
+        // Declared after usage so this stream drains before usage drops on errors too.
+        let mut fixture = Fixture { library: &library, stream: library.cuda_stream_create()?,
+            graph: std::ptr::null_mut(), buffers: vec![] };
+        let logits = (0..4).flat_map(|row| (0..8).map(move |expert| {
+            let selected = if row == 3 { expert >= 6 } else { expert == row || expert == row + 1 };
+            if selected { 4.0f32.to_bits() } else { (-4.0f32).to_bits() }
+        })).collect::<Vec<_>>();
+        let logits = fixture.upload(&logits)?;
+        let bias = fixture.upload(&[0; 8])?;
+        let ids = fixture.upload(&[0; 8])?;
+        let weights = fixture.upload(&[0; 8])?;
+        let route = || {
+            // SAFETY: four complete logits/output rows and the bias are fixture-owned on this stream.
+            unsafe { library.router_select(logits.ptr, bias.ptr, std::ptr::null(), std::ptr::null(),
+                ids.ptr, weights.ptr, 4, 8, 2, 1.0, true, fixture.stream) }
+        };
+        route()?;
+        // SAFETY: a Spark-served backbone layer uses the same full canonical top-k.
+        unsafe { record_mimo_routes(Some(&usage), 0, 0, 2, ids.ptr, 3, false, fixture.stream)?; }
+        // SAFETY: two packed members cover three real rows; the fourth router row is padding.
+        unsafe {
+            record_mimo_routes(Some(&usage), 0, 0, 1, ids.ptr, 2, false, fixture.stream)?;
+            record_mimo_routes(Some(&usage), 0, 0, 1, ids.ptr.cast::<u32>().add(4).cast(), 1, false, fixture.stream)?;
+            // No rank-one counter set, CUDA device, ids, or layer lookup is needed for replicas.
+            record_mimo_routes(Some(&usage), -1, 1, usize::MAX, std::ptr::null(), 64, false, fixture.stream)?;
+            library.cuda_graph_begin_capture(fixture.stream)?;
+        }
+        route()?;
+        // SAFETY: verify uses the actual three rows, including rejected candidates, not capacity four.
+        unsafe {
+            record_mimo_routes(Some(&usage), 0, 0, 2, ids.ptr, 3, true, fixture.stream)?;
+            fixture.graph = library.cuda_graph_end_capture(fixture.stream)?;
+        }
+        let captures = cuteafd_ffi::graph_capture_sites();
+        for _ in 0..3 {
+            // SAFETY: replay retains all fixture operands and usage counters.
+            unsafe { library.cuda_graph_launch(fixture.graph, fixture.stream)?; }
+        }
+        // SAFETY: fixture owns this stream and keeps all inputs live through its completion.
+        unsafe { library.cuda_stream_synchronize(fixture.stream)?; }
+        ensure!(cuteafd_ffi::graph_capture_sites() == captures, "steady replays captured again");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let value = reader.snapshot();
+        ensure!(value["error"].is_null(), "snapshot failed: {value}");
+        let mut prefill = vec![0u64; 24];
+        prefill[8..12].copy_from_slice(&[1, 2, 2, 1]);
+        prefill[16..20].copy_from_slice(&[1, 2, 2, 1]);
+        let mut decode = vec![0u64; 24];
+        decode[16..20].copy_from_slice(&[3, 6, 6, 3]);
+        ensure!(value["windows"]["total"]["prefill_routed_rows"] == serde_json::json!(prefill),
+            "packed/padding/replica counts: {value}");
+        ensure!(value["windows"]["total"]["decode_routed_rows"] == serde_json::json!(decode),
+            "verify/replay counts: {value}");
+        let total = &value["windows"]["total"];
+        let selections = |phase: &str, layer: usize| -> u64 {
+            total[phase].as_array().unwrap()[layer * 8..(layer + 1) * 8]
+                .iter().map(|n| n.as_u64().unwrap()).sum()
+        };
+        // One TP2 logical selection (both GPU halves), one Spark layer; never twice for replicas.
+        ensure!(selections("prefill_routed_rows", 1) == 3 * 2, "TP2 full top-k missing");
+        ensure!(selections("prefill_routed_rows", 2) == 3 * 2, "Spark full top-k missing");
+        ensure!(selections("decode_routed_rows", 2) == 3 * 3 * 2, "verify rows x replays x top-k");
+        ensure!(total["prefill_routed_rows"].as_array().unwrap().iter().map(|n| n.as_u64().unwrap()).sum::<u64>()
+            == 2 * 3 * 2, "all-owner prefill rows x top-k");
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]

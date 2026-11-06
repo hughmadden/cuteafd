@@ -277,6 +277,7 @@ EOF
       ;;
     mimo_v2)
       cat <<'EOF'
+EXPERT_USAGE
 MIMO_WEIGHT_POLICY
 MIMO_FP8_HEAD
 MIMO_FP8_O_PROJ
