@@ -465,21 +465,35 @@ mod tests {
 
     #[tokio::test]
     async fn stop_with_calls_is_a_terminal_sse_error() {
-        // Engine parsers normally promote Stop to tool_calls. Inject an
-        // inconsistent terminal protocol chunk to guard the validator contract,
+        invalid_protocol_finish_is_terminal("{}", None, deepseek_recipe::stream::FinishReason::Stop).await;
+    }
+
+    #[tokio::test]
+    async fn length_with_nontrailing_incomplete_call_is_a_terminal_sse_error() {
+        invalid_protocol_finish_is_terminal("{", Some("{"), deepseek_recipe::stream::FinishReason::Length).await;
+    }
+
+    async fn invalid_protocol_finish_is_terminal(arguments: &str, second: Option<&str>,
+        reason: deepseek_recipe::stream::FinishReason) {
+        // Inject inconsistent terminal protocol chunks to guard the validator contract,
         // then drive the real SSE responder rather than asserting its helper.
         let tool = ToolDefinition { name: "lookup".into(), description: None,
             parameters: json!({"type":"object"}), strict: None };
         let mut validator = CompletionValidator::new(None,
             ToolConstraints::new(&[tool], ToolChoice::Auto, false, true, false, ToolSyntax::Dsml).unwrap());
-        use deepseek_recipe::stream::{ChunkGenerator, OutputChunk, FinishReason, CompletionUsage};
+        use deepseek_recipe::stream::{ChunkGenerator, OutputChunk, CompletionUsage};
         use deepseek_recipe::openai::chat_completion::response::ChatCompletionChunkGenerator;
         let mut generator = ChatCompletionChunkGenerator::new("test".into(), MODEL.into(), false, false);
         let mut chunks = generator.generate(OutputChunk::ToolCall {
-            tool_name: "lookup".into(), arguments: "{}".into(),
+            tool_name: "lookup".into(), arguments: arguments.into(),
         }).await;
+        if let Some(arguments) = second {
+            chunks.extend(generator.generate(OutputChunk::ToolCall {
+                tool_name: "lookup".into(), arguments: arguments.into(),
+            }).await);
+        }
         chunks.extend(generator.generate(OutputChunk::Finish {
-            reason: FinishReason::Stop, stop_sequence: None, usage: CompletionUsage::default(),
+            reason, stop_sequence: None, usage: CompletionUsage::default(),
         }).await);
         let chunks = chunks.into_iter().map(move |chunk| {
             validator.observe(&serde_json::to_value(&chunk).unwrap())?;
