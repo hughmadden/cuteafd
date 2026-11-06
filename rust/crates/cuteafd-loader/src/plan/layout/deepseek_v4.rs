@@ -35,13 +35,15 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let memory = layout_for_experts(report, model, input, options, report.spark_ranks, false);
     let all_local = report.solver_placement.as_ref().is_some_and(|placement|
         !placement.layers.iter().any(|layer| layer.experts == crate::placement::ExpertHome::Spark));
-    if original_report.spark_ranks == 0
-        || (report.solver_placement.is_some() && !all_local) { return memory; }
+    if original_report.spark_ranks == 0 || !all_local { return memory; }
 
     // Workspace, host marks and exchange reserves depend on the executor shape.
     // Re-admit the entire local geometry, never just rewrite the published rows.
     let mut local_report = original_report.clone();
     let mut local_options = original_options.clone();
+    if let Some(placement) = &report.solver_placement {
+        local_options.pool_tokens = Some(placement.pool_tokens);
+    }
     let local = layout_for_experts(&mut local_report, model, input, &mut local_options, 0, false);
     if local_report.placement_supported && local_report.solver_placement.is_some() {
         *report = local_report;

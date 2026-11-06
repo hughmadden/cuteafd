@@ -843,6 +843,11 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
     for (family, dir) in shared_wave_snapshots() {
         for ranks in 0..=8 {
             let mut options = wave_plan_options(dir.path(), ranks);
+            if family == "deepseek_v4" && ranks > 0 {
+                // This matrix exercises remote executor capacities; automatic
+                // all-local ownership is covered by the V4 placement regression.
+                options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+            }
             let report = plan(dir.path(), &options).unwrap();
             assert_eq!(report.family.as_deref(), Some(family));
             let descriptor = family::registry().iter().find(|entry| entry.id() == family).unwrap().prefill_limits();
