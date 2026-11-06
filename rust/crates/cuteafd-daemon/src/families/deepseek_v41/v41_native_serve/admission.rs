@@ -1172,17 +1172,33 @@ mod admission_tests {
             )),
         )?;
         let total = 96usize << 30;
-        for (ranks, replicas) in [(1, false), (2, false), (2, true)] {
+        for (ranks, replicas, expert_usage) in [
+            (1, false, true), (1, false, false),
+            (2, false, true), (2, false, false),
+            (2, true, true), (2, true, false),
+        ] {
             let mut args = args(dir.path());
             args.rtx_gpus = ranks as u32;
             args.tp2_attention = replicas;
+            args.expert_usage = expert_usage;
             args.rtx_expert_layers = LocalLayers::Count(0);
             args.pool_tokens = Some(1 << 20);
             args.memory_reservation = Some("80.000001GiB".parse()?);
             let deferred = vec![64u64 << 20; ranks];
             let roomy = vec![(80usize << 30, total); ranks];
             let admitted = resolve(&args, &roomy, no_experts(), 0, &deferred, 0, None)?;
+            assert_eq!(admitted.expert_usage.is_some(), expert_usage);
+            // Counters and the device snapshot are future GPU owners. Pinned
+            // aggregates/history use host budgets, not the sampled GPU bytes.
+            let usage_bytes = admitted.expert_usage.as_ref()
+                .map_or(0, |geometry| 2 * geometry.table_bytes().unwrap());
+            for items in &admitted.placement.items {
+                assert_eq!(items.iter().filter(|item| item.group == "expert usage")
+                    .map(|item| item.bytes).sum::<u64>(), usage_bytes as u64);
+            }
             let ceiling = args.memory_reservation.unwrap().bytes(total)?;
+            assert_eq!(admitted.placement.pool_tokens, args.pool_tokens.unwrap());
+            assert_eq!(admitted.reservation_bytes, vec![ceiling; ranks]);
             let exact = admitted
                 .cache_bytes
                 .iter()
@@ -1192,7 +1208,7 @@ mod admission_tests {
                         + families::deepseek_v41::runtime_reserve(total as u64, ranks)
                             as usize
                         + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
-                    (bytes + reserve + deferred[gpu] as usize, total)
+                    (bytes + reserve + deferred[gpu] as usize + usage_bytes, total)
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
