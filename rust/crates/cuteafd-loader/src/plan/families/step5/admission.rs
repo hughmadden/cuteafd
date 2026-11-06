@@ -338,8 +338,8 @@ impl RuntimeInputs {
             "Step-5 requires one GPU or two genuine peer-accessible GPUs"
         );
         ensure!(
-            self.inventory.spark_ranks > 0 && self.inventory.spark_ranks <= 8,
-            "Step-5 target serving requires native Spark expert ranks"
+            self.inventory.spark_ranks <= 8,
+            "Step-5 Spark inventory exceeds eight ranks"
         );
         super::native::validate_span_rows(self.rows)?;
         ensure!(

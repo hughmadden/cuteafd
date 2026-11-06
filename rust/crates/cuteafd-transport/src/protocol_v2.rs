@@ -313,6 +313,48 @@ pub struct ExpertProtocolV2RequestHeader {
     pub flags: u32,
 }
 
+/// Layer-free geometry for opening persistent expert sessions. No rows are dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparkSessionShape {
+    pub row_count: u32,
+    pub hidden_dim: u32,
+    pub hidden_dtype: ExpertV2Dtype,
+    pub route_count: u32,
+    pub hidden_row_stride_bytes: u32,
+    pub hidden_payload_bytes: u64,
+    pub flags: u32,
+    pub request_wire_bytes: usize,
+    pub response_wire_bytes: usize,
+}
+
+impl SparkSessionShape {
+    pub fn new(rows: u32, hidden: u32, topk: u32, dtype: ExpertV2Dtype) -> Result<Self> {
+        anyhow::ensure!(rows > 0 && hidden > 0 && topk > 0, "invalid Spark session geometry");
+        let stride = dtype.row_bytes(hidden as usize)?;
+        let routes = rows.checked_mul(topk).context("Spark session route overflow")?;
+        let payload = (rows as usize).checked_mul(stride).context("Spark session payload overflow")?;
+        let request = cuteafd_core::expert_geometry::expert_request_payload_offset(
+            EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, rows as usize * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
+            routes as usize * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN).context("Spark session prefix overflow")?;
+        let response = (rows as usize).checked_mul(stride.max(hidden as usize * 2) + 4)
+            .and_then(|n| n.checked_add(EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN))
+            .context("Spark session response overflow")?;
+        Ok(Self { row_count: rows, hidden_dim: hidden, hidden_dtype: dtype, route_count: routes,
+            hidden_row_stride_bytes: u32::try_from(stride)?, hidden_payload_bytes: payload as u64,
+            flags: 0, request_wire_bytes: request.checked_add(payload).context("Spark session wire overflow")?,
+            response_wire_bytes: response })
+    }
+
+    pub fn from_request(request: &ExpertProtocolV2Request) -> Result<Self> {
+        let h = &request.header;
+        Ok(Self { row_count: h.row_count, hidden_dim: h.hidden_dim, hidden_dtype: h.hidden_dtype,
+            route_count: h.route_count, hidden_row_stride_bytes: h.hidden_row_stride_bytes,
+            hidden_payload_bytes: h.hidden_payload_bytes, flags: h.flags,
+            request_wire_bytes: request.wire_stats().wire_bytes,
+            response_wire_bytes: crate::verbs::verbs_host_expected_response_wire_bytes(request)? })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpertProtocolV2RowDescriptor {
     pub row_id: u64,

@@ -182,8 +182,8 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         args.peers.len(),
         "serve-native",
     )?;
-    ensure!((1..=8).contains(&args.peers.len()),
-        "V4.1 Spark transport requires 1..=8 peers, got {}", args.peers.len());
+    ensure!(args.peers.len() <= 8,
+        "V4.1 Spark transport supports at most eight peers, got {}", args.peers.len());
     args.host_cache_config()?;
     // The golden runs the worker without the API, so it loads no keyed policy.
     let api = if http { Some(args.api.load()?) } else { None };
@@ -450,12 +450,7 @@ fn worker(
         args.peers.len(),
         "serve-native",
     )?;
-    let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
-    crate::shared::spark_topology::require_world(spark_world, &catalog,
-        &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
-    // Check reduction support before CUDA allocation or readiness publication.
-    lib.v41_compact_reducer()?
-        .require_rank_count(spark_world.topology().world_size() as u32)?;
+
     // Two private decode lanes at decode width, and `slots` prefill slots on
     // one shared storage set (PLAN "Prefill contract").
     let admitted = AdmittedPrefill::resolve(&args)?;
@@ -473,6 +468,15 @@ fn worker(
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
     cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
     let usage = expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
+    let remote_experts = pool.placement.onboard_layers < catalog.routed_experts().layers;
+    let expert_world = if remote_experts { args.peers.len() } else { 0 };
+    let spark_world = if remote_experts {
+        let world = crate::shared::spark_topology::world(topology, expert_world)?;
+        crate::shared::spark_topology::require_world(world, &catalog,
+            &(pool.placement.onboard_layers..catalog.routed_experts().layers).collect::<Vec<_>>())?;
+        lib.v41_compact_reducer()?.require_rank_count(world.topology().world_size() as u32)?;
+        Some(world)
+    } else { None };
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     admission::startup_phase(&lib, "v41/startup", device_total)?;
@@ -608,22 +612,22 @@ fn worker(
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
     // Decode lanes' links at their own width (P3); the prefill link below at the unit.
-    let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, args.peers.len())?;
     let lanes = crate::shared::serve::lanes::LaneSet::default();
-    let [roce, second_roce] = lanes.try_map(|lane| spark_transport(&args.peers, decode_rows,
-        protocol_v2_timing, spark_world, u32::try_from(lane.index())?))?;
-    let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
-    let mut second_transport = NativeTp4Wave::new(&lib, second_roce, wave_bytes)?;
+    let [mut transport, mut second_transport] = lanes.try_map(|lane| match spark_world {
+        Some(world) => NativeTp4Wave::new(&lib, spark_transport(&args.peers, decode_rows,
+            protocol_v2_timing, world, u32::try_from(lane.index())?)?,
+            NativeTp4Wave::device_bytes_for(decode_rows, expert_world)?),
+        None => NativeTp4Wave::unlinked(&lib, decode_rows),
+    })?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     // The one prefill link (endpoint after the lanes'), one return slot per
     // prefill slot, held by slot 0's FFN owner; the other slots' units send
     // on it too.
-    let prefill_link = crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
-        spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world, 2)?, slots, capacity)?;
-    let mut prefill_link = Some(prefill_link);
+    let mut prefill_link = spark_world.map(|world| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+        spark_transport(&args.peers, capacity, protocol_v2_timing, world, 2)?, slots, capacity)).transpose()?;
     let slot_transports = (0..slots).map(|slot| match slot {
-        0 => NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?),
+        0 if remote_experts => NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?),
         _ => NativeTp4Wave::unlinked(&lib, capacity),
     }).collect::<Result<Vec<_>>>()?;
     let mut prefill_slots = prefill_target::PrefillSlots { packed_suffix, prompt_suffixes,
@@ -719,7 +723,7 @@ fn worker(
             "V4.1 Spark admission did not select required push");
         coordinator_push::plan_whole(&args.snapshot, &catalog,
             crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
-            records.as_ref().context("V4.1 required dense push records")?, &selected, args.peers.len(), pool.host.push.clone())
+            records.as_ref().context("V4.1 required dense push records")?, &selected, expert_world, pool.host.push.clone())
     })?;
     let (coordinator, ranks) = match coordinator {
         Some((planned, ranks)) => (Some(planned), ranks),
@@ -763,10 +767,10 @@ fn worker(
     if let Some(pending) = spark_admission { pending.wait()?; }
     if local_layers < 40 {
         // The workers serve their layers now: open the sessions and start each
-        // link's exchange worker (the first remote layer sizes the rings).
-        transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
-        second_transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
-        prefill_slots.slots[0].1.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
+        // link's exchange worker using its admitted geometry.
+        transport.bootstrap(catalog.nvfp4().is_some())?;
+        second_transport.bootstrap(catalog.nvfp4().is_some())?;
+        prefill_slots.slots[0].1.bootstrap(catalog.nvfp4().is_some())?;
     }
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
@@ -774,7 +778,7 @@ fn worker(
     admission::startup_phase(&lib, "v41/local-experts", device_total)?;
     crate::shared::memory_report::release_load_staging(&lib)?;
     tracing::info!(rtx_layers=local_layers, first_remote_dispatch_layer=local_layers,
-        remote_dispatch_layers=40-local_layers, spark_world=args.peers.len(),
+        remote_dispatch_layers=40-local_layers, spark_world=expert_world,
         spark_topology=?topology.map(|t| (t.tp(), t.ep())),
         device_occupied_bytes=occupied, device_budget_bytes=?pool.reservation_bytes,
         "native serving residency ready");

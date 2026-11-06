@@ -65,7 +65,7 @@ pub use protocol_v2::{
     EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
     EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN, EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN,
     ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2FrameArena, ExpertProtocolV2FrameBuffer,
-    ExpertProtocolV2Request, ExpertProtocolV2RequestHeader, ExpertProtocolV2RequestView,
+    SparkSessionShape, ExpertProtocolV2Request, ExpertProtocolV2RequestHeader, ExpertProtocolV2RequestView,
     ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseRef,
     ExpertProtocolV2ResponseView, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertProtocolV2Status, ExpertProtocolV2StreamPlan, ExpertProtocolV2StreamRouteGroup,

@@ -46,6 +46,16 @@ pub struct SparkRole {
     pub peer: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SparkRankRoles {
+    pub rank: usize,
+    pub experts: bool,
+    pub layers: Vec<u32>,
+    pub encoder: Option<EncoderPlacement>,
+    pub audio_encoder: Option<EncoderPlacement>,
+    pub drafter: Option<EncoderPlacement>,
+}
+
 /// All Spark owners are selected over the startup TCP protocol after the live solve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +80,8 @@ pub struct DeploymentSpec<'a> {
     pub snapshot: &'a str,
     pub rtx_gpus: usize,
     pub spark_ranks: usize,
+    pub spark_expert_world: usize,
+    pub spark_roles: Vec<SparkRankRoles>,
     pub prefill_unit_rows: u64,
     pub prefill_waves: u64,
     pub decode_lanes: u8,
@@ -118,7 +130,29 @@ impl<'a> DeploymentSpec<'a> {
         let family = report.family.as_deref().context("deployment requires a recognized family")?;
         let memory_layout = report.memory_layout.as_ref().context("deployment requires a memory layout")?;
         ensure!((1..=2).contains(&options.rtx_gpus), "deployment requires one or two RTX GPUs");
-        let ranks = report.spark_ranks;
+        let layers: Vec<u32> = if let Some(placement) = &report.solver_placement {
+            placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                (home.experts == crate::placement::ExpertHome::Spark).then_some(layer as u32)).collect()
+        } else {
+            // Failed or shape-only reports have no solved ownership to narrow.
+            let first = report.launch.as_ref().map_or(0, |launch| launch.first_expert_layer);
+            let end = report.launch.as_ref().and_then(|launch| launch.last_expert_layer.map(|l| l + 1))
+                .or_else(|| report.spec.as_ref().map(|spec| spec.layers.len())).unwrap_or(first);
+            (first..end).map(|layer| layer as u32).collect()
+        };
+        let ranks = if layers.is_empty() { 0 } else { report.spark_ranks };
+        let encoder_ranks = report.encoder.as_ref().map_or_else(Vec::new, EncoderPlacement::spark_ranks);
+        let audio_ranks = report.audio_encoder.as_ref().map_or_else(Vec::new, EncoderPlacement::spark_ranks);
+        let physical = encoder_ranks.iter().chain(&audio_ranks).copied().max().map_or(ranks, |r| ranks.max(r + 1));
+        let spark_roles = (0..physical).map(|rank| SparkRankRoles { rank,
+            experts: rank < ranks, layers: if rank < ranks { layers.clone() } else { Vec::new() },
+            encoder: encoder_ranks.contains(&rank).then(|| report.encoder.clone()).flatten(),
+            audio_encoder: audio_ranks.contains(&rank).then(|| report.audio_encoder.clone()).flatten(),
+            // Drafter placement is coordinator-only until a solved Spark owner exists.
+            drafter: None,
+        }).filter(|role| role.experts || role.encoder.is_some() || role.audio_encoder.is_some()
+            || role.drafter.is_some()).collect::<Vec<_>>();
+        let physical = spark_roles.len();
         ensure!(options.spark_tp.is_some() == options.spark_ep.is_some(),
             "--spark-tp and --spark-ep must be set together");
         let exl3 = report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"));
@@ -163,7 +197,7 @@ impl<'a> DeploymentSpec<'a> {
         let spark_tp_role = (family == "deepseek_v41" && !exl3 && explicit && topology.tp != 4)
             .then(|| format!("tp{}", topology.tp));
         Ok(Self { version: 1, family, snapshot: &report.snapshot,
-            rtx_gpus: options.rtx_gpus, spark_ranks: ranks,
+            rtx_gpus: options.rtx_gpus, spark_ranks: physical, spark_expert_world: ranks, spark_roles,
             prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
             prefill_waves: report.prefill_waves.unwrap_or(0),
             decode_lanes: report.decode_lanes,
@@ -204,6 +238,33 @@ mod tests {
             ..Default::default()
         }, ranks, Some(ranks)).unwrap();
         (dir, report)
+    }
+
+    #[test]
+    fn all_onboarded_experts_keep_only_sparse_media_roles() {
+        use super::super::encoder::{EncoderKind, EncoderPlacement};
+        let (_dir, mut report) = fixture(2, 4);
+        for layer in &mut report.solver_placement.as_mut().unwrap().layers {
+            if layer.experts == crate::placement::ExpertHome::Spark {
+                layer.experts = crate::placement::ExpertHome::RtxTp2;
+            }
+        }
+        let options = DeploymentOptions { rtx_gpus: 2, peers: vec!["worker:9200".into(); 4], ..Default::default() };
+        let local = DeploymentSpec::from_report(&report, &options).unwrap();
+        assert_eq!((local.spark_ranks, local.spark_expert_world), (0, 0));
+        assert!(local.spark_roles.is_empty() && local.peers.is_empty() && local.roles.is_empty());
+        report.encoder = Some(EncoderPlacement { kind: EncoderKind::Spark { rank: 2 },
+            weights: 128, scratch: 256, replicas: vec![], reason: "tower only".into(), shortfall: 0 });
+        report.audio_encoder = Some(EncoderPlacement { kind: EncoderKind::Spark { rank: 2 },
+            weights: 64, scratch: 512, replicas: vec![], reason: "audio only".into(), shortfall: 0 });
+        let media = DeploymentSpec::from_report(&report, &options).unwrap();
+        assert_eq!((media.spark_ranks, media.spark_expert_world), (1, 0));
+        assert_eq!(media.spark_roles.len(), 1);
+        assert_eq!(media.spark_roles[0].rank, 2);
+        assert!(!media.spark_roles[0].experts && media.spark_roles[0].layers.is_empty());
+        assert_eq!(media.spark_roles[0].encoder, report.encoder);
+        assert_eq!(media.spark_roles[0].audio_encoder, report.audio_encoder);
+        assert!(media.peers.is_empty() && media.roles.is_empty());
     }
 
     #[test]

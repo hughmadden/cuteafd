@@ -62,8 +62,10 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
     let spark_ranks = options.peers.len();
-    ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&spark_ranks),
-        "Kimi startup requires 1..8 Spark peers");
+    if spark_ranks == 0 {
+        return Err(cuteafd_loader::placement::families::kimi::LOCAL_ONLY_REFUSAL.into());
+    }
+    ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
     if RANKS == 2 {

@@ -205,27 +205,15 @@ impl<'a> V41Link<'a> {
     pub(crate) fn world_size(&self) -> usize { self.link.world_size() }
     pub(crate) fn native_topology(&self) -> Option<SparkTopology> { self.native.as_ref().map(|(topology, _)| *topology) }
     pub(crate) fn reset_connections(&mut self) -> Result<()> { self.link.reset_connections() }
-    /// Opens every rank's session once the workers serve `layer` (a remote
-    /// layer) and starts the link's exchange worker. The widest request (the
-    /// link's capacity, in the checkpoint's wire format) sizes the rings;
-    /// only the control bootstrap runs, nothing is posted.
-    pub(crate) fn bootstrap(&mut self, layer: u32, nvfp4: bool) -> Result<()> {
-        use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
-        let rows = self.link.capacity();
-        let (dtype, width) = if nvfp4 { (ExpertV2Dtype::Bf16, 10240) } else { (ExpertV2Dtype::Fp8E4m3Ue8m0K32, 5280) };
-        let descriptors = (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row.into(),
-            source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row.into(),
-            route_offset: row * 6, route_count: 6 }).collect();
-        let routes = (0..rows * 6).map(|i| ExpertProtocolV2RouteEntry { row_index: i / 6,
-            expert_id: i % V41_ROUTED_EXPERTS as u32, gate_weight: 0.0 }).collect();
-        let mut request = ExpertProtocolV2Request::new(1, 0, layer, 5120, dtype, descriptors, routes,
-            vec![0; rows as usize * width])?;
-        request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        if let Some((_, planner)) = &self.native {
-            planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?.encode(&mut request)?;
-        }
-        self.link.bootstrap(&request)
+    /// Opens reply planes at capacity without naming or executing an expert layer.
+    pub(crate) fn bootstrap(&mut self, nvfp4: bool) -> Result<()> {
+        let dtype = if nvfp4 { cuteafd_transport::ExpertV2Dtype::Bf16 }
+            else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+        let mut shape = cuteafd_transport::SparkSessionShape::new(self.link.capacity(), 5120, 6, dtype)?;
+        shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        self.link.bootstrap(&shape)
     }
+
 }
 
 pub(crate) struct NativeTp4Wave<'a> {
@@ -391,8 +379,8 @@ impl<'a> NativeTp4Wave<'a> {
     }
 
     /// Opens the lane's own link ([`V41Link::bootstrap`]).
-    pub(crate) fn bootstrap(&mut self, layer: u32, nvfp4: bool) -> Result<()> {
-        self.own_link()?.bootstrap(layer, nvfp4)
+    pub(crate) fn bootstrap(&mut self, nvfp4: bool) -> Result<()> {
+        self.own_link()?.bootstrap(nvfp4)
     }
     /// Prefill slot 0 owns the one prefill link (its non-unit work sends on
     /// it). A units call borrows it for every slot's waves

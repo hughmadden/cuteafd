@@ -476,10 +476,18 @@ impl Recipe for Step5Recipe<'_> {
             });
             index
         });
-        contract.variables.push(Variable::ExpertHome {
-            layers: self.routes.clone(),
-            rank_sets: vec![(0..self.inputs.inventory.spark_ranks as u8).collect()],
-        });
+        if self.inputs.inventory.spark_ranks > 0 {
+            contract.variables.push(Variable::ExpertHome {
+                layers: self.routes.clone(),
+                rank_sets: vec![(0..self.inputs.inventory.spark_ranks as u8).collect()],
+            });
+        } else if let Some(variable) = onboard {
+            for option in 0..self.routes.len() {
+                contract.requires.push(Requires { when: Choice { variable, option }, any_of: vec![] });
+            }
+        } else {
+            return Err(Refusal::Unsupported);
+        }
         for demand in &self.figures.fixed {
             let location = Location::coordinator(demand.gpu);
             let owner = Allocation::buffer(
@@ -538,10 +546,11 @@ impl Recipe for Step5Recipe<'_> {
             contract.components.push(Component::allocation(owner,
                 ByteCurve::fixed(bytes, self.maximum_pages), true, self.maximum_pages));
         }
-        let transport = crate::serving_capacity::spark_host_transport(cuteafd_core::ExpertGeometry::STEP5,
+        let transport = if self.inputs.inventory.spark_ranks == 0 { [0; 3] } else {
+            crate::serving_capacity::spark_host_transport(cuteafd_core::ExpertGeometry::STEP5,
             1, self.inputs.inventory.spark_ranks, false, false, false,
             self.inputs.unit_rows() as u64, self.inputs.unit_rows() as u64, self.inputs.waves as u64, None)
-            .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+            .map_err(|error| Refusal::InvalidFact(error.to_string()))? };
         for (kind, bytes) in ["rings", "egress", "intake"].into_iter().zip(transport) {
             let owner = Allocation::buffer(format!("step5.host.transport.{kind}"), Location::PINNED,
                 bytes, Lifetime::RESIDENT, Category::Transport, format!("Step-5 host transport {kind}"));

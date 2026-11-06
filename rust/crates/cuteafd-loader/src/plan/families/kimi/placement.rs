@@ -211,6 +211,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     let inventory = (|| -> anyhow::Result<_> {
         let catalog = input.expert_catalog()?;
+        if ranks == 0 { return Err(kimi::LOCAL_ONLY_REFUSAL.into()); }
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
             .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: ranks, prefill_lanes: LANES };
         let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);

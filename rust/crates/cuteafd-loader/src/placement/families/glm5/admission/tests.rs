@@ -2068,7 +2068,7 @@ fn scoring_host_output_is_additional_to_text_only_rss() {
 }
 
 #[test]
-fn optional_encoder_is_selected_jointly_and_never_uses_absent_spark_workers() {
+fn optional_encoder_is_selected_jointly_and_allows_tower_only_spark() {
     use crate::plan::encoder::{EncoderKind, EncoderPlacement};
     let cfg = cfg();
     let mut recipe = recipe(&cfg);
@@ -2087,5 +2087,8 @@ fn optional_encoder_is_selected_jointly_and_never_uses_absent_spark_workers() {
     let mut pinned = request();
     pinned.onboard = Pin::Exact(recipe.experts.as_ref().unwrap().layers.len() as u64);
     let solved = planner::solve(pinned, budgets(), &recipe).unwrap();
-    assert_eq!(solved.decisions.encoder, Some(1));
+    assert_eq!(solved.decisions.encoder, Some(0));
+    let owners = solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("glm.encoder")).collect::<Vec<_>>();
+    assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), 256);
+    assert!(owners.iter().all(|owner| owner.location.device == Device::Spark(0)));
 }

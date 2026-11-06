@@ -585,6 +585,13 @@ impl<'a> PreparedV4<'a> {
         sum(self.inputs.draft.iter().map(|cost| cost.resident_bytes))
     }
 
+    /// Restrict a remote-executor geometry to candidates that actually use it.
+    pub fn require_remote_experts(mut self) -> Result<Self, Refusal> {
+        self.counts.retain(|&count| count < self.routed.len());
+        if self.counts.is_empty() { return Err(Refusal::PinConflict); }
+        Ok(self)
+    }
+
     /// Whole-layer arena peak on GPU0 for `count` onboarded layers, including
     /// dSpark's stages ahead of them. Zero on every other GPU.
     fn whole_peak(&self, count: usize) -> Result<u64, Refusal> {

@@ -503,6 +503,8 @@ pub enum Refusal {
     PinConflict,
     #[error("no supported candidate")]
     Unsupported,
+    #[error("{family} lacks the {executor} executor; tracked in #{issue}")]
+    MissingExecutor { family: &'static str, executor: &'static str, issue: u32 },
     #[error("missing selected export {export} for {geometry} at context {context}: {detail}")]
     MissingExport {
         export: String,

@@ -41,6 +41,26 @@ fn request(row_count: usize, source_kind: ExpertV2SourceKind) -> Result<ExpertPr
 }
 
 #[test]
+fn session_shape_has_no_layer_identity_and_sizes_native_payload() -> Result<()> {
+    for rows in [1, 80, 4096] {
+        let shape = SparkSessionShape::new(rows, 4096, 8, ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+        assert_eq!(shape.route_count, rows * 8);
+        assert_eq!(shape.hidden_payload_bytes, u64::from(rows) * 4224);
+        let payload = cuteafd_core::expert_geometry::expert_request_payload_offset(
+            EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, rows as usize * 40, rows as usize * 8 * 12).unwrap();
+        assert_eq!(shape.request_wire_bytes, payload + rows as usize * 4224);
+        assert!(shape.response_wire_bytes >= rows as usize * 4096 * 2 + EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN);
+    }
+    let mut first = request(1, ExpertV2SourceKind::Decode)?;
+    let shape = SparkSessionShape::from_request(&first)?;
+    first.header.layer_id = 42;
+    first.header.request_id += 1;
+    assert_eq!(shape, SparkSessionShape::from_request(&first)?);
+    assert!(SparkSessionShape::new(0, 4096, 8, ExpertV2Dtype::Bf16).is_err());
+    Ok(())
+}
+
+#[test]
 fn capacity_error_is_final_empty_and_preserves_request_identity() -> Result<()> {
     let mut request = request(128, ExpertV2SourceKind::Prefill)?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;

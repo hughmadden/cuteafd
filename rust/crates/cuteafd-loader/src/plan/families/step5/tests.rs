@@ -697,7 +697,12 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted);
-        assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
+        if ranks == 0 {
+            assert!(r.hints.iter().any(|h| h.what.contains("no local expert package for step5")), "{:?}", r.hints);
+            assert!(r.hints.iter().any(|h| h.what.contains("memory budget 'rtx0'")), "{:?}", r.hints);
+        } else {
+            assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
+        }
     }
     let r = report(dir.path(), 2, 96, 6, Some(32_768));
     assert!(!r.wip_launchable());
@@ -1534,6 +1539,22 @@ fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
     assert_eq!((fixed.tp2.as_ref().unwrap().first, fixed.tp2.as_ref().unwrap().layers), (3, 2));
     assert!(solved.pool_tokens >= 2 << 20, "pool target first: {}", solved.pool_tokens);
     eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
+}
+
+#[test]
+fn exl3_zero_spark_refuses_partial_ownership_in_the_joint_planner() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    let report = plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(0), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![96 << 30; 2], workspace_manifest: Some(manifest),
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }),
+        ..Default::default()
+    }).unwrap();
+    assert!(!report.executable() && !report.wip_launchable());
+    assert!(report.solver_placement.is_none());
+    assert!(report.hints.iter().any(|hint| hint.what.contains("native placement refused")), "{:?}", report.hints);
 }
 
 /// NVFP4 Step is deprecated: auto onboards nothing (with the named reason),

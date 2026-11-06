@@ -997,7 +997,7 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn expert_capacity_warms_every_route_and_charges_wider_intake() -> Result<()> {
+    fn expert_capacity_reserves_layer_free_sessions_and_charges_wider_intake() -> Result<()> {
         let mut cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(8))?;
         cfg.dense = (0..8).map(|layer| layer < 3).collect();
         cfg.hidden = 64;
@@ -1008,15 +1008,11 @@ mod draft_cli_tests {
             args.prefill_waves = 3;
             assert_eq!(args.expert_rows(), capacity);
             for bf16 in [false, true] {
-                let request = engine::spark_warmup_request(&cfg, args.expert_rows(), 6, bf16)?;
+                let shape = engine::spark_session_shape(&cfg, args.expert_rows(), bf16)?;
                 let stride = if bf16 { cfg.hidden * 2 } else { cfg.hidden + cfg.hidden / 32 };
-                assert_eq!((request.header.row_count as usize, request.rows.len()), (capacity, capacity));
-                assert_eq!(request.header.layer_id, 6);
-                assert_eq!(request.routes.len(), capacity * cfg.topk);
-                assert_eq!(request.hidden_payload.len(), capacity * stride);
-                for (row, routes) in request.routes.chunks_exact(cfg.topk).enumerate() {
-                    assert!(routes.iter().all(|route| route.row_index as usize == row));
-                }
+                assert_eq!(shape.row_count as usize, capacity);
+                assert_eq!(shape.route_count as usize, capacity * cfg.topk);
+                assert_eq!(shape.hidden_payload_bytes as usize, capacity * stride);
             }
             for ranks in [1u64, 4] {
                 use cuteafd_core::serving_capacity::spark_intake_allocation_bytes;
@@ -2003,6 +1999,8 @@ impl Opened {
                 .context("host embedding tensor missing")?.meta.byte_length
         } else { 0 };
         process.encoders = args.serving_encoder.iter().cloned().collect();
+        process.physical_sparks = process.encoders.iter().flat_map(|encoder| encoder.spark_ranks())
+            .max().map_or(0, |rank| rank + 1);
         process.media_cache_bytes = args.serving_media_bytes;
         process.serving(&inputs, host_config.as_ref().map_or(0, |c| c.bytes),
             host_config.as_ref().map_or(0, |c| c.chunk_bytes), host_embedding, 0)?;
@@ -2016,7 +2014,6 @@ impl Opened {
             process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);
         }
         let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
-        admitted.validate_spark_topology(spark_ranks)?;
         tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
             "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
@@ -2444,7 +2441,7 @@ impl Opened {
         };
         let mut native_push = None;
         let mut coordinator_push = None;
-        let admission = if args.peers.is_some() {
+        let admission = if !working.spark_layers.is_empty() && args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
@@ -2930,7 +2927,7 @@ impl Opened {
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
-        let remote = selected;
+        if selected.is_empty() { return Ok(None); }
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         // One link retains independent intake planes for every outstanding unit wave.
@@ -2939,23 +2936,11 @@ impl Opened {
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
             args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
         transport.enable_terminal_ownership(self.library.clone())?;
-        let warm_rows = args.expert_rows();
-        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
-        // Publish grouping before the draft planner prices the installed workers.
-        transport.bootstrap(&warm)?;
-        let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
-            .get("transport/rdma-rings").copied().unwrap_or(0);
-        let (started, before) = (Instant::now(), rings());
-        let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
-        let exchange = transport.exchange()?;
-        let payload_bytes = exchange.compact_payload(warm.header.row_count as usize);
-        let wave = exchange.send_request(warm, payload_bytes)?;
-        exchange.land_drained(wave, warm_stream.raw())
-            .with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
-        warm_stream.finish()?;
-        tracing::info!(waves = args.prefill_waves, ranks = peers.len(), rows = warm_rows,
-            ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
-            "Spark expert transport warm");
+        let shape = engine::spark_session_shape(&self.cfg, args.expert_rows(), self.checkpoint.spark_input_is_bf16())?;
+        transport.bootstrap(&shape)?;
+        let started = Instant::now();
+        transport.warm_experts(&shape, selected[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport) }))
     }
 }

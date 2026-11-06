@@ -506,7 +506,7 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
 
 fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
     let (world, config, format) = expert_admission(args, rows, layers)?;
-    let warm = super::execution::bootstrap_request(rows, 17, &format, layers)?;
+    let warm = super::execution::bootstrap_shape(rows, &format)?;
     // The widest wave sizes every rank's rings and the exchange staging.
     let mut link = SparkLink::new_waves(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2, 1, u32::try_from(rows)?)?;
     link.bootstrap(&warm)?;
@@ -858,7 +858,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         let mut link = SparkLink::new_waves(&library, world, &args.peers, unit as u32,
             config, H * 2, waves, unit as u32)?;
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(unit, 17, &format, layers)?)?;
+        link.bootstrap(&super::execution::bootstrap_shape(unit, &format)?)?;
         Ok(link)
     })?;
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;

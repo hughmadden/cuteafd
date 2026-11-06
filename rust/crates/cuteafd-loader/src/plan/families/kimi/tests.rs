@@ -97,6 +97,18 @@ fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
 }
 
 #[test]
+fn zero_spark_reports_the_missing_local_executor_without_slicing_world_zero() {
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let report = input.plan(&with_layout(0, None)).unwrap();
+    assert!(!report.executable() && !report.wip_launchable());
+    assert!(report.solver_placement.is_none());
+    let refusal = crate::placement::families::kimi::LOCAL_ONLY_REFUSAL.to_string();
+    assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)), "{:?}", report.hints);
+    assert!(!report.hints.iter().any(|hint| hint.what.contains("geometry-invalid")), "{:?}", report.hints);
+}
+
+#[test]
 fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
     use crate::placement::{ExpertHome, FfnMode, LayerMode};
     let dir = snapshot(true);

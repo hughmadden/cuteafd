@@ -58,6 +58,11 @@ pub fn push_host_owners(envelope: &crate::push_load::PushHostEnvelope, maximum: 
     }).collect())
 }
 
+/// Local-only routed execution still needs startup/lifetime hardware qualification.
+pub const LOCAL_ONLY_REFUSAL: Refusal = Refusal::MissingExecutor {
+    family: "Kimi K3", executor: "coordinator-only routed experts", issue: 1395,
+};
+
 /// Native page quantum of the retained MLA records.
 pub const PAGE_ROWS: u64 = 64;
 
@@ -299,8 +304,16 @@ impl KimiRecipe {
     }
 
     pub fn admit(&self, request: Request, budgets: Vec<Budget>) -> Result<AdmittedKimi, Refusal> {
+        if self.spark_links && self.experts.as_ref().is_some_and(|profile|
+            request.onboard == Pin::Exact(profile.layers.len() as u64)) {
+            return Err(LOCAL_ONLY_REFUSAL);
+        }
         let solved = solve(request, budgets, self)?;
         let placement = self.execution(&solved)?;
+        if self.spark_links && self.experts.is_some()
+            && !placement.layers.iter().any(|layer| layer.experts == ExpertHome::Spark) {
+            return Err(LOCAL_ONLY_REFUSAL);
+        }
         let onboard = solved.decisions.onboard_layers.iter().map(Vec::len).max().unwrap_or(0);
         Ok(AdmittedKimi { placement, solved, onboard })
     }
@@ -559,7 +572,17 @@ impl Recipe for KimiRecipe {
             });
             Ok((variable, profile))
         }).transpose()?;
-        if let Some((_, profile)) = onboard {
+        if let Some((variable, profile)) = onboard {
+            // Arenas and rank sets are prepared from exported executors. Exclude
+            // unavailable shapes before optimizing, not after choosing a winner.
+            for (option, &count) in profile.counts.iter().enumerate() {
+                let local = count == 0 || self.arenas.iter().any(|arena| arena.count == count);
+                let remote = count == profile.layers.len() || !profile.rank_sets.is_empty();
+                let executor = !self.spark_links || count < profile.layers.len();
+                if !local || !remote || !executor {
+                    contract.requires.push(Requires { when: Choice { variable, option }, any_of: vec![] });
+                }
+            }
             if !profile.rank_sets.is_empty() {
                 contract.variables.push(Variable::ExpertHome {
                     layers: profile.layers.clone(),
@@ -1037,6 +1060,38 @@ mod tests {
             PrefillShape { rows: 64, waves: 1 }, crate::placement::planner::Operation::Serving,
             ResidentWeights(1 << 30), SparkReplyFormats::default());
         assert!(recipe.admit(pinned, budgets).is_err());
+    }
+
+    #[test]
+    fn linked_executor_refuses_all_local_but_pure_solver_still_admits() {
+        let mut recipe = recipe();
+        let budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[]).unwrap();
+        let admitted = recipe.admit(single(), budgets.clone()).unwrap();
+        assert!(!admitted.placement.layers.iter().any(|layer| layer.experts == ExpertHome::Spark));
+        recipe.spark_links = true;
+        let mut request = single();
+        request.onboard = Pin::Exact(1);
+        assert!(matches!(recipe.admit(request, budgets), Err(Refusal::MissingExecutor { issue: 1395, .. })));
+    }
+
+    #[test]
+    fn linked_search_selects_the_only_feasible_partial_executor() {
+        let mut recipe = recipe();
+        recipe.spark_links = true;
+        recipe.attention.push(recipe.attention[0]);
+        recipe.layer_attention.push(recipe.layer_attention[0].clone());
+        recipe.experts = Some(ExpertProfile { layers: vec![1, 2], destination: vec![0],
+            counts: vec![0, 1, 2], rank_sets: vec![vec![0]] });
+        recipe.arenas.push(Arena { count: 2, peak: vec![2000], resident: vec![2000], weights: vec![1800] });
+        recipe.spark = vec![
+            SparkOwner { count: 0, rank: 0, experts: 200, overhead: 0 },
+            SparkOwner { count: 1, rank: 0, experts: 100, overhead: 0 },
+        ];
+        let budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[150]).unwrap();
+        let admitted = recipe.admit(single(), budgets).unwrap();
+        assert_eq!(admitted.onboard, 1);
+        assert_eq!(admitted.placement.layers[1].experts, ExpertHome::RtxWhole { gpu: 0 });
+        assert_eq!(admitted.placement.layers[2].experts, ExpertHome::Spark);
     }
 
     #[test]

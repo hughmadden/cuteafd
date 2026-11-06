@@ -9,6 +9,10 @@ pub struct ProcessOwners {
     pub host_headroom: u64,
     pub allocations: Vec<p::Allocation>,
     pub links: Vec<PreparedSparkLink>,
+    /// Physical media ranks remain available when their expert package is absent.
+    pub remote_experts: bool,
+    /// Additional admitted media hosts, independent of expert peers.
+    pub physical_sparks: usize,
     pub native_load: Option<NativeLoad>,
     pub mount_load: Option<crate::shared::dense_read::MountLoad>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
@@ -179,7 +183,7 @@ impl NativeLoad {
 
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
-        Self { host, host_headroom, allocations: vec![], links: vec![], native_load: None, mount_load: None,
+        Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
             draft_push: None }
     }
@@ -341,21 +345,6 @@ pub struct AdmittedGlmf {
     pub encoder: Option<crate::plan::encoder::EncoderPlacement>,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum TopologyRefusal {
-    #[error("all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")]
-    IdleSparks,
-}
-
-impl AdmittedGlmf {
-    pub fn validate_spark_topology(&self, requested: usize) -> Result<(), TopologyRefusal> {
-        if requested > 0 && self.working.spark_ranks == 0 {
-            return Err(TopologyRefusal::IdleSparks);
-        }
-        Ok(())
-    }
-}
-
 fn invalid(error: impl std::fmt::Display) -> p::Refusal {
     p::Refusal::InvalidFact(error.to_string())
 }
@@ -457,6 +446,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     }
     let facts = facts(i).map_err(invalid)?;
     let gpus = i.gpus.len();
+    let physical_sparks = i.spark_ranks.max(process.physical_sparks);
+    if physical_sparks > 8 { return Err(invalid("Flash encoder Spark rank outside transport inventory")); }
     if i.max_context == 0 || i.spark_ranks > 8
         || i.graphs.ranks.iter().any(|rank| rank.margin > rank.bytes)
         || i.gpus.iter().any(|(total, baseline)| *total == 0
@@ -491,7 +482,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     let counts = if i.spark_ranks == 0 { vec![routed.len()] }
         else if let Some(n) = i.onboard.layers(routed.len()) { vec![n] }
         else if rtx_experts { (0..=routed.len()).collect() } else { vec![0] };
-    if counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
+    let counts = counts.into_iter().filter(|&count| process.remote_experts || count == routed.len()).collect::<Vec<_>>();
+    if counts.is_empty() || counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
         return Err(p::Refusal::Unsupported);
     }
     let mut contract = p::Contract::fixed(256, maximum, gpus, p::Facts {
@@ -530,17 +522,13 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             }
         }
         for (option, encoder) in process.encoders.iter().enumerate() {
-            let when = p::Choice { variable, option };
             let locations = match &encoder.kind {
                 EncoderKind::Off => vec![],
                 EncoderKind::Rtx { gpu } if *gpu < gpus => vec![p::Location::coordinator(*gpu as u8)],
-                EncoderKind::Spark { .. } if !routed.is_empty() && i.spark_ranks > 0 => {
-                    if encoder.spark_ranks().iter().any(|&rank| rank >= i.spark_ranks) {
+                EncoderKind::Spark { .. } => {
+                    if encoder.spark_ranks().iter().any(|&rank| rank >= physical_sparks) {
                         return Err(invalid("Flash encoder Spark rank absent"));
                     }
-                    contract.requires.push(p::Requires { when, any_of: counts.iter().enumerate()
-                        .filter(|(_, count)| **count < routed.len())
-                        .map(|(option, _)| p::Choice { variable: onboard_variable, option }).collect() });
                     encoder.spark_ranks().into_iter().map(|rank| p::Location {
                         device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }).collect()
                 }
@@ -596,7 +584,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         physical_bytes: host.0, logical_bytes: host.0, headroom: process.host_headroom,
         baseline: p::Baseline::Sampled { free: host.1, phase: p::Phase::Load,
             source: "MemAvailable plus process anonymous RSS".into() } });
-    for rank in 0..i.spark_ranks {
+    for rank in 0..physical_sparks {
         budgets.push(p::Budget { id: format!("spark{rank}"), locations: vec![p::Location {
             device: p::Device::Spark(rank as u8), domain: p::Domain::Managed }],
             physical_bytes: 121 << 30, logical_bytes: 121 << 30, headroom: 0,

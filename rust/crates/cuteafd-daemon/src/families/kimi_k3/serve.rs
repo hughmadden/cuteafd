@@ -91,8 +91,8 @@ impl ServeArgs {
         ensure!(!self.tp2_dflash, "Kimi TP2 DFlash requires draft Context attention exports");
         ensure!(self.device >= 0 && self.split_device.is_none_or(|peer| peer >= 0 && peer != self.device),
             "Kimi serving requires one device or two distinct coordinator devices");
-        ensure!((1..=8).contains(&self.peers.len()) && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
-            "Kimi serving requires 1..8 distinct real Spark endpoints");
+        ensure!(self.peers.len() <= 8 && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
+            "Kimi serving accepts at most eight distinct Spark endpoints");
         ensure!(self.max_context.is_none_or(|context| (1..=COMPILED_CONTEXT).contains(&context)),
             "Kimi context exceeds the compiled 1M extent");
         ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
@@ -381,7 +381,7 @@ mod tests {
         for budget in ["0", "NaN", "inf"] {
             assert!(args(&["--peers", peers, "--spark-budget-gib", budget])?.validate().is_err());
         }
-        assert!(args(&[])?.validate().is_err());
+        args(&[])?.validate()?;
         for extra in [["--split-device", "0"], ["--max-context", "1048577"],
             ["--embedding-placement", "host"], ["--prefix-partial", "on"]] {
             assert!(args(&["--peers", peers, extra[0], extra[1]])?.validate().is_err());

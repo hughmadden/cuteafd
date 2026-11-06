@@ -1102,35 +1102,17 @@ fn expert_request(identity: u64, placement_version: u64, layer: usize,
     Ok(request)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(super) enum SparkBootstrapError {
-    #[error("Step-5 Spark bootstrap has no remote layers: all routed layers are onboarded on RTX")]
-    NoRemoteLayers,
-}
-
-fn spark_bootstrap_layer(remote_layers: &[usize]) -> std::result::Result<usize, SparkBootstrapError> {
-    remote_layers.first().copied().ok_or(SparkBootstrapError::NoRemoteLayers)
-}
-
-pub(super) fn bootstrap_request(rows: usize, placement_version: u64,
-    format: &super::experts::StepExperts, remote_layers: &[usize]) -> Result<ExpertProtocolV2Request> {
-    let layer = spark_bootstrap_layer(remote_layers)?;
+pub(super) fn bootstrap_shape(rows: usize, format: &super::experts::StepExperts)
+    -> Result<cuteafd_transport::SparkSessionShape> {
     ensure!((1..=4096).contains(&rows), "Step-5 bootstrap row capacity");
-    let descriptors = (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
-        row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
-        token_position: u64::from(row), route_offset: row * 8, route_count: 8,
-    }).collect();
-    let routes = (0..rows * 8).map(|i| ExpertProtocolV2RouteEntry {
-        row_index: (i / 8) as u32, expert_id: (i % 352) as u32, gate_weight: 0.,
-    }).collect();
-    // Native mixed ingress retains BF16-max staging for tails; EXL3 admits only K32.
-    let (dtype, row_bytes) = match format.ingress() {
-        cuteafd_core::SparkIngress::Fp8K32 => (ExpertV2Dtype::Fp8E4m3Ue8m0K32, H + H / 32),
-        cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native => (ExpertV2Dtype::Bf16, H * 2),
+    let dtype = match format.ingress() {
+        cuteafd_core::SparkIngress::Fp8K32 => ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native => ExpertV2Dtype::Bf16,
         cuteafd_core::SparkIngress::Bf16Decode { .. } => anyhow::bail!("Step-5 has no row-dependent ingress"),
     };
-    expert_request(1, placement_version, layer, dtype, descriptors, routes,
-        vec![0; rows * row_bytes].into())
+    let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32, H as u32, 8, dtype)?;
+    shape.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(shape)
 }
 
 fn check_captures(startup: u64, current: u64) -> Result<()> {
@@ -1841,42 +1823,30 @@ mod tests {
             (StepExperts::Native(ExpertFormat::Nvfp4), ExpertV2Dtype::Bf16, H * 2),
         ] {
             for rows in [1, 64, 640, 2752, 4096] {
-                let request = bootstrap_request(rows, 17, &format, &[3])?;
-                assert_eq!(request.header.hidden_dtype, dtype);
-                assert_eq!(request.header.hidden_row_stride_bytes as usize, row_bytes);
-                assert_eq!(request.hidden_payload.len(), rows * row_bytes);
-                assert_eq!(request.rows.len(), rows);
-                assert_eq!(request.routes.len(), rows * 8);
-                assert_eq!(request.header.placement_version, 17);
-                assert!(request.routes.iter().all(|route| route.gate_weight == 0.));
-                assert_ne!(request.header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+                let shape = bootstrap_shape(rows, &format)?;
+                assert_eq!(shape.hidden_dtype, dtype);
+                assert_eq!(shape.hidden_row_stride_bytes as usize, row_bytes);
+                assert_eq!(shape.hidden_payload_bytes as usize, rows * row_bytes);
+                assert_eq!(shape.row_count as usize, rows);
+                assert_eq!(shape.route_count as usize, rows * 8);
+                assert_ne!(shape.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, 0);
+                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::Prefill] {
+                    let descriptors = (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+                        row_id: row as u64, source_kind: kind, source_request_id: 1,
+                        token_position: row as u64, route_offset: row * 8, route_count: 8,
+                    }).collect();
+                    let routes = (0..rows * 8).map(|i| ExpertProtocolV2RouteEntry {
+                        row_index: (i / 8) as u32, expert_id: (i % 288) as u32, gate_weight: 0.0,
+                    }).collect();
+                    let real = expert_request(1, 17, 88, dtype, descriptors, routes,
+                        vec![0; rows * row_bytes].into())?;
+                    let real = cuteafd_transport::SparkSessionShape::from_request(&real)?;
+                    assert_eq!(shape.request_wire_bytes, real.request_wire_bytes);
+                    assert!(shape.response_wire_bytes >= real.response_wire_bytes);
+                }
             }
-            for rows in [0, 4097] { assert!(bootstrap_request(rows, 17, &format, &[3]).is_err()); }
-            assert!(bootstrap_request(1, 0, &format, &[3]).is_err());
+            for rows in [0, 4097] { assert!(bootstrap_shape(rows, &format).is_err()); }
         }
-        Ok(())
-    }
-
-    #[test]
-    fn bootstrap_uses_solved_spark_layers_after_rtx_onboarding() -> Result<()> {
-        let format = super::super::experts::StepExperts::Exl3(vec![4, 6]);
-        let ownership = super::super::golden::split_ownership(&config(), 64)?
-            .with_onboarded((3..50).collect())?;
-        let remote = (3..91).filter(|&layer| !ownership.onboarded(layer)).collect::<Vec<_>>();
-        // Every Step Spark rank owns the same layer set, with different width slices.
-        for _rank in 0..6 {
-            let request = bootstrap_request(64, 17, &format, &remote)?;
-            assert_eq!(request.header.layer_id, 50);
-            assert!(remote.contains(&(request.header.layer_id as usize)));
-            assert!(!ownership.onboarded(request.header.layer_id as usize));
-            assert_eq!(request.rows.len(), 64);
-        }
-        let subset = bootstrap_request(64, 17, &format, &[88, 90])?;
-        assert_eq!(subset.header.layer_id, 88);
-        let all = ownership.with_onboarded((3..91).collect())?;
-        let remote = (3..91).filter(|&layer| !all.onboarded(layer)).collect::<Vec<_>>();
-        let error = bootstrap_request(64, 17, &format, &remote).unwrap_err();
-        assert!(matches!(error.downcast_ref::<SparkBootstrapError>(), Some(SparkBootstrapError::NoRemoteLayers)));
         Ok(())
     }
 

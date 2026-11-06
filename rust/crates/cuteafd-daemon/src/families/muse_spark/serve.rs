@@ -106,7 +106,7 @@ impl ServeArgs {
         let distinct = self.peers.iter().collect::<std::collections::HashSet<_>>().len();
         // Every Spark world the shared package range data gives the checkpoint's width.
         let worlds = cuteafd_loader::plan::experts::spark_worlds(cuteafd_loader::plan::families::muse_spark::PACKAGE, 4096);
-        ensure!(worlds.contains(&self.peers.len()) && distinct == self.peers.len(),
+        ensure!((self.peers.is_empty() || worlds.contains(&self.peers.len())) && distinct == self.peers.len(),
             "Muse Spark serves its EXL3 TP experts on {worlds:?} distinct Spark endpoints, not {}", self.peers.len());
         ensure!(self.max_context.is_none_or(|context| (1..=1 << 20).contains(&context)),
             "Muse Spark context exceeds the checkpoint's 1M extent");
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn unsupported_layouts_refuse_before_any_device_access() -> Result<()> {
-        assert!(args(&[])?.validate().is_err(), "experts need Spark ranks");
+        args(&[])?.validate()?;
         let nine = (1..=9).map(|n| format!("127.0.0.1:{n}")).collect::<Vec<_>>().join(",");
         // Worlds 5, 7 and 8 come from the shared range data (#941).
         for world in [5, 7, 8] {

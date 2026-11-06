@@ -607,7 +607,7 @@ mod tests {
         )?;
         // The widest wave sizes every rank's rings and the exchange staging.
         let mut link = SparkLink::new(device.library, world, &peers, 64, config, H * 2)?;
-        link.bootstrap(&warm)?;
+        link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&warm)?)?;
         Ok(RefCell::new(link))
     }
 

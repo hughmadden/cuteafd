@@ -843,10 +843,30 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
     for (family, dir) in shared_wave_snapshots() {
         for ranks in 0..=8 {
             let mut options = wave_plan_options(dir.path(), ranks);
+            if family == "deepseek_v4" && ranks > 0 {
+                // This matrix exercises remote executor capacities; automatic
+                // all-local ownership is covered by the V4 placement regression.
+                options.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+            }
             let report = plan(dir.path(), &options).unwrap();
             assert_eq!(report.family.as_deref(), Some(family));
             let descriptor = family::registry().iter().find(|entry| entry.id() == family).unwrap().prefill_limits();
-            let expected = crate::serving_capacity::prefill_waves::prefill_shape(ranks, descriptor, Default::default()).unwrap();
+            let expert_world = if family == "glm5_flash" {
+                let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(
+                    &Checkpoint::open(dir.path()).unwrap().config).unwrap();
+                let remote = ranks > 0 && report.experts.as_ref().is_some_and(|contract|
+                    experts::frozen_refusal(&contract.package, ranks).is_none()
+                        && experts::spark_recipe(&contract.package, cfg.moe_intermediate, ranks).is_ok());
+                if !remote {
+                    assert!(!report.executable() && !report.native_serving_admitted,
+                        "the incomplete header fixture has no local expert package: {}", render(&report));
+                    assert!(report.hints.iter().any(|hint|
+                        hint.what.contains("GLM Flash pool-first placement")), "{}", render(&report));
+                    assert_eq!(report.prefill_transports, Some(0));
+                }
+                if remote { ranks } else { 0 }
+            } else { ranks };
+            let expected = crate::serving_capacity::prefill_waves::prefill_shape(expert_world, descriptor, Default::default()).unwrap();
             let (unit, waves) = (expected.unit_rows, expected.waves);
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
@@ -859,7 +879,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
                 layout.prefill_lanes = waves;
                 layout.prefill_span_rows = Some(unit * waves);
                 let report = plan(dir.path(), &options).unwrap();
-                let max_waves = if ranks == 0 { 1 } else { descriptor.max_waves };
+                let max_waves = if expert_world == 0 { 1 } else { descriptor.max_waves };
                 if waves > max_waves {
                     assert!(!report.placement_supported, "{family} ranks={ranks}: {}", render(&report));
                     assert!(report.hints.iter().any(|hint| hint.what.contains("unsupported prefill shape")),
@@ -2358,6 +2378,15 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     assert!(report_tp5.executable(), "{}", render(&report_tp5));
     assert_eq!(component(&report_tp5, Component::RoutedExpert).status, Status::Ready, "{}", render(&report_tp5));
     assert!((report_tp5.spark_rank_share - 512.0 / 2048.0).abs() < 1e-9);
+    // A geometry-valid but frozen remote world must not bypass its policy
+    // merely because Flash defers remote-package admission to the joint solve.
+    assert!(super::experts::spark_recipe("glmf:nvfp4", 2048, 7).is_err());
+    assert!(super::experts::frozen_refusal("glmf:nvfp4", 7).is_some());
+    let mut frozen = quant_options(7);
+    frozen.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+    let refused = plan(dir.path(), &frozen).unwrap();
+    assert!(!refused.executable(), "{}", render(&refused));
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("pool-first placement")), "{:?}", refused.hints);
     // Metadata that excludes the experts contradicts their NVFP4 tensors.
     let hf = json!({"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "NVFP4", "group_size": 16,
         "exclude_modules": ["model.language_model.layers.1.mlp.experts*", "*.shared_experts.*", "*.self_attn.*"]}});
@@ -2872,16 +2901,52 @@ fn v4_plan_shared_span_matches_unit_rows_and_waves() {
 #[test]
 fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
     let dir = v4_snapshot();
-    // Unset follows the descriptor's measured best k3 (#785); pins override it.
+    // With actual remote experts, unset follows k3 (#785); pins override it.
     for (requested, expected, unit) in [(0, 3, 2752), (1, 1, 4096), (2, 2, 4096), (3, 3, 2752), (4, 4, 2048)] {
         let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
             host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
             prefill_lanes: requested, prefill_waves: requested.max(1),
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)),
             pool_tokens: Some(32768), ..Default::default()
         }), ..sparks(4) }).unwrap();
         assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
             (Some(unit), Some(expected), Some(unit * expected)));
     }
+}
+
+#[test]
+fn v4_prefill_shape_follows_solved_experts_not_available_sparks() {
+    use crate::placement::{ExpertHome, OnboardSetting};
+    let dir = v4_snapshot();
+    let options = PlanOptions { layout: Some(layout::LayoutOptions {
+        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+        rtx_bytes: vec![96 << 30], pool_tokens: Some(32768), ..Default::default()
+    }), ..sparks(4) };
+    let local = plan_spark_count(dir.path(), &options, 4, Some(4)).unwrap();
+    assert!(local.placement_supported, "{}", render(&local));
+    assert!(!local.solver_placement.as_ref().unwrap().layers.iter().any(|layer|
+        layer.experts == ExpertHome::Spark));
+    assert_eq!((local.prefill_unit_rows, local.prefill_waves, local.prefill_span_rows,
+        local.prefill_transports), (Some(4096), Some(1), Some(4096), Some(0)));
+    let direct = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
+        ..options.clone() }).unwrap();
+    assert_eq!(local.solver_placement.as_ref().unwrap().items,
+        direct.solver_placement.as_ref().unwrap().items);
+    assert_eq!(serde_json::to_value(&local.phase_ledger).unwrap(),
+        serde_json::to_value(&direct.phase_ledger).unwrap());
+    let deployment_options = deployment::DeploymentOptions { rtx_gpus: 1, ..Default::default() };
+    let local_deployment = deployment::DeploymentSpec::from_report(&local, &deployment_options).unwrap();
+    assert_eq!((local_deployment.spark_expert_world, local_deployment.prefill_unit_rows,
+        local_deployment.prefill_waves), (0, 4096, 1));
+
+    let mut remote_options = options;
+    remote_options.layout.as_mut().unwrap().onboard = Some(OnboardSetting::Layers(0));
+    let remote = plan_spark_count(dir.path(), &remote_options, 4, Some(4)).unwrap();
+    assert!(remote.placement_supported, "{}", render(&remote));
+    assert!(remote.solver_placement.as_ref().unwrap().layers.iter().any(|layer|
+        layer.experts == ExpertHome::Spark));
+    assert_eq!((remote.prefill_unit_rows, remote.prefill_waves, remote.prefill_span_rows,
+        remote.prefill_transports), (Some(2752), Some(3), Some(8256), Some(1)));
 }
 
 #[test]
@@ -3436,12 +3501,6 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             workspace_manifest: Some(path.clone()), ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
         let report = plan(dir.path(), &options).unwrap();
-        if peers > 0 && expected_rtx == 3 {
-            assert!(!report.placement_supported && report.solver_placement.is_none());
-            assert!(report.hints.iter().any(|hint| hint.what.contains(
-                "all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")), "{}", render(&report));
-            continue;
-        }
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {
@@ -5218,7 +5277,7 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
 }
 
 #[test]
-fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
+fn glm_flash_all_onboarded_preserves_tower_only_spark() {
     use super::encoder::EncoderKind;
     let mut cfg = glm5_flash_config(2);
     cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
@@ -5234,49 +5293,46 @@ fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
         drafter_bytes: 256 << 20, context_tokens: 32768,
         onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default()
     }), ..sparks(4) };
-    let sentence = "GLM Flash pool-first placement:";
-    for vision in [MediaMode::Spark(None), MediaMode::Spark(Some(0))] {
-        let report = plan(dir.path(), &PlanOptions { vision, ..base.clone() }).unwrap();
-        assert!(!report.placement_supported, "{vision:?}");
-        assert!(!report.executable(), "{vision:?}");
+    for rank in [0, 2] {
+        let report = plan(dir.path(), &PlanOptions { vision: MediaMode::Spark(Some(rank)), ..base.clone() }).unwrap();
+        assert!(report.executable(), "{}", render(&report));
+        let placement = report.solver_placement.as_ref().unwrap();
+        assert!(placement.layers.iter().all(|layer| layer.experts != crate::placement::ExpertHome::Spark));
         let encoder = report.encoder.as_ref().unwrap();
-        assert_eq!(encoder.kind, EncoderKind::Off, "{vision:?}");
-        assert!(encoder.reason.contains(sentence), "{vision:?}: {}", encoder.reason);
-        assert_eq!(encoder.shortfall, 0, "{vision:?}");
-        assert_eq!(encoder.admitted_bytes(), 0);
-        assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
-            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).count(), 0);
-        assert!(report.hints.iter().any(|hint| hint.what.contains(sentence)), "{:?}", report.hints);
-        assert_ne!(component(&report, Component::Vision).status, Status::Disabled);
-        assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|note| note.contains(sentence)));
+        assert_eq!(encoder.kind, EncoderKind::Spark { rank });
+        let device = report.memory_layout.as_ref().unwrap().devices.iter().find(|device|
+            device.kind == cuteafd_core::memory_layout::DeviceKind::Spark && device.index as usize == rank).unwrap();
+        assert_eq!(device.items.iter().filter(|item| item.group.starts_with("vision")).map(|item| item.bytes).sum::<u64>(),
+            encoder.admitted_bytes());
+        let options = super::deployment::DeploymentOptions { rtx_gpus: 2, ..Default::default() };
+        let deployment = super::deployment::DeploymentSpec::from_report(&report, &options).unwrap();
+        assert_eq!(deployment.spark_expert_world, 0);
+        assert_eq!(deployment.spark_roles.iter().map(|role| role.rank).collect::<Vec<_>>(), vec![rank]);
+        assert!(!deployment.spark_roles[0].experts && deployment.peers.is_empty());
+        assert_eq!(deployment.spark_roles[0].encoder.as_ref(), Some(encoder));
     }
-    let idle = plan(dir.path(), &base).unwrap();
-    assert!(!idle.executable() && idle.solver_placement.is_none() && idle.phase_ledger.is_none());
-    assert!(idle.hints.iter().any(|hint| hint.what.contains(
-        "all routed layers fit on the RTX GPUs; set SPARK_COUNT=0")), "{}", render(&idle));
-    assert_eq!(idle.encoder.as_ref().unwrap().admitted_bytes(), 0);
-    // The same all-local selection admits automatic vision on the last RTX.
-    let auto = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..base.clone() }).unwrap();
-    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 1 }, "{}", render(&auto));
-    assert!(auto.executable(), "{}", render(&auto));
-
-    let explicit = plan_spark_count(dir.path(), &PlanOptions {
-        vision: MediaMode::Spark(None), ..base.clone()
-    }, 4, Some(4)).unwrap();
-    assert!(!explicit.executable());
-    assert!(explicit.spark_count_warning.is_none());
-    let refusal = &explicit.hints.last().unwrap().what;
-    assert!(refusal.contains(sentence), "{refusal}");
-    assert!(refusal.contains("Spark count 4 refused:"), "{refusal}");
-    assert!(refusal.contains("counts that work: []"), "{refusal}");
-
-    // An unspecified count must not adopt a vision-only Spark either.
-    let open = plan_spark_count(dir.path(), &PlanOptions {
-        vision: MediaMode::Spark(None), ..base
-    }, 4, None).unwrap();
-    assert!(!open.executable());
-    assert!(open.spark_count_warning.is_none());
-    assert!(open.hints.last().unwrap().what.contains("counts that work: []"));
+    let mut missing_remote = base.clone();
+    missing_remote.placement = ExpertPlacement::Sparks { ranks: 1 };
+    missing_remote.vision = MediaMode::Spark(Some(0));
+    missing_remote.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Auto);
+    let report = plan(dir.path(), &missing_remote).unwrap();
+    assert!(!report.experts.as_ref().unwrap().spark_worlds.contains(&1));
+    assert!(report.executable(), "{}", render(&report));
+    assert_eq!(report.onboard_layers, Some(1));
+    assert_eq!(report.prefill_waves, Some(1));
+    let deployment_options = super::deployment::DeploymentOptions { rtx_gpus: 2, ..Default::default() };
+    let deployment = super::deployment::DeploymentSpec::from_report(&report, &deployment_options).unwrap();
+    assert_eq!((deployment.spark_ranks, deployment.spark_expert_world), (1, 0));
+    missing_remote.layout.as_mut().unwrap().onboard = Some(crate::placement::OnboardSetting::Layers(0));
+    let refused = plan(dir.path(), &missing_remote).unwrap();
+    assert!(!refused.executable());
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("pool-first placement")));
+    let idle = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..base }).unwrap();
+    assert!(idle.executable(), "{}", render(&idle));
+    let options = super::deployment::DeploymentOptions { rtx_gpus: 2, ..Default::default() };
+    let deployment = super::deployment::DeploymentSpec::from_report(&idle, &options).unwrap();
+    assert_eq!((deployment.spark_ranks, deployment.spark_expert_world), (0, 0));
+    assert!(deployment.spark_roles.is_empty() && deployment.roles.is_empty() && deployment.peers.is_empty());
 }
 
 #[test]

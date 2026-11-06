@@ -379,7 +379,7 @@ impl FamilyModel for Model {
             package: PACKAGE.into(),
             block: 128,
             spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, self.cfg.moe_intermediate),
-            local: Err("Kimi K3 routed experts (637 GiB) cannot all be resident on the coordinators".into()),
+            local: Ok("Kimi EXL3 RTX TP2 native expert package".into()),
         })
     }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
