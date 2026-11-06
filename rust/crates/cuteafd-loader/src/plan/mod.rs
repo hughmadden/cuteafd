@@ -1253,7 +1253,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        if !refused && !matches!(family.id(), "glm5" | "mistral_large4") {
+        if !refused && !matches!(family.id(), "glm5" | "mistral_large4" | "qwen3_5") {
             layout::charge_host(&mut report, &layout_options, input, false)?;
         }
     }
@@ -1531,7 +1531,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         // Shared Recipe families admit one fixed prefill shape. Preserve their
         // typed refusal instead of retrying smaller reserves in a second solve.
         if ranks == 0 || candidate.layout.is_none()
-            || matches!(report.family.as_deref(), Some("glm5" | "mistral_large4")) {
+            || matches!(report.family.as_deref(), Some("glm5" | "mistral_large4" | "qwen3_5")) {
             return Ok(report);
         }
         // The prefill reserve is sized first (TJ 2026-10-27): the largest

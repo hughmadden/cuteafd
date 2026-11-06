@@ -391,9 +391,7 @@ fn full_prefill_head_changes_only_the_admitted_logit_arena() {
             assert_eq!(wide.head_rows, PREFILL_ROWS);
             assert_eq!(narrow.logits, VERIFY_ROWS * cfg.vocab * 4);
             assert_eq!(wide.logits, PREFILL_ROWS * cfg.vocab * 4);
-            assert_eq!(wide.fixed().iter().map(|d| d.bytes).sum::<u64>()
-                - narrow.fixed().iter().map(|d| d.bytes).sum::<u64>(),
-                ((PREFILL_ROWS - VERIFY_ROWS) * cfg.vocab * 4) as u64);
+            assert_eq!(wide.logits - narrow.logits, (PREFILL_ROWS - VERIFY_ROWS) * cfg.vocab * 4);
             wide.logits = narrow.logits;
             wide.head_rows = narrow.head_rows;
             assert_eq!(wide, narrow, "full scoring must not change recurrence, replay or marks");
@@ -418,9 +416,18 @@ fn full_prefill_planner_equals_runtime_recipe_for_each_kv_format() {
             let memory = report.memory_layout.unwrap();
             assert_eq!(memory.pool_tokens, 262144);
             let device = &memory.devices[0];
-            for demand in buffers.fixed() {
-                let item = device.items.iter().find(|i| i.group == demand.group).unwrap();
-                assert_eq!(item.bytes, demand.bytes, "full={full}, kv={kv}, {}", demand.group);
+            // The admitted owner groups are the executor's actual allocations.
+            for (group, bytes) in [
+                ("native step planes and scratch", buffers.planes.iter().sum::<usize>()),
+                ("vocabulary head workspace", buffers.head),
+                ("logits", buffers.logits),
+                ("token ids", buffers.ids),
+                ("GDN commit table", buffers.commit),
+                ("exact retained prefix marks", buffers.prefix),
+                ("block verify marks, logits and taps", buffers.verify.iter().sum::<usize>()),
+            ] {
+                let item = device.items.iter().find(|i| i.group == group).unwrap();
+                assert_eq!(item.bytes, bytes as u64, "full={full}, kv={kv}, {group}");
             }
             let bytes = device.used_bytes();
             if let Some(narrow_bytes) = previous {
