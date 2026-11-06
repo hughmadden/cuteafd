@@ -2028,7 +2028,8 @@ pub(super) mod tests {
         // A fixed asymmetric owner makes equal layer counts the wrong balance.
         let whole = LayerLayout::pair(&cfg, 3,
             LayerMode::Whole { gpu: 0, ffn: FfnMode::Split })?[0].attention_bytes()? as u64;
-        i.fixed.push(Demand::new(1, Category::Runtime, "asymmetric runtime owner", 3 * whole, Basis::Exact));
+        i.fixed.push(Demand::new(1, Category::Runtime, "asymmetric runtime owner",
+            3 * (whole + (2_097_152 * i.cache_format.record_bytes()) as u64), Basis::Exact));
         let admitted = admit(i)?;
         let owners = [0, 1].map(|rank| admitted.placement.layers.iter().filter(|layer|
             matches!(layer.mode, LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank)).count());
