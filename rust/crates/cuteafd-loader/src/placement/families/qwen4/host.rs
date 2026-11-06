@@ -259,6 +259,44 @@ impl QwenHost {
     }
 }
 
+/// The host ledger when the device solve refused: the same owners, uploads at
+/// the minimum page extent, so a refusal still names its host demand (and the
+/// media cache of a requested tower).
+pub fn unsolved_ledger(host: &QwenHost, media_cache: u64, pages: u64)
+    -> Result<cuteafd_core::memory_layout::HostLayout, Refusal> {
+    use cuteafd_core::memory_layout::{Basis, HostLayout, Item, ItemLifetime};
+    use std::collections::BTreeMap;
+    let pages = pages.max(1);
+    let mut groups = BTreeMap::<(String, Category, bool), u64>::new();
+    let mut uploads = 0u64;
+    for component in host.components(pages)? {
+        let bytes = component.bytes.at(pages)?;
+        match &component.kind {
+            ComponentKind::Allocation { template, .. } if template.category != Category::Prefix => {
+                let deferred = template.lifetime.first == Phase::Ready;
+                let total = groups.entry((template.group.clone(), template.category, deferred)).or_insert(0);
+                *total = total.checked_add(bytes).ok_or(Refusal::Overflow("Qwen host ledger"))?;
+            }
+            ComponentKind::Allowance(_) => uploads = uploads.checked_add(bytes)
+                .ok_or(Refusal::Overflow("Qwen host uploads"))?,
+            _ => {}
+        }
+    }
+    let mut items: Vec<_> = groups.into_iter().map(|((group, category, deferred), bytes)| {
+        let item = Item::new(category, group, "", bytes, Basis::Formula);
+        if deferred { item.with_lifetime(ItemLifetime::PostReadyReserve) } else { item }
+    }).collect();
+    if uploads > 0 {
+        items.push(Item::new(Category::Staging, "staging/tables-and-sync", "retained uploads (page-linear bound)",
+            uploads, Basis::Estimated));
+    }
+    if media_cache > 0 {
+        items.push(Item::new(Category::Embedding, "media/embedding-cache", "", media_cache, Basis::Formula));
+    }
+    HostLayout::new(host.memory.total, host.memory.available, host.memory.reserve(), host.prefix_quota, items)
+        .ok_or(Refusal::Overflow("Qwen host ledger"))
+}
+
 /// Header-only host prefix geometry: one owner's pool unit and retained mark,
 /// the aggregate a dual executor's concatenated snapshot also stores.
 pub fn prefix_geometry(cfg: &Qwen4Config, layers: usize, mtp: bool,

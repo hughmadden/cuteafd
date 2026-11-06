@@ -153,19 +153,32 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
             qwen4::QwenEncoders::default()
         }
     };
+    // Host owners are stated before the device solve, so a refusal still
+    // reports its host demand, as the shared host pass did.
+    let host = Qwen4Config::from_hf(&checkpoint.config).map_err(anyhow::Error::from).and_then(|cfg| {
+        let span = if options.prefill_waves > 1 {
+            crate::serving_capacity::PrefillShape { unit_rows: if options.prefill_rows > 0 { options.prefill_rows } else { 4096 },
+                waves: options.prefill_waves }.validate()?.slot_rows()
+        } else { shape.prefill_rows };
+        host_owners(report, options, input, &cfg, 1, span, mtp)
+    });
     let mut pool_tokens = 0;
-    match placement(input, report, options, &mut devices[0], shape.manifest.as_deref(),
-        PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency, context_tokens: shape.context_tokens, mtp },
-        encoders, &mut notes) {
+    match host.as_ref().map_err(|error| anyhow::anyhow!("Qwen host owners: {error:#}")).and_then(|host|
+        placement(input, report, options, &mut devices[0], shape.manifest.as_deref(),
+            PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency, context_tokens: shape.context_tokens, mtp },
+            host.clone(), encoders.clone(), &mut notes)) {
         Ok(tokens) => pool_tokens = tokens,
         Err(error) => {
             let reason = format!("Qwen admission: {error:#}");
             report.refuse_placement(reason.clone(),
                 "Supply complete native checkpoint owners within the device and resident-weight budgets.");
             notes.push(reason);
+            if let Ok(host) = &host {
+                refused_host(report, options, host, &encoders, shape.context_tokens);
+            }
         }
     }
-    refused_encoder(report);
+    refused_encoder(report, &encoders);
     if pool_tokens < shape.context_tokens {
         notes.push(format!("full-context admission shortfall: context {} tokens, pool {pool_tokens} tokens, shortfall {} tokens",
             shape.context_tokens, shape.context_tokens - pool_tokens));
@@ -190,7 +203,7 @@ struct PlanShape {
 /// head, drafter, resident experts and their package scratch, encoder).
 fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: &LayoutOptions,
     device: &mut DeviceLayout, manifest: Option<&serde_json::Value>, shape: PlanShape,
-    encoders: qwen4::QwenEncoders, notes: &mut Vec<String>) -> anyhow::Result<u64> {
+    host: qwen4::QwenHost, encoders: qwen4::QwenEncoders, notes: &mut Vec<String>) -> anyhow::Result<u64> {
     use crate::serving_capacity::qwen_graphs::*;
     let checkpoint = input.checkpoint();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
@@ -244,7 +257,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         requested_pool: options.pool_tokens.filter(|&n| n > 0),
         spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 },
         startup_graph_modes: Some((shape.concurrency as usize, true)),
-        host: host_owners(report, options, input, &cfg, 1, span, mtp)?,
+        host,
         encoders,
     };
     let (placement, solved) = crate::placement::families::qwen4::admitted(&inputs)?;
@@ -410,12 +423,37 @@ fn adopt_encoder(report: &mut PlanReport, encoders: &qwen4::QwenEncoders,
     report.encoder = Some(encoder);
 }
 
-/// A refused solve still names its vision decision: Off, at no admitted bytes.
-fn refused_encoder(report: &mut PlanReport) {
+/// A refused solve still names its vision decision: the requested tower
+/// (its first candidate), or Off when vision was not requested.
+fn refused_encoder(report: &mut PlanReport, encoders: &qwen4::QwenEncoders) {
     use super::super::encoder::{EncoderKind, EncoderPlacement};
-    if report.encoder.is_none() {
-        report.encoder = Some(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
-            replicas: Vec::new(), reason: "admission refused before an encoder was chosen".into(), shortfall: 0 });
+    if report.encoder.is_some() { return; }
+    let requested = encoders.candidates.first().filter(|candidate| candidate.kind != EncoderKind::Off)
+        .filter(|_| report.vision != super::super::MediaMode::Auto);
+    report.encoder = Some(match requested {
+        Some(candidate) => EncoderPlacement { reason: format!("requested; admission refused: {}", candidate.reason),
+            ..candidate.clone() },
+        None => EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0, replicas: Vec::new(),
+            reason: "admission refused before an encoder was chosen".into(), shortfall: 0 },
+    });
+}
+
+/// A refused device solve still publishes its host owners (uploads at the
+/// context extent) and prefix quota, plus a requested tower's media cache.
+fn refused_host(report: &mut PlanReport, options: &LayoutOptions, host: &qwen4::QwenHost,
+    encoders: &qwen4::QwenEncoders, context_tokens: u64) {
+    if options.inventory { return; }
+    let requested = report.vision != super::super::MediaMode::Auto && encoders.candidates.first()
+        .is_some_and(|candidate| candidate.kind != super::super::encoder::EncoderKind::Off);
+    let media = if requested { encoders.media_cache } else { 0 };
+    let pages = crate::placement::families::qwen4::host::units_of(context_tokens);
+    match crate::placement::families::qwen4::host::unsolved_ledger(host, media, pages) {
+        Ok(ledger) => {
+            report.host_ledger = Some(ledger);
+            report.host_budget_bytes = host.prefix_quota;
+        }
+        Err(error) => report.hints.push(super::super::Hint { what: format!("Qwen host ledger: {error}"),
+            how: "Report the host owner geometry.".into() }),
     }
 }
 
@@ -509,6 +547,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
             "Supply complete PLE headers and a valid host prefix geometry.");
             return MemoryLayout { devices, pool_tokens: 0, waste: Vec::new(), notes } }
     };
+    let (refused, encoders_refused) = (host.clone(), encoders.clone());
     let pool_tokens = match apply(input, options, &mut devices, rows, concurrency, context, mtp, manifest, host, encoders) {
         Ok((placement, solved, host, encoders)) => {
             if let Err(error) = publish_host(report, options, &host, &solved) {
@@ -519,10 +558,12 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
         Err(error) => {
             report.refuse_placement(format!("Qwen dual admission: {error:#}"),
                 "Supply complete checkpoint headers and exact unequal TP2 plus MTP package manifests.");
-            notes.push(format!("Qwen dual admission: {error:#}")); 0
+            notes.push(format!("Qwen dual admission: {error:#}"));
+            refused_host(report, options, &refused, &encoders_refused, context);
+            0
         }
     };
-    refused_encoder(report);
+    refused_encoder(report, &encoders_refused);
     MemoryLayout { devices, pool_tokens, waste: Vec::new(), notes }
 }
 
