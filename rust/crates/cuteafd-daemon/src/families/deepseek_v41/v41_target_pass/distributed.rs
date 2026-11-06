@@ -1355,7 +1355,7 @@ mod tests {
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
         // As serve: each link's exchange starts at the first remote layer.
         let nvfp4 = catalog.nvfp4().is_some();
-        devices[1].run(|| transport.get_mut().bootstrap(20, nvfp4))?;
+        devices[1].run(|| transport.get_mut().bootstrap(nvfp4))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -1547,7 +1547,7 @@ mod tests {
             )
         })?;
         other_transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), 20, 16, [None, None])?)?;
-        devices[1].run(|| other_transport.get_mut().bootstrap(20, nvfp4))?;
+        devices[1].run(|| other_transport.get_mut().bootstrap(nvfp4))?;
         // The prefill slots: two passes on shared storage; slot 0's FFN owner
         // holds the one prefill link (execution lane 2), two return slots of
         // 16 rows; one TP2 FFN arena for both (reserve 32, unit 16).
@@ -1558,7 +1558,7 @@ mod tests {
         let mut slot_transports = [devices[1].own(|| NativeTp4Wave::with_link(&lib, link.into_inner()))?,
             devices[1].own(|| NativeTp4Wave::unlinked(&lib, unit_rows))?];
         for transport in &mut slot_transports { transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?; }
-        devices[1].run(|| slot_transports[0].get_mut().bootstrap(20, nvfp4))?;
+        devices[1].run(|| slot_transports[0].get_mut().bootstrap(nvfp4))?;
         let [slot0_transport, slot1_transport] = slot_transports;
         let mut prefill_slots = crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillSlots {
             packed_suffix: pass.new_packed_storage(&lib, unit_rows as usize, 2)?,

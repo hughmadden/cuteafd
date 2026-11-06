@@ -217,12 +217,12 @@ impl SparkExperts {
     /// `request` sizes the registered rings, so it must be the widest wave this
     /// transport will dispatch — the same one its start-up warm-up sends. Only
     /// the control bootstrap reaches a worker; the rows are never sent.
-    pub fn bootstrap(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+    pub fn bootstrap(&mut self, shape: &crate::SparkSessionShape) -> Result<()> {
         ensure!(self.open_waves.is_empty(), "cannot bootstrap a Spark transport with a wave in flight");
-        ensure!(request.header.row_count <= self.capacity,
+        ensure!(shape.row_count <= self.capacity,
             "Spark bootstrap request of {} rows exceeds the transport's {}-row capacity",
-            request.header.row_count, self.capacity);
-        self.clients.bootstrap(request)
+            shape.row_count, self.capacity);
+        self.clients.bootstrap(shape)
     }
     /// Physical ownership and request wire bound before any connection.
     pub fn world(&self) -> SparkWorld { self.world }

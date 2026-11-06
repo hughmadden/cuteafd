@@ -339,7 +339,7 @@ fn with_backend<T>(args: &ServeArgs,
         rtx_layers: admission.ownership.onboarded_layers().to_vec(),
         spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 };
-    let bootstrap = super::execution::bootstrap_request(inputs.unit_rows(), 1, &format, &spark_working.spark_layers)?;
+    let bootstrap = super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
     let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
@@ -729,7 +729,7 @@ mod tests {
                 spark_ranks: 6, prefill_lanes: 1 };
             SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &working,
                 6, None, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?)?;
-            super::super::execution::bootstrap_request(inputs.unit_rows(), 1, &format, &working.spark_layers)?;
+            super::super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
                 let mut native = Execution::serving_admission(&programs, &checkpoint,

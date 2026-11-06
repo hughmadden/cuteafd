@@ -1644,7 +1644,7 @@ impl Opened {
             // The bootstrap opens every rank before any wave does, so the
             // installed grouping is readable from here on. The warm-up below
             // then reuses these sessions.
-            link.bootstrap(&warm(engine::DECODE_ROWS, true)?)?;
+            link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&warm(engine::DECODE_ROWS, true)?)?)?;
             Ok(link)
         }).transpose()?;
         // One prefill transport with `prefill_lanes` waves in flight (PLAN
@@ -1654,7 +1654,7 @@ impl Opened {
                 let (peers, world) = ranks(peers)?;
                 let mut link = SparkLink::prepared(&self.library, world, &peers, config.clone(),
                     admitted.prefill_link.clone().context("admitted prefill transport")?)?;
-                link.bootstrap(&warm(args.prefill_rows, false)?)?;
+                link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&warm(args.prefill_rows, false)?)?)?;
                 Some(link)
             }
             None => None,

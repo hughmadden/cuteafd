@@ -108,7 +108,7 @@ impl<'a> MuseSparkPath<'a> {
         path.stream.device.run(|| {
             let link = path.link.as_mut().context("Muse Spark link absent")?;
             ensure!(link.world_size() == peers.len(), "Muse Spark transport world differs from its peers");
-            link.bootstrap(&bootstrap_request(first_spark_layer, unit, cutoff)?)?;
+            link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&bootstrap_request(first_spark_layer, unit, cutoff)?)?)?;
             ensure!(link.installed_grouping()?.len() == peers.len(), "Muse bootstrap requires every rank's grouping");
             for slot in 0..waves {
                 let table = Self::slot_tables(&path.tables, layout, slot);

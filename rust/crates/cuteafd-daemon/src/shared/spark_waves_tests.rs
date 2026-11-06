@@ -1256,7 +1256,7 @@ fn link_teardown_and_reset_take_the_transport_back_from_the_exchange() {
     // A reset re-opens the sessions before the exchange restarts: its device
     // landing mask is read from the live sessions, as after bootstrap.
     let reset = link.split("pub(crate) fn reset_connections(&mut self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
-    let reopened = reset.find("transport.bootstrap(&request)?").expect("reset re-opens the sessions");
+    let reopened = reset.find("transport.bootstrap(shape)?").expect("reset re-opens the sessions");
     assert!(reopened < reset.find("self.start()").unwrap(), "{reset}");
 }
 

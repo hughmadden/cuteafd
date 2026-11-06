@@ -513,14 +513,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         // The workers serve their layers: open the sessions and start each
         // link's exchange worker (the first remote layer sizes the rings).
         for transport in [&mut transport, &mut second_transport] {
-            devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
+            devices[1].run(|| transport.get_mut().bootstrap(catalog.nvfp4().is_some()))?;
         }
     }
     let mut prefill_slots = super::prefill_target::PrefillSlots { packed_suffix, prompt_suffixes,
         slots: slot_passes.into_iter().zip(slot_transports).collect() };
     if expert_layers < 40 {
         let link = &mut prefill_slots.slots[0].1;
-        devices[1].run(|| link.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
+        devices[1].run(|| link.get_mut().bootstrap(catalog.nvfp4().is_some()))?;
     }
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }

@@ -748,9 +748,9 @@ fn worker(
     if local_layers < 40 {
         // The workers serve their layers now: open the sessions and start each
         // link's exchange worker (the first remote layer sizes the rings).
-        transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
-        second_transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
-        prefill_slots.slots[0].1.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
+        transport.bootstrap(catalog.nvfp4().is_some())?;
+        second_transport.bootstrap(catalog.nvfp4().is_some())?;
+        prefill_slots.slots[0].1.bootstrap(catalog.nvfp4().is_some())?;
     }
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;

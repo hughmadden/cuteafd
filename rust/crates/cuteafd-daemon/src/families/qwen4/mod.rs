@@ -904,7 +904,7 @@ impl Opened {
         // the widest wave this transport can carry: the draft planner prices the
         // workers before any serving step opens a session, and the sessions this
         // opens are the ones every step after it reuses.
-        transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_wave_rows(),
+        transport.bootstrap(&engine::spark_session_shape(&self.cfg, args.prefill_wave_rows(),
             self.checkpoint.spark_input_is_bf16())?)?;
         crate::shared::memory_report::release_load_staging(&self.library)?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), mtp }))

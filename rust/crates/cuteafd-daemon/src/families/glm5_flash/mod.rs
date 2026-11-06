@@ -2421,7 +2421,7 @@ impl Opened {
         };
         let mut native_push = None;
         let mut coordinator_push = None;
-        let admission = if args.peers.is_some() {
+        let admission = if !working.spark_layers.is_empty() && args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
                 .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let geometry = if let Some(catalog) = &self.experts { catalog.routed_experts().geometry()? }
@@ -2918,7 +2918,7 @@ impl Opened {
         let warm_rows = args.expert_rows();
         let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
         // Publish grouping before the draft planner prices the installed workers.
-        transport.bootstrap(&warm)?;
+        transport.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&warm)?)?;
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());

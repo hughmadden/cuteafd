@@ -1460,7 +1460,7 @@ impl Opened {
             link.bind_model_endpoint(endpoint)?;
             link.enable_terminal_ownership(self.library.clone())?;
             // Bootstrap with this endpoint's widest request, never prefill on decode.
-            link.bootstrap(&request)?;
+            link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&request)?)?;
             let actual = cuteafd_ffi::memory_ledger::snapshot()
                 .by_owner(cuteafd_ffi::memory_ledger::Space::Device, args.device)
                 .get(label.as_str()).copied().unwrap_or(0);

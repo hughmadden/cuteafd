@@ -1751,25 +1751,10 @@ impl<'a> Engine<'a> {
         spark_request(self.cfg.dim, self.cfg.n_activated_experts, layer, rows, routes, wire, kind)
     }
 
-    /// Zero-valued wave at the link's live row capacity. Decode and prefill
-    /// bootstrap independently because their registered reply planes differ.
-    pub fn warm_request(&self, rows: usize, kind: ExpertV2SourceKind) -> Result<ExpertProtocolV2Request> {
-        let (h, experts, topk) = (self.cfg.dim, self.cfg.n_routed_experts, self.cfg.n_activated_experts);
-        let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
-        }).collect();
-        self.expert_request(self.cfg.n_layers - 1, rows, routes, vec![0u8; rows * (h + h / 32)].into(),
-            kind)
-    }
-
-    /// Warm a link without exceeding its own return-plane capacity.
-    pub fn warm_transport(&self, transport: &mut SparkLink<'_>, rows: usize, kind: ExpertV2SourceKind) -> Result<()> {
-        let request = self.warm_request(rows, kind)?;
-        let exchange = transport.exchange()?;
-        let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
-        let ticket = exchange.send_request(request, payload_bytes)?;
-        exchange.land_drained(ticket, self.stream)?;
-        self.sync()
+    /// Widest session geometry; opening reply planes never runs an expert layer.
+    pub fn session_shape(&self, rows: usize) -> Result<cuteafd_transport::SparkSessionShape> {
+        cuteafd_transport::SparkSessionShape::new(u32::try_from(rows)?, self.cfg.dim as u32,
+            self.cfg.n_activated_experts as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32)
     }
 
     pub(crate) fn local_layers(&self) -> usize {

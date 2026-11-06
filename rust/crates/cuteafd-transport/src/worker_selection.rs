@@ -709,7 +709,7 @@ pub fn require_peer_clients(peers: &[SocketAddr], endpoint: cuteafd_core::SparkE
 
 /// Claim one coordinator endpoint before allocating its native buffers. The
 /// lease lives on that endpoint, including any retained response payloads.
-pub(crate) fn reserve_peer_endpoint(peer: SocketAddr, header: &crate::ExpertProtocolV2RequestHeader,
+pub(crate) fn reserve_peer_endpoint(peer: SocketAddr, shape: &crate::SparkSessionShape,
     capacity: Option<u32>, endpoint: Option<u32>) -> Result<Option<EndpointReservation>> {
     let endpoints = seals().lock().map_err(|_| anyhow::anyhow!("worker selection seals poisoned"))?
         .get(&peer).map(|seal| seal.endpoints.clone());
@@ -727,19 +727,19 @@ pub(crate) fn reserve_peer_endpoint(peer: SocketAddr, header: &crate::ExpertProt
             .context("explicit endpoint index outside ModelAdmission")?;
         ensure!(capacity.is_none_or(|rows| rows <= spec.capacity),
             "explicit endpoint {index} capacity {} is smaller than requested {capacity:?}", spec.capacity);
-        validate_endpoint_request(&endpoints.selection, index as usize, header)?;
+        validate_endpoint_shape(&endpoints.selection, index as usize, shape)?;
         return installed.reserve_endpoint(Some(index));
     }
     let mut candidates = model.endpoints.iter().enumerate().collect::<Vec<_>>();
     candidates.sort_by_key(|(_, spec)| spec.capacity);
     for (index, spec) in candidates {
         if capacity.is_some_and(|rows| rows > spec.capacity) { continue; }
-        let valid = validate_endpoint_request(&endpoints.selection, index, header).is_ok();
+        let valid = validate_endpoint_shape(&endpoints.selection, index, shape).is_ok();
         if valid {
             if let Ok(lease) = installed.reserve_endpoint(Some(index as u32)) { return Ok(lease); }
         }
     }
-    anyhow::bail!("worker {peer} has no free ModelAdmission endpoint for capacity {:?} / {:?}", capacity, header.hidden_dtype)
+    anyhow::bail!("worker {peer} has no free ModelAdmission endpoint for capacity {:?} / {:?}", capacity, shape.hidden_dtype)
 }
 
 // Prefill lanes and device proxies open separate clients to the same worker.
@@ -958,8 +958,8 @@ impl EndpointReservation {
     }
 }
 
-fn validate_endpoint_request(selection: &WorkerSelection, index: usize,
-    header: &crate::ExpertProtocolV2RequestHeader) -> Result<()> {
+fn validate_endpoint_shape(selection: &WorkerSelection, index: usize,
+    header: &crate::SparkSessionShape) -> Result<()> {
     use cuteafd_core::SparkIngress;
     use crate::ExpertV2Dtype;
     let model = selection.model().expect("typed endpoint");
@@ -979,10 +979,20 @@ fn validate_endpoint_request(selection: &WorkerSelection, index: usize,
     let geometry = selection.geometry();
     ensure!(header.hidden_dim == geometry.hidden && header.route_count as u64 <= header.row_count as u64 * geometry.topk as u64,
         "endpoint {} request exceeds admitted hidden/route geometry", index);
+    Ok(())
+}
+
+fn validate_endpoint_request(selection: &WorkerSelection, index: usize,
+    header: &crate::ExpertProtocolV2RequestHeader) -> Result<()> {
+    validate_endpoint_shape(selection, index, &crate::SparkSessionShape {
+        row_count: header.row_count, hidden_dim: header.hidden_dim, hidden_dtype: header.hidden_dtype,
+        route_count: header.route_count, hidden_row_stride_bytes: header.hidden_row_stride_bytes,
+        hidden_payload_bytes: header.hidden_payload_bytes, flags: header.flags,
+        request_wire_bytes: 0, response_wire_bytes: 0,
+    })?;
     ensure!(selection.ranges().iter().any(|range| (range.first..range.end).contains(&header.layer_id)),
         "endpoint {} request layer {} outside loaded selection", index, header.layer_id);
     Ok(())
-
 }
 
 
@@ -996,6 +1006,12 @@ impl Drop for EndpointReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn session(header: &crate::ExpertProtocolV2RequestHeader) -> crate::SparkSessionShape {
+        crate::SparkSessionShape { row_count: header.row_count, hidden_dim: header.hidden_dim,
+            hidden_dtype: header.hidden_dtype, route_count: header.route_count,
+            hidden_row_stride_bytes: header.hidden_row_stride_bytes, hidden_payload_bytes: header.hidden_payload_bytes,
+            flags: header.flags, request_wire_bytes: 0, response_wire_bytes: 0 }
+    }
     fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false } }
     pub(super) fn executions(decode: u32, prefill: u32, unit: u32, units: u8) -> SparkExecutions {
         SparkExecutions::admit(&[decode], prefill, unit, units, &cuteafd_core::EXL3_CAPACITIES).unwrap()
@@ -1240,31 +1256,33 @@ mod tests {
             route_bytes: 12, hidden_payload_bytes: 80 * 12288, flags: 0,
         };
         // Prefill connects first while both decode endpoints are still free.
-        let prefill = reserve_peer_endpoint(peer, &header, Some(4096), Some(2))?.unwrap();
+        let prefill = reserve_peer_endpoint(peer, &session(&header), Some(4096), Some(2))?.unwrap();
         assert_eq!((prefill.index(), prefill.contract().1.depth), (2, 2));
-        let first = reserve_peer_endpoint(peer, &header, Some(4096), Some(0))?.unwrap();
+        let first = reserve_peer_endpoint(peer, &session(&header), Some(4096), Some(0))?.unwrap();
         assert_eq!((first.index(), first.contract().1.depth), (0, 8));
         // A busy explicit identity must not fall back to the free second lane.
-        assert!(reserve_peer_endpoint(peer, &header, Some(4096), Some(2)).is_err());
-        let second = reserve_peer_endpoint(peer, &header, Some(4096), None)?.unwrap();
+        assert!(reserve_peer_endpoint(peer, &session(&header), Some(4096), Some(2)).is_err());
+        let second = reserve_peer_endpoint(peer, &session(&header), Some(4096), None)?.unwrap();
         assert_eq!((second.index(), second.contract().1.depth), (1, 8));
         drop(first);
         drop(prefill);
-        let reconnected = reserve_peer_endpoint(peer, &header, Some(4096), Some(2))?.unwrap();
+        let reconnected = reserve_peer_endpoint(peer, &session(&header), Some(4096), Some(2))?.unwrap();
         assert_eq!((reconnected.index(), reconnected.contract().1.depth), (2, 2));
         drop(reconnected);
-        assert!(reserve_peer_endpoint(peer, &header, Some(4097), Some(2)).is_err());
-        assert!(reserve_peer_endpoint(peer, &header, None, Some(3)).is_err());
+        assert!(reserve_peer_endpoint(peer, &session(&header), Some(4097), Some(2)).is_err());
+        assert!(reserve_peer_endpoint(peer, &session(&header), None, Some(3)).is_err());
         let mut invalid = header.clone();
         invalid.row_count = 81;
-        assert!(reserve_peer_endpoint(peer, &invalid, None, Some(2)).is_err());
+        assert!(reserve_peer_endpoint(peer, &session(&invalid), None, Some(2)).is_err());
         invalid = header.clone();
         invalid.layer_id = 12;
-        assert!(reserve_peer_endpoint(peer, &invalid, None, Some(2)).is_err());
+        let layer_free = reserve_peer_endpoint(peer, &session(&invalid), None, Some(2))?.unwrap();
+        assert!(layer_free.validate_request(&invalid).is_err());
+        drop(layer_free);
         drop(second);
         drop(_seal);
-        assert!(reserve_peer_endpoint(peer, &header, None, Some(2)).is_err());
-        assert!(reserve_peer_endpoint(peer, &header, None, None)?.is_none());
+        assert!(reserve_peer_endpoint(peer, &session(&header), None, Some(2)).is_err());
+        assert!(reserve_peer_endpoint(peer, &session(&header), None, None)?.is_none());
         Ok(())
     }
 
@@ -1386,14 +1404,14 @@ mod tests {
                 hidden_row_stride_bytes: 12288, route_count: 640, row_descriptor_bytes: 40,
                 route_bytes: 12, hidden_payload_bytes: 80 * 12288, flags: 0,
             };
-            let lease = reserve_peer_endpoint(peer, &header, Some(4096), None)?.unwrap();
+            let lease = reserve_peer_endpoint(peer, &session(&header), Some(4096), None)?.unwrap();
             assert_eq!(lease.index(), 0);
-            assert!(reserve_peer_endpoint(peer, &header, Some(4096), None).is_err());
+            assert!(reserve_peer_endpoint(peer, &session(&header), Some(4096), None).is_err());
             select_model_admission(&[peer], &selection, Duration::from_secs(3))?;
-            assert!(reserve_peer_endpoint(peer, &header, Some(4096), None).is_err());
+            assert!(reserve_peer_endpoint(peer, &session(&header), Some(4096), None).is_err());
             drop(lease);
-            assert!(reserve_peer_endpoint(peer, &header, Some(4096), None)?.is_some());
-            assert!(reserve_peer_endpoint(peer, &header, Some(4097), None).is_err());
+            assert!(reserve_peer_endpoint(peer, &session(&header), Some(4096), None)?.is_some());
+            assert!(reserve_peer_endpoint(peer, &session(&header), Some(4097), None).is_err());
             Ok(())
         })
     }
@@ -1473,7 +1491,7 @@ mod tests {
                     hidden_payload_bytes: 640 * 8192,
                     flags: crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
                 };
-                let first = peers.iter().map(|&peer| reserve_peer_endpoint(peer, &header, None, None)
+                let first = peers.iter().map(|&peer| reserve_peer_endpoint(peer, &session(&header), None, None)
                     .map(|lease| lease.unwrap())).collect::<Result<Vec<_>>>()?;
                 // Rank0's layer3 wave has completed, but its persistent QPs live.
                 header.layer_id = 7;
@@ -1489,7 +1507,7 @@ mod tests {
                 for index in 1..clients {
                     header.request_id += 1;
                     for &peer in &peers {
-                        let lease = reserve_peer_endpoint(peer, &header, None, None)?.expect("typed endpoint lease");
+                        let lease = reserve_peer_endpoint(peer, &session(&header), None, None)?.expect("typed endpoint lease");
                         assert_eq!(lease.index(), u32::try_from(index)?);
                         remaining.push(lease);
                     }
@@ -1497,7 +1515,7 @@ mod tests {
                 select_model_admission(&peers, &selection, Duration::from_secs(5))?;
                 for &peer in &peers {
                     assert_eq!(seals().lock().unwrap()[&peer].endpoints.used.load(Ordering::Acquire).count_ones(), clients as u32);
-                    let error = reserve_peer_endpoint(peer, &header, None, None).err().expect("endpoint exhaustion");
+                    let error = reserve_peer_endpoint(peer, &session(&header), None, None).err().expect("endpoint exhaustion");
                     assert!(error.to_string().contains("has no free ModelAdmission endpoint for capacity None / Bf16"));
                 }
                 for server in servers { server.join().unwrap()?; }
@@ -1505,7 +1523,7 @@ mod tests {
                 drop(first);
                 for peer in peers {
                     assert_eq!(seals().lock().unwrap()[&peer].endpoints.used.load(Ordering::Acquire), 0);
-                    let lease = reserve_peer_endpoint(peer, &header, None, None)?.expect("released endpoint reusable");
+                    let lease = reserve_peer_endpoint(peer, &session(&header), None, None)?.expect("released endpoint reusable");
                     assert_eq!(lease.index(), 0);
                     drop(lease);
                     seals().lock().unwrap().remove(&peer);

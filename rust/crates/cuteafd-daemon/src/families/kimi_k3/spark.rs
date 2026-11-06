@@ -94,9 +94,9 @@ impl<'a> RoutedLane<'a> {
             Ok(link)
         })?;
         ensure!(link.world_size() == ranks, "Kimi Spark transport world differs from admission");
-        if let Some(layer) = placement.layers.iter().position(|assignment|
+        if placement.layers.iter().any(|assignment|
             assignment.experts == cuteafd_loader::placement::ExpertHome::Spark) {
-            stream.device.run(|| link.bootstrap(&bootstrap_request(layer, unit)?))?;
+            stream.device.run(|| link.bootstrap(&bootstrap_shape(unit)?))?;
             ensure!(link.installed_grouping()?.len() == ranks,
                 "Kimi bootstrap requires installed grouping from all admitted ranks");
         }
@@ -207,11 +207,12 @@ impl<'a> RoutedLane<'a> {
 
 /// Control bootstrap sizes rings for the widest real request; these rows
 /// are never dispatched to the expert kernels.
-fn bootstrap_request(layer: usize, rows: usize) -> Result<ExpertProtocolV2Request> {
-    ensure!((1..93).contains(&layer) && (1..=4096).contains(&rows), "Kimi bootstrap geometry");
-    let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
-    let staged = vec![0; layout.bytes];
-    request(layer, rows, 1, ExpertV2SourceKind::Prefill, &layout, &staged)
+fn bootstrap_shape(rows: usize) -> Result<cuteafd_transport::SparkSessionShape> {
+    ensure!((1..=4096).contains(&rows), "Kimi bootstrap geometry");
+    let mut shape = cuteafd_transport::SparkSessionShape::new(rows as u32, LATENT as u32, TOPK as u32,
+        ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+    shape.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(shape)
 }
 
 fn request(layer: usize, rows: usize, sequence: u64, kind: ExpertV2SourceKind,
@@ -267,17 +268,13 @@ mod tests {
     #[test]
     fn widest_bootstrap_matches_real_request_storage_without_consuming_a_wave() -> Result<()> {
         for rows in [1, 64, 4096] {
-            let request = bootstrap_request(6, rows)?;
-            assert_eq!(request.header.layer_id, 6);
-            assert_eq!(request.header.row_count as usize, rows);
-            assert_eq!(request.rows.len(), rows);
-            assert_eq!(request.routes.len(), rows * TOPK);
-            assert_eq!(request.hidden_payload.len(), rows * KimiExpertInput::ROW_BYTES);
-            assert!(request.routes.iter().all(|route| route.expert_id == 0 && route.gate_weight == 0.));
+            let shape = bootstrap_shape(rows)?;
+            assert_eq!(shape.row_count as usize, rows);
+            assert_eq!(shape.route_count as usize, rows * TOPK);
+            assert_eq!(shape.hidden_payload_bytes as usize, rows * KimiExpertInput::ROW_BYTES);
         }
-        assert!(bootstrap_request(0, 4096).is_err());
-        assert!(bootstrap_request(1, 0).is_err());
-        assert!(bootstrap_request(1, 4097).is_err());
+        assert!(bootstrap_shape(0).is_err());
+        assert!(bootstrap_shape(4097).is_err());
         Ok(())
     }
 

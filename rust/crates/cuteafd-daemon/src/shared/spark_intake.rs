@@ -1458,14 +1458,14 @@ pub(crate) fn copy_parallel(dst: &mut [u8], src: &[u8]) {
 /// (decode) requests keep their own copy.
 const EGRESS_MIN_BYTES: usize = 1 << 20;
 
-fn registered_egress_bytes(request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<usize> {
+fn registered_egress_bytes(request: &cuteafd_transport::SparkSessionShape) -> Result<usize> {
     let mut geometry = cuteafd_core::expert_geometry();
-    geometry.hidden = request.header.hidden_dim;
-    ensure!(request.header.row_count > 0 && request.header.route_count % request.header.row_count == 0,
+    geometry.hidden = request.hidden_dim;
+    ensure!(request.row_count > 0 && request.route_count % request.row_count == 0,
         "egress bootstrap needs a uniform route geometry");
-    geometry.topk = request.header.route_count / request.header.row_count;
-    geometry.compact_wire_bytes(request.header.row_count,
-        request.header.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16)
+    geometry.topk = request.route_count / request.row_count;
+    geometry.compact_wire_bytes(request.row_count,
+        request.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16)
         .map(|wire| wire.0).context("registered egress geometry overflow")
 }
 
@@ -1511,7 +1511,7 @@ pub(crate) struct SparkLink<'a> {
     /// The bootstrap request without its (all-zero) hidden payload, and that
     /// payload's length: a reset re-opens the sessions with it before the
     /// exchange restarts, as bootstrap does.
-    bootstrap: Option<(cuteafd_transport::ExpertProtocolV2Request, usize)>,
+    bootstrap: Option<cuteafd_transport::SparkSessionShape>,
     timing: bool,
     world: cuteafd_transport::expert::SparkWorld,
     world_size: usize,
@@ -1675,16 +1675,16 @@ impl<'a> SparkLink<'a> {
     }
 
     fn validate_admitted_bootstrap(admitted: &cuteafd_loader::placement::PreparedSparkLink,
-        request: &cuteafd_transport::ExpertProtocolV2Request, staging: usize,
+        request: &cuteafd_transport::SparkSessionShape, staging: usize,
         egress_enabled: bool) -> Result<()> {
         let spec = admitted.geometry();
         let endpoint = spec.endpoints.endpoint;
         let bf16 = matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
-        ensure!(request.header.row_count == endpoint.capacity
-            && request.header.hidden_dim == spec.endpoints.geometry.hidden
-            && request.header.route_count.checked_div(request.header.row_count)
+        ensure!(request.row_count == endpoint.capacity
+            && request.hidden_dim == spec.endpoints.geometry.hidden
+            && request.route_count.checked_div(request.row_count)
                 == Some(spec.endpoints.geometry.topk)
-            && (request.header.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16) == bf16,
+            && (request.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16) == bf16,
             "Spark bootstrap differs from admitted request geometry");
         let expected = match spec.waves.staging {
             cuteafd_loader::placement::SparkWaveStaging::Registered { slot_bytes }
@@ -1713,10 +1713,10 @@ impl<'a> SparkLink<'a> {
     /// `request` must be the widest wave the family dispatches (the one its
     /// start-up warm-up sends): it sizes every rank's registered rings and
     /// each slot's wave staging.
-    pub(crate) fn bootstrap(&mut self, request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<()> {
-        let staging = crate::shared::experts::staging::RouteStaging::new(request.header.row_count as usize,
-            usize::try_from(request.header.route_count / request.header.row_count.max(1))?.max(1),
-            request.hidden_payload.len() / (request.header.row_count as usize).max(1))?.bytes;
+    pub(crate) fn bootstrap(&mut self, request: &cuteafd_transport::SparkSessionShape) -> Result<()> {
+        let staging = crate::shared::experts::staging::RouteStaging::new(request.row_count as usize,
+            usize::try_from(request.route_count / request.row_count.max(1))?.max(1),
+            request.hidden_payload_bytes as usize / (request.row_count as usize).max(1))?.bytes;
         if let Some(admitted) = &self.admitted {
             Self::validate_admitted_bootstrap(admitted, request, staging, self.egress_enabled)?;
         }
@@ -1734,8 +1734,7 @@ impl<'a> SparkLink<'a> {
         transport.bootstrap(request)?;
         self.egress_bytes = registered;
         self.staging_bytes = staging;
-        let shape = cuteafd_transport::ExpertProtocolV2Request { hidden_payload: bytes::Bytes::new(), ..request.clone() };
-        self.bootstrap = Some((shape, request.hidden_payload.len()));
+        self.bootstrap = Some(request.clone());
         self.start()
     }
 
@@ -1851,10 +1850,8 @@ impl<'a> SparkLink<'a> {
         intake.reset(transport)?;
         // Re-open every rank's session as bootstrap did: the exchange reads
         // which ranks land in device memory from the live sessions.
-        if let Some((shape, payload)) = &self.bootstrap {
-            let request = cuteafd_transport::ExpertProtocolV2Request {
-                hidden_payload: bytes::Bytes::from(vec![0; *payload]), ..shape.clone() };
-            transport.bootstrap(&request)?;
+        if let Some(shape) = &self.bootstrap {
+            transport.bootstrap(shape)?;
         }
         self.start()
     }
@@ -2050,7 +2047,7 @@ mod tests {
                         row_index: row, expert_id: expert, gate_weight: 0.0,
                     })).collect(), vec![0; (rows * hidden_bytes) as usize])?;
                 let expected = geometry.compact_wire_bytes(rows, dtype == ExpertV2Dtype::Bf16).unwrap().0;
-                assert_eq!(registered_egress_bytes(&request)?, expected);
+                assert_eq!(registered_egress_bytes(&cuteafd_transport::SparkSessionShape::from_request(&request)?)?, expected);
                 assert_eq!(request.encode()?.len(), expected);
                 for ranks in [1, 4, 6, 8] {
                     let ingress = if dtype == ExpertV2Dtype::Bf16 { cuteafd_core::SparkIngress::Bf16 }
@@ -2064,15 +2061,15 @@ mod tests {
                     let staging = crate::shared::experts::staging::RouteStaging::new(rows as usize,
                         geometry.topk as usize, hidden_bytes as usize)?.bytes;
                     for link in links {
-                        SparkLink::validate_admitted_bootstrap(&link, &request, staging, true)?;
+                        SparkLink::validate_admitted_bootstrap(&link, &cuteafd_transport::SparkSessionShape::from_request(&request)?, staging, true)?;
                         assert_eq!(link.geometry().intake.ranks, ranks);
                         let mut narrow = request.clone();
                         narrow.header.row_count -= 1;
-                        assert!(SparkLink::validate_admitted_bootstrap(&link, &narrow, staging, true).is_err());
+                        assert!(SparkLink::validate_admitted_bootstrap(&link, &cuteafd_transport::SparkSessionShape::from_request(&narrow)?, staging, true).is_err());
                         let mut wrong_wire = request.clone();
                         wrong_wire.header.hidden_dtype = if dtype == ExpertV2Dtype::Bf16 {
                             ExpertV2Dtype::Fp8E4m3Ue8m0K32 } else { ExpertV2Dtype::Bf16 };
-                        assert!(SparkLink::validate_admitted_bootstrap(&link, &wrong_wire, staging, true).is_err());
+                        assert!(SparkLink::validate_admitted_bootstrap(&link, &cuteafd_transport::SparkSessionShape::from_request(&wrong_wire)?, staging, true).is_err());
                     }
                 }
             }
