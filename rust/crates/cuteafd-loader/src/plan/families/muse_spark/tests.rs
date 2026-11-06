@@ -15,7 +15,7 @@ fn all_layers() -> Vec<usize> { (0..62).collect() }
 /// The min card's declared serving context (examples/configs/muse-spark-exl3-min.config):
 /// one RTX PRO 6000 cannot hold the checkpoint's compiled 1M pool together
 /// with DFlash2 and the onboarding needed to keep both bundled towers on Sparks.
-const MIN_CARD_CONTEXT: u64 = 636_864;
+const MIN_CARD_CONTEXT: u64 = 634_304;
 
 fn with_layout(rtx: usize, ranks: usize) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
@@ -375,6 +375,13 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
     assert!(load.owned > 0 && load.opaque >= 4 << 30, "both estimated dense ranks are Load owners");
     let ready = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Ready).unwrap();
     assert_eq!(ready.owned + ready.opaque, host.deferred_bytes + host.host_budget_bytes);
+    assert_eq!(ready.opaque, 1536 << 20, "census-rounded ordinary host allowance");
+    for gpu in 0..2 {
+        let id = format!("rtx{gpu}");
+        for row in ledger.phases.iter().filter(|row| row.budget == id) {
+            assert_eq!(row.opaque, 160 << 20, "estimated first-use GPU growth at every phase");
+        }
+    }
     options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
     let direct = input.plan(&options).unwrap();
     let counted = input.plan_spark_count(&options, 6, Some(6)).unwrap();
@@ -713,8 +720,8 @@ fn host_transport_uses_resolved_small_and_large_card_slots_only() {
     for (bytes, slots) in [(32 << 30, 8), (crate::placement::inventory::PRO_TOTAL_BYTES, 16)] {
         let mut options = with_layout(1, 6);
         options.layout.as_mut().unwrap().rtx_bytes = vec![bytes];
-        options.layout.as_mut().unwrap().context_tokens = 4096;
-        options.layout.as_mut().unwrap().pool_tokens = Some(4096);
+        options.layout.as_mut().unwrap().context_tokens = 1024;
+        options.layout.as_mut().unwrap().pool_tokens = Some(1024);
         let report = input.plan(&options).unwrap();
         let opts = options.layout.as_ref().unwrap();
         assert_eq!(opts.resolved_state_slots("muse_spark"), slots);

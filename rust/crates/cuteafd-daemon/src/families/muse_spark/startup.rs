@@ -240,7 +240,7 @@ mod tests {
         let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
         let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         let mut refused = 0;
-        let mut clamped = 0;
+        let mut reduced_pools = 0;
         for (gpus, sparks, full_prefill_logits) in [(2, 6, false), (2, 4, false), (1, 6, false),
             (1, 4, true), (2, 6, true)] {
             // A complete image: the program manifest with the coordinator EXL3 package beside it.
@@ -248,11 +248,12 @@ mod tests {
             let path = testing::write_muse_exl3_capacities(&image);
             std::fs::write(&path, serde_json::to_vec(&manifest(gpus))?)?;
             let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
-            let opts = LayoutOptions { context_tokens: 786432, host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
+            let opts = LayoutOptions { context_tokens: 634304, host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
                 head_split: gpus == 2, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
                 full_prefill_logits,
                 ..Default::default() };
-            let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
+            let vision = cuteafd_loader::plan::MediaMode::Spark(None);
+            let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks), vision,
                 layout: Some(opts.clone()), ..Default::default() })?;
             let planned = report.solver_placement.clone()
                 .unwrap_or_else(|| panic!("{gpus} RTX + {sparks}: {:?}", report.hints));
@@ -280,7 +281,7 @@ mod tests {
                 partial_reply_formats: Default::default(),
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
-                    cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?) })?.placement;
+                    vision, cuteafd_loader::plan::MediaMode::Off, 1)?) })?.placement;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks, scoring {full_prefill_logits}");
             for gpu in 0..gpus {
                 let output = live.items[gpu].iter().find(|item| item.group == "Muse prefill logits");
@@ -292,10 +293,11 @@ mod tests {
             }
             let encoder = report.encoder.as_ref().context("vision placement")?;
             assert_eq!(encoder.admitted_bytes(), 4_860_356_960, "native vision ledger");
-            assert_eq!(encoder.shortfall, 0, "admitted Auto media has no diagnostic shortfall");
+            assert_eq!(encoder.shortfall, 0, "explicit Spark media remains admitted");
+            assert!(live.pool_tokens >= opts.context_tokens);
             if live.pool_tokens < cfg.max_position as u64 {
-                clamped += 1;
-                assert_eq!(gpus, 1, "the single-RTX cases exercise automatic context clamping");
+                reduced_pools += 1;
+                assert_eq!(gpus, 1, "single-RTX cases retain media with a smaller pool");
             }
             let layout = report.memory_layout.as_ref().context("vision layout")?;
             let native: u64 = layout.devices.iter().flat_map(|device| &device.items)
@@ -324,14 +326,14 @@ mod tests {
                     partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                     partial_reply_formats: Default::default(), local, drafter: None,
                     media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
-                        cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?)
+                        vision, cuteafd_loader::plan::MediaMode::Off, 1)?)
                 }).err().expect("missing package refuses").to_string();
                 assert!(error.contains("rebuild with the Muse coordinator scope"), "{error}");
                 refused += 1;
             }
         }
         assert!(refused > 0, "no layout onboarded, so the missing-package refusal went unexercised");
-        assert!(clamped > 0, "Auto context clamp must survive the media diagnostic baseline");
+        assert!(reduced_pools > 0, "no reduced-pool media case was exercised");
         Ok(())
     }
 

@@ -1506,7 +1506,10 @@ def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
     assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6'
     assert values['MODEL_REVISION'] == '89998fb177acd9a862ac8bd4fb79bfd50e940c97'
     assert values['SPECULATOR'] == 'dflash2' and values['POOL_TOKENS'] == 'auto'
-    assert values['VISION'] == values['AUDIO'] == 'auto'
+    assert values['VISION'] == values['AUDIO'] == ('spark' if size == 'min' else 'auto')
+    if size == 'min':
+        context = int(values['MAX_CONTEXT_TOKENS'])
+        assert context > 262144 and context % 64 == 0
     for rank, host in enumerate(hosts):
         assert values[f'SPARK_{rank}_HOST'] == host
         assert values[f'SPARK_{rank}_LANE_A'] == f'10.55.0.{rank + 1}'

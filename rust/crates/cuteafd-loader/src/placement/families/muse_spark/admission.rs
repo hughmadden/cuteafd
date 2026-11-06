@@ -106,18 +106,22 @@ pub struct HostAdmission {
     pub media_bytes: u64,
 }
 
-/// Explicit estimate until the first Muse host census (#1326), not a GLM
-/// measurement: ordinary scheduler, tokenizer, RPC metadata and allocator state.
+/// Conservative estimate rounded above the complete 1,233,498,112-byte ordinary
+/// RSS census; not an exact residual calibration of allocator/metadata state.
 pub const HOST_RUNTIME: crate::placement::inventory::MemoryFigure = crate::placement::inventory::MemoryFigure {
-    bytes: 512 << 20,
+    bytes: 1536 << 20,
     attribution: crate::placement::inventory::FigureAttribution::Estimated {
-        derivation: "512 MiB ordinary process state pending the first Muse host census (#1326)" },
-    evidence: "Muse host owner inventory; unmeasured residual (#1326)",
-    producing_commit: "planner-muse_spark-close",
+        derivation: "1.5 GiB ordinary state; 2026-11-06 Muse min scheduler-ready RSS 1233498112 B rounded up (#1326)" },
+    evidence: "planner-muse-close-build media smoke; complete ordinary RSS census (#1326)",
+    producing_commit: "c6d6fd47efa3daeac460772673f9826e20a32944",
     identity: crate::placement::inventory::FigureIdentity { declared_graphs: "Muse serving",
         programs_sha256: "unmeasured", native_sha256: "unmeasured", toolchain: "unmeasured",
         gpu_class: "sm120", driver: "unmeasured", layout: "Muse host ordinary residual" },
 };
+
+/// First-use CUDA/module/allocator growth beyond declared owners and context.
+/// Estimated per GPU from the single-RTX smoke, not an exact allocation census.
+pub const GPU_RUNTIME: u64 = 160 << 20;
 
 impl HostInput {
     pub fn budget(self) -> Budget {
@@ -388,6 +392,11 @@ impl<'a> ProductionInput<'a> {
                 lifetime: Lifetime::RESIDENT, source: HOST_RUNTIME.evidence.into(), assumed: true }) });
         for gpu in 0..gpus {
             let location = Location::coordinator(gpu as u8);
+            components.push(Component { activation: Activation::always(),
+                bytes: ByteCurve::fixed(GPU_RUNTIME, maximum_pages),
+                kind: ComponentKind::Allowance(Allowance { location, bytes: GPU_RUNTIME,
+                    lifetime: Lifetime::RESIDENT, assumed: true,
+                    source: "Muse estimated first-use CUDA/module/allocator growth: 160 MiB above 148052028 B smoke residual (#1326)".into() }) });
             let layer = layouts.iter().try_fold(0u64, |sum, ranks| {
                 sum.checked_add(ranks[gpu].bytes()? as u64).context("Muse layer bytes overflow")
             }).map_err(anyhow_refusal)?;
