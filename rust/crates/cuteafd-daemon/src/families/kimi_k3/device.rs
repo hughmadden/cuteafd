@@ -1289,7 +1289,7 @@ impl<'a> LocalLane<'a> {
 
     /// Route and quantize on this device; normal RouteStaging/SparkLane reads
     /// these admitted outputs. No CPU Vec<Routes> enters the operator hot path.
-    pub(crate) fn route(&mut self, layer: usize, rows: usize) -> Result<(cuteafd_ffi::KimiRoutes, CuteafdDeviceBuffer)> {
+    pub(crate) fn route(&mut self, layer: usize, rows: usize, tally: Option<cuteafd_ffi::expert_usage::RouteTally<'_>>) -> Result<(cuteafd_ffi::KimiRoutes, CuteafdDeviceBuffer)> {
         let weights = self.layer(layer)?;
         ensure!(self.programs.w8.cfg.dense.get(layer) == Some(&false), "Kimi dense layer has no routes");
         let input = self.plane("normalized", rows, 7168)?;
@@ -1302,6 +1302,9 @@ impl<'a> LocalLane<'a> {
         let bias = weights.buffer("router.bias")?;
         self.lane.stream.device.run(|| {
             self.programs.router.launch(rows, input, router, bias, logits, routes, self.lane.stream.raw)?;
+            // SAFETY: the canonical router just produced exactly rows complete top-k IDs
+            // on this stream; routed selection is never part of a cached Kimi graph.
+            unsafe { record_kimi_routes(tally, routes.ids.ptr, rows, self.lane.stream.raw)?; }
             if weights.is_core("latent.down") {
                 let programs=self.programs.core.as_ref().context("K6 latent programs not resolved")?;
                 let scratch=self.lane.core.as_ref().context("K6 latent scratch not admitted")?;
@@ -2740,5 +2743,141 @@ mod tests {
         assert!(error.contains("Kimi K3 norm") && error.contains("#273"), "{error}");
         let error = Pending.kda(0, &plane).unwrap_err().to_string();
         assert!(error.contains("W6"), "{error}");
+    }
+}
+
+/// # Safety
+/// `ids` contains exactly `rows * topk` canonical selections on `stream`.
+unsafe fn record_kimi_routes(tally: Option<cuteafd_ffi::expert_usage::RouteTally<'_>>,
+    ids: *const std::ffi::c_void, rows: usize, stream: *mut std::ffi::c_void) -> Result<()> {
+    if let Some(tally) = tally {
+        // SAFETY: the caller owns real, unpadded router rows until this stream completes.
+        unsafe { tally.record(ids, rows, None, u32::MAX, true, stream)?; }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod expert_usage_tests {
+    use super::*;
+    use cuteafd_ffi::expert_usage::{ExpertUsage, UsageDevice, UsagePhase};
+    use cuteafd_core::expert_usage::{Geometry, Reader};
+    use std::ffi::c_void;
+
+    #[test]
+    fn disabled_usage_never_touches_cuda_or_invalid_route_operands() -> Result<()> {
+        let captures = cuteafd_ffi::graph_captures();
+        // SAFETY: the absent tally returns before any device, pointer or stream access.
+        unsafe { record_kimi_routes(None, std::ptr::null(), usize::MAX, std::ptr::null_mut())?; }
+        assert_eq!(cuteafd_ffi::graph_captures(), captures);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA GPUs and matching CUTEAFD_NATIVE_LIB"]
+    fn kimi_expert_usage_known_routes_packed_verify_phase_replay_and_warmup() -> Result<()> {
+        struct Fixture<'a> {
+            library: &'a cuteafd_ffi::NativeLibrary, device: i32, stream: *mut c_void,
+            graph: *mut c_void, buffers: Vec<CuteafdDeviceBuffer>,
+        }
+        impl Fixture<'_> {
+            fn upload(&mut self, words: &[u32]) -> Result<CuteafdDeviceBuffer> {
+                let bytes = words.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
+                let buffer = self.library.alloc_device_buffer(bytes.len())?;
+                self.buffers.push(buffer);
+                self.library.copy_h2d(buffer, &bytes)?;
+                Ok(buffer)
+            }
+        }
+        impl Drop for Fixture<'_> {
+            fn drop(&mut self) {
+                let _ = self.library.cuda_set_device(self.device);
+                // SAFETY: private fixture owners remain live until their stream drains.
+                unsafe {
+                    if self.library.cuda_stream_synchronize(self.stream).is_err() { std::process::abort(); }
+                    if !self.graph.is_null() { let _ = self.library.cuda_graph_exec_destroy(self.graph); }
+                    for buffer in &mut self.buffers { let _ = self.library.free_device_buffer(buffer); }
+                    let _ = self.library.cuda_stream_destroy(self.stream);
+                }
+            }
+        }
+        // SAFETY: retain the matching native library through fixture and telemetry teardown.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let reader = Reader::default();
+        reader.configure(true, false).map_err(anyhow::Error::msg)?;
+        let geometry = Geometry { layers: 3, experts: 896, topk: 16, routed_layers: vec![1, 2] };
+        let usage = ExpertUsage::new(&library, geometry.clone(),
+            &[UsageDevice { logical: 0, cuda: 0 }, UsageDevice { logical: 1, cuda: 1 }], reader.clone())?;
+        for rank in 0..2 {
+            for suffix in ["counters", "snapshot", "pinned"] {
+                let name = cuteafd_core::expert_usage::device_owner(rank, suffix);
+                let owners = cuteafd_ffi::memory_ledger::allocations().into_iter()
+                    .filter(|owner| owner.key.owner == Some(name.as_str())).collect::<Vec<_>>();
+                ensure!(owners.len() == 1 && owners[0].bytes == geometry.table_bytes().unwrap(),
+                    "Kimi native allocation differs from Recipe owner {name}");
+            }
+        }
+        // Each device is a canonical producer on a different routed-layer ordinal.
+        for device in 0..2 {
+            library.cuda_set_device(device)?;
+            let layer = device as usize + 1;
+            let mut fixture = Fixture { library: &library, device, stream: library.cuda_stream_create()?,
+                graph: std::ptr::null_mut(), buffers: vec![] };
+            let logits = (0..4).flat_map(|row| (0..896).map(move |expert| {
+                let selected = if row == 3 { expert >= 880 } else { (row * 16..row * 16 + 16).contains(&expert) };
+                if selected { 4.0f32.to_bits() } else { (-4.0f32).to_bits() }
+            })).collect::<Vec<_>>();
+            let logits = fixture.upload(&logits)?;
+            let bias = fixture.upload(&[0; 896])?;
+            let ids = fixture.upload(&[0; 64])?;
+            let weights = fixture.upload(&[0; 64])?;
+            let route = || {
+                // SAFETY: four full E896/K16 router rows, live on this fixture's GPU/stream.
+                unsafe { library.router_select(logits.ptr, bias.ptr, std::ptr::null(), std::ptr::null(),
+                    ids.ptr, weights.ptr, 4, 896, 16, 1.0, true, fixture.stream) }
+            };
+            // Kimi's cached graphs exclude routing/tally. Warm and capture replays count nothing.
+            route()?;
+            // SAFETY: all graph operands outlive this private stream and executable.
+            unsafe {
+                library.cuda_graph_begin_capture(fixture.stream)?;
+                route()?;
+                fixture.graph = library.cuda_graph_end_capture(fixture.stream)?;
+                library.cuda_graph_launch(fixture.graph, fixture.stream)?;
+            }
+            let captures = cuteafd_ffi::graph_captures();
+            // Two packed members contain 2+1 real rows; the fourth router row is padding.
+            // SAFETY: both member views are canonical full top-k rows on this stream.
+            unsafe {
+                record_kimi_routes(Some(usage.routes(device, layer, UsagePhase::Prefill)?), ids.ptr, 2, fixture.stream)?;
+                record_kimi_routes(Some(usage.routes(device, layer, UsagePhase::Prefill)?),
+                    ids.ptr.cast::<u32>().add(32).cast(), 1, fixture.stream)?;
+            }
+            for _ in 0..3 {
+                // Reuse the same executable after switching phase; include rejected verify rows.
+                // SAFETY: graph IDs, counters, and stream remain live until the join.
+                unsafe {
+                    library.cuda_graph_launch(fixture.graph, fixture.stream)?;
+                    record_kimi_routes(Some(usage.routes(device, layer, UsagePhase::Decode)?), ids.ptr, 3, fixture.stream)?;
+                }
+            }
+            // SAFETY: this fixture owns and drains its private stream.
+            unsafe { library.cuda_stream_synchronize(fixture.stream)?; }
+            ensure!(captures == cuteafd_ffi::graph_captures(), "phase switch recaptured a graph");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let value = reader.snapshot();
+        ensure!(value["error"].is_null(), "snapshot failed: {value}");
+        let total = &value["windows"]["total"];
+        for (phase, multiplicity) in [("prefill_routed_rows", 1), ("decode_routed_rows", 3)] {
+            let actual = total[phase].as_array().context("usage total array missing")?;
+            let expected = (0..3 * 896).map(|cell| {
+                if cell / 896 > 0 && cell % 896 < 48 { multiplicity } else { 0 }
+            }).collect::<Vec<u64>>();
+            ensure!(*actual == expected.iter().map(|n| serde_json::json!(n)).collect::<Vec<_>>(),
+                "canonical producers/packed/padding/warm-up/verify phase mismatch: {value}");
+            ensure!(expected.iter().sum::<u64>() == 2 * 3 * 16 * multiplicity, "rows x top-k mismatch");
+        }
+        Ok(())
     }
 }

@@ -9,6 +9,7 @@ use crate::native_library_lifetime_fixture::Fixture;
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn rdma_ring_ledger_uses_native_backing_and_retires_only_after_destroy() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
     use memory_ledger::{AllocationAudit, AllocationEvent, Space};
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
@@ -111,6 +112,7 @@ fn cached_k6_wire_owners_match_diagnostic_rounding() -> Result<()> {
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn staging_census_getters_preserve_absence_backing_and_native_history() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     let mut dst = library.alloc_device_buffer(32)?;
@@ -148,6 +150,7 @@ fn staging_census_getters_preserve_absence_backing_and_native_history() -> Resul
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     let mut a = library.alloc_device_buffer(4)?;
@@ -176,6 +179,7 @@ fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_sizes_staging_once_and_refuses_growth() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
     // Pinned staging is created once per destination at the destination's whole
     // extent. A later upload never frees/reallocates it: cudaFreeHost would
     // synchronize the device while a peer wait may be queued (slot reuse).
@@ -221,6 +225,7 @@ fn ordered_upload_sizes_staging_once_and_refuses_growth() -> Result<()> {
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_failed_fence_retains_sources_and_module() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     let a = library.alloc_device_buffer(4)?;
@@ -240,6 +245,7 @@ fn ordered_upload_failed_fence_retains_sources_and_module() -> Result<()> {
 #[test]
 #[ignore = "CPU-only budget fixture; requires an explicit NVMe fixture directory"]
 fn coordinator_budget_refuses_before_allocating_and_checks_untracked_graphs() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
     // The process-wide ceiling is immutable; isolate this test from the other
     // unit tests rather than changing production configuration back and forth.
     if std::env::var_os("CUTEAFD_BUDGET_FIXTURE_CHILD").is_none() {
@@ -296,6 +302,7 @@ fn coordinator_budget_refuses_before_allocating_and_checks_untracked_graphs() ->
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn normal_drop_frees_pinned_staging_before_unloading_module() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     library
@@ -317,6 +324,7 @@ fn normal_drop_frees_pinned_staging_before_unloading_module() -> Result<()> {
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn failed_drain_marker_retains_module_and_pinned_staging() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     library

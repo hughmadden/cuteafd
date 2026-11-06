@@ -12,6 +12,8 @@ use std::{net::SocketAddr, path::Path, rc::Rc, sync::Arc};
 const HIDDEN: usize = 7168;
 
 pub(crate) struct Options<'a, const RANKS: usize = 2> {
+    pub expert_usage: bool,
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     pub cache_format: cuteafd_core::MlaCacheFormat,
     pub devices: [i32; RANKS],
     pub attention: Option<cuteafd_loader::placement::AttentionPlacement>,
@@ -180,7 +182,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         GpuBudget { capacity_bytes: sample.total_bytes, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
-    let mut admitted = admission::admit(admission::Inputs { cfg, core,
+    let mut admitted = admission::admit(admission::Inputs { expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
@@ -230,7 +232,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
         super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout)).transpose()?;
     let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
-    let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, checkpoint, native, context_programs, peer, hops,
+    let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?;
     if let Some(set) = graph_set {
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;

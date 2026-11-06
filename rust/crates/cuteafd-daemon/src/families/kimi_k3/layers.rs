@@ -31,6 +31,8 @@ type DraftProbe<'a> = RefCell<Option<crate::shared::memory::device::DeviceOwner<
     crate::shared::draft::probe::RoundProbe<'a>>>>;
 
 pub(crate) struct Execution<'a> {
+    pub expert_usage: Option<Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>,
+    pub usage_phase: Cell<cuteafd_ffi::expert_usage::UsagePhase>,
     pub plan: LayerExecutionPlan,
     lanes: Vec<LaneJoins<'a>>,
     entry_lane: Cell<Option<usize>>,
@@ -94,7 +96,7 @@ impl<'a> Execution<'a> {
             let narrow = streams[0].device.run(|| streams[0].device.library.f32_bf16_narrow())?;
             Ok(LaneJoins { streams, produced, landed, reducer, narrow })
         }).collect::<Result<_>>()?;
-        Ok(Self { plan, lanes, entry_lane: Cell::new(None), state_ready, state_pending })
+        Ok(Self { expert_usage: None, usage_phase: Cell::new(cuteafd_ffi::expert_usage::UsagePhase::Prefill), plan, lanes, entry_lane: Cell::new(None), state_ready, state_pending })
     }
 
     /// The family has no second scheduler: use the shared layer-major pipeline
@@ -560,6 +562,7 @@ mod tests {
 /// The shared pipeline owns layer/lane ordering; this binding supplies only
 /// arithmetic and the exact payload at each planned boundary.
 pub(crate) struct Bindings<'e, 'a, 's> {
+    execution: &'e Execution<'a>,
     scope: &'e SubmissionScope<'s>,
     local: &'e mut [LocalLane<'a>],
     routed: &'e mut RoutedLane<'a>,
@@ -626,7 +629,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
             for rank in 0..local.len() { peer.recv(rank, lane)?; }
             ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
         }
-        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, packed: None })
+        Ok(Self { execution, scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, packed: None })
     }
 
     fn begin_local_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
@@ -635,7 +638,9 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         let dense = self.local[0].config().dense[layer];
         let rtx = !dense && self.experts[0].as_ref().is_some_and(|expert| expert.layers().contains(&layer));
         let spark = if dense { None } else {
-            let (routes, wire) = self.local[0].route(layer, self.rows)?;
+            let tally = self.execution.expert_usage.as_ref().map(|usage|
+                usage.routes(self.local[0].stream().device.id, layer, self.execution.usage_phase.get())).transpose()?;
+            let (routes, wire) = self.local[0].route(layer, self.rows, tally)?;
             self.with_probe(|probe| {
                 if probe.wants_ring(false) {
                     let stream = self.local[0].stream();
@@ -941,7 +946,9 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
             None
         } else {
-            let (canonical, wire) = self.local[owner].route(layer, self.rows)?;
+            let tally = self.execution.expert_usage.as_ref().map(|usage|
+                usage.routes(self.local[owner].stream().device.id, layer, self.execution.usage_phase.get())).transpose()?;
+            let (canonical, wire) = self.local[owner].route(layer, self.rows, tally)?;
             if rtx || owner == 0 {
                 self.transfer_planes(owner, &[("route ids", canonical.ids.bytes),
                     ("route weights", canonical.weights.bytes), ("expert wire", wire.bytes)])?;
