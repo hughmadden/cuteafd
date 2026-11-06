@@ -149,28 +149,27 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
-        exchange_f32: case.exchange_f32 };
+        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
     let facts = admission::inputs(&cli.engine, &inputs)?;
-    let placement = admission::admit(&facts, None)?;
+    let (placement, _) = admission::admit(&facts)?;
     assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
         "V4 final residual must live on the rank0 head, not on both ranks");
     assert!(placement.hops.iter().all(|hop| hop.row_bytes == 4 * cfg.dim as u64 * 2),
         "V4 hop plan: every point carries the admitted row geometry");
     if check_upload {
+        // The loaded-mode rebase is the inverse of the uploads it credits back.
         let modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
             &cfg, case.rtx, case.dspark, catalog.tensors().iter().map(|t| &t.metadata))?;
         let loaded = weights.loaded_bytes(&modes, case.rtx)?;
-        let measured = inputs.gpus.iter().zip(loaded).map(|(&(total, baseline), bytes)| {
+        let measured = inputs.gpus.iter().zip(&loaded).map(|(&(total, baseline), &bytes)| {
             let Baseline::Measured { free_bytes } = baseline else { unreachable!() };
             Ok((total, Baseline::Measured { free_bytes: free_bytes.checked_sub(bytes)
                 .ok_or_else(|| anyhow::anyhow!("fixture weight uploads exceed free memory"))? }))
         }).collect::<anyhow::Result<Vec<_>>>()?;
         let after = admission::Inputs { gpus: measured, loaded_modes: Some(&modes), ..inputs };
-        let measured_facts = admission::inputs(&cli.engine, &after)?;
-        let checked = admission::admit(&measured_facts,
-            Some((placement.pool_tokens, placement.onboard_layers as u64)))?;
-        assert_eq!(checked, placement, "pre-upload/measured admission differs");
+        let rebased = admission::inputs(&cli.engine, &after)?;
+        assert_eq!(rebased.gpus, facts.gpus, "loaded weights rebase to the pre-upload sample");
     }
     Ok(placement)
 }
@@ -865,9 +864,9 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
-        exchange_f32: case.exchange_f32 };
+        exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
     let facts = admission::inputs(&cli.engine, &inputs)?;
-    Ok(admission::admit(&facts, None)?)
+    Ok(admission::admit(&facts)?.0)
 }
 
 /// P2's two-RTX fixture predates TP2 and its deleted GPU0-only routed layout.

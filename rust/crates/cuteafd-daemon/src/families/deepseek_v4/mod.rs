@@ -471,6 +471,11 @@ pub(crate) fn with_engine<T>(
                     .saturating_sub(if rank == 0 { embedding_bytes } else { 0 }) }))
             })
         }).collect::<Result<Vec<_>>>()?;
+        // Physical capacity apart from the logical `--coordinator-gpu-budget-gib` ceiling.
+        let physical = devices.iter().map(|&device| crate::shared::peer_split::on_device(&loaded.library, device,
+            || Ok(loaded.library.cuda_allocatable_memory_info()?.1 as u64))).collect::<Result<Vec<_>>>()?;
+        inventory.record(loaded.family, &gpus.iter().map(|(_, b)| match b {
+            Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
         let cache_stages = if args.dspark && loaded.cfg.dspark_block_size > 0
             && loaded.catalog.tensor("mtp.0.main_proj.weight").is_ok() { 3 } else { 0 };
         let onboard = args.onboard(loaded.catalog.routed_experts().routed_layers());
@@ -506,9 +511,11 @@ pub(crate) fn with_engine<T>(
         let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
             family: loaded.family, gpus, loaded_modes: None, cache_stages,
             prefill_rows, decode_rows, max_context, prefix,
-            expert_workspace, tp2_workspace, exchange_f32 };
+            expert_workspace, tp2_workspace, exchange_f32, physical,
+            host_memory: cuteafd_loader::formats::mapped_preload::host_memory()? };
         let facts = admission::inputs(args, &inputs)?;
-        let placement = admission::admit(&facts, None)
+        // One solve over every device and host owner, before the first allocation.
+        let (placement, host_prefix) = admission::admit(&facts)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
         if !skip {
@@ -567,30 +574,6 @@ pub(crate) fn with_engine<T>(
         crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-dense-push", Default::default())?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
 
-        // Measured cross-check uses the same frozen owner map and explicitly
-        // admits the selected pool/expert count. Allocation slack may not
-        // silently relocate a loaded layer or shrink the promised pool.
-        let measured_gpus = devices.iter().enumerate().map(|(rank, &device)| {
-            let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
-                loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
-                &cuteafd_loader::placement::ProgramSet::from_manifest(&loaded.manifest,
-                    &[loaded.family, &format!("{}2", loaded.family)]))?;
-            crate::shared::peer_split::on_device(&loaded.library, device, || {
-                let (free, total) = loaded.library.cuda_memory_info()?;
-                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
-            })
-        }).collect::<Result<Vec<_>>>()?;
-        inventory.record(loaded.family, &measured_gpus.iter().map(|(_, b)| match b {
-            Baseline::Measured { free_bytes } => *free_bytes, Baseline::Planned { .. } => 0 }).collect::<Vec<_>>());
-        let measured_inputs = admission::Inputs { gpus: measured_gpus, loaded_modes: Some(&loaded_modes), ..inputs };
-        let measured_facts = admission::inputs(args, &measured_inputs)?;
-        let checked = admission::admit(&measured_facts,
-            Some((placement.pool_tokens, placement.onboard_layers as u64)))
-            .map_err(|error| anyhow::anyhow!("DeepSeek V4 measured frozen admission: {error}"))?;
-        ensure!(checked.layers == placement.layers && checked.pool_tokens == placement.pool_tokens
-            && checked.movables == placement.movables && checked.tp2 == placement.tp2
-            && checked.expert_ranges == placement.expert_ranges,
-            "DeepSeek V4 measured admission disagrees with frozen pre-load placement");
         tracing::info!(pool_tokens = placement.pool_tokens, onboard = %onboard, onboard_layers = placement.onboard_layers,
             local_per_gpu = ?placement.expert_ranges, "DeepSeek V4 placement: {}", placement.summary());
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
@@ -599,9 +582,9 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
         cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
-        (placement, embedding, model, shares)
+        (placement, host_prefix, embedding, model, shares)
     };
-    let (placement, embedding, model, mut shares) = placement;
+    let (placement, host_prefix, embedding, model, mut shares) = placement;
     let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
         Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
             loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)
@@ -646,9 +629,9 @@ pub(crate) fn with_engine<T>(
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
         }
         crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-kv-pool", Default::default())?;
-        // Freeze the prefix quota and admit it together with every future table before
-        // attach_context or workspace preparation can reserve ordered-upload staging.
-        let host_config = admission::host_memory(&engine, args, prefix, context_extent)?;
+        // The host prefix quota and every pinned table were admitted with the placement.
+        let host_config = admission::host_config(prefix, prefix::Dsv4Prefix::layout_of(&engine)?,
+            engine.max_context, engine.shape.sequences, host_prefix)?;
         let held = held(&engine)?;
         let _ = held; // Prefix bytes were reserved before placement.
         let started = Instant::now();

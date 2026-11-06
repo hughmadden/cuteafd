@@ -416,6 +416,9 @@ impl FamilyModel for DeepSeekModel {
         &self.spec
     }
 
+    /// V4's contract declares its own device and host owners and one prefill shape.
+    fn contract_admission(&self) -> bool { self.id == "deepseek_v4" }
+
     /// V4.1's Engram pipeline preloads both layers' tables.
     fn mapped_table_preload(&self) -> bool {
         self.id == "deepseek_v41"

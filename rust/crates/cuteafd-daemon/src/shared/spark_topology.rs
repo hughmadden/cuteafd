@@ -326,6 +326,14 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                 }
                 let ledger = report.phase_ledger.as_ref().expect("joint physical ledger");
                 assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
+            } else if matches!(family, "dsv4f" | "dsv4p") {
+                // V4's contract owns its host tier: the eight ranks' pinned link
+                // storage is a host-budget owner in the one solved ledger.
+                let ledger = report.phase_ledger.as_ref().expect("V4 joint physical ledger");
+                assert!(report.host_ledger.is_none(), "{key}: no generic host ledger beside the contract");
+                assert!(ledger.budgets.iter().any(|budget| budget.id == "coordinator host RAM"), "{key}");
+                assert!(ledger.phases.iter().any(|row| row.budget == "coordinator host RAM" && row.owned > 0), "{key}");
+                assert!(ledger.phases.iter().all(|phase| phase.owned + phase.opaque <= phase.available));
             } else if family != "kimik3" {
                 let host = report.host_ledger.as_ref().expect("full host intake ledger");
                 let (group, expected) = if matches!(family, "mimo" | "mimof" | "mimop") {

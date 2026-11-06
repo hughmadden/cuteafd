@@ -106,7 +106,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let prepared = v4::prepare(&inputs)?;
         let reserves = prepared.reserves().to_vec();
         let request = v4::production_request(&inputs);
-        let mut placement = prepared.admit(request.clone())?.placement;
+        let prefix = prepared.prefix();
+        let admitted = prepared.admit(request.clone())?;
+        let mut solved = admitted.solved;
+        let mut placement = admitted.placement;
         if report.encoder.is_none() {
             // A mandatory encoder displaces an optional expert prefix, not the pool:
             // price it against only compulsory experts, then resolve the tower.
@@ -138,15 +141,20 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 // Mandatory media displaces optional experts, never the admitted pool.
                 let mut tower_request = request.clone();
                 tower_request.pool = Pin::Exact(placement.pool_tokens);
-                placement = v4::prepare(&with_tower)?.admit(tower_request)?.placement;
+                let admitted = v4::prepare(&with_tower)?.admit(tower_request)?;
+                solved = admitted.solved;
+                placement = admitted.placement;
             }
         }
         startup.add_experts(input.expert_catalog()?, shape.native_layers, &placement)?;
-        Ok((placement, reserves, startup.notes()?))
+        Ok((placement, reserves, startup.notes()?, solved, prefix))
     })();
     match admitted {
-        Ok((placement, reserves, startup_notes)) => {
+        Ok((placement, reserves, startup_notes, solved, prefix)) => {
             notes.extend(startup_notes);
+            report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&solved));
+            report.host_budget_bytes = prefix.owners.quota_bytes;
+            notes.extend(prefix.notes(shape.context_tokens, shape.concurrency));
             report.solver_placement = Some(placement.clone());
             for (device, reserve) in devices.iter_mut().zip(&reserves) {
                 device.capacity_bytes = options.rtx_bytes[device.index as usize].saturating_sub(*reserve);
@@ -245,6 +253,7 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
     let expert_workspace = if catalog.exl3().is_some() { exl3_workspace.unwrap_or(160 * MIB * shape.prefill_rows / 4096) }
         else { crate::serving_capacity::deepseek_v4_native_workspace(routed.hidden as u64, routed.intermediate as u64,
             routed.experts as u64, routed.topk as u64, shape.prefill_rows.max(shape.decode_rows))? };
+    let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
     let gpus = devices.iter().zip(&options.rtx_bytes).map(|(device, &total)|
         (total, Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect();
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
@@ -291,7 +300,16 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
         full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len()),
         context,
-        attention: report.requested_attention, extra: Vec::new() };
+        attention: report.requested_attention, extra: Vec::new(), physical_bytes: Vec::new(),
+        host: Some(v4::V4Host { total: host.0, available: host.1, headroom: (8 << 30).max(host.0 / 10),
+            cache_bytes: options.host_cache_bytes, prefix_entries: options.prefix_entries("deepseek_v4"),
+            span_rows: report.prefill_span_rows.unwrap_or(shape.prefill_rows * options.prefill_waves), full_prefill_logits: options.full_prefill_logits,
+            embedding_bytes: if host_embedding { checkpoint.tensors.iter().find(|t| t.meta.name == "embed.weight")
+                .map_or(0, |t| t.meta.byte_length) } else { 0 },
+            // Without a manifest, the compiled stride covers the context in 64-row groups.
+            c128_width: shape.manifest.as_deref()
+                .and_then(|m| crate::serving_capacity::compiled_c128_width(m, id).ok())
+                .unwrap_or_else(|| shape.context_tokens.div_ceil(128).next_multiple_of(64).max(64)) }) };
     let startup = inputs.weights.startup.clone();
     Ok((inputs, startup))
 }

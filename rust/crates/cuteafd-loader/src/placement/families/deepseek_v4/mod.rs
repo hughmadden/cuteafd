@@ -7,7 +7,9 @@
 //! V4's reserve envelope, the 262K legacy expert reserve and the per-device
 //! pool sizing live here, once.
 mod admission;
+mod host;
 pub use admission::{prepare, production_request, AdmittedV4, PreparedV4};
+pub use host::{pool_units, HostPrefix, PinnedTables, V4Host};
 
 use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::placement::*;
@@ -95,6 +97,11 @@ pub struct V4Inputs {
     /// Owners a caller adds after the family's own facts (an RTX media tower).
     /// They are priced exactly like a fixed demand, so the same admission runs.
     pub extra: Vec<Demand>,
+    /// Each GPU's physical capacity, apart from the logical ceiling in `gpus`;
+    /// empty when they are the same card size.
+    pub physical_bytes: Vec<u64>,
+    /// The coordinator host tier; `None` only in unit fixtures.
+    pub host: Option<V4Host>,
 }
 
 /// Native C4 context kernel scratch, read from the selected AOT manifest.
@@ -321,7 +328,7 @@ mod default_tests {
                     tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
                     first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
                     full_prefill_logits: 0, code_bytes: Vec::new(), context: None, attention: None,
-                    extra: Vec::new(),
+                    extra: Vec::new(), physical_bytes: Vec::new(), host: None,
                 };
                 let baseline = fixed_demands(&input).unwrap().0;
                 for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
@@ -393,6 +400,7 @@ mod default_tests {
             tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0, first_routed: 0,
             requested_pool: Some(262144), onboard: Onboard::Layers(0), full_prefill_logits: 0,
             code_bytes: Vec::new(), context: None, attention: None, extra: Vec::new(),
+            physical_bytes: Vec::new(), host: None,
         }
     }
 
@@ -435,7 +443,7 @@ mod default_tests {
                         panic!("expected the missing context programs, got {:?}", admitted(&input))
                     };
                     assert!(message.contains(&format!(
-                        "deepseek_v4_sparse_mla_partial_h{}_s*_m64", heads / 2)), "{message}");
+                        "{family}_sparse_mla_partial_h{}_s*_m64", heads / 2)), "{message}");
                 }
                 input.attention = Some(AttentionPlacement::Heads);
                 let heads_plan = admitted(&input).unwrap();

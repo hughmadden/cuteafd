@@ -39,6 +39,11 @@ fn invalid<E: std::fmt::Display>(error: E) -> Refusal {
     Refusal::InvalidFact(error.to_string())
 }
 
+/// The exporter's program family: `dsv4f` (Flash, hidden 4096) or `dsv4p` (Pro).
+fn program_family(inputs: &V4Inputs) -> &'static str {
+    if inputs.cfg.dim == 4096 { "dsv4f" } else { "dsv4p" }
+}
+
 /// The attention placement V4 resolves. `None` is auto: two GPUs take V4's
 /// recorded context default (a build without the C4 programs refuses there, it
 /// never silently replicates KV), one GPU runs head-split.
@@ -138,6 +143,8 @@ pub struct PreparedV4<'a> {
     /// routed layer locally and reports exactly that count.
     counts: Vec<usize>,
     tp2: bool,
+    /// The retained host prefix, resolved before admission.
+    prefix: super::HostPrefix,
 }
 
 #[derive(Debug)]
@@ -164,7 +171,7 @@ fn modes(inputs: &V4Inputs) -> Result<(Vec<LayerMode>, AttentionPlacement), Refu
             return Err(invalid("V4 context placement needs two coordinator GPUs"));
         }
         if inputs.context.is_none() {
-            let family = inputs.cfg.family_id().to_string();
+            let family = program_family(inputs);
             let rows = inputs.decode_rows;
             let mut programs = [
                 "dsa_candidate_merge",
@@ -220,7 +227,8 @@ fn budgets(inputs: &V4Inputs, reserves: &[u64]) -> Result<Vec<Budget>, Refusal> 
         .iter()
         .zip(reserves)
         .enumerate()
-        .map(|(rank, (&(capacity, baseline), &headroom))| {
+        .map(|(rank, (&(logical, baseline), &headroom))| {
+            let physical = inputs.physical_bytes.get(rank).copied().unwrap_or(logical).max(logical);
             let baseline = match baseline {
                 crate::placement::Baseline::Planned {
                     context_bytes,
@@ -232,8 +240,12 @@ fn budgets(inputs: &V4Inputs, reserves: &[u64]) -> Result<Vec<Budget>, Refusal> 
                     source: "planned context, modules and preloaded owners".into(),
                     assumed: false,
                 },
+                // The sample is relative to the logical ceiling; the budget's
+                // physical extent adds the memory above it back as free.
                 crate::placement::Baseline::Measured { free_bytes } => Baseline::Sampled {
-                    free: free_bytes,
+                    free: free_bytes
+                        .checked_add(physical - logical)
+                        .ok_or(Refusal::Overflow("V4 physical sample"))?,
                     phase: Phase::Load,
                     source: "measured free bytes after context and modules".into(),
                 },
@@ -241,8 +253,8 @@ fn budgets(inputs: &V4Inputs, reserves: &[u64]) -> Result<Vec<Budget>, Refusal> 
             Ok(Budget {
                 id: format!("rtx{rank}"),
                 locations: vec![Location::coordinator(rank as u8)],
-                physical_bytes: capacity,
-                logical_bytes: capacity,
+                physical_bytes: physical,
+                logical_bytes: logical,
                 baseline,
                 headroom,
             })
@@ -270,23 +282,26 @@ fn budgets(inputs: &V4Inputs, reserves: &[u64]) -> Result<Vec<Budget>, Refusal> 
             headroom: 0,
         }));
     }
+    if let Some(host) = &inputs.host {
+        budgets.push(super::host::budget(host)?);
+    }
     Ok(budgets)
 }
 
-/// The smallest pool the request admits. An automatic checkpoint may be served
-/// at an explicit smaller pool (serving clamps its context to it); a fixed
-/// context is a hard floor, and Spark-free layouts also keep the agentic floor.
+/// The shared pool policy for this request: an automatic checkpoint may be
+/// served at an explicit smaller pool (serving clamps its context to it); a
+/// fixed context is a hard floor, and Spark-free layouts keep the agentic floor.
+fn pool_policy(inputs: &V4Inputs) -> crate::placement::PoolPolicy {
+    // The card size plan sees (the logical ceiling), so a simulated small card
+    // targets the same pool offline and live.
+    let cards = inputs.gpus.iter().map(|&(bytes, _)| bytes).collect::<Vec<_>>();
+    crate::placement::PoolPolicy::resolve(&cards, inputs.max_context, inputs.requested_pool,
+        V4_PAGE_ROWS, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context)
+}
+
+/// The smallest pool the request admits.
 fn context_floor(inputs: &V4Inputs) -> u64 {
-    let compiled = inputs.max_context;
-    match inputs.requested_pool.filter(|&tokens| tokens > 0) {
-        Some(tokens) if inputs.automatic_context => tokens,
-        Some(tokens) => tokens.max(compiled),
-        None => compiled.max(if inputs.spark_ranks == 0 {
-            crate::placement::pool::AGENTIC_FLOOR_TOKENS
-        } else {
-            0
-        }),
-    }
+    pool_policy(inputs).floor
 }
 
 /// Prepare V4's immutable contract terms from one admission input.
@@ -331,15 +346,16 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
     } else {
         V4_PAGE_ROWS
     };
-    let small = inputs
-        .gpus
-        .iter()
-        .any(|&(capacity, _)| capacity <= 34 << 30);
-    let target = (if small { 1u64 << 20 } else { 2u64 << 20 }).max(context);
-    let maximum_tokens = target
-        .max(inputs.requested_pool.unwrap_or(0))
+    let maximum_tokens = pool_policy(inputs)
+        .maximum_tokens()
+        .max(context)
         .min(super::POOL_CEILING_TOKENS);
     let maximum_pages = maximum_tokens.div_ceil(page_rows).max(1);
+    let prefix = match &inputs.host {
+        Some(host) => super::host::prefix_owners(inputs, host, attention == AttentionPlacement::Context)?,
+        None => super::HostPrefix { owners: crate::placement::planner::serving::HostPrefixOwners {
+            quota_bytes: 0, chunk_bytes: 0 }, geometry: None },
+    };
     Ok(PreparedV4 {
         inputs,
         budgets,
@@ -356,12 +372,12 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
         routed,
         counts,
         tp2,
+        prefix,
     })
 }
 
 /// The request `plan --layout` and serve-dsv4 both admit.
 pub fn production_request(inputs: &V4Inputs) -> Request {
-    let routed = inputs.experts.len();
     Request {
         context: context_floor(inputs),
         pool: inputs
@@ -370,7 +386,7 @@ pub fn production_request(inputs: &V4Inputs) -> Request {
             .map_or(Pin::Auto, Pin::Exact),
         onboard: match inputs.onboard {
             Onboard::Auto => Pin::Auto,
-            Onboard::Layers(count) => Pin::Exact(count.min(routed) as u64),
+            Onboard::Layers(count) => Pin::Exact(count as u64),
         },
         prefill: Pin::Exact(PrefillShape {
             rows: inputs.prefill_rows,
@@ -519,6 +535,11 @@ impl<'a> PreparedV4<'a> {
 
     pub fn context(&self) -> u64 {
         self.context
+    }
+
+    /// The retained host prefix quota this contract declares.
+    pub fn prefix(&self) -> super::HostPrefix {
+        self.prefix
     }
 
     /// dSpark's stage experts open GPU0's TP1 arena. In TP2 mode they keep a
@@ -780,29 +801,15 @@ impl<'a> PreparedV4<'a> {
     }
 
     pub fn admit(self, request: Request) -> Result<AdmittedV4, Refusal> {
-        let requested = match request.onboard {
-            Pin::Exact(count) => Some(count),
-            Pin::Auto => None,
-        };
-        let solved = match solve(request.clone(), self.budgets.clone(), &self) {
-            Ok(solved) => solved,
-            Err(Refusal::Capacity { .. } | Refusal::PinConflict)
-                if requested.is_some_and(|count| count > 0) =>
-            {
-                // Name the requested prefix and the most the fixed demands leave,
-                // never the anonymous capacity failure behind it.
-                let mut relaxed = request;
-                relaxed.onboard = Pin::Auto;
-                let placed = solve(relaxed, self.budgets.clone(), &self).map_or(0, |solved| {
-                    solved.decisions.onboard_layers.iter().map(|layers| layers.len() as u64).sum()
-                });
-                return Err(Refusal::InvalidFact(format!(
-                    "{} RTX expert layers do not fit beside the fixed demands (at most {placed})",
-                    requested.unwrap_or(0)
+        if let Pin::Exact(count) = request.onboard {
+            if count as usize > self.routed.len() {
+                return Err(invalid(format!(
+                    "--rtx-expert-layers {count} exceeds the {} routed layers",
+                    self.routed.len()
                 )));
             }
-            Err(error) => return Err(error),
-        };
+        }
+        let solved = solve(request, self.budgets.clone(), &self)?;
         let placement = self.execution(&solved)?;
         Ok(AdmittedV4 {
             solved,
@@ -1024,6 +1031,10 @@ impl Recipe for PreparedV4<'_> {
                     );
                 }
             }
+        }
+        if let Some(host) = &inputs.host {
+            owners.components.extend(super::host::components(inputs, host, self.prefix.owners, self.page_rows,
+                self.attention == AttentionPlacement::Context, self.maximum_pages)?);
         }
         Ok(Contract {
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
