@@ -33,6 +33,11 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Device-only executed backbone route counts, split by prefill/decode.
+    #[arg(long)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
@@ -271,6 +276,14 @@ mod draft_storage_tests {
     fn args(extra: &[&str]) -> EngineArgs {
         Command::try_parse_from(["mimo", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
             .into_iter().chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn expert_usage_is_opt_in_and_reader_starts_disabled() {
+        let off = args(&[]);
+        assert!(!off.expert_usage);
+        assert_eq!(off.expert_usage_reader.snapshot()["enabled"], false);
+        assert!(args(&["--expert-usage"]).expert_usage);
     }
 
     #[test]
@@ -1190,6 +1203,9 @@ impl Opened {
         // Once an engine exists, setup and body failures share the same terminal
         // retirement path. Pre-engine loader ownership is a separate boundary.
         let result = (|| -> Result<T> {
+            engine.expert_usage = preflight.expert_usage.map(|geometry| cuteafd_ffi::expert_usage::ExpertUsage::new(
+                &self.library, geometry, &[cuteafd_ffi::expert_usage::UsageDevice { logical: 0, cuda: args.device }],
+                args.expert_usage_reader.clone())).transpose()?;
             engine.prefill_w8a8 = !args.prefill_w8a16;
             engine.output_fp8_decode = args.fp8_decode;
             engine.decode_graphs = args.decode_graphs;

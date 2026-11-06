@@ -1625,7 +1625,7 @@ if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
 family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
-if [[ $family == deepseek_v4 ]]; then
+if [[ $family == deepseek_v4 || $family == mimo_v2 ]]; then
   case "$(get EXPERT_USAGE off)" in
     on) family_args+=(--expert-usage) ;;
     off) ;;

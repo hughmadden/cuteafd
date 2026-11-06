@@ -524,6 +524,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let request = admission::production_request(context, options.pool_tokens, onboard, prefill,
         operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let prepared = ProductionInput {
+        expert_usage: options.expert_usage,
         cfg: &cfg, layers: cfg.layers, kv, mtp_stages: selected_mtp(checkpoint, options), context, maximum_pool_tokens,
         prefill, lanes: lanes as u64, embedding, gpus: ranks, spark_ranks,
         experts, expert_workspace, tp2_workspace,

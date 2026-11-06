@@ -9,6 +9,7 @@ use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoKvFormats, MimoPrefillO
 
 /// Exact tensor admission against the measured post-module baseline.
 pub(super) struct Preflight {
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub capacity: cuteafd_core::serving_capacity::ResolvedCapacity,
     pub graph_plan: cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan,
     pub graph_bound_bytes: Vec<u64>,
@@ -541,6 +542,7 @@ fn preflight_shape(
         args.onboard.resolve(routed_layers), prefill, operation,
         crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
     let prepared = ProductionInput {
+        expert_usage: args.expert_usage,
         cfg, layers, kv, mtp_stages: args.mtp, context: args.max_context as u64,
         maximum_pool_tokens, prefill, lanes: transport_lanes as u64, embedding, gpus: ranks,
         spark_ranks, experts: expert_costs, expert_workspace, tp2_workspace,
@@ -589,6 +591,7 @@ fn preflight_shape(
         reservations = %serde_json::to_string(&capacity.devices)?,
         "MiMo pre-allocation capacity against measured post-module baseline");
     Ok(Preflight {
+        expert_usage: prepared.recipe.expert_usage.clone(),
         capacity,
         graph_plan,
         graph_bound_bytes,
