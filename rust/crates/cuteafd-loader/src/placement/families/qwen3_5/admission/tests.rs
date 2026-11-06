@@ -49,6 +49,12 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
     };
     let left = map(&plan.facts);
     let right = map(&declared);
+    let staging = plan.facts.allowances.iter().find(|allowance|
+        allowance.location == Location::PINNED).unwrap();
+    assert_eq!(staging.bytes, 128 << 10);
+    assert!(staging.bytes >= 108_000 && staging.assumed);
+    assert_eq!(staging.lifetime, Lifetime::TARGET);
+    assert!(staging.source.starts_with("estimated:"));
     assert_eq!(left.len(), plan.facts.allocations.len(), "duplicate owner id");
     assert_eq!(left.len(), right.len());
     for id in left.keys().chain(right.keys()).collect::<std::collections::BTreeSet<_>>() {

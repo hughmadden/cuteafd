@@ -287,8 +287,8 @@ impl DenseFacts<'_> {
             allocations.extend(serving.allocations(self.cfg.vocab)?);
         }
         allocations.extend(self.host_prefix.allocations("host.prefix", serving::ServingOwners::LIFETIME)?);
-        // One ownerless allowance remains from the old recipe: CUDA/driver
-        // growth beyond the named workspaces. It is an explicit estimate.
+        // Opaque growth and not-yet-attributed retained host staging remain
+        // explicit estimates, separate from exact physical owners.
         let mut allowances = vec![
             Allowance { location: gpu, bytes: 512 << 20, lifetime: Lifetime::TARGET,
                 source: "dense head/runtime growth: unqualified pre-existing estimate".into(),
@@ -299,6 +299,12 @@ impl DenseFacts<'_> {
                 source: "estimated: one packed operand read and Vec capacity; read_exact_at, no shard buffer".into(),
                 assumed: true },
         ];
+        // The min-card receipt found 108,000 B beyond the named pinned
+        // owners (ordered uploads and draft landing); attribution follows #1326.
+        allowances.push(Allowance { location: Location::PINNED, bytes: 128 << 10,
+            lifetime: Lifetime::TARGET,
+            source: "estimated: retained ordered-upload and draft landing staging; #1326".into(),
+            assumed: true });
         allowances.retain(|allowance| allowance.bytes > 0);
         Ok(Facts { resident_weights, phase_order: PhaseOrder::TARGET_THEN_DRAFT, allocations,
             deferred: vec![], sequential: vec![], reservations: vec![], allowances })
