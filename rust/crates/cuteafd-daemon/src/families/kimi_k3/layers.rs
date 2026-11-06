@@ -562,6 +562,7 @@ mod tests {
 /// The shared pipeline owns layer/lane ordering; this binding supplies only
 /// arithmetic and the exact payload at each planned boundary.
 pub(crate) struct Bindings<'e, 'a, 's> {
+    execution: &'e Execution<'a>,
     scope: &'e SubmissionScope<'s>,
     local: &'e mut [LocalLane<'a>],
     routed: &'e mut RoutedLane<'a>,
@@ -628,7 +629,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
             for rank in 0..local.len() { peer.recv(rank, lane)?; }
             ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
         }
-        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, packed: None })
+        Ok(Self { execution, scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, packed: None })
     }
 
     fn begin_local_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {

@@ -841,6 +841,11 @@ mod tests {
             let mut recipe = recipe();
             recipe.gpus = ranks;
             recipe.records_per_page = vec![64; ranks];
+            for arena in &mut recipe.arenas {
+                arena.peak.resize(ranks, 0);
+                arena.resident.resize(ranks, 0);
+                arena.weights.resize(ranks, 0);
+            }
             let off = recipe.prepare(&single()).unwrap();
             assert!(!off.components.iter().any(|component| matches!(&component.kind, ComponentKind::Allocation { template, .. } if template.id.starts_with("expert-usage."))));
             let geometry = Geometry { layers: 5, experts: 896, topk: 16, routed_layers: vec![1, 2, 3, 4] };
