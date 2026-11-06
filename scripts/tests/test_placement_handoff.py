@@ -124,6 +124,7 @@ resolved_decode_lanes=2
             if dspark_experts is not None:
                 setup+=f'\nTP2_DSPARK_EXPERTS={dspark_experts}\n'
             count_plan = {**(encoder or {}), "spark_admission": "coordinator_authoritative"}
+            count_plan["memory_layout"] = dict(devices=[dict(kind="spark", index=i, worker_budget_bytes=107374182400) for i in range(spark_count)])
             count_plan.update(spark_expert_world=spark_count,
                 spark_roles=[dict(rank=i, experts=True, encoder=(encoder or {}).get("encoder") if i == (encoder or {}).get("encoder", {}).get("kind", {}).get("rank") else None) for i in range(spark_count)])
             setup += f"\nspark_expert_world={spark_count}\nspark_worker_ranks=({' '.join(map(str, range(spark_count)))})\n"

@@ -385,6 +385,7 @@ release_deployment_spark_roles() {
   for rank in "${spark_worker_ranks[@]}"; do
     [[ -n "$(get "SPARK_${rank}_HOST")" && -n "$(get "SPARK_${rank}_LANE_A")" ]] ||
       release_die "Spark role rank $rank has no configured host or lane"
+    release_spark_role_budget "$deployment" "$rank" >/dev/null || return 1
   done
 }
 release_spark_role_has_experts() {
@@ -403,12 +404,18 @@ release_spark_role_ready_marker() {
 release_spark_worker_budget() {
   local deployment="$1" ranks="$2"
   jq -er --argjson ranks "$ranks" '
-    .spark_roles as $roles |
+    [.spark_roles[] | select(.experts) | .rank] as $experts |
     [.memory_layout.devices[] | select(.kind == "spark") |
-      select(.index as $index | any($roles[]; .rank == $index)) | .worker_budget_bytes] |
+      select(.index as $index | any($experts[]; . == $index)) | .worker_budget_bytes] |
     select(length == $ranks and all(.[]; type == "number" and . > 0)) |
     unique | select(length == 1) | .[0]' <<<"$deployment" ||
     release_die "the deployment plan names no uniform Spark worker allocation ceiling"
+}
+release_spark_role_budget() {
+  jq -er --argjson rank "$2" '
+    [.memory_layout.devices[] | select(.kind == "spark" and .index == $rank) | .worker_budget_bytes] |
+    select(length == 1 and all(.[]; type == "number" and . > 0)) | .[0]' <<<"$1" ||
+    release_die "the deployment plan names no uniform Spark worker allocation ceiling for rank $2"
 }
 # DeepSeek V4.1 reads shell variables after release_load_config, not get().
 _v41_allowed_keys() {

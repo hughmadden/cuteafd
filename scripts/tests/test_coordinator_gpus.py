@@ -223,7 +223,7 @@ def test_resolve_on_a_one_gpu_host_returns_that_gpu(tmp_path: Path) -> None:
 
 def test_admit_reclaims_only_the_replaced_container(tmp_path: Path) -> None:
     deployment = tmp_path / "plan.json"
-    deployment.write_text(json.dumps({"spark_ranks": 1, "memory_layout": {"devices": [
+    deployment.write_text(json.dumps({"spark_ranks": 1, "spark_expert_world": 1, "memory_layout": {"devices": [
         {"kind": "rtx", "index": 0, "items": [{"category": "weights", "bytes": 40 << 30},
                                                {"category": "experts", "bytes": 30 << 30},
                                                {"category": "kv", "bytes": 20 << 30}]}]}}))
@@ -235,9 +235,10 @@ def test_admit_reclaims_only_the_replaced_container(tmp_path: Path) -> None:
     assert admitted.returncode == 0, admitted.stderr
 
 
-def test_admit_charges_onboarded_experts_without_sparks(tmp_path: Path) -> None:
+@pytest.mark.parametrize("roles", [[], [{"rank": 2, "experts": False, "encoder": {"kind": {"kind": "spark", "rank": 2}}}]])
+def test_admit_charges_onboarded_experts_without_spark_experts(tmp_path: Path, roles: list[dict]) -> None:
     deployment = tmp_path / "plan.json"
-    deployment.write_text(json.dumps({"spark_ranks": 0, "memory_layout": {"devices": [
+    deployment.write_text(json.dumps({"spark_ranks": len(roles), "spark_expert_world": 0, "spark_roles": roles, "memory_layout": {"devices": [
         {"kind": "rtx", "index": 0, "items": [{"category": "weights", "bytes": 10 << 30},
                                                {"category": "experts", "bytes": 50 << 30}]}]}}))
     result = _selector(tmp_path, "admit", "--uuids", FAKE_GPU_UUIDS[0], "--deployment", str(deployment),

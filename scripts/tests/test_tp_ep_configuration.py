@@ -468,7 +468,7 @@ resolved_decode_lanes=2
 {extra_setup}'''
             roles = [dict(rank=i, experts=True) for i in range(spark_count)]
             setup += f"\nspark_expert_world={spark_count}\nspark_worker_ranks=({' '.join(map(str, range(spark_count)))})\nspark_vision_ranks=()\n"
-            setup += "count_plan=" + __import__('shlex').quote(json.dumps(dict(spark_roles=roles))) + "\n"
+            setup += "count_plan=" + __import__('shlex').quote(json.dumps(dict(spark_roles=roles, memory_layout=dict(devices=[dict(kind="spark", index=i, worker_budget_bytes=107374182400) for i in range(spark_count)])))) + "\n"
             result = subprocess.run(
                 ["bash", "-c", setup + block, "test", str(gpus)],
                 env=env,

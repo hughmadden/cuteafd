@@ -1546,7 +1546,8 @@ def capture_native_exlr8_capability_deployment(deployment_path: Path) -> None:
     source = (ROOT / "scripts/launch/run-family.sh").read_text()
     functions = []
     for name in ("release_spark_worker_budget", "release_validate_deployment"):
-        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.MULTILINE | re.DOTALL)
+        helper_source = (ROOT / "scripts/lib/family-keys.sh").read_text() if name == "release_spark_worker_budget" else source
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", helper_source, re.MULTILINE | re.DOTALL)
         assert match, f"missing actual launcher function {name}"
         functions.append(match.group())
     script = '\n'.join(functions) + r'''
@@ -5035,3 +5036,41 @@ def test_spark_roles_reject_unlaunchable_rank_contracts(tmp_path, role, world, d
                       "spark_roles": [dict(layers=[], encoder=None, audio_encoder=None, drafter=None) | role]})
     assert result.returncode != 0 and diagnostic in result.stderr, result.stderr
     assert "docker run -d" not in result.stderr
+
+
+@pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
+def test_expert_world_excludes_rank_two_media_worker(tmp_path, family):
+    config = {"model_type": family, "vision_config": {"depth": 2}}
+    if family == "mimo_v2":
+        config.update(num_hidden_layers=2, moe_layer_freq=[0, 1])
+    placement = {"kind": {"kind": "spark", "rank": 2}, "replicas": []}
+    roles = [dict(rank=i, experts=i < 2, layers=[], encoder=placement if i == 2 else None,
+                  audio_encoder=None, drafter=None) for i in range(3)]
+    budgets = [108 << 30, 108 << 30, 96 << 30]
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    result = _family_launch_result(tmp_path, config, model,
+        "MODEL_REVISION=\nSPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=spark:2\nAUDIO=off\n",
+        extra_args=("--wip", "mixed-roles"), execute_workers=True,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_expert_world": 2,
+                      "spark_roles": roles, "encoder": placement, "encoder_plan_hash": "ab" * 32},
+        deployment_overrides={"memory_layout": {"devices": [
+            dict(kind="rtx", index=0, items=[dict(category="weights", bytes=8 << 30)]),
+            *[dict(kind="spark", index=i, worker_budget_bytes=budget) for i, budget in enumerate(budgets)],
+            dict(kind="spark", index=7, worker_budget_bytes=1)]}})
+    assert result.returncode == 0, result.stderr
+    workers = [shlex.split(line) for line in result.stderr.splitlines()
+               if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
+    assert len(workers) == 3, result.stderr
+    by_rank = {int(worker[worker.index("--rank") + 1]): worker for worker in workers}
+    assert set(by_rank) == {0, 1, 2}
+    for rank, worker in by_rank.items():
+        assert worker[worker.index("--device-budget-bytes") + 1] == str(budgets[rank])
+        if rank < 2:
+            assert worker[worker.index("--world") + 1] == "2"
+            assert "--encoder-only" not in worker and "--listen" in worker
+        else:
+            assert "--encoder-only" in worker and "--encoder-listen" in worker
+            assert not {"--world", "--listen", "--spark-tp", "--spark-ep"} & set(worker)
+    coordinator = next(shlex.split(line) for line in result.stderr.splitlines()
+                       if "docker run -d" in line and "--max-output-tokens" in line)
+    assert coordinator[coordinator.index("--peers") + 1] == "10.0.0.1:19441,10.0.0.2:19441"

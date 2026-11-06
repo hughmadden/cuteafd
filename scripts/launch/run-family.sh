@@ -777,8 +777,8 @@ if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   ((selected_count <= SPARK_COUNT)) || release_die "planner requested more Spark ranks than configured: $selected_count > $SPARK_COUNT"
   [[ "$selected_count" == "$SPARK_COUNT" ]] || echo "Spark roles use $selected_count of $SPARK_COUNT configured ranks"
 fi
-if ((selected_count > 0)); then
-  SPARK_DEVICE_BUDGET_BYTES="$(release_spark_worker_budget "$count_plan" "$selected_count")" || exit 1
+if ((spark_expert_world > 0)); then
+  SPARK_DEVICE_BUDGET_BYTES="$(release_spark_worker_budget "$count_plan" "$spark_expert_world")" || exit 1
 fi
 release_prefill_shape "$count_plan" deepseek_v41
 PREFILL_BATCH_TOKENS="$PREFILL_ROWS"
@@ -1150,7 +1150,8 @@ for i in "${spark_worker_ranks[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
-  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_expert_world" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
+  worker_budget="$(release_spark_role_budget "$count_plan" "$i")" || exit 1
+  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$worker_budget" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_expert_world" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
   worker_encoder_rank=-1
   for vision_rank in "${spark_vision_ranks[@]}"; do
     [[ "$vision_rank" != "$i" ]] || worker_encoder_rank="$i"
@@ -2610,8 +2611,8 @@ audio_encoder_hash=""
   if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
     family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")
   fi
-  if ((${#spark_worker_ranks[@]})); then
-    budget="$(release_spark_worker_budget "$deployment_json" "$selected_ranks")" || exit 1
+  if ((spark_expert_world > 0)); then
+    budget="$(release_spark_worker_budget "$deployment_json" "$spark_expert_world")" || exit 1
   fi
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
@@ -2805,9 +2806,10 @@ for rank in "${spark_worker_ranks[@]}"; do
   host="$(get "SPARK_${rank}_HOST")"
   encoder_args=""
   encoder_flag=--encoder audio_encoder_flag=--audio-encoder
-  expert_args="--rank $rank --device-budget-bytes $budget"
+  worker_budget="$(release_spark_role_budget "$deployment_json" "$rank")" || exit 1
+  expert_args="--rank $rank --device-budget-bytes $worker_budget"
   if release_spark_role_has_experts "$deployment_json" "$rank"; then
-    expert_args="--rank $rank --world $spark_expert_world --device-budget-bytes $budget $spark_worker_args --listen 0.0.0.0:$port"
+    expert_args="--rank $rank --world $spark_expert_world --device-budget-bytes $worker_budget $spark_worker_args --listen 0.0.0.0:$port"
   else
     encoder_flag=--encoder-only audio_encoder_flag=--audio-encoder-only
   fi

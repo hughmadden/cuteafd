@@ -22,7 +22,7 @@ class CompactSparkTopologyTest(unittest.TestCase):
 
     def test_planner_wire_is_mandatory(self):
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
-        body = source.split('spark_wire="$(jq -er', 1)[1].split('\nrelease_validate_spark_topology', 1)[0]
+        body = source.split('spark_wire="$(jq -er', 1)[1].split('\n(SPARK_COUNT=', 1)[0]
         body = 'spark_wire="$(jq -er' + body
         for wire, status, expected in [
             ('canonical', 0, '0::'),
@@ -198,14 +198,15 @@ release_stop_wip_containers
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
         invocation, remote = source.split('echo "== starting native Spark experts =="', 1)[1].split("<<'REMOTE' &", 1)
         remote = remote.split('\nREMOTE', 1)[0]
-        self.assertIn('"$SPARK_COUNT"', invocation)
-        # The legacy ten-positional invocation must survive for both compact
-        # worlds: the coordinator keeps the worker at the world it was given.
+        self.assertIn('"$spark_expert_world"', invocation)
+        # The complete role-aware positional contract preserves compact expert
+        # worlds independently of the configured Spark inventory.
         for world in (2, 3):
             with self.subTest(world=world):
                 result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' +
                     remote.replace(' >/dev/null', ''), 'test', 'image', 'name', '1',
-                    '107374182400', '19441', 'snapshot', 'fingerprint', str(world), '0', str(world), '1'],
+                    '107374182400', '19441', 'snapshot', 'fingerprint', str(world), '0', str(world), '1', '', '', 'info', '__none__',
+                    '-1', '19541', '', 'revision', '1'],
                     cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 arguments = result.stdout.splitlines()

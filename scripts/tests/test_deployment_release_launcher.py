@@ -60,6 +60,11 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                         f'cuteafd-spark-expert-worker-{rank}-{old}',
                         f'cuteafd-spark-expert-worker-{rank}-{new}')
     golden = json.loads(golden_text)
+    if entry["name"] == "v4-flash-max":
+        # The RTX pair now owns all 43 expert layers; retain the historical
+        # coordinator contract, deliberately retiring its four Spark workers.
+        assert [run["host"] for run in golden] == ["coordinator", *[f"worker-{i}" for i in range(4)]]
+        golden = golden[:1]
     selected = release_entry(entry)
     compact_draft = entry["family"] in {"glm5", "glm5_flash", "mimo_v2"}
     if compact_draft:
@@ -130,6 +135,12 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                                     ("--prefill-span-rows", unit * waves)]:
                     before["command"][before["command"].index(flag) + 1] = str(value)
             if entry["family"] == "deepseek_v4":
+                if entry["name"] == "v4-flash-max":
+                    position = before["command"].index("--peers")
+                    assert before["command"][position + 1] == ",".join(
+                        f"192.0.2.{i + 1}:19905" for i in range(4))
+                    del before["command"][position:position + 2]
+                    assert "--peers" not in after["command"]
                 # V4 forwards the planner's resolved unit and wave defaults.
                 anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
                 position = before["command"].index(anchor) + 2

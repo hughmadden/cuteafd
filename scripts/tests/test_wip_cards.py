@@ -3229,4 +3229,3 @@ def test_deployment_preflight_checks_only_assigned_spark_roles(entry, tmp_path, 
     cards.assert_absent(job)
     assert len(seen) == len(checked)
     assert all(host in str(seen) for host in checked if host != 'raptor')
-
