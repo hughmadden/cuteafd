@@ -1176,8 +1176,8 @@ impl Opened {
                 cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
                     args.prefill_rows, args.expert_input.into())?.to_vec(),
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
-            let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
-                &preflight.working_set, peers.len(), None, model)?;
+            let admission = crate::shared::placement::SparkAdmission::plan_view(self.checkpoint.view.as_ref().context("MiMo Spark admission requires selected checkpoint view")?, geometry, self.catalog.as_ref(),
+                &preflight.working_set, peers.len(), None, model, None)?;
             let ranks = push_policy.plan(|| {
                 ensure!(admission.coordinator_pushes(), "MiMo Spark admission did not select required push");
                 prepare_push(peers.len())

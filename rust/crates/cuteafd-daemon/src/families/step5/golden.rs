@@ -482,8 +482,8 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
     };
     let unit = args.prefill_units.unwrap_or(rows);
     let config = TcpTransportConfig::default();
-    SparkAdmission::plan(
-        &args.snapshot,
+    SparkAdmission::plan_view(
+        &args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?,
         ExpertGeometry::STEP5,
         Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet {
@@ -496,7 +496,7 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
         None,
         super::serve::spark_model(&exports,
             SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: format.ingress(), partial_reply_bytes: None },
-            u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
+            u64::from(args.prefill_waves), 1, config.max_frame_bytes)?, None,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,

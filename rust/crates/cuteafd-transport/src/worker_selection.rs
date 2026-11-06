@@ -221,7 +221,9 @@ impl WorkerSelection {
 
     pub fn validate_for(&self, identity: &WorkerIdentity) -> Result<()> {
         self.validate()?;
-        ensure!(&self.identity == identity, "worker checkpoint/geometry/topology/placement identity mismatch");
+        ensure!(&self.identity == identity,
+            "worker checkpoint/geometry/topology/placement identity mismatch: coordinator={:?}; worker={identity:?}",
+            self.identity);
         Ok(())
     }
 }

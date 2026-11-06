@@ -563,11 +563,12 @@ pub(crate) fn with_engine<T>(
                     matches!(home.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer)).collect(),
                 spark_ranks: peers.len(), prefill_lanes: 1,
             };
-            if !peers.is_empty() { crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
+            if !peers.is_empty() { crate::shared::placement::SparkAdmission::plan_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
+                &loaded.snapshot, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
                 peers.len(), None, admission::spark_model(
                     cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&loaded.catalog)?,
-                    decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?; }
+                    decode_rows, prefill_rows, prefill.waves as usize)?, None)?.select(&peers)?; }
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         if crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&loaded.snapshot)?

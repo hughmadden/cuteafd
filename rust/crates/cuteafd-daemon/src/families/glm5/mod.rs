@@ -1375,7 +1375,8 @@ impl Opened {
         let admission = if let Some(peers) = selected_peers {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-            let admission = crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
+            let admission = crate::shared::placement::SparkAdmission::plan_view(&args.attention.selected_view.clone().map(Ok)
+                .unwrap_or_else(|| args.attention.select(&self.snapshot))?,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working,
                 peers.len(), None, spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
                 args.exlr8_manifest.as_deref())?;
