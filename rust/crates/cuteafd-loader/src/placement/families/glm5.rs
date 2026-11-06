@@ -1059,7 +1059,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = dir.path().join("snapshot");
         std::fs::create_dir_all(&snapshot).unwrap();
-        crate::plan::testing::write_mistral_large4_snapshot(&snapshot, Some(&[1]), true);
+        crate::plan::testing::write_mistral_large4_snapshot(&snapshot, None, true);
         let catalog = crate::read_expert_catalog(&snapshot).unwrap();
         let cfg = GlmDsaConfig::from_hf(&crate::plan::checkpoint::read_json(&snapshot.join("config.json")).unwrap()).unwrap();
         let tiers = catalog.exl3().unwrap().decoder_tiers().iter().map(usize::to_string).collect::<String>();
