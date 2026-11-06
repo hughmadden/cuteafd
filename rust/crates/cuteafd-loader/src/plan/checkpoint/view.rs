@@ -33,6 +33,7 @@ pub struct CheckpointView {
     index_name: String,
     quant_names: Vec<String>,
     fingerprint: String,
+    metadata_digests: BTreeMap<String, [u8; 32]>,
     config: Arc<Value>,
     quantize_config: Option<Arc<Value>>,
     weight_map: Option<Arc<BTreeMap<String, String>>>,
@@ -98,6 +99,7 @@ impl CheckpointView {
         hash.update(match mode { AttentionMode::Hqa => b"hqa".as_slice(),
             AttentionMode::Compact => b"compact", AttentionMode::Fp8Compact => b"fp8-compact" });
         if mode == AttentionMode::Fp8Compact { hash.update(recipe.as_bytes()); }
+        let mut metadata_digests = BTreeMap::new();
         let mut quantize_config = None;
         for name in std::iter::once(config_name).chain(quant_names.iter().map(String::as_str)) {
             let path = snapshot.join(name);
@@ -110,6 +112,7 @@ impl CheckpointView {
             check_references(&value, &allowed_quant, &index_name)?;
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
+            metadata_digests.insert(name.to_owned(), Sha256::digest(&bytes).into());
             hash.update(bytes);
             if name != config_name && quantize_config.is_none() { quantize_config = Some(Arc::new(value)); }
         }
@@ -133,7 +136,7 @@ impl CheckpointView {
         }
         Ok(Self { snapshot: snapshot.into(), mode, config_name: config_name.into(), index_name,
             quant_names, fingerprint: format!("{:x}", hash.finalize()), config: Arc::new(config),
-            quantize_config, weight_map, attention })
+            quantize_config, weight_map, attention, metadata_digests })
     }
 
     pub fn snapshot(&self) -> &Path { &self.snapshot }
@@ -154,6 +157,12 @@ impl CheckpointView {
         let parsed = crate::formats::exl3_contract::AttentionContract::parse(
             self.config.get("quantization_config").unwrap_or(&Value::Null), manifest)?;
         ensure!(parsed.as_ref() == self.attention.as_deref(), "attention metadata changed after bundle selection");
+        Ok(())
+    }
+    pub(crate) fn check_metadata_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let expected = self.metadata_digests.get(name).context("metadata was not selected")?;
+        let actual: [u8; 32] = Sha256::digest(bytes).into();
+        ensure!(*expected == actual, "selected metadata {name} changed after bundle selection");
         Ok(())
     }
     pub fn index_path(&self) -> PathBuf { self.snapshot.join(&self.index_name) }
@@ -227,7 +236,33 @@ mod tests {
     }
 
     #[test]
-    fn published_hqa_metadata_matches_native_headers_and_compact_parent() -> Result<()> {
+    fn selected_identity_and_manifest_digest_do_not_follow_mutation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        bundle(root.path(), true);
+        let view = CheckpointView::select(root.path(), AttentionMode::Compact)?;
+        let identity = super::super::identity::CheckpointIdentity::from_view(&view, None)?;
+        view.check_metadata_bytes(COMPACT_QUANT, b"{}")?;
+        assert!(view.check_metadata_bytes(COMPACT_QUANT, b"{}\n").is_err());
+        std::fs::remove_file(root.path().join(COMPACT_CONFIG))?;
+        std::fs::remove_file(root.path().join(COMPACT_INDEX))?;
+        assert_eq!(identity, super::super::identity::CheckpointIdentity::from_view(&view, None)?);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_index_requires_every_named_tensor_in_readable_shard() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        bundle(root.path(), true);
+        crate::plan::testing::write_safetensors(&root.path().join("a.safetensors"),
+            &[crate::plan::testing::t("other.weight", "BF16", &[2])]);
+        let view = CheckpointView::select(root.path(), AttentionMode::Compact)?;
+        let error = crate::plan::Checkpoint::open_view(&view).unwrap_err().to_string();
+        assert!(error.contains("indexed tensor a.weight missing"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn published_hqa_metadata_matches_native_headers_and_selected_catalogs() -> Result<()> {
         let Some(snapshot) = std::env::var_os("CUTEAFD_HQA_TEST_SNAPSHOT") else { return Ok(()); };
         let snapshot = PathBuf::from(snapshot);
         ensure!(snapshot.is_dir(), "CUTEAFD_HQA_TEST_SNAPSHOT is not a directory");

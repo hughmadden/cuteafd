@@ -1253,8 +1253,27 @@ echo "  context/output: $MAX_CONTEXT_TOKENS/$MAX_OUTPUT_TOKENS; dSpark: $SPECULA
 }
 
 # The family: run.sh passes --family; a direct call reads the checkpoint's own config.json.
-detected_family="$(release_config_family "$config")"
+attention_mode="$(get ATTENTION_MODE hqa)"
+case "$attention_mode" in
+  hqa|compact|fp8-compact) ;;
+  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
+esac
+selected_config=config.json
+[[ "$attention_mode" != compact ]] || selected_config=config.compact-attention.json
+detected_family="$(release_config_family "$config" "$attention_mode")"
 [[ -n "$family" ]] || family="$detected_family"
+attention_mode="$(get ATTENTION_MODE hqa)"
+attention_mode_args=()
+case "$attention_mode" in
+  hqa) ;;
+  compact|fp8-compact)
+    [[ "$family" == glm5_flash ]] || release_die "unsupported ATTENTION_MODE=$attention_mode for $family; only glm5_flash supports alternate attention bundles"
+    if [[ "$attention_mode" == compact ]]; then attention_mode_args=(--compact-attention)
+    else attention_mode_args=(--fp8-compact-attention); fi
+    ;;
+  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
+esac
+
 [[ "$family" == deepseek_v41 || "$family" == deepseek_v4 || "$(get TP2_DSPARK_EXPERTS off)" != on ]] ||
   release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark"
 if [[ "$family" == deepseek_v41 ]]; then
@@ -1283,7 +1302,7 @@ snapshot_rel="hub/models--${model//\//--}/snapshots/$revision"
 release_hub_mounts "$namespace_root" "$site_hub" "$hf_home" "$snapshot_rel"
 generic_worker_mounts=("${RELEASE_HUB_MOUNTS[@]}")
 # Family, the serving command and the layers with routed experts.
-described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$root/snapshots/$revision/config.json")" || exit 2
+described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$root/snapshots/$revision/$selected_config")" || exit 2
 read -r detected model_type first_layer last_layer <<<"$described"
 [[ -z "$family" || "$family" == "$detected" ]] ||
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
@@ -1450,7 +1469,7 @@ if [[ "$family" == qwen4 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
   case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   # NVFP4: a ModelOpt publication with 4-bit weight groups (nvidia/Qwen3.8-Flash-Next-NVFP4).
-  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
+  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); m=q.get("quant_method", q.get("method")); g=q.get("config_groups", {}).values(); print(int(m == "exl3"), int(m == "modelopt" and any(x.get("weights", {}).get("num_bits") == 4 for x in g)), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/$selected_config")"
   read -r qwen_exl3 qwen_nvfp4 qwen_mtp <<<"$qwen_features"
 fi
 # Docker options only the Spark expert workers take (their environment and mounts).
@@ -1467,17 +1486,7 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   readlink -f "$dir/snapshots/$rev"
 }
-attention_mode="$(get ATTENTION_MODE hqa)"
-attention_mode_args=()
-case "$attention_mode" in
-  hqa) ;;
-  compact|fp8-compact)
-    [[ "$family" == glm5_flash ]] || release_die "unsupported ATTENTION_MODE=$attention_mode for $family; only glm5_flash supports alternate attention bundles"
-    if [[ "$attention_mode" == compact ]]; then attention_mode_args=(--compact-attention)
-    else attention_mode_args=(--fp8-compact-attention); fi
-    spark_worker_args+=" ${attention_mode_args[*]}" ;;
-  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
-esac
+spark_worker_args+=" ${attention_mode_args[*]}"
 exlr8_manifest="$(get EXLR8_MANIFEST)"
 exlr8_prefill_activations="$(get EXLR8_PREFILL_ACTIVATIONS)"
 if [[ -n "$exlr8_prefill_activations" ]]; then
@@ -1539,7 +1548,7 @@ mimo_flash_mopd=0 mimo_bundled_dflash=0
 # dspark_block_size in config.json); one without it serves without speculation.
 dsv4_dspark=0
 if [[ $family == deepseek_v4 ]]; then
-  dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/config.json")"
+  dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/$selected_config")"
 fi
 speculator="$(get SPECULATOR)"
 default_drafter=""
@@ -1569,7 +1578,7 @@ if [[ -z "$speculator" ]]; then
     echo "note: DeepSeek V4 drafts with its bundled dSpark; SPECULATOR=off disables it" >&2
   fi
   if [[ $speculator == off && $family == qwen3_5 ]] &&
-      python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(c.get("text_config",c).get("hidden_size") != 5120)' "$root/snapshots/$revision/config.json"; then
+      python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(c.get("text_config",c).get("hidden_size") != 5120)' "$root/snapshots/$revision/$selected_config"; then
     speculator=dspark default_drafter=RadixArk/Qwen3.8-27B-DSpark
   fi
   if [[ $speculator == off && $family == muse_spark ]]; then
@@ -2583,11 +2592,11 @@ audio_encoder_hash=""
 # when only decode requests use BF16, so this preflight requires the same coverage.
 if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   [[ "$ranks" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
-  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
+  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/$selected_config")"
   case "$store_dtype" in
     fp8) expert_geometry=mimo ;;
     mxfp4)
-      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/config.json")"
+      hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c.get("text_config", c).get("hidden_size", 0))' "$root/snapshots/$revision/$selected_config")"
       case "$hidden" in
         4096) expert_geometry=mimof ;;
         6144) expert_geometry=mimop ;;
@@ -2606,7 +2615,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
 fi
 if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash
           || "$family" == muse_spark || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
-   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
+   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/$selected_config"; } ||
    [[ "$audio" != off ]]; then
   selected="$(python3 -c '
 import json,sys

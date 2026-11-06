@@ -147,7 +147,11 @@ pub fn manifest_standalone(snapshot: &Path, role: &str) -> Result<FileManifest> 
 pub fn include_directory(manifest: &mut FileManifest, snapshot: &Path, directory: &str) -> Result<()> {
     let mut files = manifest.files.iter().map(|f| f.path.clone()).collect();
     collect_directory(snapshot, &snapshot.join(directory), &mut files)?;
-    *manifest = manifest_from_files(snapshot, manifest.role.clone(), files)?;
+    manifest.files = files.into_iter().map(|path| {
+        let bytes = std::fs::metadata(snapshot.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len());
+        RequiredFile { path, bytes }
+    }).collect();
+    manifest.total_bytes = manifest.files.iter().try_fold(0u64, |total, file| total.checked_add(file.bytes?));
     Ok(())
 }
 
@@ -206,6 +210,25 @@ fn manifest_from_files_view(snapshot: &Path, role: String, mut files: BTreeSet<S
 mod tests {
     use super::*;
     use crate::plan::testing::{mimo_flash_config, mimo_flash_tensors, write_safetensors};
+
+    #[test]
+    fn directory_additions_preserve_selected_bundle_and_auxiliary_snapshots() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("config.json"), b"default")?;
+        std::fs::write(root.path().join("config.compact-attention.json"), b"compact")?;
+        std::fs::create_dir(root.path().join("aux"))?;
+        std::fs::write(root.path().join("aux/vector.bin"), b"123")?;
+        let mut manifest = FileManifest { role: "coordinator".into(), snapshot: root.path().display().to_string(),
+            repo_id: None, revision: None, files: vec![RequiredFile {
+                path: "config.compact-attention.json".into(), bytes: Some(7) }], total_bytes: Some(7),
+            additional_snapshots: vec![manifest_standalone(root.path(), "drafter")?] };
+        include_directory(&mut manifest, root.path(), "aux")?;
+        assert_eq!(manifest.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            ["aux/vector.bin", "config.compact-attention.json"]);
+        assert_eq!(manifest.total_bytes, Some(10));
+        assert_eq!(manifest.additional_snapshots.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn all_family_loader_inputs_are_in_the_role_inventory() {

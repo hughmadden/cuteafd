@@ -69,6 +69,7 @@ EOF
 
 config="$repo_root/cuteafd.config"
 family_args=()
+attention_override=""
 # The former DeepSeek V4.1 options, as the configuration keys they set.
 legacy_key() {
   case "$1" in
@@ -85,7 +86,10 @@ legacy_key() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?$1 requires FILE}"; shift 2 ;;
-    --set) family_args+=(--set "${2:?$1 requires KEY=VALUE}"); shift 2 ;;
+    --set)
+      family_args+=(--set "${2:?$1 requires KEY=VALUE}")
+      [[ "$2" != ATTENTION_MODE=* ]] || attention_override="${2#*=}"
+      shift 2 ;;
     --embedding-placement) family_args+=(--embedding-placement "${2:?$1 requires host or gpu}"); shift 2 ;;
     --wip) family_args+=(--wip "${2:?$1 requires SLOT}"); shift 2 ;;
     --rotate-console-secret) exec "$repo_root/scripts/launch/console-secret.sh" rotate ;;
@@ -105,5 +109,5 @@ done
 if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" && -d "$CUTEAFD_NAMESPACE_ROOT/hf-home" ]]; then
   export HF_HOME="$(readlink -f "$CUTEAFD_NAMESPACE_ROOT")/hf-home"
 fi
-family="$(release_config_family "$config")"
+family="$(release_config_family "$config" "$attention_override")"
 exec "$repo_root/scripts/launch/run-family.sh" --config "$config" --family "$family" ${family_args[@]+"${family_args[@]}"}

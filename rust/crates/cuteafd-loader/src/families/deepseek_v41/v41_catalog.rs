@@ -1038,7 +1038,11 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
         draft_stages: 0,
         draft_experts: 0,
     };
-    if crate::plan::checkpoint::CheckpointFormat::detect(snapshot)? == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+    let format = match checkpoint.and_then(|checkpoint| checkpoint.view.as_ref()) {
+        Some(view) => crate::plan::checkpoint::CheckpointFormat::detect_view(view)?,
+        None => crate::plan::checkpoint::CheckpointFormat::detect(snapshot)?,
+    };
+    if format == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
         let (_, _, family) = crate::plan::exlr8::native::family_geometry(config)?;
         crate::plan::Checkpoint::inventory(snapshot)?;
         let draft_layers = crate::plan::exlr8::draft_layers(snapshot, config)?;

@@ -96,7 +96,11 @@ def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, f
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     keys = (f"ATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=2\n"
             "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
-    result = _family_launch_result(tmp_path, config, "test/hqa-flash", keys)
+    source = tmp_path / "selected-checkpoint"
+    source.mkdir()
+    (source / "config.compact-attention.json").write_text(json.dumps(config))
+    (source / "config.json").write_text(json.dumps(config) if mode != "compact" else "invalid default must not open")
+    result = _family_launch_result(tmp_path, config, "test/hqa-flash", keys, checkpoint_source=source)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     for command in ["cuteafd plan", "cuteafd serve-glmf --snapshot", "cuteafd expertd-native"]:
@@ -909,6 +913,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config, "a" * 40 if native_v41 else "abc")
+    if "ATTENTION_MODE=compact" in keys:
+        selected = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
+        (selected / "config.compact-attention.json").write_text(json.dumps(family_config))
     if checkpoint_source is not None:
         staged = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         # Header fixtures have huge sparse tensor payloads; never materialize them.

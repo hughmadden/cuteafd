@@ -986,7 +986,7 @@ release_validate_coordinator_gpu_budget() {
 # here, is DeepSeek V4.1, the release default; its own validation reports a
 # missing snapshot.
 release_config_family() {
-  local config="$1" model="" revision="" line key value hub dir
+  local config="$1" model="" revision="" attention="hqa" line key value hub dir
   [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(release_trim "${line%%#*}")"
@@ -995,16 +995,20 @@ release_config_family() {
     case "$key" in
       MODEL_ID) model="$value" ;;
       MODEL_REVISION) revision="$value" ;;
+      ATTENTION_MODE) attention="$value" ;;
     esac
   done < "$config"
   [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
   hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
   dir="$hub/models--${model//\//--}"
   [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
+  [[ -z "${2:-}" ]] || attention="$2"
+  local selected_config=config.json
+  [[ "$attention" != compact ]] || selected_config=config.compact-attention.json
   local described=""
-  if [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
+  if [[ -n "$revision" && -f "$dir/snapshots/$revision/$selected_config" ]]; then
     described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" \
-      "$dir/snapshots/$revision/config.json" 2>/dev/null)" || described=""
+      "$dir/snapshots/$revision/$selected_config" 2>/dev/null)" || described=""
   fi
   # Unrecognized configs stay on the DeepSeek V4.1 path, whose checks name the problem.
   [[ -n "$described" ]] || described=deepseek_v41

@@ -46,6 +46,16 @@ pub fn index_path(snapshot: &Path) -> Result<PathBuf> {
 }
 
 impl CheckpointFormat {
+    pub fn detect_view(view: &CheckpointView) -> Result<Self> {
+        if view.mode() != AttentionMode::Compact && super::exlr8::recognizes(view.snapshot())? {
+            return Ok(Self::Exlr8);
+        }
+        if view.weight_map().is_some() { return Ok(Self::HfIndexed); }
+        ensure!(view.snapshot().join("model.safetensors").is_file(),
+            "checkpoint has no recognized tensor inventory");
+        Ok(Self::HfSingle)
+    }
+
     pub fn detect(snapshot: &Path) -> Result<Self> {
         if super::exlr8::recognizes(snapshot)? { return Ok(Self::Exlr8); }
         if index_path(snapshot)?.is_file() { return Ok(Self::HfIndexed); }
@@ -242,8 +252,10 @@ impl Checkpoint {
         mut validation: Option<&mut Result<(), String>>) -> Result<Self> {
         let snapshot = view.snapshot();
         let config = view.config()?;
-        if view.mode() == AttentionMode::Hqa && CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
-            return super::exlr8::inventory(snapshot, config, needed);
+        if CheckpointFormat::detect_view(view)? == CheckpointFormat::Exlr8 {
+            let mut checkpoint = super::exlr8::inventory(snapshot, config, needed)?;
+            checkpoint.view = Some(view.clone());
+            return Ok(checkpoint);
         }
         let quantize_config = view.quantize_config();
         let index_path = view.index_path();
@@ -295,6 +307,9 @@ impl Checkpoint {
             };
             if let Some(result) = validation.as_deref_mut().filter(|result| result.is_ok()) {
                 *result = validate_index_headers(shard, &names, &headers).map_err(|error| error.to_string());
+            }
+            if validation.is_none() && role.is_none() {
+                validate_index_headers(shard, &names, &headers)?;
             }
             if let Some(role) = role {
                 let header_names: BTreeSet<_> = headers.iter().map(|meta| meta.name.as_str()).collect();

@@ -75,24 +75,21 @@ impl CheckpointIdentity {
 
     pub fn from_view(view: &super::CheckpointView, manifest: Option<&str>) -> Result<Self> {
         let snapshot = view.snapshot();
-        let format = if view.mode() == super::AttentionMode::Compact { CheckpointFormat::HfIndexed }
-            else { CheckpointFormat::detect(snapshot)? };
+        let format = CheckpointFormat::detect_view(view)?;
         let mut hash = Sha256::new();
         hash.update(view.fingerprint().as_bytes());
         hash.update(b"cuteafd-checkpoint-identity-v2\0");
-        hash_file(&mut hash, snapshot, view.config_name(), false)?;
+
         let manifest = match format {
             CheckpointFormat::HfIndexed | CheckpointFormat::HfSingle => {
                 ensure!(
                     manifest.is_none(),
                     "EXLR8 manifest requires an EXLR8 checkpoint"
                 );
-                let (name, header) = if format == CheckpointFormat::HfIndexed {
-                    (view.index_name().to_owned(), false)
-                } else {
-                    ("model.safetensors".to_owned(), true)
-                };
-                hash_file(&mut hash, snapshot, &name, header)?;
+                // Indexed configuration and inventories are already frozen in the view digest.
+                if format == CheckpointFormat::HfSingle {
+                    hash_file(&mut hash, snapshot, "model.safetensors", true)?;
+                }
                 None
             }
             CheckpointFormat::Exlr8 => {
