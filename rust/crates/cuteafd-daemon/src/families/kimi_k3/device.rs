@@ -114,7 +114,8 @@ impl<'a> W8<'a> {
 
 /// Explicit packed-path catalogue. Attention keeps its singleton row geometry;
 /// dense K6 stages remain conservatively bounded even inside attention producers.
-fn packing_inventory(core: Option<&serde_json::Value>) -> Result<Vec<(String, crate::shared::prefill_packing::ProgramRows)>> {
+fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
+    -> Result<Vec<(String, crate::shared::prefill_packing::ProgramRows)>> {
     use crate::shared::prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
     let mut inventory = BTreeMap::new();
     let mut add = |name: String, role| -> Result<()> {
@@ -193,6 +194,7 @@ fn packing_inventory(core: Option<&serde_json::Value>) -> Result<Vec<(String, cr
             }
         }
     }
+    for name in native { add(name.clone(), PackedRows)?; }
     Ok(inventory.into_iter().collect())
 }
 
@@ -213,9 +215,10 @@ fn classify_packing_inventory<'a>(names: impl IntoIterator<Item = &'a str>,
     Ok(inventory)
 }
 
-fn coordinator_packing_cap(programs: &Programs<'_>, core: bool, rows: usize) -> Result<usize> {
-    let catalogue = packing_inventory(core.then(|| programs.family_metadata("dense_trellis_k6")).transpose()?)?;
-    let inventory = classify_packing_inventory(programs.names().filter(|name| packing_program(name, core)), &catalogue)?;
+fn coordinator_packing_cap(programs: &Programs<'_>, core: bool, rows: usize, native: &[String]) -> Result<usize> {
+    let catalogue = packing_inventory(core.then(|| programs.family_metadata("dense_trellis_k6")).transpose()?, native)?;
+    let inventory = classify_packing_inventory(programs.names().filter(|name| packing_program(name, core))
+        .chain(native.iter().map(String::as_str)), &catalogue)?;
     crate::shared::prefill_packing::coordinator_row_cap(programs, inventory, rows)
 }
 
@@ -250,6 +253,14 @@ pub(crate) struct MlaPrograms<'a> {
 /// validated manifest requirements, not estimated total-engine allowances.
 pub(crate) use cuteafd_loader::families::kimi_k3::allocation::NativeScratch;
 
+pub(crate) fn resolve_native_programs(programs: &Programs<'_>,
+    inventory: &cuteafd_loader::families::kimi_k3::core::CoreInventory, rows: usize, ranks: usize)
+    -> Result<cuteafd_loader::placement::planner::native_attention::NativePrograms> {
+    let specs = programs.names().map(|name| programs.spec(name)).collect::<Result<Vec<_>>>()?;
+    let manifest = cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?;
+    inventory.native_programs(rows, ranks, Some(&manifest))
+}
+
 impl<'a> NativePrograms<'a> {
     pub(crate) fn load(device: Device<'a>, cfg: &KimiK3Config,
         programs: &'a Programs<'a>, ffn_mode: cuteafd_ffi::KimiFfnMode, cache_format: cuteafd_core::MlaCacheFormat) -> Result<Self> {
@@ -264,10 +275,20 @@ impl<'a> NativePrograms<'a> {
     pub(crate) fn load_for_ranks(device: Device<'a>, cfg: &KimiK3Config, programs: &'a Programs<'a>,
         ffn_mode: cuteafd_ffi::KimiFfnMode, cache_format: cuteafd_core::MlaCacheFormat,
         inventory: &cuteafd_loader::families::kimi_k3::core::CoreInventory, rows: usize, ranks: usize) -> Result<Self> {
+        let native = device.run(|| resolve_native_programs(programs, inventory, rows, ranks))?;
+        Self::load_resolved(device, cfg, programs, ffn_mode, cache_format, inventory, rows, ranks, &native)
+    }
+
+    pub(crate) fn load_resolved(device: Device<'a>, cfg: &KimiK3Config, programs: &'a Programs<'a>,
+        ffn_mode: cuteafd_ffi::KimiFfnMode, cache_format: cuteafd_core::MlaCacheFormat,
+        inventory: &cuteafd_loader::families::kimi_k3::core::CoreInventory, rows: usize, ranks: usize,
+        native: &cuteafd_loader::placement::planner::native_attention::NativePrograms) -> Result<Self> {
+        use cuteafd_loader::placement::planner::native_attention::NativeResolution;
         ensure!(matches!(ranks, 1 | 2), "Kimi native program physical rank count");
         ensure!(device.id >= 0 && std::ptr::eq(device.library, programs.library()),
             "Kimi programs and device must share their native library");
-        let packing_cap = coordinator_packing_cap(programs, !inventory.projections.is_empty(), rows)?;
+        ensure!(native.resolution == NativeResolution::Exact, "Kimi live native programs require exact manifest resolution");
+        let packing_cap = coordinator_packing_cap(programs, !inventory.projections.is_empty(), rows, &native.programs)?;
         device.run(|| {
             let heads = cfg.kda_heads / ranks;
             let kda = [KimiKda::load_heads(programs, 64, true, heads)?,
@@ -284,10 +305,13 @@ impl<'a> NativePrograms<'a> {
             let mla = [load_mla(48)?, load_mla(96)?];
             let scratch = NativeScratch::combine(kda.each_ref().map(|p| p.scratch_bytes()),
                 mla.iter().flat_map(|p| [p.decode.scratch_bytes(), p.verify.scratch_bytes(), p.extend.scratch_bytes()]))?;
+            let core = super::core_runtime::CorePrograms::load_for_ranks(programs, cfg, inventory, rows, cache_format, ranks)?;
+            ensure!(core.as_ref().map_or(0, |core| core.native_scratch) as u64 == native.fp8_scratch_bytes,
+                "Kimi runtime native scratch differs from exact shared manifest charge");
             Ok(Self { device, w8: W8::load_for_ranks(cfg, programs, ffn_mode, ranks)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
                 kda, commit: KimiKdaCommit::load_heads(programs, heads)?, mla, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
-                add: device.library.bf16_add()?, core:super::core_runtime::CorePrograms::load_for_ranks(programs,cfg,inventory,rows,cache_format,ranks)?, packing_cap, ranks, scratch,
+                add: device.library.bf16_add()?, core, packing_cap, ranks, scratch,
                 wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid::new(device.library.sm_count()?, None)? })
         })
     }
@@ -1864,7 +1888,7 @@ mod packing_inventory_tests {
             "native_input":"input", "native_program":"core", "output_program":"output",
             "grouped":{"groups":4, "max_rows":4096, "native_input":"input_g4",
                 "native_program":"core_g4", "output_program":"output_g4"}}]});
-        let catalogue = packing_inventory(Some(&core))?;
+        let catalogue = packing_inventory(Some(&core), &[])?;
         let inventory = classify_packing_inventory(catalogue.iter().map(|(name, _)| name.as_str()), &catalogue)?;
         let roles = inventory.iter().copied().collect::<BTreeMap<_, _>>();
         for name in ["kimik3_router_scores", "kimik3_ffn_gate_up_i16896", "kimik3_rmsnorm_h7168",
@@ -1889,6 +1913,36 @@ mod packing_inventory_tests {
         assert!(classify_packing_inventory(inventory.iter().map(|(name, _)| *name), &missing).is_err());
         assert!(!packing_program("glm_stage_router", true));
         assert!(!packing_program("dense_trellis_k6_core", false));
+        Ok(())
+    }
+
+    #[test]
+    fn native_packing_uses_only_resolver_selected_names() -> Result<()> {
+        use cuteafd_loader::families::{glm5_flash::core::NativeProjection,
+            kimi_k3::core::{CoreInventory, CoreSplit}};
+        for fp8 in [false, true] { for ranks in [1, 2] { for rows in [64, 2752] {
+            let core = CoreInventory { native: BTreeMap::from([
+                ("language_model.model.layers.0.self_attn.o_proj".into(),
+                    NativeProjection { shape: [7168, 12288], fp8, split: CoreSplit::Input }),
+                ("language_model.model.layers.3.self_attn.q_b_proj".into(),
+                    NativeProjection { shape: [18432, 1536], fp8, split: CoreSplit::Output }),
+            ]), ..Default::default() };
+            let native = core.native_programs(rows, ranks, None)?;
+            let catalogue = packing_inventory(None, &native.programs)?;
+            let classified = classify_packing_inventory(native.programs.iter().map(String::as_str), &catalogue)?;
+            assert_eq!(classified.len(), native.programs.len());
+            assert!(classified.iter().all(|(_, role)| *role == PackedRows));
+            assert!(native.programs.iter().all(|name| !packing_program(name, true)));
+            let unrelated = "native_attention_n8192_k4096_m64";
+            assert!(!catalogue.iter().any(|(name, _)| name == unrelated));
+            assert!(classify_packing_inventory(native.programs.iter().map(String::as_str)
+                .chain([unrelated]), &catalogue).is_err());
+            if fp8 {
+                let unselected = core.native_programs(if rows == 64 { 2752 } else { 64 }, ranks, None)?;
+                assert!(unselected.programs.iter().all(|name| !catalogue.iter().any(|(selected, _)| selected == name)));
+                assert_eq!(native.programs.iter().filter(|name| name.ends_with("_f32")).count(), usize::from(ranks == 2));
+            }
+        } } }
         Ok(())
     }
 }

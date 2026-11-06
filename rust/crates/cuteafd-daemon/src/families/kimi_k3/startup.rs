@@ -80,8 +80,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     // peer exchange, hop and Spark wave serves one unit.
     let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, options.waves,
         options.prefill_rows)?.unit_rows as usize;
-    let native = devices.iter().map(|&device| NativePrograms::load_for_ranks(device, full, programs, options.ffn_mode,
-        options.cache_format, &core, unit, RANKS).map(Rc::new)).collect::<Result<Vec<_>>>()?;
+    let native_exports = devices[0].run(|| super::device::resolve_native_programs(programs, &core, unit, RANKS))?;
+    let native = devices.iter().map(|&device| NativePrograms::load_resolved(device, full, programs, options.ffn_mode,
+        options.cache_format, &core, unit, RANKS, &native_exports).map(Rc::new)).collect::<Result<Vec<_>>>()?;
     let native: [_; RANKS] = native.try_into().map_err(|_| anyhow::anyhow!("Kimi native physical rank inventory"))?;
     ensure!(RANKS == 2 || !options.draft.as_ref().is_some_and(|draft| draft.tp2_dflash),
         "Kimi TP2 DFlash requires two physical coordinator GPUs");
