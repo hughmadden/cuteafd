@@ -167,7 +167,10 @@ def jobs(scope):
                    ["--geometry", "kimik3", "--only", ",".join([
                        "mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
                        "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
-                       "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"])]))
+                       "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64",
+                       "mla_draft_partial_full_m64", "mla_draft_partial_w4096_m64",
+                       "mla_draft_partial_full_fp8_m64", "mla_draft_partial_w4096_fp8_m64",
+                       "mla_draft_lse_combine2"])]))
     result.append(("kimi-residual", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "attn_res_c1_keep_append", "attn_res_c2_add_append",

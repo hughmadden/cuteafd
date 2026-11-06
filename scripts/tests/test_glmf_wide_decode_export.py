@@ -617,7 +617,7 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs
              if op in ("mla_producer", "mla_output", "dense_mla")}
-    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 7
+    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 11
     assert len(calls) == 2 * (3 * len({decode_rows, prefill_rows}) + 6)
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
@@ -674,7 +674,8 @@ def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(export
 @pytest.mark.parametrize("namespace", ["kimik3"])
 def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, namespace):
     ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/mla_draft.rs").read_text()
-    load = ffi.split("pub fn load(", 1)[1].split("pub fn scratch_bytes", 1)[0]
+    implementation = ffi.split("impl<'a> MlaDraft<'a> {", 1)[1]
+    load = implementation.split("pub fn load(", 1)[1].split("pub fn load_ml4(", 1)[0]
     requested = re.findall(r'programs\.program\(&format!\("([^"]+)"', load)
     assert len(requested) == 3
     catalog = {f"{namespace}_{stem}" for stem, *_ in

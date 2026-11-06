@@ -126,6 +126,7 @@ pub struct SparkOwner {
 /// One drafter owner whose extent grows with the retained pool.
 #[derive(Debug, Clone)]
 pub struct DraftOwner {
+    pub gpu: u8,
     pub category: Category,
     pub group: String,
     pub bytes_at_first: u64,
@@ -139,6 +140,7 @@ pub struct DraftOwner {
 /// transient is only the difference above them.
 #[derive(Debug, Clone)]
 pub struct Draft {
+    pub context_split: bool,
     pub owners: Vec<DraftOwner>,
     pub staging_at_first: u64,
     pub staging_per_page: u64,
@@ -202,40 +204,50 @@ pub fn whole_arenas(counts: &[usize], workspace: u64, parts: &[Bytes2])
 pub fn draft_facts(layout: &MlaDraftRuntimeLayout, page_rows: u64, maximum_pages: u64, gpu: u8)
     -> anyhow::Result<Draft> {
     use anyhow::Context;
-    let at = |pages: u64| -> anyhow::Result<(Vec<(String, Category, u64, u64)>, u64)> {
+    let multiple = if layout.context_split() && page_rows == 64 { 2 } else { 1 };
+    anyhow::ensure!(maximum_pages >= multiple, "Kimi draft pool cannot hold one physical pair");
+    let at = |pages: u64| -> anyhow::Result<(Vec<(u8, String, Category, u64, u64)>, u64)> {
         let tokens = page_rows.checked_mul(pages).context("Kimi draft pool overflow")?;
         let layout = layout.with_pool_tokens(usize::try_from(tokens).context("Kimi draft pool extent")?)?;
         let (demand, peak) = layout.demands(gpu)?;
-        Ok((demand.owned.into_iter().map(|d| (d.group, d.category, d.bytes, d.resident_weights.0)).collect(),
+        Ok((demand.owned.into_iter().map(|d| (d.gpu, d.group, d.category, d.bytes, d.resident_weights.0)).collect(),
             peak.bytes))
     };
-    let (one, peak_one) = at(1)?;
-    let (last, peak_last) = at(maximum_pages)?;
+    let last_page = maximum_pages / multiple * multiple;
+    let (one, peak_one) = at(multiple)?;
+    let (last, peak_last) = at(last_page)?;
     let step = |first: u64, end: u64| -> anyhow::Result<u64> {
-        if maximum_pages == 1 { return Ok(0); }
+        if last_page == multiple { return Ok(0); }
         let total = end.checked_sub(first).context("Kimi draft owner shrinks with the pool")?;
-        anyhow::ensure!(total % (maximum_pages - 1) == 0, "Kimi draft owner is not linear in pool pages");
-        Ok(total / (maximum_pages - 1))
+        anyhow::ensure!(total % (last_page - multiple) == 0, "Kimi draft owner is not linear in legal pool pages");
+        Ok(total / (last_page - multiple))
     };
-    if one.len() != last.len() || one.iter().zip(&last).any(|(a, b)| a.0 != b.0 || a.1 != b.1) {
+    if one.len() != last.len() || one.iter().zip(&last).any(|(a, b)| a.0 != b.0 || a.1 != b.1 || a.2 != b.2) {
         return Err(anyhow::anyhow!("Kimi draft owner set depends on the pool extent"));
     }
     // The load peak is the owners plus transient packing; charging the peak on
     // top of the owners would reserve the resident part twice.
-    let resident = |owners: &[(String, Category, u64, u64)]| -> anyhow::Result<u64> {
-        owners.iter().try_fold(0u64, |sum, owner| sum.checked_add(owner.2)
+    let resident = |owners: &[(u8, String, Category, u64, u64)]| -> anyhow::Result<u64> {
+        owners.iter().try_fold(0u64, |sum, owner| sum.checked_add(owner.3)
             .context("Kimi draft owner total overflow"))
     };
     let staging_one = peak_one.checked_sub(resident(&one)?)
         .context("Kimi draft load peak excludes its own owners")?;
     let staging_last = peak_last.checked_sub(resident(&last)?)
         .context("Kimi draft load peak excludes its own owners")?;
-    let owners = one.into_iter().zip(last).map(|((group, category, bytes, weights), (_, _, end, end_weights))| {
-        Ok(DraftOwner { category, group,
-            bytes_at_first: bytes, bytes_per_page: step(bytes, end)?,
-            weights_at_first: weights, weights_per_page: step(weights, end_weights)? })
+    let owners = one.into_iter().zip(last).map(|((gpu, group, category, bytes, weights), (_, _, _, end, end_weights))| {
+        let per_page = step(bytes, end)?;
+        let weights_per_page = step(weights, end_weights)?;
+        Ok(DraftOwner { gpu, category, group,
+            bytes_at_first: bytes.checked_sub(per_page * (multiple - 1)).context("Kimi draft owner intercept")?,
+            bytes_per_page: per_page,
+            weights_at_first: weights.checked_sub(weights_per_page * (multiple - 1)).context("Kimi draft weights intercept")?,
+            weights_per_page })
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(Draft { owners, staging_at_first: staging_one, staging_per_page: step(staging_one, staging_last)? })
+    let staging_per_page = step(staging_one, staging_last)?;
+    Ok(Draft { context_split: layout.context_split(), owners,
+        staging_at_first: staging_one.checked_sub(staging_per_page * (multiple - 1)).context("Kimi draft staging intercept")?,
+        staging_per_page })
 }
 
 /// Kimi's physical owners and finite domains. Every field is a resolved fact:
@@ -503,6 +515,9 @@ impl Recipe for KimiRecipe {
             LayerMode::HeadSplit | LayerMode::ContextSplit => self.gpus != 2,
             LayerMode::Whole { gpu, .. } => usize::from(*gpu) >= self.gpus,
         }) || self.fixed.iter().any(|owner| usize::from(owner.rank) >= self.gpus)
+            || self.draft.as_ref().is_some_and(|draft|
+                (draft.context_split && self.gpus != 2)
+                    || draft.owners.iter().any(|owner| usize::from(owner.gpu) >= self.gpus))
         {
             return Err(invalid("attention ownership or fixed owner rank"));
         }
@@ -515,7 +530,8 @@ impl Recipe for KimiRecipe {
                 decode: Some(request.spark_reply_formats.decode()),
             }),
             page_rows: self.page_rows(),
-            pool_page_multiple: 1,
+            pool_page_multiple: if self.draft.as_ref().is_some_and(|draft| draft.context_split)
+                && self.page_rows() == PAGE_ROWS { 2 } else { 1 },
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,
             variables: if self.gpus == 2 && self.placement == AttentionPlacement::Layers {
@@ -736,7 +752,7 @@ impl Recipe for KimiRecipe {
             let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
             for (index, owner) in draft.owners.iter().enumerate() {
                 let allocation = Allocation::buffer(format!("draft.{index}"),
-                    Location::coordinator(rank), owner.bytes_at_first, lifetime,
+                    Location::coordinator(owner.gpu), owner.bytes_at_first, lifetime,
                     owner.category, owner.group.clone());
                 if owner.weights_at_first > 0 || owner.weights_per_page > 0 {
                     contract.components.push(Component::resident_weight(
@@ -1022,6 +1038,37 @@ mod tests {
     fn zero_pool_pin_normalizes_like_omission() {
         assert_eq!(request_with(Some(0)).pool, request_with(None).pool);
         assert_ne!(request_with(Some(256)).pool, request_with(None).pool);
+    }
+
+    #[test]
+    fn context_draft_preserves_physical_homes_and_requires_whole_page_pairs() {
+        let mut recipe = recipe();
+        recipe.gpus = 2;
+        recipe.hop_spec.terminal = crate::placement::TerminalHome::Replicated;
+        recipe.records_per_page = vec![64; 2];
+        recipe.attention = vec![LayerMode::HeadSplit; 2];
+        recipe.layer_attention = vec![ModeBytes { whole: 100, split: [50; 2] }; 2];
+        recipe.experts = None;
+        recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
+        recipe.draft = Some(Draft { context_split: true, staging_at_first: 100,
+            staging_per_page: 0, owners: (0..2).map(|gpu| DraftOwner { gpu,
+                category: Category::Drafter, group: "physical draft cache".into(),
+                bytes_at_first: 32, bytes_per_page: 32, weights_at_first: 0,
+                weights_per_page: 0 }).collect() });
+        let budget = budgets(&[(1 << 30, 1 << 30); 2], 0, &[0; 2], &[]).unwrap();
+        let contract = recipe.prepare(&single()).unwrap();
+        assert_eq!(contract.pool_page_multiple, 2);
+        let admitted = recipe.admit(single(), budget.clone()).unwrap();
+        for rank in 0..2 {
+            let owners: Vec<_> = admitted.placement.items[rank].iter()
+                .filter(|owner| owner.group == "physical draft cache").collect();
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0].bytes, 128);
+        }
+        let request = |pool| Request { context: 128, ..request_with(Some(pool)) };
+        recipe.context = 128;
+        assert!(recipe.admit(request(192), budget.clone()).is_err());
+        assert_eq!(recipe.admit(request(128), budget).unwrap().solved.pool_tokens, 128);
     }
 
     #[test]

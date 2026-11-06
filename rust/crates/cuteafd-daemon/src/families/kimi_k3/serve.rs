@@ -45,7 +45,7 @@ pub(crate) struct ServeArgs {
     /// Opt in to a checkpoint-native MLA DFlash2 drafter.
     #[arg(long)] pub draft: Option<PathBuf>,
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub draft_fp8: bool,
-    /// Split DFlash over the target pair (pending Context draft exports).
+    /// Split the native draft cache and attention over both physical GPUs.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
@@ -88,7 +88,8 @@ impl ServeArgs {
     }
 
     fn validate(&self) -> Result<()> {
-        ensure!(!self.tp2_dflash, "Kimi TP2 DFlash requires draft Context attention exports");
+        ensure!(!self.tp2_dflash || (self.draft.is_some() && self.split_device.is_some()),
+            "Kimi TP2 DFlash requires a drafter and two coordinator devices");
         ensure!(self.device >= 0 && self.split_device.is_none_or(|peer| peer >= 0 && peer != self.device),
             "Kimi serving requires one device or two distinct coordinator devices");
         ensure!(self.peers.len() <= 8 && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == self.peers.len(),
@@ -113,7 +114,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
     slots: usize, marks: usize, prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan)
     -> Result<startup::Loaded<'a>> {
     let draft = args.draft.as_ref().map(|snapshot| super::draft::Options {
-        snapshot: snapshot.clone(), fp8: args.draft_fp8, cache_format: args.kv_cache });
+        snapshot: snapshot.clone(), fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache });
     startup::load(library, programs, checkpoint, cfg, cfg, startup::Options {
         expert_usage: args.expert_usage, expert_usage_reader: args.expert_usage_reader.clone(),
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib,
@@ -267,6 +268,7 @@ mod tests {
         let defaults = args(&[])?;
         assert!(defaults.draft.is_none());
         assert!(!defaults.draft_fp8);
+        assert!(!defaults.tp2_dflash);
         assert!(defaults.draft_fixed.is_none());
         for fp8 in ["false", "true"] {
             let selected = args(&["--draft", "/drafter", "--draft-fp8", fp8, "--draft-fixed", "7"])?;
@@ -274,11 +276,27 @@ mod tests {
             assert_eq!(selected.draft_fp8, fp8 == "true");
             assert_eq!(selected.draft_fixed, Some(7));
         }
+        for enabled in ["false", "true"] {
+            assert_eq!(args(&["--tp2-dflash", enabled])?.tp2_dflash, enabled == "true");
+        }
+        assert!(args(&["--tp2-dflash"]).is_err());
         assert!(args(&["--draft-fp8"]).is_err());
         assert!(args(&["--draft-fixed", "1"]).is_err());
         for depth in ["0", "8"] {
             assert!(args(&["--draft", "/drafter", "--draft-fixed", depth]).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn context_draft_validation_requires_drafter_and_physical_peer() -> Result<()> {
+        let base = ["--tp2-dflash", "true", "--peers", "127.0.0.1:8001"];
+        assert!(args(&base)?.validate().is_err());
+        let mut selected = base.to_vec();
+        selected.extend(["--draft", "/drafter"]);
+        assert!(args(&selected)?.validate().is_err());
+        selected.extend(["--split-device", "1"]);
+        args(&selected)?.validate()?;
         Ok(())
     }
 

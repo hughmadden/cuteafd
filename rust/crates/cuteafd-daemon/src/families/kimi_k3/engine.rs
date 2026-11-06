@@ -27,7 +27,7 @@ pub(crate) struct Engine<'a> {
     startup_captures: Cell<Option<u64>>,
     provisional: RefCell<Option<super::state::Provisional>>,
     hops: Option<HopLink<'a>>,
-    peer: Option<PeerExchange<'a>>,
+    peer: Option<Rc<PeerExchange<'a>>>,
     terminal: Cell<TerminalState>,
     // PeerExchange and HopLink borrow raw handles; keep their exact streams
     // after both links and their terminal abort storage have been released.
@@ -163,7 +163,7 @@ impl<'a> Engine<'a> {
         checkpoint: &cuteafd_loader::plan::Checkpoint,
         programs: [std::rc::Rc<super::device::NativePrograms<'a>>; RANKS],
         context_programs: [Option<Rc<super::context::Programs<'a>>>; RANKS],
-        peer: Option<PeerExchange<'a>>, hops: Option<HopLink<'a>>, peers: Vec<std::net::SocketAddr>,
+        peer: Option<Rc<PeerExchange<'a>>>, hops: Option<HopLink<'a>>, peers: Vec<std::net::SocketAddr>,
         config: cuteafd_transport::TcpTransportConfig,
         mut expert_modules: [Option<Vec<crate::shared::experts::exl3::execution::Exl3Modules<'a>>>; RANKS]) -> Result<Self> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
@@ -222,7 +222,7 @@ impl<'a> Engine<'a> {
             && (admission.context_layout().is_some() || context_programs.iter().all(Option::is_none)),
             "Kimi context programs differ from admitted storage");
         let context = if admission.context_layout().is_some() {
-            let peer = peer.as_ref().context("Kimi context missing ordinary peer abort owner")?;
+            let peer = peer.as_deref().context("Kimi context missing ordinary peer abort owner")?;
             Some(admission.allocate_context(library,
                 [lane_streams[0].clone(), lane_streams[1].clone()],
                 [peer.abort_word(0)?.context("Kimi context missing rank 0 abort word")?,
@@ -277,7 +277,7 @@ impl<'a> Engine<'a> {
     /// Bind only exact owners already allocated through Admission. No device
     /// allocations or program loading occur after this constructor returns.
     pub(crate) fn bind(exchange_streams: Vec<Rc<Stream<'a>>>,
-        plan: LayerExecutionPlan, peer: Option<PeerExchange<'a>>, hops: Option<HopLink<'a>>,
+        plan: LayerExecutionPlan, peer: Option<Rc<PeerExchange<'a>>>, hops: Option<HopLink<'a>>,
         local: Vec<Vec<LocalLane<'a>>>, routed: Vec<RoutedLane<'a>>,
         io: Vec<Vec<TokenIo<'a>>>,
         experts: Vec<Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>>,
@@ -298,7 +298,7 @@ impl<'a> Engine<'a> {
             }
         }
         let streams = local.iter().map(|ranks| ranks.iter().map(|local| local.stream().clone()).collect()).collect();
-        let execution = Execution::new(plan, peer.as_ref(), hops.as_ref(), exchange_streams.clone(), streams)?;
+        let execution = Execution::new(plan, peer.as_deref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         Ok(Self { host_prefix: None, max_pool_tokens_no_onboard: None, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
@@ -392,7 +392,7 @@ impl<'a> Engine<'a> {
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, io, experts } = &mut *lanes;
-            let normalized = self.execution.run_packed(scope, self.peer.as_ref(), self.hops.as_ref(),
+            let normalized = self.execution.run_packed(scope, self.peer.as_deref(), self.hops.as_ref(),
                 &mut local[0], &mut routed[0], &mut experts[0], &metadata, pool, self.draft.as_deref())?;
             drop(metadata);
             for (placement, tokens) in sequences.iter_mut() {
@@ -568,12 +568,12 @@ impl<'a> Engine<'a> {
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let result = if unit_call {
                 let units = self.prefill_units(rows)?;
-                self.execution.run_units(scope, self.peer.as_ref(), self.hops.as_ref(), &mut local[0],
+                self.execution.run_units(scope, self.peer.as_deref(), self.hops.as_ref(), &mut local[0],
                     &mut routed[0], &mut experts[0], &units, self.depth.waves, &metadata[0], pool,
                     self.draft.as_deref()).map(|output| vec![output])
             } else {
                 ensure!(rows <= self.prefill.unit_rows, "Kimi {rows}-row multi-sequence step exceeds one prefill unit");
-                self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
+                self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                     &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
                     super::layers::Output::Normalized, self.draft.as_deref(), Some(&self.draft_probe))
             };
@@ -653,7 +653,7 @@ impl<'a> Engine<'a> {
         let result = teardown(&mut Teardown {
             abort: || {
                 self.terminal.set(TerminalState::Aborting);
-                self.peer.as_ref().map_or(Ok(()), PeerExchange::publish_abort)
+                self.peer.as_deref().map_or(Ok(()), PeerExchange::publish_abort)
             },
             ranks: || {
                 if let Some(peer) = &self.peer { peer.drain_compute()?; }
@@ -713,7 +713,7 @@ impl<'a> Engine<'a> {
             for local in &mut lanes.local[0] { local.stage_attention(&sequences, pool)?; }
             lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, experts, .. } = &mut *lanes;
-            let outputs = self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
+            let outputs = self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                 &mut local[..1], &mut routed[..1], &mut experts[..1], &[tokens.len()], false,
                 super::layers::Output::Residual, None, None)?;
             let stream = local[0][self.head()].stream();
@@ -772,12 +772,12 @@ impl<'a> Engine<'a> {
             let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = if unit_call {
                 let units = self.prefill_units(rows[0])?;
-                vec![self.execution.run_units(scope, self.peer.as_ref(), self.hops.as_ref(), &mut local[0],
+                vec![self.execution.run_units(scope, self.peer.as_deref(), self.hops.as_ref(), &mut local[0],
                     &mut routed[0], &mut experts[0], &units, self.depth.waves, &sequences[0][0], pool, None)?]
             } else {
                 ensure!(rows.iter().sum::<usize>() <= self.prefill.unit_rows,
                     "Kimi multi-sequence diagnostic step exceeds one prefill unit");
-                self.execution.run(scope, self.peer.as_ref(), self.hops.as_ref(),
+                self.execution.run(scope, self.peer.as_deref(), self.hops.as_ref(),
                     &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
                     super::layers::Output::Normalized, None, None)?
             };

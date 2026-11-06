@@ -141,10 +141,12 @@ fn packing_inventory(core: Option<&serde_json::Value>) -> Result<Vec<(String, cr
     }
     // The drafter consumes each member's private context after packed target work.
     add("kimik3_mla_draft_output_m64".into(), SequenceLocal)?;
+    add("kimik3_mla_draft_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_mla_draft_producer{cache}_m64"), SequenceLocal)?;
         for mode in ["full", "w4096"] {
             add(format!("kimik3_mla_draft_attention_{mode}{cache}_m64"), SequenceLocal)?;
+            add(format!("kimik3_mla_draft_partial_{mode}{cache}_m64"), SequenceLocal)?;
         }
     }
     add("kimik3_attn_res_c1_keep_append".into(), PackedRows)?;
@@ -1757,6 +1759,27 @@ impl Ops for Pending {
 mod packing_inventory_tests {
     use super::*;
     use crate::shared::prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+
+    #[test]
+    fn context_draft_exports_are_sequence_local_in_both_target_inventories() -> Result<()> {
+        let draft = ["kimik3_mla_draft_partial_full_m64", "kimik3_mla_draft_partial_full_fp8_m64",
+            "kimik3_mla_draft_partial_w4096_m64", "kimik3_mla_draft_partial_w4096_fp8_m64",
+            "kimik3_mla_draft_lse_combine2"];
+        let core = serde_json::json!({"row_policies": []});
+        for metadata in [None, Some(&core)] {
+            let catalogue = packing_inventory(metadata)?;
+            let inventory = classify_packing_inventory(draft, &catalogue)?;
+            assert_eq!(inventory.len(), draft.len());
+            for (name, role) in inventory {
+                assert!(packing_program(name, metadata.is_some()));
+                assert_eq!(role, SequenceLocal, "{name}");
+                let missing = catalogue.iter().filter(|(entry, _)| entry != name)
+                    .cloned().collect::<Vec<_>>();
+                assert!(classify_packing_inventory(draft, &missing).is_err(), "{name}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn packed_coordinator_catalogue_classifies_k6_and_rejects_new_programs() -> Result<()> {

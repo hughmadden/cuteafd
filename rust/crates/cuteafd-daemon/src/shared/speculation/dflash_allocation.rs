@@ -69,7 +69,14 @@ impl DflashDrafter<'_> {
                 inventory.device("context.kv", context.kv.buffer)?;
                 inventory.device("context.slots", context.slots.buffer)?;
             }
-            DraftContext::Mla(context) => inventory.device("context.slots", context.slots.buffer)?,
+            DraftContext::Mla(context) => {
+                inventory.device("context.slots", context.slots.buffer)?;
+                if let Some(split) = &context.split {
+                    for (rank, name, buffer) in split.buffers() {
+                        inventory.device(&format!("context.{rank}.{name}"), buffer)?;
+                    }
+                }
+            }
         }
         if let Some(workspace) = self.workspace.try_borrow()?.as_ref() {
             for (name, owner) in [("h", &workspace.h), ("n", &workspace.n), ("delta", &workspace.delta),
@@ -104,6 +111,18 @@ impl DflashDrafter<'_> {
                     }
                     if let Some(owner) = &workspace.q_residual {
                         inventory.device("workspace.attention.q_residual", owner.buffer)?;
+                    }
+                }
+            }
+        }
+        if let DraftContext::Mla(context) = &self.context {
+            if let Some(split) = &context.split {
+                for (rank, stream) in split.exchange_streams().enumerate() {
+                    let first = inventory.receipts.len();
+                    inventory.ordered_uploads(self.library, stream.raw)?;
+                    // Staging is keyed by destination AND stream, not destination alone.
+                    for receipt in &mut inventory.receipts[first..] {
+                        receipt.allocation.id.push_str(&format!(".exchange.{rank}"));
                     }
                 }
             }

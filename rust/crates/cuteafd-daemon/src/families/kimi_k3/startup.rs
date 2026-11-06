@@ -83,6 +83,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let native = devices.iter().map(|&device| NativePrograms::load_for_ranks(device, full, programs, options.ffn_mode,
         options.cache_format, &core, unit, RANKS).map(Rc::new)).collect::<Result<Vec<_>>>()?;
     let native: [_; RANKS] = native.try_into().map_err(|_| anyhow::anyhow!("Kimi native physical rank inventory"))?;
+    ensure!(RANKS == 2 || !options.draft.as_ref().is_some_and(|draft| draft.tp2_dflash),
+        "Kimi TP2 DFlash requires two physical coordinator GPUs");
     let draft_layout = options.draft.as_ref().map(|draft| devices[head].run(||
         draft.layout(options.slots, options.max_context, library.sm_count()?))).transpose()?;
     // Resolve native modules before the measured baseline, while retaining their handles.
@@ -91,6 +93,14 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
             MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
     })).transpose()?;
+    let _draft_context_modules = if draft_layout.as_ref().is_some_and(|layout| layout.context_split()) {
+        use cuteafd_ffi::mla_draft::{MlaDraftPartial, MlaDraftCombine, MlaDraftWindow};
+        let partials = devices.iter().map(|device| device.run(|| Ok([
+            MlaDraftPartial::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
+            MlaDraftPartial::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])))
+            .collect::<Result<Vec<_>>>()?;
+        Some((partials, devices[head].run(|| Ok(MlaDraftCombine::load(programs, "kimik3")?))?))
+    } else { None };
     let spark_budget_gib = options.spark_budget_gib.unwrap_or(
         cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES as f64 / (1u64 << 30) as f64);
     ensure!(spark_budget_gib.is_finite() && spark_budget_gib > 0.0
@@ -223,7 +233,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             unit.min(64) * plan.spec().row_bytes as usize))?;
         hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
             peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
-        (Some(peer), Some(hops))
+        (Some(Rc::new(peer)), Some(hops))
     } else { (None, None) };
     let lane_streams: [_; RANKS] = devices.iter().map(|&device| Stream::new(device).map(Rc::new))
         .collect::<Result<Vec<_>>>()?.try_into().map_err(|_| anyhow::anyhow!("Kimi lane stream count"))?;
@@ -232,7 +242,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&checkpoint.snapshot)?
             == crate::shared::experts::rtx::push::PushPolicy::Required)?;
     let draft = options.draft.as_ref().zip(draft_layout.as_ref()).map(|(options, layout)|
-        super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout)).transpose()?;
+        super::draft::NativeDraft::load_for_ranks(&mut admitted, programs, options, lane_streams.to_vec(), layout,
+            peer.as_ref().map(|peer| ([streams[0].clone(), streams[1].clone()], peer.clone())))).transpose()?;
     let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
     let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?;

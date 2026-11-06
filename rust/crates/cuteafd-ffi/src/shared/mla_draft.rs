@@ -16,6 +16,8 @@ const PRODUCER: &[&str] = &["x", "kv_slots", "positions", "inv_freq", "w_qkv_a",
 const ATTENTION: &[&str] = &["query", "kv_cache", "page_table", "cache_seqlens", "cu_seqlens_q",
     "attn", "lse", "scratch"];
 const OUTPUT: &[&str] = &["attn", "w_uv", "w_o", "out", "scratch"];
+const PARTIAL: &[&str] = &["query", "kv_cache", "page_table", "visible_intervals", "cu_seqlens_q",
+    "attn", "lse", "scratch"];
 /// Mistral Large 4's mtp_dspark producer (no q-LoRA; RoPE through a unit query scale).
 const ML4_PRODUCER: &[&str] = &["x", "kv_slots", "positions", "cos_sin", "unit_s", "unit_b", "w_q", "w_kv_a",
     "kv_a_norm", "w_uk", "kv_cache", "query", "scratch"];
@@ -94,6 +96,59 @@ impl MlaDraftWindow {
     }
 }
 
+/// Both normalized h64 partials already reside on the lead GPU. Their order is
+/// physical GPU 0, then GPU 1; the no-sink base2 merge is checkpoint-independent.
+#[derive(Clone, Copy, Debug)]
+pub struct MlaDraftCombineBatch {
+    pub rows: usize,
+    pub partial: [Buffer; 2],
+    pub lse: [Buffer; 2],
+    pub sink: Buffer,
+    pub output: Buffer,
+}
+
+pub struct MlaDraftCombine<'a> { program: Program<'a> }
+
+impl<'a> MlaDraftCombine<'a> {
+    pub fn load(programs: &'a Programs<'a>, namespace: &str) -> Result<Self> {
+        let name = format!("{namespace}_mla_draft_lse_combine2");
+        validate_combine_manifest(programs.spec(&name)?)?;
+        Ok(Self { program: programs.program(&name, &["o0", "l0", "o1", "l1", "sink", "out"])? })
+    }
+
+    pub fn check(&self, batch: MlaDraftCombineBatch) -> Result<()> {
+        validate_combine_batch(batch)
+    }
+
+    pub fn launch(&self, batch: MlaDraftCombineBatch, stream: *mut c_void) -> Result<()> {
+        self.check(batch)?;
+        // SAFETY: disjoint checked rank-local extents survive the ordered merge.
+        unsafe { self.program.launch(&[batch.partial[0].ptr, batch.lse[0].ptr,
+            batch.partial[1].ptr, batch.lse[1].ptr, batch.sink.ptr, batch.output.ptr],
+            &[Scalar::I32(batch.rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_combine_manifest(spec: &ProgramSpec) -> Result<()> {
+    if spec.scalar_kinds != b"i" || !spec.scratch.is_empty()
+        || spec.geometry["heads"].as_u64() != Some(64)
+        || spec.geometry["has_sink"].as_bool() != Some(false)
+        || !spec.pointers.iter().map(String::as_str).eq(["o0", "l0", "o1", "l1", "sink", "out"]) {
+        return Err(MlaDraftError::Invalid("h64 no-sink combine ABI"));
+    }
+    Ok(())
+}
+
+fn validate_combine_batch(batch: MlaDraftCombineBatch) -> Result<()> {
+    if !(1..=ROWS).contains(&batch.rows) { return Err(MlaDraftError::Invalid("combine rows")); }
+    let attention = batch.rows * HEADS * 512 * 2;
+    let lse = batch.rows * HEADS * 4;
+    validate_buffers(&[(batch.partial[0], attention), (batch.lse[0], lse),
+        (batch.partial[1], attention), (batch.lse[1], lse), (batch.sink, HEADS * 4),
+        (batch.output, attention)], batch.output.device_id)
+}
+
 /// BF16 low-rank operands. Unlike the target, draft output has no gate.
 /// DFlash2 fills every field; mtp_dspark has no q-LoRA: `qkv_a` holds `wq`,
 /// `q_b` holds `wkv_a_with_mqa`, `q_a_norm` the unit query-scale vectors
@@ -117,6 +172,103 @@ pub struct MlaDraftBatch {
     pub query: Buffer, pub q_resid: Buffer, pub attention: Buffer, pub lse: Buffer,
     pub output: Buffer, pub producer_scratch: Buffer, pub attention_scratch: Buffer,
     pub output_scratch: Buffer,
+}
+
+/// One query per request, against a compact stream of context-owned latent pages.
+/// The caller validates interval contents, page IDs and `[0, 1, ... rows]` offsets
+/// before staging; global window masking precedes global-to-owned mapping.
+#[derive(Clone, Copy, Debug)]
+pub struct MlaDraftPartialBatch {
+    pub rows: usize, pub page_table_width: usize, pub cache_pages: usize,
+    pub active_splits: usize, pub attention_scale: f32,
+    pub query: Buffer, pub cache: Buffer, pub page_table: Buffer,
+    pub intervals: Buffer, pub query_offsets: Buffer,
+    pub attention: Buffer, pub lse: Buffer, pub scratch: Buffer,
+}
+
+/// All h64 normalized partials with base2 LSE, not a target head shard.
+pub struct MlaDraftPartial<'a> {
+    program: Program<'a>, context: usize, cache_format: MlaCacheFormat,
+}
+
+impl<'a> MlaDraftPartial<'a> {
+    pub fn load(programs: &'a Programs<'a>, namespace: &str, window: MlaDraftWindow,
+        cache_format: MlaCacheFormat) -> Result<Self> {
+        let program = programs.program(&format!("{namespace}_mla_draft_partial_{}{}_m64",
+            window.suffix(), cache_format.program_suffix()), PARTIAL)?;
+        let context = validate_partial_manifest(program.spec(), window, cache_format)?;
+        Ok(Self { program, context, cache_format })
+    }
+
+    pub fn max_context(&self) -> usize { self.context }
+
+    pub fn scratch_bytes(rows: usize) -> Result<usize> {
+        if !(1..=ROWS).contains(&rows) { return Err(MlaDraftError::Invalid("partial rows")); }
+        let entries = rows * HEADS * 16;
+        Ok((entries * 512 * 2).next_multiple_of(1024) + entries * 4)
+    }
+
+    pub fn check(&self, batch: MlaDraftPartialBatch) -> Result<()> {
+        validate_partial_batch(batch, self.context, self.cache_format)
+    }
+
+    pub fn launch(&self, b: MlaDraftPartialBatch, stream: *mut c_void) -> Result<()> {
+        self.check(b)?;
+        // SAFETY: checked disjoint, device-local live buffers and scalar bounds;
+        // the owner stages validated metadata and retains storage through drain.
+        unsafe {
+            self.program.launch(&[b.query.ptr, b.cache.ptr, b.page_table.ptr, b.intervals.ptr,
+                b.query_offsets.ptr, b.attention.ptr, b.lse.ptr, b.scratch.ptr],
+                &[Scalar::I32(b.rows as i32), Scalar::I64(b.page_table_width as i64),
+                  Scalar::I32(b.active_splits as i32), Scalar::F32(b.attention_scale)], stream)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_partial_manifest(spec: &ProgramSpec, window: MlaDraftWindow,
+    cache_format: MlaCacheFormat) -> Result<usize> {
+    let g = &spec.geometry;
+    if !matches!(window, MlaDraftWindow::Full | MlaDraftWindow::Sliding4096)
+        || spec.capacity_rows as usize != ROWS || spec.scalar_kinds != b"ilif"
+        || !spec.pointers.iter().map(String::as_str).eq(PARTIAL.iter().copied())
+        || g["name"].as_str() != Some("mla_block_draft")
+        || g["kv_cache"].as_str() != Some(cache_format.label())
+        || g["norm_eps"].as_f64() != Some(1e-5)
+        || g["explicit_intervals"].as_bool() != Some(true)
+        || g["runtime_attention_scale"].as_bool() != Some(true)
+        || g["runtime_splits"].as_bool() != Some(true)
+        || g["lse_base"].as_u64() != Some(2)
+        || g["num_splits"].as_u64() != Some(16)
+        || g["max_rows"].as_u64() != Some(ROWS as u64)
+        || [ ("heads", 64), ("hidden", 7168), ("q_lora_rank", 1536), ("kv_lora_rank", 512),
+            ("qk_nope_dim", 128), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64)]
+            .iter().any(|&(key, n)| g[key].as_u64() != Some(n))
+        || match window.rows() { Some(n) => g["window_size"].as_u64() != Some(n),
+            None => !g["window_size"].is_null() }
+        || spec.scratch.len() != 1
+        || spec.scratch.get("scratch").copied() != Some(MlaDraftPartial::scratch_bytes(ROWS)? as u64) {
+        return Err(MlaDraftError::Invalid("partial manifest geometry/ABI/base2 contract"));
+    }
+    g["max_context"].as_u64().filter(|&n| n > 0 && n <= 1048576)
+        .map(|n| n as usize).ok_or(MlaDraftError::Invalid("partial context"))
+}
+
+fn validate_partial_batch(b: MlaDraftPartialBatch, context: usize, cache_format: MlaCacheFormat) -> Result<()> {
+    let scratch = MlaDraftPartial::scratch_bytes(b.rows)?;
+    if context == 0 || context > 1048576 || b.page_table_width == 0
+        || b.page_table_width > context.div_ceil(PAGE) + 1
+        || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize
+        || !(2..=16).contains(&b.active_splits) || !b.active_splits.is_power_of_two()
+        || !b.attention_scale.is_finite() || b.attention_scale <= 0.0 {
+        return Err(MlaDraftError::Invalid("partial context/splits/scale"));
+    }
+    let cache = b.cache_pages.checked_mul(PAGE * cache_format.record_bytes())
+        .ok_or(MlaDraftError::Invalid("partial cache extent overflow"))?;
+    validate_buffers(&[(b.query, b.rows * HEADS * 576 * 2), (b.cache, cache),
+        (b.page_table, b.rows * b.page_table_width * 4), (b.intervals, b.rows * 2 * 4),
+        (b.query_offsets, (b.rows + 1) * 4), (b.attention, b.rows * HEADS * 512 * 2),
+        (b.lse, b.rows * HEADS * 4), (b.scratch, scratch)], b.query.device_id)
 }
 
 /// Native noncausal block attention with checkpoint-supplied YaRN scales.
@@ -187,6 +339,27 @@ impl<'a> MlaDraft<'a> {
                     b.cache.ptr, b.query.ptr, b.producer_scratch.ptr],
                     &[Scalar::I32(b.rows as i32)], stream)?;
             },
+        }
+        Ok(())
+    }
+
+    /// Validate the final projection before a Context producer mutates cache.
+    pub fn check_output(&self, w: MlaDraftWeights, b: MlaDraftBatch) -> Result<()> {
+        let hidden = self.kind.hidden();
+        if !(1..=ROWS).contains(&b.rows) { return Err(MlaDraftError::Invalid("output rows")); }
+        validate_buffers(&[(b.attention, b.rows * HEADS * 512 * 2),
+            (w.uv, HEADS * 128 * 512 * 2), (w.output, hidden * HEADS * 128 * 2),
+            (b.output, b.rows * hidden * 2), (b.output_scratch, self.layout.scratch[2])], b.output.device_id)
+    }
+
+    /// Apply the output projection after Context partials have been LSE-combined.
+    pub fn output(&self, w: MlaDraftWeights, b: MlaDraftBatch, stream: *mut c_void) -> Result<()> {
+        self.check_output(w, b)?;
+        // SAFETY: checked rank-local live extents; caller orders the combined
+        // attention producer before this projection and retains every owner.
+        unsafe {
+            self.output.launch(&[b.attention.ptr, w.uv.ptr, w.output.ptr, b.output.ptr,
+                b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?;
         }
         Ok(())
     }
@@ -484,6 +657,73 @@ mod tests {
     }
 
     #[test]
+    fn draft_context_partial_checks_distinct_interval_and_base2_contract() {
+        for window in [MlaDraftWindow::Full, MlaDraftWindow::Sliding4096] {
+            for cache in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                let mut spec = specs(window, 1048576)[1].clone();
+                spec.pointers = PARTIAL.iter().map(|s| s.to_string()).collect();
+                spec.scalar_kinds = b"ilif".to_vec();
+                for (key, value) in [("explicit_intervals", true.into()), ("runtime_attention_scale", true.into()),
+                    ("runtime_splits", true.into()), ("lse_base", 2.into()), ("max_rows", 64.into()),
+                    ("kv_cache", cache.label().into())] { spec.geometry[key] = value; }
+                spec.scratch.insert("scratch".into(), MlaDraftPartial::scratch_bytes(64).unwrap() as u64);
+                assert_eq!(validate_partial_manifest(&spec, window, cache).unwrap(), 1048576);
+                for (key, value) in [("explicit_intervals", false.into()), ("runtime_attention_scale", false.into()),
+                    ("runtime_splits", false.into()), ("lse_base", 0.into()), ("heads", 48.into()),
+                    ("max_context", 0.into()), ("num_splits", 8.into()), ("max_rows", 4096.into())] {
+                    let mut bad = spec.clone(); bad.geometry[key] = value;
+                    assert!(validate_partial_manifest(&bad, window, cache).is_err(), "{key}");
+                }
+                let mut bad = spec.clone(); bad.scalar_kinds = b"iilif".to_vec();
+                assert!(validate_partial_manifest(&bad, window, cache).is_err());
+                let mut bad = spec.clone(); bad.pointers[3] = "cache_seqlens".into();
+                assert!(validate_partial_manifest(&bad, window, cache).is_err());
+                let mut bad = spec.clone(); bad.scratch.insert("scratch".into(), 256);
+                assert!(validate_partial_manifest(&bad, window, cache).is_err());
+                assert!(validate_partial_manifest(&spec, MlaDraftWindow::BlockAnchored2048, cache).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn draft_context_partial_checks_all_live_buffers_and_bounded_scalars() {
+        let (_, b, _) = fixture();
+        let good = MlaDraftPartialBatch { rows: 64, page_table_width: 66, cache_pages: 520,
+            active_splits: 8, attention_scale: 0.037, query: b.query, cache: b.cache,
+            page_table: b.page_table, intervals: b.lengths, query_offsets: b.query_offsets,
+            attention: b.attention, lse: b.lse, scratch: b.attention_scratch };
+        for cache in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            validate_partial_batch(good, 1048576, cache).unwrap();
+            for rows in [0, 65, usize::MAX] {
+                assert!(validate_partial_batch(MlaDraftPartialBatch { rows, ..good }, 1048576, cache).is_err());
+            }
+            for splits in [0, 1, 3, 17, usize::MAX] {
+                assert!(validate_partial_batch(MlaDraftPartialBatch { active_splits: splits, ..good }, 1048576, cache).is_err());
+            }
+            for scale in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+                assert!(validate_partial_batch(MlaDraftPartialBatch { attention_scale: scale, ..good }, 1048576, cache).is_err());
+            }
+            let fields: [fn(&mut MlaDraftPartialBatch) -> &mut Buffer; 8] = [|b| &mut b.query,
+                |b| &mut b.cache, |b| &mut b.page_table, |b| &mut b.intervals,
+                |b| &mut b.query_offsets, |b| &mut b.attention, |b| &mut b.lse, |b| &mut b.scratch];
+            for field in fields {
+                for defect in 0..5 {
+                    let mut bad = good;
+                    match defect { 0 => field(&mut bad).bytes = 0, 1 => field(&mut bad).device_id = 0,
+                        2 => field(&mut bad).ptr = 1usize as *mut c_void,
+                        3 => field(&mut bad).ptr = std::ptr::null_mut(),
+                        _ => {
+                            let pointer = field(&mut bad).ptr;
+                            field(&mut bad).ptr = if pointer == good.query.ptr { good.scratch.ptr } else { good.query.ptr };
+                        } }
+                    assert!(validate_partial_batch(bad, 1048576, cache).is_err());
+                }
+            }
+        }
+        assert_eq!(MlaDraftPartial::scratch_bytes(64).unwrap(), 67371008);
+    }
+
+    #[test]
     fn compact_draft_manifest_rejects_mixed_records() {
         for window in [MlaDraftWindow::Full, MlaDraftWindow::Sliding4096] {
             let mut compact = specs(window, 524288);
@@ -578,6 +818,32 @@ mod tests {
         assert!(validate_manifest(good.each_ref(), MlaDraftWindow::BlockAnchored2048, MlaCacheFormat::Fp8).is_err());
         let kimi = specs(MlaDraftWindow::Sliding4096, 1048576);
         assert!(validate_ml4_manifest(kimi.each_ref()).is_err());
+    }
+
+    #[test]
+    fn context_combine_checks_h64_no_sink_and_rank_local_disjoint_extents() {
+        let spec = ProgramSpec { name: "kimik3_mla_draft_lse_combine2".into(),
+            capacity_rows: 64, geometry: serde_json::json!({"heads":64,"has_sink":false}),
+            pointers: ["o0", "l0", "o1", "l1", "sink", "out"].map(str::to_owned).to_vec(),
+            scalar_kinds: b"i".to_vec(), scratch: Default::default() };
+        validate_combine_manifest(&spec).unwrap();
+        for (key, value) in [("heads", serde_json::json!(48)), ("has_sink", true.into())] {
+            let mut wrong = spec.clone(); wrong.geometry[key] = value;
+            assert!(validate_combine_manifest(&wrong).is_err());
+        }
+        let (_, b, _) = fixture();
+        let good = MlaDraftCombineBatch { rows: 64, partial: [b.attention, b.query],
+            lse: [b.lse, b.lengths], sink: b.slots, output: b.output };
+        validate_combine_batch(good).unwrap();
+        for rows in [0, 65, usize::MAX] {
+            assert!(validate_combine_batch(MlaDraftCombineBatch { rows, ..good }).is_err());
+        }
+        let mut wrong = good; wrong.partial[0] = wrong.output;
+        assert!(validate_combine_batch(wrong).is_err());
+        let mut wrong = good; wrong.lse[1].device_id = 0;
+        assert!(validate_combine_batch(wrong).is_err());
+        let mut wrong = good; wrong.output.bytes = 64 * 64 * 512 * 2 - 1;
+        assert!(validate_combine_batch(wrong).is_err());
     }
 
     fn fixture() -> (MlaDraftWeights, MlaDraftBatch, Layout) {

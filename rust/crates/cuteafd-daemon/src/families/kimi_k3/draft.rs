@@ -13,6 +13,7 @@ use std::{cell::{Cell, RefCell}, path::PathBuf, rc::Rc};
 pub(crate) struct Options {
     pub snapshot: PathBuf,
     pub fp8: bool,
+    pub tp2_dflash: bool,
     pub cache_format: cuteafd_core::MlaCacheFormat,
 }
 
@@ -27,7 +28,7 @@ impl Options {
     pub(crate) fn layout(&self, slots: usize, context: usize, sms: usize) -> Result<MlaDraftRuntimeLayout> {
         let cfg = MlaDflashConfig::read(&self.snapshot)?;
         cfg.runtime_layout(self.representation(), GlmDraftCapacity::new(slots, slots.min(8), cfg.block)?,
-            context, slots.checked_mul(context).context("draft pool overflow")?, sms, Fp8Rows::W8a16.code() as u8, self.cache_format).map_err(Into::into)
+            context, slots.checked_mul(context).context("draft pool overflow")?, sms, Fp8Rows::W8a16.code() as u8, self.cache_format)?.with_context_split(self.tp2_dflash).map_err(Into::into)
     }
 }
 
@@ -135,12 +136,13 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn load(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: [Rc<Stream<'a>>; 2],
         layout: &MlaDraftRuntimeLayout) -> Result<Self> {
-        Self::load_for_ranks(admission, programs, options, streams.to_vec(), layout)
+        Self::load_for_ranks(admission, programs, options, streams.to_vec(), layout, None)
     }
 
     pub(crate) fn load_for_ranks(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: Vec<Rc<Stream<'a>>>,
-        layout: &MlaDraftRuntimeLayout) -> Result<Self> {
+        layout: &MlaDraftRuntimeLayout,
+        exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>) -> Result<Self> {
         ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
         ensure!(matches!(streams.len(), 1 | 2)
             && (streams.len() == 1 || streams[0].device.id != streams[1].device.id),
@@ -160,7 +162,7 @@ impl<'a> NativeDraft<'a> {
         let file = if crate::shared::experts::rtx::dense::is_recording() { Vec::new() }
             else { std::fs::read(options.snapshot.join("model.safetensors"))? };
         let draft = admission.allocate_draft(bridge.stream().device, programs, &options.snapshot, file,
-            bridge.stream().raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16)?;
+            bridge.stream().raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16, exchange)?;
         let demands = cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(
             layout, admission.lane_rows(), streams.len())?;
         let device = streams[0].device;
@@ -374,7 +376,7 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn drafts(&self) -> usize { self.owners.draft.cfg.drafts() }
     pub(crate) fn require_live(&self) -> Result<()> { self.bridge.require_live() }
     pub(crate) fn abort(&self) -> Result<()> { self.bridge.abort() }
-    pub(crate) fn drain(&self) -> Result<()> { self.bridge.synchronize() }
+    pub(crate) fn drain(&self) -> Result<()> { self.bridge.synchronize()?; self.common().drain_mla() }
     pub(crate) fn finish_terminal(&self, drained: bool) { self.bridge.finish_terminal(drained); }
 
     pub(crate) fn propose(&self, sequences: &[DraftSeq]) -> Result<Vec<Draft>> {
@@ -542,7 +544,7 @@ mod tests {
 
     #[test]
     fn precision_is_one_explicit_resident_representation() {
-        let options = Options { snapshot: PathBuf::new(), fp8: false, cache_format: Default::default() };
+        let options = Options { snapshot: PathBuf::new(), fp8: false, cache_format: Default::default(), tp2_dflash: false };
         assert_eq!(options.representation(), GlmDraftRepresentation::Bf16Only);
         assert_eq!(Options { fp8: true, ..options }.representation(), GlmDraftRepresentation::Fp8Only);
     }
@@ -589,7 +591,7 @@ mod tests {
             spark_budget_gib: Some(110.), rows: 2048, waves: 2, prefill_rows: Some(1024),
             slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false,
             ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true, cache_format }), verify_rows: 0, prefix: None,
+            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash: false, cache_format }), verify_rows: 0, prefix: None,
         })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;
@@ -658,6 +660,7 @@ mod tests {
         let peers = env("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
             .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let cache_format = std::env::var("CUTEAFD_KIMI_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse().map_err(anyhow::Error::msg)?;
+        let tp2_dflash = std::env::var("CUTEAFD_KIMI_TP2_DFLASH").unwrap_or_else(|_| "false".into()).parse::<bool>()?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         cfg.release_geometry()?;
@@ -676,7 +679,7 @@ mod tests {
             rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true, cache_format }), verify_rows: 0, prefix: None,
+            draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash, cache_format }), verify_rows: 0, prefix: None,
         })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;
