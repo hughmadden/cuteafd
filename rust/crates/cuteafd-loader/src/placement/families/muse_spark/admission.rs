@@ -398,8 +398,23 @@ impl<'a> ProductionInput<'a> {
                     lifetime: Lifetime::RESIDENT, assumed: true,
                     source: "Muse estimated first-use CUDA/module/allocator growth: 160 MiB above 148052028 B smoke residual (#1326)".into() }) });
             let layer = layouts.iter().try_fold(0u64, |sum, ranks| {
-                sum.checked_add(ranks[gpu].bytes()? as u64).context("Muse layer bytes overflow")
+                let native = ranks[gpu].native.values().try_fold(0u64, |sum, layout|
+                    layout.bytes().and_then(|bytes| sum.checked_add(bytes).context("Muse native bytes overflow")))?;
+                sum.checked_add(ranks[gpu].bytes()? as u64 - native).context("Muse layer bytes overflow")
             }).map_err(anyhow_refusal)?;
+            let mount = crate::families::muse_spark::weight_layout::native_mount_load(
+                layouts.iter().flat_map(|ranks| ranks[gpu].native.values())).map_err(anyhow_refusal)?;
+            for (layer, ranks) in layouts.iter().enumerate() {
+                for (name, native) in &ranks[gpu].native {
+                    let bytes = native.bytes().map_err(anyhow_refusal)?;
+                    components.extend(weights(format!("muse.native.{gpu}.{layer}.{name}"), location,
+                        bytes, bytes, Category::Weights, "Muse native attention values and block scales", maximum_pages)?);
+                }
+            }
+            for owner in mount.allocations(&format!("muse.native.load.{gpu}")) {
+                let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+                components.push(Component::allocation(owner, bytes, false, maximum_pages));
+            }
             components.extend(weights(format!("muse.layer_weights.{gpu}"), location, layer, layer,
                 Category::Weights,
                 "layer weights (head-split attention; MoE projections, router, norms, residual gates whole)",

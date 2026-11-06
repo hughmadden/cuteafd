@@ -193,7 +193,8 @@ pub(crate) struct NativeWeights<'a> {
 
 impl<'a> LayerWeights<'a> {
     fn load(device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &MuseSparkConfig,
-        layer: usize, rank: usize, ranks: usize, layout: &LayerLayout, dense: &DenseLoad<'a>) -> Result<Self> {
+        layer: usize, rank: usize, ranks: usize, layout: &LayerLayout, dense: &DenseLoad<'a>,
+        native_load: &DenseLoad<'a>) -> Result<Self> {
         let recipe = layer_rects(checkpoint, cfg, layer, rank, ranks, layout)?;
         let mut operands = BTreeMap::new();
         for (name, rect) in recipe {
@@ -230,8 +231,8 @@ impl<'a> LayerWeights<'a> {
                 crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
                 scales.as_ref().map(|scales| scales.buffer))? {
                 match record {
-                    AttentionRecord::Operand(operand) => dense.operand(operand)?,
-                    AttentionRecord::Step(step) => dense.step(step, std::ptr::null_mut())?,
+                    AttentionRecord::Operand(operand) => native_load.operand(operand)?,
+                    AttentionRecord::Step(step) => native_load.step(step, std::ptr::null_mut())?,
                 }
             }
             Ok((name, NativeWeights { layout: layout.clone(), values, scales }))
@@ -282,9 +283,12 @@ pub(crate) fn load_rank<'a>(device: Device<'a>, cfg: &MuseSparkConfig, checkpoin
     let ranks = layouts.first().map_or(0, Vec::len);
     ensure!(layouts.len() == cfg.layers && rank < ranks, "Muse rank {rank} of {ranks} over {} layers", layouts.len());
     let dense = DenseLoad::mount(device.library);
+    let native_load = DenseLoad::mount(device.library);
+    native_load.admit_mount(cuteafd_loader::families::muse_spark::weight_layout::native_mount_load(
+        layouts.iter().flat_map(|per_rank| per_rank[rank].native.values()))?)?;
     layouts.iter().enumerate().map(|(layer, per_rank)| {
         let layout = &per_rank[rank];
-        LayerWeights::load(device, checkpoint, cfg, layer, rank, ranks, layout, &dense)
+        LayerWeights::load(device, checkpoint, cfg, layer, rank, ranks, layout, &dense, &native_load)
             .with_context(|| format!("Muse layer {layer} rank {rank}"))
     }).collect()
 }
@@ -343,6 +347,66 @@ mod tests {
         checkpoint.weight_map.insert(format!("{PREFIX}0.self_attn.q_proj.weight"), "wrong.safetensors".into());
         let layout = LayerLayout::ranks(&cfg, 0, 1, &inventory)?.remove(0);
         assert!(layer_rects(&checkpoint, &cfg, 0, 0, 1, &layout).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_attention_records_match_mode_residency_and_admitted_load() -> Result<()> {
+        use cuteafd_loader::{families::muse_spark::core::{CoreSplit, NativeLayout},
+            plan::{checkpoint::{AttentionMode, CheckpointView}, testing, Checkpoint}};
+        use super::super::super::glm5_flash::weights::{attention_records, AttentionRecord};
+        let dir = tempfile::tempdir()?;
+        let stem = format!("{PREFIX}0.self_attn.o_proj");
+        let mut config = testing::muse_spark_config();
+        config["quantization_config"] = serde_json::json!({"quant_method":"exl3"});
+        testing::write_snapshot(dir.path(), &config,
+            &[testing::t(format!("{stem}.weight"), "BF16", &[8192, 8192])], None);
+        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let checkpoint = Checkpoint::open_view(&view)?;
+            let selected = checkpoint.projection(&stem)?;
+            for ranks in [1, 2] {
+                for rank in 0..ranks {
+                    let k = 8192 / ranks;
+                    let fp8 = mode == AttentionMode::Fp8Compact;
+                    let layout = NativeLayout { stem: stem.clone(), shape: [8192, k], fp8,
+                        split: CoreSplit::Input, rank, ranks };
+                    let values = CuteafdDeviceBuffer { ptr: 0x1000_0000usize as *mut _,
+                        bytes: 8192 * k * if fp8 { 1 } else { 2 }, device_id: rank as i32, flags: 0 };
+                    let scales = fp8.then_some(CuteafdDeviceBuffer { ptr: 0x8000_0000usize as *mut _,
+                        bytes: 64 * (k / 128) * 4, ..values });
+                    let receipt = cuteafd_loader::families::muse_spark::weight_layout::native_mount_load([&layout])?;
+                    let records = attention_records(dir.path(), &selected, mode, &layout,
+                        crate::shared::fp8_linear::Fp8Scales::Amax, values, scales)?;
+                    // Conversion windows are whole 128-row scale blocks, bounded above
+                    // by STEP_BYTES; smaller shared transform windows are also valid.
+                    assert!(!records.is_empty());
+                    if !fp8 { assert_eq!(records.len(), 1); }
+                    let mut converted_rows = 0;
+                    for record in records {
+                        match record {
+                            AttentionRecord::Operand(operand) => {
+                                assert!(!fp8);
+                                receipt.validate(operand.mount_load()?)?;
+                                assert!(operand.lands.iter().all(|(rect, _)| rect.name == format!("{stem}.weight")));
+                            }
+                            AttentionRecord::Step(step) => {
+                                assert!(fp8);
+                                let rows = step.rects.iter().map(|rect| rect.rows.len()).sum::<usize>();
+                                assert_eq!(rows % 128, 0);
+                                assert!(rows * k * 2 <= cuteafd_loader::shared::dense_read::STEP_BYTES);
+                                converted_rows += rows;
+                                receipt.validate(step.mount_load()?)?;
+                                assert!(step.rects.iter().all(|rect| rect.name == format!("{stem}.weight")));
+                                assert!(step.jobs.iter().all(|job| matches!(job, Job::Quant {
+                                    layout: crate::shared::fp8_load_quant::Layout::Block, .. })));
+                            }
+                        }
+                    }
+                    if fp8 { assert_eq!(converted_rows, 8192); }
+                }
+            }
+        }
         Ok(())
     }
 

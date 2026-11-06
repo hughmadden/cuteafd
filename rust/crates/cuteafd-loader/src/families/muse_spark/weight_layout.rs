@@ -88,6 +88,27 @@ impl LayerLayout {
     }
 }
 
+/// Load-only native reader bounds. Projections share one drained runner per
+/// rank; BF16 source rows also bound a checkpoint that stores FP8 directly.
+pub fn native_mount_load<'a>(layouts: impl IntoIterator<Item = &'a NativeLayout>)
+    -> Result<crate::shared::dense_read::MountLoad> {
+    use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
+    let mut mount = MountLoad::default();
+    for layout in layouts {
+        let [n, k] = layout.shape;
+        let source_k = k.checked_mul(if layout.split == CoreSplit::Input { layout.ranks } else { 1 })
+            .context("Muse native source width overflow")?;
+        let batch = ReadBatch::new(n, source_k.checked_mul(2).context("Muse native row overflow")?,
+            k.checked_mul(2).context("Muse native packed row overflow")?, STEP_BYTES)?;
+        let mut load = MountLoad::read(batch);
+        if layout.fp8 {
+            load.pinned_tables = cuteafd_ffi::programs::fp8_load_table_bytes(batch.rows, 1)? as u64;
+        }
+        mount.merge(load);
+    }
+    Ok(mount)
+}
+
 /// Globals: the embedding (on the entry GPU), the final norm (each GPU) and the
 /// head (on the head GPU; K6, stored N128-padded).
 #[derive(Debug, Clone, PartialEq, Eq)]
