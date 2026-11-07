@@ -175,7 +175,8 @@ pub fn flash_routed_workspace(metadata: &MetadataInput, cfg: &crate::families::g
     let first = cfg.dense.iter().position(|&dense| !dense).context("Flash routed suffix")?;
     let mut units = 0;
     for layer in first..cfg.layers { for rank in 0..ranks {
-        units = units.max(metadata.plan(layer, ranks, rank, super::residency::ExpertSet::Routed)?.compact_unit_limit());
+        // Reuse admission's validated census; sizing needs no fresh load descriptors.
+        units = units.max(metadata.admission_geometry(layer, ranks, rank, super::residency::ExpertSet::Routed)?.1);
     } }
     super::routed_workspace(manifest, KernelFamily::GlmFlash, rows, units, super::PrefillActivations::A16)
 }
