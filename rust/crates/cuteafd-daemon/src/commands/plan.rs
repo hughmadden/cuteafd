@@ -604,6 +604,11 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         }
     }
     resolve_speculator(&mut args, snapshot, family, &cfg)?;
+    // File inventories have no admitted layout. Retain the checkpoint-native
+    // superset so fetching headers cannot omit a subsequently selected MTP owner.
+    if family == "qwen4" && args.speculator == "auto" {
+        args.speculator = if args.native_mtp_layers > 0 { "mtp" } else { "off" }.into();
+    }
     let needs_drafter = if let Some(layout) = &args.file_layout {
         let hosts: std::collections::BTreeMap<String, Vec<String>> =
             cuteafd_loader::read_json_file(layout)?;
@@ -1439,6 +1444,36 @@ mod tests {
                 Some(&cfg["SPECULATOR_MODEL_REVISION"])).unwrap().snapshot_path.unwrap();
             assert_eq!(resolved.drafter_snapshot.as_deref(), Some(draft.as_path()), "{}", config.display());
         }
+    }
+
+    #[test]
+    fn qwen_speculator_auto_is_deferred_but_overrides_and_file_owners_are_explicit() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        let config = qwen4_config(4);
+        write_snapshot(target.path(), &config, &[t("mtp.layers.0.enorm.weight", "BF16", &[2560])], None);
+        for (selected, configured, disabled, expected) in [
+            ("auto", None, false, "auto"),
+            ("auto", Some("auto"), false, "auto"),
+            ("auto", Some("mtp"), false, "mtp"),
+            ("auto", Some("off"), false, "off"),
+            ("mtp", Some("off"), false, "mtp"),
+            ("off", Some("mtp"), false, "off"),
+            ("auto", None, true, "off"),
+        ] {
+            let mut request = args(target.path(), 2, false);
+            request.speculator = selected.into();
+            request.no_speculator = disabled;
+            let cfg = configured.map(|value| std::collections::BTreeMap::from([("SPECULATOR".into(), value.into())]))
+                .unwrap_or_default();
+            resolve_speculator(&mut request, target.path(), "qwen4", &cfg).unwrap();
+            assert_eq!(request.speculator, expected);
+        }
+        let files = file_args(args(target.path(), 2, false), target.path()).unwrap();
+        assert_eq!(files.speculator, "mtp", "file inventory retains MTP's checkpoint superset");
+        let mut off = args(target.path(), 2, false);
+        off.speculator = "off".into();
+        assert_eq!(file_args(off, target.path()).unwrap().speculator, "off");
     }
 
     #[test]

@@ -1609,6 +1609,28 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert "prefill reserve does not fit" not in result.stderr
 
 
+
+def capture_qwen4_real_spark_launch(snapshot: Path, example: Path, binary: Path,
+                                   programs: Path, hf_home: Path, temporary: Path) -> None:
+    """Installed EXL3 + four Sparks must keep expert roles through launcher dispatch."""
+    output = temporary / "real-deployment.json"
+    result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
+        "test/qwen-real-sparks", "RTX_GPUS=1\nSPARK_COUNT=4\nEXPERT_BACKEND=spark\nVISION=off\nAUDIO=off\n",
+        physical_gpus=(0,), root_launcher=True, execute_workers=True,
+        extra_args=("--wip", "qwen-real-sparks"), extra_env={
+            "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
+            "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
+            "STUB_REAL_PLAN_OUTPUT": str(output), "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    deployment = _read_real_deployment(output)
+    assert deployment["spark_expert_world"] == 4 and deployment["spark_ranks"] == 4, deployment
+    assert deployment["speculator"] == "off", deployment
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "serve-qwen4 --snapshot" in line)
+    assert "--local-experts" not in serve and "--mtp" not in serve, serve
+    workers = [shlex.split(line) for line in result.stderr.splitlines() if "cuteafd expertd-native --snapshot" in line]
+    assert len(workers) == 4, result.stderr
+    assert all(role["experts"] and role["layers"] for role in deployment["spark_roles"]), deployment
+
 def capture_mimo_real_planner_launch(snapshot: Path, example: Path, binary: Path,
                                      programs: Path, hf_home: Path, temporary: Path) -> None:
     """Exercise shipped config -> real launcher argv -> real CPU Recipe admission."""

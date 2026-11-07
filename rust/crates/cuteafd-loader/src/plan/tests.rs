@@ -6061,13 +6061,21 @@ fn qwen_auto_mtp_matches_explicit_memory_and_deployment() {
     config["text_config"]["mtp_num_hidden_layers"] = json!(1);
     let dir = snapshot(config, &[t("mtp.layers.0.enorm.weight", "BF16", &[2560])]);
     for ranks in [0, 2] {
-        let options = PlanOptions { qwen_auto_mtp: true, ..sparks(ranks) };
+        let options = PlanOptions { qwen_auto_mtp: true,
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                host_cache_bytes: Some(0), ..Default::default() }), ..sparks(ranks) };
         let auto = plan(dir.path(), &options).unwrap();
         let selected = if ranks == 0 { "mtp" } else { "off" };
         assert_eq!(auto.speculator, Some(selected));
         let explicit = plan(dir.path(), &PlanOptions { qwen_auto_mtp: false,
             draft_ownership: Some(DraftOwnership::selected("qwen4", selected)), ..options }).unwrap();
         assert_eq!(serde_json::to_value(&auto.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+        assert_eq!(serde_json::to_value(&auto.memory_layout).unwrap(), serde_json::to_value(&explicit.memory_layout).unwrap());
+        if ranks == 0 {
+            let deployment = deployment::DeploymentOptions { rtx_gpus: 1, speculator: "auto".into(), ..Default::default() };
+            let resolved = deployment::DeploymentSpec::from_report(&auto, &deployment).unwrap();
+            assert_eq!(resolved.speculator, selected);
+        }
         assert_eq!(component(&auto, Component::Speculator).status == Status::Disabled, selected == "off");
     }
     for (quant, stages, qualified) in [
@@ -6080,4 +6088,50 @@ fn qwen_auto_mtp_matches_explicit_memory_and_deployment() {
         let cfg = json!({"quantization_config":quant, "text_config":{"mtp_num_hidden_layers":stages}});
         assert_eq!(qualified_qwen_mtp(&cfg), qualified);
     }
+}
+
+#[test]
+fn qwen_auto_mtp_real_inventory_selects_local_without_losing_mtp() {
+    let mut config = qwen4_config(4);
+    config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    let mut tensors = qwen4_coordinator(&config, true);
+    let (mut experts, storage) = qwen4_exl3(5, 4);
+    for tensor in &mut experts {
+        tensor.0 = tensor.0.replace("model.language_model.layers.4.", "mtp.layers.0.");
+    }
+    tensors.extend(experts);
+    let storage: Value = serde_json::from_str(&serde_json::to_string(&storage).unwrap()
+        .replace("model.language_model.layers.4.", "mtp.layers.0.")).unwrap();
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &storage);
+    let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
+    let options = PlanOptions { qwen_auto_mtp: true,
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(layout::LayoutOptions { workspace_manifest: Some(manifest),
+            context_tokens: 32768,
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            prefix_slots: Some(0), ..Default::default() }), ..sparks(2) };
+    let input = PlanInput::open(dir.path()).unwrap();
+    // A real Spark solve must not masquerade as a local expert deployment.
+    let spark = input.plan(&options).unwrap();
+    assert!(spark.solver_placement.is_some(), "{}", render(&spark));
+    assert_eq!(spark.spark_expert_world(), 2);
+    assert_eq!(spark.speculator, Some("off"));
+    // Inventory is nonzero; the selected expert count is independently local.
+    let auto = input.plan_spark_count(&options, 2, Some(0)).unwrap();
+    assert!(auto.solver_placement.is_some(), "{}", render(&auto));
+    assert!(auto.placement_supported, "{}", render(&auto));
+    assert_eq!(auto.spark_ranks, 0);
+    assert_eq!(auto.spark_expert_world(), 0);
+    assert_eq!(auto.speculator, Some("mtp"));
+    let explicit = input.plan_spark_count(&PlanOptions { qwen_auto_mtp: false,
+        draft_ownership: Some(spec::DraftOwnership::NativeMtp), ..options }, 2, Some(0)).unwrap();
+    assert_eq!(serde_json::to_value(&auto.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+    assert_eq!(serde_json::to_value(&auto.memory_layout).unwrap(), serde_json::to_value(&explicit.memory_layout).unwrap());
+    for which in [Component::Speculator, Component::SpeculatorExpert] {
+        let owner = component(&auto, which);
+        assert!(owner.bytes > 0 && owner.status != Status::Disabled, "{which:?}: {owner:?}");
+    }
+    let deployment = deployment::DeploymentOptions { rtx_gpus: 1, speculator: "auto".into(), ..Default::default() };
+    assert_eq!(deployment::DeploymentSpec::from_report(&auto, &deployment).unwrap().speculator, "mtp");
 }
