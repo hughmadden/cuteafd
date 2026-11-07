@@ -1747,8 +1747,8 @@ fn swa_ring_of_one_unit_reads_every_window_exactly_and_restores_byte_identically
     }
 }
 
-/// The target SWA ring is one unit, whatever the prefill reserve; predictor
-/// rings, the hidden history and staging follow the step rows.
+/// Every SWA ring is one unit, whatever the prefill reserve; only staging and
+/// the target hidden history (published for a whole step) follow the step rows.
 #[test]
 fn target_ring_is_one_unit_and_the_reserve_only_sizes_step_storage() {
     use crate::serving_capacity::step5::{swa_ring, Step5CacheLayout};
@@ -1759,7 +1759,18 @@ fn target_ring_is_one_unit_and_the_reserve_only_sizes_step_storage() {
     let reserve = Step5CacheLayout::new(&cfg, 1, 1 << 20, 3, 2752, 3 * 2752, fp8).unwrap();
     assert_eq!(one.ring, swa_ring(512, 2752).unwrap());
     assert_eq!(reserve.ring, one.ring);
-    assert_eq!((reserve.step_rows, reserve.mtp_ring.step), (3 * 2752, 3 * 2752));
+    assert_eq!(reserve.step_rows, 3 * 2752);
+    // A predictor catch-up chunks at one unit, so its K/V ring reads one unit
+    // per call like the target: the wider reserve sizes it not at all.
+    assert_eq!(reserve.mtp_ring, one.mtp_ring);
+    assert_eq!(reserve.mtp_ring, swa_ring(512, 2752).unwrap());
+    assert!(reserve.mtp_ring.proposal(0, 2752).is_some());
+    assert!(reserve.mtp_ring.proposal(0, 2753).is_none());
+    // The hidden history is published for a whole step and read back by later
+    // steps, so it keeps the step (span) rows.
+    assert_eq!(one.mtp_history, Some(swa_ring(516, 2752).unwrap()));
+    assert_eq!(reserve.mtp_history, Some(swa_ring(516, 3 * 2752).unwrap()));
+    assert!(reserve.mtp_history.unwrap().proposal(0, 3 * 2752).is_some());
     assert!(reserve.mtp_hidden_rows > one.mtp_hidden_rows);
     let target = |layout: &Step5CacheLayout| layout.ranks[0].sliding.iter().filter(|r| !r.mtp)
         .map(|r| r.key.bytes + r.value.bytes).sum::<u64>();

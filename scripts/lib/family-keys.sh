@@ -215,7 +215,7 @@ PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
   _spark_slot_keys HOST LANE_A
-  [[ "$1" != mimo_v2 && "$1" != kimi_k3 ]] || printf '%s\n' TP2_DFLASH
+  [[ "$1" != mimo_v2 && "$1" != kimi_k3 && "$1" != glm5_flash ]] || printf '%s\n' TP2_DFLASH
   case "$1" in
     deepseek_v4)
       cat <<'EOF'
@@ -282,7 +282,6 @@ GLM5_FLASH_DECODE_ROWS
 GLM5_FLASH_PREFILL_BATCH
 PREFILL_PACKING
 GLM5_FLASH_ROUTE_RING_CHECK
-GLM5_FLASH_REMOTE_DRAFTER
 EOF
       ;;
     mimo_v2)

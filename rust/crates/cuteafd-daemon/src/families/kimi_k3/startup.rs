@@ -43,6 +43,28 @@ pub(crate) struct Loaded<'a> {
     pub engine: Engine<'a>,
     pub admission_free: Vec<u64>,
     pub admitted_bytes: Vec<u64>,
+    pub ownership: Ownership,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Ownership {
+    pub rtx_expert_layers: usize,
+    pub spark_layers: Vec<usize>,
+    pub inactive_seeded_layers: usize,
+    pub inactive_loaded_layers: usize,
+}
+
+pub(super) fn check_hosted_layers(setting: cuteafd_loader::placement::OnboardSetting,
+    selected: &[usize], seeded: &[usize]) -> Result<usize> {
+    ensure!(seeded.windows(2).all(|pair| pair[0] < pair[1]),
+        "Kimi worker layer subset must be sorted and unique");
+    if setting == cuteafd_loader::placement::OnboardSetting::Auto {
+        ensure!(selected.iter().all(|layer| seeded.binary_search(layer).is_ok()),
+            "Kimi worker layer subset is missing shared placement layers");
+    } else {
+        ensure!(selected == seeded, "Kimi worker layer subset differs from shared placement");
+    }
+    Ok(seeded.len() - selected.len())
 }
 
 /// Run before loading native programs, whose card selection can query the GPU.
@@ -79,8 +101,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     // peer exchange, hop and Spark wave serves one unit.
     let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, options.waves,
         options.prefill_rows)?.unit_rows as usize;
-    let native = devices.iter().map(|&device| NativePrograms::load_for_ranks(device, full, programs, options.ffn_mode,
-        options.cache_format, &core, unit, RANKS).map(Rc::new)).collect::<Result<Vec<_>>>()?;
+    let native_exports = devices[0].run(|| super::device::resolve_native_programs(programs, &core, unit, RANKS))?;
+    let native = devices.iter().map(|&device| NativePrograms::load_resolved(device, full, programs, options.ffn_mode,
+        options.cache_format, &core, unit, RANKS, &native_exports).map(Rc::new)).collect::<Result<Vec<_>>>()?;
     let native: [_; RANKS] = native.try_into().map_err(|_| anyhow::anyhow!("Kimi native physical rank inventory"))?;
     ensure!(RANKS == 2 || !options.draft.as_ref().is_some_and(|draft| draft.tp2_dflash),
         "Kimi TP2 DFlash requires two physical coordinator GPUs");
@@ -103,7 +126,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     // The per-Spark cap (`SPARK_MEMORY_CAP`), else Kimi's estimated complete ceiling.
     let spark_budget_bytes = cuteafd_core::memory_policy::MemoryPolicy::current()
         .spark_cap_bytes(cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES);
-    let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+        .context("Kimi startup requires the immutable selected checkpoint view")?)?;
     let routed = cfg.dense.iter().filter(|dense| !**dense).count();
     let onboard = options.rtx_expert_layers.resolve(routed);
     let model = crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?;
@@ -167,6 +191,11 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         super::graphs::inventory_for_ranks(cfg, 1, unit, options.slots, verify_rows, RANKS, |_, _| true)
     } else { super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows) }).transpose()?;
     let mut fixed = if RANKS == 2 { exchange_demands(unit, diagnostics)? } else { vec![] };
+    if core.native_attention_split(RANKS) {
+        for rank in 0..RANKS {
+            fixed.push(core.native_attention_receive_demand(unit, rank as u8, RANKS)?);
+        }
+    }
     if let Some(layout) = &draft_layout {
         fixed.extend(cuteafd_loader::families::kimi_k3::draft_bridge_demands_for_ranks(layout, rows, RANKS)?);
         fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
@@ -178,8 +207,11 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             }
         }
     }
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(
+    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(
         if core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] }, programs.names());
+    selected.names.extend(native_exports.programs.iter().cloned());
+    selected.names.sort();
+    selected.names.dedup();
     for (rank, sample) in inventory.gpus.iter().enumerate() {
         let pending = crate::shared::inventory::pending_code(library, sample.device, rank, RANKS == 2,
             "kimik3", "exl3", &selected)?;
@@ -191,6 +223,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         GpuBudget { capacity_bytes: sample.total_bytes, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
+    let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
+        core.attention_receive_bytes(unit.min(64), RANKS)?];
     let mut admitted = admission::admit(admission::Inputs { expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, requested_pool: options.pool_tokens,
@@ -200,10 +234,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             (0..RANKS).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
         spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
     let graph_set = admitted.graph_set.take();
-    if let Some(expected) = options.hosted_layers.as_ref() {
-        ensure!(admitted.working_set().spark_layers == *expected,
-            "Kimi worker layer subset differs from shared placement");
-    }
+    let spark_layers = admitted.working_set().spark_layers;
+    let inactive_seeded_layers = options.hosted_layers.as_ref().map(|expected|
+        check_hosted_layers(options.rtx_expert_layers, &spark_layers, expected)).transpose()?.unwrap_or(0);
+    // Golden's seed list is only a coverage hint. WorkerSelection loads exactly
+    // the admitted working set, never the inactive hinted layers.
+    let ownership = Ownership { rtx_expert_layers: admitted.placement.onboard_layers,
+        spark_layers, inactive_seeded_layers, inactive_loaded_layers: 0 };
     if let Some(set) = &graph_set {
         super::graphs::check_placement_for_ranks(cfg, &admitted.placement, &set.keys, RANKS)?;
         tracing::info!(executables = set.keys.len(), bytes = ?(0..RANKS)
@@ -211,6 +248,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             reserve = "estimated", "Kimi startup graph inventory");
     }
     tracing::info!(placement = %admitted.placement.summary(), rtx_expert_layers = admitted.placement.onboard_layers,
+        inactive_seeded_layers, inactive_loaded_layers = ownership.inactive_loaded_layers,
         prefix_marks = admitted.mark_selection.slots, marks = %admitted.mark_selection.summary(),
         spark_budget_bytes, reserve = "estimated until W9 census",
         "Kimi admitted TP2 expert ownership");
@@ -225,7 +263,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     let (peer, hops) = if RANKS == 2 {
         let ranks = [0, 1].map(|rank| RankDevice { device: streams[rank].device.id, stream: streams[rank].raw });
         let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1,
-            exchange_recv_bytes(unit)?, exchange_recv_bytes(unit.min(64))?))?;
+            peer_receive[0], peer_receive[1]))?;
         let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec(),
             unit.min(64) * plan.spec().row_bytes as usize))?;
         hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
@@ -260,7 +298,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             ensure!(bytes <= set.inventory.bytes(rank), "Kimi startup graphs exceed admitted reserve");
         }
     }
-    Ok(Loaded { engine, admission_free, admitted_bytes })
+    Ok(Loaded { engine, admission_free, admitted_bytes, ownership })
 }
 
 fn check_attention(attention: Option<cuteafd_loader::placement::AttentionPlacement>, ranks: usize, graphs: bool) -> Result<()> {
@@ -287,6 +325,19 @@ pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Dem
 mod tests {
     use super::*;
     use cuteafd_loader::families::kimi_k3::core::{CoreInventory,CoreProjection,CoreSplit};
+
+    #[test]
+    fn automatic_hosted_hint_may_cover_but_never_omit_selected_layers() -> Result<()> {
+        use cuteafd_loader::placement::OnboardSetting::{Auto, All, Layers};
+        assert_eq!(check_hosted_layers(Auto, &[3, 4], &[2, 3, 4])?, 1);
+        assert!(check_hosted_layers(Auto, &[3, 4], &[2, 3]).is_err());
+        for setting in [Layers(1), All] {
+            assert!(check_hosted_layers(setting, &[3, 4], &[2, 3, 4]).is_err());
+            assert_eq!(check_hosted_layers(setting, &[3, 4], &[3, 4])?, 0);
+        }
+        assert!(check_hosted_layers(Auto, &[3, 4], &[3, 3, 4]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn context_cannot_fall_back_to_single_rank_or_eager_decode() {
@@ -316,7 +367,7 @@ mod tests {
         let stem=format!("{root}.q_proj");
         core.projections.insert(stem.clone(),projection(&stem));
         let error=core.validate_runtime_groups(&cfg).unwrap_err().to_string();
-        assert!(error.contains(&stem) && error.contains("k_proj") && error.contains("whole-group"));
+        assert!(error.contains("validated per-projection") && error.contains(root));
         for leaf in ["k_proj","v_proj","g_proj","o_proj"] {
             let stem=format!("{root}.{leaf}");core.projections.insert(stem.clone(),projection(&stem));
         }

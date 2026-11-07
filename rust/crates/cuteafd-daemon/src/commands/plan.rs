@@ -89,7 +89,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_kda_state: args.kda_state.into(),
                 glmf_index: args.index_cache.into(),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
-                glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
+                glmf_shared_replay: args.replay_records == crate::cli::PlanReplayRecords::Shared,
+                glmf_auto_replay: args.replay_records == crate::cli::PlanReplayRecords::Auto,
                 concurrency: args.concurrency,
                 dspark_draft_limit: args.dspark_draft_limit.unwrap_or(5),
                 tp2_dspark_experts: args.tp2_dspark_experts,
@@ -122,7 +123,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 muse_drafter_snapshot: None,
                 muse_partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
                 dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
-                kimi_draft_fp8: args.draft_fp8,
+                kimi_draft_fp8: args.draft_fp8.unwrap_or(false),
+                glmf_draft_representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(
+                    args.draft_fp8),
+                glmf_draft_fp8_mode: args.draft_linear.code() as u8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
@@ -173,7 +177,8 @@ fn tp2_dspark_experts(args: &PlanArgs, family: &str,
 
 fn tp2_dflash(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
-    let default_on = crate::cli::tp2_dflash_default(family, args.layout && args.rtx == 2,
+    let default_on = crate::cli::tp2_dflash_default(family, args.layout && args.rtx == 2
+            && (family != "glm5_flash" || args.drafter_gib == 0.0),
         args.speculator == "dflash2");
     let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
         None | Some("") => default_on,
@@ -183,9 +188,27 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
     };
     let enabled = args.tp2_dflash.unwrap_or(configured);
     anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
-        && matches!(family, "mimo_v2" | "kimi_k3")),
-        "TP2_DFLASH requires MiMo/Kimi, --layout, --rtx 2 and DFlash2");
+        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash")),
+        "TP2_DFLASH requires MiMo/Kimi/GLM Flash, --layout, --rtx 2 and DFlash2");
     Ok(enabled)
+}
+
+fn glmf_tp2_dflash_auto(args: &PlanArgs, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>) -> bool {
+    family == "glm5_flash" && args.layout && args.rtx == 2 && args.drafter_gib == 0.0 && args.speculator == "dflash2"
+        && args.tp2_dflash.is_none() && cfg.get("TP2_DFLASH").is_none_or(String::is_empty)
+}
+
+fn resolve_exlr8_draft(args: &mut PlanArgs, snapshot: &std::path::Path, family: &str,
+    cfg: &std::collections::BTreeMap<String, String>, options: &mut PlanOptions) -> Result<()> {
+    resolve_speculator(args, snapshot, family, cfg)?;
+    let split = tp2_dflash(args, family, cfg)?;
+    if let Some(layout) = &mut options.layout {
+        layout.tp2_dflash = split;
+        layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(args, family, cfg);
+        if family == "glm5_flash" { layout.glmf_drafter_snapshot = args.drafter_snapshot.clone(); }
+    }
+    Ok(())
 }
 
 fn v41_draft_limit(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<u8> {
@@ -271,8 +294,9 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             anyhow::ensure!(args.spark_tp.is_none() && args.spark_ep.is_none(),
                 "EXLR8 requires canonical Spark wire, not explicit ownership topology");
             let cfg = launch_config(args.config.as_deref())?;
-            resolve_speculator(&mut args, &snapshot, "glm5", &cfg)?;
+            let family = cuteafd_loader::plan::exlr8::architecture(&view.config()?)?;
             let mut native_options = options.clone();
+            resolve_exlr8_draft(&mut args, &snapshot, family, &cfg, &mut native_options)?;
             native_options.placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
             let native = cuteafd_loader::plan::exlr8::native_plan(&snapshot,
                 args.exlr8_manifest.as_deref().context("EXLR8 native layout requires --exlr8-manifest up1|bit325")?,
@@ -320,6 +344,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if let Some(layout) = &mut options.layout {
         layout.tp2_dspark_experts = tp2_dspark_experts;
         layout.tp2_dflash = tp2_dflash;
+        layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(&args, family, &cfg);
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
@@ -832,7 +857,7 @@ mod tests {
     #[test]
     fn exlr8_native_cli_resolves_default_config_and_opt_out_before_admission() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"glm_moe_dsa"}"#).unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"glm_moe_dsa","architectures":["GlmMoeDsaForCausalLM"]}"#).unwrap();
         let experts = dir.path().join("experts");
         std::fs::create_dir(&experts).unwrap();
         let header = br#"{"__metadata__":{"format":"exlr8-v2"}}"#;
@@ -862,6 +887,78 @@ mod tests {
             }
             let error = run_plan(request).unwrap_err().to_string();
             assert!(error.contains(expected), "{selected}/{configured:?}/{no_speculator}: {error}");
+        }
+    }
+
+    #[test]
+    fn exlr8_tp2_dflash_resolves_default_config_and_explicit_off_before_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"),
+            r#"{"model_type":"glm5_next","architectures":["Glm5NextForConditionalGeneration"]}"#).unwrap();
+        let experts = dir.path().join("experts");
+        std::fs::create_dir(&experts).unwrap();
+        let header = br#"{"__metadata__":{"format":"exlr8-v2"}}"#;
+        let mut index = (header.len() as u64).to_le_bytes().to_vec();
+        index.extend_from_slice(header);
+        std::fs::write(experts.join("exlr8-layer-3.index.safetensors"), index).unwrap();
+        for configured in [None, Some("on"), Some("off")] {
+            for explicit in [None, Some(false), Some(true)] {
+                let mut request = args(dir.path(), 0, false);
+                request.rtx = 2;
+                request.exlr8_manifest = Some("k4".into());
+                request.tp2_dflash = explicit;
+                let cfg = configured.map(|value| ("TP2_DFLASH".into(), value.into()))
+                    .into_iter().collect();
+                let mut resolved = options(&request).unwrap();
+                let family = cuteafd_loader::plan::exlr8::architecture(
+                    &serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap()).unwrap();
+                resolve_exlr8_draft(&mut request, dir.path(), family, &cfg, &mut resolved).unwrap();
+                let layout = resolved.layout.unwrap();
+                assert_eq!(layout.tp2_dflash, explicit.unwrap_or(configured != Some("off")));
+                assert_eq!(layout.glmf_tp2_dflash_auto, explicit.is_none() && configured.is_none());
+                // Invalid topology must fail in the early-return path, before native admission.
+                request.rtx = 1;
+                request.tp2_dflash = Some(true);
+                let error = run_plan(request).unwrap_err().to_string();
+                assert!(error.contains("TP2_DFLASH requires"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn glmf_tp2_auto_requires_two_gpus_and_checkpoint_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for rtx in [1, 2] {
+            for drafter_gib in [0.0, 12.0] {
+                let mut request = args(dir.path(), 0, false);
+                request.rtx = rtx;
+                request.drafter_gib = drafter_gib;
+                request.speculator = "dflash2".into();
+                let cfg = Default::default();
+                let expected = rtx == 2 && drafter_gib == 0.0;
+                assert_eq!(tp2_dflash(&request, "glm5_flash", &cfg).unwrap(), expected);
+                assert_eq!(glmf_tp2_dflash_auto(&request, "glm5_flash", &cfg), expected);
+                let cfg = [("TP2_DFLASH".into(), "off".into())].into_iter().collect();
+                assert!(!tp2_dflash(&request, "glm5_flash", &cfg).unwrap());
+                assert!(!glmf_tp2_dflash_auto(&request, "glm5_flash", &cfg));
+            }
+        }
+    }
+
+    #[test]
+    fn glmf_plan_preserves_explicit_drafter_representation_and_rows() {
+        use clap::Parser;
+        use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
+        for (flags, representation, mode) in [
+            (vec![], GlmDraftRepresentation::Fp8Only, 0),
+            (vec!["--draft-fp8", "false", "--draft-linear", "wide"], GlmDraftRepresentation::Bf16Only, 1),
+            (vec!["--draft-fp8", "true", "--draft-linear", "w8a8"], GlmDraftRepresentation::Fp8Only, 2),
+        ] {
+            let argv = [vec!["cuteafd", "plan", "model", "--layout"], flags].concat();
+            let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(argv).unwrap().command else { panic!("plan") };
+            let layout = options(&request).unwrap().layout.unwrap();
+            assert_eq!(layout.glmf_draft_representation, representation);
+            assert_eq!(layout.glmf_draft_fp8_mode, mode);
         }
     }
 
@@ -1018,20 +1115,20 @@ mod tests {
             let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
                 argv.into_iter().chain(["--tp2-dflash", explicit])).unwrap().command
                 else { panic!("expected plan") };
-            for family in ["mimo_v2", "kimi_k3"] {
+            for family in ["mimo_v2", "kimi_k3", "glm5_flash"] {
                 assert_eq!(tp2_dflash(&request, family, &cfg).unwrap(), expected);
             }
             assert_eq!(options(&request).unwrap().layout.unwrap().tp2_dflash, expected);
         }
         let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
             else { panic!("expected plan") };
-        for family in ["mimo_v2", "kimi_k3"] {
+        for family in ["mimo_v2", "kimi_k3", "glm5_flash"] {
             assert!(tp2_dflash(&request, family, &Default::default()).unwrap());
             assert!(!tp2_dflash(&request, family, &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).unwrap());
         }
         request.rtx = 1;
-        for family in ["mimo_v2", "kimi_k3"] {
+        for family in ["mimo_v2", "kimi_k3", "glm5_flash"] {
             assert!(!tp2_dflash(&request, family, &Default::default()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).is_err());
         }
@@ -1118,7 +1215,7 @@ mod tests {
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,
-            drafter_snapshot: None, draft_fp8: false, vision_snapshot: None, audio_snapshot: None,
+            drafter_snapshot: None, draft_fp8: None, draft_linear: Default::default(), vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,
@@ -1139,7 +1236,7 @@ mod tests {
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
-            replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
+            replay_records: crate::cli::PlanReplayRecords::Own,
             concurrency: 8,
             dspark_draft_limit: None,
             tp2_dspark_experts: false,
@@ -2092,7 +2189,11 @@ mod tests {
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);
         let knobs = custom.layout.as_ref().unwrap();
         assert_eq!((knobs.concurrency, knobs.state_slots, knobs.glmf_mark_lanes, knobs.mimo_prefix_entries,
-            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay), (16, Some(16), Some(16), 6, 1971 << 20, true));
+            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay, knobs.glmf_auto_replay),
+            (16, Some(16), Some(16), 6, 1971 << 20, true, false));
+        let auto_replay = layout(&["--replay-records", "auto"]);
+        let auto_knobs = auto_replay.layout.as_ref().unwrap();
+        assert_eq!((auto_knobs.glmf_shared_replay, auto_knobs.glmf_auto_replay), (false, true));
         for zero in ["--state-slots", "--mark-lanes"] {
             assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", zero, "0"]).is_err());
         }

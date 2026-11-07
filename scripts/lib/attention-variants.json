@@ -2,7 +2,7 @@
   "glm5_flash": true,
   "glm5": true,
   "mistral_large4": true,
-  "kimi_k3": false,
+  "kimi_k3": true,
   "step5": true,
   "muse_spark": true
 }

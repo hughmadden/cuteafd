@@ -95,7 +95,7 @@ pub(crate) enum Drafter<'a> {
 
 impl<'a> Drafter<'a> {
     pub fn require_live(&self) -> Result<()> {
-        match self { Self::RemoteDflash(d) => d.require_live(), _ => Ok(()) }
+        match self { Self::RemoteDflash(d) => d.require_live(), Self::Dflash2(d) => d.require_live(), _ => Ok(()) }
     }
 
     pub fn publish_abort(&self) -> Result<()> {

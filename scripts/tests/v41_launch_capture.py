@@ -152,6 +152,9 @@ if tool == "docker":
                     span = 16384
                 response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_slots=waves, prefill_span_rows=span)
             report = dict(response)
+            if family == "glm5_flash":
+                # This launch-ABI fixture chooses whole; real fit is covered by planner tests.
+                report["tp2_dflash"] = value("--tp2-dflash", "false") == "true"
             if family == "mimo_v2":
                 report["prefill_lanes"] = response["prefill_waves"]
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and int(ranks) not in (0, 4)

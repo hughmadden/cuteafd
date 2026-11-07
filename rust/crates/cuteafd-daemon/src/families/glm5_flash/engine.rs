@@ -1427,7 +1427,7 @@ pub(crate) struct GlmfEngine<'a> {
     layer_waves: RefCell<Vec<Option<crate::shared::spark_waves::WaveTicket>>>,
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
-    exchange: Option<PeerExchange<'a>>,
+    exchange: Option<std::rc::Rc<PeerExchange<'a>>>,
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     tp2: Option<Tp2Experts<'a>>,
     local: Option<(Vec<usize>, Experts<'a>)>,
@@ -2090,7 +2090,7 @@ impl<'a> GlmfEngine<'a> {
             },
             finish: |drained| {
                 self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
-                for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+                for exchange in self.exchange.iter().map(|exchange| exchange.as_ref()).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
                     exchange.finish_terminal(drained);
                 }
                 if let Some(drafter) = &self.drafter { drafter.finish_terminal(drained); }
@@ -2101,7 +2101,7 @@ impl<'a> GlmfEngine<'a> {
 
     fn publish_tp2_abort(&self) -> Result<()> {
         let mut failures = Vec::new();
-        for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
+        for exchange in self.exchange.iter().map(|exchange| exchange.as_ref()).chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
             match exchange.terminal_state() {
                 crate::shared::peer_split::TerminalState::Aborting
                 | crate::shared::peer_split::TerminalState::Drained => continue,
@@ -2771,7 +2771,7 @@ impl<'a> GlmfEngine<'a> {
                 graphs: RefCell::new(GraphBank::new(self.graphs.borrow().budget())), l2: None })
         })?;
         self.peer = Some(peer);
-        self.exchange = Some(exchange);
+        self.exchange = Some(std::rc::Rc::new(exchange));
         // Native kernels load lazily on first launch, and a lazy load can wait for the device:
         // queued a layer ahead, rank 1 would then wait for its own stream, which waits on a
         // push the host has not queued yet. Load the native MLA prefill on both GPUs now.
@@ -2818,8 +2818,12 @@ impl<'a> GlmfEngine<'a> {
         self.peer.as_ref().context("no head-split peer")
     }
 
+    pub(crate) fn draft_exchange(&self) -> Result<std::rc::Rc<PeerExchange<'a>>> {
+        self.exchange.clone().context("TP2 DFlash requires a target peer exchange")
+    }
+
     fn exchange(&self) -> Result<&PeerExchange<'a>> {
-        self.exchange.as_ref().context("no head-split exchange")
+        self.exchange.as_deref().context("no head-split exchange")
     }
 
     /// The stream of rank `rank`.
@@ -2897,7 +2901,7 @@ impl<'a> GlmfEngine<'a> {
         let writes = match &self.drafter {
             Some(super::dspark::Drafter::RemoteDflash(d)) => d.replay_write_ranges(),
             Some(super::dspark::Drafter::Dflash2(d)) => d.replay_write_ranges().into_iter()
-                .map(|(name, buffer)| (self.device, name, buffer)).collect(),
+                .map(|(name, buffer)| (buffer.device_id, name, buffer)).collect(),
             _ => Vec::new(),
         };
         let encode = |ranges: &[(i32, String, cuteafd_ffi::CuteafdDeviceBuffer)]| {

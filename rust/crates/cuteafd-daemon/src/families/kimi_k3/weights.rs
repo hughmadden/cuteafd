@@ -155,6 +155,7 @@ pub(crate) struct LayerLayout {
     operands: BTreeMap<&'static str, usize>,
     pub(crate) attention: AttentionShare,
     core: BTreeMap<&'static str, CoreWeightLayout>,
+    pub(crate) native: BTreeMap<&'static str, cuteafd_loader::formats::native_attention::NativeLayout>,
 }
 
 impl LayerLayout {
@@ -170,6 +171,7 @@ impl LayerLayout {
         use cuteafd_loader::families::kimi_k3::weight_layout::{LayerLayout as Shared, WeightAttention};
         Ok(Shared::ranks_with_core(cfg, layer, mode, inventory, ranks)?.into_iter().map(|layout| Self {
             operands: layout.operands,
+            native: layout.native,
             attention: match layout.attention { WeightAttention::Absent => AttentionShare::Absent,
                 WeightAttention::Whole => AttentionShare::Whole, WeightAttention::Split => AttentionShare::Split },
             core: layout.core.into_iter().map(|(name, layout)| (name, CoreWeightLayout::from_shared(layout))).collect(),
@@ -179,20 +181,24 @@ impl LayerLayout {
     pub(crate) fn core_layouts(&self) -> impl Iterator<Item=&CoreWeightLayout> { self.core.values() }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
-            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))
+        let base = self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
+            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))?;
+        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
+            .context("Kimi native attention extent overflow"))
     }
 
     pub(super) fn attention_bytes(&self) -> Result<usize> {
-        self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
+        let base = self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
             .map(|(_, bytes)| *bytes).chain(self.core.iter().filter(|(name, _)|
                 name.starts_with("mla.") || name.starts_with("kda.")).map(|(_, layout)| layout.bytes))
-            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))
+            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))?;
+        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
+            .context("Kimi native attention extent overflow"))
     }
 
     fn check(&self, packed: &PackedLayer) -> Result<()> {
         ensure!(self.attention == packed.attention && self.operands.len() == packed.operands.len()
-            && self.core.len() == packed.core.len(),
+            && self.core.len() == packed.core.len() && self.native.len() == packed.native.len(),
             "Kimi packed operand inventory differs from native admission");
         for (name, bytes) in &self.operands {
             ensure!(packed.operands.get(name).is_some_and(|data| data.len() == *bytes),
@@ -200,6 +206,11 @@ impl LayerLayout {
         }
         for (name, layout) in &self.core {
             layout.check(packed.core.get(name).context("Kimi packed core operand absent")?)?;
+        }
+        for (name, layout) in &self.native {
+            ensure!(!layout.fp8, "Kimi FP8 attention uses the recorded conversion path");
+            ensure!(packed.native.get(name).is_some_and(|bytes| bytes.len() as u64 == layout.bytes().unwrap_or(0)),
+                "Kimi packed native attention {name} differs from admission");
         }
         Ok(())
     }
@@ -216,11 +227,12 @@ pub(crate) struct PackedLayer {
     operands: BTreeMap<&'static str, Vec<u8>>,
     attention: AttentionShare,
     core: BTreeMap<&'static str, LoadedDenseTrellis>,
+    native: BTreeMap<&'static str, Vec<u8>>,
 }
 
 impl PackedLayer {
     pub(crate) fn bytes(&self) -> Result<usize> {
-        self.operands.values().map(Vec::len).chain(self.core.values().map(|loaded|
+        self.operands.values().chain(self.native.values()).map(Vec::len).chain(self.core.values().map(|loaded|
             loaded.shard.payload.len() + loaded.shard.suh.len() + loaded.shard.svh.len()))
             .try_fold(0usize, |total, bytes| total.checked_add(bytes).context("Kimi packed layer size overflow"))
     }
@@ -243,7 +255,7 @@ impl PackedLayer {
         let kind = cfg.attention[layer];
         let shares = layouts.iter().map(|layout| layout.attention).collect::<Vec<_>>();
         let mut pair = shares.iter().map(|&attention| Self {
-            operands: BTreeMap::new(), attention, core: BTreeMap::new() }).collect::<Vec<_>>();
+            operands: BTreeMap::new(), attention, core: BTreeMap::new(), native: BTreeMap::new() }).collect::<Vec<_>>();
         let all_owners = (0..ranks).collect::<Vec<_>>();
         for (site, score, norm) in [
             (ResidualWeightSite::Attention(layer), "attention.score", "attention.norm"),
@@ -394,7 +406,12 @@ fn pack_projection_pair(layouts: &[LayerLayout], packed: &mut [PackedLayer], nam
                         row[rank * share..(rank + 1) * share].iter().copied()).collect()
                 }
             };
-            packed[owner].operands.insert(name, bytes);
+            if let Some(layout) = layouts[owner].native.get(name) {
+                ensure!(!layout.fp8, "Kimi FP8 attention uses the recorded conversion path");
+                packed[owner].native.insert(name, bytes);
+            } else {
+                packed[owner].operands.insert(name, bytes);
+            }
         }
     }
     Ok(())
@@ -413,6 +430,7 @@ pub(crate) struct LayerWeights<'a> {
     operands: BTreeMap<&'static str, Allocation<'a>>,
     pub(crate) attention: AttentionShare,
     core: BTreeMap<&'static str, CoreWeights<'a>>,
+    pub(crate) native: BTreeMap<&'static str, crate::shared::native_attention::NativeAttentionWeights<'a>>,
 }
 
 impl<'a> LayerWeights<'a> {
@@ -420,6 +438,9 @@ impl<'a> LayerWeights<'a> {
         ensure!(self.operands.values().chain(self.core.values().flat_map(|weights|
             [&weights.payload, &weights.suh, &weights.svh])).all(|allocation| allocation.device.id == device.id
             && std::ptr::eq(allocation.device.library, device.library)), "Kimi layer weight owner differs from lane device");
+        ensure!(self.native.values().all(|weight| weight.values.buffer.device_id == device.id
+            && weight.scales.as_ref().is_none_or(|scales| scales.buffer.device_id == device.id)),
+            "Kimi native attention owner differs from lane device");
         Ok(())
     }
 
@@ -439,7 +460,13 @@ impl<'a> LayerWeights<'a> {
         }).collect::<Result<_>>()?;
         let core = packed.core.into_iter().map(|(name, loaded)|
             Ok((name, layout.core[name].upload(device, loaded)?))).collect::<Result<_>>()?;
-        Ok(Self { operands, attention: packed.attention, core })
+        let native = packed.native.into_iter().map(|(name, bytes)| device.run(|| {
+            let values = crate::shared::memory::DeviceAllocation::new(device.library, bytes.len())?;
+            device.library.copy_h2d(values.buffer, &bytes)?;
+            Ok((name, crate::shared::native_attention::NativeAttentionWeights {
+                layout: layout.native[name].clone(), values, scales: None }))
+        })).collect::<Result<_>>()?;
+        Ok(Self { operands, attention: packed.attention, core, native })
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -784,7 +811,7 @@ mod core_owner_tests {
     }
 
     fn inventory(layer: usize, leaves: &[(&str, [usize; 2])]) -> CoreInventory {
-        CoreInventory { projections: leaves.iter().map(|(leaf, shape)| {
+        CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: leaves.iter().map(|(leaf, shape)| {
             let stem = format!("language_model.model.layers.{layer}.{leaf}");
             let projection = CoreProjection { stem: stem.clone(), bits: 6, codebook: Exl3Codebook::Mul1,
                 shape: *shape, stored_outputs: shape[0], split: cuteafd_loader::families::kimi_k3::core::split(&stem).unwrap(),
@@ -984,7 +1011,7 @@ mod core_owner_tests {
     fn native_head_is_terminal_only_and_packs_no_bf16_shadow() -> Result<()> {
         let mut cfg=fixture_config();cfg.vocab_size=128;
         let stem="language_model.lm_head".to_owned();
-        let core=CoreInventory{projections:BTreeMap::from([(stem.clone(),CoreProjection{
+        let core=CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{
             stem,bits:6,codebook:Exl3Codebook::Mul1,shape:[cfg.vocab_size,cfg.hidden],
             stored_outputs:cfg.vocab_size,split:CoreSplit::Whole,source_bytes:0})])};
         let baseline=GlobalLayout::pair(&cfg)?;
@@ -1012,7 +1039,7 @@ mod core_owner_tests {
         let mut cfg = fixture_config();
         cfg.vocab_size = 128;
         let stem = "language_model.lm_head".to_owned();
-        let core = CoreInventory { projections: BTreeMap::from([(stem.clone(), CoreProjection {
+        let core = CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
             stem, bits: 6, codebook: Exl3Codebook::Mul1, shape: [cfg.vocab_size, cfg.hidden],
             stored_outputs: cfg.vocab_size, split: CoreSplit::Whole, source_bytes: 0,
         })]) };
@@ -1062,7 +1089,7 @@ mod core_owner_tests {
         let core = inventory(1, &[("block_sparse_moe.shared_experts.gate_proj", [256, 256])]);
         let layouts = LayerLayout::pair_with_core(&cfg, 1, LayerMode::HeadSplit, &core)?;
         let mut packed: [PackedLayer; 2] = std::array::from_fn(|rank| PackedLayer { operands: BTreeMap::new(),
-            core: BTreeMap::new(), attention: layouts[rank].attention });
+            core: BTreeMap::new(), native: BTreeMap::new(), attention: layouts[rank].attention });
         let stem = "language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj";
         let mut names = Vec::new();
         pack_projection_pair(&layouts, &mut packed, "ffn.gate", stem, [256, 256], TrellisSide::Output,

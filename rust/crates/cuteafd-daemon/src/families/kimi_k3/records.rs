@@ -261,8 +261,40 @@ impl<'a> KimiRecords<'_, 'a> {
             KimiAttention::Kda => self.kda(devices, layer, layouts, &mut ops, &mut core)?,
             KimiAttention::Mla => self.mla(devices, layer, layouts, &shares, &mut ops, &mut core)?,
         }
-        let weights = ops.into_iter().zip(core).zip(shares).map(|((operands, core), attention)|
-            LayerWeights { operands, attention, core }).collect::<Vec<_>>();
+        let native = layouts.iter().zip(devices).map(|(layout, &device)| {
+            layout.native.iter().map(|(&name, layout)| {
+                use crate::shared::native_attention::{attention_records, AttentionRecord, NativeAttentionWeights};
+                use crate::shared::memory::DeviceAllocation;
+                let selected = self.checkpoint.projection(&layout.stem)?;
+                let [n, k] = layout.shape;
+                let (values, scales) = device.run(|| Ok((
+                    DeviceAllocation::new(device.library, (n * k * if layout.fp8 { 1 } else { 2 }).max(256))?,
+                    if layout.fp8 { Some(DeviceAllocation::new(device.library, (n / 128 * (k / 128) * 4).max(256))?) } else { None },
+                )))?;
+                let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.attention_mode(),
+                    layout, crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
+                    scales.as_ref().map(|scales| scales.buffer))?;
+                let stream = self.streams.iter().find(|(id, _)| *id == device.id)
+                    .context("Kimi native attention load stream")?.1;
+                let admitted = self.core.native_mount_load(devices.len())?;
+                for record in records {
+                    match record {
+                        AttentionRecord::Operand(record) => {
+                            admitted.validate(record.mount_load()?)?;
+                            self.dense.operand(record)?;
+                        }
+                        AttentionRecord::Step(record) => {
+                            admitted.validate(record.mount_load()?)?;
+                            self.dense.step(record, stream)?;
+                        }
+                    }
+                }
+                Ok((name, NativeAttentionWeights { layout: layout.clone(), values, scales }))
+            }).collect::<Result<BTreeMap<_, _>>>()
+        }).collect::<Result<Vec<_>>>()?;
+        let weights = ops.into_iter().zip(core).zip(shares).zip(native)
+            .map(|(((operands, core), attention), native)| LayerWeights { operands, attention, core, native })
+            .collect::<Vec<_>>();
         for (layout, weights) in layouts.iter().zip(&weights) { layout.check_owned(weights)?; }
         Ok(weights)
     }
@@ -277,7 +309,7 @@ impl<'a> KimiRecords<'_, 'a> {
                 let layout = layouts[owner].core.get(name).context("Kimi K6 owner layout")?;
                 core[owner].insert(name, self.core(devices[owner], layout)?);
             }
-        } else {
+        } else if !layouts[owners[0]].native.contains_key(name) {
             for (index, &owner) in owners.iter().enumerate() {
                 ops[owner].insert(name, self.bf16_share(devices[owner], &format!("{stem}.weight"), shape, side,
                     owners.len(), index)?);
@@ -447,7 +479,8 @@ impl LayerLayout {
     /// Recorded owners match the admitted extents exactly (as `check` does for packed bytes).
     fn check_owned(&self, weights: &LayerWeights<'_>) -> Result<()> {
         ensure!(self.attention == weights.attention && self.operands.len() == weights.operands.len()
-            && self.core.len() == weights.core.len(), "Kimi recorded operand inventory differs from admission");
+            && self.core.len() == weights.core.len() && self.native.len() == weights.native.len(),
+            "Kimi recorded operand inventory differs from admission");
         for (name, bytes) in &self.operands {
             ensure!(weights.operands.get(name).is_some_and(|a| a.buffer.bytes == *bytes),
                 "Kimi recorded operand {name} differs from admission");
@@ -457,6 +490,62 @@ impl LayerLayout {
             ensure!(owned.shape == layout.shape && owned.side == layout.side && owned.codebook == layout.codebook
                 && owned.payload.buffer.bytes + owned.suh.buffer.bytes + owned.svh.buffer.bytes == layout.bytes,
                 "Kimi recorded K6 operand {name} differs from admission");
+        }
+        for (name, layout) in &self.native {
+            let owned = weights.native.get(name).context("Kimi recorded native operand absent")?;
+            ensure!(owned.layout == *layout
+                && (owned.values.buffer.bytes + owned.scales.as_ref().map_or(0, |s| s.buffer.bytes)) as u64 == layout.bytes()?,
+                "Kimi recorded native operand {name} differs from admission");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_record_tests {
+    use super::*;
+    use crate::shared::native_attention::{attention_records, AttentionRecord};
+    use cuteafd_loader::{formats::{native_attention::{NativeLayout, NativeProjection}, trellis_core::CoreSplit},
+        plan::checkpoint::{AttentionMode, CheckpointTensor, ProjectionStorage, SelectedProjection},
+        SafetensorsTensorMetadata};
+
+    #[test]
+    fn native_mount_estimate_covers_actual_qb_and_o_records() -> Result<()> {
+        for (leaf, shape, split) in [("q_b_proj", [18432, 1536], CoreSplit::Output),
+            ("o_proj", [7168, 12288], CoreSplit::Input)] {
+            let stem = format!("language_model.model.layers.0.self_attn.{leaf}");
+            let selected = SelectedProjection { storage: ProjectionStorage::Native {
+                dtype: DType::Bf16, shape: shape.to_vec() }, source_bytes: (shape[0] * shape[1] * 2) as u64,
+                tensors: vec![CheckpointTensor { shard: "not-opened.safetensors".into(),
+                    meta: SafetensorsTensorMetadata { name: format!("{stem}.weight"), dtype: DType::Bf16,
+                        shape: shape.to_vec(), byte_offset: 4096, byte_length: (shape[0] * shape[1] * 2) as u64 } }] };
+            for fp8 in [false, true] {
+                let core = CoreInventory { native: BTreeMap::from([(stem.clone(), NativeProjection {
+                    shape, fp8, split })]), ..Default::default() };
+                for ranks in [1, 2] { for rank in 0..ranks {
+                    let mut local = shape;
+                    match split { CoreSplit::Input => local[1] /= ranks,
+                        CoreSplit::Output => local[0] /= ranks, CoreSplit::Whole => {} }
+                    let layout = NativeLayout { stem: stem.clone(), shape: local, fp8, rank, ranks, split };
+                    let values = CuteafdDeviceBuffer { ptr: 0x1000usize as *mut _,
+                        bytes: local[0] * local[1] * if fp8 { 1 } else { 2 }, ..Default::default() };
+                    let scales = fp8.then(|| CuteafdDeviceBuffer { ptr: 0x2000usize as *mut _,
+                        bytes: local[0] / 128 * (local[1] / 128) * 4, ..Default::default() });
+                    let mode = if fp8 { AttentionMode::Fp8Compact } else { AttentionMode::Hqa };
+                    let records = attention_records(std::path::Path::new("/not-opened"), &selected, mode,
+                        &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, scales)?;
+                    let mut actual = cuteafd_loader::shared::dense_read::MountLoad::default();
+                    for record in records {
+                        actual.merge(match record {
+                            AttentionRecord::Operand(record) => record.mount_load()?,
+                            AttentionRecord::Step(record) => record.mount_load()?,
+                        });
+                    }
+                    core.native_mount_load(ranks)?.validate(actual)?;
+                    assert_eq!(actual.pinned_tables > 0, fp8);
+                    assert_eq!(actual.full_row_cache > 0, ranks == 2 && split == CoreSplit::Input);
+                } }
+            }
         }
         Ok(())
     }

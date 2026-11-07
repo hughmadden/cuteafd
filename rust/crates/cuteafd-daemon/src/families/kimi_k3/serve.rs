@@ -148,10 +148,26 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         let result = (|| -> Result<()> {
             cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
                 .map_err(|_| anyhow::anyhow!("Kimi serving needs an isolated process"))?;
-            let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&worker_args.snapshot, false, false)?;
+            let view = worker_args.attention.selected_view.clone().map(Ok)
+                .unwrap_or_else(|| worker_args.attention.select(&worker_args.snapshot))?;
+            worker_args.attention.validate_view(&view)?;
+            let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
             let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
             cfg.release_geometry()?;
             cuteafd_bench::context::set_family(cfg.family_id());
+            let view = checkpoint.view.as_ref()
+                .context("Kimi serving requires the immutable selected checkpoint view")?;
+            use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, AttentionMode};
+            let mode = match view.mode() {
+                AttentionMode::Hqa => "hqa", AttentionMode::Compact => "compact",
+                AttentionMode::Fp8Compact => "fp8-compact",
+            };
+            let recipe = if view.mode() == AttentionMode::Fp8Compact { FP8_RECIPE } else { "none" };
+            cuteafd_bench::context::set_resolved("attention-mode", mode);
+            cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
+            cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
+            tracing::info!(attention_mode = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+                "selected immutable attention bundle");
             let concurrency = usize::from(worker_args.max_sequences);
             let slots = cuteafd_core::concurrency::state_slots(concurrency as u64) as usize;
             let prefill = worker_args.prefill()?;
@@ -245,6 +261,16 @@ mod tests {
         assert!(args(&["--expert-usage"])?.expert_usage);
         assert!(!off.expert_usage_reader.configure(true, true).map_err(anyhow::Error::msg)?);
         assert!(off.expert_usage_reader.require_enabled().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn attention_bundle_flags_use_shared_modes_and_conflict() -> Result<()> {
+        use cuteafd_loader::plan::checkpoint::AttentionMode;
+        assert_eq!(args(&[])?.attention.mode(), AttentionMode::Hqa);
+        assert_eq!(args(&["--compact-attention"])?.attention.mode(), AttentionMode::Compact);
+        assert_eq!(args(&["--fp8-compact-attention"])?.attention.mode(), AttentionMode::Fp8Compact);
+        assert!(args(&["--compact-attention", "--fp8-compact-attention"]).is_err());
         Ok(())
     }
 

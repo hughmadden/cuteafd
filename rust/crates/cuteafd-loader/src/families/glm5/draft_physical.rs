@@ -71,6 +71,15 @@ pub struct GlmDflashConfig {
 }
 
 impl GlmDflashConfig {
+    /// GQA heads, retained KV and MLP neurons are independent rank-local owners.
+    pub fn for_tp(&self, ranks: usize) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2) && self.heads % ranks == 0
+            && self.kv_heads % ranks == 0 && self.intermediate % ranks == 0,
+            "DFlash head/MLP geometry cannot split across {ranks} ranks");
+        Ok(Self { heads: self.heads / ranks, kv_heads: self.kv_heads / ranks,
+            intermediate: self.intermediate / ranks, ..self.clone() })
+    }
+
     pub fn read(snapshot: &Path) -> Result<Self> {
         let raw: RawConfig = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)
             .context("parsing the DFlash2 config.json")?;

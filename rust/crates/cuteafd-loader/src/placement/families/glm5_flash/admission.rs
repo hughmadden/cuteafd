@@ -22,6 +22,8 @@ pub struct ProcessOwners {
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
     /// The drafter's standalone push group, after the target group has committed.
     pub draft_push: Option<DraftPush>,
+    /// Fixed rank-local GQA owners, not a movable single-home drafter.
+    pub draft_tp2: Vec<crate::families::glm5::draft_physical::GlmDflashPhysicalLayout>,
 }
 
 /// Owners of the drafter's standalone coordinator push group (draft loading only):
@@ -61,14 +63,24 @@ impl DraftPush {
             device_scratch: if fp8 { step } else { 0 } }))
     }
 
+    pub fn for_tp(mut self, ranks: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(matches!(ranks, 1 | 2), "DFlash push rank count");
+        self.host = crate::push_load::PushHostEnvelope::new(vec![0; ranks],
+            vec![self.host.dense_bytes[0]; ranks], self.host.slots, self.host.slot_bytes)?;
+        Ok(self)
+    }
+
     /// Recipe owners on draft home `gpu`, alive only while the drafter loads.
     pub fn allocations(&self, gpu: u8) -> Result<Vec<p::Allocation>, p::Refusal> {
         let lifetime = p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::DraftLoad };
         let mut owners = self.host.allocations(&format!("glmf.draft.push.{gpu}"))?;
         for owner in &mut owners { owner.lifetime = lifetime; }
         if self.device_scratch > 0 {
-            owners.push(p::Allocation::buffer(format!("glmf.draft.push.scratch.{gpu}"), p::Location::coordinator(gpu),
-                self.device_scratch, lifetime, Category::Staging, "draft push step scratch"));
+            for rank in 0..self.host.expert_bytes.len() {
+                let rank = gpu + rank as u8;
+                owners.push(p::Allocation::buffer(format!("glmf.draft.push.scratch.{rank}"), p::Location::coordinator(rank),
+                    self.device_scratch, lifetime, Category::Staging, "draft push step scratch"));
+            }
         }
         Ok(owners)
     }
@@ -185,7 +197,7 @@ impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
         Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
-            draft_push: None }
+            draft_push: None, draft_tp2: vec![] }
     }
 
     pub fn serving(&mut self, i: &GlmfInputs<'_>, quota: u64, chunk: u64, host_embedding: u64,
@@ -452,7 +464,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
  {
         return Err(invalid("GLM Flash executor geometry"));
     }
-    if i.shared_replay && (gpus != 1 || i.spark_ranks == 0) {
+    if i.shared_replay && (gpus != 1 || i.spark_ranks == 0 || !process.remote_experts) {
         return Err(invalid("--replay-records shared needs one coordinator GPU with Spark experts"));
     }
     for profile in [&i.workspace, &i.local_workspace] {
@@ -475,6 +487,10 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         else if let Some(n) = i.onboard.layers(routed.len()) { vec![n] }
         else if rtx_experts { (0..=routed.len()).collect() } else { vec![0] };
     let counts = counts.into_iter().filter(|&count| process.remote_experts || count == routed.len()).collect::<Vec<_>>();
+    if i.shared_replay && counts.iter().all(|&count| count == routed.len()) {
+        return Err(invalid("--replay-records shared needs one coordinator GPU with Spark experts"));
+    }
+    let counts = counts.into_iter().filter(|&count| !i.shared_replay || count < routed.len()).collect::<Vec<_>>();
     if counts.is_empty() || counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
         return Err(p::Refusal::Unsupported);
     }
@@ -596,6 +612,31 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         .chain(process.mount_load.iter().flat_map(|load| load.allocations("glmf.load.mount"))) {
         let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
         contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
+    }
+    if !process.draft_tp2.is_empty() {
+        if gpus != 2 || process.draft_tp2.len() != 2 || i.drafter_bytes != 0 || i.drafter_bridge.is_some() {
+            return Err(invalid("TP2 DFlash requires two fixed rank owners, not a movable"));
+        }
+        for (rank, layout) in process.draft_tp2.iter().enumerate() {
+            let prefix = if rank == 0 { "glmf.draft" } else { "glmf.draft.peer" };
+            let location = p::Location::coordinator(rank as u8);
+            for owner in layout.allocations(prefix, location) {
+                let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
+                contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
+            }
+            for owner in layout.weight_owners() {
+                contract.components.push(p::Component::resident_weight(p::ResidentWeight {
+                    id: format!("{prefix}.{}", owner.id), location,
+                    weights: ResidentWeights(owner.bytes),
+                }, p::ByteCurve::fixed(owner.bytes, maximum)));
+            }
+        }
+        if let Some(draft) = &process.draft_push {
+            for owner in draft.allocations(0)? {
+                let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
+                contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
+            }
+        }
     }
     if let Some(envelope) = &process.push_host {
         for owner in envelope.allocations("glmf.push")? {
@@ -925,5 +966,30 @@ mod tests {
             let scratch = owners.iter().find(|owner| owner.id == "glmf.load.shared.scratch").unwrap();
             assert_eq!(scratch.lifetime.last, p::Phase::Load);
         }
+    }
+
+    #[test]
+    fn shared_replay_requires_admitted_spark_experts() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let routed = cfg.dense[..cfg.layers].iter().filter(|&&d| !d).count();
+        let mut input = crate::placement::families::glm5_flash::tests::inputs(&cfg, 1, 96 << 30);
+        input.shared_replay = true;
+        input.spark_ranks = 2;
+
+        // Admitted Spark experts succeed.
+        let process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        assert!(prepare(&input, 188, true, process).is_ok());
+
+        // Media-only Spark ranks without remote experts refuse shared replay.
+        let mut media_only = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        media_only.remote_experts = false;
+        let err = prepare(&input, 188, true, media_only).err().unwrap().to_string();
+        assert!(err.contains("--replay-records shared needs one coordinator GPU with Spark experts"), "{err}");
+
+        // Onboarding all routed layers to RTX leaves admitted expert world 0 and refuses shared replay.
+        input.onboard = Onboard::Layers(routed);
+        let process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        let err = prepare(&input, 188, true, process).err().unwrap().to_string();
+        assert!(err.contains("--replay-records shared needs one coordinator GPU with Spark experts"), "{err}");
     }
 }

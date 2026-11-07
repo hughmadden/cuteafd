@@ -3904,6 +3904,23 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
         assert_eq!(item(&path, false, fixed, Category::Workspace, "steps"), item(&path, true, fixed, Category::Workspace, "steps"));
     }
     assert_eq!(report(&path, true, None).memory_layout.unwrap().pool_tokens, 1_048_576);
+    assert_eq!(report(&path, true, None).replay_records, Some("shared"));
+    assert_eq!(report(&path, false, None).replay_records, Some("own"));
+    let auto_report = |placement: ExpertPlacement, pool: Option<u64>, onboard: Option<crate::placement::OnboardSetting>| {
+        let options = PlanOptions { placement, layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            drafter_bytes: 256 << 20, rtx_bytes: vec![96 << 30], context_tokens: 131_072,
+            workspace_manifest: Some(path.clone()), glmf_auto_replay: true, pool_tokens: pool,
+            onboard, ..Default::default() }), ..Default::default() };
+        plan(dir.path(), &options).unwrap()
+    };
+    let auto_spark = auto_report(ExpertPlacement::Sparks { ranks: 4 }, None, None);
+    assert_eq!(auto_spark.replay_records, Some("shared"));
+    let auto_fixed = auto_report(ExpertPlacement::Sparks { ranks: 4 }, Some(131_072), None);
+    assert_eq!(auto_fixed.replay_records, Some("own"));
+    let auto_local = auto_report(ExpertPlacement::Local, None, None);
+    assert_eq!(auto_local.replay_records, Some("own"));
+    let auto_onboard_all = auto_report(ExpertPlacement::Sparks { ranks: 4 }, None, Some(crate::placement::OnboardSetting::All));
+    assert_eq!(auto_onboard_all.replay_records, Some("own"));
 }
 
 #[test]
@@ -3985,6 +4002,29 @@ fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
 }
 
 #[test]
+fn glmf_tp2_auto_manual_budget_and_spark_range_keep_whole_single_gpu() {
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
+    let manifest = write_glm5_flash_workspaces(dir.path());
+    let options = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            pool_tokens: Some(32768), context_tokens: 32768, drafter_bytes: 256 << 20,
+            tp2_dflash: true, glmf_tp2_dflash_auto: true,
+            workspace_manifest: Some(manifest), ..Default::default()
+        }), ..sparks(4) };
+    let report = plan(dir.path(), &options).unwrap();
+    assert!(report.solver_placement.is_some(), "{}", render(&report));
+    assert_eq!(report.tp2_dflash, Some(false));
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&options).unwrap();
+    let single = columns.iter().find(|column| column.rtx_gpus == 1).unwrap();
+    assert!(single.range.is_some(), "{single:?}");
+    assert!(single.counts.iter().any(|count| count.currently_launchable), "{single:?}");
+    assert!(single.counts.iter().all(|count| count.executable_blockers.iter()
+        .all(|blocker| !blocker.contains("TP2 DFlash requires"))), "{single:?}");
+}
+
+#[test]
 fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_override() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     use crate::families::glm5::draft_representation::GlmDraftRepresentation;
@@ -3998,7 +4038,7 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     for draft_kv_cache in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
         let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
-            draft_sequences:Some(8), draft_context_slots:Some(8), draft_kv_cache, glmf_drafter_snapshot:Some(draft.path().into()),
+            draft_sequences:Some(8), draft_context_slots:Some(8), draft_kv_cache, glmf_draft_fp8_mode:2, glmf_drafter_snapshot:Some(draft.path().into()),
             context_tokens:131_072, ..Default::default() };
         let run = |options: &layout::LayoutOptions| {
             let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()),

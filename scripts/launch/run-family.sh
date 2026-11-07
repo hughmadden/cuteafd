@@ -1675,14 +1675,15 @@ if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family
   esac
 fi
 tp2_dflash_default=off
-if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
+if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
   tp2_dflash_default=on
+  [[ "$family" != glm5_flash ]] || tp2_dflash_default=auto
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
-case "$tp2_dflash" in on|off) ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
-[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
-  release_die "TP2_DFLASH requires MiMo/Kimi, two selected RTX GPUs and DFlash2"
-if [[ "$family" == mimo_v2 || "$family" == kimi_k3 ]]; then
+case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == glm5_flash && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
+[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
+  release_die "TP2_DFLASH requires MiMo/Kimi/GLM Flash, two selected RTX GPUs and DFlash2"
+if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && "$tp2_dflash" != auto ]]; then
   # Forward false as well: an explicit off must survive future default changes.
   tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"
   family_args+=(--tp2-dflash "$tp2_dflash_bool")
@@ -2278,15 +2279,9 @@ if [[ $family == glm5_flash ]]; then
   # own 321 MB, 642 MB with GLM5_FLASH_DECODE_ROWS=128) or shared (the prefill lanes' scratch, which
   # no decode step reads). One GPU whose pool is sized from measured memory (an automatic pool with
   # Spark experts).
-  replay_eligible=0
-  if [[ $head_split != 0 ]]; then replay_reason="head split keeps its own records"
-  elif [[ $glmf_pool != 0 ]]; then replay_reason="fixed pool keeps its own records"
-  elif [[ $ranks == 0 ]]; then replay_reason="local experts keep their own records"
-  else replay_eligible=1; replay_reason="one GPU; automatic measured pool with Spark experts"; fi
-  replay_records="$(release_glmf_auto GLM5_FLASH_REPLAY_RECORDS "$(get GLM5_FLASH_REPLAY_RECORDS auto)" \
-    shared own "$replay_eligible" "$replay_reason")"
-  case "$replay_records" in
-    ""|own) ;;
+  requested_replay_records="$(get GLM5_FLASH_REPLAY_RECORDS auto)"
+  case "$requested_replay_records" in
+    ""|auto|own) ;;
     shared)
       if [[ $head_split != 0 ]]; then
         echo "GLM5_FLASH_REPLAY_RECORDS=shared keeps the records in one GPU's prefill scratch; serve it without a head split" >&2
@@ -2295,6 +2290,7 @@ if [[ $family == glm5_flash ]]; then
       family_args+=(--replay-records shared) ;;
     *) echo "GLM5_FLASH_REPLAY_RECORDS must be own or shared" >&2; exit 2 ;;
   esac
+  glmf_replay_pos=${#family_args[@]}
   # GLM5_FLASH_DECODE_ROWS: auto keeps 64; 128 remains opt-in after the C16 cost-model gate. With
   # 128 a step of more than 64 rows runs the wide _m128 programs (a build with
   # CUTEAFD_GLMF_WIDE_DECODE_ROWS=128) and a verify step schedules up to the GPU's whole sparse MLA
@@ -2328,11 +2324,6 @@ if [[ $family == glm5_flash ]]; then
     on) trace_args+=(-e "CUTEAFD_GLMF_ROUTE_RING_CHECK=1") ;;
     *) echo "GLM5_FLASH_ROUTE_RING_CHECK must be on or off" >&2; exit 2 ;;
   esac
-  remote_drafter="$(get GLM5_FLASH_REMOTE_DRAFTER)"
-  case "$remote_drafter" in
-    ""|on|off) ;;
-    *) echo "GLM5_FLASH_REMOTE_DRAFTER must be on or off" >&2; exit 2 ;;
-  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
@@ -2348,15 +2339,7 @@ case "$family" in
   glm5)
     # Prefill units, waves and span come from the deployment plan (units-span).
     ;;
-  glm5_flash)
-    # Planner and server must offer the same conditional drafter homes.
-    # Explicit config overrides the legacy process-wide diagnostic switch.
-    case "$remote_drafter" in
-      on) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=1) ;;
-      off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
-      "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
-    esac ;;
-  qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2) ;;
+  glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
@@ -2393,7 +2376,7 @@ audio_encoder_hash=""
     plan_cap="$(python3 -c 'import sys;f,t,b=map(int,sys.argv[1:]);print(max(1,b-(t-f)*2**20))' "$free_mib" "$total_mib" "$profile_cap")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
-  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 ]]; then
+  if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
@@ -2411,6 +2394,9 @@ audio_encoder_hash=""
   for ((i=0; i<${#family_args[@]}; i++)); do
     [[ "${family_args[i]}" != --host-cache-bytes ]] || plan_host_cache="${family_args[i+1]}"
     [[ "${family_args[i]}" != --media-cache-bytes ]] || plan_draft_args+=(--media-cache-bytes "${family_args[i+1]}")
+    if [[ "$family" == glm5_flash && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]]; then
+      plan_draft_args+=("${family_args[i]}" "${family_args[i+1]}")
+    fi
   done
   plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
   [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
@@ -2463,7 +2449,12 @@ audio_encoder_hash=""
   [[ "$family" != glm5_flash || -z "${prefix_marks:-}" ]] || plan_draft_args+=(--prefix-marks "$prefix_marks")
   # GLM 5.3 Flash: shared replay records (GLM5_FLASH_REPLAY_RECORDS above) live in the prefill
   # scratch, so the plan does not charge their own copy either.
-  [[ "$family" != glm5_flash || "${replay_records:-own}" != shared ]] || plan_draft_args+=(--replay-records shared)
+  if [[ "$family" == glm5_flash ]]; then
+    case "${requested_replay_records:-auto}" in
+      shared) plan_draft_args+=(--replay-records shared) ;;
+      ""|auto) plan_draft_args+=(--replay-records auto) ;;
+    esac
+  fi
   # GLM 5.3 Flash plans the decode rows serving takes (GLM5_FLASH_DECODE_ROWS above): 128 rows
   # charge their wider decode workspace, selector, replay records and expert intake, as serving
   # admits them, before an encoder placement is chosen.
@@ -2579,6 +2570,26 @@ audio_encoder_hash=""
   # admission policy and endpoints come from the typed deployment above.
   deployment_json="$plan_json"
   release_deployment_spark_roles "$deployment_json" "$ranks"
+  if [[ "$family" == glm5_flash ]]; then
+    resolved_replay_records="$(jq -r '.replay_records // empty' <<<"$deployment_json")"
+    if [[ -z "$resolved_replay_records" ]]; then
+      if [[ "${requested_replay_records:-auto}" == shared ]]; then resolved_replay_records=shared
+      elif [[ "${requested_replay_records:-auto}" == own ]]; then resolved_replay_records=own
+      elif [[ $head_split == 0 && $glmf_pool == 0 ]] && ((spark_expert_world > 0)); then resolved_replay_records=shared
+      else resolved_replay_records=own; fi
+    fi
+    replay_eligible=0
+    if [[ "$resolved_replay_records" == shared ]]; then
+      replay_eligible=1; replay_reason="one GPU; automatic measured pool with Spark experts"
+    elif [[ $head_split != 0 ]]; then replay_reason="head split keeps its own records"
+    elif [[ $glmf_pool != 0 ]]; then replay_reason="fixed pool keeps its own records"
+    else replay_reason="local experts keep their own records"; fi
+    replay_records="$(release_glmf_auto GLM5_FLASH_REPLAY_RECORDS "${requested_replay_records:-auto}" \
+      shared own "$replay_eligible" "$replay_reason")"
+    if [[ "${requested_replay_records:-auto}" != shared && "$replay_records" == shared ]]; then
+      family_args=("${family_args[@]:0:glmf_replay_pos}" --replay-records shared "${family_args[@]:glmf_replay_pos}")
+    fi
+  fi
   if [[ "$family" == qwen4 && "$head_split" == 1 && "$spark_expert_world" != 0 ]]; then
     release_die "Qwen dual requires a Spark-free local TP2 layout"
   fi
@@ -2588,6 +2599,11 @@ audio_encoder_hash=""
     esac
   fi
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
+  if [[ "$family" == glm5_flash && "$tp2_dflash" == auto ]]; then
+    tp2_dflash_bool="$(jq -er '.tp2_dflash | if . == true then "true" elif . == false then "false" else error("missing drafter choice") end' <<<"$plan_json")"
+    family_args+=(--tp2-dflash "$tp2_dflash_bool")
+    echo "GLM Flash planner selected TP2_DFLASH=$tp2_dflash_bool"
+  fi
   release_prefill_shape "$deployment_json" "$family"
   resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$deployment_json")" ||
     release_die "deployment does not name a supported decode lane count"

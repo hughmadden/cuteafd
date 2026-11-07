@@ -19,8 +19,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "python/reference"))
-from fidelity_windows import (canonical, finish_golden, load_set, verify_snapshot,
-                              write_scored_logits)
+from fidelity_windows import (admit_reference_memory, canonical, finish_golden, load_set,
+                              verify_snapshot, write_scored_logits)
 from families.kimi_k3.model import (LayerWeights, configure_f32, geometry, load_official,
                                     package_source_identity, source_identity)
 
@@ -152,7 +152,20 @@ class LayerState:
             shutil.rmtree(self.root / ("layer%03d" % previous["layer"]))
 
 
-def native_layer(reference, config, weights, index):
+def admit_layer_memory(cuda, config, index, required, largest, max_length):
+    if getattr(config, "dsa_config", None) is not None:
+        from families.kimi_k3.k31 import execution_memory
+        buffers = execution_memory(config, max_length, index)
+        print("K3.1 live-buffer admission: " + json.dumps(buffers, sort_keys=True), flush=True)
+        admit_reference_memory(cuda, required + largest * 5 + buffers["peak"],
+                               margin_bytes=buffers["margin"])
+    else:
+        # Preserve K3's established reserve, but allow GB10 to reclaim file cache.
+        admit_reference_memory(cuda, required + largest * 5 + 64 * 1024 ** 3,
+                               margin_bytes=0)
+
+
+def native_layer(reference, config, weights, index, *, max_length=16384):
     import torch
     with torch.device("meta"):
         layer = reference.KimiDecoderLayer(config, index)
@@ -170,10 +183,7 @@ def native_layer(reference, config, weights, index):
                 largest = max(largest, parameter.numel() * 4)
             else:
                 required += parameter.numel() * 4
-        free, _ = torch.cuda.mem_get_info()
-        # Admission covers all 16K-window state/combine/KDA buffers plus slack.
-        if required + largest * 5 + 64 * 1024 ** 3 > free:
-            raise ValueError("packed layer plus strict F32 execution reserve does not fit")
+        admit_layer_memory(torch.cuda, config, index, required, largest, max_length)
         return weights.load_module(layer, prefix, stream_experts=True)
     required = 0
     for name, parameter in layer.named_parameters():
@@ -186,9 +196,7 @@ def native_layer(reference, config, weights, index):
             required += parameter.numel() * sizes[descriptor["dtype"]]
         else:
             required += parameter.numel() * 2
-    free, _ = torch.cuda.mem_get_info()
-    if required + 16 * 1024 ** 3 > free:
-        raise ValueError("native layer plus 16 GiB execution reserve does not fit")
+    admit_reference_memory(torch.cuda, required + 16 * 1024 ** 3, margin_bytes=0)
     return weights.load_module(layer, prefix)
 
 
@@ -200,7 +208,7 @@ def official_mask(hidden):
     return mask[None, None]
 
 
-def official_check(out, arrays, per_layer):
+def official_check(out, arrays, per_layer, *, comparison=None):
     import numpy as np
     native, adapted = arrays
     logp = native.astype(np.float64)
@@ -213,7 +221,7 @@ def official_check(out, arrays, per_layer):
     result = {"schema": "cuteafd.kimi.official-forward/1", "tokens": len(native),
               "top1": top1, "kl": kl, "relative_logit_l2": relative,
               "max_abs_logit_difference": float(np.abs(native - adapted).max()),
-              "comparison": "independent native decoder streams; original eager versus fixed-M128 causal tiles; same exact native weights and F32 output head",
+              "comparison": comparison or "independent native decoder streams; original eager versus fixed-M128 causal tiles; same exact native weights and F32 output head",
               "passed": top1 >= .99 and kl <= 1e-4 and relative <= .01,
               "limits": {"top1_min": .99, "kl_max": 1e-4, "relative_logit_l2_max": .01},
               "layers": per_layer}
@@ -244,13 +252,20 @@ def execute(a):
 
     started = time.monotonic()
     a.out.mkdir(parents=True, exist_ok=True)
-    arithmetic = configure_f32()
+    if getattr(a, "check_only", False):
+        torch.set_default_dtype(torch.float32)
+        arithmetic = None
+    else:
+        arithmetic = configure_f32()
     torch.manual_seed(0)
     manifest = load_set(a.windows)
-    if manifest["family"] != "kimi_k3" or any(w.get("media") for w in manifest["windows"]):
+    if manifest["family"] not in ("kimi_k3", "kimi_k31") or any(w.get("media") for w in manifest["windows"]):
         raise ValueError("Kimi oracle supports only its own text panel")
     snapshot = verify_snapshot(manifest, a.snapshot)
     reference, config, quantization = load_official(a.snapshot)
+    is_k31 = getattr(config, "dsa_config", None) is not None
+    if (manifest["family"] == "kimi_k31") != is_k31:
+        raise ValueError("Kimi panel family differs from checkpoint")
     if stop is not None and not 0 <= stop < config.num_hidden_layers:
         raise ValueError("diagnostic stop layer is outside checkpoint")
     weights = LayerWeights(a.snapshot, quantization, dtype=torch.float32,
@@ -272,11 +287,18 @@ def execute(a):
         weights.validate_module(module, prefix)
     del outer, module
     print(f"native shape preflight passed; {len(weights.narrowed_a_log)} zero-padded KDA A_log tensors", flush=True)
+    if getattr(a, "check_only", False):
+        return
     pins = {**source_identity(a.snapshot), "fla_source_sha256": package_source_identity(fla),
             "transformers_source_sha256": package_source_identity(transformers),
             "compressed_tensors_source_sha256": package_source_identity(compressed_tensors),
             "reference_adapter_sha256": digest(Path(__file__).with_name("model.py")),
             "reference_runner_sha256": digest(Path(__file__))}
+    if is_k31:
+        if transformers.__version__ != "4.57.6":
+            raise ValueError("K3.1 oracle requires explicitly installed transformers 4.57.6")
+        pins["indexer_ops_sha256"] = digest(Path(__file__).parents[1] / "mistral_large4/ops.py")
+        pins["shape_invariant_sha256"] = digest(ROOT / "python/reference/shape_invariant.py")
     checking = getattr(a, "_prefix_probe", False)
     if not checking and stop is None:
         a._kimi_probe_state = a.out.parent / (a.out.name + "-prefix-state")
@@ -286,7 +308,8 @@ def execute(a):
             archive.mkdir(exist_ok=True)
             previous.rename(archive / previous.name)
     # A diagnostic prefix is never passed to qualification or output scoring.
-    proof = qualify(a, manifest, execute) if stop is None else None
+    proof = qualify(a, manifest, execute, route_forcing=is_k31) if stop is None else None
+    forced_routes = checking and getattr(a, "_route_forced_qualification", False)
     windows = copy.deepcopy(manifest["windows"])
     if checking:
         for name in ("official_short", "adapted_short"):
@@ -303,6 +326,8 @@ def execute(a):
                "expert_storage": "GPU packed cache; one F32 matrix resident per native Linear call",
                "state_bytes_per_layer": sum(len(w["tokens"]) * config.hidden_size * 4 for w in windows),
                "windows": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows}}
+    if forced_routes:
+        binding["qualification_routing"] = "eager IDs; adapted native weights; relative cutoff margin <=1e-5"
     state = LayerState(a._kimi_probe_state if checking else
                        a.out.parent / (a.out.name + "-layer-state"), binding,
                        diagnostic_prefix=stop)
@@ -319,21 +344,41 @@ def execute(a):
         print(f"resume after layer {state.latest['layer']}; {len(windows)} streams", flush=True)
         for index in range(state.latest["layer"] + 1, config.num_hidden_layers if stop is None else stop + 1):
             tick = time.monotonic()
-            layer = native_layer(reference, config, weights, index)
+            layer = native_layer(reference, config, weights, index,
+                                 max_length=max(len(window["tokens"]) for window in windows))
             pending = state.begin(index)
             short_outputs = {}
+            from contextlib import nullcontext
+            from shape_invariant import ForcedRouteQualification
+            routing = ForcedRouteQualification() if forced_routes and hasattr(layer, "block_sparse_moe") else None
+            gate = layer.block_sparse_moe.gate if routing else None
+            if gate and (gate.moe_router_activation_func != "sigmoid" or gate.num_expert_group != 1):
+                raise ValueError("Kimi forced routing requires ungrouped sigmoid gate")
+
+            def choices(logits):
+                return logits.sigmoid() + gate.e_score_correction_bias.unsqueeze(0)
+
+            def route_weights(logits, ids):
+                values = logits.sigmoid().gather(1, ids)
+                if gate.top_k > 1 and gate.moe_renormalize:
+                    values = values / (values.sum(dim=-1, keepdim=True) + 1e-20)
+                return values * gate.routed_scaling_factor
+
             for window in windows:
                 wid = window["id"]
                 hidden, blocks = state.load(wid, config.hidden_size)
                 original_blocks = blocks.shape[1]
                 if wid == "official_short":
                     mask = None if layer.is_linear_attn else official_mask(hidden)
-                    result, history = layer(hidden, attention_mask=mask, block_residual=blocks,
-                                            use_cache=False, output_attentions=False)
-                else:
-                    with geometry(reference):
-                        result, history = layer(hidden, attention_mask=None, block_residual=blocks,
+                    with routing.observe(gate, choices=choices) if routing else nullcontext():
+                        result, history = layer(hidden, attention_mask=mask, block_residual=blocks,
                                                 use_cache=False, output_attentions=False)
+                else:
+                    forced = routing and wid == "adapted_short"
+                    with geometry(reference):
+                        with routing.observe(gate, choices=choices, weights=route_weights) if forced else nullcontext():
+                            result, history = layer(hidden, attention_mask=None, block_residual=blocks,
+                                                    use_cache=False, output_attentions=False)
                 append = index % config.attn_res_block_size == 0
                 if history.shape[1] != original_blocks + int(append):
                     raise ValueError("official block-residual count differs")
@@ -347,7 +392,13 @@ def execute(a):
                 difference = short_outputs["official_short"] - short_outputs["adapted_short"]
                 pending["checks"].append({"layer": index, "max_abs_hidden_difference": difference.abs().max().item(),
                                           "relative_hidden_l2": (difference.norm() /
-                                              short_outputs["official_short"].norm().clamp_min(1e-30)).item()})
+                                              short_outputs["official_short"].norm().clamp_min(1e-30)).item(),
+                                          **({"natural_routing": routing.report} if routing else {})})
+                if routing:
+                    atomic_json(a.out / "route-qualification.json", {
+                        "schema": "cuteafd.reference.forced-routes/1", "layers": pending["checks"],
+                        "forced_ids_only": True, "published_scoring": "unforced fixed-M128"})
+                    routing.require_valid()
             pending["native_fp32_parameters"] = sorted(set(pending["native_fp32_parameters"]) | weights.native_fp32)
             state.commit(pending)
             del layer
@@ -392,7 +443,13 @@ def execute(a):
             del hidden, blocks, selected, logits
         comparison = None
         if checking:
-            comparison = official_check(a.out, [short_logits["official_short"], short_logits["adapted_short"]], state.latest["checks"])
+            description = None
+            if is_k31:
+                description = ("K3.1 eager versus fixed-M128 arithmetic with teacher-forced eager expert IDs, "
+                               "candidate-native combine weights; natural choice flips/margins reported per layer; "
+                               "both DSA arms share the source-pinned adapter; published scoring remains unforced")
+            comparison = official_check(a.out, [short_logits["official_short"], short_logits["adapted_short"]],
+                                        state.latest["checks"], comparison=description)
         else:
             evidence = next(a.out.glob("prefix-gate-*/official-forward.json"), None)
             if evidence is None:
@@ -400,6 +457,7 @@ def execute(a):
             comparison = json.loads(evidence.read_bytes())
             shutil.copyfile(evidence, a.out / "official-forward.json")
         finish_golden(a.out, manifest, entries, snapshot_identity=snapshot, source_pin=pins,
+                      **({"source_identity_provider": "families.kimi_k3.k31"} if is_k31 else {}),
                       nll=total_nll / total_rows, scored_tokens=total_rows, seconds=time.monotonic() - started,
                       torch=torch.__version__, transformers=transformers.__version__, tokenizers=tokenizers.__version__,
                       attention="eager", mtp=False, use_cache=False, prefix_qualification=proof,
@@ -411,7 +469,7 @@ def execute(a):
                              "kda_a_log_zero_padding": weights.padding_provenance()},
                       official_forward=comparison, arithmetic=arithmetic,
                       expert_storage=binding["expert_storage"],
-                      root_arithmetic={"source": "official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32",
+                      root_arithmetic={"source": ("hash-checked official K3 decoder plus isolated K3.1 DSA adapter, cross-checked against pinned vLLM and SGLang; F32 indexer does not emulate serving E4M3/UE8M0 QDQ; original/fixed-row comparison shares the DSA adapter" if is_k31 else "official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32"),
                           "arithmetic": "Reference computed entirely in F32 from the native checkpoint: exact group-32 MXFP4 to F32; shipped BF16/F32 dense tensors upcast to F32; F32 activations, block history, router, norms, KDA recurrence and eager attention; TF32 disabled in Torch and Triton, highest matmul precision; one expert matrix dequantized at a time from a per-layer packed GPU cache; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note: the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
                       platform={"capability": list(torch.cuda.get_device_capability()),
                                 "gpu": torch.cuda.get_device_name(), "cuda": torch.version.cuda})
@@ -422,11 +480,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--check-only", action="store_true", help="CPU checkpoint source/header/shape validation; no golden or device allocation")
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--stop-after-layer", type=int, default=None,
                         help="diagnostic only: retain residual at this zero-based layer; never score or publish")
     parser.add_argument("--diagnose-layer", type=int, default=None,
-                        help="compare native/fixed sub-ops at layer 1 without running a golden")
+                        help="diagnostic only: layer 1 sub-ops, otherwise replay through this zero-based layer and stop at the first route flip")
     parser.add_argument("--diagnose-official-noise", action="store_true",
                         help="compare unmodified native batch 2 with retained batch-1 probe states")
     parser.add_argument("--diagnose-blas", choices=("cublas", "cublaslt"),

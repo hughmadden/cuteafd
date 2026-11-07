@@ -148,6 +148,12 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 if "--split-device" in before["command"] and "--dspark" in before["command"]:
                     before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
             if entry["family"] == "glm5_flash":
+                # Preserve historical whole-drafter commands with the now-explicit choice.
+                # On max pairs this is the mock planner's selection, not a fit assertion.
+                position = after["command"].index("--tp2-dflash")
+                assert after["command"].count("--tp2-dflash") == 1
+                assert after["command"][position + 1] == "false"
+                del after["command"][position:position + 2]
                 if "--vision-peers" in before["command"]:
                     endpoints = before["command"][before["command"].index("--vision-peers") + 1].split(",")
                     # Historical endpoint lanes encode the physical rank, not expert-world order.

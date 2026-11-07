@@ -1,6 +1,7 @@
 """CPU contracts for GLM's ABI2 tower qualification; no CUDA imports."""
 import ctypes
 import importlib.util
+import re
 from pathlib import Path
 
 import numpy as np
@@ -183,7 +184,12 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert "kda.in[24896|12576,4096]" in source
     module = (root / "glm5_flash/mod.rs").read_text()
     opening = module.split("pub fn with_engine", 1)[1]
-    assert opening.index("self.admit(") < opening.index("TokenEmbedding::load(")
+    inventory = opening.index("self.admission_inventory(")
+    allocation = opening.index("TokenEmbedding::load(")
+    assert opening.count("self.admission_inventory(") == 1
+    assert inventory < opening.index("self.admit_candidate(")
+    assert all(inventory < start < allocation for start in (
+        match.start() for match in re.finditer(r"self\.admit_candidate\(", opening)))
     assert "admitted_graphs.lifetime" in opening
     assert 'full_prefill_logits_bytes(' not in opening
     startup = opening.index("let result = with_startup_graphs(")
@@ -201,7 +207,9 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert "self.reset_context(0, 0)?" in prime
     assert "self.reset_context(slot, TAP_ROWS)?" in prime
     assert "self.discard_context(slot)?" in prime
-    assert prime.index("self.prime_metadata()?") < prime.index("self.update(") < prime.index("self.draft_device_with(")
+    assert prime.index("self.prime_metadata()?") < prime.index("self.update(") < prime.index("self.draft_from_rank(")
+    assert prime.index("self.prime_rank(false)?") < prime.index("split.peer.prime_remote()")
+    assert prime.index("split.peer.prime_remote()") < prime.index("split.exchange.add(")
     assert prime.index("self.discard_context(slot)?") < prime.index("self.startup_primed.set(true)")
     assert "prepare_workspace()" not in existing
     assert "prepare_workspace()" not in drafter.split("pub(crate) fn prepare_workspace(", 1)[0]

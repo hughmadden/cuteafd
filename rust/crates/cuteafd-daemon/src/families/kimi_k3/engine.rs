@@ -18,6 +18,7 @@ struct Lanes<'a> {
 pub(crate) struct Engine<'a> {
     pub max_pool_tokens_no_onboard: Option<u64>,
     pub host_prefix: Option<cuteafd_hostcache::config::Config>,
+    target_view: cuteafd_loader::plan::checkpoint::CheckpointView,
     draft: Option<Rc<super::draft::NativeDraft<'a>>>,
     draft_probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a,
         crate::shared::draft::probe::RoundProbe<'a>>>>,
@@ -200,13 +201,15 @@ impl<'a> Engine<'a> {
         let rows = u32::try_from(admission.unit_rows())?;
         let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
             plan.spec().lanes as usize];
-        let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
+        let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
+            .context("Kimi engine requires the immutable selected checkpoint view")?)?;
         let executions = cuteafd_loader::plan::spark_executions::admit_family("kimi_k3",
             &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports(), None,
             u64::from(rows), admission.waves() as u64)?;
         let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;
         model.validate(ExpertGeometry::KIMI_K3)?;
-        let spark = SparkAdmission::plan_view(checkpoint.view.as_ref().context("Kimi Spark admission requires selected checkpoint view")?, ExpertGeometry::KIMI_K3,
+        let spark = SparkAdmission::plan_view(checkpoint.view.as_ref()
+            .context("Kimi bootstrap requires the immutable selected checkpoint view")?, ExpertGeometry::KIMI_K3,
             Some(&catalog), &admission.working_set(), peers.len(), None, model, None)?;
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).
@@ -264,8 +267,10 @@ impl<'a> Engine<'a> {
         let routed = local.iter().map(|owners| admission.connect_spark(library, &owners[RANKS - 1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
+        let target_view = checkpoint.view.as_ref()
+            .context("Kimi engine requires the immutable selected checkpoint view")?.clone();
         let mut engine = Self::bind(exchange_streams.into(), plan, peer, hops,
-            local, routed, io, experts, prefill, coordinator_packing_cap)?;
+            local, routed, io, experts, prefill, coordinator_packing_cap, target_view)?;
         engine.execution.expert_usage = expert_usage;
         engine.max_pool_tokens_no_onboard = admission.placement.max_pool_tokens_no_onboard;
         engine.host_prefix = admission.host_prefix.take();
@@ -281,7 +286,8 @@ impl<'a> Engine<'a> {
         local: Vec<Vec<LocalLane<'a>>>, routed: Vec<RoutedLane<'a>>,
         io: Vec<Vec<TokenIo<'a>>>,
         experts: Vec<Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>>,
-        prefill: PrefillUnits, coordinator_packing_cap: usize) -> Result<Self> {
+        prefill: PrefillUnits, coordinator_packing_cap: usize,
+        target_view: cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<Self> {
         ensure!(matches!(exchange_streams.len(), 1 | 2) && !local.is_empty()
             && local.len() == routed.len() && local.len() == io.len() && local.len() == experts.len(),
             "Kimi engine physical ranks or local/Spark/IO lane counts differ");
@@ -300,9 +306,13 @@ impl<'a> Engine<'a> {
         let streams = local.iter().map(|ranks| ranks.iter().map(|local| local.stream().clone()).collect()).collect();
         let execution = Execution::new(plan, peer.as_deref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
-        Ok(Self { host_prefix: None, max_pool_tokens_no_onboard: None, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+        Ok(Self { host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
             hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
+    }
+
+    pub(crate) fn target_view(&self) -> &cuteafd_loader::plan::checkpoint::CheckpointView {
+        &self.target_view
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
@@ -442,7 +452,8 @@ impl<'a> Engine<'a> {
     pub(crate) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize)
         -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::{draft::resource::{self, LayerHome}, experts::rtx::RtxExpertLayer};
-        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+        ensure!(snapshot == self.target_view.snapshot(), "Kimi draft target snapshot differs from selected view");
+        let catalog = cuteafd_loader::read_expert_catalog_view(&self.target_view)?;
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi draft needs EXL3 headers"))?;
         let lanes = self.lanes.try_borrow()?;
         let cfg = lanes.local[0][0].config();
@@ -484,6 +495,15 @@ impl<'a> Engine<'a> {
         if let Some(startup) = self.startup_captures.get() {
             super::graphs::check_captures(startup, cuteafd_ffi::graph_captures())?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn attach_capture(&self, capture: Rc<super::golden::Capture>) -> Result<()> {
+        self.require_live()?;
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        ensure!(lanes.local.len() == 1 && self.provisional.borrow().is_none(),
+            "Kimi capture requires one idle diagnostic lane after startup");
+        for local in &mut lanes.local[0] { local.capture = Some(capture.clone()); }
         Ok(())
     }
 

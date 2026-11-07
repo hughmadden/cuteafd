@@ -98,7 +98,7 @@ pub(crate) struct Load<'a> {
 }
 
 enum Prefetched {
-    File(Vec<u8>),
+    File(std::rc::Rc<Vec<u8>>),
     Tensors(HashMap<String, Vec<u8>>),
 }
 
@@ -117,6 +117,10 @@ impl<'a> Load<'a> {
     }
 
     pub fn with_prefetched_file(library: &'a NativeLibrary, path: &Path, bytes: Vec<u8>) -> Result<Self> {
+        Self::with_shared_prefetched_file(library, path, std::rc::Rc::new(bytes))
+    }
+
+    pub fn with_shared_prefetched_file(library: &'a NativeLibrary, path: &Path, bytes: std::rc::Rc<Vec<u8>>) -> Result<Self> {
         let mut load = Self { library, source: Source::open_file(path)?, dense: DenseLoad::mount(library), prefetched: None };
         if !crate::shared::experts::rtx::dense::is_recording() { load.prefetched = Some(Prefetched::File(bytes)); }
         Ok(load)

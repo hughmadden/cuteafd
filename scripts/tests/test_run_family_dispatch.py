@@ -819,8 +819,9 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert update.index("self.put(&context.slots") < update.index("ready()?") < update.index("self.linear(")
     draft = shared.split("    fn draft_from(", 1)[1].split("let (s, l)", 1)[0]
     assert "if let AttentionWorkspace::Gqa(attention) = &w.attention" in draft
-    for metadata in ("w.positions", "attention.tables", "w.anchors"):
+    for metadata in ("w.positions", "attention.tables", "head.anchors"):
         assert draft.index(f"self.put(&{metadata}") < draft.index("input(&ids, w.h.buffer")
+    assert "if let Some(head) = &w.head { self.put(&head.anchors" in draft
     transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]
     assert "self.synchronize()?" not in transport
     assert "cuda_stream_synchronize" not in transport
@@ -858,8 +859,10 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "self.bridge.exchange.wait(" not in prime and "self.bridge.exchange.push" not in prime
     isolated = shared.split("    pub(crate) fn prime_remote(", 1)[1].split("    fn workspace(", 1)[0]
     assert "0..TAP_ROWS" in isolated and "1..=self.max_sequences" in isolated
-    assert "self.draft_device_with(" in isolated
-    assert isolated.index("self.draft_device_with(") < isolated.index("for ring in")
+    assert "self.prime_rank(true)" in isolated
+    assert isolated.index("self.prime_rank(false)?") < isolated.index("split.peer.prime_remote()") < isolated.index("split.exchange.add(")
+    assert "HeadCall::Launch(&head), true, paired)" in isolated
+    assert isolated.index("self.draft_from_rank(") < isolated.index("for ring in")
     assert "DraftAttention::Gqa(layer)" in isolated and "self.discard_context(slot)?" in isolated
     assert "buffers.push(&layer.page_table)" in isolated
     assert "&attention.lengths, &attention.query_offsets" in isolated
@@ -1097,6 +1100,9 @@ report.update(spark_ranks=ranks)
 if family == "mimo_v2":
     report["prefill_lanes"] = 3
 gpus = int(value("--rtx", "1"))
+if family == "glm5_flash":
+    report.setdefault("tp2_dflash", gpus == 2 and value("--speculator") == "dflash2"
+        and value("--tp2-dflash", "true") == "true")
 def size_bytes(text):
     match = re.fullmatch(r"([0-9]+(?:\\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)?", text)
     return int(float(match.group(1)) * {None: 1, "B": 1, "MB": 10**6, "GB": 10**9, "MiB": 2**20, "GiB": 2**30}[match.group(2)])
@@ -1127,8 +1133,17 @@ for key, field in (("encoder", "encoder"), ("audio_encoder", "audio_encoder")):
 ranks = len(roles)
 report["spark_ranks"] = ranks
 peers = peers[:expert_world]
+requested_replay = value("--replay-records", "own")
+resolved_replay = (
+    ("shared" if gpus == 1 and int(value("--pool-tokens", "0") or 0) == 0 and expert_world > 0 else "own")
+    if requested_replay == "auto"
+    else requested_replay
+)
+if family == "glm5_flash":
+    report["replay_records"] = resolved_replay
 deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio_encoder"),
-    encoder_plan_hash=report.get("encoder_plan_hash", "ab" * 32), spark_expert_world=expert_world, spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
+    encoder_plan_hash=report.get("encoder_plan_hash", "ab" * 32), spark_expert_world=expert_world,
+    replay_records=report.get("replay_records"), spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=expert_world, ep=ep,
                   wire="native_ownership" if explicit and expert_world else "canonical"), peers=peers,
     speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
@@ -2961,7 +2976,6 @@ def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, 
     ("GLM5_FLASH_DRAFT_POLICY=cycle\n", "unknown configuration key: GLM5_FLASH_DRAFT_POLICY"),
     ("GLM5_FLASH_ROUTE_RING_CHECK=yes\n", "GLM5_FLASH_ROUTE_RING_CHECK must be"),
     ("GLM5_FLASH_DRAFT_TRACE=yes\n", "unknown configuration key: GLM5_FLASH_DRAFT_TRACE"),
-    ("GLM5_FLASH_REMOTE_DRAFTER=yes\n", "GLM5_FLASH_REMOTE_DRAFTER must be"),
 ])
 def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
@@ -4200,40 +4214,35 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
         assert f"--vision {mode or 'auto'}" in preflight
 
 
-@pytest.mark.parametrize("setting,value,legacy", [("on", "1", "0"), ("off", "0", "1")])
-def test_glmf_remote_drafter_config_overrides_env_for_plan_and_server(tmp_path, setting, value, legacy):
-    config = {**SPLIT_CONFIGS["glm5_flash"], "vision_config": {"depth": 24}}
+@pytest.mark.parametrize("selected", [False, True])
+def test_glmf_tp2_dflash_auto_passes_planner_choice_to_server(tmp_path, selected):
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
-            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
-    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
-                                  f"RTX_GPUS=2\nSPECULATOR=off\nVISION=rtx\nGLM5_FLASH_REMOTE_DRAFTER={setting}\n",
-                                  encoder_plan=plan, extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": legacy})
+            "tp2_dflash": selected}
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/tp2-dflash",
+        "RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/tp2-dflash\nVISION=off\nAUDIO=off\n",
+        encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
     server = next(line for line in lines if "cuteafd serve-glmf" in line)
-    for command in (planner, server):
-        assert command.count("-e CUTEAFD_GLMF_REMOTE_DFLASH=") == 1, command
-        assert f"-e CUTEAFD_GLMF_REMOTE_DFLASH={value}" in command, command
-    assert not any("CUTEAFD_GLMF_REMOTE_DFLASH=" in line for line in lines if "cuteafd expertd-native" in line)
+    assert "--tp2-dflash" not in shlex.split(planner)
+    assert f"--tp2-dflash {str(selected).lower()}" in server
 
 
-@pytest.mark.parametrize("value", ["", "0", "1"])
-def test_glmf_remote_dflash_candidate_env_matches_plan_and_server(tmp_path, value):
-    config = {**SPLIT_CONFIGS["glm5_flash"], "vision_config": {"depth": 24}}
-    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
-            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
-    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
-                                  "RTX_GPUS=2\nSPECULATOR=off\nVISION=rtx\n", encoder_plan=plan,
-                                  extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": value})
+@pytest.mark.parametrize("precision,mode", [("off", "w8a16"), ("on", "wide"), ("auto", "w8a8")])
+def test_glmf_plan_uses_served_drafter_precision_and_rows(tmp_path, precision, mode):
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "tp2_dflash": True}
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/tp2-dflash",
+        "RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/tp2-dflash\nVISION=off\nAUDIO=off\n"
+        f"SPECULATOR_FP8={precision}\nGLM5_FLASH_DRAFT_LINEAR={mode}\n", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
-    planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
-    server = next(line for line in lines if "cuteafd serve-glmf" in line)
-    expected = f"-e CUTEAFD_GLMF_REMOTE_DFLASH={value}"
-    for command in (planner, server):
-        assert (expected in command) == bool(value), command
-    assert not any("CUTEAFD_GLMF_REMOTE_DFLASH=" in line for line in lines if "cuteafd expertd-native" in line)
+    planner = shlex.split(next(line for line in lines if "cuteafd plan" in line and "--deployment" in line))
+    server = shlex.split(next(line for line in lines if "cuteafd serve-glmf" in line))
+    for flag in ["--draft-fp8", "--draft-linear"]:
+        assert (flag in planner) == (flag in server)
+        if flag in server:
+            assert planner[planner.index(flag) + 1] == server[server.index(flag) + 1]
 
 
 @pytest.mark.parametrize("vision", [None, "auto"])
@@ -4389,8 +4398,10 @@ def test_glmf_auto_defaults_and_encoder_plan_agree(tmp_path, split, fixed, local
     for command in (planner, serve):
         assert "--decode-rows 128" not in command, command
         assert ("--index-cache compact" in command) == (not split), command
-        assert ("--replay-records shared" in command) == (not split and not fixed and not local), command
         assert "--prefix-marks pool" not in command
+    assert "--replay-records auto" in planner, planner
+    assert "--replay-records shared" not in planner, planner
+    assert ("--replay-records shared" in serve) == (not split and not fixed and not local), serve
     assert result.stderr.count("GLM5_FLASH_DECODE_ROWS=auto ->") == 1
     assert result.stderr.count("GLM5_FLASH_INDEX_CACHE=auto ->") == 1
     assert result.stderr.count("GLM5_FLASH_REPLAY_RECORDS=auto ->") == 1
@@ -5130,7 +5141,8 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert "prefill reserve does not fit" not in result.stderr
 
 
-@pytest.mark.parametrize("family,command", [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi")])
+@pytest.mark.parametrize("family,command", [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi"),
+                                           ("glm5_flash", "serve-glmf")])
 @pytest.mark.parametrize("value,expected", [(None, None), ("off", "false"), ("on", "true")])
 def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, command, value, expected):
     if expected is None:
@@ -5139,18 +5151,25 @@ def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, co
     if family == "kimi_k3":
         config = {"model_type": family, "text_config": {"model_type": "kimi_linear",
                   "num_hidden_layers": 93, "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+    if family == "glm5_flash":
+        config = GLMF_TWO_LAYER
     keys = "RTX_GPUS=2\nSPECULATOR=dflash2\nVISION=off\nAUDIO=off\n"
-    if family == "kimi_k3":
+    if family in {"kimi_k3", "glm5_flash"}:
         keys += "SPECULATOR_MODEL_ID=test/tp2-dflash\n"
     if value is not None:
         keys += f"TP2_DFLASH={value}\n"
-    result = _family_launch_result(tmp_path, config, "test/tp2-dflash", keys)
+    automatic = family == "glm5_flash" and value is None
+    result = _family_launch_result(tmp_path, config, "test/tp2-dflash", keys,
+        encoder_plan={"tp2_dflash": True} if automatic else None)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     serve = next(line for line in lines if f"cuteafd {command} --snapshot" in line)
     plans = [line for line in lines if "cuteafd plan " in line]
     assert f"--tp2-dflash {expected}" in serve
-    assert plans and all(f"--tp2-dflash {expected}" in line for line in plans)
+    if automatic:
+        assert plans and all("--tp2-dflash" not in shlex.split(line) for line in plans)
+    else:
+        assert plans and all(f"--tp2-dflash {expected}" in line for line in plans)
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=1\nSPECULATOR=dflash2\n",
@@ -5295,3 +5314,75 @@ def test_glmf_expertless_vision_handoff_preserves_physical_ranks(tmp_path, visio
                if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
     assert {int(worker[worker.index("--rank") + 1]) for worker in workers} == set(vision_ranks)
     assert all("--encoder-only" in worker and "--world" not in worker for worker in workers)
+
+
+@pytest.mark.parametrize("case,spark_count,expert_world,vision_rank,explicit_replay,expect_shared", [
+    ("zero_inventory", 0, 0, None, None, False),
+    ("nonzero_inventory_expert_world_zero", 3, 0, None, None, False),
+    ("sparse_tower_only_vision_rank2", 3, 0, 2, None, False),
+    ("admitted_spark_experts", 2, 2, None, None, True),
+    ("explicit_own_override", 2, 2, None, "own", False),
+    ("explicit_shared_override", 2, 2, None, "shared", True),
+])
+def test_glmf_auto_replay_records_follow_admitted_expert_world(
+    tmp_path, case, spark_count, expert_world, vision_rank, explicit_replay, expect_shared,
+):
+    placement = (
+        {"kind": {"kind": "spark", "rank": vision_rank}, "replicas": []}
+        if vision_rank is not None
+        else {"kind": {"kind": "off"}, "replicas": []}
+    )
+    roles = []
+    if expert_world > 0:
+        roles = [
+            dict(rank=i, experts=True, layers=[1], encoder=None, audio_encoder=None, drafter=None)
+            for i in range(expert_world)
+        ]
+    elif vision_rank is not None:
+        roles = [
+            dict(rank=vision_rank, experts=False, layers=[], encoder=placement, audio_encoder=None, drafter=None)
+        ]
+    keys = f"RTX_GPUS=1\nSPARK_COUNT={spark_count}\nSPECULATOR=off\n"
+    keys += "VISION=auto\nAUDIO=off\n" if vision_rank is not None else "VISION=off\nAUDIO=off\n"
+    if spark_count == 0:
+        keys += "EXPERT_BACKEND=local\n"
+    if explicit_replay is not None:
+        keys += f"GLM5_FLASH_REPLAY_RECORDS={explicit_replay}\n"
+    result = _family_launch_result(
+        tmp_path,
+        GLMF_VISION,
+        "zai-org/GLM-5.3-Flash",
+        keys,
+        extra_args=("--wip", f"glmf-replay-{case}"),
+        execute_workers=vision_rank is not None,
+        encoder_plan={
+            "placement_supported": True,
+            "fits": True,
+            "spark_expert_world": expert_world,
+            "spark_roles": roles,
+            "encoder": placement if vision_rank is not None else None,
+            "encoder_plan_hash": "ab" * 32,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    planner = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-glmf --snapshot" in line)
+    if explicit_replay is None:
+        assert "--replay-records" in planner and planner[planner.index("--replay-records") + 1] == "auto"
+        expected_note = (
+            "GLM5_FLASH_REPLAY_RECORDS=auto -> shared (one GPU; automatic measured pool with Spark experts)"
+            if expect_shared
+            else "GLM5_FLASH_REPLAY_RECORDS=auto -> own (local experts keep their own records)"
+        )
+        assert expected_note in result.stderr
+    elif explicit_replay == "shared":
+        assert "--replay-records" in planner and planner[planner.index("--replay-records") + 1] == "shared"
+    else:
+        assert "--replay-records" not in planner
+    assert ("--replay-records" in serve and serve[serve.index("--replay-records") + 1] == "shared") == expect_shared
+    assert ("--local-experts" in serve) == (expert_world == 0)
+    if vision_rank is not None:
+        assert serve[serve.index("--vision") + 1] == f"spark:{vision_rank}"
+        assert serve[serve.index("--vision-peer-ranks") + 1] == str(vision_rank)
+        assert "--peers" not in serve
+
