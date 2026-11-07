@@ -183,3 +183,24 @@ pub fn mtp_arena(checkpoint: &Checkpoint, cfg: &Qwen35Config, format: DenseForma
     ensure!(layout.payload_bytes() as u64 == admitted.weights.0, "dense MTP layout differs from admitted payload");
     Ok(layout)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planner_and_runtime_share_the_installed_operand_recipe() -> Result<()> {
+        let (directory, _, _, _) = super::super::tests::native_planner_fixture();
+        let checkpoint = Checkpoint::open(directory.path())?;
+        let cfg = Qwen35Config::from_hf(&checkpoint.config)?;
+        let format = DenseFormat::detect(&checkpoint)?;
+        let layout = target_arena(&checkpoint, &cfg, DType::F32, format)?;
+        let payload = crate::placement::families::qwen3_5::NativeWeights::native(&checkpoint, &cfg, DType::F32)?;
+        assert_eq!(layout.payload_bytes() as u64,
+            payload.layers.iter().sum::<u64>() + payload.norm + payload.head + payload.embedding);
+        assert_eq!(layout.views().len(), 3 * 10 + 8 + 3);
+        assert_eq!(layout.view("model.language_model.layers.0/norm_w").unwrap().bytes(), 512);
+        assert!(mtp_arena(&checkpoint, &cfg, format).is_err());
+        Ok(())
+    }
+}
