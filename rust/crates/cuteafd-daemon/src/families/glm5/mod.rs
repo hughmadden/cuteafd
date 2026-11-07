@@ -1584,7 +1584,7 @@ impl Opened {
         self.library.cuda_set_device(args.device)?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.bytes();
-        let embedding_bytes = embedding.device_bytes();
+        let embedding_bytes = embedding.device_owner_bytes();
         let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
             .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
             .enumerate().map(|(rank, bytes)| bytes
