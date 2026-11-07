@@ -101,6 +101,23 @@ impl TargetLayout {
     }
 }
 
+/// Independently retired dense dSpark weights; routed experts have their own arena.
+pub fn draft_layout(catalog: &OfficialV41Catalog) -> Result<WeightArenaLayout> {
+    let mut requests = BTreeMap::new();
+    for tensor in catalog.tensors() {
+        let meta = &tensor.metadata;
+        let name = &meta.name;
+        if !name.starts_with("mtp.") || name.contains(".ffn.experts.") { continue; }
+        let bytes = usize::try_from(meta.byte_length)?;
+        insert(&mut requests, name.clone(), bytes)?;
+        if name.ends_with(".weight") && meta.dtype == cuteafd_core::DType::F8E4M3
+            && (!name.ends_with(".main_proj.weight") || name == "mtp.0.main_proj.weight") {
+            insert(&mut requests, packed_scale_name(name), bytes / 32)?;
+        }
+    }
+    WeightArenaLayout::new("v41/dspark/dense", requests)
+}
+
 fn insert(requests: &mut BTreeMap<String, usize>, name: String, bytes: usize) -> Result<()> {
     ensure!(bytes > 0 && requests.insert(name.clone(), bytes).is_none(), "invalid or duplicate V4.1 weight {name}");
     Ok(())
