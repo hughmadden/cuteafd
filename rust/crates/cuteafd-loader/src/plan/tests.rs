@@ -3518,7 +3518,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             rtx_bytes: vec![placement::inventory::PRO_TOTAL_BYTES; 2], head_split: true,
             context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(setting),
             prefill_rows: 4096, prefill_lanes: lanes, state_slots: Some(8), prefix_slots: Some(8),
-            glmf_drafter_disabled: true, glmf_prefill_expanded: false,
+            glmf_drafter_disabled: true, glmf_prefill_expanded: false, host_cache_bytes: Some(0),
             glmf_representation: resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false },
             workspace_manifest: Some(path.clone()), ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
