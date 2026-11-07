@@ -628,6 +628,19 @@ def test_muse_default_drafter_is_pinned_and_off_is_explicit(tmp_path: Path, mode
         assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
 
 
+@pytest.mark.parametrize("selection,expected", [(None, "false"), ("off", "false"), ("on", "true")])
+def test_muse_tp2_dflash_reaches_plan_and_serve(tmp_path: Path, selection, expected) -> None:
+    drafter = "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
+    revision = "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
+    _snapshot(tmp_path / "hf", drafter, {}, revision=revision)
+    keys = "SPECULATOR=dflash2\n"
+    if selection is not None:
+        keys += f"TP2_DFLASH={selection}\n"
+    result = _muse(tmp_path, keys)
+    serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(serve, "--tp2-dflash") == _flag(plan, "--tp2-dflash") == expected
+
+
 @pytest.mark.parametrize("setting", ["", "off", "on"])
 def test_muse_prefill_scoring_is_launch_admitted(tmp_path: Path, setting: str) -> None:
     result = _muse(tmp_path, f"FULL_PREFILL_LOGITS={setting}\n" if setting else "")
