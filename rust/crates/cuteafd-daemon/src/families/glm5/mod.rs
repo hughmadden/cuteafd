@@ -1413,7 +1413,7 @@ impl Opened {
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let admission = crate::shared::placement::SparkAdmission::plan_view(&self.view,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working,
-                peers.len(), None, spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
+                peers.len(), spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
                 args.exlr8_manifest.as_deref())?;
             // Plan coordinator membership before offers; a Required failure
             // refuses startup rather than silently reading through the mount.

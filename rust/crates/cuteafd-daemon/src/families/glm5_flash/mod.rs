@@ -2499,7 +2499,7 @@ impl Opened {
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let source_view = &self.expert_view;
             let admission = crate::shared::placement::SparkAdmission::plan_view(&source_view, geometry, self.experts.as_ref(),
-                &working, peers.len(), None, model, args.exlr8_manifest.as_deref())?;
+                &working, peers.len(), model, args.exlr8_manifest.as_deref())?;
             let native_ranks = if native_admission.is_some() {
                 push_policy.plan(|| {
                     ensure!(admission.coordinator_pushes(), "native Flash Spark admission did not select required push");

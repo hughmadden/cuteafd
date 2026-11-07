@@ -544,7 +544,7 @@ pub struct SparkAssignment {
 }
 
 /// Selected storage policy; runtime validates its installed package against
-/// this same layout before allocating. Native shards may be replicated groups.
+/// this same layout before allocating.
 #[derive(Debug, Clone, Copy)]
 pub enum SparkResidentLayout {
     Exl3 { world: usize, rank: usize },

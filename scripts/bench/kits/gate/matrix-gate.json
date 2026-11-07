@@ -218,8 +218,6 @@
     "MAX_CONTEXT_TOKENS": "1048576",
     "SPECULATOR": "dspark",
     "SPARK_COUNT": "4",
-    "SPARK_TP": "4",
-    "SPARK_EP": "1",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",
     "SPARK_2_HOST": "emu",
@@ -242,8 +240,6 @@
     "ADDR": "0.0.0.0:8702",
     "EXPERT_PORT": "19802",
     "SPARK_COUNT": "3",
-    "SPARK_TP": "3",
-    "SPARK_EP": "1",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",
     "SPARK_2_HOST": "emu"

@@ -404,10 +404,6 @@ pub(crate) struct PlanArgs {
     /// Emit typed launch decisions; live artifact verification stays with the launcher.
     #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
     pub(crate) deployment: bool,
-    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=8))]
-    pub(crate) spark_tp: Option<u8>,
-    #[arg(long, requires = "deployment", requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub(crate) spark_ep: Option<u8>,
     /// Ordered endpoint inventory; selected ranks take its prefix.
     #[arg(long = "deployment-peers", requires = "deployment", value_delimiter = ',')]
     pub(crate) deployment_peers: Vec<String>,
@@ -737,12 +733,6 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Spark tensor-parallel world; one rank supports whole Qwen EXL3 experts.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) world: u32,
-    /// Replicated-group tensor-parallel degree inside one group (opt-in; all-or-none with --spark-ep).
-    #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
-    pub(crate) spark_tp: Option<u8>,
-    /// Number of replicated expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
-    #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub(crate) spark_ep: Option<u8>,
     /// Total device bytes allowed for resident weights, loading and execution.
     #[arg(long)]
     pub(crate) device_budget_bytes: usize,
@@ -1358,43 +1348,17 @@ mod tests {
     }
 
     #[test]
-    fn spark_topology_flags_are_opt_in_all_or_none_and_range_checked() {
+    fn spark_topology_flags_are_gone_and_worker_world_is_range_checked() {
         use clap::Parser;
         let serve = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         let expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--device-budget-bytes", "1000", "--rank", "0", "--world", "4"];
-        // Absent keys preserve the legacy launch vector exactly.
         for base in [&serve[..], &expert[..]] {
-            let cli = Cli::try_parse_from(base).unwrap();
-            match cli.command {
-                Commands::ServeNative(args) => {
-                    assert_eq!((args.spark_tp, args.spark_ep), (None, None));
-                }
-                Commands::Expertd(args) => {
-                    assert_eq!((args.spark_tp, args.spark_ep), (None, None));
-                }
-                other => panic!("unexpected command {other:?}"),
+            Cli::try_parse_from(base).unwrap();
+            for flag in ["--spark-tp", "--spark-ep"] {
+                assert!(Cli::try_parse_from(base.iter().copied().chain([flag, "2"])).is_err(), "{flag}");
             }
-        }
-        // Both keys parse for either process.
-        let cli = Cli::try_parse_from(serve.into_iter().chain(["--spark-tp", "2", "--spark-ep", "2"]))
-            .unwrap();
-        let Commands::ServeNative(args) = cli.command else { panic!("serve-native") };
-        assert_eq!((args.spark_tp, args.spark_ep), (Some(2), Some(2)));
-        let cli = Cli::try_parse_from(expert.into_iter()
-            .chain(["--spark-tp", "3", "--spark-ep", "2"])).unwrap();
-        let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
-        assert_eq!((args.spark_tp, args.spark_ep), (Some(3), Some(2)));
-        // All-or-none and value ranges are enforced at parse time.
-        for flags in [vec!["--spark-tp", "2"], vec!["--spark-ep", "2"]] {
-            assert!(Cli::try_parse_from(serve.into_iter().chain(flags.clone())).is_err());
-            assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err());
-        }
-        for (tp, ep) in [("1", "2"), ("9", "1"), ("2", "0"), ("2", "4")] {
-            let flags = ["--spark-tp", tp, "--spark-ep", ep];
-            assert!(Cli::try_parse_from(serve.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
-            assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
         }
         // Whole-expert Qwen TP1 must reach the worker's family validation.
         let one = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
@@ -1405,29 +1369,11 @@ mod tests {
         for invalid in ["0", "9"] {
             assert!(Cli::try_parse_from(one.into_iter().chain([invalid])).is_err());
         }
-        // The worker world range also admits the six-rank layouts.
         let cli = Cli::try_parse_from(["cuteafd", "expertd-native", "--snapshot", "/model",
             "--native-lib", "/native.so", "--device-budget-bytes", "1000",
-            "--rank", "5", "--world", "6"]).unwrap();
+            "--rank", "7", "--world", "8"]).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
-        assert_eq!((args.rank, args.world), (5, 6));
-
-        // Pure TP6EP1 parses on both processes; TP9 is outside transport capacity.
-        let six_expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib",
-            "/native.so", "--device-budget-bytes", "1000", "--rank", "5", "--world", "6"];
-        for command in [&serve[..], &six_expert[..]] {
-            let cli = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "6", "--spark-ep", "1"])).unwrap();
-            match cli.command {
-                Commands::ServeNative(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
-                Commands::Expertd(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
-                other => panic!("unexpected command {other:?}"),
-            }
-            let error = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "9", "--spark-ep", "1"]))
-                .expect_err("TP9 exceeds transport capacity");
-            assert!(error.to_string().contains("expected 2 through 8"), "{error}");
-        }
+        assert_eq!((args.rank, args.world), (7, 8));
     }
 }
 
@@ -1616,25 +1562,6 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long,value_delimiter=',',num_args=1..)] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long,default_value="127.0.0.1:8000")] pub listen: String,
-    /// Replicated-group tensor-parallel degree inside one Spark group (opt-in; all-or-none with --spark-ep).
-    #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
-    pub spark_tp: Option<u8>,
-    /// Number of replicated Spark expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
-    #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub spark_ep: Option<u8>,
-}
-
-/// Parse transport geometry; checkpoint admission checks native package coverage.
-fn parse_spark_tp(value: &str) -> Result<u8, String> {
-    let value: u8 = value
-        .parse()
-        .map_err(|_| "expected a Spark TP degree between 2 and 8".to_string())?;
-    match value {
-        2..=8 => Ok(value),
-        _ => Err(format!(
-            "unsupported Spark TP degree {value}; expected 2 through 8"
-        )),
-    }
 }
 
 /// `cuteafd plan --decode-rows`: GLM 5.3 Flash's decode programs' 64 rows, or the wide programs' 128.

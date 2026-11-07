@@ -8,8 +8,6 @@ pub enum CuteafdError {
     UnknownRole(String),
     #[error("unknown placement policy: {0}")]
     UnknownPlacementPolicy(String),
-    #[error("unknown replicated expert tie-seed mode: {0} (expected dispatch or layer)")]
-    UnknownReplicatedExpertTieSeed(String),
     #[error("KV cache capacity exceeded: requested {requested_tokens} tokens, available {available_tokens}")]
     KvCapacityExceeded {
         requested_tokens: usize,

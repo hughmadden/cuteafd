@@ -71,10 +71,10 @@ fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize
         }
         ExpertLayer::Dspark { stage } => (V41Exl3Layer::Dspark(stage), 1, 0),
         ExpertLayer::DsparkTp2 { .. } => anyhow::bail!("TP2 dSpark EXL3 is not implemented"),
-        // Replicated native TP×EP groups are native-checkpoint only; EXL3
-        // publications are rejected at topology admission before reaching here.
-        ExpertLayer::BackboneReplicatedTp { .. } => anyhow::bail!(
-            "replicated TP×EP expert groups require the official native checkpoint"
+        // Native Spark TP shards are native-checkpoint only; EXL3 selects
+        // `BackboneExl3Tp` before reaching here.
+        ExpertLayer::BackboneSparkTp { .. } => anyhow::bail!(
+            "native Spark TP shards require a native expert checkpoint"
         ),
     })
 }

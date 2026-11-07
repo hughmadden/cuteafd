@@ -122,7 +122,7 @@ rust/crates/
   cuteafd-ffi        libloading C ABI; one module per kernel family, family-namespaced symbols
   cuteafd-loader     checkpoint catalog, family readers (HF config -> ModelSpec), LoadPlan,
                  capability check, fast sliced readers, mapped tables, sparknest placement
-  cuteafd-transport  ExpertProtocolV2, verbs RoCE, TP x EP topology (unchanged from ds41rt)
+  cuteafd-transport  ExpertProtocolV2, verbs RoCE, Spark TP topology
   cuteafd-hostcache  pinned host RAM prefix snapshots (unchanged)
   cuteafd-engine     model-agnostic serve runtime: scheduler, lanes, prefix cache, memory,
                  speculative transaction framework, console state
@@ -159,7 +159,7 @@ pin bumps ever bypass those tests; the current AOT manifest does not carry them.
 - `Attention` per layer kind: CED compressed MLA (V4.1), alternating
   compressed MLA (V4), MLA + DSA indexer (GLM), GQA full / SWA + sink (MiMo),
   KDA / GDN linear (GLM Flash, Qwen). Each owns its KV layout and formats.
-- `ExpertBackend`: Spark TP×EP over RoCE, local RTX TP1/TP2, dSpark-style
+- `ExpertBackend`: Spark TP over RoCE, local RTX TP1/TP2, dSpark-style
   drafter experts. Format-specific pack/unpack lives with the AOT shim.
 - `Speculator`: propose, verify, commit/rollback inside the existing
   speculative transaction protocol.
@@ -452,10 +452,9 @@ memory budget — and 1–6 Sparks, KV target, objective) → a hashed
 `placement.json` that the loader, workers, engines and launchers all
 consume. It generalizes V4.1's startup handoff (`v41_native_serve/placement.rs`),
 live memory planner and 20/20 backbone split. Per MoE layer the experts are
-resident on GPU0/GPU1 (full width, or TP2 where measured) or on a Spark group
-with TP×EP and uneven whole-block slices; EP means expert subsets per group
-(new: today groups are replicated). Cost model counts the busiest rank
-(E[max] routed experts per group), fabric intake as a shared prefill
+resident on GPU0/GPU1 (full width, or TP2 where measured) or on the Sparks
+as TP slices with uneven whole-block widths. Cost model counts the busiest rank,
+fabric intake as a shared prefill
 resource, and per-family coordinator step tables; search is exhaustive.
 Cold components get dispositions: official vision/audio towers run whole on
 a Spark when they fit (`ENCODERS=rtx0` pins them) with a hash-keyed
@@ -2412,7 +2411,7 @@ sketches; typed errors inside crates.
       - role/manifest proof (`V41_EXPERT_TP_AOT.json`, `symbols_verified`,
         native-library hash, the `io.cuteafd.spark_tp_roles` label);
       - artifact identity and the resolved-config fingerprint;
-      - the topology (`SPARK_TP`/`SPARK_EP`) and the placement handoff;
+      - the Spark TP (the expert rank count) and the placement handoff;
       - `KV_POOL_SIZE` and `MEMORY_RESERVATION` as `AdmissionArgs`.
     - **CLI.** V4.1's arguments are composed from shared clap groups
       (`RuntimeServeArgs`, `AdmissionArgs`, `TopologyArgs`, `PrefixArgs`,

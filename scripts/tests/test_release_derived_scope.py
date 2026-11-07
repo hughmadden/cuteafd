@@ -24,7 +24,7 @@ def matrix(tmp_path):
     path = tmp_path / 'matrix.json'
     path.write_text(json.dumps(dict(defaults=dict(set=dict(AUDIO='off')), entries=[
         dict(name='glm-fp8', family='glm5', config='glm.config', sparks=['rank-a', 'rank-b'], gpus=[0, 1],
-             set=dict(SPARK_TP='2', RTX_GPUS='1')),
+             set=dict(SPARK_COUNT='2', RTX_GPUS='1')),
         dict(name='flash-nvfp4', family='glm5_flash', config='flash.config', sparks=[], gpus=[0]),
     ])))
     # The helper imports WIP derivation from the source repo, not a fixture repo.
@@ -78,7 +78,7 @@ def test_union_equals_per_entry_derivation(fixture_repo):
                 assert SCOPE.tokens(value) == expected
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS'] <= SCOPE.tokens(union[P + 'GENERIC_SPARK_COUNTS'])
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['EXPERT_FAMILIES'] <= SCOPE.tokens(union[P + 'EXPERT_FAMILIES'])
-    assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 4
+    assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 2  # set wins over config
     assert not SCOPE.requirements(repo, path, 'glm-fp8')[0]['dual']  # set wins over gpus
 
 

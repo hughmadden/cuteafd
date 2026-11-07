@@ -37,7 +37,7 @@ impl ScalePlan {
         use crate::shared::experts::layer::ExpertLayer;
         Self::selected(catalog, layers.into_iter().map(|(layer, planes, base)| {
             let selection = if world == 1 { ExpertLayer::BackboneFull { layer } }
-                else { ExpertLayer::BackboneReplicatedTp { layer, world, rank } };
+                else { ExpertLayer::BackboneSparkTp { layer, world, rank } };
             (selection, planes, base)
         }))
     }
@@ -51,7 +51,7 @@ impl ScalePlan {
             let (layer, world, rank) = match selection {
                 ExpertLayer::BackboneFull { layer } => (layer, 1, 0),
                 ExpertLayer::BackboneTp2 { layer, rank } => (layer, 2, rank),
-                ExpertLayer::BackboneReplicatedTp { layer, world, rank } => (layer, world, rank),
+                ExpertLayer::BackboneSparkTp { layer, world, rank } => (layer, world, rank),
                 ExpertLayer::DsparkTp2 { stage, rank } => (stage, 2, rank),
                 _ => anyhow::bail!("unsupported native scale selection {selection:?}"),
             };

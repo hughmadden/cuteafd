@@ -525,7 +525,7 @@ impl V41CompactReducer<'_> {
 
     /// Sum `ranks` physical-rank BF16 [rows,5120] partial planes in rank order in
     /// FP32, add the optional BF16 shared expert exactly once, then round once to
-    /// BF16. This is the replicated-group contract: every physical rank returns
+    /// BF16. Every physical rank returns
     /// one plane directly to the coordinator, with no group-local reduction.
     /// # Safety
     /// `planes[0..ranks]` must be live non-null CUDA BF16 [rows,5120] views on the
@@ -755,17 +755,17 @@ impl NativeLibrary {
         self.expert_info_for(capacity,4)
     }
 
-    /// Replicated-group Spark TP2 shard metadata (intermediate 1152, SM121).
+    /// Spark TP2 shard metadata (intermediate 1152, SM121).
     pub fn v41_spark_tp2_expert_info(&self, capacity: u32) -> Result<V41ExpertInfo> {
         self.expert_info_for(capacity, 8)
     }
 
-    /// Replicated-group Spark TP3 shard metadata (intermediate 768, SM121).
+    /// Spark TP3 shard metadata (intermediate 768, SM121).
     pub fn v41_spark_tp3_expert_info(&self, capacity: u32) -> Result<V41ExpertInfo> {
         self.expert_info_for(capacity, 9)
     }
 
-    /// Pure `TP6EP1` Spark shard metadata (intermediate 384, SM121). Six
+    /// Spark TP6 shard metadata (intermediate 384, SM121). Six
     /// disjoint intermediate slices of every routed expert, no storage padding.
     pub fn v41_spark_tp6_expert_info(&self, capacity: u32) -> Result<V41ExpertInfo> {
         self.expert_info_for(capacity, 11)
@@ -892,7 +892,7 @@ impl NativeLibrary {
     fn expert_info_for(&self, capacity: u32, interface: u8) -> Result<V41ExpertInfo> {
         // 5..7 select the W4A4 ModelOpt NVFP4 family (RTX TP2, Spark TP4, full
         // RTX); 0..4 select the native W4A8 family; 8/9/11 select the native
-        // replicated-group Spark TP2/TP3 and pure TP6 shards. All may live in
+        // Spark TP2/TP3 and pure TP6 shards. All may live in
         // one library.
         let name: &[u8] = match interface {
             2 => b"cuteafd_v41_local_expert_info",
@@ -945,7 +945,7 @@ impl NativeLibrary {
             "unsupported native expert input representation"
         );
         if matches!(interface, 8 | 9 | 11 | 14) {
-            // Replicated-group and pure TP6 Spark shards are always exported
+            // Spark TP shards are always exported
             // from the native FP8 K32 wire format; reject a BF16-hidden
             // artifact explicitly.
             ensure!(
@@ -1006,17 +1006,17 @@ impl NativeLibrary {
         self.expert_kernel_for(capacity,4)
     }
 
-    /// Replicated-group Spark TP2 shard kernels (native FP8 K32, SM121).
+    /// Spark TP2 shard kernels (native FP8 K32, SM121).
     pub fn v41_spark_tp2_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         self.expert_kernel_for(capacity, 8)
     }
 
-    /// Replicated-group Spark TP3 shard kernels (native FP8 K32, SM121).
+    /// Spark TP3 shard kernels (native FP8 K32, SM121).
     pub fn v41_spark_tp3_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         self.expert_kernel_for(capacity, 9)
     }
 
-    /// Pure `TP6EP1` Spark shard kernels (native FP8 K32, SM121): six disjoint
+    /// Spark TP6 shard kernels (native FP8 K32, SM121): six disjoint
     /// intermediate slices of every routed expert, no storage padding.
     pub fn v41_spark_tp6_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         self.expert_kernel_for(capacity, 11)
@@ -1277,7 +1277,7 @@ mod tests {
 
     #[test]
     fn expected_geometry_covers_spark_tp2_tp3_tp6_without_touching_rtx_tp2() {
-        // Replicated-group Spark shards: TP2 1152 and TP3 768 are unpadded, and
+        // Spark shards: TP2 1152 and TP3 768 are unpadded, and
         // pure TP6 384 stores exactly its 2304/6 slice with no padding.
         assert_eq!(expected_expert_geometry(V41, false, 5, 1152), Some((384, 1152, 1152, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 6, 768), Some((384, 768, 768, 6)));

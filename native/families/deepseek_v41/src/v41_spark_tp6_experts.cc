@@ -1,5 +1,5 @@
 // Pure TP6 Spark shard modules (native FP8 K32 family, SM121).
-// Distinct symbol family from the standard Spark TP4 and replicated-group
+// Distinct symbol family from the standard Spark TP4 and the other Spark TP
 // TP2/TP3 shards so a single libcuteafd_native.so can hold every Spark TP
 // degree. Geometry is baked into the exported variant table: the official
 // intermediate 2304 splits evenly across six ranks, so the local shard is 384

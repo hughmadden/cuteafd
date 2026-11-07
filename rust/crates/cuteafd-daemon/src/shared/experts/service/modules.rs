@@ -28,8 +28,7 @@ impl Fp8Group {
     fn plan(catalog: &OfficialV41Catalog, config: &NativeExpertServiceConfig) -> Result<Vec<Self>> {
         use cuteafd_loader::formats::fp8_experts::ExpertFormat;
         let tensors = catalog.fp8().context("native expert groups require checkpoint tensors")?;
-        ensure!(config.spark_world()?.wire() == cuteafd_transport::expert::SparkWire::Canonical,
-            "native expert packages require canonical Spark wire");
+        config.spark_world()?;
         let layers = config.resident_layers(catalog.routed_experts().layers)?;
         let mut groups = Vec::<Self>::new();
         for layer in layers {

@@ -4,7 +4,7 @@ the `write-v41-expert-tp-manifest.py` role table.
 
 No hardware, Docker, SSH, cmake or cargo is touched. The test extracts the real
 role-selection block from each script by its boundary comments, sources the real
-`scripts/lib/release-common.sh` for `release_die`/`release_spark_topology_explicit`,
+`scripts/lib/release-common.sh` for `release_die`,
 and runs the block in bash under a matrix of configurations. A change to the
 allowlist, the default set or the multi-role syntax fails here rather than at
 release time.
@@ -46,7 +46,7 @@ UNIVERSAL = "tp2;tp3;tp5;tp6;tp7;tp8"
 # its dry-run exit. wip.sh names the WIP role variable in its usage text earlier in
 # the file, so its block is located from the right.
 BUILD_START = "# release-spark-tp-roles:start"
-WIP_START = "# Opt-in replicated-group Spark expert roles"
+WIP_START = "# Opt-in Spark expert roles"
 BLOCK_END = "if ((dry_run)); then"
 
 
@@ -63,7 +63,7 @@ def _role_block(script: Path = BUILD, *, variable: str = "spark_tp_roles",
     return block
 
 
-def _run(script: Path, spark_tp: str, override: str | None, *, variable: str,
+def _run(script: Path, override: str | None, *, variable: str,
          env_name: str, block: str) -> subprocess.CompletedProcess:
     harness = f"""
 set -euo pipefail
@@ -71,13 +71,7 @@ source "{RELEASE_COMMON}"
 {block}
 printf 'ROLES=%s\\n' "${{{variable}}}"
 """
-    env = {
-        "PATH": "/usr/bin:/bin:/usr/local/bin",
-        "SPARK_TP": spark_tp,
-        # `release_spark_topology_explicit` reads SPARK_EP under `set -u`; an
-        # explicit topology always sets it, so mirror that here.
-        "SPARK_EP": "1" if spark_tp else "",
-    }
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin"}
     # An unset override means "use the script's own default"; a set override is the
     # documented escape hatch, and an empty one is the explicit legacy request.
     if override is not None:
@@ -88,13 +82,13 @@ printf 'ROLES=%s\\n' "${{{variable}}}"
     )
 
 
-def _run_roles(spark_tp: str, override: str | None) -> subprocess.CompletedProcess:
-    return _run(BUILD, spark_tp, override, variable="spark_tp_roles",
+def _run_roles(override: str | None) -> subprocess.CompletedProcess:
+    return _run(BUILD, override, variable="spark_tp_roles",
                 env_name="CUTEAFD_RELEASE_SPARK_TP_ROLES", block=_role_block())
 
 
-def _run_wip_roles(spark_tp: str, override: str | None) -> subprocess.CompletedProcess:
-    return _run(WIP, spark_tp, override, variable="wip_spark_tp_roles",
+def _run_wip_roles(override: str | None) -> subprocess.CompletedProcess:
+    return _run(WIP, override, variable="wip_spark_tp_roles",
                 env_name="CUTEAFD_WIP_SPARK_TP_ROLES",
                 block=_role_block(WIP, variable="wip_spark_tp_roles", last=True,
                                   marker=WIP_START))
@@ -105,10 +99,9 @@ def _roles(result: subprocess.CompletedProcess) -> str:
     return result.stdout.rstrip().splitlines()[-1].removeprefix("ROLES=")
 
 
-@pytest.mark.parametrize("spark_tp", ["", "2", "3", "4", "6"])
-def test_build_release_default_is_universal(spark_tp) -> None:
-    """No configured topology may narrow what a published image can serve."""
-    assert _roles(_run_roles(spark_tp, None)) == UNIVERSAL
+def test_build_release_default_is_universal() -> None:
+    """No configuration may narrow what a published image can serve."""
+    assert _roles(_run_roles(None)) == UNIVERSAL
 
 
 @pytest.mark.parametrize(
@@ -122,39 +115,28 @@ def test_build_release_default_is_universal(spark_tp) -> None:
     ],
 )
 def test_build_release_subset_escape_hatch(override, expected) -> None:
-    assert _roles(_run_roles("4", override)) == expected
+    assert _roles(_run_roles(override)) == expected
 
 
 def test_build_rejects_an_unknown_role_with_a_clear_error() -> None:
-    result = _run_roles("", "tp9")
+    result = _run_roles("tp9")
     assert result.returncode == 2, result.stdout
     assert "accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in result.stderr
     assert "tp9" in result.stderr
 
 
 @pytest.mark.parametrize(
-    "spark_tp,override,expected",
-    [
-        ("", None, UNIVERSAL),
-        ("4", None, UNIVERSAL),
-        ("6", None, UNIVERSAL),
-        ("2", None, UNIVERSAL),
-        ("3", None, UNIVERSAL),
-        ("3", "", ""),
-        ("6", "", ""),
-        ("", UNIVERSAL, UNIVERSAL),
-        ("", "tp6", "tp6"),
-        ("4", UNIVERSAL, UNIVERSAL),
-    ],
+    "override,expected",
+    [(None, UNIVERSAL), ("", ""), (UNIVERSAL, UNIVERSAL), ("tp6", "tp6")],
 )
-def test_wip_role_selection_matrix(spark_tp, override, expected) -> None:
+def test_wip_role_selection_matrix(override, expected) -> None:
     """WIP shares release defaults and validation, with a subset escape hatch."""
-    result = _run_wip_roles(spark_tp, override)
+    result = _run_wip_roles(override)
     assert _roles(result) == expected
 
 
 def test_wip_rejects_an_unknown_role_and_names_the_wip_variable() -> None:
-    result = _run_wip_roles("", "tp9")
+    result = _run_wip_roles("tp9")
     assert result.returncode == 2, result.stdout
     assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in result.stderr
 
@@ -165,11 +147,10 @@ def test_wip_subset_is_always_contained_in_the_release_default() -> None:
     The parity that matters is containment: every role a slot resolves must also be
     baked into the published image, so a slot result transfers to the release path.
     """
-    release = set(_roles(_run_roles("", None)).split(";")) - {""}
+    release = set(_roles(_run_roles(None)).split(";")) - {""}
     assert release == set(UNIVERSAL.split(";"))
-    for spark_tp in ("2", "3", "4", "6"):
-        slot = set(_roles(_run_wip_roles(spark_tp, None)).split(";")) - {""}
-        assert slot <= release, (spark_tp, slot, release)
+    slot = set(_roles(_run_wip_roles(None)).split(";")) - {""}
+    assert slot <= release, (slot, release)
 
 
 @pytest.mark.parametrize("tp,width", [(3, 768), (6, 384)])

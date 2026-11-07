@@ -137,7 +137,7 @@ export CUTEAFD_EXPORT_HOST
 # Resolve once for direct builds too; explicit card/environment scopes win,
 # including an empty expert list or Spark role override.
 wip_scopes="$(python3 "$repo_root/scripts/lib/wip_aot_scopes.py" --config "$config" \
-  --set "SPARK_COUNT=$SPARK_COUNT" --set "SPARK_TP=$SPARK_TP" --set "RTX_GPUS=$RTX_GPUS")" ||
+  --set "SPARK_COUNT=$SPARK_COUNT" --set "RTX_GPUS=$RTX_GPUS")" ||
   release_die "could not derive WIP AOT scopes from $config"
 wip_scope_summary=()
 while IFS='=' read -r key value; do
@@ -202,7 +202,7 @@ done
 wip_container_hosts=("${wip_hosts[@]}")
 ((wip_seed_serves)) || wip_container_hosts=("$seed_host" "${wip_hosts[@]}")
 
-# Opt-in replicated-group Spark expert roles for the WIP slot. Shared slots
+# Opt-in Spark expert roles for the WIP slot. Shared slots
 # derive coverage from the release role configuration; an explicit empty
 # override keeps the legacy TP4-only escape hatch.
 wip_spark_tp_roles="$(release_spark_tp_roles_canonical \
@@ -219,7 +219,6 @@ if ((dry_run)); then
   echo "  Spark hosts (${#wip_hosts[@]}): $(IFS=,; echo "${wip_hosts[*]}")"
   echo "  seed host: $seed_host ($( ((wip_seed_serves)) && echo serving || echo build-only), transfer ${CUTEAFD_WIP_SEED_TRANSFER:-auto}${WIP_SEED_ADDR:+ via $WIP_SEED_ADDR})"
   echo "  Spark targets (${#wip_target_hosts[@]}): $(IFS=,; echo "${wip_target_hosts[*]}")"
-  echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
   echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
   echo "  Audio AOT: $audio_aot"

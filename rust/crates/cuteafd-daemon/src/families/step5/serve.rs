@@ -359,7 +359,7 @@ fn with_backend<T>(args: &ServeArgs,
         spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 };
     let bootstrap = super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
-    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(&view, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
+    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(&view, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(),
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?, None)?) };
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
@@ -776,7 +776,7 @@ mod tests {
                 spark_layers: (3..91).filter(|layer| !admitted.ownership.onboarded(*layer)).collect(),
                 spark_ranks: 6, prefill_lanes: 1 };
             SparkAdmission::plan_view(checkpoint.view.as_ref().context("Step-5 Spark admission requires selected checkpoint view")?, ExpertGeometry::STEP5, Some(&catalog), &working,
-                6, None, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?, None)?;
+                6, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?, None)?;
             super::super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {

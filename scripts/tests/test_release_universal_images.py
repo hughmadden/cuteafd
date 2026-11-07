@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """CPU-only regressions for the universal release image pair.
 
-One published pair has to serve every approved native topology: the ARM64 (SM121)
-Spark expert image carries the historical TP4 shard plus the TP2, TP3 and TP6
-replicated-group shards, and the x86_64 coordinator image carries none of them
-because Spark expert roles are expert-only. `./run.sh` selects the mode from
-`SPARK_TP`/`SPARK_EP`, so a published image must never advertise a role it cannot
-honor, and a build must not label a partial export as the resolved request.
+One published pair has to serve every planned Spark count: the ARM64 (SM121)
+Spark expert image carries the historical TP4 shard plus the other Spark TP
+shards, and the x86_64 coordinator image carries none of them because Spark
+expert roles are expert-only. `./run.sh` requires the role the planned count
+needs, so a published image must never advertise a role it cannot honor, and a
+build must not label a partial export as the resolved request.
 
 No Docker, SSH, GPU, Cargo or CMake is touched. Each test drives the real producer
 text: the `build.sh` canonicalizer and post-build comparison are extracted between
@@ -65,22 +65,14 @@ def _bash(script: str, positional: list[str] | None = None):
 # build.sh: one canonicalizer, shared by the selection and the post-build check
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("spark_tp,spark_ep", [
-    ("", ""), ("4", "1"), ("2", "2"), ("2", "3"), ("3", "2"), ("6", "1"),
-])
-def test_universal_roles_are_the_default_for_every_configuration(spark_tp, spark_ep):
-    """The resolved role set no longer depends on the configured topology.
-
-    A topology-derived role set meant `./build.sh` on the shipped default
-    configuration published an image that `./run.sh` then refused for every
-    explicit SPARK_TP/SPARK_EP configuration.
-    """
+@pytest.mark.parametrize("spark_count", ["0", "3", "4", "6", "8"])
+def test_universal_roles_are_the_default_for_every_configuration(spark_count):
+    """The resolved role set does not depend on the configured Spark count, so
+    one published Spark image serves every planned world."""
     result = _bash(f"""
 set -euo pipefail
 source "{RELEASE_COMMON}"
-SPARK_COUNT=4
-SPARK_TP="{spark_tp}"
-SPARK_EP="{spark_ep}"
+SPARK_COUNT={spark_count}
 {_between(BUILD, ROLES_BLOCK)}
 printf 'ROLES=%s\\n' "$spark_tp_roles"
 """)
@@ -202,7 +194,7 @@ def test_docker_exported_role_manifest_is_checksummed_per_role():
     ("", False),
 ])
 def test_publisher_requires_the_universal_role_membership(advertised, publishable):
-    """A published release pair must serve every approved native topology."""
+    """A published release pair must serve every planned Spark count."""
     result = _bash(f"""
 set -euo pipefail
 source "{RELEASE_COMMON}"

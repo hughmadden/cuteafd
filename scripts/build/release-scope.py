@@ -201,7 +201,7 @@ def requirements(repo, matrix, scope):
         experts = tokens(scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'])
         dual = int(values.get('RTX_GPUS', '1').replace('auto', '2')) == 2
         count = int(values.get('SPARK_COUNT', '0'))
-        tp = int(values.get('SPARK_TP') or count or 1)
+        tp = count or 1
         programs = set()
         if family == 'deepseek_v4':
             tag = 'dsv4p' if any(s.startswith('dsv4p:') for s in experts) else 'dsv4f'

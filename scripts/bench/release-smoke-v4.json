@@ -549,8 +549,6 @@
         "RTX_GPUS": "1",
         "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
-        "SPARK_TP": "",
-        "SPARK_EP": "",
         "ADDR": "0.0.0.0:8813",
         "EXPERT_PORT": "20160",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",

@@ -1561,7 +1561,7 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
         'RTX_GPUS': '1', 'COORDINATOR_GPUS': '0',
         'GPU_MEMORY_CAP': '31.8GiB', 'SPARK_INTAKE': 'pinned',
         'MAX_CONTEXT_TOKENS': '1048576',
-        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
+        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4',
     }
     assert {key: values[key] for key in expected} == expected
     # The prefill reserve is the planner's (TJ 2026-10-27): no row pin.
@@ -1879,7 +1879,7 @@ def _slot_with_roles(roles, verified=True, nvfp4=(), error=None):
     ([], False, 'TP manifest hash mismatch', 'cannot attest Spark TP role tp3: TP manifest hash mismatch'),
 ])
 def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, monkeypatch, roles, verified, error, message):
-    """#98: the card-derived Spark TP (v41-flash-min: SPARK_TP=3) must be attested by
+    """#98: the card-derived Spark TP (v41-flash-min: three Sparks, TP3) must be attested by
     every rank's slot before enqueue, as the launcher refuses it at launch."""
     gate = ROOT / 'scripts/bench/kits/gate'
     argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s',
@@ -1916,12 +1916,11 @@ def test_attested_spark_tp_roles_are_checked_again_at_grant(tmp_path, monkeypatc
 
 @pytest.mark.parametrize('keys,role', [
     ({'SPARK_COUNT': '4'}, None),
-    ({'SPARK_COUNT': '3', 'SPARK_TP': '3', 'SPARK_EP': '1'}, 'tp3'),
-    ({'SPARK_COUNT': '6', 'SPARK_TP': '6', 'SPARK_EP': '1'}, 'tp6'),
-    ({'SPARK_COUNT': '4', 'SPARK_TP': '2', 'SPARK_EP': '2'}, 'tp2'),
-    ({'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1'}, None),
     # A native count other than 4 is TP=count at launch.
+    ({'SPARK_COUNT': '3'}, 'tp3'),
+    ({'SPARK_COUNT': '5'}, 'tp5'),
     ({'SPARK_COUNT': '6'}, 'tp6'),
+    ({'SPARK_COUNT': '8'}, 'tp8'),
     ({'SPARK_COUNT': '2', 'EXPERT_FORMAT': 'exl3'}, None),
     ({'SPARK_COUNT': '0'}, None),
 ])
