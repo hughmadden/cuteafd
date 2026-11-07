@@ -43,6 +43,7 @@ pub mod push_outcome;
 pub mod memory_layout;
 pub mod memory_policy;
 pub mod packed_head;
+pub mod kx7;
 pub mod media;
 pub use media::{AudioKey, ImageKey, MediaKey, MediaSpan};
 pub use engram::{EngramBatch, EngramError, EngramHashes, EngramHistory, EngramPrefillCursor, ENGRAM_LAYERS, ENGRAM_ROWS, ENGRAM_COMPRESSED_VOCAB};
