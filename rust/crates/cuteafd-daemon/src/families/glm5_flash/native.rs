@@ -114,9 +114,15 @@ impl Admission {
 
     pub(super) fn arena_layouts(&self, cfg: &GlmNextConfig, embedding_rank: usize)
         -> Result<Vec<cuteafd_loader::serving_capacity::WeightArenaLayout>> {
+        Self::target_layouts(&self.facts, &self.dense, cfg, embedding_rank)
+    }
+
+    fn target_layouts(facts: &DenseFacts, dense: &[NativeDenseRecords], cfg: &GlmNextConfig, embedding_rank: usize)
+        -> Result<Vec<cuteafd_loader::serving_capacity::WeightArenaLayout>> {
         use crate::shared::{experts::exlr8::dense_weights::{layer_requests, PlainPack}, token_io::native::row_requests};
-        let mut requests = vec![Vec::new(); self.dense.len()];
-        for (rank, records) in self.dense.iter().enumerate() {
+        ensure!(!dense.is_empty() && embedding_rank < dense.len(), "native Flash arena rank");
+        let mut requests = vec![Vec::new(); dense.len()];
+        for (rank, records) in dense.iter().enumerate() {
             for source in &records.layers {
                 let p = format!("{}layers.{}", super::weights::PREFIX, source.layer);
                 let packs = if cfg.attention[source.layer] == cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda {
@@ -131,8 +137,8 @@ impl Admission {
             }
         }
         requests[0].push((format!("{}norm.weight", super::weights::PREFIX),
-            exlr8::dense::DenseTransform::Identity.allocation_bytes(&self.dense[0].norm)?));
-        let vocabulary = VocabularyPlan::new(&self.facts.records, &self.facts.selection, self.dense.len(), 0,
+            exlr8::dense::DenseTransform::Identity.allocation_bytes(&dense[0].norm)?));
+        let vocabulary = VocabularyPlan::new(&facts.records, &facts.selection, dense.len(), 0,
             cfg.hidden, cfg.vocab_size)?;
         for (i, slice) in vocabulary.dense_plan().tensors.iter().enumerate() {
             let rank = if i == 0 { embedding_rank } else { 0 };
@@ -305,6 +311,21 @@ mod tests {
             let facts = DenseFacts::new(records.clone(), selection.clone(), cfg.layers, shared.clone())?;
             let body = (0..world).map(|rank| NativeDenseRecords::new(root.path(), cfg.layers, world, rank, &BTreeMap::new())
                 .map(|r| r.plan)).collect::<Result<Vec<_>>>()?;
+            let dense = (0..world).map(|rank| NativeDenseRecords::new(root.path(), cfg.layers, world, rank, &BTreeMap::new()))
+                .collect::<Result<Vec<_>>>()?;
+            for embedding_rank in 0..world {
+                let layouts = Admission::target_layouts(&facts, &dense, &cfg, embedding_rank)?;
+                let vocabulary = VocabularyPlan::new(&facts.records, &selection, world, 0, cfg.hidden, cfg.vocab_size)?;
+                let embedding_bytes = crate::shared::token_io::native::row_requests(&vocabulary.dense_plan().tensors[0])?
+                    .into_iter().map(|(_, bytes)| bytes).sum::<usize>();
+                for (rank, layout) in layouts.iter().enumerate() {
+                    let expected = body[rank].resident_bytes + if rank == 0 { vocabulary.resident_bytes() - embedding_bytes + 256 } else { 0 }
+                        + if rank == embedding_rank { embedding_bytes } else { 0 };
+                    assert_eq!(layout.payload_bytes(), expected, "native rank {rank}, embedding rank {embedding_rank}");
+                    assert_eq!(layout.bytes(), layout.payload_bytes() + layout.padding_bytes());
+                    assert!(layout.views().values().all(|view| view.offset() % 256 == 0));
+                }
+            }
             let actual = owners_resident(&facts, &body, &cfg)?;
             let canonical = cuteafd_loader::families::glm5_flash::resident::native_resident(
                 &selection, cfg.layers, &facts.plans(&BTreeMap::new())?, &shared)?;
