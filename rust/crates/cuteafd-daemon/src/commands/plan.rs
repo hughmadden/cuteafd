@@ -73,7 +73,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
                 onboard: args.rtx_expert_layers,
                 exchange_f32: args.exchange_f32,
-                context_tokens: args.context_tokens,
+                context_tokens: args.context_tokens.unwrap_or(0),
                 prefill_rows: args.prefill_rows,
                 full_prefill_logits: args.full_prefill_logits,
                 expert_usage: args.expert_usage.unwrap_or(true),
@@ -137,6 +137,20 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     options.apply_spark_budget();
     options.validate()?;
     Ok(options)
+}
+
+fn resolve_context_tokens(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    if args.context_tokens.is_none() {
+        args.context_tokens = cfg.get("MAX_CONTEXT_TOKENS").filter(|value| !value.is_empty())
+            .map(|value| {
+                anyhow::ensure!(value.bytes().all(|byte| byte.is_ascii_digit()) && !value.starts_with('0'),
+                    "MAX_CONTEXT_TOKENS must be in 1..1048576");
+                let tokens = value.parse::<u64>().context("MAX_CONTEXT_TOKENS must be in 1..1048576")?;
+                anyhow::ensure!((1..=1048576).contains(&tokens), "MAX_CONTEXT_TOKENS must be in 1..1048576");
+                Ok(tokens)
+            }).transpose()?;
+    }
+    Ok(())
 }
 
 fn resolve_expert_usage(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
@@ -241,6 +255,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
         resolve_expert_usage(&mut args, &cfg)?;
+        resolve_context_tokens(&mut args, &cfg)?;
         args.available_sparks = (0..8).take_while(|rank|
             cfg.get(&format!("SPARK_{rank}_HOST")).is_some_and(|host| !host.is_empty())).count();
         if args.spark_ranks.is_none() {
@@ -845,6 +860,58 @@ mod tests {
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
 
+    fn configured_context(flags: &[&str]) -> cuteafd_loader::placement::planner::Context {
+        use clap::Parser;
+        let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/configs/muse-spark-exl3-min.config");
+        let argv = [vec!["cuteafd", "plan", "model", "--layout", "--config", config.to_str().unwrap()],
+            flags.to_vec()].concat();
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+            else { panic!("plan") };
+        let cfg = launch_config(request.config.as_deref()).unwrap();
+        resolve_context_tokens(&mut request, &cfg).unwrap();
+        let layout = options(&request).unwrap().layout.unwrap();
+        cuteafd_loader::placement::planner::Context::resolve(1048576,
+            (layout.context_tokens > 0).then_some(layout.context_tokens))
+    }
+
+    #[test]
+    fn plan_config_uses_installed_muse_context_pin() {
+        use cuteafd_loader::placement::planner::{Context, Pin};
+        assert_eq!(configured_context(&[]), Context { maximum: 1048576, pin: Pin::Exact(634304) });
+    }
+
+    #[test]
+    fn plan_context_cli_overrides_installed_muse_config() {
+        use cuteafd_loader::placement::planner::{Context, Pin};
+        assert_eq!(configured_context(&["--context-tokens", "131072"]),
+            Context { maximum: 1048576, pin: Pin::Exact(131072) });
+        assert_eq!(configured_context(&["--context-tokens", "0"]), Context::automatic(1048576));
+    }
+
+    #[test]
+    fn plan_config_context_omitted_or_empty_stays_automatic() {
+        for configured in [None, Some("")] {
+            let mut request = args(std::path::Path::new("model"), 4, false);
+            request.context_tokens = None;
+            let cfg = configured.map(|value| ("MAX_CONTEXT_TOKENS".into(), value.into()))
+                .into_iter().collect();
+            resolve_context_tokens(&mut request, &cfg).unwrap();
+            assert_eq!(options(&request).unwrap().layout.unwrap().context_tokens, 0);
+        }
+    }
+
+    #[test]
+    fn plan_config_context_rejects_non_launcher_values() {
+        for value in ["0", "auto", "-1", "+1", "01", "1048577", "18446744073709551616"] {
+            let mut request = args(std::path::Path::new("model"), 4, false);
+            request.context_tokens = None;
+            let cfg = [("MAX_CONTEXT_TOKENS".into(), value.into())].into_iter().collect();
+            assert!(resolve_context_tokens(&mut request, &cfg).unwrap_err().to_string()
+                .contains("MAX_CONTEXT_TOKENS must be in 1..1048576"), "{value}");
+        }
+    }
+
     #[test]
     fn plan_prefill_waves_and_span_reach_both_layout_fields() {
         use clap::Parser;
@@ -1235,7 +1302,7 @@ mod tests {
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
             attention_placement: "auto".into(),
-            context_tokens: 262144,
+            context_tokens: Some(262144),
             prefill_rows: 0,
             full_prefill_logits: false, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,

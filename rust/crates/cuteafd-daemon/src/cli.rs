@@ -530,8 +530,8 @@ pub(crate) struct PlanArgs {
     #[arg(long)]
     pub(crate) exchange_f32: bool,
     /// Compiled maximum context for table and workspace reservations (0: family/image default).
-    #[arg(long, default_value_t = 0)]
-    pub(crate) context_tokens: u64,
+    #[arg(long)]
+    pub(crate) context_tokens: Option<u64>,
     /// Prefill workspace capacity for --layout (0: family/image default; GLM 5.3 Flash: per lane).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_rows: u64,
