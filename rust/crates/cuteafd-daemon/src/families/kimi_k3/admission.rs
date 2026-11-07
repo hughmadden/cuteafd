@@ -450,11 +450,6 @@ impl<'a> Admission<'a> {
         -> Result<(Vec<GlobalWeights<'a>>, Vec<Vec<LayerWeights<'a>>>)> {
         ensure!(devices.len() == self.devices.len() && streams.len() == devices.len(),
             "Kimi dense records physical inventory differs from admission");
-        // Push recording allocates only retained weights; mount loading can also
-        // allocate transient transform workspaces and is not this measured window.
-        let before = if load.pushing() {
-            crate::shared::inventory::cuda_malloc_extents(devices[0].library, &self.devices)?
-        } else { None };
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
         let records = super::weights::records::KimiRecords { checkpoint, cfg: &self.cfg, core: &self.core,
             dense: load, streams: streams.to_vec() };
@@ -467,26 +462,6 @@ impl<'a> Admission<'a> {
             memory.sample_layer(layer, self.cfg.layers)?;
         }
         memory.sample("weights-core-layers-recorded")?;
-        if let Some(before) = before {
-            let after = crate::shared::inventory::cuda_malloc_extents(devices[0].library, &self.devices)?
-                .context("Kimi cudaMalloc qualification changed during weight recording")?;
-            // Publish all ranks together, preserving the selected pool and layout.
-            let mut receipt = self.receipt.clone();
-            for (rank, (before, after)) in before.into_iter().zip(after).enumerate() {
-                cuteafd_loader::placement::planner::reconcile_allocation_granularity(
-                    &mut receipt, &format!("kimi.weights.{rank}"), before, after)?;
-            }
-            let items = (0..devices.len()).map(|rank| receipt.items(
-                cuteafd_loader::placement::planner::Location::coordinator(rank as u8)))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            self.receipt = receipt;
-            self.placement.items = items;
-            cuteafd_bench::context::ResolvedSettings::placement(&self.placement).publish();
-            let bytes = self.receipt.facts.allocation_granularity.iter().map(|owner| owner.bytes())
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            tracing::info!(phases = ?self.receipt.phases, ?bytes,
-                "Kimi weight allocation granularity reconciled without reselection");
-        }
         Ok((global, layers))
     }
 

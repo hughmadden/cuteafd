@@ -96,30 +96,6 @@ impl RuntimeInventory {
     }
 }
 
-fn qualified_cuda_malloc(info: &cuteafd_ffi::CuteafdCudaDeviceInfo, loading: &str) -> bool {
-    let text = |bytes: &[std::ffi::c_char]| bytes.iter().take_while(|&&b| b != 0)
-        .map(|&b| char::from(b as u8)).collect::<String>();
-    loading.eq_ignore_ascii_case("LAZY") && info.compute_capability_major == 12
-        && info.compute_capability_minor == 0 && info.integrated == 0
-        && text(&info.driver_version) == "13.2" && text(&info.runtime_version) == "13.2"
-}
-
-/// Native cudaMalloc requests including preexisting blocks, not logical views.
-/// Unqualified runtimes retain the Estimated forecast, never a calibrated charge.
-pub(crate) fn cuda_malloc_extents(library: &NativeLibrary, devices: &[i32])
-    -> Result<Option<Vec<Vec<cuteafd_loader::placement::planner::DeviceExtent>>>> {
-    use cuteafd_ffi::memory_ledger::{self, Space};
-    let loading = std::env::var("CUDA_MODULE_LOADING").unwrap_or_else(|_| "LAZY".into());
-    for &device in devices {
-        if !qualified_cuda_malloc(&library.cuda_device_info(device)?, &loading) { return Ok(None); }
-    }
-    let live = memory_ledger::allocations();
-    Ok(Some(devices.iter().map(|&device| live.iter().filter(|allocation|
-        allocation.key.space == Space::Device && allocation.key.device == device)
-        .map(|allocation| cuteafd_loader::placement::planner::DeviceExtent {
-            address: allocation.address as u64, bytes: allocation.bytes as u64 }).collect()).collect()))
-}
-
 fn after_modules<T>(device: i32, load: &mut impl FnMut(i32) -> Result<()>,
     measure: impl FnOnce() -> Result<T>) -> Result<T> {
     load(device)?;
@@ -129,29 +105,6 @@ fn after_modules<T>(device: i32, load: &mut impl FnMut(i32) -> Result<()>,
 #[cfg(test)]
 mod phase_tests {
     use super::InventoryPhase;
-
-    #[test]
-    fn cuda_malloc_page_union_requires_measured_arch_runtime_and_loading_mode() {
-        let mut info = cuteafd_ffi::CuteafdCudaDeviceInfo {
-            compute_capability_major: 12, compute_capability_minor: 0, ..Default::default()
-        };
-        for (dst, value) in [(&mut info.driver_version, b"13.2"), (&mut info.runtime_version, b"13.2")] {
-            for (out, &byte) in dst.iter_mut().zip(value) { *out = byte as std::ffi::c_char; }
-        }
-        assert!(super::qualified_cuda_malloc(&info, "LAZY"));
-        assert!(!super::qualified_cuda_malloc(&info, "EAGER"));
-        info.compute_capability_minor = 1;
-        assert!(!super::qualified_cuda_malloc(&info, "LAZY"));
-        info.compute_capability_minor = 0;
-        info.integrated = 1;
-        assert!(!super::qualified_cuda_malloc(&info, "LAZY"));
-        info.integrated = 0;
-        info.driver_version[3] = b'1' as std::ffi::c_char;
-        assert!(!super::qualified_cuda_malloc(&info, "LAZY"));
-        info.driver_version[3] = b'2' as std::ffi::c_char;
-        info.runtime_version[3] = b'3' as std::ffi::c_char;
-        assert!(!super::qualified_cuda_malloc(&info, "LAZY"));
-    }
 
     #[test]
     fn selected_modules_load_before_admission_sample_and_failure_stops_sampling() {

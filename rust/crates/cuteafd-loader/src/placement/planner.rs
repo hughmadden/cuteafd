@@ -473,9 +473,8 @@ pub fn driver_page_table_bytes(mapped_bytes: u64) -> u64 {
 mod contract;
 mod search;
 mod granularity;
-pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence, DeviceExtent,
-    ALLOCATION_GRANULARITY_GROUP, allocation_granularity_forecast, allocation_granularity_component,
-    reconcile_allocation_granularity};
+pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence,
+    ALLOCATION_GRANULARITY_GROUP, allocation_granularity_forecast, allocation_granularity_component};
 pub mod native_attention;
 pub mod serving;
 pub use contract::{

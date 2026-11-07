@@ -104,46 +104,6 @@ fn allocation_granularity_refuses_duplicate_alias_stale_and_wrong_domain_backing
 }
 
 #[test]
-fn allocation_granularity_reconciles_transactionally_without_reselection_or_baseline_recharge() {
-    let page = 2 << 20;
-    let maximum = 8;
-    let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
-    let owner = granular_owner("weights", "payload", vec![3 << 20, 24 << 10], Lifetime::RESIDENT);
-    let payload = owner.requests().iter().sum();
-    contract.components.push(Component::allocation(Allocation::buffer("payload", owner.location,
-        payload, owner.lifetime, Category::Weights, "weights"), ByteCurve::fixed(payload, maximum), false, maximum));
-    contract.components.push(allocation_granularity_component(owner, maximum).unwrap());
-    let mut physical = budget(9 << 20);
-    physical.baseline = Baseline::Forecast { occupied: page, source: "earlier live small-allocation block".into(), assumed: false };
-    let mut plan = solve(request(), vec![physical], &Prepared(contract)).unwrap();
-    let original = plan.clone();
-    let before = vec![DeviceExtent { address: 4 * page, bytes: 14 << 10 }];
-    let mut after = before.clone();
-    after.extend([DeviceExtent { address: 4 * page + (16 << 10), bytes: 24 << 10 },
-        DeviceExtent { address: 8 * page, bytes: 3 << 20 }]);
-    reconcile_allocation_granularity(&mut plan, "weights", before.clone(), after).unwrap();
-    assert_eq!((plan.pool_tokens, &plan.decisions, &plan.budgets), (original.pool_tokens, &original.decisions, &original.budgets));
-    assert_eq!(plan.facts.allocations, original.facts.allocations);
-    assert_eq!(plan.facts.allocation_granularity[0].bytes().unwrap(), (1 << 20) - (24 << 10));
-    assert!(plan.items(Location::coordinator(0)).unwrap().iter().any(|item|
-        item.group == ALLOCATION_GRANULARITY_GROUP && item.basis == Basis::Calibrated));
-    for (old, new) in original.phases.iter().zip(&plan.phases) {
-        assert_eq!((old.owned, old.available), (new.owned, new.available));
-        assert_eq!(old.opaque - new.opaque, page);
-    }
-    let measured = plan.clone();
-    assert!(reconcile_allocation_granularity(&mut plan, "weights", before.clone(), before.clone()).is_err());
-    assert_eq!(plan, measured);
-    assert!(reconcile_allocation_granularity(&mut plan, "absent", before.clone(), before.clone()).is_err());
-    assert_eq!(plan, measured);
-    // Same requested sizes, but an allocation straddles three backing pages.
-    let after = vec![before[0], DeviceExtent { address: 8 * page - 512, bytes: 3 << 20 },
-        DeviceExtent { address: 16 * page, bytes: 24 << 10 }];
-    assert!(matches!(reconcile_allocation_granularity(&mut plan, "weights", before, after), Err(Refusal::Capacity { .. })));
-    assert_eq!(plan, measured);
-}
-
-#[test]
 fn driver_page_tables_preserve_backings_aliases_activation_and_lifetimes() {
     let maximum = 32;
     let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();

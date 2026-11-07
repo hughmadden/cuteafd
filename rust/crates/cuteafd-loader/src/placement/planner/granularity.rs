@@ -13,20 +13,11 @@ pub struct GranularityBacking {
     pub requests: Vec<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceExtent {
-    pub address: u64,
-    pub bytes: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GranularityEvidence {
     /// Large allocations round independently; small requests share driver blocks.
     /// This is not a packing guarantee (e.g. repeated 576 KiB requests fragment).
     Forecast,
-    /// Complete live native device extents around an allocation-only boundary.
-    /// Include earlier owners so their already-paid small blocks are not charged twice.
-    Live { before: Vec<DeviceExtent>, after: Vec<DeviceExtent> },
 }
 
 /// Qualified only for discrete SM120 direct cudaMalloc, driver/runtime 13020,
@@ -68,33 +59,6 @@ pub fn allocation_granularity_forecast(requests: &[u64]) -> Result<u64, Refusal>
         .ok_or(Refusal::Overflow("cudaMalloc granularity"))
 }
 
-fn extent_map(extents: &[DeviceExtent]) -> Result<BTreeMap<u64, u64>, Refusal> {
-    let mut map = BTreeMap::new();
-    for extent in extents {
-        if extent.address == 0 || extent.bytes == 0 || map.insert(extent.address, extent.bytes).is_some() {
-            return Err(Refusal::InvalidFact("invalid or duplicate live cudaMalloc extent".into()));
-        }
-    }
-    let mut previous_end = 0;
-    for (&address, &bytes) in &map {
-        if address < previous_end { return Err(Refusal::InvalidFact("overlapping live cudaMalloc extents".into())); }
-        previous_end = address.checked_add(bytes).ok_or(Refusal::Overflow("live cudaMalloc extent"))?;
-    }
-    Ok(map)
-}
-
-fn page_union(map: &BTreeMap<u64, u64>) -> Result<u64, Refusal> {
-    let (mut end, mut pages) = (0u64, 0u64);
-    for (&address, &bytes) in map {
-        let first = address / PAGE;
-        let last = address.checked_add(bytes).ok_or(Refusal::Overflow("live cudaMalloc page"))?.div_ceil(PAGE);
-        pages = pages.checked_add(last.saturating_sub(first.max(end)))
-            .ok_or(Refusal::Overflow("live cudaMalloc page union"))?;
-        end = end.max(last);
-    }
-    pages.checked_mul(PAGE).ok_or(Refusal::Overflow("live cudaMalloc backing"))
-}
-
 impl AllocationGranularity {
     pub fn requests(&self) -> Vec<u64> {
         self.backings.iter().flat_map(|owner| owner.requests.iter().copied()).collect()
@@ -105,35 +69,13 @@ impl AllocationGranularity {
             || !matches!(self.location, Location { device: Device::Coordinator(_), domain: Domain::Device }) {
             return Err(Refusal::InvalidFact("SM120 cudaMalloc granularity requires a named coordinator owner".into()));
         }
-        let requests = self.requests();
-        match &self.evidence {
-            GranularityEvidence::Forecast => allocation_granularity_forecast(&requests),
-            GranularityEvidence::Live { before, after } => {
-                let before = extent_map(before)?;
-                let after = extent_map(after)?;
-                if before.iter().any(|(address, bytes)| after.get(address) != Some(bytes)) {
-                    return Err(Refusal::InvalidFact("cudaMalloc measurement removed or resized a baseline owner".into()));
-                }
-                let mut added = after.iter().filter(|(address, _)| !before.contains_key(address))
-                    .map(|(_, &bytes)| bytes).collect::<Vec<_>>();
-                let mut expected = requests;
-                expected.sort_unstable();
-                added.sort_unstable();
-                if added != expected { return Err(Refusal::InvalidFact("cudaMalloc measurement requests differ from declared owners".into())); }
-                let requested = sum_requests(expected)?;
-                page_union(&after)?.checked_sub(page_union(&before)?).and_then(|bytes| bytes.checked_sub(requested))
-                    .ok_or_else(|| Refusal::InvalidFact("live cudaMalloc increment has no nonnegative opaque slack".into()))
-            }
-        }
+        allocation_granularity_forecast(&self.requests())
     }
 
-    pub fn basis(&self) -> Basis {
-        match self.evidence { GranularityEvidence::Forecast => Basis::Estimated, GranularityEvidence::Live { .. } => Basis::Calibrated }
-    }
+    pub fn basis(&self) -> Basis { Basis::Estimated }
 
     pub fn source(&self) -> String {
-        format!("{} (SM120 direct cudaMalloc, driver/runtime13020 LAZY, #1454 2026-11-08, {})", self.id,
-            match self.evidence { GranularityEvidence::Forecast => "sizes-only forecast", GranularityEvidence::Live { .. } => "live 2 MiB page union" })
+        format!("{} (SM120 direct cudaMalloc, driver/runtime13020 LAZY, #1454 2026-11-08, sizes-only forecast)", self.id)
     }
 
     pub(super) fn validate_backings(&self, facts: &Facts, seen: &mut BTreeSet<String>) -> Result<(), Refusal> {
@@ -156,21 +98,6 @@ pub fn allocation_granularity_component(owner: AllocationGranularity, maximum: u
     let bytes = owner.bytes()?;
     Ok(Component { activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum),
         kind: ComponentKind::AllocationGranularity(owner) })
-}
-
-/// Replace only the selected owner's forecast, without reselecting pool/layout.
-/// The caller's live sample must not already have paid this increment in its baseline.
-pub fn reconcile_allocation_granularity(plan: &mut ResolvedPlan, id: &str,
-    before: Vec<DeviceExtent>, after: Vec<DeviceExtent>) -> Result<(), Refusal> {
-    let mut facts = plan.facts.clone();
-    let owners = facts.allocation_granularity.iter_mut().filter(|owner| owner.id == id).collect::<Vec<_>>();
-    let [owner]: [&mut AllocationGranularity; 1] = owners.try_into()
-        .map_err(|_| Refusal::InvalidFact("missing or duplicate cudaMalloc granularity owner".into()))?;
-    owner.evidence = GranularityEvidence::Live { before, after };
-    let phases = evaluate(&facts, &plan.budgets)?;
-    plan.facts = facts;
-    plan.phases = phases;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -201,27 +128,5 @@ mod tests {
         }
         assert!(allocation_granularity_forecast(&[0]).is_err());
         assert!(allocation_granularity_forecast(&[u64::MAX]).is_err());
-    }
-
-    #[test]
-    fn live_union_reuses_paid_small_blocks_and_rejects_aliases_or_missing_requests() {
-        let before = vec![DeviceExtent { address: 4 * PAGE, bytes: 14 << 10 }];
-        let mut after = before.clone();
-        after.extend([DeviceExtent { address: 4 * PAGE + (16 << 10), bytes: 24 << 10 },
-            DeviceExtent { address: 8 * PAGE, bytes: 3 << 20 }]);
-        let mut owner = AllocationGranularity { id: "core".into(), location: Location::coordinator(0),
-            lifetime: Lifetime::RESIDENT, backings: vec![GranularityBacking { backing: "payload".into(),
-                requests: vec![24 << 10, 3 << 20] }], evidence: GranularityEvidence::Live { before: before.clone(), after: after.clone() } };
-        assert_eq!(owner.bytes().unwrap(), (1 << 20) - (24 << 10));
-        assert_eq!(owner.basis(), Basis::Calibrated);
-        owner.evidence = GranularityEvidence::Forecast;
-        assert_eq!(owner.bytes().unwrap(), (3 << 20) - (24 << 10));
-        for bad in [vec![after[1]], vec![after[0], after[0]], vec![after[0], DeviceExtent { address: after[0].address + 1, bytes: 1 }]] {
-            owner.evidence = GranularityEvidence::Live { before: before.clone(), after: bad };
-            assert!(owner.bytes().is_err());
-        }
-        owner.location = Location { device: Device::Spark(0), domain: Domain::Managed };
-        owner.evidence = GranularityEvidence::Forecast;
-        assert!(owner.bytes().is_err());
     }
 }
