@@ -257,6 +257,17 @@ pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: us
     Ok((owned.unwrap(), scratch))
 }
 
+/// The same checkpoint-native rank recipes consumed by the shared GQA executor.
+pub fn drafter_tp2_inventory(snapshot: &std::path::Path,
+    capacity: crate::families::glm5::draft_representation::GlmDraftCapacity, sms: &[u64],
+    representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+    mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache)
+    -> anyhow::Result<Vec<crate::families::glm5::draft_physical::GlmDflashPhysicalLayout>> {
+    anyhow::ensure!(sms.len() == 2, "TP2 DFlash requires two coordinator GPUs");
+    sms.iter().enumerate().map(|(rank, &sm)| crate::families::glm5::draft_physical::GlmDflashPhysicalLayout::read_tp(
+        snapshot, representation, capacity, usize::try_from(sm)?, mode, kv_cache, rank, 2)).collect()
+}
+
 /// GPU1 DFlash bridge inventory, conditional on installing its executor.
 /// `rows` is the drafter's full admitted batch (sequences * block), not a
 /// target-head launch chunk. GPU1's existing draft destinations are already
@@ -266,9 +277,19 @@ pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u6
     draft::remote_dflash_bridge_demands(hidden, vocab, taps, rows, 0)
 }
 
-/// Opt-in until the remote executor's hardware gates qualify its default.
-pub fn remote_dflash_requested() -> bool {
-    std::env::var("CUTEAFD_GLMF_REMOTE_DFLASH").as_deref() == Ok("1")
+/// Pool capacity wins; an equal pool uses the split to balance compute.
+pub fn prefer_tp2_dflash(whole_pool: Option<u64>, split_pool: Option<u64>) -> bool {
+    split_pool.is_some_and(|split| whole_pool.is_none_or(|whole| split >= whole))
+}
+
+#[test]
+fn tp2_dflash_choice_maximizes_pool_and_balances_ties() {
+    assert!(!prefer_tp2_dflash(Some(1430016), Some(1325568)));
+    assert!(prefer_tp2_dflash(Some(2097152), Some(2097152)));
+    assert!(prefer_tp2_dflash(Some(1), Some(2)));
+    assert!(prefer_tp2_dflash(None, Some(1)));
+    assert!(!prefer_tp2_dflash(Some(1), None));
+    assert!(!prefer_tp2_dflash(None, None));
 }
 
 /// Derive bridge capacity from the same checkpoint and batch used by runtime.
@@ -645,6 +666,25 @@ pub(crate) mod tests {
             *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
         }
         input
+    }
+
+    #[test]
+    fn tp2_dflash_whole_home_matches_plan_and_serve_without_remote_candidate() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for heavy in [0, 1] {
+            let mut planned = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+            planned.spark_ranks = 0;
+            planned.graphs = GraphSet::budget(&[64 << 20; 2]);
+            planned.requested_pool = Some(262_144);
+            planned.resident[heavy].weights += 6 << 30;
+            assert!(planned.drafter_bridge.is_none());
+            let offline = contract(&planned).unwrap().placement;
+            let serving = contract(&sampled(&planned)).unwrap().placement;
+            assert_eq!(offline.movables, [(MovableId::Drafter, 0)]);
+            assert_eq!(offline.movables, serving.movables);
+            assert_eq!(offline.pool_tokens, serving.pool_tokens);
+            assert_eq!(offline.items, serving.items);
+        }
     }
 
     #[test]

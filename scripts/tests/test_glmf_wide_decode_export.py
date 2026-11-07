@@ -1138,3 +1138,12 @@ def test_projected_operand_data_contract_matches_exporter_declarations():
                       ("projected_index_keys", "compile_glmf_projected_index_keys_aot")):
         actual[key] = declared(declaration(trees["glmf_split.py"], ast.FunctionDef, name))
     assert actual == contracts
+
+
+def test_glmf_tp2_drafter_exports_every_rank_local_projection(exporter):
+    shapes = exporter.draft_bf16_shapes()
+    expected = {(20480, 4096), (4096, 3072), (4096, 1024),
+                (2048, 4096), (4096, 12288), (6144, 4096)}
+    assert {shape for shape, families in shapes.items() if "dflash2-glmf-tp2" in families} == expected
+    assert "dflash-convolution" in shapes[4096, 1024]
+    assert "dflash-selector" in shapes[4096, 256]

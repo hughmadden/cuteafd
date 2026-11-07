@@ -169,7 +169,6 @@ Spark layer IDs and inactive hinted/loaded counts.
 | `DRAFT_CONTEXT_SLOTS` | `max(20, drafts)` | positive int | GLM/MiMo drafter context slots. |
 | `DRAFT_SEQUENCES` | engine default | positive int | Maximum drafts in one batch. |
 | `SPECULATION_TRACE` | unset | absolute path | JSONL speculation trace. |
-| `GLM5_FLASH_REMOTE_DRAFTER` | unset | `on`, `off` | GLM Flash drafter on a Spark rank. |
 | `GLM5_FLASH_DRAFT_LINEAR` | auto by drafter | `w8a16`, `wide`, `w8a8` | GLM Flash drafter GEMM. |
 
 ## Prefill
@@ -231,7 +230,7 @@ weights and scratch alongside the KV pool and routed experts.
 | `GLM5_FLASH_TARGET_HEAD` | `auto` | `auto`, `tensor`, `exact` | GLM Flash's `TARGET_HEAD` spelling. |
 | `TP2_ATTENTION`, `TP2_QUERY_PROJECTION`, `TP2_OUTPUT_PROJECTION` | `off` | `on`, `off` | V4.1 TP2 projections on the RTX pair. |
 | `TP2_DSPARK_EXPERTS` | `on` with dual RTX + dSpark, otherwise `off` | `on`, `off` | V4/V4.1 TP2 draft experts; requires two RTX GPUs and dSpark. Explicit `off` retains GPU0-only draft experts. |
-| `TP2_DFLASH` | MiMo/Kimi dual-RTX with DFlash2: `on`; otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. Kimi splits cache and attention by Context; producer weights and FFN stay on GPU1. Explicit `off` reaches plan and serve; CLI false overrides config on. |
+| `TP2_DFLASH` | MiMo/Kimi dual-RTX DFlash2: `on`; GLM Flash: planner choice; otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. GLM Flash compares the whole GPU0 drafter with a head split: larger admitted pool wins, ties split for balance. Omit the key for this automatic choice; explicit `on` or `off` wins. Auto requires two GPUs and checkpoint-derived drafter owners (`--drafter-gib` keeps whole placement). GLM Flash selector weights and head-only workspace stay on GPU0. Plan accepts `--draft-fp8 true|false` (omission defaults to FP8 for GLM Flash) and `--draft-linear w8a16|wide|w8a8` and charges the same representation and scratch as serve. MiMo and GLM Flash split query/KV heads and MLP neurons, retaining replicated residual/convolution owners. Kimi splits cache and attention by Context; producer weights and FFN stay on GPU1. CLI false overrides config on. |
 
 ## Concurrency and serving
 
@@ -430,7 +429,6 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `DRAFT_CONTEXT_SLOTS` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `DRAFT_SEQUENCES` | ✗ | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `SPECULATION_TRACE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ |
-| `GLM5_FLASH_REMOTE_DRAFTER` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_DRAFT_LINEAR` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Prefill** | | | | | | | | | | |
 | `PREFILL_PACKING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -480,7 +478,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `TP2_QUERY_PROJECTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `TP2_OUTPUT_PROJECTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `TP2_DSPARK_EXPERTS` | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `TP2_DFLASH` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
+| `TP2_DFLASH` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
 | **Concurrency and serving** | | | | | | | | | | |
 | `ADDR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CONCURRENCY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

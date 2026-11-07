@@ -3991,6 +3991,29 @@ fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
     }
 }
 
+#[test]
+fn glmf_tp2_auto_manual_budget_and_spark_range_keep_whole_single_gpu() {
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
+    let manifest = write_glm5_flash_workspaces(dir.path());
+    let options = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            pool_tokens: Some(32768), context_tokens: 32768, drafter_bytes: 256 << 20,
+            tp2_dflash: true, glmf_tp2_dflash_auto: true,
+            workspace_manifest: Some(manifest), ..Default::default()
+        }), ..sparks(4) };
+    let report = plan(dir.path(), &options).unwrap();
+    assert!(report.solver_placement.is_some(), "{}", render(&report));
+    assert_eq!(report.tp2_dflash, Some(false));
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&options).unwrap();
+    let single = columns.iter().find(|column| column.rtx_gpus == 1).unwrap();
+    assert!(single.range.is_some(), "{single:?}");
+    assert!(single.counts.iter().any(|count| count.currently_launchable), "{single:?}");
+    assert!(single.counts.iter().all(|count| count.executable_blockers.iter()
+        .all(|blocker| !blocker.contains("TP2 DFlash requires"))), "{single:?}");
+}
+
 /// A GLM 5.3 Flash graph budget is kept as the engine's KV admission keeps it: the budget itself on one
 /// GPU with Spark experts and an automatic pool (measured), else the budget or the graph allowance,
 /// whichever is larger, on every GPU (a head split, a fixed pool, local experts: planned).
@@ -4034,7 +4057,7 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     for draft_kv_cache in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
         let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
-            draft_sequences:Some(8), draft_context_slots:Some(8), draft_kv_cache, glmf_drafter_snapshot:Some(draft.path().into()),
+            draft_sequences:Some(8), draft_context_slots:Some(8), draft_kv_cache, glmf_draft_fp8_mode:2, glmf_drafter_snapshot:Some(draft.path().into()),
             context_tokens:131_072, ..Default::default() };
         let run = |options: &layout::LayoutOptions| {
             let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()),
