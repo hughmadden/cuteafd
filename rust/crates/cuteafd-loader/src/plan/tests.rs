@@ -3527,12 +3527,14 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
-            gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
-                context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
-                    + placement::inventory::loaded_code_allowance("glmf", "fp8", true, rank as u8,
-                        placement::ArchContext::for_device("sm_120", total),
-                        Some(&placement::ProgramSet::from_manifest(&manifest, &["glmf", "glmf2"]))).bytes,
-                loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: crate::placement::reserve::gpu("glm5_flash"),
+            gpus: opts.rtx_bytes.iter().map(|&total| (total, Baseline::Planned {
+                context_bytes: placement::ArchContext::coordinator(total, None).context_bytes,
+                loaded_bytes: 0 })).collect(),
+            pending_code: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)|
+                placement::inventory::loaded_code_allowance("glmf", "fp8", true, rank as u8,
+                    placement::ArchContext::for_device("sm_120", total),
+                    Some(&placement::ProgramSet::from_manifest(&manifest, &["glmf", "glmf2"]))).bytes).collect(),
+            headroom_bytes: crate::placement::reserve::gpu("glm5_flash"),
             spark_ranks: peers, prefill_lanes: lanes, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262144, sequences: 8, speculation: false, state_slots: 8, mark_slots: 8,
             pool_marks: false, index: opts.glmf_index, kda_state_bytes: 4, shared_replay: false,
@@ -5537,7 +5539,13 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     let released = (14 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
     assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
     assert_eq!(marks(&legacy) - marks(&staged), released);
-    assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(), released as i64);
+    let prefix_driver = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
+        .filter(|item| item.group.starts_with("driver page tables: glmf.host.prefix."))
+        .map(|item| item.bytes).sum::<u64>();
+    let mapped_prefix = prefix_driver(&staged) - prefix_driver(&legacy);
+    assert_eq!(mapped_prefix, (32u64 << 30) / 512);
+    assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(),
+        released as i64 - mapped_prefix as i64);
     assert_eq!(released, 1_771_438_080);
     // An explicit arena (0: none) is taken as given.
     let mut none = layout(96 << 30, 16);
