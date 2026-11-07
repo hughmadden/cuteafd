@@ -546,6 +546,12 @@ mod tests {
                             assert_eq!(a, b, "native TP{ranks} rank{rank} {} compact={compact}", layout.stem);
                         }
                     }
+                    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0, "native owner drops");
+                    drop(arena);
+                    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0, "last arena root drop");
+                    drop(dense);
+                    assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1),
+                        "dense mount scratch drop TP{ranks} rank{rank} compact={compact}");
                 }
             }
         }
