@@ -67,7 +67,8 @@ Speculation: one best speculator per family (native MTP/nextn, dSpark,
 DFlash2). Adaptive width with calibrated confidence and cost model, as in
 ds41rt `dspark_policy` and glmrt `dflash2_confidence`.
 Qwen's launcher defaults to MTP3 for qualified local EXL3 and NVFP4
-(`ranks == 0`); explicit overrides win. Spark-backed layouts leave the
+(admitted Spark expert world 0, independent of inventory); explicit overrides
+win. Spark-backed expert layouts leave the
 speculator off unless selected explicitly. Native MTP with coordinator-local
 draft experts is an explicit Spark option, not a requirement of vision or
 decode-bucket qualification.
