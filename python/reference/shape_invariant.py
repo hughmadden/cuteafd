@@ -52,18 +52,110 @@ def einsum(equation, *operands):
     return torch.cat(result, dim=1)
 
 
-def qualify(a, manifest, execute):
+class ForcedRouteQualification:
+    """Compare arithmetic on eager expert IDs, observing natural cutoff flips.
+
+    Callbacks supply checkpoint-native choice scores and combine weights; only
+    IDs are teacher-forced. Published scoring must never install these hooks.
+    """
+    def __init__(self, *, relative_margin_limit=1e-5):
+        self.relative_margin_limit = relative_margin_limit
+        self.eager = None
+        self.report = None
+
+    def observe(self, gate, *, choices, weights=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def hooked():
+            original = F.linear
+            logits = None
+            active = False
+
+            def before(module, args):
+                nonlocal active
+                active = True
+
+            def linear_call(*args, **kwargs):
+                nonlocal logits
+                result = original(*args, **kwargs)
+                if active:
+                    logits = result
+                return result
+
+            def after(module, args, output):
+                nonlocal active
+                active = False
+                if logits is None or not isinstance(output, tuple) or len(output) != 2:
+                    raise ValueError("unsupported qualification router output")
+                ids, native_weights = output
+                scores = choices(logits).detach()
+                if ids.ndim != 2 or scores.ndim != 2 or ids.shape[0] != scores.shape[0]:
+                    raise ValueError("qualification router geometry differs")
+                if not torch.isfinite(scores).all():
+                    raise ValueError("non-finite qualification choice scores")
+                if weights is None:
+                    self.eager = (ids.detach().clone(), scores.clone())
+                    return output
+                if self.eager is None:
+                    raise ValueError("forced routing requires an eager observation")
+                eager_ids, eager_scores = self.eager
+                if eager_ids.shape != ids.shape or eager_scores.shape != scores.shape:
+                    raise ValueError("eager/adapted router geometry differs")
+                flips = []
+                changed = (eager_ids.sort(-1).values != ids.sort(-1).values).any(-1)
+                for token in torch.nonzero(changed).flatten().tolist():
+                    eager_set, natural_set = set(eager_ids[token].tolist()), set(ids[token].tolist())
+                    removed, added = sorted(eager_set - natural_set), sorted(natural_set - eager_set)
+                    margins = []
+                    for arm in (eager_scores, scores):
+                        left, right = arm[token, removed], arm[token, added]
+                        delta = (left[:, None] - right[None, :]).abs()
+                        scale = torch.maximum(left[:, None].abs(), right[None, :].abs()).clamp_min(1e-30)
+                        margins.append({"absolute": float(delta.max()), "relative": float((delta / scale).max()),
+                                        "eager_only_scores": left.tolist(), "natural_only_scores": right.tolist()})
+                    flips.append({"token": token, "eager_only_experts": removed,
+                                  "natural_only_experts": added, "margins": margins})
+                self.report = {"selection_flip_tokens": len(flips), "flips": flips,
+                               "relative_margin_limit": self.relative_margin_limit,
+                               "trajectory": "natural choices on teacher-forced upstream state",
+                               "passed": all(margin["relative"] <= self.relative_margin_limit
+                                             for flip in flips for margin in flip["margins"])}
+                forced_weights = weights(logits, eager_ids)
+                if forced_weights.shape != native_weights.shape or forced_weights.dtype != native_weights.dtype:
+                    raise ValueError("forced route weight geometry/dtype differs")
+                return eager_ids, forced_weights
+
+            handles = [gate.register_forward_pre_hook(before), gate.register_forward_hook(after)]
+            F.linear = linear_call
+            try:
+                yield
+            finally:
+                F.linear = original
+                for handle in handles:
+                    handle.remove()
+        return hooked()
+
+    def require_valid(self):
+        if self.report is None or not self.report["passed"]:
+            raise ValueError("natural routing flip exceeds relative F32 margin limit")
+
+
+def qualify(a, manifest, execute, *, route_forcing=False):
     """Nested layer-major probes must not change the outer family's dtype."""
     if getattr(a, "_prefix_probe", False):
         return None
     from fidelity_windows import qualify_prefix
     dtype = torch.get_default_dtype()
+    previous = getattr(a, "_route_forced_qualification", False)
+    a._route_forced_qualification = route_forcing
     try:
         proof = qualify_prefix(a, manifest, execute)
         from fidelity_windows import canonical
         (a.out / "prefix-qualification.json").write_bytes(canonical(proof) + b"\n")
         return proof
     finally:
+        a._route_forced_qualification = previous
         torch.set_default_dtype(dtype)
 
 

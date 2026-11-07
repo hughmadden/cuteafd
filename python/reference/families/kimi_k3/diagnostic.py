@@ -335,7 +335,206 @@ def diagnose_official_noise(a, *, native_layer, atomic_json, digest, state_type,
                           "candidate_within_observed_noise": within}, sort_keys=True), flush=True)
 
 
+@contextmanager
+def route_capture(gate):
+    """Observe the actual router input, linear logits and selected IDs only."""
+    import torch.nn.functional as F
+    observed = {}
+    original = F.linear
+    active = False
+
+    def before(module, args):
+        nonlocal active
+        active = True
+        observed["input"] = args[0].detach().clone()
+
+    def linear(*args, **kwargs):
+        output = original(*args, **kwargs)
+        if active:
+            observed["logits"] = output.detach().cpu().clone()
+            observed["choice"] = (output.sigmoid() + gate.e_score_correction_bias).detach().cpu()
+        return output
+
+    def after(module, args, output):
+        nonlocal active
+        active = False
+        observed["ids"] = output[0].detach().cpu().clone()
+
+    handles = [gate.register_forward_pre_hook(before), gate.register_forward_hook(after)]
+    F.linear = linear
+    try:
+        yield observed
+    finally:
+        F.linear = original
+        for handle in handles:
+            handle.remove()
+
+
+def route_comparison(gate, left, right):
+    import torch
+    if gate.moe_router_activation_func != "sigmoid" or gate.num_expert_group != 1:
+        raise ValueError("bounded route diagnosis requires ungrouped sigmoid routing")
+    ids = [arm["ids"].reshape(-1, gate.top_k) for arm in (left, right)]
+    scores = [arm["choice"] for arm in (left, right)]
+    changed = (ids[0].sort(-1).values != ids[1].sort(-1).values).any(-1)
+    flips = []
+    for token in torch.nonzero(changed).flatten().tolist():
+        a, b = (set(value[token].tolist()) for value in ids)
+        removed, added = sorted(a - b), sorted(b - a)
+        choices = []
+        for score in scores:
+            ordered = score[token].topk(gate.top_k + 1).values
+            choices.append({"cutoff_margin": float(ordered[-2] - ordered[-1]),
+                            "removed_scores": [float(score[token, expert]) for expert in removed],
+                            "added_scores": [float(score[token, expert]) for expert in added]})
+        flips.append({"token": token, "official_only_experts": removed,
+                      "adapted_only_experts": added, "arms": choices})
+    return {"selection_flip_tokens": int(changed.sum()), "flips": flips,
+            "router_logits": differences(left["logits"], right["logits"]),
+            "router_input": differences(left["input"], right["input"])}
+
+
+def diagnose_routes(a, *, native_layer, atomic_json, digest, state_type, official_mask):
+    """Replay two short streams, retaining the input of the first route flip."""
+    import time
+    import numpy as np
+    import torch
+    import fla
+    import transformers
+    import compressed_tensors
+    from fidelity_windows import load_set, verify_snapshot
+    from families.kimi_k3.model import (LayerWeights, configure_f32, geometry, load_official,
+                                       package_source_identity, source_identity)
+
+    if a.probe_state is None or a.diagnose_layer < 0:
+        raise ValueError("route diagnosis requires a nonnegative layer and --probe-state")
+    arithmetic = configure_f32()
+    torch.manual_seed(0)
+    if a.diagnose_blas:
+        torch.backends.cuda.preferred_blas_library(a.diagnose_blas)
+    manifest = load_set(a.windows)
+    snapshot = verify_snapshot(manifest, a.snapshot)
+    latest = json.loads((a.probe_state / "latest.json").read_bytes())
+    parent = latest["binding"]
+    runtime = {"torch": torch.__version__, "fla": fla.__version__,
+               "transformers": transformers.__version__, "compressed_tensors": compressed_tensors.__version__,
+               "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
+               "compute_capability": list(torch.cuda.get_device_capability())}
+    if (parent["snapshot_identity"] != snapshot or parent["set_sha256"] != manifest["set_sha256"]
+            or any(parent[key] != value for key, value in runtime.items())
+            or parent.get("state_dtype") != "float32"):
+        raise ValueError("route diagnostic source/set/runtime differs from saved F32 probe")
+    retained = state_type(a.probe_state, parent)
+    blob = latest["windows"]["official_short"]["blocks"][0]
+    other = latest["windows"]["adapted_short"]["blocks"][0]
+    if blob["sha256"] != other["sha256"] or "block000" not in blob["path"]:
+        raise ValueError("initial official/adapted embeddings differ")
+    reference, config, quantization = load_official(a.snapshot)
+    if a.diagnose_layer >= config.num_hidden_layers:
+        raise ValueError("diagnostic layer outside checkpoint")
+    pins = source_identity(a.snapshot)
+    for package, name in ((fla, "fla"), (transformers, "transformers"),
+                          (compressed_tensors, "compressed_tensors")):
+        pins[name + "_source_sha256"] = package_source_identity(package)
+    binding = {"role": "route-diagnostic-only", "snapshot_identity": snapshot, "source_pin": pins,
+               "parent_sha256": digest(a.probe_state / "latest.json"), "diagnostic_sha256": digest(__file__),
+               "arithmetic": arithmetic, "runtime": runtime, "state_dtype": "float32",
+               "state_bytes_per_layer": 2 * 128 * config.hidden_size * 4,
+               "embedding_sha256": blob["sha256"],
+               "blas": str(torch.backends.cuda.preferred_blas_library())}
+    a.out.mkdir(parents=True, exist_ok=True)
+    state = state_type(a.out / "layer-state", binding, diagnostic_prefix=a.diagnose_layer)
+    weights = LayerWeights(a.snapshot, quantization, dtype=torch.float32,
+                           kda_num_heads=config.linear_attn_config["num_heads"])
+
+    def forward(layer, hidden, blocks, adapted):
+        from contextlib import nullcontext
+        def run():
+            capture = (route_capture(layer.block_sparse_moe.gate)
+                       if hasattr(layer, "block_sparse_moe") else nullcontext({}))
+            with capture as route:
+                mask = None if adapted or layer.is_linear_attn else official_mask(hidden)
+                output, history = layer(hidden, attention_mask=mask, block_residual=blocks,
+                                        use_cache=False, output_attentions=False)
+            return output, history, route
+        if adapted:
+            with geometry(reference):
+                return run()
+        return run()
+
+    with torch.inference_mode():
+        if state.latest is None:
+            raw = np.fromfile(retained.verify(blob), dtype="<f4")
+            embedding = torch.from_numpy(raw).reshape(1, -1, config.hidden_size).cuda()
+            if embedding.shape[1] != 128:
+                raise ValueError("route diagnosis requires the 128-token short stream")
+            pending = state.begin(-1)
+            for name in ("official_short", "adapted_short"):
+                state.save(pending, name, embedding)
+            state.commit(pending)
+            del embedding
+        for index in range(state.latest["layer"] + 1, a.diagnose_layer + 1):
+            tick = time.monotonic()
+            layer = native_layer(reference, config, weights, index, max_length=128)
+            pending = state.begin(index)
+            routes, outputs = [], []
+            for adapted, name in enumerate(("official_short", "adapted_short")):
+                hidden, blocks = state.load(name, config.hidden_size)
+                result, history, route = forward(layer, hidden, blocks, bool(adapted))
+                append = index % config.attn_res_block_size == 0
+                if history.shape[1] != blocks.shape[1] + int(append):
+                    raise ValueError("diagnostic block history count differs")
+                if append and not torch.equal(history[:, -1], hidden[0]):
+                    raise ValueError("diagnostic block history differs")
+                state.save(pending, name, result, append_block=append)
+                routes.append(route)
+                outputs.append(result.detach().cpu())
+                del hidden, blocks, result, history
+            comparison = (route_comparison(layer.block_sparse_moe.gate, *routes)
+                          if hasattr(layer, "block_sparse_moe") else
+                          {"selection_flip_tokens": 0, "flips": [], "dense_layer": True})
+            row = {"layer": index, **comparison, "output": differences(*outputs)}
+            pending["checks"].append(row)
+            atomic_json(a.out / "routes.json", {"binding": binding, "layers": pending["checks"]})
+            if comparison["selection_flip_tokens"]:
+                hidden, blocks = state.load("official_short", config.hidden_size)
+                controlled, history, controlled_route = forward(layer, hidden, blocks, True)
+                gate_routes = []
+                for adapted in (False, True):
+                    def gate_run():
+                        with route_capture(layer.block_sparse_moe.gate) as observed:
+                            layer.block_sparse_moe.gate(routes[0]["input"])
+                        return observed
+                    if adapted:
+                        with geometry(reference):
+                            gate_routes.append(gate_run())
+                    else:
+                        gate_routes.append(gate_run())
+                report = {"schema": "cuteafd.kimi.route-diagnostic/1", "binding": binding,
+                          "first_flip": row, "retained_input_layer": state.latest["layer"],
+                          "controlled_layer_same_input": route_comparison(layer.block_sparse_moe.gate, routes[0], controlled_route),
+                          "controlled_router_same_input": route_comparison(layer.block_sparse_moe.gate, *gate_routes),
+                          "controlled_layer_output": differences(outputs[0], controlled.cpu()),
+                          "qualification": "diagnostic only; no threshold changes or publishable scores"}
+                atomic_json(a.out / "layer-diagnostic.json", report)
+                print(json.dumps(report), flush=True)
+                weights.release_experts()
+                weights.close()
+                return
+            state.commit(pending)
+            del layer, routes, outputs
+            weights.release_experts()
+            torch.cuda.empty_cache()
+            print(f"route layer {index}/{a.diagnose_layer} committed; {time.monotonic() - tick:.1f}s", flush=True)
+        atomic_json(a.out / "layer-diagnostic.json", {"binding": binding, "first_flip": None,
+                    "layers": state.latest["checks"], "qualification": "diagnostic only"})
+        weights.close()
+
+
 def diagnose(a, *, native_layer, atomic_json, digest, state_type, official_mask):
+    if a.diagnose_layer != 1:
+        return diagnose_routes(a, native_layer=native_layer, atomic_json=atomic_json, digest=digest,
+                               state_type=state_type, official_mask=official_mask)
     import numpy as np
     import torch
     import fla
