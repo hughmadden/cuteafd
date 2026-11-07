@@ -413,7 +413,17 @@ mod tests {
                 let local = layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
                 let arena = DeviceWeightArena::new(device,
                     cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &local)?)?;
-                let weights = load_rank(device, &cfg, &checkpoint, &layouts, rank, &arena)?;
+                let (embedding, weights) = if rank == 0 {
+                    let tensor = checkpoint.tensors.iter().find(|tensor|
+                        tensor.meta.name == "model.language_model.embed_tokens.weight").context("fixture embedding")?;
+                    let source = crate::shared::token_io::EmbedSource::new(&checkpoint.snapshot, &tensor.shard,
+                        &tensor.meta, cfg.hidden)?;
+                    let (embedding, weights) = device.run(|| crate::shared::token_io::TokenEmbedding::load_with(
+                        &library, source, crate::shared::memory::EmbedPlacement::Gpu,
+                        || load_rank(device, &cfg, &checkpoint, &layouts, rank, &arena),
+                        |name, bytes| allocate(device, &arena, name, bytes)))?;
+                    (Some(embedding), weights)
+                } else { (None, load_rank(device, &cfg, &checkpoint, &layouts, rank, &arena)?) };
                 let backing_bytes = arena.layout().bytes();
                 drop(arena);
                 let device_ids = (0..ranks as i32).collect::<Vec<_>>();
@@ -435,6 +445,10 @@ mod tests {
                 }
                 let mut census = crate::shared::memory::receipts::Census::default();
                 census.owners(receipts.receipts);
+                if let Some(embedding) = &embedding {
+                    assert_eq!(embedding.verify_resident()?, global.embedding);
+                    census.owners(embedding.allocation_receipts(devices, "muse.embedding")?);
+                }
                 census.normalize(cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)?;
                 assert_eq!(census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count(), 1);
             }

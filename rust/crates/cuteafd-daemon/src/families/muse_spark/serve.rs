@@ -305,14 +305,15 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                     cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(
                         rank, gpus, &built.global, &layers)?)
             }).collect::<Result<Vec<_>>>()?;
-            let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
+            let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load_with(&library, source.clone(),
                 crate::shared::memory::EmbedPlacement::Gpu, || {
                     devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
                         super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
                             checkpoint: &checkpoint, built: &built, placement, rank, slots: sequences as u64, arena: &arenas[rank],
                             unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
                         .collect::<Result<Vec<_>>>()
-                }))?;
+                }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(
+                    devices[0], Some(&arenas[0]), name, bytes)))?;
             // Admission names the drafter's home; it joins that GPU's dense
             // rank before the one target/expert push group is planned.
             let draft = match (args.draft.as_deref(), &built.drafter) {
@@ -377,7 +378,30 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
         served_context, pages, local, draft, pricing, super::media::Binding::from_view(&view, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
-    crate::shared::inventory::startup_probe(&library, &device_ids, "muse-backend-ready", Default::default())?;
+    let target_census = if crate::shared::inventory::startup_probe_enabled() {
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
+        use crate::shared::memory::receipts::{Census, Inventory};
+        let devices = CoordinatorDevices::new(&device_ids)?;
+        let mut owners = Inventory::new(devices, "muse.target", Lifetime::TARGET,
+            cuteafd_core::memory_layout::Category::Weights, "Muse target weights");
+        for (rank, resources) in ranks.iter().enumerate() {
+            let mut rank_owners = Inventory::new(devices, &format!("muse.target.rank{rank}"), Lifetime::TARGET,
+                cuteafd_core::memory_layout::Category::Weights, "Muse target weights");
+            resources.globals.inventory(&mut rank_owners)?;
+            for (layer, weights) in resources.layers.iter().enumerate() {
+                weights.inventory(&mut rank_owners, &format!("layers.{layer}"))?;
+            }
+            owners.receipts.extend(rank_owners.receipts);
+        }
+        let mut census = Census::default();
+        census.owners(owners.receipts);
+        census.owners(embedding.allocation_receipts(devices, "muse.target.embedding")?);
+        census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+        tracing::info!("Muse startup named census covers target weights only; other owners remain in native-live records");
+        Some(census)
+    } else { None };
+    crate::shared::inventory::startup_probe(&library, &device_ids, "muse-backend-ready",
+        crate::shared::inventory::StartupEvidence { census: target_census.as_ref(), ..Default::default() })?;
     // Engine teardown may block while joining exchange workers; preserve the
     // original scheduler error before any backend or native owners unwind.
     // Scheduler-owned selection, cache copies and timing live beside the target head.
