@@ -2729,6 +2729,22 @@ for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
 done
 peers=()
 [[ -z "$deployment_peer_csv" ]] || IFS=, read -r -a peers <<<"$deployment_peer_csv"
+# Recipe registration is not proof that this seal/image contains its TP variants.
+package_requirements="$(jq -c '.artifact_requirements.spark_packages // {}' <<<"$deployment_json")"
+if [[ "$package_requirements" != '{}' ]]; then
+  for rank in "${spark_expert_ranks[@]}"; do
+    host="$(get "SPARK_${rank}_HOST")"
+    identity="$checkpoint_family $host image $spark_image"
+    if [[ -n "$wip_slot" ]]; then
+      slot_root="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip"
+      printf -v package_command '%q ' python3 - "$package_requirements" "$identity slot $wip_slot ($slot_root)" "$slot_root"
+    else
+      printf -v package_command '%q ' docker run --rm --network none -i --entrypoint python3 "$spark_image" - "$package_requirements" "$identity"
+    fi
+    timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "$package_command" < "$repo_root/scripts/launch/preflight-spark-packages.py" ||
+      release_die "$host is missing deployment Spark packages (before startup)"
+  done
+fi
 if ((dry_run)); then
   # No serving container, restart or remote staging below this point is allowed
   # during validation. Runtime-only proofs (including audio exports) stay pending.
