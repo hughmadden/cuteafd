@@ -26,6 +26,7 @@ pub(crate) mod token_table;
 pub(crate) mod memory;
 pub(crate) mod memory_report;
 pub(crate) mod packed_head;
+pub(crate) mod kx7;
 pub(crate) mod peer_probe;
 pub(crate) mod peer_split;
 pub(crate) mod placement;

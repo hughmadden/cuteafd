@@ -570,6 +570,9 @@ fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
             let repr = options.layout.as_ref().map(|layout| layout.glmf_representation).unwrap_or_default();
             active.push("MLA and shared experts: FP8 block weights; W8A8 prefill (existing launcher default)".into());
             if repr.kda_fp8 { active.push("KDA projections: row-K128 FP8 weights (existing launcher default)".into()); }
+            if repr.kda_kx7 && !repr.kda_fp8 {
+                active.push("KDA projections: KX7 exact (bound 8 bits/weight; the BF16 values, Huffman-packed at load)".into());
+            }
             match repr.head {
                 crate::families::glm5_flash::resident::GlmfHeadFormat::Fp8 =>
                     active.push("head: row-K128 FP8 weights (existing launcher default)".into()),

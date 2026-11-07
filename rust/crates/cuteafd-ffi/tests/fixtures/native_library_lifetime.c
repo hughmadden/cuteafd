@@ -995,3 +995,8 @@ int cuteafd_packed_head_linear(const void *x, void *const *planes, void *out,
     (void)planes; (void)coarse;
     return cuteafd_fp8_w8a16_linear(x, NULL, NULL, out, f32, rows, k, n, scratch, bytes, stream);
 }
+int cuteafd_kx7_linear(const void *x, const void *pack, void *out, int rows, void *workspace,
+        size_t bytes, void *stream) {
+    (void)pack;
+    return cuteafd_fp8_w8a16_linear(x, NULL, NULL, out, 0, rows, 4096, 8192, workspace, bytes, stream);
+}

@@ -947,7 +947,8 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 kda: layers.iter().filter(|l| l.attention == GlmNextAttention::Kda)
                     .all(|l| ["q_proj", "k_proj", "v_proj", "o_proj"].iter()
                         .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))
-                            || l.attention_native.contains_key(&format!("self_attn.{leaf}"))) || native::is_native(l)),
+                            || l.attention_native.contains_key(&format!("self_attn.{leaf}"))
+                            || l.kx7.contains_key(format!("self_attn.{leaf}").as_str())) || native::is_native(l)),
                 mla: layers.iter().filter(|l| l.attention == GlmNextAttention::Mla && l.attention_share.present())
                     .all(|l| ["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"].iter()
                         .all(|leaf| l.core.contains_key(&format!("self_attn.{leaf}"))
@@ -2375,7 +2376,8 @@ impl<'a> GlmfEngine<'a> {
                     };
                     ensure!(shares[rank].present() && leaves.iter().all(|leaf|
                         layer.core.contains_key(&format!("self_attn.{leaf}"))
-                            || layer.attention_native.contains_key(&format!("self_attn.{leaf}"))),
+                            || layer.attention_native.contains_key(&format!("self_attn.{leaf}"))
+                            || layer.kx7.contains_key(format!("self_attn.{leaf}").as_str())),
                         "Flash selected attention group incomplete");
                 }
                 if shares[rank].present() { weights.push(rank as u8); }
@@ -3607,7 +3609,8 @@ impl<'a> GlmfEngine<'a> {
         for layer in &self.weights.layers {
             match layer.attention {
                 GlmNextAttention::Kda => {
-                    let name = if layer.has("w_in_fp8") {
+                    let name = if core::kx7_attention(layer) { core::kx7_prefill_program(self.kda_state) }
+                    else if layer.has("w_in_fp8") {
                         if self.kda_state == KdaState::F32 {
                             format!("kda_w8{}_m4096", if self.kda_prefill_expanded { "_expanded" } else { "" })
                         } else { self.kda_state.w8_program(PREFILL_CAP) }
@@ -4802,7 +4805,8 @@ impl<'a> GlmfEngine<'a> {
         let rows_at = [row_at(&w.x, first, h * 2), row_at(&w.kda_slots, first, 4), row_at(&w.seq_first, first, 4),
             w.delta.buffer.ptr.wrapping_byte_add(first * h * out_bytes)];
         if core::stage_attention(layer) {
-            ensure!(self.kda_state == KdaState::F32, "native Flash K6 requires the F32 KDA stage package");
+            ensure!(self.kda_state == KdaState::F32 || core::kx7_attention(layer),
+                "native Flash K6 requires the F32 KDA stage package");
             return self.core_kda(rank, w, layer, rows, first, cap, spec, [conv_state, state, replay]);
         }
         if layer.has("w_in_fp8") {
@@ -5237,6 +5241,8 @@ impl<'a> GlmfEngine<'a> {
         (0..layers.len()).map(|i| match layers.get(i + 1) {
             Some(next) => {
                 let attention: &[&str] = match next.attention {
+                    GlmNextAttention::Kda if core::kx7_attention(next) => &["w_aux", "w_fg", "conv_w", "a_log",
+                        "dt_bias", "o_norm"],
                     GlmNextAttention::Kda if next.has("w_in_fp8") => &["w_in_fp8", "w_in_kscale", "w_fg", "conv_w",
                         "a_log", "dt_bias", "o_norm", "w_o_fp8", "w_o_kscale"],
                     GlmNextAttention::Kda => &["w_in", "w_fg", "conv_w", "a_log", "dt_bias", "o_norm", "w_o"],
@@ -5244,16 +5250,27 @@ impl<'a> GlmfEngine<'a> {
                         "w_q_b_scale", "w_iq", "w_ik", "k_norm_w", "k_norm_b", "ape", "w_uk", "w_uv", "w_o_fp8",
                         "w_o_scale"],
                 };
-                let names: Vec<&str> = ["attn.fn", "attn.scale", "attn.base", "input_norm"].iter().chain(attention)
-                    .chain(&["ffn.fn", "ffn.scale", "ffn.base", "post_norm", "gate", "gate.bias", "w_gate_up_fp8",
-                        "w_gate_up_scale", "w_down_fp8", "w_down_scale"])
-                    .copied().collect();
-                let mut ranges = crate::shared::l2_prefetch::operands(&names, |n| next.range(n));
+                let site = ["attn.fn", "attn.scale", "attn.base", "input_norm"];
+                let ffn = ["ffn.fn", "ffn.scale", "ffn.base", "post_norm", "gate", "gate.bias", "w_gate_up_fp8",
+                    "w_gate_up_scale", "w_down_fp8", "w_down_scale"];
+                let names: Vec<&str> = site.iter().chain(attention).chain(&ffn).copied().collect();
+                let mut ranges = if core::kx7_attention(next) {
+                    let operands = |names: &[&str]| crate::shared::l2_prefetch::operands(names, |n| next.range(n));
+                    let packs = |keys: &[&str]| keys.iter().filter_map(|key| next.kx7.get(key))
+                        .flat_map(|w| w.ranges()).collect::<Vec<_>>();
+                    let projections = super::kx7::PROJECTIONS;
+                    let mut ranges = operands(&site);
+                    ranges.extend(packs(&projections[..3]));
+                    ranges.extend(operands(attention));
+                    ranges.extend(packs(&projections[3..]));
+                    ranges.extend(operands(&ffn));
+                    ranges
+                } else { crate::shared::l2_prefetch::operands(&names, |n| next.range(n)) };
                 for weight in next.core.values() {
                     ranges.extend([weight.payload.buffer, weight.suh.buffer, weight.svh.buffer]
                         .map(|buffer| (buffer.ptr.cast_const(), buffer.bytes)));
                 }
-                if let Some(aux) = next.range("w_aux") { ranges.push(aux); }
+                if let Some(aux) = next.range("w_aux").filter(|_| !core::kx7_attention(next)) { ranges.push(aux); }
                 ranges
             }
             None if rank == 1 => Vec::new(),

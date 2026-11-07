@@ -423,6 +423,14 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
             params = dict(input_features=k, output_features=n, max_rows=rows, decode=rows in decode_caps)
             out.append((f"fp8_linear_k{k}_n{n}_m{rows}", "attention_projection", params,
                         partial(compile_glmf_fp8_linear_aot, **params)))
+    # BF16-state cores for staged KDA (KX7 projections with --kda-state bf16 / bf16-tile),
+    # named as the fused kda_s16 / kda_s16t programs; appended after every existing entry.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        decode = rows in decode_caps
+        for tag, rounding in (("s16", "window"),) + (() if decode else (("s16t", "tile"),)):
+            params = dict(max_rows=rows, decode=decode, state_dtype="bfloat16", state_rounding=rounding)
+            out.append((f"kda_core_{tag}_m{rows}", "kda_core", params,
+                        partial(compile_glmf_kda_core_aot, g, **params)))
     return out
 
 

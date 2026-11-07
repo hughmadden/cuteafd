@@ -86,6 +86,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != crate::families::glm5_flash::fp8::KdaFp8::Off,
+                    kda_kx7: args.kda_exact == crate::families::glm5_flash::kx7::KdaExact::Kx7,
                     head: args.head_format, ..Default::default() },
                 glmf_kda_state: args.kda_state.into(),
                 glmf_index: args.index_cache.into(),
@@ -228,6 +229,11 @@ fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanErro
         && args.head_format != GlmfHeadFormat::Bf16 {
         return Err(PlanError::InvalidOption { option: "--target-head", reason: format!(
             "explicit tensor head needs --fp8-head false; the {} head has its own GEMV", args.head_format.name()) });
+    }
+    if family == "glm5_flash" && args.kda_exact == crate::families::glm5_flash::kx7::KdaExact::Kx7
+        && args.kda_fp8 != crate::families::glm5_flash::fp8::KdaFp8::Off {
+        return Err(PlanError::InvalidOption { option: "--kda-exact", reason:
+            "kx7 holds the BF16 KDA projections exactly; it takes --kda-fp8 off".into() });
     }
     Ok(())
 }
@@ -1233,6 +1239,7 @@ mod tests {
             kv_format: Default::default(),
             fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128,
+            kda_exact: Default::default(),
             kda_state: crate::families::glm5_flash::engine::KdaState::F32,
             head_format: crate::families::glm5_flash::head::GlmfHeadFormat::Fp8, target_head: None,
             draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
@@ -2061,6 +2068,17 @@ mod tests {
             }
         }
         assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--fp8-head", "maybe"]).is_err());
+        // --kda-exact kx7 reaches the layout's representation and takes --kda-fp8 off.
+        assert!(!options(&defaults).unwrap().layout.unwrap().glmf_representation.kda_kx7);
+        for state in ["f32", "bf16"] {
+            let kx7 = parse(&["--kda-exact", "kx7", "--kda-fp8", "off", "--kda-state", state]);
+            let layout = options(&kx7).unwrap().layout.unwrap();
+            assert!(layout.glmf_representation.kda_kx7 && !layout.glmf_representation.kda_fp8);
+            assert!(validate_glmf_precision(&kx7, "glm5_flash").is_ok());
+        }
+        let lossy = parse(&["--kda-exact", "kx7", "--kda-fp8", "row128"]);
+        assert!(validate_glmf_precision(&lossy, "glm5_flash").unwrap_err().to_string().contains("--kda-fp8 off"));
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--kda-exact", "kx8"]).is_err());
         let tensor = parse(&["--target-head", "tensor"]);
         assert!(validate_glmf_precision(&tensor, "glm5_flash").is_err());
         assert!(validate_glmf_precision(&tensor, "glm5").is_ok());

@@ -970,7 +970,7 @@ release_known_key() {
     TARGET_HEAD) return 0 ;;
     GLM5_FLASH_EXL3_SCHEDULE) return 0 ;;
     RDMA_BOND_BALANCE|HOST_ISA) return 0 ;;
-    GLM5_FLASH_KDA_STATE) return 0 ;;
+    GLM5_FLASH_KDA_STATE|GLM5_FLASH_KDA_EXACT) return 0 ;;
     GLM5_FLASH_PREFIX_MARKS) return 0 ;;
     GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
     GLM5_FLASH_DECODE_ROWS) return 0 ;;

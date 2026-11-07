@@ -37,7 +37,7 @@ fn native_k6_core_and_head_records_match_host_pack() -> Result<()> {
         stored_outputs: 256, split: CoreSplit::Output, source_bytes: 0 };
     let stream = std::ptr::null_mut();
     let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
-        kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off, kda_output_shard: false,
+        kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off, kda_exact: Default::default(), kda_output_shard: false,
         fp8_head: false, kda_nvfp4: None, fp8_scales: crate::shared::fp8_linear::Fp8Scales::Pow2,
         device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
         dense: std::rc::Rc::new(DenseLoad::mount(&library)) };
@@ -102,7 +102,7 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
     let mut actual = std::collections::BTreeMap::new();
     for rule in [crate::shared::fp8_linear::Fp8Scales::Pow2, crate::shared::fp8_linear::Fp8Scales::Best] {
         let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
-            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true, kda_nvfp4: None,
+            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_exact: Default::default(), kda_output_shard: false, fp8_head: true, kda_nvfp4: None,
             fp8_scales: rule, device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
             dense: std::rc::Rc::new(DenseLoad::mount(&library)) };
         let dense = (0..cfg.layers).find(|&l| cfg.dense[l]).context("no dense layer")?;
@@ -170,7 +170,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
     for (gpus, oshard) in [(2usize, false), (2, true), (1, false)] {
         let load = std::rc::Rc::new(DenseLoad::push(&library));
         let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
-            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: oshard, fp8_head: true,
+            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_exact: Default::default(), kda_output_shard: oshard, fp8_head: true,
             kda_nvfp4: None, fp8_scales: rule, device: 0,
             peers: if gpus == 2 { vec![crate::shared::peer_split::RankDevice { device: 1, stream }] } else { Vec::new() },
             dense: load.clone() };
