@@ -504,7 +504,20 @@ fn with_backend<T>(args: &ServeArgs,
     })?;
     tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup weight delivery complete");
-    crate::shared::inventory::startup_probe(&library, &ids, "step5/weights-loaded", Default::default())?;
+    if crate::shared::inventory::startup_probe_enabled() {
+        // Arena receipts exist from Load: one backing per GPU plus a view per owner.
+        use crate::shared::memory::receipts::{Census, Inventory};
+        let coordinator = cuteafd_loader::placement::planner::CoordinatorDevices::new(&ids)?;
+        let mut weights = Inventory::new(coordinator, "step5.target", cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "step5 weights");
+        native.inventory(&mut weights)?;
+        if let Some(mtp) = &mtp { mtp.inventory(&mut weights)?; }
+        let mut census = Census::default();
+        census.owners(weights.receipts);
+        census.owners(embedding.allocation_receipts(coordinator, "step5.embedding")?);
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/weights-loaded",
+            crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+    }
     let bind_start = std::time::Instant::now();
     if !spark_working.spark_layers.is_empty() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;

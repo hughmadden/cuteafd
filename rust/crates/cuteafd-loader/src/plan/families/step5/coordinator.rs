@@ -915,4 +915,102 @@ mod tests {
             assert!(CoordinatorContract::from_checkpoint(&cp).is_err());
         }
     }
+
+    /// Before: one cudaMalloc per final owner (operand, or trellis member);
+    /// after: one arena. SM120 rounds requests over 1 MiB up to 2 MiB.
+    fn census(layout: &RankWeightLayout, arena: &crate::serving_capacity::WeightArenaLayout) -> String {
+        let tensors = layout.arena_tensors(|_| true).unwrap();
+        let bytes = tensors.iter().map(|(_, n)| *n as u64).sum::<u64>();
+        let large = tensors.iter().filter(|(_, n)| *n > 1 << 20).map(|(_, n)| *n as u64).collect::<Vec<_>>();
+        let rounding = large.iter().map(|n| n.div_ceil(2 << 20) * (2 << 20) - n).sum::<u64>();
+        let last = arena.views().values().map(|v| v.offset() + v.bytes()).max().unwrap();
+        format!("before {} allocations / {bytes} B, {} > 1 MiB / {} B, SM120 rounding {rounding} B; \
+            after arena {} B, padding {} B, tail {} B", tensors.len(), large.len(), large.iter().sum::<u64>(),
+            arena.bytes(), arena.padding_bytes(), arena.bytes() - last)
+    }
+
+    /// Views are exactly the final owners: unique, 256-aligned, disjoint, and
+    /// summing to the admitted resident bytes; composites stay one view.
+    fn assert_arena(layout: &RankWeightLayout) -> crate::serving_capacity::WeightArenaLayout {
+        let arena = layout.arena_layout("step5/test", |_| true).unwrap();
+        assert_eq!(arena.payload_bytes() as u64, layout.resident_bytes);
+        assert_eq!(arena.views().len(), layout.operands.len() + 3 * layout.core.len());
+        let mut views = arena.views().iter().collect::<Vec<_>>();
+        views.sort_by_key(|(_, v)| v.offset());
+        let mut end = 0;
+        for (name, view) in &views {
+            assert_eq!(view.offset() % 256, 0, "{name}");
+            assert!(view.offset() >= end && view.offset() - end < 256, "{name}");
+            assert!(!name.contains("staging") && !name.contains("marker"), "{name}");
+            end = view.offset() + view.bytes();
+        }
+        assert_eq!(end, arena.bytes());
+        for operand in &layout.operands {
+            let key = if operand.name == "model.embed_tokens.weight" { "embedding.table" } else { &operand.name };
+            assert_eq!(arena.view(key).unwrap().bytes() as u64, operand.allocation_bytes, "{key}");
+        }
+        for core in layout.core.values() {
+            let parts = ["trellis", "suh", "svh"].map(|p| arena.view(&format!("{}.{p}", core.stem)).unwrap().bytes());
+            assert_eq!(parts.iter().sum::<usize>(), core.bytes, "{}", core.stem);
+        }
+        arena
+    }
+
+    #[test]
+    fn rank_arenas_hold_exactly_the_final_fp8_owners() {
+        let dir = snapshot("fp8");
+        let cp = Checkpoint::open(dir.path()).unwrap();
+        let one = RankWeightLayout::from_checkpoint(&cp, 0, 1).unwrap();
+        let arena = assert_arena(&one);
+        assert!(arena.views().keys().all(|name| !name.ends_with("weight_scale_inv")));
+        eprintln!("Step-5 FP8 TP1 rank 0: {}", census(&one, &arena));
+        // FP8-compact attention: each converted O keeps values and scales as one
+        // composite view, sized by its packed native layout.
+        let mut compact = one.clone();
+        compact.select_attention(crate::plan::checkpoint::AttentionMode::Fp8Compact).unwrap();
+        let arena = assert_arena(&compact);
+        let converted = compact.operands.iter().filter(|o| o.dtype == DType::F8E4M3).collect::<Vec<_>>();
+        assert!(!converted.is_empty() && converted.iter().all(|o| o.name.ends_with(".self_attn.o_proj.weight")));
+        for operand in converted {
+            assert_eq!(arena.view(&operand.name).unwrap().bytes() as u64,
+                operand.native_layout(0, 1).unwrap().bytes().unwrap(), "{}", operand.name);
+        }
+        eprintln!("Step-5 FP8-compact TP1 rank 0: {}", census(&compact, &arena));
+        let ranks = [0, 1].map(|rank| RankWeightLayout::from_checkpoint(&cp, rank, 2).unwrap());
+        for (rank, layout) in ranks.iter().enumerate() {
+            let arena = assert_arena(layout);
+            eprintln!("Step-5 FP8 TP2 rank {rank}: {}", census(layout, &arena));
+        }
+        // TP2 holds rank-local slices: q rows halve, replicated FFNs keep whole extents.
+        let q = |l: &RankWeightLayout| l.operands.iter().find(|o| o.name == "model.layers.3.self_attn.q_proj.weight")
+            .unwrap().allocation_bytes;
+        assert_eq!(q(&ranks[0]) * 2, q(&one));
+        assert_eq!(q(&ranks[0]), q(&ranks[1]));
+    }
+
+    #[test]
+    fn rank_and_predictor_arenas_hold_exactly_the_final_exl3_owners() {
+        let dir = crate::plan::families::step5::tests::exl3_snapshot();
+        let cp = Checkpoint::coordinator(dir.path(), false, true).unwrap();
+        let one = RankWeightLayout::from_checkpoint(&cp, 0, 1).unwrap();
+        assert!(!one.core.is_empty());
+        let arena = assert_arena(&one);
+        eprintln!("Step-5 EXL3 TP1 rank 0: {}", census(&one, &arena));
+        for rank in 0..2 {
+            let layout = RankWeightLayout::from_checkpoint(&cp, rank, 2).unwrap();
+            let arena = assert_arena(&layout);
+            eprintln!("Step-5 EXL3 TP2 rank {rank}: {}", census(&layout, &arena));
+            // A K-split o_proj owner keeps only this rank's input columns.
+            let o = &layout.core["model.layers.3.self_attn.o_proj.weight"];
+            assert_eq!((o.rank, o.ranks), (rank, 2));
+        }
+        // The predictor arena is its own scope: no target layer or global appears in it.
+        let mtp = RankWeightLayout::for_mtp(&cp, 3).unwrap();
+        let predictor = assert_arena(&mtp);
+        let cfg = crate::plan::families::step5::Config::parse(&cp).unwrap();
+        assert!(predictor.views().keys().all(|name| name.strip_prefix("model.layers.")
+            .and_then(|rest| rest.split('.').next()).and_then(|l| l.parse::<usize>().ok())
+            .is_some_and(|layer| layer >= cfg.layers)), "predictor arena holds a target owner");
+        eprintln!("Step-5 EXL3 MTP depth 3: {}", census(&mtp, &predictor));
+    }
 }
