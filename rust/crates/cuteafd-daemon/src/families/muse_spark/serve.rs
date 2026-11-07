@@ -387,10 +387,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
         use crate::shared::memory::receipts::{Census, Inventory};
         let devices = CoordinatorDevices::new(&device_ids)?;
-        let mut owners = Inventory::new(devices, "muse.target", Lifetime::TARGET,
+        let mut owners = Inventory::new(devices, "muse.target", Lifetime::RESIDENT,
             cuteafd_core::memory_layout::Category::Weights, "Muse target weights");
         for (rank, resources) in ranks.iter().enumerate() {
-            let mut rank_owners = Inventory::new(devices, &format!("muse.target.rank{rank}"), Lifetime::TARGET,
+            let mut rank_owners = Inventory::new(devices, &format!("muse.target.rank{rank}"), Lifetime::RESIDENT,
                 cuteafd_core::memory_layout::Category::Weights, "Muse target weights");
             resources.globals.inventory(&mut rank_owners)?;
             for (layer, weights) in resources.layers.iter().enumerate() {

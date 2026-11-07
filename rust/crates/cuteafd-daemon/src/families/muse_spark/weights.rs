@@ -429,7 +429,7 @@ mod tests {
                 let device_ids = (0..ranks as i32).collect::<Vec<_>>();
                 let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&device_ids)?;
                 let mut receipts = crate::shared::memory::receipts::Inventory::new(devices, "muse",
-                    cuteafd_loader::placement::planner::Lifetime::TARGET, cuteafd_core::memory_layout::Category::Weights,
+                    cuteafd_loader::placement::planner::Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Weights,
                     "Muse target weights");
                 for (layer, weights) in weights.iter().enumerate() {
                     let expected = PackedLayer::pack(&cfg, layer, rank, ranks, &layouts[layer][rank], &BTreeMap::new(),
