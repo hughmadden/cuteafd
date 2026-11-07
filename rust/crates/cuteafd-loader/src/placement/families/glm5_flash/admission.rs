@@ -928,7 +928,7 @@ mod tests {
             input.prefill_lanes = waves;
             input.requested_pool = Some(262_144);
             input.graphs = GraphSet::budget(&[64 << 20; 2]);
-            if !draft { input.drafter_bytes = 0; input.drafter_weights = ResidentWeights::ZERO; }
+            if !draft { input.drafter_bytes = 0; input.drafter_weights = ResidentWeights(0); }
             let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
             process.encoders = vec![EncoderPlacement { kind: EncoderKind::Rtx { gpu: 1 },
                 weights: 1024, scratch: 4096, replicas: vec![], reason: "test".into(), shortfall: 0 }];
