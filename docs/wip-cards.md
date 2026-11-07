@@ -38,7 +38,18 @@ smoke scheduler; separately bound arms use independent smoke processes with
 disjoint lock sets. Simulated timings never enter
 medians or paired deltas. Results include JSON, a markdown table, hook logs,
 raw/corrected CUDA 50ms peaks (NVML sampler-context subtraction). The memory probe holds about 550 MiB of CUDA context on each sampled GPU for the whole run, and the server's admission sees it: a card with `--probe memory` admits a smaller pool than a real launch (V4 Flash max 1.18M where the same plan gives more without the probe). Leave the memory probe off for pool and admission comparisons, and never compare pools across arms that differ in probing, worker ring
-ledger peaks and authenticated console stage events. Explicit probes fail
+ledger peaks and authenticated console stage events. Spark memory is sampled
+from host `/proc/meminfo` at the same 50 ms cadence, without a CUDA context:
+`memory-spark-rankN.jsonl` retains byte-valued fields and sampled phase labels
+(refreshed once per second; console snapshots can be up to two seconds old,
+so these are not exact wave boundaries). Additional host samples at readiness
+and after each sweep go to `memory-spark-rankN-ready.jsonl` and
+`memory-spark-rankN-post-sweep.jsonl`, retaining their boundary provenance.
+Each result's `spark_memory` reports per-rank and per-phase minimum MemAvailable
+and field peaks; the text summary also lists minima. Streams end with the card,
+on observer EOF, or after a lost heartbeat. Optional `--spark-memory-guard`
+stops only this card's mount-verified WIP worker below 512 MiB MemAvailable;
+it never stops a foreign container. Explicit probes fail
 rather than silently claim missing evidence. Pool admission and red-square
 image checks run after readiness, before the benchmark. Explicit `panels:`
 selections are validated before launch and checked against the finished report.

@@ -491,13 +491,15 @@ def cargo(source, root, args, env):
     env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
+    env.setdefault('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
+                   str(Path(env.get('HOME', str(Path.home()))) / '.cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json'))
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
     code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
                                 '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust', args.cargo_build_timeout)
     complete = cargo_build_succeeded(build_log)
     result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log),
-                  scrubbed_env=scrubbed_env)
+                  scrubbed_env=scrubbed_env, deployment_test_programs=env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'])
     if code or not complete:
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or

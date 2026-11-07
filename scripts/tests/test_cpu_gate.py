@@ -317,7 +317,10 @@ def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monke
     result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=full), env)
     assert result['status'] == 'pass'
     assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME') == (expected if full or inventory == 'override' else None)
-    assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS') == env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
+    manifest = env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
+                       str(tmp_path / '.cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json'))
+    assert all(call['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] == manifest for call in calls)
+    assert result['deployment_test_programs'] == manifest
     assert calls[1].get('CUTEAFD_TEST_PYTHON') == ('/gate-venv/bin/python' if full else None)
     assert 'CUTEAFD_TEST_PYTHON' not in env
     assert ('CUTEAFD_DEPLOYMENT_TEST_HF_HOME' in env) == (inventory == 'override')
