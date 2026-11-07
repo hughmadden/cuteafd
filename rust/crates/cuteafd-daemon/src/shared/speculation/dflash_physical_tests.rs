@@ -71,7 +71,7 @@ fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
         && receipt.allocation.view.as_ref().is_some_and(|view| view.offset == 0))
         .context("offset-zero draft weight alias missing")?;
     let expected = format!("{}.upload", alias.allocation.id);
-    fixture.reserve_ordered_upload(&library, first, stream.raw as usize)?;
+    device.run(|| fixture.reserve_ordered_upload(&library, first, stream.raw as usize))?;
     let after = drafter.allocation_receipts(devices, "draft")?;
     let uploads = after.iter().filter(|receipt| receipt.allocation.id.ends_with(".upload"))
         .collect::<Vec<_>>();

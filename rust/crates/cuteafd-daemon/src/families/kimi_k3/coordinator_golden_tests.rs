@@ -131,7 +131,7 @@ fn baseline_operands<'a>(device: Device<'a>, operands: BTreeMap<&'static str, Ve
     }).collect()
 }
 
-fn baseline_global<'a>(device: Device<'a>, layout: &GlobalLayout, packed: PackedGlobal)
+pub(crate) fn baseline_global<'a>(device: Device<'a>, layout: &GlobalLayout, packed: PackedGlobal)
     -> Result<GlobalWeights<'a>> {
     layout.check(&packed)?;
     let operands = baseline_operands(device, packed.operands)?;
