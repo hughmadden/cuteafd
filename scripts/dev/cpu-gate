@@ -204,14 +204,10 @@ def check_venv(python, requirements=GATE_REQUIREMENTS):
 
 def python_for(source):
     common = Path(checked(['git', '-C', str(source), 'rev-parse', '--path-format=absolute', '--git-common-dir']).strip()).parent
-    candidates = []
-    if source.resolve() != common.resolve():
-        candidates.append(source / '.venv/bin/python')
-    candidates.extend((gate_venv_for() / 'bin/python', REPO / '.venv/bin/python', common / '.venv/bin/python'))
-    seen = set()
+    candidates = [*([] if source.resolve() == common.resolve() else [source / '.venv/bin/python']),
+                  gate_venv_for() / 'bin/python', REPO / '.venv/bin/python', common / '.venv/bin/python']
     for candidate in candidates:
-        if candidate not in seen and candidate.is_file():
-            seen.add(candidate)
+        if candidate.is_file():
             return check_venv(candidate)
     raise SystemExit(f'cpu-gate: no .venv here, in ~/.cache/cuteafd/gate-venv, or in the main checkout '
                      f'(uv venv --python 3.12 .venv && uv pip sync --python .venv/bin/python {GATE_REQUIREMENTS}; see AGENTS.md)')
@@ -692,9 +688,7 @@ def scripts(source, root, args, env):
 
 
 def gate(source, root, args, owned=False):
-    if (args.scripts and scripts.__name__ == 'scripts') or (
-            args.cargo and getattr(args, 'full', False) and not getattr(args, 'skip_live_planners', False)
-            and cargo.__name__ == 'cargo'):
+    if args.scripts or (args.cargo and getattr(args, 'full', False) and not getattr(args, 'skip_live_planners', False)):
         python_for(source)
     prepare(source, root, owned)
     # Record the gated commit before running: a checkout that moves during the

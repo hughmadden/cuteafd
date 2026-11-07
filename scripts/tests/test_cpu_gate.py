@@ -451,6 +451,7 @@ def test_prepare_refuses_a_moved_pin_only_in_the_gated_source(tmp_path, monkeypa
 
 def test_gate_records_the_starting_head_and_fails_when_it_moves(tmp_path, monkeypatch):
     """A checkout that changes while the gate runs must not be credited with its tests."""
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
     heads = iter(['aaaa', 'bbbb'])
     def checked(cmd, **k):
@@ -505,6 +506,7 @@ def test_slow_runs_only_explicit_cpu_tests(tmp_path, monkeypatch):
 def test_suites_overlap_without_changing_receipt_order(tmp_path, monkeypatch):
     import threading
     barrier = threading.Barrier(2, timeout=5)
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'prepare', lambda *a, **k: None)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'abc' if 'rev-parse' in cmd else '')
     def run(name):
