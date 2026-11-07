@@ -351,6 +351,41 @@ mod mask_tests {
         Ok(())
     }
 
+    /// The planned arena names every operand `load_rank` allocates (the
+    /// loader's `+` groups, FP8 planes, the mask row) at exactly its bytes;
+    /// TP2 halves split the sharded projections and replicate the rest.
+    #[test]
+    fn drafter_arena_names_each_loaded_operand_at_its_extent() -> Result<()> {
+        use cuteafd_loader::families::mimo_v2::weight_arena::dflash_arena_requests;
+        for sinks in [false, true] {
+            let c = DflashConfig { sinks, ..cfg() };
+            for representation in [MimoDraftRepresentation::Bf16Only, MimoDraftRepresentation::Fp8Only] {
+                let one = dflash_arena_requests(&c, representation, 0, 1)?;
+                let mut expected = groups(&c).into_iter().flat_map(|group| {
+                    let name = group.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("+");
+                    let bytes = group.iter().map(|(_, s)| s.iter().product::<usize>() * 2).sum::<usize>();
+                    if representation == MimoDraftRepresentation::Fp8Only && group[0].1.len() == 2 {
+                        vec![(format!("{name}.payload"), bytes / 2), (format!("{name}.scales"), bytes / 2 / 128 * 4)]
+                    } else { vec![(name, bytes.max(256))] }
+                }).collect::<Vec<_>>();
+                expected.push(("mask_embedding".into(), (c.hidden * 2).max(256)));
+                expected.sort();
+                let actual = one.views().iter().map(|(n, v)| (n.clone(), v.bytes())).collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{representation:?} sinks={sinks}");
+                let layout = c.weight_layout(representation)?;
+                assert!(one.payload_bytes() as u64 >= layout.resident_bytes()?, "{representation:?}");
+                let halves = (0..2).map(|rank| dflash_arena_requests(&c, representation, rank, 2))
+                    .collect::<Result<Vec<_>>>()?;
+                assert_eq!(halves[0].views().keys().collect::<Vec<_>>(), one.views().keys().collect::<Vec<_>>());
+                assert_eq!(halves[0].views().values().map(|v| v.bytes()).collect::<Vec<_>>(),
+                    halves[1].views().values().map(|v| v.bytes()).collect::<Vec<_>>());
+                assert_eq!(halves[1].id(), "mimo.dflash.rank1");
+                assert!(halves[0].payload_bytes() < one.payload_bytes());
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn bundled_and_external_drafters_select_their_own_namespace_and_normalize_aliases() -> Result<()> {
         use crate::shared::experts::rtx::push::PushPolicy;
@@ -576,10 +611,18 @@ impl<'a> MimoDrafter<'a> {
         let runtime_layout = cfg.runtime_layout(representation, capacity)?;
         let weight_layout = runtime_layout.weights;
         let (mask_row, mask_source) = mask_source(dir, cfg.hidden)?;
+        // One planned arena per rank (DraftLoad, after target KV); views retain it.
+        let device = Device { library, id: library.cuda_get_device()? };
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+            cuteafd_loader::families::mimo_v2::weight_arena::dflash_arena_requests(&source_cfg, representation, rank, ranks)?)?;
+        let mut allocate = |id: i32, name: &str, bytes: usize| {
+            ensure!(id == device.id, "MiMo DFlash rank {rank} allocates on GPU {id}, not {}", device.id);
+            arena.view(name, bytes)
+        };
         let checkpoint = match file {
             Some(file) => Load::with_prefetched_file(library, &dir.join(WEIGHTS), file)?,
             None => Load::open_file(library, &dir.join(WEIGHTS))?,
-        };
+        }.with_allocator(&mut allocate);
         checkpoint.validate(tensor_shapes(&source_cfg))?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
@@ -638,7 +681,7 @@ impl<'a> MimoDrafter<'a> {
             context_positions: zeroed(TAP_ROWS * 8)?,
             context_slots: zeroed(TAP_ROWS * 4)?,
             mask_device: {
-                let owner = DeviceAllocation::new(library, mask_row.len().max(256))?;
+                let owner = DeviceAllocation::from_allocation(arena.view("mask_embedding", mask_row.len().max(256))?);
                 DenseLoad::mount(library).operand(Operand { device: owner.buffer.device_id,
                     buffer: owner.buffer, bytes: mask_row.len(), lands: vec![(mask_source, 0)] })?;
                 owner
@@ -653,6 +696,40 @@ impl<'a> MimoDrafter<'a> {
             cfg,
             rank, ranks, peer: None, exchange: None,
         })
+    }
+
+    /// Drafter weights as their `mimo.dflash.rank{r}` arena backing plus view
+    /// aliases, live from DraftLoad (after target KV) through Growth.
+    pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_loader::placement::planner::{Lifetime, Phase};
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "mimo.dflash",
+            Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+            cuteafd_core::memory_layout::Category::Drafter, "drafter weights");
+        self.weight_receipts(&mut inventory)?;
+        if let Some(peer) = &self.peer { peer.get().weight_receipts(&mut inventory)?; }
+        Ok(inventory.receipts)
+    }
+
+    fn weight_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        let r = self.rank;
+        self.fc.allocation_receipts(inventory, &format!("rank.{r}.fc"))?;
+        self.hidden_norm.inventory(inventory, &format!("rank.{r}.hidden_norm"))?;
+        self.norm.inventory(inventory, &format!("rank.{r}.norm"))?;
+        self.mask_device.inventory(inventory, &format!("rank.{r}.mask"))?;
+        for (l, layer) in self.layers.iter().enumerate() {
+            let p = format!("rank.{r}.layer.{l}");
+            layer.input_norm.inventory(inventory, &format!("{p}.input_norm"))?;
+            layer.post_norm.inventory(inventory, &format!("{p}.post_norm"))?;
+            layer.qkv.allocation_receipts(inventory, &format!("{p}.qkv"))?;
+            layer.q_norm.inventory(inventory, &format!("{p}.q_norm"))?;
+            layer.k_norm.inventory(inventory, &format!("{p}.k_norm"))?;
+            if let Some(sinks) = &layer.sinks { sinks.inventory(inventory, &format!("{p}.sinks"))?; }
+            layer.o.allocation_receipts(inventory, &format!("{p}.o"))?;
+            layer.gate_up.allocation_receipts(inventory, &format!("{p}.gate_up"))?;
+            layer.down.allocation_receipts(inventory, &format!("{p}.down"))?;
+        }
+        Ok(())
     }
 
     pub fn tap_index(&self, layer: usize) -> Option<usize> {

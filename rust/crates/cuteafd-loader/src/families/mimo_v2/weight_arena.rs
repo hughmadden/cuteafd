@@ -1,7 +1,7 @@
 //! Final MiMo operand requests, shared by packing and the header-only inventory.
 use super::resident::MimoResidentLayout;
 use crate::{plan::checkpoint::Checkpoint, serving_capacity::WeightArenaLayout};
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 #[derive(Debug)]
 pub struct MimoArenaLayouts {
@@ -36,6 +36,50 @@ impl MimoArenaLayouts {
             Some(WeightArenaLayout::new("mimo.mtp.rank0", mtp)?)
         } })
     }
+}
+
+/// The DFlash2 drafter's immutable destinations on head-split rank `rank` of
+/// `ranks`, named as the shared drafter `Load` names them (`a+b` row
+/// concatenations; FP8 `.payload`/`.scales` planes) plus the trained mask row.
+/// Rings, activations and FP8 packing staging stay outside.
+pub fn dflash_arena_requests(source: &super::draft_config::DflashConfig,
+    representation: super::draft_representation::MimoDraftRepresentation, rank: usize, ranks: usize)
+    -> Result<WeightArenaLayout> {
+    use super::draft_representation::MimoDraftRepresentation as D;
+    anyhow::ensure!(matches!(ranks, 1 | 2) && rank < ranks && matches!(representation, D::Bf16Only | D::Fp8Only),
+        "MiMo DFlash arena rank {rank}/{ranks} or representation {representation:?}");
+    let cfg = source.for_tp(ranks)?;
+    let h = cfg.hidden;
+    let mut requests = Vec::new();
+    let mut tensor = |name: String, bytes: usize| requests.push((name, bytes.max(256)));
+    let mut matrices = Vec::new();
+    // (parts, local rows, local cols): sharded rows/cols are already this rank's slice.
+    let mut matrix = |parts: Vec<String>, rows: usize, cols: usize| matrices.push((operand_key(parts), rows, cols));
+    matrix(vec!["fc.weight".into()], h, cfg.taps.len() * h);
+    tensor("hidden_norm.weight".into(), h * 2);
+    tensor("norm.weight".into(), h * 2);
+    for l in 0..cfg.layers {
+        let (p, a) = (format!("layers.{l}"), format!("layers.{l}.self_attn"));
+        tensor(format!("{p}.input_layernorm.weight"), h * 2);
+        tensor(format!("{p}.post_attention_layernorm.weight"), h * 2);
+        matrix(["q_proj", "k_proj", "v_proj"].map(|n| format!("{a}.{n}.weight")).to_vec(), cfg.qkv_width(), h);
+        tensor(format!("{a}.q_norm.weight"), cfg.head_dim * 2);
+        tensor(format!("{a}.k_norm.weight"), cfg.head_dim * 2);
+        if cfg.sinks { tensor(format!("{a}.attention_sink_bias"), cfg.heads * 2); }
+        matrix(vec![format!("{a}.o_proj.weight")], h, cfg.heads * cfg.head_dim);
+        matrix(["gate_proj", "up_proj"].map(|n| format!("{p}.mlp.{n}.weight")).to_vec(), 2 * cfg.intermediate, h);
+        matrix(vec![format!("{p}.mlp.down_proj.weight")], h, cfg.intermediate);
+    }
+    tensor("mask_embedding".into(), h * 2);
+    for (name, rows, cols) in matrices {
+        let payload = rows.checked_mul(cols).context("MiMo DFlash matrix extent overflow")?;
+        if representation == D::Bf16Only {
+            requests.push((name, (payload * 2).max(256)));
+        } else {
+            requests.extend([(format!("{name}.payload"), payload), (format!("{name}.scales"), payload / 128 * 4)]);
+        }
+    }
+    WeightArenaLayout::new(format!("mimo.dflash.rank{rank}"), requests)
 }
 
 fn final_key(checkpoint: &Checkpoint, name: &str) -> String {
@@ -224,6 +268,22 @@ mod tests {
                         requests.len(), requests.iter().sum::<u64>(), large.len(), large.iter().copied().sum::<u64>(),
                         rounding, bytes, layout.padding_bytes(), tail, rounding as i64 - (layout.padding_bytes() as u64 + tail) as i64);
                 }
+            }
+        }
+        // The bundled DFlash2 drafter (its own DraftLoad arena), BF16-only as shipped.
+        let draft = super::draft_config::DflashConfig::read(&snapshot.join("dflash"))?;
+        for ranks in [1, 2] {
+            for rank in 0..ranks {
+                let layout = dflash_arena_requests(&draft,
+                    super::draft_representation::MimoDraftRepresentation::Bf16Only, rank, ranks)?;
+                let requests = layout.views().values().map(|v| v.bytes() as u64).collect::<Vec<_>>();
+                let large = requests.iter().filter(|&&b| b > MIB).collect::<Vec<_>>();
+                let rounding = large.iter().map(|&&b| b.div_ceil(SM120_GRANULE) * SM120_GRANULE - b).sum::<u64>();
+                let bytes = layout.bytes() as u64;
+                let tail = if bytes > MIB { bytes.div_ceil(SM120_GRANULE) * SM120_GRANULE - bytes } else { 0 };
+                eprintln!("tp{ranks} rank{rank} dflash: before n={} sum={} large n={} sum={} sm120_rounding={} \
+                    | after arena={} padding={} tail={}", requests.len(), requests.iter().sum::<u64>(), large.len(),
+                    large.iter().copied().sum::<u64>(), rounding, bytes, layout.padding_bytes(), tail);
             }
         }
         Ok(())
