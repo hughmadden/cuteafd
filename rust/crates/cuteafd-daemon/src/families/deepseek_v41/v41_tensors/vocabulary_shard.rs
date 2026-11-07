@@ -101,7 +101,7 @@ impl<'a> VocabularyShard<'a> {
                     // The exact copy packs (and verifies) from the whole landed
                     // BF16 shard, which it then releases.
                     ensure!(!crate::shared::experts::rtx::dense::is_recording(), "the packed head loads through the mount");
-                    packed = Some(super::pack_packed(library, allocation, rows)?);
+                    packed = Some(super::pack_packed_in(library, allocation, rows, arena)?);
                     (None, None)
                 }
                 _ => {
@@ -117,6 +117,12 @@ impl<'a> VocabularyShard<'a> {
             fp8_bytes = fp8.as_ref().map_or(0, |w| w.bytes()), packed12_bytes = packed.as_ref().map_or(0, |h| h.bytes()),
             exceptions, row_exceptions, "V4.1 vocabulary residency");
         Ok(Self { allocation, device_id, tokens, fp8, packed })
+    }
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        if let Some(allocation) = &self.allocation { allocation.inventory(inventory, "head.bf16")?; }
+        if let Some(fp8) = &self.fp8 { fp8.inventory(inventory, "head.fp8")?; }
+        if let Some(packed) = &self.packed { packed.inventory(inventory, "head")?; }
+        Ok(())
     }
     pub fn resident_bytes(&self) -> usize {
         self.allocation.as_ref().map_or(0, |a| a.buffer.bytes)

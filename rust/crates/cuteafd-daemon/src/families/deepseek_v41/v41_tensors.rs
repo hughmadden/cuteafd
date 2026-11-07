@@ -233,9 +233,15 @@ fn pack_fp8_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, row
 /// destination, the source and the native module until process teardown.
 fn pack_packed<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize)
     -> Result<crate::shared::packed_head::PackedHead<'a>> {
+    pack_packed_in(library, weight, rows, None)
+}
+fn pack_packed_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize,
+    arena: Option<&DeviceWeightArena<'a>>) -> Result<crate::shared::packed_head::PackedHead<'a>> {
     ensure!(weight.buffer.bytes == rows * 10240, "packed head geometry differs from BF16");
     let stream = library.cuda_stream_create()?;
-    let packed = crate::shared::packed_head::PackedHead::pack(library, weight.buffer.ptr, rows, 5120, stream);
+    let device = Device { library, id: library.cuda_get_device()? };
+    let packed = crate::shared::packed_head::PackedHead::pack_with(library, weight.buffer.ptr, rows, 5120, stream,
+        |name, bytes| weight_allocation(device, arena, &format!("head.{name}"), bytes));
     if packed.is_err() && library.is_quarantined_after_failed_drain() {
         // The pack could not prove its reads of the source retired.
         std::mem::forget(weight);
@@ -337,6 +343,9 @@ mod head_site_tests {
     }
 }
 impl<'library> VocabularyHead<'library> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.shard.inventory(inventory)
+    }
     /// Peak load admission, including BF16 staging and FP8 destinations.
     pub fn plan(catalog: &OfficialV41Catalog) -> Result<usize> {
         VocabularyShard::load_bytes(catalog, 0..129280)
