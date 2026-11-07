@@ -711,7 +711,8 @@ def test_cleanup_foreign_root_refused(tmp_path, monkeypatch):
     root.mkdir(parents=True)
     (root / 'foreign').write_text('keep')
     script = cards.cleanup_script(dict(instance='test', slot='s'), 'task')
-    result = subprocess.run([sys.executable, '-c', script], env={**os.environ, 'HOME': str(home)}, text=True, capture_output=True)
+    prefix = 'import subprocess\nsubprocess.check_output=lambda cmd,**kw: ""\n'
+    result = subprocess.run([sys.executable, '-c', prefix + script], env={**os.environ, 'HOME': str(home)}, text=True, capture_output=True)
     assert result.returncode and 'refusing unowned' in result.stderr
     assert (root / 'foreign').exists()
 
