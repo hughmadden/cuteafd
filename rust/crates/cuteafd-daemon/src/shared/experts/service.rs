@@ -129,9 +129,13 @@ pub(crate) struct NativeExpertServiceConfig {
     bf16_ingress: bool,
 }
 
-fn admit_worker_peak(library: &NativeLibrary, load_peak: usize, serve_peak: usize) -> Result<()> {
+fn admit_worker_peak(library: &NativeLibrary, rank: usize, load_peak: usize, serve_peak: usize) -> Result<()> {
     let available = library.cuda_allocatable_memory_info()
         .context("query worker allocatable memory for admission")?.0;
+    tracing::info!(rank, available_bytes = available, load_peak_bytes = load_peak,
+        serve_peak_bytes = serve_peak, load_margin_bytes = available as i128 - load_peak as i128,
+        serve_margin_bytes = available as i128 - serve_peak as i128,
+        "Spark worker live admission margins");
     ensure!(load_peak <= available && serve_peak <= available,
         "Spark worker needs {load_peak} bytes at load / {serve_peak} at serve but only {available} bytes are available");
     Ok(())
@@ -205,7 +209,7 @@ fn load_weights<'a>(
     // GB10; explicit topologies also enforce the configured reservation below.
     let budget = spark_admission_budget(config, resident, staging, pinned_host,
         read_scratch, workspace)?;
-    admit_worker_peak(library, budget.load_peak, budget.serve_peak)?;
+    admit_worker_peak(library, config.rank, budget.load_peak, budget.serve_peak)?;
     if let Some(topology) = config.declared_world.ownership_topology() {
         ensure!(
             budget.load_peak <= config.device_budget
@@ -1005,6 +1009,8 @@ mod tests {
             prefill_lanes: 1, ..Default::default() };
         for rank in 0..6 {
             let mut config = config(6, rank, None);
+            assert!(config.declared_world.ownership_topology().is_none());
+            assert_eq!(config.declared_world, SparkWorld::canonical(6)?);
             config.capacity = 1024;
             config.device_budget = 110 << 30;
             set_model(&mut config, 1024, false, 1);
@@ -1026,6 +1032,10 @@ mod tests {
             assert_eq!(budget.headroom, 4096);
             assert_eq!(budget.load_peak, 118_005_436_416);
             assert_eq!(budget.serve_peak, 118_087_746_784);
+            assert!(budget.load_peak <= config.device_budget);
+            assert!(budget.serve_peak <= config.device_budget);
+            assert_eq!(config.device_budget - budget.load_peak, 106_164_224);
+            assert_eq!(config.device_budget - budget.serve_peak, 23_853_856);
             assert!(budget.load_peak as u64 <= coordinator);
             assert!(budget.serve_peak as u64 <= coordinator);
             assert!(coordinator <= config.device_budget as u64);
