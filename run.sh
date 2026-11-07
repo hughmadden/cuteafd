@@ -20,10 +20,6 @@ The CPU planner counts this workspace with plan --layout --full-prefill-logits.
 Unspecified Spark count makes all configured hosts available to the planner.
 SPARK_COUNT or SPARK_HOSTS bounds the available Sparks; the plan may use fewer,
 including 0, and refuses only when the requested deployment cannot fit.
-An optional expert-group topology is selected in the configuration with
-SPARK_TP and SPARK_EP (all-or-none, native checkpoint only); at SPARK_COUNT=3
-the explicit SPARK_TP=3 SPARK_EP=1 form is one unreplicated three-rank group.
-See docs/tp-ep-configuration.md.
 INSTANCE (configuration key, empty by default) names a launch that runs beside
 others on disjoint hardware: its coordinator container is
 cuteafd-coordinator-INSTANCE instead of the one shared cuteafd-coordinator, and

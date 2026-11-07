@@ -194,14 +194,7 @@ fn layout(hardware: &Hardware, settings: &[Setting]) -> String {
     }
     match hardware.sparks.len() {
         0 => parts.push("experts on the coordinator".into()),
-        n => {
-            let tp = setting(settings, &["spark-tp"]).and_then(|v| v.parse::<usize>().ok());
-            let ep = setting(settings, &["spark-ep"]).and_then(|v| v.parse::<usize>().ok());
-            parts.push(match (tp, ep) {
-                (Some(tp), Some(ep)) => format!("experts TP{tp}×EP{ep} over {n} Sparks"),
-                _ => format!("experts TP{n} over {n} Sparks"),
-            });
-        }
+        n => parts.push(format!("experts TP{n} over {n} Sparks")),
     }
     if let Some(placement) = context::mapped_placement() { parts.push(placement.label()); }
     parts.join(" · ")

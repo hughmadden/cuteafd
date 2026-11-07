@@ -222,12 +222,11 @@ impl Family for MiMo {
                         packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
                         python/tools/aot/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows), widest stored width {stored}, \
-                        {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
-                        that land on one EP group). The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
+                        {:.1} GiB per rank. The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
                         above 640 live rows, and its down projection quantizes the BF16 SwiGLU rows per K32 to \
                         MXFP8 for block-scaled MXFP8 x MXFP4 MMAs (FP8_EXPERT_PREFILL=w8a16 keeps BF16 down); \
                         smaller row counts use the grouped route.",
-                        widest - 32, per_rank(stored), per_rank(i / 2) / 3.0),
+                        widest - 32, per_rank(stored)),
                 })
             }
             Component::RoutedExpert => Some(Hint {

@@ -241,7 +241,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let sequences = usize::from(args.max_sequences);
     let spark = super::admission::spark_plan(placement, prefill, cutoff, sequences, args.peers.len())?;
     let admission_plan = crate::shared::placement::SparkAdmission::plan_view(&view,
-        cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
+        cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(),
         spark.model.clone(), None)?;
     let context = args.max_context.unwrap_or(cfg.max_position as u64);
     // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over

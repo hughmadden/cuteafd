@@ -36,16 +36,13 @@ if tool == 'docker':
         def value(flag, default=None):
             return args[args.index(flag) + 1] if flag in args else default
         ranks = int(value('--spark-ranks'))
-        tp, ep = int(value('--spark-tp', str(ranks))), int(value('--spark-ep', '1'))
-        explicit = '--spark-tp' in args or ranks == 3
         gpus = int(value('--rtx', '1'))
         print(json.dumps(dict(spark_expert_world=ranks,
             spark_roles=[dict(rank=i, experts=True, layers=[], encoder=None, audio_encoder=None, drafter=None) for i in range(ranks)], spark_ranks=ranks, prefill_unit_rows=rows or 1024,
             prefill_waves=1, prefill_span_rows=rows or 1024, prefill_reserve_rows=8192, decode_lanes=2,
             version=1, family='deepseek_v41', executable=True, wip_launchable=True,
             launch=dict(family='deepseek_v41'),
-            topology=dict(tp=tp, ep=ep,
-                  wire="native_ownership" if explicit else "canonical"),
+            topology=dict(tp=ranks),
             artifact_requirements=dict(spark_tp_role=None),
             speculator=value('--speculator', 'off'),
             admission=dict(kv_pool_size=value('--kv-pool-size'), memory_policy={}),
@@ -128,15 +125,12 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
         self.assertNotEqual(result.stdout.split('release identity: ')[1],
                             four.stdout.split('release identity: ')[1])
 
-    def test_native_tp3_preserves_implicit_and_explicit_topology(self):
-        for explicit in (False, True):
-            extra = ('--set', 'SPARK_TP=3', '--set', 'SPARK_EP=1') if explicit else ()
-            result, _ = self.launch(spark_count=3, extra=extra)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('Spark ranks: 3;', result.stdout)
-            fixed, _ = self.launch(spark_count=3,
-                                   extra=(*extra, '--set', 'RTX_EXPERT_LAYERS=20'))
-            self.assertEqual(fixed.returncode, 0, fixed.stderr)
+    def test_native_tp3_dry_run_reaches_three_ranks(self):
+        result, _ = self.launch(spark_count=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Spark ranks: 3;', result.stdout)
+        fixed, _ = self.launch(spark_count=3, extra=('--set', 'RTX_EXPERT_LAYERS=20'))
+        self.assertEqual(fixed.returncode, 0, fixed.stderr)
 
     def test_native_six_rank_preflight_reaches_every_host(self):
         result, calls = self.launch(spark_count=6)

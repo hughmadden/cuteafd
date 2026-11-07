@@ -255,9 +255,7 @@ expert_capacity=4096
 fingerprint=fp
 spark_first_layer=0
 SPARK_COUNT=2
-topology_explicit=explicit
 spark_tp=2
-spark_ep=2
 wip_slot=
 encoder_rank=-1
 spark_expert_world=2
@@ -333,7 +331,7 @@ class TestRunShLifecycle:
     def test_transport_is_resolved_after_validation_and_before_any_host(self):
         text = run_text()
         configure = text.index("release_configure_ssh_transport")
-        assert configure > text.index("release_validate_spark_topology"), (
+        assert configure > text.index("release_validate_tp2_options"), (
             "resolving the transport before configuration validation would report a"
             " transport error in place of a bad config value"
         )
@@ -423,7 +421,7 @@ class TestRunShLifecycle:
 
     def test_launch_passes_its_contract_positionally(self, tmp_path):
         """The worker argument contract is positional: an option set change must
-        not shift a single one of the twenty values the remote script decodes."""
+        not shift a single one of the seventeen values the remote script decodes."""
         result, invocations = self._run(tmp_path, _slice("expert-launch"))
         assert result.returncode == 0, result.stderr
         call = invocations[0]
@@ -431,7 +429,7 @@ class TestRunShLifecycle:
         assert payload == [
             "cuteafd-spark-expert:v10", "cuteafd-spark-expert-seed0-19441", "0",
             "107374182400", "19441", "hub/models--x--M/snapshots/rev",
-            "fp", "2", "explicit", "2", "2", "", "", "info", "__none__",
+            "fp", "2", "", "", "info", "__none__",
             "-1", "19541", "", "revision", "1",
             # Docker options follow the positionals behind one sentinel.
             "--profile-args", "-e", "CUTEAFD_FP8_EXPERT_PREFILL=auto", "-e", "CUTEAFD_THERMAL=on",
@@ -445,9 +443,9 @@ class TestRunShLifecycle:
         )
         assert result.returncode == 0, result.stderr
         payload = _remote_payload(invocations[0])
-        assert payload[11:13] == ["/dev/infiniband", ""], payload
-        assert payload[13:15] == ["info", "__none__"], payload
-        assert payload.index("--profile-args") == 20, payload
+        assert payload[8:10] == ["/dev/infiniband", ""], payload
+        assert payload[10:12] == ["info", "__none__"], payload
+        assert payload.index("--profile-args") == 17, payload
 
 
 

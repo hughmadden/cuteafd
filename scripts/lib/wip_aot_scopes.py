@@ -170,7 +170,7 @@ def family_scopes(cards, config_reader):
             if tag == 'dsv4p' and expert_format(family, values) == 'exl3':
                 scopes.add(tag + ':exl3-k23')
         if family == 'kimi_k3':
-            tp = int(values.get('SPARK_TP', count))
+            tp = count
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             scopes.add('kimik3:exl3-k23')
             if count:
@@ -183,14 +183,14 @@ def family_scopes(cards, config_reader):
             if values.get('AUDIO', 'auto') != 'off':
                 env['CUTEAFD_WIP_AUDIO_AOT'] = 'ON'
             if count:
-                counts.add(f"muse={int(values.get('SPARK_TP', count))}")
+                counts.add(f"muse={count}")
         if family == 'mistral_large4':
             # The GLM engine's ml4 variant: its own coordinator programs and K6
             # core (ML4_AOT), EXL3 K4/K5 experts at the card's Spark TP.
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             scopes.add('ml4:exl3-k45')
             if count:
-                counts.add(f"ml4={int(values.get('SPARK_TP', count))}")
+                counts.add(f"ml4={count}")
         # EXLR8 checkpoints retain family coordinator programs without expert packages.
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
@@ -205,7 +205,7 @@ def family_scopes(cards, config_reader):
                     continue
                 fmt = expert_format(family, values)
                 if count and fam != 'step5':
-                    counts.add(f"{tag}={int(values.get('SPARK_TP', count))}")
+                    counts.add(f"{tag}={count}")
                 # Qwen's FP8 package has no Spark TP layout (intermediate 640): request the NVFP4 family,
                 # which CMake expands to nvfp4, nvfp4a4 and, on the coordinator only, the FP8 MTP sibling
                 # (fp8_moe.cmake), as the release image ships them.
@@ -215,7 +215,7 @@ def family_scopes(cards, config_reader):
                     # the K6 core and K4 MTP run the shared dense trellis programs.
                     scopes.add('step5:exl3-k46')
                     if count:
-                        counts.add(f"step5:exl3={int(values.get('SPARK_TP', count))}")
+                        counts.add(f"step5:exl3={count}")
                     card_scopes, scopes = scopes, scopes_before | scopes
                     if count:
                         spark_scopes |= card_scopes
@@ -226,7 +226,7 @@ def family_scopes(cards, config_reader):
                     # Format keys keep the min/max card TP layouts independent.
                     scopes.add('step5:bf16')
                     if count:
-                        counts.update(f"{scope}={int(values.get('SPARK_TP', count))}" for scope in scopes)
+                        counts.update(f"{scope}={count}" for scope in scopes)
                 if fam == 'glm5_flash' and nvfp4:
                     scopes.add('glmfdense:nvfp4')
                 if fmt == 'exl3':
@@ -285,17 +285,10 @@ def config_scopes(values):
     # stays narrow, as on cards; the launcher chooses placement at run time.
     if resolved.get('RTX_GPUS') == 'auto':
         resolved['RTX_GPUS'] = '2'
-    if not resolved.get('SPARK_TP'):
-        resolved.pop('SPARK_TP', None)
     if 'SPARK_COUNT' not in resolved:
         resolved['SPARK_COUNT'] = str(sum(bool(values.get(f'SPARK_{i}_HOST')) for i in range(8)))
     card = dict(family=family, name='', config=None)
     scopes = family_scopes([card], lambda _: resolved)
-    # Direct configs name their Spark TP explicitly (TP2xEP3 on six Sparks is
-    # the tp2 role, not tp6); cards keep the Spark-count role.
-    spark_tp = resolved.get('SPARK_TP', '')
-    if family == 'deepseek_v41' and scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] and spark_tp != '4' and spark_tp in {str(tp) for tp in native_spark_artifacts('v41')}:
-        scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] = 'tp' + spark_tp
     if family in ('glm5', 'glm5_flash'):
         scopes['CUTEAFD_WIP_CONTEXT_SPLIT_AOT'] = 'ON'
     return family, scopes

@@ -186,7 +186,6 @@ impl<'a> Weights<'a> {
                 modules.exlr8()?, weights, config, remaining)?),
             Self::Full(weights) => {
                 let mut execution = ExpertWeights::execution_layers(weights, compiled, config.capacity, remaining)?;
-                execution.install_native_group(config.native_group()?)?;
                 execution.install_worker_timing(config.rank)?;
                 Execution::Full(execution)
             }

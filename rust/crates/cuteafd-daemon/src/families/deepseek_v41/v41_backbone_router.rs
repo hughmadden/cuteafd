@@ -949,7 +949,7 @@ impl Drop for BackboneRouterWave<'_, '_> {
 }
 
 /// The next native expert request id (one process-wide sequence, so every
-/// remote request is distinct and the replicated planner's seed reproduces).
+/// remote request is distinct).
 fn next_request_id() -> Result<u64> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1015,11 +1015,7 @@ impl RouterOutput<'_> {
     /// The worker-side builder of this layer's Spark request: the same request
     /// request bytes (one request id per
     /// call, taken now, in issue order), from the staged routes and wire rows.
-    /// `encode` (replicated TP x EP lanes) rewrites the route words on the
-    /// worker, in the same order requests are issued.
-    pub fn request_builder(&self, placement: u64, rows: &[ExpertRow],
-        encode: Option<std::sync::Arc<std::sync::Mutex<
-            crate::families::deepseek_v41::v41_experts::coordinator::ReplicatedGroupPlanner>>>)
+    pub fn request_builder(&self, placement: u64, rows: &[ExpertRow])
         -> Result<(QueryBinding, crate::shared::spark_waves::BuildRequest)> {
         use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor};
         let binding = self.validate_request_rows(rows)?;
@@ -1035,10 +1031,6 @@ impl RouterOutput<'_> {
                 descriptors, routes, wire)?;
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             cuteafd_transport::expert::BackboneRequest::validate_owned(&request, count)?;
-            if let Some(planner) = encode {
-                planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?
-                    .encode(&mut request)?;
-            }
             Ok(request)
         })))
     }

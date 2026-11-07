@@ -2,7 +2,7 @@
 use anyhow::{ensure, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
 use cuteafd_loader::formats::fp8_experts::ExpertFormat;
-use cuteafd_transport::{expert::{SparkTopology, SparkWorld}, worker_selection::ModelAdmission,
+use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission,
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertV2Dtype, ExpertV2SourceKind, TcpTransportConfig,
     protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
@@ -10,28 +10,6 @@ use crate::shared::{memory::{DeviceAllocation, LoadStream}, placement::{spark_ri
     spark_intake::SparkLink};
 use super::tp_reference::{error, expert, outputs, reference, route_weight, wire_input};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
-use crate::families::deepseek_v41::v41_experts::coordinator::ReplicatedGroupPlanner;
-
-struct GateRequests {
-    native: Option<ReplicatedGroupPlanner>,
-}
-
-impl GateRequests {
-    fn new(world: SparkWorld) -> Result<Self> {
-        Ok(Self { native: world.ownership_topology().map(ReplicatedGroupPlanner::new).transpose()? })
-    }
-
-    fn build(&mut self, geometry: ExpertGeometry, layer: usize, rows: usize, dtype: ExpertV2Dtype)
-        -> Result<ExpertProtocolV2Request> {
-        let mut request = request(geometry, layer, rows, dtype)?;
-        if let Some(native) = &mut self.native {
-            // Use the serving wave's ownership planner, not just its request flag.
-            native.encode(&mut request)?;
-        }
-        Ok(request)
-    }
-}
-
 fn checkpoint_ingress(snapshot: &std::path::Path) -> Result<(SparkIngress, ExpertV2Dtype)> {
     let checkpoint = cuteafd_loader::plan::Checkpoint::inventory(snapshot)?;
     Ok(if checkpoint.spark_input_is_bf16() {
@@ -95,37 +73,24 @@ fn validate_source(catalog: &cuteafd_loader::OfficialV41Catalog, family: &str, f
 }
 
 fn checkpoint_world(catalog: &cuteafd_loader::OfficialV41Catalog, ranks: usize) -> Result<SparkWorld> {
-    let native = catalog.exl3().is_none() && catalog.fp8().is_none();
-    let topology = if native && ranks != 4 {
-        Some(SparkTopology::new(u8::try_from(ranks)?, 1)?)
-    } else {
-        None
-    };
-    let world = crate::shared::spark_topology::world(topology, ranks)?;
+    let world = crate::shared::spark_topology::world(ranks)?;
     crate::shared::spark_topology::require_wire(world, catalog)?;
     Ok(world)
 }
 
 #[test]
-fn checkpoint_world_preserves_generic_wire_and_native_tp6_ownership() -> Result<()> {
+fn checkpoint_worlds_are_canonical_for_every_format() -> Result<()> {
     use cuteafd_loader::plan::testing as fixture;
     let root = tempfile::tempdir()?;
     fixture::write_v41_snapshot(root.path());
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-    assert_eq!(checkpoint_world(&catalog, 4)?, SparkWorld::canonical(4)?);
-    assert_eq!(checkpoint_world(&catalog, 6)?, SparkWorld::owned(SparkTopology::NATIVE_TP6_EP1)?);
+    for ranks in [3, 4, 6] {
+        assert_eq!(checkpoint_world(&catalog, ranks)?, SparkWorld::canonical(ranks)?);
+    }
     let root = tempfile::tempdir()?;
     fixture::write_v4_pro_exl3_snapshot(root.path());
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
     assert_eq!(checkpoint_world(&catalog, 3)?, SparkWorld::canonical(3)?);
-    let root = tempfile::tempdir()?;
-    let mut config = fixture::glm5_config();
-    config["quantization_config"] = fixture::exl3_compact(4);
-    let tensors = fixture::glm5_tensors(|name, n, k| (0..256).flat_map(|expert|
-        fixture::exl3(&name.replace(".experts.0.", &format!(".experts.{expert}.")), n, k, 4)).collect());
-    fixture::write_snapshot(root.path(), &config, &tensors, None);
-    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-    assert_eq!(checkpoint_world(&catalog, 6)?, SparkWorld::canonical(6)?);
     Ok(())
 }
 
@@ -153,50 +118,6 @@ fn requests_use_checkpoint_geometry_and_two_repeated_oracle_rows() -> Result<()>
     Ok(())
 }
 
-#[test]
-fn native_requests_use_serving_ownership_and_generic_requests_stay_identical() -> Result<()> {
-    use cuteafd_transport::expert::{BackboneRequest, V41NativeOwnerRouteWord,
-        V41_NATIVE_GROUP_REQUEST_FLAG};
-    let geometry = ExpertGeometry::DEEPSEEK_V41;
-    let dtype = ExpertV2Dtype::Fp8E4m3Ue8m0K32;
-    for ranks in [2, 3, 4, 6] {
-        let topology = SparkTopology::new(ranks, 1)?;
-        let mut requests = GateRequests::new(SparkWorld::owned(topology)?)?;
-        let mut serving = ReplicatedGroupPlanner::new(topology)?;
-        for layer in 3..9 {
-            for rows in [1, 16] {
-                let canonical = request(geometry, layer, rows, dtype)?;
-                let mut expected = canonical.clone();
-                serving.encode(&mut expected)?;
-                let actual = requests.build(geometry, layer, rows, dtype)?;
-                assert_eq!(actual, expected);
-                BackboneRequest::validate_owned_native_group(&actual, 16, topology)?;
-                assert_ne!(actual.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG, 0);
-                assert_eq!(actual.hidden_payload, canonical.hidden_payload);
-                assert_eq!(actual.rows, canonical.rows);
-                for (encoded, original) in actual.routes.iter().zip(&canonical.routes) {
-                    let owner = V41NativeOwnerRouteWord::decode(encoded.expert_id, 1)?;
-                    assert_eq!(owner.owner, 0);
-                    assert_eq!(owner.expert_id, original.expert_id);
-                    assert_eq!(encoded.gate_weight.to_bits(), original.gate_weight.to_bits());
-                    assert_eq!(encoded.row_index, original.row_index);
-                }
-            }
-        }
-    }
-    // EXL3 GLM and native-format MiMo use generic wire even at uneven worlds.
-    for geometry in [ExpertGeometry::GLM5, ExpertGeometry::MIMO_V2_FLASH] {
-        for ranks in [2, 3, 4, 6] {
-            let mut requests = GateRequests::new(SparkWorld::canonical(ranks)?)?;
-            for rows in [1, 16] {
-                let actual = requests.build(geometry, 3, rows, dtype)?;
-                assert_eq!(actual, request(geometry, 3, rows, dtype)?);
-                assert_eq!(actual.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG, 0);
-            }
-        }
-    }
-    Ok(())
-}
 
 #[test]
 fn compact_partial_planes_use_bf16_rows_independently_of_ingress_and_topk() -> Result<()> {
@@ -263,7 +184,6 @@ fn native_tp_rank_sum() -> Result<()> {
     let (ingress, dtype) = checkpoint_ingress(&snapshot)?;
     let output_row_bytes = partial_row_bytes(geometry)?;
     let spark_world = checkpoint_world(&catalog, world)?;
-    let mut requests = GateRequests::new(spark_world)?;
     cuteafd_core::set_expert_geometry(geometry)
         .map_err(|_| anyhow::anyhow!("rank-sum process already selected another expert geometry"))?;
     ensure!(layers.iter().all(|&l| l >= catalog.routed_experts().first_layer && l < geometry.layers as usize),
@@ -277,7 +197,7 @@ fn native_tp_rank_sum() -> Result<()> {
     let config = TcpTransportConfig::default();
     SparkAdmission::plan_view(&view, geometry, Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
-            spark_ranks: world, prefill_lanes: 1 }, world, spark_world.ownership_topology(),
+            spark_ranks: world, prefill_lanes: 1 }, world,
         ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: 16, ingress, partial_reply_bytes: None }],
             spark_rings(config.max_frame_bytes)?, gate_executions(&catalog, 16)?)?, None)?.select(&peers)?;
     let h = geometry.hidden as usize;
@@ -288,12 +208,12 @@ fn native_tp_rank_sum() -> Result<()> {
     let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, output_row_bytes)?;
     link.enable_terminal_ownership(library.clone())?;
     let result = (|| -> Result<()> {
-        link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&requests.build(geometry, layers[0], 16, dtype)?)?)?;
+        link.bootstrap(&cuteafd_transport::SparkSessionShape::from_request(&request(geometry, layers[0], 16, dtype)?)?)?;
         let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
         let mut metrics = Vec::new();
         for &layer in &layers {
             for rows in [1, 16] {
-                let request = requests.build(geometry, layer, rows, dtype)?;
+                let request = request(geometry, layer, rows, dtype)?;
                 let exchange = link.exchange()?;
                 let payload_bytes = exchange.compact_payload(request.header.row_count as usize);
                 let wave = exchange.send_request(request, payload_bytes)?;

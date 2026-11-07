@@ -1,6 +1,5 @@
 """CPU regressions for Hugh Madden's fused-QKV scale finding (issue #3)."""
 import ast
-import importlib.util
 import json
 import os
 import struct
@@ -12,10 +11,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 REFERENCE = ROOT / "python/reference/families/mimo_v2/mimo_v26/golden.py"
-BF16_HELPER = ROOT / "python/tools/qualify/deepseek_v41/qualify_v41_tie_seed_replay.py"
-spec = importlib.util.spec_from_file_location("qkv_bf16_oracle", BF16_HELPER)
-bf16_oracle = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(bf16_oracle)
+
+
+def float2bfloat16_rn(x: np.ndarray) -> np.ndarray:
+    """Round float32 to BF16 (round-to-nearest-even), returned as float32."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    if not np.isfinite(x).all():
+        raise ValueError("non-finite value rejected before BF16 conversion")
+    bits = x.view(np.uint32)
+    rounded = (bits + np.uint32(0x7FFF) + ((bits >> 16) & np.uint32(1))) & np.uint32(0xFFFF0000)
+    return rounded.view(np.float32)
 
 
 class Tensor(np.ndarray):
@@ -25,7 +30,7 @@ class Tensor(np.ndarray):
         return self.astype(np.float32).view(Tensor)
 
     def bfloat16(self):
-        return bf16_oracle.float2bfloat16_rn(self).view(Tensor)
+        return float2bfloat16_rn(self).view(Tensor)
 
     def repeat_interleave(self, repeats, dim):
         return np.repeat(self, repeats, axis=dim).view(Tensor)

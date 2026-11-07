@@ -292,8 +292,6 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             "EXLR8 file manifests and fetching are not supported");
         if args.layout {
             use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
-            anyhow::ensure!(args.spark_tp.is_none() && args.spark_ep.is_none(),
-                "EXLR8 requires canonical Spark wire, not explicit ownership topology");
             let cfg = launch_config(args.config.as_deref())?;
             let family = cuteafd_loader::plan::exlr8::architecture(&view.config()?)?;
             let mut native_options = options.clone();
@@ -303,7 +301,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
                 args.exlr8_manifest.as_deref().context("EXLR8 native layout requires --exlr8-manifest up1|bit325")?,
                 &native_options, &args.speculator)?;
             if args.deployment {
-                let deployment = DeploymentOptions { rtx_gpus: args.rtx, spark_tp: None, spark_ep: None,
+                let deployment = DeploymentOptions { rtx_gpus: args.rtx,
                     peers: args.deployment_peers.clone(), speculator: args.speculator.clone(),
                     admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
                         pool_tokens: args.pool_tokens, memory_policy: args.memory.policy() } };
@@ -464,8 +462,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if args.deployment {
         use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
         let deployment = DeploymentOptions {
-            rtx_gpus: args.rtx, spark_tp: args.spark_tp.map(usize::from),
-            spark_ep: args.spark_ep.map(usize::from), peers: args.deployment_peers.clone(),
+            rtx_gpus: args.rtx, peers: args.deployment_peers.clone(),
             speculator: args.speculator.clone(),
             admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
                 pool_tokens: args.pool_tokens, memory_policy: args.memory.policy() },
@@ -1218,7 +1215,7 @@ mod tests {
             coordinator_weight_budget_gib: 80.0,
             memory: crate::cli::MemoryArgs { spark_memory_cap: Some(100 << 30), ..Default::default() },
             json: true,
-            deployment: false, spark_tp: None, spark_ep: None, deployment_peers: vec![],
+            deployment: false, deployment_peers: vec![],
             kv_pool_size: None,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,

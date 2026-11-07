@@ -1561,7 +1561,7 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
         'RTX_GPUS': '1', 'COORDINATOR_GPUS': '0',
         'GPU_MEMORY_CAP': '31.8GiB', 'SPARK_INTAKE': 'pinned',
         'MAX_CONTEXT_TOKENS': '1048576',
-        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
+        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4',
     }
     assert {key: values[key] for key in expected} == expected
     # The prefill reserve is the planner's (TJ 2026-10-27): no row pin.
@@ -1879,7 +1879,7 @@ def _slot_with_roles(roles, verified=True, nvfp4=(), error=None):
     ([], False, 'TP manifest hash mismatch', 'cannot attest Spark TP role tp3: TP manifest hash mismatch'),
 ])
 def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, monkeypatch, roles, verified, error, message):
-    """#98: the card-derived Spark TP (v41-flash-min: SPARK_TP=3) must be attested by
+    """#98: the card-derived Spark TP (v41-flash-min: three Sparks, TP3) must be attested by
     every rank's slot before enqueue, as the launcher refuses it at launch."""
     gate = ROOT / 'scripts/bench/kits/gate'
     argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s',
@@ -1916,12 +1916,11 @@ def test_attested_spark_tp_roles_are_checked_again_at_grant(tmp_path, monkeypatc
 
 @pytest.mark.parametrize('keys,role', [
     ({'SPARK_COUNT': '4'}, None),
-    ({'SPARK_COUNT': '3', 'SPARK_TP': '3', 'SPARK_EP': '1'}, 'tp3'),
-    ({'SPARK_COUNT': '6', 'SPARK_TP': '6', 'SPARK_EP': '1'}, 'tp6'),
-    ({'SPARK_COUNT': '4', 'SPARK_TP': '2', 'SPARK_EP': '2'}, 'tp2'),
-    ({'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1'}, None),
     # A native count other than 4 is TP=count at launch.
+    ({'SPARK_COUNT': '3'}, 'tp3'),
+    ({'SPARK_COUNT': '5'}, 'tp5'),
     ({'SPARK_COUNT': '6'}, 'tp6'),
+    ({'SPARK_COUNT': '8'}, 'tp8'),
     ({'SPARK_COUNT': '2', 'EXPERT_FORMAT': 'exl3'}, None),
     ({'SPARK_COUNT': '0'}, None),
 ])
@@ -3338,3 +3337,19 @@ def test_release_preflight_verifies_exact_packages_without_gpu(entry, tmp_path, 
     with pytest.raises(ValueError, match='missing Spark package tp5-compact-rank4/m1'):
         cards.preflight_job(job, dict(release='v4.1.2'))
     assert len(commands) == 1
+
+
+@pytest.mark.parametrize('attested,refused', [([], True), (['tp3', 'tp6'], True), (['tp7'], False)])
+def test_unequal_v41_world_needs_its_own_attested_role(attested, refused):
+    """A V4.1 TP7 card (adjacent-width packages) is refused before enqueue unless
+    every rank's slot attests tp7 itself; another world's role never stands in."""
+    card = dict(name='v', family='deepseek_v41', config='', set={'SPARK_COUNT': '7'}, sparks=[])
+    assert cards.v41_tp_role(card, {'SPARK_COUNT': '7'})['tp_role'] == 'tp7'
+    problems = cards.tp_role_problems('kiwi', 's', 'tp7', False,
+        dict(tp_roles=dict(roles=attested, verified=True, nvfp4=[], error=None)))
+    assert bool(problems) == refused, problems
+    if refused:
+        assert 'not tp7' in problems[0] and 'CUTEAFD_WIP_SPARK_TP_ROLES=tp7' in problems[0]
+    # A slot with no role manifest at all is refused too (the #1105 shape).
+    missing = cards.tp_role_problems('kiwi', 's', 'tp7', False, dict(tp_roles=None))
+    assert missing and 'has no V41_EXPERT_TP_AOT.json' in missing[0]

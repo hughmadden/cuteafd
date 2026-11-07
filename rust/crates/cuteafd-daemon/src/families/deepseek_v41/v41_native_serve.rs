@@ -176,12 +176,6 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
     }
-    crate::shared::spark_topology::resolve(
-        args.spark_tp,
-        args.spark_ep,
-        args.peers.len(),
-        "serve-native",
-    )?;
     ensure!(args.peers.len() <= 8,
         "V4.1 Spark transport supports at most eight peers, got {}", args.peers.len());
     args.host_cache_config()?;
@@ -444,12 +438,6 @@ fn worker(
     cuteafd_bench::context::set_family(catalog.config().family_id());
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v41",
         if args.dspark { "dspark" } else { "off" }))?;
-    let topology = crate::shared::spark_topology::resolve(
-        args.spark_tp,
-        args.spark_ep,
-        args.peers.len(),
-        "serve-native",
-    )?;
 
     // Two private decode lanes at decode width, and `slots` prefill slots on
     // one shared storage set (PLAN "Prefill contract").
@@ -471,7 +459,7 @@ fn worker(
     let remote_experts = pool.placement.onboard_layers < catalog.routed_experts().layers;
     let expert_world = if remote_experts { args.peers.len() } else { 0 };
     let spark_world = if remote_experts {
-        let world = crate::shared::spark_topology::world(topology, expert_world)?;
+        let world = crate::shared::spark_topology::world(expert_world)?;
         crate::shared::spark_topology::require_world(world, &catalog,
             &(pool.placement.onboard_layers..catalog.routed_experts().layers).collect::<Vec<_>>())?;
         lib.v41_compact_reducer()?.require_rank_count(world.topology().world_size() as u32)?;
@@ -609,8 +597,7 @@ fn worker(
         args.concurrency)?;
     admission::startup_phase(&lib, "v41/workspace:prefill-slots", device_total)?;
     let protocol_v2_timing = protocol_v2_timing();
-    // Every replicated layout reserves its exact physical rank plane count; the
-    // legacy 4-rank forecast is no longer reused for six ranks.
+    // Every Spark world reserves its exact physical rank plane count.
     // Decode lanes' links at their own width (P3); the prefill link below at the unit.
     let lanes = crate::shared::serve::lanes::LaneSet::default();
     let [mut transport, mut second_transport] = lanes.try_map(|lane| match spark_world {
@@ -717,7 +704,7 @@ fn worker(
         per_slot * slots + per_decode * 2 + budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0)
     } else { 0 };
     ensure!(expected as u64 <= admitted_experts.peak_bytes, "runtime local owners exceed shared admission");
-    let spark_plan = admission::plan_sparks(&args, &catalog, local_layers, capacity, topology)?;
+    let spark_plan = admission::plan_sparks(&args, &catalog, local_layers, capacity)?;
     let coordinator = push_policy.plan(|| {
         ensure!(spark_plan.as_ref().is_none_or(|spark| spark.coordinator_pushes()),
             "V4.1 Spark admission did not select required push");
@@ -779,7 +766,6 @@ fn worker(
     crate::shared::memory_report::release_load_staging(&lib)?;
     tracing::info!(rtx_layers=local_layers, first_remote_dispatch_layer=local_layers,
         remote_dispatch_layers=40-local_layers, spark_world=expert_world,
-        spark_topology=?topology.map(|t| (t.tp(), t.ep())),
         device_occupied_bytes=occupied, device_budget_bytes=?pool.reservation_bytes,
         "native serving residency ready");
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }

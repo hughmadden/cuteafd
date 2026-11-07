@@ -61,8 +61,7 @@ pub(super) fn geometry(local: impl Fn(usize) -> bool, slice_bytes: impl Fn(usize
 /// Geometry of the installed placement: resource class and per-device expert
 /// bytes of every layer.
 pub(super) fn placement(transport: &NativeTp4Wave<'_>, nvfp4: bool, draft_width: usize) -> Result<PolicyGeometry> {
-    let remote_tp = transport.native_topology()
-        .map_or(transport.spark_world(), |topology| topology.tp() as usize);
+    let remote_tp = transport.spark_world();
     ensure!(remote_tp > 0, "Spark tensor-parallel width is zero");
     Ok(geometry(|layer| transport.has_local_layer(layer), |layer| {
         let tp = if transport.has_tp2_layer(layer) { 2 }

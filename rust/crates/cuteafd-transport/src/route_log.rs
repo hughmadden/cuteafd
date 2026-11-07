@@ -51,10 +51,6 @@ pub const ROW_DETAIL_LIMIT: usize = 64;
 /// Rows of one input sample (a wider wave contributes its first rows).
 pub const SAMPLE_ROWS: usize = 64;
 const DEFAULT_SAMPLE_STEPS: u64 = 64;
-/// V4.1 native group requests pack the owner rank above bit 9 of the expert
-/// id; only those requests are masked. Other families keep full ids (Kimi K3
-/// has 896 experts).
-const NATIVE_GROUP_ID_MASK: u32 = 511;
 
 /// The route log's settings, from the environment once per process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,16 +121,11 @@ pub struct StepContext {
 }
 
 impl Wave {
-    /// The wave's routes, read from `request` (owner bits of native group
-    /// requests are masked off); `weights` keeps narrow waves' gate weights.
+    /// The wave's routes, read from `request`; `weights` keeps narrow waves'
+    /// gate weights.
     pub fn from_request(request: &ExpertProtocolV2Request, transport: u64, pass: u64, ranks: usize,
         step: Option<StepContext>, weights: bool) -> Self {
-        let mask = if request.header.flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
-            NATIVE_GROUP_ID_MASK
-        } else {
-            u32::MAX
-        };
-        let ids = request.routes.iter().map(|r| r.expert_id & mask).collect();
+        let ids = request.routes.iter().map(|r| r.expert_id).collect();
         let routes = if request.rows.len() <= ROW_DETAIL_LIMIT {
             let topk = request.rows.first().map_or(0, |r| r.route_count as usize);
             let uniform = request.rows.iter().enumerate()
@@ -540,16 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_bits_are_masked_off() {
-        let mut request = request(1, 2, 4, ExpertV2SourceKind::Decode);
-        request.header.flags |= crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG;
-        request.routes[0].expert_id = 383 | (1 << 10);
-        let wave = Wave::from_request(&request, 0, 0, 4, None, false);
-        assert_eq!(encoded(&wave)["topk"][0][0], 383);
-    }
-
-    #[test]
-    fn ids_above_511_are_kept_outside_native_group_requests() {
+    fn ids_above_511_are_kept() {
         // Kimi K3 routes to 896 experts; ids 512..895 must not alias.
         let mut narrow = request(1, 2, 4, ExpertV2SourceKind::Decode);
         narrow.routes[0].expert_id = 895;

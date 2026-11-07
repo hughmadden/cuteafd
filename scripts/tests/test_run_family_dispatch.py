@@ -1091,9 +1091,6 @@ if "--compact-attention" in args:
 described = subprocess.check_output([sys.executable, os.environ["STUB_FAMILY_READER"], config_path], text=True).split()
 family, _, first, last = described
 ranks = int(os.environ["STUB_PREFERRED_RANKS"] if os.environ["STUB_FORCE_PREFERRED"] else value("--spark-ranks", os.environ["STUB_PREFERRED_RANKS"]))
-tp = int(value("--spark-tp", str(ranks)))
-ep = int(value("--spark-ep", "1"))
-explicit = "--spark-tp" in args or family == "deepseek_v41" and ranks not in (0, 4)
 peers = value("--deployment-peers", "").split(",")[:ranks] if ranks else []
 report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
@@ -1144,8 +1141,7 @@ if family == "glm5_flash":
 deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio_encoder"),
     encoder_plan_hash=report.get("encoder_plan_hash", "ab" * 32), spark_expert_world=expert_world,
     replay_records=report.get("replay_records"), spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
-    topology=dict(tp=expert_world, ep=ep,
-                  wire="native_ownership" if explicit and expert_world else "canonical"), peers=peers,
+    topology=dict(tp=expert_world), peers=peers,
     speculator=("mtp" if expert_world == 0 and config.get("text_config", config).get("mtp_num_hidden_layers") == 1
         and (config.get("quantization_config", {}).get("quant_method") == "exl3"
              or config.get("quantization_config", {}).get("quant_method") == "modelopt"
@@ -1154,7 +1150,7 @@ deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_policy={}),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
-    artifact_requirements=dict(spark_tp_role=f"tp{expert_world}" if family == "deepseek_v41" and explicit and expert_world not in (0, 4) else None), report=report,
+    artifact_requirements=dict(spark_tp_role=f"tp{expert_world}" if family == "deepseek_v41" and expert_world not in (0, 4) else None), report=report,
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
                                                                  dict(category="kv", bytes=64 << 30)]) for i in range(gpus)] +
                                [dict(kind="spark", index=role["rank"], capacity_bytes=spark_capacity, worker_budget_bytes=spark_capacity, items=[]) for role in roles]))
@@ -1406,7 +1402,7 @@ def capture_v41_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/v41-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
         extra_args=("--wip", "real-planner-test"), extra_env={
-            "STUB_SPARK_ROLES": f"tp{config.get('SPARK_TP', config['SPARK_COUNT'])}",
+            "STUB_SPARK_ROLES": f"tp{config['SPARK_COUNT']}",
             "STUB_SERVED_MODEL_ID": "test/v41-real-plan",
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
             "STUB_REAL_PROGRAMS": str(programs), "STUB_REAL_HF_HOME": str(hf_home),
@@ -1731,7 +1727,7 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
     keys += "".join(f"SPARK_{rank}_HOST=worker-{rank}\nSPARK_{rank}_LANE_A=192.0.2.{rank + 1}\n"
                     for rank in range(8))
     if family == "deepseek_v41":
-        keys += "SPARK_TP=8\nSPARK_EP=1\nSPARKINFER_EXL3=disable\nRTX_EXPERT_LAYERS=auto\n"
+        keys += "SPARKINFER_EXL3=disable\nRTX_EXPERT_LAYERS=auto\n"
     model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/eight-rank"
     result = _family_launch_result(temporary, config, model, keys,
         physical_gpus=tuple(range(deployment["rtx_gpus"])), root_launcher=True,
@@ -3914,8 +3910,7 @@ def test_memory_keys_are_accepted_for_cleanup_and_native_launchers(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout.split() == ["--gpu-memory-cap", "32GiB", "--spark-reserve", "3GiB",
                                      "--kv-max-tokens", "4194304"]
-    for file in ("scripts/launch/run-family.sh", "scripts/launch/run-tp-ep-native-candidate.sh"):
-        assert "release_memory_args" in (ROOT / file).read_text()
+    assert "release_memory_args" in (ROOT / "scripts/launch/run-family.sh").read_text()
 
 
 @pytest.mark.parametrize("keys,expected", [

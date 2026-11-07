@@ -61,15 +61,13 @@ pub(crate) enum ExpertLayer {
     Backbone { layer: usize, rank: usize },
     BackboneFull { layer: usize },
     BackboneTp2 { layer: usize, rank: usize },
-    /// Explicit replicated-group native Spark shard. `world` is this group's
-    /// tensor-parallel degree (2 through 8) and `rank` is the shard index
-    /// inside the group (`global_rank % world`). Native checkpoints support
-    /// replicated groups; NVFP4 uses pure TP3/TP6 only. `world: 6`
-    /// is the pure unreplicated `TP6EP1` layout: six disjoint intermediate
-    /// slices of every expert, so every rank sees every route.
-    BackboneReplicatedTp { layer: usize, rank: usize, world: usize },
-    /// EXL3 compact TP shard: one rank of an implicit (no `--spark-tp/--spark-ep`
-    /// keys), unreplicated intermediate split of the compressed checkpoint,
+    /// Native Spark TP shard: `world` is the Spark rank count (2 through 8)
+    /// and `rank` the shard index. Each rank holds one disjoint intermediate
+    /// slice of every expert of its layers and sees every route. Native MXFP4
+    /// checkpoints use every packaged width; NVFP4 uses TP3/TP6 only.
+    BackboneSparkTp { layer: usize, rank: usize, world: usize },
+    /// EXL3 compact TP shard: one rank of an intermediate split of the
+    /// compressed checkpoint,
     /// carved on whole H128 blocks. `world` is 1 (Qwen whole experts), 3 or 6;
     /// the two-rank compact profile keeps the dedicated
     /// `BackboneTp2` layer so its published behavior is unchanged. This layer
@@ -97,7 +95,7 @@ impl ExpertLayer {
             },
             Self::BackboneFull { layer } => V41ExpertSelection::BackboneFull { layer, expert },
             Self::BackboneTp2 { layer, rank } => V41ExpertSelection::BackboneTp2 { layer, expert, rank },
-            Self::BackboneReplicatedTp { layer, rank, world } =>
+            Self::BackboneSparkTp { layer, rank, world } =>
                 V41ExpertSelection::BackboneTp { layer, expert, rank, world },
             Self::BackboneExl3Tp { .. } => unreachable!(
                 "EXL3 Spark shards never stage native expert weights"
@@ -113,7 +111,7 @@ impl ExpertLayer {
             | Self::BackboneFull { layer }
             | Self::BackboneTp2 { layer, .. }
             | Self::BackboneExl3Tp { layer, .. }
-            | Self::BackboneReplicatedTp { layer, .. } => layer,
+            | Self::BackboneSparkTp { layer, .. } => layer,
             Self::Dspark { .. } | Self::DsparkTp2 { .. } => usize::MAX,
         }
     }
@@ -127,7 +125,7 @@ impl ExpertLayer {
             Self::Backbone { layer, rank } => (layer, 4, rank),
             Self::BackboneFull { layer } => (layer, 1, 0),
             Self::BackboneTp2 { layer, rank } => (layer, 2, rank),
-            Self::BackboneReplicatedTp { layer, rank, world } => (layer, world, rank),
+            Self::BackboneSparkTp { layer, rank, world } => (layer, world, rank),
             _ => anyhow::bail!("not a native backbone shard: {self:?}"),
         };
         let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
@@ -136,7 +134,7 @@ impl ExpertLayer {
     }
 
     fn unequal_width(self, geometry: cuteafd_core::ExpertGeometry) -> Option<usize> {
-        let Self::BackboneReplicatedTp { world, .. } = self else { return None; };
+        let Self::BackboneSparkTp { world, .. } = self else { return None; };
         let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
         if world == 0 || (geometry.intermediate as usize / unit) % world == 0 { return None; }
         self.shard_for_geometry(geometry).ok().map(|shard| shard.width)
@@ -154,13 +152,13 @@ impl ExpertLayer {
             Self::Backbone { .. } => 1,
             Self::BackboneFull { .. } => 2,
             Self::BackboneTp2 { .. } => 3,
-            // Explicit replicated shards publish their own native roles; TP4 is
-            // only reachable through the legacy `Backbone` layer.
-            Self::BackboneReplicatedTp { world: 2, .. } => 5,
-            Self::BackboneReplicatedTp { world: 3, .. } => 6,
-            Self::BackboneReplicatedTp { world: 6, .. } => 7,
-            Self::BackboneReplicatedTp { world: 8, .. } => 8,
-            Self::BackboneReplicatedTp { .. } => 1,
+            // Spark TP shards publish their own native roles; TP4 is only
+            // reachable through the legacy `Backbone` layer.
+            Self::BackboneSparkTp { world: 2, .. } => 5,
+            Self::BackboneSparkTp { world: 3, .. } => 6,
+            Self::BackboneSparkTp { world: 6, .. } => 7,
+            Self::BackboneSparkTp { world: 8, .. } => 8,
+            Self::BackboneSparkTp { .. } => 1,
             // Compressed shards have no native role; see the sentinel doc.
             Self::BackboneExl3Tp { world, .. } => EXL3_SHARD_ROLE_SENTINEL + world as u32,
             Self::DsparkTp2 { .. } => 4,
@@ -182,14 +180,14 @@ impl ExpertLayer {
             library.v41_tp2_expert_info(capacity)
         } else if matches!(self,Self::DsparkTp2 { .. }) {
             library.v41_dspark_tp2_expert_info(capacity)
-        } else if let Self::BackboneReplicatedTp { world, .. } = self {
+        } else if let Self::BackboneSparkTp { world, .. } = self {
             match world {
                 2 => library.v41_spark_tp2_expert_info(capacity),
                 3 => library.v41_spark_tp3_expert_info(capacity),
                 4 => library.v41_expert_info(capacity),
                 6 => library.v41_spark_tp6_expert_info(capacity),
                 8 => library.v41_spark_tp8_expert_info(capacity),
-                other => anyhow::bail!("unsupported replicated Spark TP degree {other}"),
+                other => anyhow::bail!("unsupported Spark TP degree {other}"),
             }
         } else { library.v41_expert_info(capacity) }
     }
@@ -206,14 +204,14 @@ impl ExpertLayer {
             library.v41_tp2_expert_kernel(capacity)
         } else if matches!(self,Self::DsparkTp2 { .. }) {
             library.v41_dspark_tp2_expert_kernel(capacity)
-        } else if let Self::BackboneReplicatedTp { world, .. } = self {
+        } else if let Self::BackboneSparkTp { world, .. } = self {
             match world {
                 2 => library.v41_spark_tp2_expert_kernel(capacity),
                 3 => library.v41_spark_tp3_expert_kernel(capacity),
                 4 => library.v41_expert_kernel(capacity),
                 6 => library.v41_spark_tp6_expert_kernel(capacity),
                 8 => library.v41_spark_tp8_expert_kernel(capacity),
-                other => anyhow::bail!("unsupported replicated Spark TP degree {other}"),
+                other => anyhow::bail!("unsupported Spark TP degree {other}"),
             }
         } else { library.v41_expert_kernel(capacity) }
     }
@@ -233,7 +231,7 @@ impl ExpertLayer {
             Self::Backbone { .. } => library.v41_nvfp4_expert_kernel(capacity),
             Self::BackboneTp2 { .. } => library.v41_nvfp4_tp2_expert_kernel(capacity),
             Self::BackboneFull { .. } => library.v41_nvfp4_local_expert_kernel(capacity),
-            Self::BackboneReplicatedTp { world: tp @ (3 | 6), .. } =>
+            Self::BackboneSparkTp { world: tp @ (3 | 6), .. } =>
                 library.v41_nvfp4_spark_expert_kernel(capacity, tp),
             // Raw publications keep draft experts at source MXFP4 precision.
             other => other.kernel(library, capacity),
@@ -245,7 +243,7 @@ impl ExpertLayer {
             Self::Backbone { .. } => library.v41_nvfp4_expert_info(capacity),
             Self::BackboneTp2 { .. } => library.v41_nvfp4_tp2_expert_info(capacity),
             Self::BackboneFull { .. } => library.v41_nvfp4_local_expert_info(capacity),
-            Self::BackboneReplicatedTp { world: tp @ (3 | 6), .. } =>
+            Self::BackboneSparkTp { world: tp @ (3 | 6), .. } =>
                 library.v41_nvfp4_spark_expert_info(capacity, tp),
             other => other.info(library, capacity),
         }
@@ -291,7 +289,7 @@ impl ExpertLayer {
                 Self::Backbone { .. }
                     | Self::BackboneTp2 { .. }
                     | Self::BackboneFull { .. }
-                    | Self::BackboneReplicatedTp { world: 3 | 6, .. }
+                    | Self::BackboneSparkTp { world: 3 | 6, .. }
             )
     }
 }
@@ -437,7 +435,7 @@ mod format_dispatch_tests {
                 for rank in 0..world {
                     let mut roles = std::collections::BTreeSet::new();
                     for layer in 0..world * 2 {
-                        let selected = ExpertLayer::BackboneReplicatedTp { layer, world, rank };
+                        let selected = ExpertLayer::BackboneSparkTp { layer, world, rank };
                         let shard = LayerShard::new(geometry.intermediate as usize, unit, layer, world, rank).unwrap();
                         assert_eq!(selected.shard_for_geometry(geometry).unwrap(), shard);
                         let role = selected.role_for_geometry(geometry);
@@ -458,11 +456,11 @@ mod format_dispatch_tests {
             (ExpertLayer::Backbone { layer: 2, rank: 0 }, true),
             (ExpertLayer::BackboneFull { layer: 2 }, true),
             (ExpertLayer::BackboneTp2 { layer: 2, rank: 0 }, true),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 3 }, true),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 6 }, true),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 2 }, false),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 4 }, false),
-            (ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 0, world: 5 }, false),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 3 }, true),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 6 }, true),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 2 }, false),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 4 }, false),
+            (ExpertLayer::BackboneSparkTp { layer: 2, rank: 0, world: 5 }, false),
             (ExpertLayer::BackboneExl3Tp { layer: 2, rank: 0, world: 3 }, false),
             (ExpertLayer::BackboneExl3Tp { layer: 2, rank: 0, world: 6 }, false),
             (ExpertLayer::Dspark { stage: 0 }, false),

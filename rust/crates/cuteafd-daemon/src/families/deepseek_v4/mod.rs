@@ -563,7 +563,7 @@ pub(crate) fn with_engine<T>(
             if !peers.is_empty() { crate::shared::placement::SparkAdmission::plan_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
                 &loaded.snapshot, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
-                peers.len(), None, admission::spark_model(
+                peers.len(), admission::spark_model(
                     cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&loaded.catalog)?,
                     decode_rows, prefill_rows, prefill.waves as usize)?, None)?.select(&peers)?; }
         }

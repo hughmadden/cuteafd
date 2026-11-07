@@ -7,7 +7,7 @@ SAME-WIDTH Python kernel execution and the independent scalar oracle, then
 drives the exported native ABI for the requested Spark TP degree (role 5 for
 TP2, role 6 for TP3) on the DODO GB10/SM121 lease.
 
-Deliberately does not use the EP benchmark helper: the fixture is the frozen,
+Deliberately does not use a benchmark helper: the fixture is the frozen,
 known-valid preparation. Weight arenas are pinned to the full 384-expert layout
 even though the fixture populates 32 experts, so expert indices 352..383 are
 exercised and the remaining arena must be untouched.

@@ -20,29 +20,11 @@ class CompactSparkTopologyTest(unittest.TestCase):
                 'source scripts/lib/release-common.sh; release_load_config "$1"; ' + command,
                 'test', str(config)], cwd=ROOT, text=True, capture_output=True)
 
-    def test_planner_wire_is_mandatory(self):
+    def test_planner_topology_is_the_expert_rank_count(self):
         source = (ROOT / 'scripts/launch/run-family.sh').read_text()
-        body = source.split('spark_wire="$(jq -er', 1)[1].split('\n(SPARK_COUNT=', 1)[0]
-        body = 'spark_wire="$(jq -er' + body
-        for wire, status, expected in [
-            ('canonical', 0, '0::'),
-            ('native_ownership', 0, '1:3:1'),
-            ('unqualified', 2, None),
-            (None, 1, None),
-        ]:
-            with self.subTest(wire=wire):
-                topology = dict(tp=3, ep=1)
-                if wire is not None:
-                    topology['wire'] = wire
-                script = ('source scripts/lib/release-common.sh; count_plan="$1"; '
-                          'spark_tp=3; spark_ep=1; SPARK_TP=6; SPARK_EP=1; '
-                          + body + '\nprintf "%s:%s:%s" "$topology_explicit" "$SPARK_TP" "$SPARK_EP"')
-                result = subprocess.run(['bash', '-euc', script, 'test',
-                                         json.dumps(dict(topology=topology))], cwd=ROOT,
-                                        text=True, capture_output=True, timeout=30)
-                self.assertEqual(result.returncode, status, result.stderr)
-                if expected is not None:
-                    self.assertEqual(result.stdout, expected)
+        self.assertIn('spark_tp="$(jq -er \'.topology.tp\' <<<"$count_plan")"', source)
+        for retired in ('.topology.ep', '.topology.wire', '--spark-tp', '--spark-ep', 'native_ownership'):
+            self.assertNotIn(retired, source)
 
     def test_blank_count_remains_implicit_across_config_reloads(self):
         result = self.config('SPARK_COUNT=\nSPARK_HOSTS=',
@@ -138,62 +120,25 @@ release_stop_wip_containers
     # --- v10 three-rank profiles: implicit compact TP3, explicit native bypass --
 
     COMPACT3 = 'SPARK_COUNT=3\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto'
-    NATIVE3 = ('SPARK_COUNT=3\nEXPERT_FORMAT=native\nSPARKINFER_EXL3=disable\n'
-               'SPARK_TP=3\nSPARK_EP=1')
 
     def test_implicit_counts_are_admitted(self):
         for count in (2, 3):
             for settings in (f'SPARK_COUNT={count}', f'SPARK_COUNT={count}\nRTX_GPUS=2'):
                 self.assertEqual(self.config(settings).returncode, 0)
-    def test_explicit_native_tp3ep1_bypasses_every_compact_rule(self):
-        # The bypass must hold for GPU_MEMORY_CAP, KV, prefill and the
-        # single-RTX rule: nothing in the compact block may touch this launch.
-        result = self.config(self.NATIVE3,
-                             'printf "%s\\n" "$GPU_MEMORY_CAP" "$KV_POOL_SIZE" '
-                             '"$PREFILL_BATCH_TOKENS" "$EXPERT_FORMAT"')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ['', '', '2048', 'native'])
-        result = self.config(self.NATIVE3 + '\nGPU_MEMORY_CAP=90GiB',
-                             'printf "%s" "$GPU_MEMORY_CAP"')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, '90GiB')
-        result = self.config(self.NATIVE3 + '\nPREFILL_BATCH_TOKENS=4096',
-                             'printf "%s" "$PREFILL_BATCH_TOKENS"')
-        self.assertEqual(result.returncode, 0, result.stderr)   # no 256 cap
-        self.assertEqual(result.stdout, '4096')
-        self.assertNotIn('caps PREFILL_BATCH_TOKENS', result.stderr)
-    def test_explicit_flash_exl3_topology_is_refused(self):
-        result = self.config('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('requires EXPERT_FORMAT=native', result.stderr)
-
-    def test_malformed_partial_three_rank_topologies_are_rejected(self):
-        for settings, message in [
-            ('SPARK_COUNT=3\nSPARK_TP=3', 'set together or omitted together'),
-            ('SPARK_COUNT=3\nSPARK_EP=1', 'set together or omitted together'),
-            ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=2', 'must equal SPARK_COUNT'),
-            ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'unsupported native Spark topology TP1EP3'),
-            ('SPARK_COUNT=3\nSPARK_TP=2\nSPARK_EP=1', 'must equal SPARK_COUNT'),
-            ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..8'),
-        ]:
-            with self.subTest(settings=settings):
-                result = self.config(settings)
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn(message, result.stderr)
+    def test_retired_topology_keys_are_unknown(self):
+        for key in ('SPARK_TP', 'SPARK_EP'):
+            result = self.config(f'SPARK_COUNT=3\n{key}=3')
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('unknown configuration key', result.stderr)
 
     def test_out_of_range_worlds_are_refused_before_launch(self):
         for count in (9, 10):
-            for topology in ('', f'\nSPARK_TP={count}\nSPARK_EP=1'):
-                with self.subTest(count=count, topology=topology):
-                    result = self.config(f'SPARK_COUNT={count}{topology}')
-                    self.assertEqual(result.returncode, 2, result.stderr)
-                    self.assertIn('must be in', result.stderr)
-        # Native ownership is qualified for TP2..TP8; TP1 remains canonical.
-        result = self.config('SPARK_COUNT=1\nSPARK_TP=1\nSPARK_EP=1')
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn('unsupported native Spark topology', result.stderr)
-        for count in (5, 7):
-            result = self.config(f'SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1\n'
+            with self.subTest(count=count):
+                result = self.config(f'SPARK_COUNT={count}')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('SPARK_COUNT must be in 0..8', result.stderr)
+        for count in (1, 5, 7):
+            result = self.config(f'SPARK_COUNT={count}\n'
                                  'SPARK_6_HOST=fixture-rank6\nSPARK_6_LANE_A=10.55.0.7\n'
                                  'SPARK_6_LANE_B=10.55.1.7')
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -210,16 +155,14 @@ release_stop_wip_containers
             with self.subTest(world=world):
                 result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' +
                     remote.replace(' >/dev/null', ''), 'test', 'image', 'name', '1',
-                    '107374182400', '19441', 'snapshot', 'fingerprint', str(world), '0', str(world), '1', '', '', 'info', '__none__',
+                    '107374182400', '19441', 'snapshot', 'fingerprint', str(world), '', '', 'info', '__none__',
                     '-1', '19541', '', 'revision', '1'],
                     cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 arguments = result.stdout.splitlines()
                 self.assertEqual(arguments[arguments.index('--world') + 1], str(world))
                 self.assertNotIn('--first-layer', arguments)
-                # A legacy world-2/3 launch carries no explicit topology flags.
                 self.assertNotIn('--spark-tp', arguments)
-                self.assertNotIn('--spark-ep', arguments)
 
 
     def test_daemon_remote_memory_flags_are_global_worker_flags(self):
@@ -234,7 +177,7 @@ release_stop_wip_containers
                 tail = ['--profile-args', '-e', 'CUTEAFD_THERMAL=on'] + (['--memory-args', *memory] if memory else [])
                 result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' +
                     remote.replace(' >/dev/null', ''), 'test', 'image', 'name', '1',
-                    '107374182400', '19441', 'snapshot', 'fingerprint', '4', '0', '4', '1', '', '', 'info', '__none__',
+                    '107374182400', '19441', 'snapshot', 'fingerprint', '4', '', '', 'info', '__none__',
                     '-1', '19541', '', 'revision', '1', *tail],
                     cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)

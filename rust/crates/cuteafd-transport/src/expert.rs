@@ -15,12 +15,8 @@ mod roce;
 pub use roce::{SparkExpertPending, SparkExpertWave, SparkExperts, WaveReceipt};
 mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
-mod native_group;
-pub use native_group::{
-    SparkTopology, V41_MAX_NATIVE_GROUPS, V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_INACTIVE_OWNER,
-    V41_NATIVE_UNASSIGNED_EXPERT_ID, V41_ROUTED_EXPERTS, V41NativeOwnerRouteWord,
-    V41NativeOwnershipBatch,
-};
+mod topology;
+pub use topology::{SparkTopology, V41_ROUTED_EXPERTS};
 
 pub const V41_HIDDEN: u32 = 5120;
 pub const V41_BACKBONE_TOPK: u32 = 6;
@@ -46,65 +42,28 @@ fn validate_frame_budget(capacity: u32, max_frame_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-/// A request encoding is independent of rank ownership. Canonical requests
-/// still bind every response to an explicit pure-TP topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SparkWire {
-    Canonical,
-    NativeOwnership,
-}
-
+/// The Spark world a coordinator or worker is launched for: every rank
+/// receives the same canonical request and returns its tensor-parallel plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparkWorld {
     topology: SparkTopology,
-    wire: SparkWire,
 }
 
 impl SparkWorld {
-    pub fn new(topology: SparkTopology, wire: SparkWire) -> Result<Self> {
-        ensure!(
-            topology.world_size() <= cuteafd_core::MAX_SPARK_WORLD,
-            "Spark world exceeds physical rank ceiling"
-        );
-        ensure!(
-            wire != SparkWire::NativeOwnership
-                || cuteafd_core::tp_units::spark_ownership_topology(
-                    topology.tp() as usize, topology.ep() as usize),
-            "unqualified Spark ownership topology"
-        );
-        ensure!(
-            wire != SparkWire::Canonical || topology.ep() == 1,
-            "canonical Spark wire requires a pure-TP topology"
-        );
-        Ok(Self { topology, wire })
-    }
-
     pub fn canonical(ranks: usize) -> Result<Self> {
         let tp = u8::try_from(ranks).context("Spark rank count exceeds topology range")?;
-        Self::new(SparkTopology::new(tp, 1)?, SparkWire::Canonical)
-    }
-
-    pub fn owned(topology: SparkTopology) -> Result<Self> {
-        Self::new(topology, SparkWire::NativeOwnership)
+        let topology = SparkTopology::new(tp)?;
+        ensure!(topology.world_size() <= cuteafd_core::MAX_SPARK_WORLD, "Spark world exceeds physical rank ceiling");
+        Ok(Self { topology })
     }
 
     pub const fn topology(self) -> SparkTopology {
         self.topology
     }
-    pub const fn wire(self) -> SparkWire {
-        self.wire
-    }
-    pub const fn ownership_topology(self) -> Option<SparkTopology> {
-        match self.wire {
-            SparkWire::Canonical => None,
-            SparkWire::NativeOwnership => Some(self.topology),
-        }
-    }
 
     /// The canonical device producer supports TP4 and TP6 rank planes.
     pub fn supports_device_exchange(self) -> bool {
-        self.wire == SparkWire::Canonical
-            && matches!(self.topology, SparkTopology::NATIVE_TP4_EP1 | SparkTopology::NATIVE_TP6_EP1)
+        matches!(self.topology.tp(), 4 | 6)
     }
 }
 
@@ -206,104 +165,15 @@ fn validate_canonical(
     validate_canonical_body(header, max_rows, row_at, route_at)
 }
 
-/// Ownership-aware canonical admission for a worker bound to one replicated
-/// `TP×EP` topology. The flag and the topology's group count are both required,
-/// every active expert must keep one owner across the whole batch, and only a
-/// native compact batch may use the contract.
-fn validate_native_group(
-    header: &crate::ExpertProtocolV2RequestHeader,
-    max_rows: u32,
-    topology: SparkTopology,
-    row_at: impl Fn(usize) -> Result<crate::ExpertProtocolV2RowDescriptor>,
-    mut route_at: impl FnMut(usize) -> Result<crate::ExpertProtocolV2RouteEntry>,
-) -> Result<()> {
-    ensure!(
-        header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0,
-        "native group worker requires the native group request flag"
-    );
-    ensure!(
-        header.flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 != 0,
-        "native group request requires compact BF16 response agreement"
-    );
-    ensure!(
-        header.flags
-            & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
-                | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-                | V41_NATIVE_GROUP_REQUEST_FLAG | COMPRESSED_REPLY_FLAGS)
-            == 0,
-        "native group requests cannot use legacy reduction/compression or stream flags"
-    );
-    let mut batch = V41NativeOwnershipBatch::default();
-    validate_canonical_body(header, max_rows, row_at, |index| {
-        let route = route_at(index)?;
-        let decoded = batch.observe(route.expert_id, topology.group_count())?;
-        Ok(crate::ExpertProtocolV2RouteEntry {
-            expert_id: decoded.expert_id,
-            ..route
-        })
-    })
-}
-
 /// Validated canonical row-major routing; the same request must reach every TP rank.
 pub struct BackboneRequest<'a> {
     view: ExpertProtocolV2RequestView<'a>,
-    /// Present only for a request admitted under the native replicated-group
-    /// contract, which binds the group count used to decode owner bits.
-    native_topology: Option<SparkTopology>,
 }
 impl<'a> BackboneRequest<'a> {
     pub fn parse(frame: &'a [u8], max_rows: u32) -> Result<Self> {
         let view = ExpertProtocolV2RequestView::parse(frame)?;
         validate_canonical(&view.header, max_rows, |i| view.row(i), |i| view.route(i))?;
-        Ok(Self {
-            view,
-            native_topology: None,
-        })
-    }
-    /// Explicit admission for a worker bound to one replicated `TP×EP`
-    /// topology. All ranks receive the same encoded owner assignment; each rank
-    /// unpacks only its own group's routes.
-    pub fn parse_native_group(
-        frame: &'a [u8],
-        max_rows: u32,
-        topology: SparkTopology,
-    ) -> Result<Self> {
-        let view = ExpertProtocolV2RequestView::parse(frame)?;
-        validate_native_group(
-            &view.header,
-            max_rows,
-            topology,
-            |i| view.row(i),
-            |i| view.route(i),
-        )?;
-        Ok(Self {
-            view,
-            native_topology: Some(topology),
-        })
-    }
-    pub fn is_native_group(&self) -> bool {
-        self.native_topology.is_some()
-    }
-    /// Topology this request was admitted under, if it carries native ownership.
-    pub fn native_topology(&self) -> Option<SparkTopology> {
-        self.native_topology
-    }
-
-    /// Ownership-aware check of a locally owned native group request; the caller
-    /// must supply the topology its workers are bound to.
-    pub fn validate_owned_native_group(
-        request: &crate::ExpertProtocolV2Request,
-        max_rows: u32,
-        topology: SparkTopology,
-    ) -> Result<()> {
-        request.validate()?;
-        validate_native_group(
-            &request.header,
-            max_rows,
-            topology,
-            |i| Ok(request.rows[i].clone()),
-            |i| Ok(request.routes[i].clone()),
-        )
+        Ok(Self { view })
     }
     /// Check a locally owned request using the worker's canonical contract,
     /// without serializing or copying its activation payload.
@@ -364,10 +234,6 @@ impl<'a> BackboneRequest<'a> {
     }
     /// Fill caller-owned GPU-upload arrays without reordering or rounding routes.
     pub fn copy_routes_into(&self, ids: &mut [i32], weights: &mut [f32]) -> Result<()> {
-        ensure!(
-            !self.is_native_group(),
-            "native group routes require ownership-aware unpacking"
-        );
         let count = self.view.header.route_count as usize;
         ensure!(
             ids.len() >= count && weights.len() >= count,
@@ -377,46 +243,6 @@ impl<'a> BackboneRequest<'a> {
             let route = self.view.route(index)?;
             ids[index] = route.expert_id as i32;
             weights[index] = route.gate_weight;
-        }
-        Ok(())
-    }
-    /// Unpack one replicated group's routes for a worker bound to `topology`.
-    ///
-    /// A route owned by `group` keeps its true expert id and exact FP32 gate
-    /// weight; every other route receives [`V41_NATIVE_UNASSIGNED_EXPERT_ID`]
-    /// and a zero weight, which the existing kernel reduces to zero through its
-    /// invalid-id inverse `-1` path. The batch-wide ownership check rejects a
-    /// request whose encoded owners conflict, so a route can never be counted
-    /// twice. Buffers are reused; no allocation occurs on success.
-    pub fn copy_native_group_routes_into(
-        &self,
-        ids: &mut [i32],
-        weights: &mut [f32],
-        group: u8,
-    ) -> Result<()> {
-        let topology = self
-            .native_topology
-            .context("native group routes require a topology-admitted request")?;
-        ensure!(
-            group < topology.group_count(),
-            "native group index out of range"
-        );
-        let count = self.view.header.route_count as usize;
-        ensure!(
-            ids.len() >= count && weights.len() >= count,
-            "native group routing buffers are too short"
-        );
-        let mut batch = V41NativeOwnershipBatch::default();
-        for index in 0..count {
-            let route = self.view.route(index)?;
-            let decoded = batch.observe(route.expert_id, topology.group_count())?;
-            if decoded.owner == group {
-                ids[index] = decoded.expert_id as i32;
-                weights[index] = route.gate_weight;
-            } else {
-                ids[index] = V41_NATIVE_UNASSIGNED_EXPERT_ID;
-                weights[index] = 0.0;
-            }
         }
         Ok(())
     }
@@ -437,8 +263,7 @@ impl<'a> BackboneRequest<'a> {
             output_row_stride_bytes: if self.view.partial_replies() { 0 } else { self.output_row_bytes()? },
             output_payload_bytes: self.plane_bytes()? as u64,
             status: ExpertProtocolV2Status::Ok,
-            // Request-only admission flags never appear in a response.
-            flags: header.flags & !V41_NATIVE_GROUP_REQUEST_FLAG,
+            flags: header.flags,
             executor_id,
             pace: None,
         })
@@ -531,12 +356,6 @@ impl<'a> V41Tp4Planes<'a> {
     }
     /// Generic constructor for the validated physical rank counts 1..=8.
     pub fn new_ranks(request: &BackboneRequest<'_>, executors: &[u64]) -> Result<Self> {
-        if let Some(topology) = request.native_topology() {
-            ensure!(
-                executors.len() == topology.world_size(),
-                "native group executor count does not match its topology"
-            );
-        }
         let mut identity = Self::from_header_ranks(&request.view.header, executors)?;
         identity.set_partial_plan(request.partial_plan()?.as_ref())?;
         Ok(identity)
@@ -753,46 +572,17 @@ mod tests {
     }
 
     #[test]
-    fn declared_worlds_reject_unqualified_topologies() -> Result<()> {
+    fn declared_worlds_cover_one_through_eight_ranks() -> Result<()> {
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             let world = SparkWorld::canonical(ranks)?;
             assert_eq!(world.topology().world_size(), ranks);
-            assert_eq!(world.wire(), SparkWire::Canonical);
+            assert_eq!(world.supports_device_exchange(), matches!(ranks, 4 | 6));
         }
         for ranks in [0, 9, usize::MAX] {
             assert!(SparkWorld::canonical(ranks).is_err(), "TP{ranks}");
         }
-        assert!(SparkWorld::owned(SparkTopology::new(1, 1)?).is_err());
-        for tp in 2..=cuteafd_core::MAX_SPARK_WORLD {
-            assert!(SparkWorld::owned(SparkTopology::new(u8::try_from(tp)?, 1)?).is_ok(), "TP{tp}");
-        }
-        assert!(SparkWorld::new(SparkTopology::NATIVE_TP2_EP2, SparkWire::Canonical).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn explicit_canonical_tp4_preserves_device_exchange() -> Result<()> {
-        let world = SparkWorld::new(SparkTopology::NATIVE_TP4_EP1, SparkWire::Canonical)?;
-        assert!(world.supports_device_exchange());
-        assert_eq!(world.topology().executor_ids(), [1, 2, 3, 4]);
-        assert_eq!(world.ownership_topology(), None);
-        assert!(!SparkWorld::owned(SparkTopology::NATIVE_TP4_EP1)?.supports_device_exchange());
-        Ok(())
-    }
-
-    #[test]
-    fn canonical_tp6_device_exchange_is_pure_tp_only() -> Result<()> {
-        let world = SparkWorld::canonical(6)?;
-        assert!(world.supports_device_exchange());
-        assert_eq!(world.topology(), SparkTopology::NATIVE_TP6_EP1);
-        assert_eq!(world.topology().executor_ids(), [27, 28, 29, 30, 31, 32]);
-        assert_eq!(world.ownership_topology(), None);
-        for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
-            assert_eq!(SparkWorld::canonical(ranks)?.supports_device_exchange(), matches!(ranks, 4 | 6));
-        }
-        for (tp, ep) in [(2, 1), (3, 1), (4, 1), (6, 1), (2, 2), (3, 2), (2, 3)] {
-            assert!(!SparkWorld::owned(SparkTopology::new(tp, ep)?)?.supports_device_exchange());
-        }
+        assert_eq!(SparkWorld::canonical(4)?.topology().executor_ids(), [1, 2, 3, 4]);
+        assert_eq!(SparkWorld::canonical(6)?.topology().executor_ids(), [27, 28, 29, 30, 31, 32]);
         Ok(())
     }
 
@@ -812,8 +602,8 @@ mod tests {
                 .executor_id(rank)
                 .unwrap()
         });
-        // The canonical three-rank EXL3 group answers in the TP3EP1
-        // namespace, exactly as the two-rank group shares TP2EP1's 5..=6.
+        // The canonical three-rank group answers in the TP3 namespace,
+        // exactly as the two-rank group keeps TP2's 5..=6.
         let tp3 = [0, 1, 2].map(|rank| {
             SparkWorld::canonical(3)
                 .unwrap()
@@ -824,24 +614,16 @@ mod tests {
         assert_eq!(tp4, [1, 2, 3, 4]);
         assert_eq!(tp2, [5, 6]);
         assert_eq!(tp3, [7, 8, 9]);
-        assert_eq!(tp3.to_vec(), SparkTopology::new(3, 1)?.executor_ids());
-        // The canonical six-rank EXL3 group is TP6EP1's namespace.
+        assert_eq!(tp3.to_vec(), SparkTopology::new(3)?.executor_ids());
+        // The canonical six-rank group keeps the TP6 namespace.
         let tp6: Vec<u64> = (0..6)
             .map(|rank| SparkWorld::canonical(6)?.topology().executor_id(rank))
             .collect::<Result<_>>()?;
-        assert_eq!(tp6, SparkTopology::new(6, 1)?.executor_ids());
+        assert_eq!(tp6, SparkTopology::new(6)?.executor_ids());
         let tp1 = SparkWorld::canonical(1)?.topology().executor_id(0)?;
         assert_eq!(tp1, 33);
-        for topology in [
-            SparkTopology::NATIVE_TP2_EP1,
-            SparkTopology::NATIVE_TP3_EP1,
-            SparkTopology::NATIVE_TP4_EP1,
-            SparkTopology::NATIVE_TP2_EP2,
-            SparkTopology::NATIVE_TP3_EP2,
-            SparkTopology::NATIVE_TP2_EP3,
-            SparkTopology::NATIVE_TP6_EP1,
-        ] {
-            assert!(!topology.executor_ids().contains(&tp1));
+        for tp in 2..=8 {
+            assert!(!SparkTopology::new(tp)?.executor_ids().contains(&tp1));
         }
         // Every implicit namespace stays disjoint from the other worlds'.
         for (world, rank) in [
@@ -958,50 +740,6 @@ mod tests {
                 let mut invalid = owned.clone();
                 invalid.rows[0].source_request_id = 2;
                 assert!(BackboneRequest::parse(&invalid.encode()?, 65).is_ok());
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn native_group_reply_formats_roundtrip() -> Result<()> {
-        use cuteafd_core::SparkReplyFormat;
-        let topology = SparkTopology::NATIVE_TP2_EP2;
-        for format in [SparkReplyFormat::Bf16, SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
-            let mut owned = request(65);
-            for row in &mut owned.rows {
-                row.source_kind = ExpertV2SourceKind::Prefill;
-                row.source_request_id = 1;
-            }
-            owned.with_native_group_owners(&vec![0; 384], topology)?;
-            owned.select_combined_reply(cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(format), decode: Some(format) })?;
-            let encoded = owned.encode()?;
-            let request = BackboneRequest::parse_native_group(&encoded, 65, topology)?;
-            let ranks = topology.executor_ids();
-            let payload = vec![0; request.plane_bytes()?];
-            let frames = ranks.iter().map(|executor|
-                request.response(*executor, &payload)?.to_owned()?.encode()).collect::<Result<Vec<_>>>()?;
-            let mut planes = V41Tp4Planes::new_ranks(&request, &ranks)?;
-            for (rank, frame) in frames.iter().enumerate() {
-                assert_eq!(planes.insert(frame)?, rank);
-            }
-            assert!(planes.complete());
-            let mut mismatch = owned.clone();
-            mismatch.select_combined_reply(cuteafd_core::spark_reply::SparkReplyFormats { prefill: Some(if format == SparkReplyFormat::Bf16 {
-                SparkReplyFormat::Nvfp4
-            } else { SparkReplyFormat::Bf16 }), decode: None })?;
-            let other_encoded = mismatch.encode()?;
-            let other = BackboneRequest::parse_native_group(&other_encoded, 65, topology)?;
-            assert!(V41Tp4Planes::new_ranks(&other, &ranks)?.insert(&frames[0]).is_err());
-            if format != SparkReplyFormat::Bf16 {
-                for kind in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::MtpVerify] {
-                    let mut invalid = owned.clone();
-                    invalid.rows[0].source_kind = kind;
-                    assert!(BackboneRequest::parse_native_group(&invalid.encode()?, 65, topology).is_ok());
-                }
-                let mut invalid = owned.clone();
-                invalid.rows[0].source_request_id = 2;
-                assert!(BackboneRequest::parse_native_group(&invalid.encode()?, 65, topology).is_ok());
             }
         }
         Ok(())

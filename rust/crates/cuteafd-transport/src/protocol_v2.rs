@@ -46,6 +46,7 @@ pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR: u32 = 1 << 17;
 // unit on its prefill owner, two LE u32 at bytes 88..96. Never combined with
 // the debug checksum, which occupies those bytes.
 pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE: u32 = 1 << 19;
+// Bit 18 is reserved (free for future use) and rejected by `validate_flags`.
 pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION: u32 = 1 << 11;
 /// Per-expert partial replies (models whose experts carry a per-expert output
 /// norm): the worker returns each routed (row, slot)'s unweighted partial in the
@@ -670,8 +671,7 @@ fn response_header_len_from_flags(flags: u32) -> usize {
 fn validate_flags(flags: u32, label: &str) -> Result<()> {
     let allowed = match label {
         "request" => {
-            crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
-                | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
+            EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
                 | EXPERT_PROTOCOL_V2_FLAG_PRECOMPILE_WARMUP
@@ -698,19 +698,6 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
         }
         _ => EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
     };
-    // Native replicated-group ownership: same compact request contract as the
-    // canonical native batch, and
-    // never present in a response.
-    if label == "request" && flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
-        let native_allowed = crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG
-            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
-            | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_NVFP4_E2M1_FP8_E4M3
-            | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
-            | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
-        if flags & !native_allowed != 0 || flags & EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 == 0 {
-            bail!("native group ownership requires the native compact request contract");
-        }
-    }
     let unknown = flags & !allowed;
     if unknown != 0 {
         bail!("ExpertProtocolV2 {label} has unknown flags 0x{unknown:08x}");

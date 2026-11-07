@@ -735,7 +735,7 @@ def preflight_job(job, arm):
     required_packages = deployment.get('artifact_requirements', {}).get('spark_packages')
     if required_packages is None:
         # Older sealed binaries register recipes but do not attest installed variants.
-        tp = deployment.get('topology', {}).get('tp') or int(values.get('SPARK_TP') or values.get('SPARK_COUNT', 0))
+        tp = deployment.get('topology', {}).get('tp') or int(values.get('SPARK_COUNT', 0))
         required_packages = {package: exl3_spark_layouts(
             package.removeprefix('exl3/exl3-').rsplit('-k', 1)[0] + ':exl3-k' + package.rsplit('-k', 1)[1], tp)
             for package in needs['spark'] if package.startswith('exl3/') and tp}
@@ -2006,7 +2006,7 @@ def tp_roles(p,art):
         assert hashlib.sha256(data).hexdigest()==meta.get('v41_expert_tp_manifest_sha256'),'TP manifest hash mismatch'
         manifest=json.loads(data)
         roles=manifest.get('spark_tp_roles')
-        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp6') for r in roles),'invalid TP roles'
+        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp5','tp6','tp7','tp8') for r in roles),'invalid TP roles'
         assert roles==meta.get('spark_tp_roles'),'slot and artifact roles differ'
         lib=hashlib.sha256((art/'libcuteafd_native.so').read_bytes()).hexdigest()
         assert lib==manifest.get('native_library_sha256'),'native library hash mismatch'
@@ -2176,21 +2176,14 @@ def slot_needs(card):
 
 def v41_tp_role(card, values):
     """The SM121 expert role a DeepSeek V4.1 card's Spark TP requires, as the
-    launcher derives it (scripts/launch/run-family.sh, launch_deepseek_v41): an
-    explicit SPARK_TP/SPARK_EP topology with TP 2, 3 or 6, or a native non-EXL3
+    planner names it (`artifact_requirements.spark_tp_role`): a native non-EXL3
     count other than 0 and 4 (TP = count). TP4 is the built-in default role.
     NVFP4 checkpoints need the role's NVFP4 exports too."""
     if card.get('family') != 'deepseek_v41':
         return dict(tp_role=None, nvfp4=False)
     count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
-    explicit = bool(values.get('SPARK_TP') or values.get('SPARK_EP'))
     exl3 = values.get('EXPERT_FORMAT', 'native') == 'exl3'
-    tp = int(values['SPARK_TP']) if explicit and values.get('SPARK_TP') else count
-    role = None
-    if explicit and tp in (2, 3, 6):
-        role = f'tp{tp}'
-    elif not explicit and not exl3 and count not in (0, 4) and count in (2, 3, 6):
-        role = f'tp{count}'
+    role = f'tp{count}' if not exl3 and 2 <= count <= 8 and count != 4 else None
     return dict(tp_role=role, nvfp4=checkpoint_is_nvfp4(values))
 
 
@@ -2223,7 +2216,7 @@ def toolchain_hash(revision):
 
 # Serving-only keys never belong in a build (staging) config.
 BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING',
-              'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
+              'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
               'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
               'PROFILE_NCU_SKIP', 'PROFILE_SPARK', 'PROFILE_SPARK_RANKS', 'PROFILE_SPARK_NCU_KERNEL', 'PROFILE_SPARK_NCU_COUNT',

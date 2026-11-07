@@ -138,8 +138,7 @@ if tool == "docker":
             if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
                 decode_lanes = 1
             response["decode_lanes"] = decode_lanes
-            tp = int(value("--spark-tp", ranks))
-            ep = int(value("--spark-ep", "1"))
+            tp = int(ranks)
             if family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4", "mimo_v2"}:
                 # Mirror the planner (prefill_waves::depth): a fixed three units
                 # of the reserve with Sparks, one without (TJ 2026-10-28).
@@ -161,14 +160,12 @@ if tool == "docker":
                 report["replay_records"] = response["replay_records"] = resolved
             if family == "mimo_v2":
                 report["prefill_lanes"] = response["prefill_waves"]
-            explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and int(ranks) not in (0, 4)
             response.update(spark_expert_world=int(ranks), spark_roles=[dict(rank=i, experts=True, layers=[], encoder=response.get("encoder") if i == 0 else None, audio_encoder=None, drafter=None) for i in range(int(ranks))], version=1, family=family, executable=True, wip_launchable=True,
                 report=report, spark_admission="coordinator_authoritative",
                 launch={"family": family, "first_expert_layer": int(os.environ.get("CAPTURE_FIRST_LAYER", "0")),
                         "last_expert_layer": json.loads(os.environ.get("CAPTURE_LAST_LAYER", "null"))},
-                topology={"tp": tp, "ep": ep,
-                          "wire": "native_ownership" if explicit_topology else "canonical"},
-                artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and explicit_topology and tp != 4 else None},
+                topology={"tp": tp},
+                artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and tp not in (0, 4) else None},
                 speculator=value("--speculator"),
                 admission={"kv_pool_size": value("--kv-pool-size"), "memory_policy": {}},
                 peers=value("--deployment-peers", "").split(",")[:int(ranks)],

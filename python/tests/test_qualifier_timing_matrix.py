@@ -21,7 +21,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "python" / "tools"
-QUALIFIER = TOOLS / "qualify" / "deepseek_v41" / "qualify_v41_replicated_native.py"
+QUALIFIER = TOOLS / "qualify" / "deepseek_v41" / "qualify_v41_spark_tp_native.py"
 
 
 def _load_qualifier():
