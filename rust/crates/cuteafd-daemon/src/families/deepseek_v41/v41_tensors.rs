@@ -276,7 +276,7 @@ pub(crate) unsafe fn project_vocabulary(library: &NativeLibrary, projection: &cu
             weight.apply(library, input.ptr, logits.ptr, true, rows, 0, weight.n, &scratch.allocation, stream)
         },
         HeadCopy::Packed(head) => unsafe {
-            head.apply(library, input.ptr, logits.ptr, true, rows, scratch.coarse, &scratch.allocation, stream)
+            head.apply(library, input.ptr, logits.ptr, true, rows, scratch.coarse, scratch.allocation.buffer, stream)
         },
     }
 }

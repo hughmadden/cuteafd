@@ -1,6 +1,6 @@
 //! Final, header-derived requests for the independently retired target weight set.
 //! The daemon binds exactly these views and admission charges exactly these layouts.
-use super::{core::CoreInventory, GlmNextAttention, GlmNextConfig};
+use super::{core::CoreInventory, resident::GlmfHeadFormat, GlmNextAttention, GlmNextConfig};
 use crate::{placement::LayerMode, plan::Checkpoint, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -15,7 +15,7 @@ pub fn joined(names: &[String]) -> String { names.join("+") }
 /// (row128 or channel) does not change any extent.
 #[allow(clippy::too_many_arguments)]
 pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
-    ranks: usize, kda_fp8: bool, output_shard: bool, fp8_head: bool,
+    ranks: usize, kda_fp8: bool, output_shard: bool, head: GlmfHeadFormat,
     embedding: Option<(usize, usize)>) -> Result<Vec<WeightArenaLayout>> {
     ensure!(matches!(ranks, 1 | 2) && modes.len() <= cfg.layers, "Flash arena rank/layer extent");
     let core = CoreInventory::from_checkpoint(cfg, checkpoint)?;
@@ -59,8 +59,19 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
         for (name, bytes) in layout.arena_tensors(&layout.stem)? {
             ensure!(requests[0].insert(name.clone(), bytes).is_none(), "duplicate Flash K6 view {name}");
         }
-    } else if fp8_head { fp8(&mut requests[0], vec!["lm_head.weight".into()], 1, true)?; }
-    else { one(&mut requests[0], "lm_head.weight".into())?; }
+    } else {
+        match head {
+            GlmfHeadFormat::Fp8 => fp8(&mut requests[0], vec!["lm_head.weight".into()], 1, true)?,
+            // The exact 12-bit copy (its BF16 source is transient, outside the arena).
+            GlmfHeadFormat::Packed => {
+                let shape = &tensor("lm_head.weight")?.meta.shape;
+                ensure!(shape.len() == 2, "Flash head shape");
+                insert(&mut requests[0], "packed12".into(),
+                    cuteafd_core::packed_head::PackedHeadLayout::new(shape[0], shape[1])?.total_bytes())?;
+            }
+            GlmfHeadFormat::Bf16 => one(&mut requests[0], "lm_head.weight".into())?,
+        }
+    }
     for (layer, &mode) in modes.iter().enumerate() {
         let p = format!("{PREFIX}layers.{layer}");
         let a = |leaf: &str| format!("{p}.self_attn.{leaf}");
@@ -169,7 +180,7 @@ pub fn target_options(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Lay
         return (0..homes).map(|home| native_target(facts, &dense, cfg, home)).collect();
     }
     (0..homes).map(|home| target(checkpoint, cfg, modes, ranks, representation.kda_fp8,
-        representation.output_shard, representation.fp8_head,
+        representation.output_shard, representation.head,
         (embedding_bytes > 0).then_some((home, usize::try_from(embedding_bytes)?)))).collect()
 }
 
@@ -237,12 +248,13 @@ mod tests {
         let checkpoint = Checkpoint::open(root.path())?;
         let cfg = GlmNextConfig::from_hf(&config)?;
         for ranks in [1, 2] { for kda_fp8 in [false, true] {
-            for fp8_head in [false, true] { for output_shard in [false, true] {
+            for head in [GlmfHeadFormat::Bf16, GlmfHeadFormat::Fp8, GlmfHeadFormat::Packed] { for output_shard in [false, true] {
                 if output_shard && (ranks == 1 || !kda_fp8) { continue; }
-                let repr = GlmfRepresentation { kda_fp8, fp8_head, output_shard };
+                if head == GlmfHeadFormat::Packed && ranks == 2 { continue; }
+                let repr = GlmfRepresentation { kda_fp8, head, output_shard };
                 let old = resident_weights(&checkpoint, &cfg, cfg.layers, ranks, repr).map_err(anyhow::Error::msg)?;
                 let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
-                    kda_fp8, output_shard, fp8_head, Some((0, old[0].embedding as usize)))?;
+                    kda_fp8, output_shard, head, Some((0, old[0].embedding as usize)))?;
                 for (rank, layout) in layouts.iter().enumerate() {
                     check(layout);
                     assert_eq!(layout.payload_bytes() as u64, old[rank].embedding + old[rank].weights,
@@ -289,7 +301,7 @@ mod tests {
             }).collect::<Vec<_>>();
             let old = resident_weights_placed(&checkpoint, &cfg, cfg.layers, ranks,
                 GlmfRepresentation::default(), attention, first_owner).map_err(anyhow::Error::msg)?;
-            let layouts = target(&checkpoint, &cfg, &modes, ranks, true, false, true, None)?;
+            let layouts = target(&checkpoint, &cfg, &modes, ranks, true, false, GlmfHeadFormat::Fp8, None)?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 assert_eq!(layout.payload_bytes() as u64, old[rank].weights, "native rank {rank}/{ranks}");
@@ -312,7 +324,7 @@ mod tests {
             let embedding = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}embed_tokens.weight"))
                 .context("installed embedding header")?.meta.byte_length as usize;
             let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
-                true, ranks == 2, true, Some((0, embedding)))?;
+                true, ranks == 2, GlmfHeadFormat::Fp8, Some((0, embedding)))?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();

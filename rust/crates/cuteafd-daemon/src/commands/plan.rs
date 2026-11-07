@@ -86,7 +86,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != crate::families::glm5_flash::fp8::KdaFp8::Off,
-                    fp8_head: args.fp8_head, ..Default::default() },
+                    head: args.head_format, ..Default::default() },
                 glmf_kda_state: args.kda_state.into(),
                 glmf_index: args.index_cache.into(),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
@@ -233,9 +233,11 @@ fn v41_draft_limit(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, Str
 }
 
 fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanError> {
-    if family == "glm5_flash" && args.target_head == Some(crate::shared::target_head::TargetHead::Tensor) && args.fp8_head {
-        return Err(PlanError::InvalidOption { option: "--target-head", reason:
-            "explicit tensor head needs --fp8-head false; the FP8 head has its own program".into() });
+    use crate::families::glm5_flash::head::GlmfHeadFormat;
+    if family == "glm5_flash" && args.target_head == Some(crate::shared::target_head::TargetHead::Tensor)
+        && args.head_format != GlmfHeadFormat::Bf16 {
+        return Err(PlanError::InvalidOption { option: "--target-head", reason: format!(
+            "explicit tensor head needs --fp8-head false; the {} head has its own GEMV", args.head_format.name()) });
     }
     Ok(())
 }
@@ -1350,7 +1352,8 @@ mod tests {
             fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128,
             kda_state: crate::families::glm5_flash::engine::KdaState::F32,
-            fp8_head: true, target_head: None, draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
+            head_format: crate::families::glm5_flash::head::GlmfHeadFormat::Fp8, target_head: None,
+            draft_head: crate::shared::speculation::dflash::DraftHead::Exact,
             drafter_gib: 0.0,
             rtx_expert_layers: None,
             deprecated_peer_expert_ranges: false,
@@ -2159,27 +2162,36 @@ mod tests {
             let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
             args
         };
+        use crate::families::glm5_flash::head::GlmfHeadFormat;
         let defaults = parse(&[]);
-        assert_eq!((defaults.kda_fp8, defaults.kda_state, defaults.fp8_head), (KdaFp8::Row128, KdaState::F32, true));
+        assert_eq!((defaults.kda_fp8, defaults.kda_state, defaults.head_format),
+            (KdaFp8::Row128, KdaState::F32, GlmfHeadFormat::Fp8));
         for state in ["f32", "bf16", "bf16-tile"] {
             for kda in ["off", "row128", "channel"] {
-                for head in ["true", "false"] {
+                for (head, format) in [("true", GlmfHeadFormat::Fp8), ("false", GlmfHeadFormat::Bf16),
+                    ("packed", GlmfHeadFormat::Packed), ("fp8", GlmfHeadFormat::Fp8), ("bf16", GlmfHeadFormat::Bf16)] {
                     let args = parse(&["--kda-state", state, "--kda-fp8", kda, "--fp8-head", head]);
                     let layout = options(&args).unwrap().layout.unwrap();
                     assert_eq!(layout.glmf_kda_state.bytes(), if state == "f32" { 4 } else { 2 });
                     assert_eq!(layout.glmf_representation.kda_fp8, kda != "off");
-                    assert_eq!(layout.glmf_representation.fp8_head, head == "true");
+                    assert_eq!(layout.glmf_representation.head, format);
                 }
             }
         }
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--fp8-head", "maybe"]).is_err());
         let tensor = parse(&["--target-head", "tensor"]);
         assert!(validate_glmf_precision(&tensor, "glm5_flash").is_err());
         assert!(validate_glmf_precision(&tensor, "glm5").is_ok());
+        // The packed head runs its own exact GEMV: an explicit tensor route is refused, exact is inert.
+        let packed_tensor = parse(&["--fp8-head", "packed", "--target-head", "tensor"]);
+        let error = validate_glmf_precision(&packed_tensor, "glm5_flash").unwrap_err().to_string();
+        assert!(error.contains("exact 12-bit"), "{error}");
+        assert!(validate_glmf_precision(&parse(&["--fp8-head", "packed", "--target-head", "exact"]), "glm5_flash").is_ok());
         for target in ["exact", "tensor"] {
             for draft in ["exact", "tensor"] {
                 let layout = options(&parse(&["--fp8-head", "false", "--target-head", target,
                     "--draft-head", draft])).unwrap().layout.unwrap();
-                assert!(!layout.glmf_representation.fp8_head);
+                assert_eq!(layout.glmf_representation.head, GlmfHeadFormat::Bf16);
                 assert_eq!(layout.drafter_bytes, 0, "head arithmetic must not add a weight copy");
             }
         }

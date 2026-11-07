@@ -263,9 +263,8 @@ impl<'a> NativePrograms<'a> {
 
     /// `cuteafd_packed_head_workspace`: the row-64 B fragments plus runtime-SM split-K.
     pub fn packed_vocabulary_scratch(&self, rows: u64, n: u64) -> Result<u64> {
-        let splits = self.vocabulary_splits(rows, n)?;
-        let align = |bytes: u64| bytes.div_ceil(256) * 256;
-        Ok(align(5120 * 64 * 2) + if splits > 1 { align(splits * rows.min(64) * n * 4) } else { 0 })
+        self.vocabulary_splits(rows, n)?;
+        Ok(cuteafd_core::packed_head::workspace_bytes(rows, 5120, n, u64::from(self.sms)))
     }
 
     /// Scratch of one projection through `mode`'s resident copy of the vocabulary.

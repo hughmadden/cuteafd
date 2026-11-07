@@ -2085,15 +2085,24 @@ if [[ $family == glm5_flash ]]; then
       echo "PREFILL_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
     fi
   fi
+  # GLM5_FLASH_FP8_HEAD: the one resident LM head the target and drafter share. auto (default) = on,
+  # an E4M3 copy; off keeps the checkpoint's BF16; packed keeps the exact 12-bit copy of the BF16
+  # (mirroring V41_FP8_HEAD=packed): target logits exact, drafts through its coarse plane, about
+  # three quarters of the BF16 bytes. packed serves one GPU: refused with the two-GPU head split.
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;
-    on|off) ;;
-    *) echo "GLM5_FLASH_FP8_HEAD must be auto, on or off" >&2; exit 2 ;;
+    on|off|packed) ;;
+    *) echo "GLM5_FLASH_FP8_HEAD must be auto, on, off or packed" >&2; exit 2 ;;
   esac
+  if [[ $fp8_head == packed && $head_split != 0 ]]; then
+    echo "GLM5_FLASH_FP8_HEAD=packed keeps one exact 12-bit head on one GPU; the two-GPU head split takes on or off (or set RTX_GPUS=1)" >&2
+    exit 2
+  fi
   case "$fp8_head" in
     on) family_args+=(--fp8-head true) ;;
     off) family_args+=(--fp8-head false) ;;
+    packed) family_args+=(--fp8-head packed) ;;
   esac
   # GLM5_FLASH_DRAFT_LINEAR: w8a8 with an FP8 drafter; w8a16 runs the W8A16 GEMV in passes of
   # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
@@ -2108,14 +2117,14 @@ if [[ $family == glm5_flash ]]; then
   esac
   # GLM5_FLASH_TARGET_HEAD: GLM 5.3 Flash's own spelling of TARGET_HEAD (--target-head). auto
   # (default) forwards nothing: the shared setting applies (tensor cores at every row count over the
-  # BF16 head; the FP8 head runs its own program). exact (diagnostic) keeps the pedantic GEMM; an
-  # explicit tensor with the FP8 head is refused.
+  # BF16 head; the FP8 and packed heads run their own GEMVs). exact (diagnostic) keeps the pedantic
+  # GEMM; an explicit tensor with the FP8 or packed head is refused.
   target_head="$(get GLM5_FLASH_TARGET_HEAD auto)"
   case "$target_head" in
     ""|auto) ;;
     exact) family_args+=(--target-head exact) ;;
     tensor)
-      if [[ $fp8_head == on ]]; then
+      if [[ $fp8_head != off ]]; then
         echo "GLM5_FLASH_TARGET_HEAD=tensor runs the BF16 head; set GLM5_FLASH_FP8_HEAD=off" >&2
         exit 2
       fi
@@ -2370,7 +2379,8 @@ audio_encoder_hash=""
     [[ -z "$chat_template_from" || "$vision" == off ]] || plan_draft_args+=(--chat-template-from "$chat_template_from")
   fi
   if [[ "$family" == glm5_flash ]]; then
-    plan_draft_args+=(--kda-fp8 "$kda_fp8" --kda-state "${kda_state:-f32}" --fp8-head "$([[ $fp8_head == on ]] && echo true || echo false)")
+    case "$fp8_head" in on) plan_head=true ;; packed) plan_head=packed ;; *) plan_head=false ;; esac
+    plan_draft_args+=(--kda-fp8 "$kda_fp8" --kda-state "${kda_state:-f32}" --fp8-head "$plan_head")
     [[ "${target_head:-auto}" == auto || -z "${target_head:-}" ]] || plan_draft_args+=(--target-head "$target_head")
     # Draft-head arithmetic borrows the same target weight, not a second resident head.
     plan_draft_args+=(--draft-head exact)
