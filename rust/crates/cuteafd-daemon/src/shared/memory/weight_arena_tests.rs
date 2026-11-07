@@ -5,6 +5,46 @@ use cuteafd_loader::push_load::{
 };
 use std::collections::{BTreeMap, VecDeque};
 
+#[test]
+fn static_weight_views_retain_backing_and_match_tensor_checksums() -> Result<()> {
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    fixture.configure_memory(&library, 1, 1 << 20)?;
+    fixture.strict_device_free(&library, true)?;
+    let device = Device { library: &library, id: 1 };
+    let tensors = [("payload".to_string(), vec![3u8; 513]), ("scales".into(), vec![17u8; 258])];
+    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
+        tensors.iter().map(|(name, data)| (name.clone(), data.len())))?;
+    let arena = DeviceWeightArena::new(device, layout)?;
+    assert!(arena.view("absent", 513).is_err());
+    assert!(arena.view("payload", 512).is_err());
+    let views = tensors.iter().map(|(name, data)| arena.view(name, data.len())).collect::<Result<Vec<_>>>()?;
+    assert_eq!(views[1].buffer.ptr as usize - views[0].buffer.ptr as usize, 768);
+    for ((_, data), view) in tensors.iter().zip(&views) {
+        let tensor = Allocation::new(device, data.len())?;
+        device.run(|| {
+            library.copy_h2d(tensor.buffer, data)?;
+            library.copy_h2d(view.buffer, data)?;
+            let mut old = vec![0; data.len()];
+            let mut packed = vec![0; data.len()];
+            library.copy_d2h(&mut old, tensor.buffer)?;
+            library.copy_d2h(&mut packed, view.buffer)?;
+            assert_eq!(Sha256::digest(&old), Sha256::digest(&packed));
+            assert_eq!(&packed, data);
+            Ok(())
+        })?;
+    }
+    drop(arena);
+    assert_eq!(fixture.mapped_bytes(&library)?, 1026, "views retain the full physical request");
+    drop(views);
+    assert_eq!(fixture.mapped_bytes(&library)?, 0);
+    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+    Ok(())
+}
+
 struct FileWalk<'a> {
     walks: Vec<RunWalk<'a>>,
     heads: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u64, u32, usize)>>,

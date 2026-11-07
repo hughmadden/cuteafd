@@ -58,21 +58,38 @@ impl CoreWeightLayout {
         Ok(loaded)
     }
 
+    pub(crate) fn shared_layout(&self) -> cuteafd_loader::formats::trellis_core::CoreWeightLayout {
+        cuteafd_loader::formats::trellis_core::CoreWeightLayout {
+            stem: self.stem.clone(), side: self.side, rank: self.rank, ranks: self.ranks,
+            shape: self.shape, bytes: self.bytes, bits: self.bits, codebook: self.codebook,
+        }
+    }
+
+    pub(crate) fn arena_tensors(&self, prefix: &str) -> Result<Vec<(String, usize)>> {
+        self.shared_layout().arena_tensors(prefix)
+    }
+
     /// The shared native K6 recipe, used unchanged by mount and push loads.
     pub(crate) fn load_recorded<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
         dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void) -> Result<CoreWeights<'a>> {
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+            format!("K6/{}", self.stem), self.arena_tensors("projection")?)?;
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
+        self.load_recorded_in(device, checkpoint, dense, stream, &arena, "projection")
+    }
+
+    pub(crate) fn load_recorded_in<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
+        dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>, prefix: &str) -> Result<CoreWeights<'a>> {
         use crate::shared::experts::rtx::dense::{Job, Operand, Rect, Step};
         let metadata = |name: &str| -> Result<&cuteafd_loader::SafetensorsTensorMetadata> {
             let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("checkpoint lacks {name}"))?;
             Ok(&checkpoint.tensors[at].meta)
         };
-        let allocate = |bytes| {
-            let _scope = cuteafd_ffi::memory_ledger::scope("weights/native K6 core");
-            Allocation::new(device, bytes)
-        };
-        let landed = |r: Rect, bytes| -> Result<Allocation<'a>> {
-            let allocation = allocate(bytes)?;
+        let allocate = |suffix: &str, bytes| arena.view(&format!("{prefix}.{suffix}"), bytes);
+        let landed = |suffix: &str, r: Rect, bytes| -> Result<Allocation<'a>> {
+            let allocation = allocate(suffix, bytes)?;
             dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(r, 0)], bytes })?;
             Ok(allocation)
         };
@@ -96,7 +113,7 @@ impl CoreWeightLayout {
             TrellisSide::Input => local_n == n && local_k * self.ranks == k }
             && local_n % 128 == 0 && local_k % 128 == 0, "{stem}: K6 shard geometry");
         let tile_bytes = 32 * module.bits;
-        let payload = allocate(local_n * local_k * module.bits / 8)?;
+        let payload = allocate("payload", local_n * local_k * module.bits / 8)?;
         let k16 = local_k / 16;
         for (kr, source) in self.payload_rects(checkpoint, n)? {
             let rows = source.rows.len();
@@ -107,7 +124,7 @@ impl CoreWeightLayout {
             let name = format!("{stem}.{suffix}");
             let r = Rect::tensor(checkpoint, &name, None, Some(start * 2..(start + count) * 2))?;
             let bytes = r.bytes();
-            landed(r, bytes)
+            landed(suffix, r, bytes)
         };
         let suh = vector("suh", k0, local_k)?;
         let svh = vector("svh", n0, local_n)?;

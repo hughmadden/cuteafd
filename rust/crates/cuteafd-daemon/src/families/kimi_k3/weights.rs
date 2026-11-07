@@ -33,6 +33,13 @@ pub(crate) struct GlobalLayout {
 }
 
 impl GlobalLayout {
+    pub(crate) fn shared_layout(&self) -> cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout {
+        cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout {
+            rank: self.rank, hidden: self.hidden, vocab: self.vocab, operands: self.operands.clone(),
+            core_head: self.core_head.as_ref().map(CoreWeightLayout::shared_layout),
+        }
+    }
+
     pub(crate) fn pair(cfg: &KimiK3Config) -> Result<[Self; 2]> {
         Self::pair_with_core(cfg, &CoreInventory::default())
     }
@@ -159,6 +166,16 @@ pub(crate) struct LayerLayout {
 }
 
 impl LayerLayout {
+    pub(crate) fn shared_layout(&self) -> cuteafd_loader::families::kimi_k3::weight_layout::LayerLayout {
+        use cuteafd_loader::families::kimi_k3::weight_layout::WeightAttention;
+        cuteafd_loader::families::kimi_k3::weight_layout::LayerLayout {
+            operands: self.operands.clone(), native: self.native.clone(),
+            attention: match self.attention { AttentionShare::Absent => WeightAttention::Absent,
+                AttentionShare::Whole => WeightAttention::Whole, AttentionShare::Split => WeightAttention::Split },
+            core: self.core.iter().map(|(&name, layout)| (name, layout.shared_layout())).collect(),
+        }
+    }
+
     pub(crate) fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode) -> Result<[Self; 2]> {
         Self::pair_with_core(cfg, layer, mode, &CoreInventory::default())
     }

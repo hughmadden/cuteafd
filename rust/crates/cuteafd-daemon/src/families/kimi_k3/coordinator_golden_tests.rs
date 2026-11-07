@@ -172,8 +172,8 @@ fn recorded_for_ranks<'a>(library: &'a NativeLibrary, model: &Installed,
     load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, ranks: usize)
     -> Result<(Vec<(usize, GlobalWeights<'a>)>, Vec<(String, usize, LayerWeights<'a>)>)> {
     let devices = (0..ranks).map(|id| Device { library, id: id as i32 }).collect::<Vec<_>>();
-    let records = records::KimiRecords { checkpoint: &model.checkpoint, cfg: &model.cfg, core: &model.core, dense: load,
-        streams: devices.iter().map(|device| (device.id, std::ptr::null_mut())).collect() };
+    let records = records::KimiRecords::new(&model.checkpoint, &model.cfg, &model.core, load,
+        devices.iter().map(|device| (device.id, std::ptr::null_mut())).collect());
     let globals = GlobalLayout::ranks_with_core(&model.cfg, &model.core, ranks)?;
     let mut global = Vec::new();
     for (rank, layout) in globals.iter().enumerate() { global.push((rank, records.global(devices[rank], layout)?)); }
@@ -368,8 +368,8 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
     let checkpoint = Checkpoint::open(root.path())?;
     let model = Installed { checkpoint, cfg, core };
     let rejected = DenseLoad::push(&library);
-    let records = records::KimiRecords { checkpoint: &model.checkpoint, cfg: &model.cfg,
-        core: &model.core, dense: &rejected, streams: vec![(0, std::ptr::null_mut())] };
+    let records = records::KimiRecords::new(&model.checkpoint, &model.cfg,
+        &model.core, &rejected, vec![(0, std::ptr::null_mut())]);
     let device = Device { library: &library, id: 0 };
     let whole = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
     let mut invalid = LayerLayout::ranks_with_core(&model.cfg, 0, whole, &model.core, 1)?;

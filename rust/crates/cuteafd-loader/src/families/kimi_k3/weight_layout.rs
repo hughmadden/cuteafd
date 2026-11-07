@@ -6,6 +6,17 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
 use std::collections::BTreeMap;
 
+/// One physical request per coordinator rank. Views are stable across mount
+/// and push loads and include ordinary operands, K6 planes and native attention.
+pub fn coordinator_arena(rank: usize, global: &GlobalLayout, layers: &[&LayerLayout])
+    -> Result<crate::serving_capacity::WeightArenaLayout> {
+    let mut tensors = global.arena_tensors()?;
+    for (layer, layout) in layers.iter().enumerate() {
+        tensors.extend(layout.arena_tensors(&format!("layers.{layer}"))?);
+    }
+    crate::serving_capacity::WeightArenaLayout::new(format!("kimi/coordinator/{rank}"), tensors)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightAttention { Absent, Whole, Split }
 impl WeightAttention {
@@ -37,6 +48,12 @@ pub struct GlobalLayout {
     pub operands: BTreeMap<&'static str, usize>, pub core_head: Option<CoreWeightLayout>,
 }
 impl GlobalLayout {
+    pub fn arena_tensors(&self) -> Result<Vec<(String, usize)>> {
+        let mut tensors = self.operands.iter().map(|(name, bytes)| (format!("global.{name}"), *bytes)).collect::<Vec<_>>();
+        if let Some(head) = &self.core_head { tensors.extend(head.arena_tensors("global.head")?); }
+        Ok(tensors)
+    }
+
     pub fn ranks_with_core(cfg: &KimiK3Config, inventory: &CoreInventory, ranks: usize) -> Result<Vec<Self>> {
         ensure!(matches!(ranks, 1 | 2), "Kimi global rank count");
         let [mut entry, terminal] = Self::pair_with_core(cfg, inventory)?;
@@ -92,6 +109,22 @@ pub struct LayerLayout {
     pub native: BTreeMap<&'static str, crate::formats::native_attention::NativeLayout>,
 }
 impl LayerLayout {
+    pub fn arena_tensors(&self, prefix: &str) -> Result<Vec<(String, usize)>> {
+        let mut tensors = self.operands.iter().map(|(name, bytes)| (format!("{prefix}.{name}"), *bytes)).collect::<Vec<_>>();
+        for (name, layout) in &self.core { tensors.extend(layout.arena_tensors(&format!("{prefix}.{name}"))?); }
+        for (name, layout) in &self.native {
+            let [n, k] = layout.shape;
+            let values = n.checked_mul(k).and_then(|v| v.checked_mul(if layout.fp8 { 1 } else { 2 }))
+                .context("Kimi native arena extent overflow")?.max(256);
+            tensors.push((format!("{prefix}.{name}.values"), values));
+            if layout.fp8 {
+                let scales = usize::try_from(layout.bytes()?)?.checked_sub(values).context("Kimi native arena scales")?;
+                tensors.push((format!("{prefix}.{name}.scales"), scales));
+            }
+        }
+        Ok(tensors)
+    }
+
     pub fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode) -> Result<[Self; 2]> {
         Ok(Self::ranks(cfg, layer, mode, 2)?.try_into().expect("two rank layouts"))
     }

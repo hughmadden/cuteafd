@@ -451,8 +451,16 @@ impl<'a> Admission<'a> {
         ensure!(devices.len() == self.devices.len() && streams.len() == devices.len(),
             "Kimi dense records physical inventory differs from admission");
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-        let records = super::weights::records::KimiRecords { checkpoint, cfg: &self.cfg, core: &self.core,
-            dense: load, streams: streams.to_vec() };
+        let mut records = super::weights::records::KimiRecords::new(checkpoint, &self.cfg, &self.core,
+            load, streams.to_vec());
+        let arenas = devices.iter().enumerate().map(|(rank, &device)| {
+            let global = self.global_layouts[rank].shared_layout();
+            let layers = self.layouts.iter().map(|layouts| layouts[rank].shared_layout()).collect::<Vec<_>>();
+            let layout = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(
+                rank, &global, &layers.iter().collect::<Vec<_>>())?;
+            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?))
+        }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        records.arenas = Rc::new(arenas);
         let global = devices.iter().zip(&self.global_layouts).map(|(&device, layout)| records.global(device, layout))
             .collect::<Result<Vec<_>>>()?;
         memory.sample("weights-global-recorded")?;
