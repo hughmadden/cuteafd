@@ -29,6 +29,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,14 @@
 namespace {
 
 int failures = 0;
+
+// The value of a BF16 bit pattern.
+float bf16_value(uint16_t bits) {
+  const uint32_t word = uint32_t(bits) << 16;
+  float value;
+  std::memcpy(&value, &word, 4);
+  return value;
+}
 
 void fail(const char* what, const std::string& where, long long a = 0, long long b = 0) {
   ++failures;
@@ -382,6 +391,96 @@ void device_part(const Pack& p, cudaStream_t s) {
       CUDA_MUST(cudaStreamSynchronize(s));
       check(std::memcmp(one.data(), wide.data(), n * 2) == 0, "row 0 is invariant to the step width", p.name, rows);
     }
+  }
+  // Strided and grouped GEMVs (decode rows 1..64): a pack's columns written into wider rows, and
+  // three packs sharing one launch, each element bit for bit the plain linear's; and the BF16 GEMV
+  // for BF16 rows beside them (its own K split: row-width invariant, and within BF16 rounding of
+  // cuBLAS over the same weights).
+  if (p.n % 32 == 0 && p.k % 256 == 0) {
+    const int32_t ldo = 3 * p.n + 16;
+    void* wide_out = nullptr;
+    CUDA_MUST(cudaMalloc(&wide_out, size_t(64) * ldo * 2));
+    std::vector<uint16_t> plain(size_t(64) * n), strided(size_t(64) * ldo);
+    for (int rows : {1, 7, 16, 17, 33, 64}) {
+      MUST(cuteafd_kx7_linear(dx, &d.header, res, rows, ws, ws_bytes, s));
+      CUDA_MUST(cudaMemcpyAsync(plain.data(), res, size_t(rows) * n * 2, cudaMemcpyDeviceToHost, s));
+      CUDA_MUST(cudaMemsetAsync(wide_out, 0xff, size_t(64) * ldo * 2, s));
+      MUST(cuteafd_kx7_linear_ld(dx, &d.header, static_cast<uint16_t*>(wide_out) + 16, ldo, rows, s));
+      CUDA_MUST(cudaMemcpyAsync(strided.data(), wide_out, size_t(rows) * ldo * 2, cudaMemcpyDeviceToHost, s));
+      CUDA_MUST(cudaStreamSynchronize(s));
+      bool same = true, untouched = true;
+      for (int r = 0; r < rows; ++r) {
+        same = same && std::memcmp(&plain[size_t(r) * n], &strided[size_t(r) * ldo + 16], n * 2) == 0;
+        for (size_t c = 0; c < 16; ++c) untouched = untouched && strided[size_t(r) * ldo + c] == 0xffff;
+        for (size_t c = 16 + n; c < size_t(ldo); ++c) untouched = untouched && strided[size_t(r) * ldo + c] == 0xffff;
+      }
+      check(same, "a strided GEMV equals the linear", p.name, rows);
+      check(untouched, "a strided GEMV writes only its columns", p.name, rows);
+      const cuteafd_kx7_pack_t* group[3] = {&d.header, &d.header, &d.header};
+      const int32_t col0[3] = {0, p.n, 2 * p.n};
+      CUDA_MUST(cudaMemsetAsync(wide_out, 0xff, size_t(64) * ldo * 2, s));
+      MUST(cuteafd_kx7_gemv_group(dx, group, 3, col0, wide_out, ldo, rows, s));
+      CUDA_MUST(cudaMemcpyAsync(strided.data(), wide_out, size_t(rows) * ldo * 2, cudaMemcpyDeviceToHost, s));
+      CUDA_MUST(cudaStreamSynchronize(s));
+      same = true;
+      for (int r = 0; r < rows; ++r) {
+        for (int g = 0; g < 3; ++g) {
+          same = same && std::memcmp(&plain[size_t(r) * n], &strided[size_t(r) * ldo + size_t(g) * n], n * 2) == 0;
+        }
+      }
+      check(same, "a grouped GEMV equals each pack's linear", p.name, rows);
+    }
+    const cuteafd_kx7_pack_t* group[2] = {&d.header, &d.header};
+    const int32_t overlap[2] = {0, p.n};
+    check(cuteafd_kx7_gemv_group(dx, group, 2, overlap, wide_out, 2 * p.n - 2, 1, s) != 0,
+          "a group past its rows is refused", p.name);
+    check(cuteafd_kx7_gemv_group(dx, group, 2, overlap, wide_out, ldo, 65, s) != 0,
+          "a group past the GEMV's rows is refused", p.name);
+    check(cuteafd_kx7_linear_ld(dx, &d.header, wide_out, p.n - 8, 1, s) != 0, "a stride below n is refused", p.name);
+    if (p.k % 512 == 0) {
+      // Against an FP64 dot product over sampled columns: every output within half a BF16 ulp of
+      // the exact value plus FP32 accumulation slack; cuBLAS and the KS=4 twin are printed too.
+      std::vector<uint16_t> mine(size_t(64) * ldo), twin(size_t(64) * n), blas(size_t(64) * n), first(n);
+      auto worst = [&](const std::vector<uint16_t>& got, size_t stride, int rows) {
+        double ratio = 0.0;
+        for (int r = 0; r < rows; ++r) {
+          for (size_t c = 0; c < n; c += 97) {
+            double exact = 0.0, scale = 0.0;
+            for (size_t i = 0; i < k; ++i) {
+              const double t = double(bf16_value(x[size_t(r) * k + i])) * double(bf16_value(p.source[c * k + i]));
+              exact += t;
+              scale += std::fabs(t);
+            }
+            const double err = std::fabs(double(bf16_value(got[size_t(r) * stride + c])) - exact);
+            ratio = std::max(ratio, err / (std::ldexp(std::fabs(exact), -8) + 1e-6 * scale + 1e-30));
+          }
+        }
+        return ratio;
+      };
+      for (int rows : {1, 7, 16, 17, 33, 64}) {
+        MUST(cuteafd_bf16_gemv_ld(dx, dw, wide_out, ldo, rows, p.n, p.k, s));
+        CUDA_MUST(cudaMemcpyAsync(mine.data(), wide_out, size_t(rows) * ldo * 2, cudaMemcpyDeviceToHost, s));
+        const bool twin_ok = p.n % 32 == 0;
+        if (twin_ok) {
+          CUDA_MUST(cudaError_t(cuteafd_kx7_reference_gemv(dx, dw, ref, rows, int32_t(n), int32_t(k), s)));
+          CUDA_MUST(cudaMemcpyAsync(twin.data(), ref, size_t(rows) * n * 2, cudaMemcpyDeviceToHost, s));
+        }
+        MUST(cuteafd_cuda_linear_bf16_cublas_async(static_cast<const uint16_t*>(dx), static_cast<const uint16_t*>(dw),
+                                                   nullptr, static_cast<uint16_t*>(res), size_t(rows), k, n, s));
+        CUDA_MUST(cudaMemcpyAsync(blas.data(), res, size_t(rows) * n * 2, cudaMemcpyDeviceToHost, s));
+        CUDA_MUST(cudaStreamSynchronize(s));
+        if (rows == 1) std::memcpy(first.data(), mine.data(), n * 2);
+        const double m = worst(mine, ldo, rows), t = twin_ok ? worst(twin, n, rows) : 0.0, b = worst(blas, n, rows);
+        std::printf("  bf16 GEMV %-18s rows %2d: worst error / bound: this %.3f, KS=4 twin %.3f, cuBLAS %.3f\n",
+                    p.name.c_str(), rows, m, t, b);
+        check(m <= 1.0, "the BF16 GEMV is within its FP64 bound", p.name, rows, (long long)(m * 1000));
+        check(b <= 1.0, "cuBLAS's BF16 GEMM keeps FP32 reductions (within the FP64 bound)", p.name, rows,
+              (long long)(b * 1000));
+        check(std::memcmp(first.data(), mine.data(), n * 2) == 0, "the BF16 GEMV's row 0 is width-invariant", p.name,
+              rows);
+      }
+    }
+    cudaFree(wide_out);
   }
   const int rows = 64;
   const size_t bytes = size_t(rows) * n * 2;

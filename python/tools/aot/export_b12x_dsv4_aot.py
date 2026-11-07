@@ -378,7 +378,7 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     """Native trellis projection boundaries using the original Flash primitives."""
     from functools import partial
     from b12x.integration.cuteafd.glmf_split import (
-        compile_glmf_kda_core_aot, compile_glmf_stage_aot,
+        compile_glmf_kda_core_aot, compile_glmf_kda_core_projected_aot, compile_glmf_stage_aot,
         compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
         compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot,
         compile_glmf_fp8_linear_aot)
@@ -432,6 +432,12 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
             params = dict(max_rows=rows, decode=decode, state_dtype="bfloat16", state_rounding=rounding)
             out.append((f"kda_core_{tag}_m{rows}", "kda_core", params,
                         partial(compile_glmf_kda_core_aot, g, **params)))
+    # KX7 decode steps (--kda-exact kx7, FP32 state, at most 64 rows): the staged KDA body over
+    # in-projection rows the engine writes itself; appended after every existing entry.
+    for rows in sorted(r for r in decode_caps if r <= 64):
+        params = dict(max_rows=rows, decode=True)
+        out.append((f"kda_core_projected_m{rows}", "kda_core", params,
+                    partial(compile_glmf_kda_core_projected_aot, g, **params)))
     return out
 
 
