@@ -11,6 +11,40 @@ use crate::shared::{memory::{device::{Device, Stream}, receipts::Inventory,
     experts::{exlr8::Exlr8Weights, exl3::{Exl3Weights, execution::{Exl3Modules, Exl3ModulePaths}}}};
 use std::{collections::BTreeMap, path::{Path, PathBuf}, rc::Rc};
 
+#[test]
+fn glm_expert_census_resides_weights_before_kv_only() -> Result<()> {
+    use cuteafd_loader::placement::planner::{Allocation, Phase, PhaseOrder, Receipt, View};
+    use crate::families::glm5::engine::resident_expert_weights;
+    let owner = |id: &str| Receipt { allocation: Allocation::buffer(id, Location::coordinator(0), 64,
+        Lifetime::TARGET, Category::Experts, "resident expert owners"), address: 0x10000 };
+    let mut root = owner("experts.exl3.gpu.1.selection");
+    root.allocation.category = Category::Weights;
+    root.allocation.group = "weight arena".into();
+    let mut alias = owner("glm.expert.routed.rank.0.weight.3.0");
+    alias.allocation.view = Some(View { backing: root.allocation.id.clone(), offset: 0 });
+    let push = owner("glm.expert.routed.rank.0.weight.7.0.backing");
+    let shared = owner("glm.expert.shared.rank.1.layer.4.backing");
+    let workspace = owner("glm.expert.routed.rank.0.execution.0.weight.3");
+    let pair = owner("glm.expert.routed.routes.0");
+    let mut receipts = vec![root, alias, push, shared, workspace, pair];
+    let mut invalid = receipts.clone();
+    invalid[1].allocation.view.as_mut().unwrap().backing = "missing".into();
+    assert!(resident_expert_weights(&mut invalid).is_err());
+    assert!(invalid.iter().all(|r| r.allocation.lifetime == Lifetime::TARGET), "failed census mutates lifetimes");
+    invalid = receipts.clone();
+    invalid[4].allocation.view = invalid[1].allocation.view.clone();
+    assert!(resident_expert_weights(&mut invalid).is_err(), "workspace alias silently becomes a weight");
+    resident_expert_weights(&mut receipts)?;
+    for (index, receipt) in receipts.iter().enumerate() {
+        let lifetime = receipt.allocation.lifetime;
+        assert_eq!(lifetime, if index < 4 { Lifetime::RESIDENT } else { Lifetime::TARGET });
+        assert_eq!(lifetime.contains(Phase::Load, PhaseOrder::TARGET_THEN_DRAFT), index < 4);
+        assert!(lifetime.contains(Phase::Ready, PhaseOrder::TARGET_THEN_DRAFT));
+    }
+    resident_expert_weights(&mut receipts)?;
+    Ok(())
+}
+
 fn installed_snapshot(repo: &str) -> Result<PathBuf> {
     let home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(||
         PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface"));
@@ -79,7 +113,7 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
     let root = tempfile::tempdir()?;
     let tensors = [1, 2].into_iter().flat_map(|layer| (0..cfg.experts).flat_map(move |expert|
         ["gate_proj", "up_proj", "down_proj"].into_iter().flat_map(move |projection|
-            exl3(&format!("model.layers.{layer}.mlp.experts.{expert}.{projection}"), 256, 256, 4))))
+            exl3(&format!("model.layers.{layer}.mlp.experts.{expert}.{projection}"), 256, 256, 3 + expert))))
         .collect::<Vec<_>>();
     write_snapshot(root.path(), &config, &tensors, None);
     let path = root.path().join("model-00001-of-00001.safetensors");
@@ -94,9 +128,6 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
     fixture.immediate_copies(&library)?;
     fixture.strict_device_free(&library, true)?;
     for rank in 0..2 { fixture.configure_memory(&library, rank, 1usize << 30)?; }
-    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
-    let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
-    let ranks = [0, 1].map(|rank| RankDevice { device: rank as i32, stream: streams[rank].raw });
     let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"), "/../../../third_party/sparkinfer.lock.json")))?;
     for world in [1, 2] {
@@ -108,7 +139,7 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
             let meta = serde_json::json!({
                 "schema":"cuteafd.v41-exl3-aot.v1", "sparkinfer_revision":lock["revision"],
                 "hidden":cfg.hidden,"intermediate":cfg.moe_intermediate/world,"experts":cfg.experts,
-                "top_k":cfg.topk,"capacity":capacity,"bits":[4],"output_dtype":"fp32",
+                "top_k":cfg.topk,"capacity":capacity,"bits":[3,4],"output_dtype":"fp32",
                 "swiglu_limit":geometry.swiglu_limit(),"direct":true,"sms":1,"blocks_per_sm":1,
                 "decode_capacity":capacity <= 80,"tile":[64,128,64,128],
                 "objects":[{"label":"v41_exl3_core","pointer_slots":["gate_suh_ptr"],"scalar_slots":["active_m"]},
@@ -123,6 +154,11 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
         }
         let local = glm5::LocalInventory { package: package.clone(), format: glm5::GlmLocalFormat::Exl3,
             experts: vec![], backend_workspace: 0, extra_workspace: [0;2], world, unit_limit: 0 };
+        for physical in [[0, 1], [1, 0]] {
+        let coordinator = CoordinatorDevices::new(&physical[..world])?;
+        let devices = physical.map(|id| Device { library: &library, id });
+        let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
+        let ranks = [0, 1].map(|rank| RankDevice { device: physical[rank], stream: streams[rank].raw });
         for rows in [64, 256] {
             let mut selected = LocalPhysicalInput { layers: vec![1, 2], max_rows: rows, lanes: 2,
                 storage: LocalStorage::Mount, route_checks: true, peer_diagnostics: false,
@@ -163,11 +199,11 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
                     let mut backend = owners.iter().enumerate().map(|(rank, owner)|
                         owner.execution_with_modules(Some(modules(&fixture, devices[rank], &package, rows)?))
                             .map(|execution| Box::new(execution) as Box<dyn RtxExpertLayer>)).collect::<Result<Vec<_>>>()?;
-                    let mut actual = Inventory::new(CoordinatorDevices::new(&[0, 1])?, "glm", Lifetime::TARGET,
+                    let mut actual = Inventory::new(coordinator, "glm", Lifetime::TARGET,
                         Category::Experts, "resident expert owners");
                     // Check the backend's complete physical sum before pair routes/checks are added.
                     for (rank, executor) in backend.iter().enumerate() {
-                        let mut receipts = Inventory::new(CoordinatorDevices::new(&[0, 1])?, "glm", Lifetime::TARGET,
+                        let mut receipts = Inventory::new(coordinator, "glm", Lifetime::TARGET,
                             Category::Experts, "resident expert owners");
                         executor.allocation_receipts(&mut receipts, &format!("expert.routed.rank.{rank}"))?;
                         assert_eq!(receipts.receipts.iter().filter(|r| r.allocation.view.is_none()).map(|r| r.allocation.bytes).sum::<u64>(),
@@ -181,15 +217,20 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
                         assert!(pair.start_checks(true)?);
                         pair.allocation_receipts(&mut actual, "expert.routed")?;
                     }
+                    crate::families::glm5::engine::resident_expert_weights(&mut actual.receipts)?;
+                    assert!(actual.receipts.iter().any(|r| r.allocation.lifetime == Lifetime::RESIDENT));
+                    assert!(actual.receipts.iter().any(|r| r.allocation.lifetime == Lifetime::TARGET));
                     let actual_len = actual.receipts.len();
                     let actual = actual.receipts.into_iter().map(|r| (r.allocation.id.clone(), r.allocation)).collect::<BTreeMap<_, _>>();
                     let expected_len = expected.owners.len() + expected.views.len();
-                    let expected = expected.owners.into_iter().chain(expected.views).map(|a| (a.id.clone(), a)).collect::<BTreeMap<_, _>>();
+                    let expected = coordinator.remap_weight_arenas(&expected.owners.into_iter().chain(expected.views).collect::<Vec<_>>())?
+                        .into_iter().map(|a| (a.id.clone(), a)).collect::<BTreeMap<_, _>>();
                     assert_eq!(actual.len(), actual_len, "duplicate runtime IDs");
                     assert_eq!(expected.len(), expected_len, "duplicate planner IDs");
-                    assert_eq!(actual, expected, "TP{world} {storage:?} {rows} {:?}", selected.layers);
+                    assert_eq!(actual, expected, "TP{world} {storage:?} {rows} {:?} {physical:?}", selected.layers);
                 }
             }
+        }
         }
     }
     Ok(())
@@ -225,15 +266,17 @@ fn glm_fp8_package_physical_weights_equal_mount_and_push() -> Result<()> {
     let mut selected = LocalPhysicalInput { layers:vec![1,2], max_rows:64, lanes:2,
         storage:LocalStorage::Mount, route_checks:true, peer_diagnostics:false, activations:PrefillActivations::A16 };
     let source = LocalPhysicalSource::read(&cfg, &catalog, &local, &selected, None)?;
+    for physical in [[0, 1], [1, 0]] {
+    let coordinator = CoordinatorDevices::new(&physical)?;
     for layers in [vec![1], vec![1,2], vec![2]] {
         selected.layers = layers;
         for storage in [LocalStorage::Mount, LocalStorage::Push] {
             selected.storage = storage;
             let expected = source.inventory(&selected)?;
-            let mut actual = Inventory::new(CoordinatorDevices::new(&[0,1])?, "glm", Lifetime::TARGET,
+            let mut actual = Inventory::new(coordinator, "glm", Lifetime::RESIDENT,
                 Category::Experts, "resident expert owners");
             for rank in 0..2 {
-                let device = Device { library:&library, id:rank as i32 };
+                let device = Device { library:&library, id:physical[rank] };
                 let (_, slicing) = cuteafd_loader::formats::fp8_experts::exact_layout_directory(&package, &tensors, 2, rank);
                 let weights = if storage == LocalStorage::Mount {
                     let arena = crate::shared::experts::weight_layout::arena(device, "fp8",
@@ -262,11 +305,13 @@ fn glm_fp8_package_physical_weights_equal_mount_and_push() -> Result<()> {
             }
             let actual_len = actual.receipts.len();
             let actual = actual.receipts.into_iter().map(|r| (r.allocation.id.clone(),r.allocation)).collect::<BTreeMap<_,_>>();
-            let expected = expected.owners.into_iter().chain(expected.views).filter(|a| a.id.starts_with("experts.")
-                || a.id.contains(".weight.")).map(|a| (a.id.clone(),a)).collect::<BTreeMap<_,_>>();
+            let expected = coordinator.remap_weight_arenas(&expected.owners.into_iter().chain(expected.views).collect::<Vec<_>>())?
+                .into_iter().filter(|a| a.id.starts_with("experts.") || a.id.contains(".weight."))
+                .map(|a| (a.id.clone(),a)).collect::<BTreeMap<_,_>>();
             assert_eq!(actual.len(),actual_len,"duplicate FP8 runtime IDs");
-            assert_eq!(actual,expected,"FP8 {storage:?} {:?}",selected.layers);
+            assert_eq!(actual,expected,"FP8 {storage:?} {:?} {physical:?}",selected.layers);
         }
+    }
     }
     Ok(())
 }
@@ -413,6 +458,7 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
         assert!(pair.start_checks(true)?);
         let mut actual = Inventory::new(CoordinatorDevices::new(&[0, 1])?, "glm", Lifetime::TARGET, Category::Experts, "resident expert owners");
         pair.allocation_receipts(&mut actual, "expert.routed")?;
+        crate::families::glm5::engine::resident_expert_weights(&mut actual.receipts)?;
         if !native && storage == LocalStorage::Mount {
             let layouts = (0..2).map(|rank| crate::shared::experts::weight_layout::layout(
                 devices[rank].id, "exl3", crate::shared::experts::exl3::regions(catalog,

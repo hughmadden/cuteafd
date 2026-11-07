@@ -194,7 +194,7 @@ impl LocalPhysicalSource {
                 let format = if self.format == GlmLocalFormat::Exl3 { "exl3" } else { "fp8" };
                 let layout = WeightArenaLayout::new(expert_weight_arena_id(format, rank as i32, &regions)?, regions)?;
                 out.record(Allocation::buffer(layout.id(), location, u64::try_from(layout.bytes())?,
-                    Lifetime::TARGET, Category::Weights, "weight arena"));
+                    Lifetime::RESIDENT, Category::Weights, "weight arena"));
                 Some(layout)
             } else { None };
             let mut rank_backing: Option<String> = None;
@@ -239,6 +239,11 @@ impl LocalPhysicalSource {
                     }
                 }
             }
+        }
+        // Weight backings and aliases already exist when KV is first allocated;
+        // executor, pair and check storage binds afterward.
+        for weight in out.owners.iter_mut().chain(&mut out.views) {
+            weight.lifetime = Lifetime::RESIDENT;
         }
         out.owners.extend(self.backend.owners.iter().cloned());
         out.views.extend(self.backend.views.iter().cloned());
