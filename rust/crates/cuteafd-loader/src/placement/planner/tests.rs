@@ -127,7 +127,7 @@ fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
         pool_tokens: 64, phases: evaluate(&physical, &budgets).unwrap(), facts: physical, budgets };
     let original = plan.clone();
     let graphs = GraphSet { ranks: vec![rank], shapes: 1, lifetime: GraphLifetime::Startup };
-    let declared = vec!["exact keys".into()];
+    let declared: Vec<String> = vec!["exact keys".into()];
     let capture = CapturedGraphRank { declared_graphs: declared[0].clone(), executables: 2, bytes: 200 };
     let measured = serving::reconcile_startup_graphs(&mut plan, "test", &graphs, &declared, &[capture.clone()]).unwrap();
     assert_eq!(measured.ranks[0].bytes, 200);
