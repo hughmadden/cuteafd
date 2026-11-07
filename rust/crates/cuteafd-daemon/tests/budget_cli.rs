@@ -89,7 +89,7 @@ fn global_resident_weight_flag_reaches_plan_admission() {
             .args(["--coordinator-weight-budget-gib", gib, "plan"])
             .arg(snapshot.path()).arg("--workspace-manifest").arg(&manifest)
             .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--spark-memory-cap", "256GiB",
-                "--speculator", "off", "--attention-placement", "heads", "--rtx-expert-layers", "0", "--context-tokens", "262144",
+                "--speculator", "off", "--attention-placement", "heads", "--rtx-expert-layers", "0", "--max-context-tokens", "262144",
                 "--pool-tokens", "262144", "--concurrency", "2", "--prefix-slots", "0",
                 "--host-cache-bytes", "0", "--prefill-rows", "2048", "--prefill-waves", "2",
                 "--vision", "off", "--audio", "off", "--json", "--require-ready"])
@@ -121,7 +121,7 @@ fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
             command.args(["--gpu-memory-cap", &format!("{gib}GiB"),
                 "--coordinator-weight-budget-gib", "80", "plan"]).arg(snapshot.path())
                 .args(["--spark-ranks", "4", "--spark-memory-cap", "100GiB", "--speculator", "off",
-                    "--context-tokens", "262144", "--concurrency", "8", "--prefill-rows", "2048",
+                    "--max-context-tokens", "262144", "--concurrency", "8", "--prefill-rows", "2048",
                     "--prefill-waves", "2", "--vision", "off", "--audio", "off", "--json", "--require-ready"]);
             if layout { command.args(["--layout", "--rtx", "2"]); }
             let output = command

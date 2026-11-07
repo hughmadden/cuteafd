@@ -46,10 +46,9 @@ fn invalid(detail: impl std::fmt::Display) -> Refusal {
 
 /// The largest pool tokens this build may index: the automatic target or the
 /// explicit request, rounded up to the profile's pool quantum.
-pub fn maximum_pool_tokens(cards: &[u64], context: u64, requested: Option<u64>, page_rows: u64,
-    spark_free: bool) -> u64 {
+pub fn maximum_pool_tokens(cards: &[u64], context: u64, requested: Option<u64>, page_rows: u64) -> u64 {
     let page = page_rows.max(1);
-    crate::placement::PoolPolicy::resolve(cards, context, requested, page, spark_free)
+    crate::placement::PoolPolicy::resolve(cards, context, requested, page)
         .maximum_tokens()
         .div_ceil(page)
         .saturating_mul(page)
@@ -109,11 +108,11 @@ pub fn device_headroom(rank: usize, startup_probe_bytes: u64) -> u64 {
     crate::placement::reserve::gpu("mimo_v2").max(probe)
 }
 
-pub fn production_request(context: u64, pool: Option<u64>, onboard: crate::placement::Onboard,
+pub fn production_request(context: impl Into<crate::placement::planner::Context>, pool: Option<u64>, onboard: crate::placement::Onboard,
     prefill: PrefillShape, operation: Operation, resident_weight_limit: ResidentWeights,
     spark_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats) -> Request {
     Request {
-        context,
+        context: context.into(),
         pool: crate::placement::PoolPolicy::normalize_request(pool).map_or(Pin::Auto, Pin::Exact),
         onboard: match onboard {
             crate::placement::Onboard::Auto => Pin::Auto,
@@ -550,7 +549,7 @@ impl MimoRecipe<'_> {
 
 impl Recipe for MimoRecipe<'_> {
     fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
-        if request.context == 0 { return Err(invalid("zero context")); }
+        if request.context.maximum == 0 { return Err(invalid("zero context")); }
         let maximum = self.maximum_pages;
         let mut contract = Contract { floor_fallback: None,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
@@ -790,7 +789,7 @@ pub fn resolved_capacity(admitted: &AdmittedMimo, concurrency: u32, rings: u32)
                     && budget.locations.iter().any(|location|
                         matches!(location.device, crate::placement::planner::Device::Coordinator(_))));
             (if small { 1u64 << 20 } else { 2u64 << 20 })
-                .max(admitted.solved.request.context)
+                .max(admitted.solved.request.context.maximum)
                 .div_ceil(profile.pool_unit_rows)
                 .saturating_mul(profile.pool_unit_rows)
         }
@@ -800,14 +799,14 @@ pub fn resolved_capacity(admitted: &AdmittedMimo, concurrency: u32, rings: u32)
         state_slots: rings,
         checkpoint_max_context_tokens: profile.context.checkpoint_max_tokens,
         compiled_index_max_context_tokens: profile.context.compiled_index_max_tokens,
-        effective_max_context_tokens: admitted.solved.request.context,
+        effective_max_context_tokens: admitted.solved.request.context.served(admitted.solved.pool_tokens),
         requested_kv_floor_tokens: floor,
         feasible_gpu_kv_tokens: feasible,
         allocated_gpu_kv_tokens: placement.pool_tokens,
         requested_floor_fits_hardware: feasible >= floor,
         requested_floor_allocated: placement.pool_tokens >= floor,
         requested_floor_shortfall_tokens: floor.saturating_sub(placement.pool_tokens),
-        active_max_context_sequences: (units / admitted.solved.request.context.div_ceil(profile.pool_unit_rows))
+        active_max_context_sequences: (units / admitted.solved.request.context.served(admitted.solved.pool_tokens).div_ceil(profile.pool_unit_rows))
             .min(concurrency as u64) as u32,
         host_prefix_bytes: profile.host_prefix_bytes,
         explicit_pool_override: matches!(admitted.solved.request.pool, Pin::Exact(_)),

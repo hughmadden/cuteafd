@@ -69,8 +69,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (layer 0 is the only dense layer).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence; 0 selects the checkpoint's full context.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<usize>)]
     pub max_context: usize,
     /// Tokens the full-attention record pool holds across sequences; 0 sizes
     /// it from what every GPU has left after weights, workspaces, graphs and
@@ -347,7 +347,7 @@ mod draft_storage_tests {
         assert_eq!(automatic.pool_tokens, 0);
         assert_eq!(automatic.prefill_span_rows, 16384);
         assert_eq!(automatic.token_io.embed_placement, None);
-        let explicit = args(&["--max-context", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
+        let explicit = args(&["--max-context-tokens", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
         assert_eq!(explicit.max_context, 32768);
         assert_eq!(explicit.pool_tokens, 131072);
         assert_eq!(explicit.token_io.embed_placement, Some(crate::shared::token_io::EmbedPlacement::Gpu));
@@ -511,7 +511,7 @@ mod source_format_tests {
     fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
         let automatic = crate::commands::bench::assert_resolved_family_seam("mimo_v2",
-            &["max-context", "pool-tokens", "prefill-rows", "prefill-waves", "prefill-span-rows",
+            &["max-context-tokens", "pool-tokens", "prefill-rows", "prefill-waves", "prefill-span-rows",
                 "onboard", "split-device", "embedding-placement"], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
                 serve::resolve_serving_capacity(&mut args, 16, false);
@@ -991,7 +991,7 @@ impl Opened {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, media: crate::shared::experts::rtx::dense::Records,
         prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
-        let automatic_context = args.max_context == 0;
+        let requested_context = (args.max_context > 0).then_some(args.max_context as u64);
         let shape = admission::resolved_prefill_shape(usize::from(args.peers.is_some()),
             args.prefill_rows, args.prefill_waves)?;
         let depth = shape.waves as usize;
@@ -1071,14 +1071,14 @@ impl Opened {
                 Ok(())
             })?;
         }
-        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
+        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, cuteafd_loader::placement::planner::Context::resolve(resolved.max_context as u64, requested_context))?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
         cuteafd_bench::context::set_rtx_expert_layers(preflight.placement.onboard_layers);
         resolved.prefill_rows = preflight.prefill_rows;
         resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
         cuteafd_bench::context::ResolvedSettings::placement(&preflight.placement).publish();
         cuteafd_bench::context::ResolvedSettings::default()
-            .value("max-context", resolved.max_context).value("prefill-rows", resolved.prefill_rows)
+            .value("max-context-tokens", resolved.max_context).value("prefill-rows", resolved.prefill_rows)
             .value("prefill-waves", resolved.prefill_waves).value("prefill-span-rows", resolved.prefill_span_rows)
             .value("embedding-placement", format!("{:?}", resolved.token_io.embed_placement.unwrap()).to_lowercase()).publish();
         let args = &resolved;

@@ -227,17 +227,17 @@ pub enum CacheGeometryError {
 pub enum PoolContextError {
     #[error("explicit context {context} > admitted pool supports {pool}; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change")]
     Explicit { context: usize, pool: usize },
-    #[error("admitted pool {pool} cannot hold one request plus its safety margin")]
+    #[error("admitted pool {pool} cannot hold one request")]
     TooSmall { pool: usize },
 }
 
 /// Resolve the serving extent before sizing pool-dependent startup inventories.
-pub fn pool_context(context: usize, automatic: bool, pool: usize, unit: usize) -> Result<usize, PoolContextError> {
-    if context <= pool { return Ok(context); }
-    if !automatic { return Err(PoolContextError::Explicit { context, pool }); }
-    let supported = pool.saturating_sub(unit.max(64));
-    if supported == 0 { return Err(PoolContextError::TooSmall { pool }); }
-    Ok(supported)
+pub fn pool_context(context: crate::placement::planner::Context, pool: usize) -> Result<usize, PoolContextError> {
+    if pool == 0 { return Err(PoolContextError::TooSmall { pool }); }
+    if context.required() > pool as u64 {
+        return Err(PoolContextError::Explicit { context: context.required() as usize, pool });
+    }
+    Ok(context.served(pool as u64) as usize)
 }
 
 /// Shared scalar/WMMA draft-attention arena. WMMA capacity partitions are

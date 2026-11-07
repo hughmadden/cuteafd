@@ -211,7 +211,7 @@ mod tests {
             expert_usage: false,
             cfg, layers: 4, kv: MimoKvFormats::default(), mtp_stages: 0, context,
             maximum_pool_tokens: admission::maximum_pool_tokens(&[96 << 30; 2][..ranks], context,
-                None, spark.pool_unit_rows, false),
+                None, spark.pool_unit_rows),
             prefill: crate::placement::planner::PrefillShape { rows: 4096, waves: 3 },
             lanes: 3, embedding: crate::placement::planner::EmbeddingHome::Device(0),
             gpus: ranks, spark_ranks: 6,

@@ -138,9 +138,7 @@ impl<'a> Step5Recipe<'a> {
             &capacities,
             inputs.context,
             inputs.requested_pool,
-            PAGE_ROWS,
-            false,
-        )
+            PAGE_ROWS)
         .maximum_tokens()
         .div_ceil(PAGE_ROWS);
         ensure!(maximum_pages > 0, "Step-5 empty pool ceiling");
@@ -333,7 +331,7 @@ impl<'a> Step5Recipe<'a> {
     /// omission both select automatic admission.
     pub fn request(&self) -> Request {
         Request {
-            context: self.inputs.context,
+            context: self.inputs.serving_context,
             pool: PoolPolicy::normalize_request(self.inputs.requested_pool)
                 .map_or(Pin::Auto, Pin::Exact),
             onboard: match self.inputs.onboard.as_ref().map(|onboard| onboard.mode) {
@@ -439,9 +437,9 @@ impl Recipe for Step5Recipe<'_> {
             || self.attention.len() != self.cfg.layers
             || self.maximum_pages == 0
             || self.maximum_pages == u64::MAX
-            || request.context != self.inputs.context
-            || request.context < FLOOR
-            || request.context > self.cfg.max_context
+            || request.context.maximum != self.inputs.context
+            || request.context.maximum < FLOOR
+            || request.context.maximum > self.cfg.max_context
             || self.counts.len() != self.routes.len() + 1
             || self.destination.is_empty()
             || self.cfg.layers != 92
@@ -674,7 +672,7 @@ impl Step5Recipe<'_> {
                 && solved.decisions.embedding == Some(EmbeddingHome::Device(0))
                 && solved.decisions.attention.is_empty()
                 && solved.pool_tokens % self.page_rows == 0
-                && solved.pool_tokens >= self.inputs.context,
+                && solved.pool_tokens >= self.inputs.serving_context.required(),
             "Step-5 resolved execution differs from prepared geometry"
         );
         let onboarded = solved.decisions.onboard_layers.first().cloned().unwrap_or_default();
@@ -776,10 +774,11 @@ impl Step5Recipe<'_> {
             .map(|rank| Reservation::new(&self.figures.cache, rank, self.inputs.sequences as u64,
                 self.marks, pages, usize::MAX))
             .collect::<Result<Vec<_>>>()?;
+        let cache = self.figures.cache.clone();
         Ok(Admission {
             placement,
             ownership,
-            cache: self.figures.cache.clone(),
+            cache,
             marks: usize::try_from(self.marks)?,
             reservations,
             fixed: self.figures.fixed.clone(),

@@ -648,7 +648,8 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
     if "PREFIX_CACHE_MARK_MIB" in cache_keys:
         assert "--prefix-cache-mark-mib 1024" in launch
     assert "--pool-tokens 0" in launch and "--vision off --audio off" in launch
-    for unsupported in ("--max-context", "--local-experts", "--peers", "--split-device"):
+    assert "--max-context-tokens auto" in launch
+    for unsupported in ("--local-experts", "--peers", "--split-device"):
         assert unsupported not in launch
     assert "cuteafd expertd-native" not in result.stderr
     assert "ssh h0" not in result.stderr
@@ -734,7 +735,6 @@ def test_deployment_wip_still_requires_matching_launch_family(tmp_path, family, 
     ("SPARK_COUNT=0\nRTX_GPUS=2\n", "two-RTX layer ranges are not qualified"),
     ("SPARK_COUNT=0\nVISION=rtx\n", "media execution is not qualified"),
     ("SPARK_COUNT=0\nEMBEDDING=host\n", "requires device token embedding"),
-    ("SPARK_COUNT=0\nMAX_CONTEXT_TOKENS=4096\n", "unused configuration key"),
 ])
 def test_dense_qwen_refuses_unqualified_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
     result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B", keys,
@@ -1323,10 +1323,10 @@ def _capture_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     assert deployment["family"] == family, deployment
     assert deployment["spark_ranks"] == int(config["SPARK_COUNT"]), deployment
     assert deployment["wip_launchable"] and deployment["report"]["fits"], deployment
-    # The pool never falls below the config's declared serving context (and the
-    # historical 1M floor where the config declares none).
-    declared = int(config.get("MAX_CONTEXT_TOKENS", "0")) or 1 << 20
-    assert deployment["memory_layout"]["pool_tokens"] >= declared, deployment
+    # Numeric contexts pin a floor; automatic context follows admitted capacity.
+    declared = config.get("MAX_CONTEXT_TOKENS", "auto") or "auto"
+    if declared != "auto":
+        assert deployment["memory_layout"]["pool_tokens"] >= int(declared), deployment
     assert deployment["report"]["placement_supported"], deployment
     plans = [shlex.split(line) for line in result.stderr.splitlines()
              if "cuteafd plan " in line and "--deployment" in line]
@@ -1464,8 +1464,10 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     # Single-owner placement retains the solver's Heads label with Whole-only modes.
     expected = "context" if gpus == 2 else "heads"
     assert deployment["report"]["attention_placement"] == expected, deployment
-    context_floor = 1048576 if "-k6-" in example.name else 524288
-    assert deployment["memory_layout"]["pool_tokens"] >= context_floor, deployment
+    maximum = 1048576 if "-k6-" in example.name else 524288
+    served = min(maximum, deployment["memory_layout"]["pool_tokens"])
+    assert any(note.startswith(f"Kimi API max context: {served} tokens;")
+               for note in deployment["memory_layout"]["notes"]), deployment
     plans = [shlex.split(line) for line in result.stderr.splitlines()
              if "cuteafd plan " in line and "--deployment" in line]
     assert len(plans) == 1
@@ -1905,7 +1907,7 @@ def test_mimo_full_context_profile_respects_physical_and_logical_memory(tmp_path
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, gpu_total_mib=total)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert "--max-context 0" in launch
+    assert "--max-context-tokens auto" in launch
     assert f"--max-sequences {8 if embedding == 'host' else 16}" in launch
     assert f"--embedding-placement {embedding}" in launch
     assert "--pool-tokens 0" in launch
@@ -1990,7 +1992,7 @@ def test_mimo_small_card_profile_keeps_explicit_overrides(tmp_path, embedding):
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, gpu_total_mib=32768)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert "--max-context 65536" in launch
+    assert "--max-context-tokens 65536" in launch
     assert "--max-sequences 2" in launch
     assert f"--embedding-placement {embedding}" in launch
     assert "--pool-tokens 131072" in launch
@@ -2834,11 +2836,14 @@ MEMORY_POLICY_KEYS = {
 }
 
 
-@pytest.mark.parametrize("family", ["glm5_flash", "glm5", "mimo_v2", "deepseek_v4", "qwen4"])
+@pytest.mark.parametrize("family", ["glm5_flash", "glm5", "mimo_v2", "deepseek_v4", "qwen4", "kimi_k3"])
 def test_every_memory_policy_key_reaches_the_plan_and_the_serve_argv(tmp_path, family):
     config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
               if family == "glm5" else {"model_type": "deepseek_v4"}
-              if family == "deepseek_v4" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
+              if family == "deepseek_v4" else {"model_type": "kimi_k3", "text_config": {
+                  "model_type": "kimi_linear", "num_hidden_layers": 93,
+                  "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+              if family == "kimi_k3" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
     keys = "RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + "".join(
         f"{key}={value}\n" for key, (_, value) in MEMORY_POLICY_KEYS.items())
     result = _family_launch_result(tmp_path, config, "test/model", keys)
@@ -4190,7 +4195,7 @@ def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency, gpu_t
     assert f"--concurrency {effective}" in preflight
     assert f"--max-sequences {effective}" in launch
     assert "unbound variable" not in result.stderr
-    assert "--context-tokens 131072" in preflight
+    assert "--max-context-tokens 131072" in preflight
     assert "--prefill-rows" not in shlex.split(preflight)
     assert "--prefill-rows 2752" in launch
     assert "--prefill-waves 3 --prefill-span-rows 16384" in launch
@@ -4213,7 +4218,7 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     assert f"--expert-input {ingress}" in preflight and f"--expert-input {ingress}" in launch
     assert "--rtx-expert-layers 0" in preflight and "--onboard 0" in launch
-    assert "--context-tokens 262144" in preflight and "--max-context 262144" in launch
+    assert "--max-context-tokens 262144" in preflight and "--max-context-tokens 262144" in launch
     assert "--mimo-decode-graphs" in preflight and "--decode-graphs true" in launch
     assert "--full-prefill-logits" in preflight and "--full-prefill-logits" in launch
 
@@ -4773,7 +4778,10 @@ def test_generic_family_checkpoint_context_default_and_override(tmp_path, family
     result = _family_launch_result(tmp_path, config, "test/model", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert f"--max-context {context or 0}" in launch
+    if context is None:
+        assert "--max-context-tokens auto" in launch
+    else:
+        assert f"--max-context-tokens {context}" in launch
 
 
 def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):

@@ -235,7 +235,7 @@ fn reply_settings(context: &mut cuteafd_bench::context::ServerContext,
 #[derive(Clone, Copy)]
 struct DerivedArguments { family: Option<&'static str>, names: &'static [&'static str] }
 const DERIVED_ARGUMENTS: &[DerivedArguments] = &[
-    DerivedArguments { family: None, names: &["max-context", "pool-tokens", "kv-format", "prefill-rows", "prefill-waves",
+    DerivedArguments { family: None, names: &["max-context-tokens", "pool-tokens", "kv-format", "prefill-rows", "prefill-waves",
         "prefill-span-rows", "prefill-units", "rtx-expert-layers", "onboard", "attention-placement",
         "attention-plan-rows", "prefix-cache-entries", "spark-prefill-reply-format", "spark-decode-reply-format"] },
     DerivedArguments { family: Some("glm5"), names: &["max-sequences", "draft-context-slots", "draft-window-marks", "draft-fp8"] },

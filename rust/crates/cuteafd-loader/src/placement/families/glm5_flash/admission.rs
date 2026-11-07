@@ -475,7 +475,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         }
     }
     let pool = PoolPolicy::resolve(&i.gpus.iter().map(|g| g.0).collect::<Vec<_>>(),
-        i.max_context, PoolPolicy::normalize_request(i.requested_pool), 256, i.spark_ranks == 0);
+        i.max_context, PoolPolicy::normalize_request(i.requested_pool), 256);
     let maximum = pool.maximum_tokens().div_ceil(256);
     let attention = modes(i);
     let routed: Vec<_> = (0..i.layers).filter(|&layer| !i.cfg.dense[layer]).collect();
@@ -788,10 +788,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 p::Lifetime { first, last: p::Phase::Growth }, maximum)?);
         }
     }
-    let required_context = if i.automatic_context {
-        if i.spark_ranks == 0 { crate::placement::pool::AGENTIC_FLOOR_TOKENS } else { 256 }
-    } else { i.max_context };
-    let request = p::Request { context: required_context,
+    let request = p::Request { context: i.context,
         pool: PoolPolicy::normalize_request(i.requested_pool).map_or(p::Pin::Auto, p::Pin::Exact),
         onboard: i.onboard.layers(routed.len()).map_or(p::Pin::Auto, |n| p::Pin::Exact(n as u64)),
         prefill: p::Pin::Exact(prefill), operation: p::Operation::Serving,
@@ -816,8 +813,7 @@ impl PreparedGlmf<'_> {
         let option = self.counts.iter().position(|&n| n == count).ok_or_else(|| invalid("unprepared onboarding count"))?;
         let working = GlmfWorkingSet::candidate(i, count).map_err(invalid)?;
         let mut graphs = if i.graphs.lifetime == Lifetime::Startup {
-            startup_graphs(i.cfg, i.layers, glmf_graphs::admitted_graph_context(i.max_context as usize,
-                solved.pool_tokens as usize, i.automatic_context), solved.pool_tokens as usize,
+            startup_graphs(i.cfg, i.layers, solved.request.context.served(solved.pool_tokens) as usize, solved.pool_tokens as usize,
                 i.sequences as usize, i.speculation, i.gpus.len(), i.decode_rows as usize, self.sms)
         } else { i.graphs.clone() };
         if i.local_tp2_exl3 && working.spark_ranks == 0 { calibrate_local_tp2_graphs(&mut graphs); }

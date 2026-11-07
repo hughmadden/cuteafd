@@ -242,16 +242,21 @@ fn layout_picks_its_spark_range_and_onboards_by_default() { plan_matrix(2); }
 #[test]
 fn layout_plans_every_spark_world_on_one_rtx() { plan_matrix(1); }
 
-/// The shared planner never silently clamps the pool below the compiled
-/// context: one RTX asked for the checkpoint's full 1M is the typed
-/// full-context shortfall that names the feasible ceiling, not a plan whose
-/// declared context the card cannot serve (the pre-port solver clamped it).
+/// Automatic context follows the admitted pool; an explicit 1M pin still
+/// reports the typed capacity shortfall on one RTX.
 #[test]
-fn compiled_context_above_one_rtx_capacity_is_the_typed_shortfall() {
+fn automatic_context_fits_one_rtx_and_full_context_pin_reports_shortfall() {
     let dir = snapshot(&all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let package = tempfile::tempdir().unwrap();
-    let report = input.plan(&with_package(1, 4, package.path())).unwrap();
+    let mut options = with_package(1, 4, package.path());
+    let report = input.plan(&options).unwrap();
+    assert!(report.fits && report.wip_launchable(), "{:?}", report.hints);
+    let pool = report.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!((262144..1 << 20).contains(&pool));
+    assert_eq!(report.phase_ledger.as_ref().unwrap().served_context_tokens, pool);
+    options.layout.as_mut().unwrap().context_tokens = 1 << 20;
+    let report = input.plan(&options).unwrap();
     assert!(!report.fits && !report.wip_launchable(), "{:?}", report.hints);
     let hint = report.hints.iter().map(|hint| &hint.what).find(|what|
         what.contains("selected context 1048576 cannot fit")).expect("the typed shortfall");

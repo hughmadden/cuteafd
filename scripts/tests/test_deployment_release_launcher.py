@@ -177,6 +177,17 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             position = before["command"].index("--max-output-tokens") + 2
             before["command"][position:position] = ["--mapped-scale-preload-gib", "0"]
             command = after["command"]
+            context_position = command.index("--max-context-tokens") + 1
+            context = command[context_position]
+            launch_config = dict(line.split("=", 1) for line in (ROOT / selected["config"]).read_text().splitlines()
+                                 if line and not line.startswith("#"))
+            launch_config.update(selected["set"])
+            pinned_context = launch_config.get("MAX_CONTEXT_TOKENS")
+            if pinned_context:
+                assert context == pinned_context
+            else:
+                # Automatic context stays automatic; either CLI encoding has the same meaning.
+                assert context in {"0", "auto"}, (entry["name"], context)
             waves = command[command.index("--prefill-waves") + 1]
             assert waves == ("3" if int(selected["set"]["SPARK_COUNT"]) else "1"), (entry["name"], waves)
             anchor = "--decode-lanes" if "--decode-lanes" in before["command"] else "--mapped-scale-preload-gib"

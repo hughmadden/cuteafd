@@ -41,8 +41,8 @@ pub struct V4Inputs {
     pub expert_usage: bool,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
-    /// True only when the operator left context automatic.
-    pub automatic_context: bool,
+    /// Shared model extent and optional operator context pin.
+    pub serving_context: crate::placement::planner::Context,
     pub cfg: DeepseekV4Config,
     /// Header-derived uploads; no attention weights hidden in the baseline.
     pub weights: crate::families::deepseek_v4::resident::WeightInventory,
@@ -308,7 +308,7 @@ mod default_tests {
             for gpus in [1, 2] {
                 let mut input = V4Inputs {
                     expert_usage: false, resident_weight_limit: None,
-                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, serving_context: crate::placement::planner::Context::pinned(262_144),
                     cfg: cfg.clone(), weights: crate::families::deepseek_v4::resident::WeightInventory {
                         c4_attention: Vec::new(), fixed: Vec::new(), startup: Default::default() },
                     cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned {
@@ -381,7 +381,7 @@ mod default_tests {
     fn plan_inputs(cfg: &DeepseekV4Config) -> V4Inputs {
         V4Inputs {
             expert_usage: false, resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
-            automatic_context: false, cfg: cfg.clone(),
+            serving_context: crate::placement::planner::Context::pinned(262_144), cfg: cfg.clone(),
             weights: crate::families::deepseek_v4::resident::WeightInventory {
                 c4_attention: vec![ModeBytes::default(); cfg.n_layers], fixed: Vec::new(), startup: Default::default() },
             cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2],

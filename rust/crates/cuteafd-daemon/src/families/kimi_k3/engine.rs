@@ -37,6 +37,8 @@ pub(crate) struct Engine<'a> {
     prefill: PrefillUnits,
     packed_row_cap: Cell<Option<usize>>,
     coordinator_packing_cap: usize,
+    /// Admission's API/scheduler limit; physical lane and prefix owners stay compiled-wide.
+    served_context: usize,
     /// The same shape as the shared prefill depth.
     depth: crate::shared::prefill_depth::PrefillDepth,
 }
@@ -306,9 +308,17 @@ impl<'a> Engine<'a> {
         let streams = local.iter().map(|ranks| ranks.iter().map(|local| local.stream().clone()).collect()).collect();
         let execution = Execution::new(plan, peer.as_deref(), hops.as_ref(), exchange_streams.clone(), streams)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
+        let served_context = local[0][0].max_context();
         Ok(Self { host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
-            hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap })
+            hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap, served_context })
+    }
+
+    pub(crate) fn with_served_context(mut self, context: usize) -> Result<Self> {
+        ensure!(context > 0 && context <= self.served_context,
+            "Kimi served context exceeds compiled lane extent");
+        self.served_context = context;
+        Ok(self)
     }
 
     pub(crate) fn target_view(&self) -> &cuteafd_loader::plan::checkpoint::CheckpointView {
@@ -340,7 +350,7 @@ impl<'a> Engine<'a> {
         let local = &lanes.local[0][0];
         let (state, _) = local.prefix_banks();
         Ok(crate::shared::qwen::scheduler::Geometry { family: "kimi_k3",
-            vocab_size: local.config().vocab_size, max_context: local.max_context(),
+            vocab_size: local.config().vocab_size, max_context: self.served_context,
             // A call is the slots' units.
             slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64),
             full_prefill_logits: lanes.io[0][self.head()].full_prefill_logits() })

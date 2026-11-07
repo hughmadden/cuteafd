@@ -136,7 +136,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
         Some(draft)
     } else { None };
-    let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512, spark_ranks == 0);
+    let mut pool = PoolPolicy::resolve(&options.rtx_bytes, shape.context_tokens, options.pool_tokens, 512)
+        .with_context(crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)));
     // CLI zero and an omitted pool are the same automatic admission.
     let automatic = pool.requested.is_none();
     if automatic {
@@ -144,7 +145,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     pool.validate_explicit()?;
     let maximum_pool_tokens = pool.maximum_tokens();
-    let context = shape.context_tokens.max(if automatic { pool.floor } else { 0 });
+    let context = shape.context_tokens;
     let mut working = SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..40).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: slots as u64 };
@@ -212,7 +213,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     reserves.extend(host_facts.estimates.clone());
     let budgets = admission::production_budgets(&cards, crate::placement::reserve::gpu("deepseek_v41"), Some(host), 0,
         &vec![options.spark_bytes; spark_ranks])?;
-    let request = admission::production_request(context, options.pool_tokens, onboard,
+    let request = admission::production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard,
         PrefillShape { rows, waves: slots as u64 },
         if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
         options.weight_budget_bytes, options.spark_reply_formats);

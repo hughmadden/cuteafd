@@ -65,8 +65,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (dense layers need no experts).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<usize>)]
     pub max_context: usize,
     /// Tokens the shared latent/index cache pool holds across sequences; 0
     /// sizes it from what every GPU has left after weights and the planner's
@@ -382,7 +382,7 @@ mod draft_cli_tests {
             argv.extend_from_slice(extra);
             let mut args = Parse::try_parse_from(argv).unwrap().engine;
             crate::commands::bench::assert_resolved_family_seam("glm5",
-                &["max-context", "pool-tokens", "rtx-expert-layers", "draft-window-marks", "attention-plan-rows"], || {
+                &["max-context-tokens", "pool-tokens", "rtx-expert-layers", "draft-window-marks", "attention-plan-rows"], || {
                     crate::commands::bench::fixture_prefix().resolve_entries(16);
                     serve::resolve_serving_capacity(&mut args, 16);
                     resolve_prefill(&mut args)?;
@@ -894,17 +894,17 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 
 struct ResolvedEngineArgs {
     args: EngineArgs,
-    automatic_context: bool,
+    context: cuteafd_loader::placement::planner::Context,
 }
 
 impl ResolvedEngineArgs {
     fn new(args: &EngineArgs) -> Result<Self> {
-        let automatic_context = args.max_context == 0;
+        let requested_context = (args.max_context > 0).then_some(args.max_context as u64);
         let mut resolved = args.clone();
         resolve_prefill(&mut resolved)?;
         resolved.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
-        Ok(Self { args: resolved, automatic_context })
+        Ok(Self { context: cuteafd_loader::placement::planner::Context::resolve(resolved.max_context as u64, requested_context), args: resolved })
     }
 }
 
@@ -942,8 +942,7 @@ impl Opened {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
         media_owners: (Option<(i32, u64, u64)>, u64),
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>) -> Result<T> {
-        let ResolvedEngineArgs { args, automatic_context } = resolved;
-        let automatic_context = *automatic_context;
+        let ResolvedEngineArgs { args, context: serving_context } = resolved;
         let expert_usage = args.expert_usage_reader.configure(args.expert_usage, args.skip_routed_experts)
             .map_err(anyhow::Error::msg)?;
         let native = self.native;
@@ -1178,7 +1177,7 @@ impl Opened {
         let requested_pool = cuteafd_loader::placement::PoolPolicy::normalize_request(Some(args.pool_tokens as u64));
         let maximum_pool_tokens = cuteafd_loader::placement::PoolPolicy::resolve(
             &cards.iter().map(|&(_, ceiling)| ceiling).collect::<Vec<_>>(), args.max_context as u64,
-            requested_pool, page_tokens, spark_ranks == 0).maximum_tokens();
+            requested_pool, page_tokens).maximum_tokens();
         let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
         let prefill = PrefillShape { rows: args.prefill_rows as u64, waves: prefill_lanes as u64 };
         let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
@@ -1274,7 +1273,7 @@ impl Opened {
         let budgets = production_budgets(&cards, cuteafd_loader::placement::reserve::gpu("glm5"), host,
             serving.map_or(8 << 30, |(prefix, _)| prefix.host_cache_headroom_bytes).max(host.0 / 10),
             &vec![cuteafd_loader::placement::reserve::spark_cap(); spark_ranks])?;
-        let request = production_request(args.max_context as u64, requested_pool,
+        let request = production_request(*serving_context, requested_pool,
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
         let admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
@@ -1603,7 +1602,7 @@ impl Opened {
         cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        let max_context = crate::shared::context::pool_context("glm5", args.max_context, automatic_context, pool_tokens, 256)?;
+        let max_context = crate::shared::context::pool_context("glm5", *serving_context, pool_tokens)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         // Pack before allocating the serving pool and expert arenas: the load-phase
         // admission peak is above the same resident target-weight baseline.

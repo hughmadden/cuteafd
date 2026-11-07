@@ -93,7 +93,7 @@ impl fmt::Display for ProgramCapacityError {
         match self {
             Self::Invalid { field } => write!(f, "program manifest capacities.{field} must be a positive integer that fits usize"),
             Self::MissingContext { family } => write!(f, "{family}: program manifest lacks capacities.max_context; export matching coordinator programs with an explicit --max-context before loading weights"),
-            Self::ContextExceeded { family, requested, compiled } => write!(f, "{family}: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_DSV4_MAX_CONTEXT={requested} (--max-context {requested}), or lower --max-context to {compiled}"),
+            Self::ContextExceeded { family, requested, compiled } => write!(f, "{family}: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_DSV4_MAX_CONTEXT={requested} (--max-context {requested}), or lower --max-context-tokens to {compiled}"),
         }
     }
 }

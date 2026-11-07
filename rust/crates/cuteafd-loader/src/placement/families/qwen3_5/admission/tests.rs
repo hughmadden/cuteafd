@@ -18,7 +18,7 @@ fn budgets() -> Vec<Budget> {
 }
 
 fn request() -> Request {
-    Request { context: 262144, pool: Pin::Auto, onboard: Pin::Auto, prefill: Pin::Auto,
+    Request { context: (262144).into(), pool: Pin::Auto, onboard: Pin::Auto, prefill: Pin::Auto,
         operation: Operation::Serving, resident_weight_limit: None,
         spark_reply_formats: Default::default() }
 }
@@ -102,7 +102,7 @@ fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
     // Draft KV is a page-linear extent, so a smaller explicit pool pays for
     // fewer pages rather than a fixed full-context reservation.
     let mut smaller = request();
-    smaller.context = 4 * PAGE_ROWS;
+    smaller.context = (4 * PAGE_ROWS).into();
     smaller.pool = Pin::Exact(4 * PAGE_ROWS);
     let small = admit(smaller, budgets(), input).unwrap();
     assert_eq!(small.pool_tokens, 4 * PAGE_ROWS);

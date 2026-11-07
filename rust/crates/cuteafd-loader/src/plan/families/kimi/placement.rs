@@ -39,11 +39,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let attention = if gpus == 1 { report.requested_attention.unwrap_or(AttentionPlacement::Heads) }
         else { crate::families::kimi_k3::resolve_attention(report.requested_attention, gpus) };
     report.attention_placement = attention;
-    let context = if opts.context_tokens == 0 { crate::families::kimi_k3::default_context(&model.core) as u64 } else { opts.context_tokens };
+    let context = if opts.context_tokens == 0 { cfg.max_position as u64 } else { opts.context_tokens };
     memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
     if context > COMPILED_CAPACITY {
         report.refuse_placement(format!("Kimi context {context} exceeds compiled capacity {COMPILED_CAPACITY}"),
-            "Lower --context-tokens to at most 1M; the pool must cover the selected context extent.");
+            "Lower --max-context-tokens to at most 1M; the pool must cover the selected context extent.");
         return memory;
     }
     let context_split = attention == AttentionPlacement::Context;
@@ -378,13 +378,20 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Check the routed EXL3 arena costs."); return memory; }
     };
     let mut spark = Vec::new();
+    let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+        .expect("zero-arena reserve cannot overflow");
     for rank in 0..ranks {
+        let Some(owners) = spark_budget.overhead[rank].checked_sub(runtime) else {
+            report.refuse_placement("Spark overhead excludes startup reserve".into(),
+                "Keep actual owners separate from the replaceable startup reserve.");
+            return memory;
+        };
         for &count in &counts {
-            // The rank's runtime residual stays charged at every count; the
-            // expert suffix is empty only when every routed layer is onboarded.
+            let active = count < spark_budget.layers.len();
             spark.push(SparkOwner { count, rank,
                 experts: spark_budget.resident[rank][count..].iter().sum(),
-                overhead: spark_budget.overhead[rank] });
+                runtime: if active { runtime } else { 0 },
+                overhead: if active { owners } else { 0 } });
         }
     }
     let mut fixed_owners = fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
@@ -539,10 +546,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     report.host_ledger = cuteafd_core::memory_layout::HostLayout::new(host_total, host_available,
         (8 << 30).max(host_total / 10), host_quota, host_items);
-    let resolved = recipe.admit(kimi::request(context, requested_pool, onboard, prefill,
+    let resolved = recipe.admit(kimi::request(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)), requested_pool, onboard, prefill,
         crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
     let onboarded = match resolved {
         Ok(selection) => {
+            let served = selection.solved.request.context.served(selection.solved.pool_tokens);
+            memory.notes.retain(|note| !note.starts_with("Kimi API max context:"));
+            memory.notes.push(format!("Kimi API max context: {served} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
             let placed = &selection.placement;
             memory.notes.push(format!("Kimi retained prefix marks are a fixed charge: {legacy_marks} slots per rank"));
             memory.notes.push(format!("Kimi selected RTX expert layers: {}; retained marks: {}", placed.onboard_layers, legacy_marks));
