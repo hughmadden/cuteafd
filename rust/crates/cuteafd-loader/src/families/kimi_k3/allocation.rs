@@ -366,9 +366,15 @@ pub fn io_extents(vocab: usize, rank: usize, rows: usize, core_head: bool) -> [u
 
 pub fn io_extents_for_ranks(vocab: usize, rank: usize, rows: usize, core_head: bool,
     ranks: usize) -> Result<[usize; 3]> {
+    io_extents_with_logits(vocab, rank, rows, rows.min(64), core_head, ranks)
+}
+
+pub fn io_extents_with_logits(vocab: usize, rank: usize, rows: usize, logit_rows: usize,
+    core_head: bool, ranks: usize) -> Result<[usize; 3]> {
     ensure!(matches!(ranks, 1 | 2) && rank < ranks, "Kimi token IO physical rank count");
+    ensure!((1..=rows).contains(&logit_rows), "Kimi token IO logit rows exceed lane");
     Ok([if rank == 0 { rows * 4 } else { 0 },
-        if rank == ranks - 1 { rows.min(64) * vocab * 4 } else { 0 },
+        if rank == ranks - 1 { logit_rows * vocab * 4 } else { 0 },
         if rank == ranks - 1 && !core_head { 4 << 20 } else { 0 }])
 }
 
