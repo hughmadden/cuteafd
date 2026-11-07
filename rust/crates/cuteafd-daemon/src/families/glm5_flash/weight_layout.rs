@@ -1,0 +1,144 @@
+//! Final, header-derived requests for the independently retired target weight set.
+use super::{weights::PREFIX, fp8::KdaFp8};
+use anyhow::{ensure, Context, Result};
+use cuteafd_core::DType;
+use cuteafd_loader::{families::glm5_flash::{GlmNextAttention, GlmNextConfig, core::CoreInventory},
+    placement::{LayerExecutionPlan, LayerMode}, plan::Checkpoint, serving_capacity::WeightArenaLayout};
+use std::collections::BTreeMap;
+
+pub(super) fn joined(names: &[String]) -> String { names.join("+") }
+
+pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, plan: &LayerExecutionPlan,
+    ranks: usize, kda_fp8: KdaFp8, output_shard: bool, fp8_head: bool,
+    embedding: Option<(usize, usize)>) -> Result<Vec<WeightArenaLayout>> {
+    ensure!(matches!(ranks, 1 | 2) && plan.modes().len() <= cfg.layers, "Flash arena rank/layer extent");
+    let core = CoreInventory::from_checkpoint(cfg, checkpoint)?;
+    let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
+        .with_context(|| format!("Flash arena missing {name}"));
+    let elements = |name: &str| -> Result<usize> { tensor(name)?.meta.shape.iter().try_fold(1usize,
+        |n, &d| n.checked_mul(d).context("Flash arena element overflow")) };
+    let mut requests = vec![BTreeMap::new(); ranks];
+    let insert = |out: &mut BTreeMap<String, usize>, name: String, bytes: usize| -> Result<()> {
+        ensure!(out.insert(name.clone(), bytes.max(256)).is_none(), "duplicate Flash arena request {name}");
+        Ok(())
+    };
+    let one = |out: &mut BTreeMap<String, usize>, name: String| -> Result<()> {
+        insert(out, name.clone(), usize::try_from(tensor(&name)?.meta.byte_length)?)
+    };
+    let f32 = |out: &mut BTreeMap<String, usize>, name: String| -> Result<()> {
+        insert(out, name.clone(), elements(&name)?.checked_mul(4).context("Flash F32 extent overflow")?)
+    };
+    let fp8 = |out: &mut BTreeMap<String, usize>, names: Vec<String>, divisor: usize, row: bool| -> Result<()> {
+        let (mut values, mut scales) = (0usize, 0usize);
+        for name in &names {
+            let shape = &tensor(name)?.meta.shape;
+            ensure!(shape.len() == 2, "Flash FP8 matrix shape: {name}");
+            values = values.checked_add(shape[0].checked_mul(shape[1]).context("Flash FP8 overflow")?)
+                .context("Flash FP8 concatenation overflow")?;
+            scales += if row { shape[0] * shape[1].div_ceil(128) * 4 }
+                else { shape[0].div_ceil(128) * shape[1].div_ceil(128) * 4 };
+        }
+        let key = joined(&names);
+        insert(out, format!("{key}.payload"), values / divisor)?;
+        insert(out, format!("{key}.scales"), scales / divisor)
+    };
+    if let Some((rank, bytes)) = embedding {
+        ensure!(rank < ranks, "Flash embedding arena rank");
+        insert(&mut requests[rank], "embedding.table".into(), bytes)?;
+    }
+    one(&mut requests[0], format!("{PREFIX}norm.weight"))?;
+    if let Some(head) = core.get_weight("lm_head") {
+        let layout = cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
+            cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
+        for (name, bytes) in layout.arena_tensors(&layout.stem)? { insert(&mut requests[0], name, bytes)?; }
+    } else if fp8_head { fp8(&mut requests[0], vec!["lm_head.weight".into()], 1, true)?; }
+    else { one(&mut requests[0], "lm_head.weight".into())?; }
+    for (layer, &mode) in plan.modes().iter().enumerate() {
+        let p = format!("{PREFIX}layers.{layer}");
+        let a = |leaf: &str| format!("{p}.self_attn.{leaf}");
+        let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(usize::from(gpu)), _ => None };
+        let native_core = core.layer_weights(cfg, layer, ranks, owner.map(|r| r as u8))?;
+        let native_attention = core.layer_native(cfg, layer, ranks, owner.map(|r| r as u8))?;
+        let native = core.projections.keys().any(|stem| stem.starts_with(&format!("{p}.")));
+        for (rank, out) in requests.iter_mut().enumerate() {
+            for site in ["attn", "ffn"] { for suffix in ["fn", "scale", "base"] {
+                f32(out, format!("{p}.hc_{site}_{suffix}"))?;
+            }}
+            for leaf in ["input_layernorm.weight", "post_attention_layernorm.weight"] { one(out, format!("{p}.{leaf}"))?; }
+            for layout in native_core[rank].values() { for (name, bytes) in layout.arena_tensors(&layout.stem)? {
+                insert(out, name, bytes)?;
+            }}
+            for layout in native_attention[rank].values() {
+                let [n, k] = layout.shape;
+                insert(out, format!("{}.payload", layout.stem), n*k*if layout.fp8 { 1 } else { 2 })?;
+                if layout.fp8 { insert(out, format!("{}.scales", layout.stem), n/128*(k/128)*4)?; }
+            }
+            match cfg.attention[layer] {
+                GlmNextAttention::Kda => {
+                    if native {
+                        insert(out, format!("{p}.w_aux"), (elements(&a("f_a_proj.weight"))?
+                            + elements(&a("g_a_proj.weight"))? + elements(&a("b_proj.weight"))?/ranks)*2)?;
+                    } else {
+                        let inputs = ["q_proj.weight", "k_proj.weight", "v_proj.weight", "f_a_proj.weight", "g_a_proj.weight", "b_proj.weight"]
+                            .map(|leaf| a(leaf)).to_vec();
+                        let values = inputs.iter().enumerate().map(|(i, name)| elements(name)
+                            .map(|bytes| bytes / if matches!(i, 3 | 4) { 1 } else { ranks })).collect::<Result<Vec<_>>>()?
+                            .into_iter().sum::<usize>();
+                        if kda_fp8 != KdaFp8::Off {
+                            let key = joined(&inputs);
+                            insert(out, format!("{key}.payload"), values)?;
+                            insert(out, format!("{key}.scales"), values/128*4)?;
+                            fp8(out, vec![a("o_proj.weight")], if output_shard { 1 } else { ranks }, true)?;
+                        } else {
+                            insert(out, format!("{p}.w_in"), values*2)?;
+                            // TP1's unchanged output uses its checkpoint name.
+                            insert(out, if ranks == 1 { a("o_proj.weight") } else { format!("{p}.w_o") }, elements(&a("o_proj.weight"))?*2/ranks)?;
+                        }
+                    }
+                    for (key, bytes) in [
+                        ("w_fg", (elements(&a("f_b_proj.weight"))?+elements(&a("g_b_proj.weight"))?)*2/ranks),
+                        ("conv_w", ["q", "k", "v"].iter().map(|s| elements(&a(&format!("{s}_conv1d.weight"))))
+                            .collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>()*4/ranks),
+                        ("a_log", cfg.kda_heads*4/ranks),
+                        ("dt_bias", elements(&a("dt_bias"))?*4/ranks),
+                        ("o_norm", usize::try_from(tensor(&a("o_norm.weight"))?.meta.byte_length)?),
+                    ] { insert(out, format!("{p}.{key}"), bytes)?; }
+                }
+                GlmNextAttention::Mla if owner.is_none_or(|owner| owner == rank) => {
+                    let parts = if owner.is_some() { 1 } else { ranks };
+                    for leaf in ["q_a_layernorm.weight", "kv_a_layernorm.weight", "indexer.wq_b.weight",
+                        "indexer.k_norm.weight", "indexer.k_norm.bias", "indexer.index_kpool_compress_ape"] { one(out, a(leaf))?; }
+                    insert(out, format!("{}.uk", a("kv_b_proj.weight")), cfg.heads*cfg.qk_nope_dim*cfg.kv_lora_rank*2/parts)?;
+                    insert(out, format!("{}.uv", a("kv_b_proj.weight")), cfg.heads*cfg.v_head_dim*cfg.kv_lora_rank*2/parts)?;
+                    if !native {
+                        fp8(out, vec![a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], 1, false)?;
+                        fp8(out, vec![a("q_b_proj.weight")], parts, false)?;
+                        fp8(out, vec![a("o_proj.weight")], parts, false)?;
+                    }
+                    let names = ["wk.weight", "weights_proj.weight", "index_kpool_compress_gate"].map(|leaf| a(&format!("indexer.{leaf}"))).to_vec();
+                    let bytes = names.iter().map(|name| elements(name)).collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>()*2;
+                    insert(out, joined(&names), bytes)?;
+                }
+                GlmNextAttention::Mla => {}
+            }
+            if !native {
+                let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
+                if cfg.dense[layer] && tensor(&format!("{mlp}.gate_proj.weight"))?.meta.dtype == DType::U8 {
+                    if rank == 0 { for proj in ["gate_proj", "up_proj", "down_proj"] {
+                        one(out, format!("{mlp}.{proj}.weight"))?;
+                        insert(out, format!("{mlp}.{proj}.weight_scale"), usize::try_from(tensor(&format!("{mlp}.{proj}.weight_scale"))?.meta.byte_length)?+8)?;
+                    }}
+                } else {
+                    fp8(out, vec![format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], ranks, false)?;
+                    fp8(out, vec![format!("{mlp}.down_proj.weight")], ranks, false)?;
+                }
+            }
+            if !cfg.dense[layer] {
+                one(out, format!("{p}.mlp.gate.weight"))?;
+                f32(out, format!("{p}.mlp.gate.e_score_correction_bias"))?;
+            }
+        }
+    }
+    requests.into_iter().enumerate().map(|(rank, requests)| WeightArenaLayout::new(
+        format!("glm5_flash/target/{rank}"), requests)).collect()
+}

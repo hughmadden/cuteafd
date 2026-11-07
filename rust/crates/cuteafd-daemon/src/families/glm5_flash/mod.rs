@@ -20,6 +20,7 @@ pub(crate) mod head;
 mod precision;
 mod native;
 pub(crate) mod weights;
+mod weight_layout;
 
 /// Whether this launch's coordinator operands can join a push group: every
 /// representation the push path records (BF16 operands, GPU FP8 copies,
@@ -2229,7 +2230,7 @@ impl Opened {
         // both admissions reserve these marks, and `prefix_cache` allocates as many.
         let mark_slots = args.mark_arena.slots_placed(&self.cfg, layers, index_cache, args.kda_state,
             context_mode.is_some())?;
-        let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
+        let loader = weights::GlmfLoader { arenas: Default::default(), library: &self.library, checkpoint: &self.checkpoint, stream,
             kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales, device: args.device,
@@ -2376,18 +2377,32 @@ impl Opened {
             "GLM Flash executor only binds whole experts on coordinator rank zero");
         let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
             .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
+        let layouts = if let Some(native) = &native_admission {
+            native.arena_layouts(&self.cfg, embedding_rank)?
+        } else {
+            let embedding = (args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu)
+                .then(|| embed.as_ref().context("Flash embedding source").and_then(|source|
+                    source.allocation_request("embedding.table", cuteafd_loader::placement::planner::EmbeddingHome::Device(embedding_rank as u8))))
+                .transpose()?.map(|request| (embedding_rank, request.bytes as usize));
+            weight_layout::target(&self.checkpoint, &self.cfg, &execution, gpus, args.kda_fp8,
+                args.kda_output_shard, args.fp8_head, embedding)?
+        };
+        let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {
+            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(*device, layout)?))
+        }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        let loader = weights::GlmfLoader { arenas: std::rc::Rc::new(arenas), ..loader };
         let plan_dense = |sparks: usize| -> Result<_> {
             ensure!(dense_pushable(args), "GLM Flash NVFP4 measurement mode cannot record required push operands");
             let load = std::rc::Rc::new(weights::DenseLoad::push(&self.library));
             let planning = weights::GlmfLoader { dense: load.clone(), ..loader.clone() };
             let ((embedding, model), mut records) = crate::shared::experts::rtx::dense::recording(|| {
-                embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
+                embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(
                     &self.library, embed.as_ref().context("legacy Flash embedding source")?.clone(), args.token_io.embed_placement, || {
                         devices[0].run(|| {
                             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                             planning.model(&self.cfg, &execution)
                         })
-                    }))
+                    }, |name, bytes| planning.allocate(embedding_device.id, name, bytes)))
             })?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
             records.extend(media.clone());
@@ -2635,14 +2650,14 @@ impl Opened {
                     split.log("glm5_flash dense push");
                     (pushed, (embedding, model))
                 }
-                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(&self.library,
+                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     embed.as_ref().context("legacy Flash embedding source")?.clone(),
                     args.token_io.embed_placement, || {
                         crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(|| {
                             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                             loader.model(&self.cfg, &execution)
                         })
-                    }))?),
+                    }, |name, bytes| loader.allocate(embedding_device.id, name, bytes)))?),
             };
             let tp2 = if tp2_layers.is_empty() { pushed_whole = pushed; None }
                 else { Some(tp2_weights(pushed)?) };

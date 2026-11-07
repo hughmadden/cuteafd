@@ -30,7 +30,8 @@
 //! KDA activations for its token rows. Quantization runs once before replication.
 use crate::shared::experts::rtx::dense::{Job, Rect};
 use crate::shared::fp8_load_quant::Target;
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, device::{Allocation, Device}, weight_arena::DeviceWeightArena};
+use super::weight_layout::joined;
 use crate::shared::peer_split::{Axis, RankDevice};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -153,6 +154,7 @@ impl GlmfWeights<'_> {
 
 #[derive(Clone)]
 pub(crate) struct GlmfLoader<'a> {
+    pub arenas: std::rc::Rc<std::collections::BTreeMap<i32, DeviceWeightArena<'a>>>,
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
@@ -245,6 +247,16 @@ fn quantize_kda_part(bytes: &[u8], rows: usize, cols: usize, layout: super::fp8:
 }
 
 impl<'a> GlmfLoader<'a> {
+    pub(super) fn allocate(&self, device: i32, name: &str, bytes: usize) -> Result<Allocation<'a>> {
+        let arena = self.arenas.get(&device).context("Flash target arena absent")?;
+        crate::shared::memory::weight_arena::weight_allocation(Device { library: self.library, id: device },
+            Some(arena), name, bytes)
+    }
+
+    fn allocation(&self, rank: usize, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        Ok(DeviceAllocation::from_allocation(self.allocate(self.rank_device(rank)?, name, bytes.max(256))?))
+    }
+
     fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
         cuteafd_ffi::memory_ledger::tensor(name);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
@@ -302,14 +314,14 @@ impl<'a> GlmfLoader<'a> {
                 }
                 _ => {}
             }
-            ops.insert(w_key, self.upload(&weight)?);
-            ops.insert(s_key, self.upload(&scales)?);
+            ops.insert(w_key, self.upload(&format!("{name}.weight"), &weight)?);
+            ops.insert(s_key, self.upload(&format!("{name}.weight_scale"), &scales)?);
         }
         Ok(true)
     }
 
-    fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
-        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+    fn upload(&self, name: &str, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
+        let allocation = self.allocation(0, name, bytes.len())?;
         crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(allocation.buffer, bytes))?;
         Ok(allocation)
     }
@@ -328,7 +340,7 @@ impl<'a> GlmfLoader<'a> {
             return self.gpu_fp8(&parts, layout, false, 0);
         }
         let (values, scales, _) = self.fp8_host(names, layout)?;
-        Ok((self.upload(&values)?, self.upload(&scales)?))
+        Ok((self.upload(&format!("{}.payload", joined(names)), &values)?, self.upload(&format!("{}.scales", joined(names)), &scales)?))
     }
 
     /// Whether every name is a native E4M3 matrix with FP32 128x128 `_scale_inv`
@@ -400,7 +412,7 @@ impl<'a> GlmfLoader<'a> {
             at += bytes;
             grid_at += grid_bytes;
         }
-        Ok((self.landed(rank, values, at)?, self.landed(rank, grids, grid_at)?))
+        Ok((self.landed(rank, &format!("{}.payload", joined(names)), values, at)?, self.landed(rank, &format!("{}.scales", joined(names)), grids, grid_at)?))
     }
 
     /// `parts` row-concatenated and quantized on the current device: E4M3 values
@@ -423,8 +435,9 @@ impl<'a> GlmfLoader<'a> {
         ensure!(rects.iter().all(|r| r.width() == cols * 2), "FP8 rows must share columns");
         let total: usize = rects.iter().map(|r| r.rows.len()).sum();
         let (kb, unit) = (cols / 128, if layout == super::fp8::Layout::Block { 128 } else { 1 });
-        let values = DeviceAllocation::new(self.library, (total * cols).max(256))?;
-        let scales = DeviceAllocation::new(self.library, (total / unit * kb * 4).max(256))?;
+        let key = joined(&rects.iter().map(|r| r.name.clone()).collect::<Vec<_>>());
+        let values = self.allocation(rank, &format!("{key}.payload"), total * cols)?;
+        let scales = self.allocation(rank, &format!("{key}.scales"), total / unit * kb * 4)?;
         self.quant_steps(&rects, layout, rank, |rows| Target {
             // SAFETY: rows `rows` lie inside `values` (allocated for `total` rows).
             q: CuteafdDeviceBuffer { ptr: unsafe { values.buffer.ptr.cast::<u8>().add(rows.start * cols) }.cast(),
@@ -463,10 +476,10 @@ impl<'a> GlmfLoader<'a> {
     }
 
     /// Records or fills one class-2 operand of `bytes` on rank `rank`'s GPU.
-    fn landed(&self, rank: usize, lands: Vec<(Rect, usize)>, bytes: usize) -> Result<DeviceAllocation<'a>> {
+    fn landed(&self, rank: usize, name: &str, lands: Vec<(Rect, usize)>, bytes: usize) -> Result<DeviceAllocation<'a>> {
         let device = self.rank_device(rank)?;
         self.on_rank(rank, || {
-            let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
+            let allocation = self.allocation(rank, name, bytes)?;
             let operand = crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer, lands, bytes };
             self.dense.operand(operand)?;
             Ok(allocation)
@@ -483,7 +496,7 @@ impl<'a> GlmfLoader<'a> {
         let tensor = self.tensor(name)?;
         let rows = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
         let bytes = tensor.meta.byte_length as usize;
-        self.landed(rank, vec![(rect(self.checkpoint, name, 0..rows, 0..bytes / rows)?, 0)], bytes)
+        self.landed(rank, name, vec![(rect(self.checkpoint, name, 0..rows, 0..bytes / rows)?, 0)], bytes)
     }
 
     /// `make(rank)` on every rank: in push mode each rank receives its own copy;
@@ -529,7 +542,7 @@ impl<'a> GlmfLoader<'a> {
             at += bytes;
         }
         ensure!(lands.windows(2).all(|w| w[0].0.width() == w[1].0.width()), "{names:?} do not share columns");
-        self.landed(rank, lands, at)
+        self.landed(rank, &joined(names), lands, at)
     }
 
     /// Whether every name is a BF16 matrix in the source checkpoint (quantized on the GPU).
@@ -554,7 +567,7 @@ impl<'a> GlmfLoader<'a> {
             return self.gpu_fp8(&parts, layout, true, 0);
         }
         let (values, scales, cols) = self.fp8_host(names, layout)?;
-        Ok((self.upload(&values)?, self.upload(&kmajor_scales(&scales, values.len() / cols, cols / 128))?))
+        Ok((self.upload(&format!("{}.payload", joined(names)), &values)?, self.upload(&format!("{}.scales", joined(names)), &kmajor_scales(&scales, values.len() / cols, cols / 128))?))
     }
 
     /// Host bytes of [`Self::fp8`]: E4M3 values, FP32 scales, and the column count.
@@ -610,7 +623,7 @@ impl<'a> GlmfLoader<'a> {
             DType::Bf16 => {
                 let bytes = tensor.meta.byte_length as usize;
                 let rows = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
-                let out = self.on_rank(rank, || DeviceAllocation::new(self.library, (bytes * 2).max(256)))?;
+                let out = self.on_rank(rank, || self.allocation(rank, name, bytes * 2))?;
                 let whole = rect(self.checkpoint, name, 0..rows, 0..bytes / rows)?;
                 for (parts, window) in crate::shared::experts::rtx::dense::windows(&[whole], 1)? {
                     let width = bytes / rows;
@@ -642,8 +655,8 @@ impl<'a> GlmfLoader<'a> {
         let per = (crate::shared::experts::rtx::dense::TRANSFORM_BYTES / ((nope + v) * lat * 2)).max(1);
         (0..ranks).map(|rank| {
             let (uk, uv) = self.on_rank(rank, || Ok((
-                DeviceAllocation::new(self.library, (heads * lat * nope * 2).max(256))?,
-                DeviceAllocation::new(self.library, (heads * v * lat * 2).max(256))?)))?;
+                self.allocation(rank, &format!("{name}.uk"), heads * lat * nope * 2)?,
+                self.allocation(rank, &format!("{name}.uv"), heads * v * lat * 2)?)))?;
             let mut h = 0;
             while h < heads {
                 let count = per.min(heads - h);
@@ -696,8 +709,9 @@ impl<'a> GlmfLoader<'a> {
         let stream = if rank == 0 { self.stream } else {
             self.peers.get(rank - 1).context("native K6 load peer")?.stream
         };
-        self.on_rank(rank, || layout.load_recorded(crate::shared::memory::device::Device {
-            library: self.library, id: self.library.cuda_get_device()? }, self.checkpoint, &self.dense, stream))
+        self.on_rank(rank, || layout.load_recorded_with(Device {
+            library: self.library, id: self.rank_device(rank)? }, self.checkpoint, &self.dense, stream,
+                |name, bytes| self.allocate(self.rank_device(rank)?, name, bytes)))
     }
 
     fn native_layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode,
@@ -751,7 +765,7 @@ impl<'a> GlmfLoader<'a> {
                         let bytes = source.bytes();
                         lands.push((source, at)); at += bytes;
                     }
-                    ops[rank].insert("w_aux", self.landed(rank, lands, at)?);
+                    ops[rank].insert("w_aux", self.landed(rank, &format!("{p}.w_aux"), lands, at)?);
                 }
                 for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,
                     KdaOperand::DtBias, KdaOperand::ONorm] {
@@ -790,8 +804,8 @@ impl<'a> GlmfLoader<'a> {
                 let selected = self.checkpoint.projection(&layout.stem)?;
                 let [n,k] = layout.shape;
                 let (values, scales) = self.on_rank(rank, || Ok((
-                    DeviceAllocation::new(self.library, (n*k*if layout.fp8 { 1 } else { 2 }).max(256))?,
-                    if layout.fp8 { Some(DeviceAllocation::new(self.library, (n/128*(k/128)*4).max(256))?) } else { None }
+                    self.allocation(rank, &format!("{}.payload", layout.stem), n*k*if layout.fp8 { 1 } else { 2 })?,
+                    if layout.fp8 { Some(self.allocation(rank, &format!("{}.scales", layout.stem), n/128*(k/128)*4)?) } else { None }
                 )))?;
                 let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.attention_mode(),
                     &layout, self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
@@ -860,12 +874,12 @@ impl<'a> GlmfLoader<'a> {
                         ensure!(dtype == DType::Bf16, "{name}: NVFP4 gate needs BF16");
                         let rounded = super::fp8::nvfp4_roundtrip(&raw, shape[0], shape[1], search);
                         if name.ends_with("o_proj.weight") {
-                            ops.insert("w_o_nvfp4", self.upload(&rounded)?);
+                            ops.insert("w_o_nvfp4", self.upload(&a("o_proj.weight"), &rounded)?);
                         } else {
                             bytes.extend(rounded);
                         }
                     }
-                    ops.insert("w_in", self.upload(&bytes)?);
+                    ops.insert("w_in", self.upload(&format!("{p}.w_in"), &bytes)?);
                 } else {
                     ops.insert("w_in", self.kda_upload(cfg, &p, KdaOperand::WIn)?);
                 }
@@ -924,7 +938,12 @@ impl<'a> GlmfLoader<'a> {
         for rank in 0..self.peers.len() {
             let source = out[0].buffer;
             out.push(self.on_rank(rank + 1, || {
-                let copy = DeviceAllocation::new(self.library, source.bytes)?;
+                let lead = self.arenas.get(&source.device_id).context("Flash replica source arena")?;
+                let root = out[0].backing.as_ref().and_then(|a| a.weight_backing()).context("Flash replica source backing")?;
+                let offset = source.ptr as usize - root.buffer.ptr as usize;
+                let name = lead.layout().views().iter().find(|(_, view)| view.offset() == offset && view.bytes() == source.bytes)
+                    .map(|(name, _)| name.as_str()).context("Flash replica source view")?;
+                let copy = self.allocation(rank + 1, name, source.bytes)?;
                 self.dense.peer_copy(source, copy.buffer, source.bytes)?;
                 Ok(copy)
             })?);
@@ -993,7 +1012,7 @@ impl<'a> GlmfLoader<'a> {
                 // rank's active heads uploaded from the staging.
                 let name = Self::kda_name(prefix, KdaRole::ALog);
                 let raw = self.tensor(&name)?.meta.byte_length as usize;
-                let out = self.on_rank(rank, || DeviceAllocation::new(self.library, bytes.max(256)))?;
+                let out = self.on_rank(rank, || self.allocation(rank, &format!("{prefix}.{}", operand.name()), bytes))?;
                 let piece = &pieces[0];
                 self.step(rank, vec![rect(self.checkpoint, &name, 0..1, 0..raw)?], vec![Job::ALog { heads },
                     Job::Upload { at: piece.rows.start * 4, bytes, dst: out.buffer }])?;
@@ -1002,10 +1021,10 @@ impl<'a> GlmfLoader<'a> {
             if pieces.iter().all(|p| p.source == plan.dtype) {
                 let mut at = 0;
                 let lands = rects.into_iter().map(|r| { let o = at; at += r.bytes(); (r, o) }).collect();
-                return self.landed(rank, lands, bytes);
+                return self.landed(rank, &format!("{prefix}.{}", operand.name()), lands, bytes);
             }
             // Widened pieces: each a step writing its F32 elements.
-            let out = self.on_rank(rank, || DeviceAllocation::new(self.library, bytes.max(256)))?;
+            let out = self.on_rank(rank, || self.allocation(rank, &format!("{prefix}.{}", operand.name()), bytes))?;
             for (piece, whole) in pieces.iter().zip(rects) {
                 ensure!(piece.source == DType::Bf16 && plan.dtype == DType::F32, "KDA piece needs a widening");
                 let row_elements = piece.window.len();
@@ -1104,8 +1123,8 @@ impl<'a> GlmfLoader<'a> {
             Axis::Cols => (shapes[0].0, cols / ranks),
         };
         let out = (0..ranks).map(|rank| self.on_rank(rank, || Ok((
-            DeviceAllocation::new(self.library, (rank_rows * rank_cols).max(256))?,
-            DeviceAllocation::new(self.library, (rank_rows / 128 * (rank_cols / 128) * 4).max(256))?,
+            self.allocation(rank, &format!("{}.payload", joined(names)), rank_rows * rank_cols)?,
+            self.allocation(rank, &format!("{}.scales", joined(names)), rank_rows / 128 * (rank_cols / 128) * 4)?,
         )))).collect::<Result<Vec<_>>>()?;
         for (rank, (values, grid)) in out.iter().enumerate() {
             let mut row = 0;
@@ -1333,7 +1352,8 @@ impl<'a> GlmfLoader<'a> {
                         vec![PlainPack { name: "conv_w".into(), components: ["q", "k", "v"].iter()
                             .map(|kind| format!("{p}.self_attn.{kind}_conv1d.weight")).collect() }]
                     } else { vec![] };
-                    let mut native = dense_weights::load_layer_packed(self.library, &self.dense, source, &packs, stream)?;
+                    let mut native = dense_weights::load_layer_packed_with(self.library, &self.dense, source, &packs, stream,
+                        |name, bytes| self.allocate(self.rank_device(rank)?, name, bytes))?;
                     let mut operands = HashMap::new();
                     let mut take = |key: &'static str, tensor: String| {
                         if let Some(allocation) = native.remove(&tensor) { operands.insert(key, allocation); }
@@ -1373,8 +1393,9 @@ impl<'a> GlmfLoader<'a> {
                 share.push(part);
             }
         }
-        let norm = dense_weights::landed(self.library, &self.dense, &format!("{PREFIX}norm.weight"),
-            &records[0].norm, cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, self.stream)?;
+        let norm = dense_weights::landed_with(self.library, &self.dense, &format!("{PREFIX}norm.weight"),
+            &records[0].norm, cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, self.stream,
+                |name, bytes| self.allocate(self.device, name, bytes))?;
         for (rank, layers) in shares.iter().enumerate() {
             let loaded = layers.iter().map(GlmfLayer::bytes).sum::<usize>()
                 + if rank == 0 { norm.buffer.bytes } else { 0 };

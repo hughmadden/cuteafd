@@ -112,6 +112,40 @@ impl Admission {
         Ok(Self { facts, metadata, dense, charges, resident })
     }
 
+    pub(super) fn arena_layouts(&self, cfg: &GlmNextConfig, embedding_rank: usize)
+        -> Result<Vec<cuteafd_loader::serving_capacity::WeightArenaLayout>> {
+        use crate::shared::{experts::exlr8::dense_weights::{layer_requests, PlainPack}, token_io::native::row_requests};
+        let mut requests = vec![Vec::new(); self.dense.len()];
+        for (rank, records) in self.dense.iter().enumerate() {
+            for source in &records.layers {
+                let p = format!("{}layers.{}", super::weights::PREFIX, source.layer);
+                let packs = if cfg.attention[source.layer] == cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda {
+                    vec![PlainPack { name: "conv_w".into(), components: ["q", "k", "v"].iter()
+                        .map(|kind| format!("{p}.self_attn.{kind}_conv1d.weight")).collect() }]
+                } else { vec![] };
+                layer_requests(source, &packs, |request| {
+                    requests[rank].extend(request.owners.into_iter().map(|(name, bytes)|
+                        (format!("layers.{}.{name}", source.layer), bytes)));
+                    Ok(())
+                })?;
+            }
+        }
+        requests[0].push((format!("{}norm.weight", super::weights::PREFIX),
+            exlr8::dense::DenseTransform::Identity.allocation_bytes(&self.dense[0].norm)?));
+        let vocabulary = VocabularyPlan::new(&self.facts.records, &self.facts.selection, self.dense.len(), 0,
+            cfg.hidden, cfg.vocab_size)?;
+        for (i, slice) in vocabulary.dense_plan().tensors.iter().enumerate() {
+            let rank = if i == 0 { embedding_rank } else { 0 };
+            let name = if i == 0 { "embedding" } else { "head" };
+            requests[rank].extend(row_requests(slice)?.into_iter().map(|(suffix, bytes)|
+                (format!("{name}.{suffix}"), bytes)));
+        }
+        // The embedding facade has its own final placeholder, not a BF16 vocabulary source.
+        requests[0].push(("embedding.table".into(), 256));
+        requests.into_iter().enumerate().map(|(rank, requests)|
+            cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm5_flash/target/{rank}"), requests)).collect()
+    }
+
     pub(super) fn load_owners(&self, cfg: &GlmNextConfig)
         -> Result<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad> {
         use cuteafd_loader::plan::exlr8::residency::ExpertSet;
@@ -158,11 +192,13 @@ impl Admission {
         let plan = VocabularyPlan::new(&self.facts.records, &self.facts.selection, self.dense.len(), 0,
             cfg.hidden, cfg.vocab_size)?;
         admitted.validate_vocabulary(plan.staging_bytes() as u64)?;
-        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared(
-            library, programs, plan, admitted.vocabulary, embedding_device)?
+        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared_with(
+            library, programs, plan, admitted.vocabulary, embedding_device,
+            |name, bytes| loader.allocate(library.cuda_get_device()?, name, bytes))?
             .context("native Flash rank0 owns vocabulary")?);
         let source = embedding_source(&self.facts.records, &self.facts.selection, cfg.hidden, cfg.vocab_size)?;
-        let embedding = TokenEmbedding::row_fp8(library, source, vocabulary.clone())?;
+        let embedding = TokenEmbedding::row_fp8_with(library, source, vocabulary.clone(),
+            |name, bytes| loader.allocate(library.cuda_get_device()?, name, bytes))?;
         let model = loader.native_model(cfg, execution, &self.dense, vocabulary)?;
         Ok((embedding, model))
     }
