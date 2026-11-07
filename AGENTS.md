@@ -167,7 +167,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
 - Host checks: `cargo check/test --workspace` from `rust/` with
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
-  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers "huggingface-hub>=2.2" jsonschema pyyaml pillow matplotlib safetensors);
+  (`uv venv --python 3.12 .venv && uv pip sync --python .venv/bin/python scripts/dev/gate-requirements.txt`;
+  `cpu-gate` verifies the active venv against `scripts/dev/gate-requirements.txt`
+  and prefers `~/.cache/cuteafd/gate-venv` before a main checkout's `.venv`);
   `scripts/dev/cpu-gate --task NAME --jobs N` runs both suites concurrently
   (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). The gate uses
   nextest when present on PATH or in the persistent architecture Cargo home,
@@ -412,7 +414,10 @@ Host policy and read-only inventory: [host tuning](docs/host-tuning.md).
 - `maxq`: WSL2 x86-64, RTX PRO 6000 Blackwell Max-Q 96 GB (SM120),
   reached as `ssh maxq`. Builds, AOT exports, quants, CPU gates and
   single-GPU correctness only; never perf A/B, cards or serving. Its
-  hardware lock is `~/.cache/cuteafd/maxq.lock` on raptor.
+  hardware lock is `~/.cache/cuteafd/maxq.lock` on raptor. CPU gates on
+  `maxq` use `~/.cache/cuteafd/gate-venv` (synced to
+  `scripts/dev/gate-requirements.txt`, or linked as the worktree's `.venv`);
+  never touch `~/Developer/cuteafd/.venv` on `maxq` (TJ's quant venv).
 
 - `raptor`: coordinator, x86-64, 2× RTX PRO 6000 Blackwell 96 GB (SM120),
   power-limited by the gpu-powerd daemon (900 W shared budget, thermal

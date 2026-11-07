@@ -79,6 +79,7 @@ fn installed_glm_exl3_local_physical_equals_serving() -> Result<()> {
 
 fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
     test_name: &str, ignored: bool) -> Result<()> {
+    ensure!(manifest.is_file(), "required installed PROGRAMS.json missing: {}", manifest.display());
     const CHILD: &str = "CUTEAFD_GLM_LOCAL_PHYSICAL_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let mut command = std::process::Command::new(std::env::current_exe()?);
@@ -109,7 +110,7 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
     let repo = if native { "kindlingai/glm-5.3-exlr8-k2-k3-k4" }
         else { "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6" };
     let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)
-        .with_context(|| format!("required installed PROGRAMS missing: {}", manifest.display()))?)?;
+        .with_context(|| format!("required installed PROGRAMS.json missing: {}", manifest.display()))?)?;
     fixture.register_programs(&library, metadata["programs"].as_array().context("installed programs missing")?)?;
     let programs = library.programs()?.with_manifest(&manifest)?;
     let snapshot = installed_snapshot(repo)?;

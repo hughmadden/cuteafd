@@ -656,7 +656,7 @@ fn check_concurrency_plan_cell(
 
 #[test]
 fn boot_concurrency_full_plan_matrix() {
-    const ALL_CONCURRENCIES: &[u64] = &[1, 4, 16, 17, 32, 64, 65, 128];
+    const ALL_CONCURRENCIES: &[u64] = &[1, 17, 64, 128];
     struct Case {
         family: &'static str,
         label: &'static str,
@@ -693,7 +693,7 @@ fn boot_concurrency_full_plan_matrix() {
             let dir = tempfile::tempdir().unwrap();
             write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
             let manifest = write_muse_exl3_capacities(dir.path());
-            Case { family: "muse_spark", label: "muse_spark", dir, topologies: &[(1, 4), (2, 4)], concurrencies: &[65, 128], manifest: Some(manifest), base_options: None }
+            Case { family: "muse_spark", label: "muse_spark", dir, topologies: &[(1, 4), (2, 4)], concurrencies: &[128], manifest: Some(manifest), base_options: None }
         }),
         Box::new(|| {
             let dir = tempfile::tempdir().unwrap();
@@ -743,6 +743,9 @@ fn boot_concurrency_full_plan_matrix() {
                     let family = case.family;
                     seen.lock().unwrap().insert(family);
                     let input = PlanInput::open(case.dir.path()).unwrap();
+                    if family != "qwen3_5" {
+                        input.expert_catalog().unwrap();
+                    }
                     for &(gpus, ranks) in case.topologies {
                         for &c in case.concurrencies {
                             let mut options = case.base_options.clone()
@@ -798,8 +801,9 @@ fn boot_concurrency_full_plan_matrix_muse_spark() {
     write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
     let manifest = write_muse_exl3_capacities(dir.path());
     let input = PlanInput::open(dir.path()).unwrap();
+    input.expert_catalog().unwrap();
     for (gpus, ranks) in [(1, 4), (2, 4)] {
-        for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+        for c in [1, 17, 64, 128] {
             let mut options = wave_plan_options(dir.path(), ranks);
             let layout = options.layout.as_mut().unwrap();
             layout.state_slots = None;

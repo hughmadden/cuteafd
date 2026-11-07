@@ -1593,15 +1593,22 @@ pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize
 /// checkpoint and catalog `input` already read.
 fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usize,
     explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+    plan_spark_count_with(input, options, available, explicit, |candidate| input.plan(candidate))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn plan_spark_count_with(input: &PlanInput, options: &PlanOptions, available: usize,
+    explicit: Option<usize>,
+    mut plan_one: impl FnMut(&PlanOptions) -> Result<PlanReport, PlanError>) -> Result<PlanReport, PlanError> {
     if available > 8 {
         return Err(PlanError::InvalidOption { option: "available Sparks", reason: "inventory exceeds transport limit 8".into() });
     }
     let count = explicit.unwrap_or(available);
-    let candidate = |ranks| -> Result<PlanReport, PlanError> {
+    let mut candidate = |ranks| -> Result<PlanReport, PlanError> {
         let mut candidate = PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
         };
-        let mut report = input.plan(&candidate)?;
+        let mut report = plan_one(&candidate)?;
         // Shared Recipe families admit one fixed prefill shape. Preserve their
         // typed refusal instead of retrying smaller reserves in a second solve.
         if ranks == 0 || candidate.layout.is_none()
@@ -1640,7 +1647,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
             let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
                 candidate.layout.as_mut().unwrap().prefill_reserve_rows = Some(reserve);
-                input.plan(&candidate)?
+                plan_one(&candidate)?
             };
             report.prefill_reserve_rows = Some(reserve);
             Ok(report)
