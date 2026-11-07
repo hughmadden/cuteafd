@@ -173,38 +173,38 @@ pub(crate) fn mount_two_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::O
     out: &mut Digests) -> Result<()> {
     let devices = [Device { library, id: 0 }, Device { library, id: 1 }];
     let map = CachePlacement::encoder_decoder();
-    let weights = BackboneLaneWeights::load_distributed(library, catalog, map,
-        BackboneLaneWeights::distributed_device_bytes(library, catalog, map)?, 16 << 20)?;
+    let arenas = super::weight_layout::TargetArenas::new(library,
+        super::weight_layout::target_layout(catalog, Some(map), true, super::v41_tensors::fp8_head(), false, false)?)?;
+    let weights = BackboneLaneWeights::load_in(library, catalog, 16 << 20, Some(map), false, false, Some(&arenas))?;
     collect(library, out, |f| weights.visit(f))?;
     drop(weights);
-    let producers = CacheProducerWeights::load_distributed(library, catalog, map,
-        CacheProducerWeights::distributed_device_bytes(library, catalog, map)?, 16 << 20)?;
+    let producers = CacheProducerWeights::load_in(library, catalog, 16 << 20, Some(map), Some(&arenas))?;
     collect(library, out, |f| producers.visit(f))?;
     drop(producers);
-    let index = IndexLaneWeights::load_distributed(library, catalog, map,
-        IndexLaneWeights::distributed_device_bytes(library, catalog, map)?, 16 << 20)?;
+    let index = IndexLaneWeights::load_in(library, catalog, 16 << 20, Some(map), Some(&arenas))?;
     collect(library, out, |f| index.visit(f))?;
     drop(index);
-    let engram = PlacedEngramWeights::load(library, catalog, map,
-        PlacedEngramWeights::device_bytes(library, catalog, map)?, 16 << 20)?;
+    let engram = PlacedEngramWeights::load_in(library, catalog, map, 16 << 20, Some(&arenas))?;
     collect(library, out, |f| engram.visit(f))?;
     drop(engram);
-    let table = devices[0].own(|| NativeRtxTensors::load_embedding(library, catalog,
-        crate::shared::memory::EmbedPlacement::Gpu))?;
+    let table = devices[0].own(|| NativeRtxTensors::load_embedding_in(library, catalog,
+        crate::shared::memory::EmbedPlacement::Gpu, Some(arenas.get(0)?)))?;
     collect(library, out, |f| table.visit("gpu0.", f))?;
     drop(table);
     for (gpu, tokens) in [(0usize, 0..64640), (1, 64640..129280)] {
-        let shard = devices[gpu].own(|| VocabularyShard::load(library, catalog, tokens, 1 << 30, 16 << 20))?;
+        let shard = devices[gpu].own(|| VocabularyShard::load_in(library, catalog, tokens, 1 << 30, 16 << 20,
+            Some(arenas.get(gpu as i32)?)))?;
         collect(library, out, |f| shard.visit(&format!("gpu{gpu}.vocab."), f))?;
     }
-    let head = devices[1].own(|| TargetHeadWeights::load(library, catalog,
-        TargetHeadWeights::device_bytes(catalog)?, 16 << 20))?;
+    let head = devices[1].own(|| TargetHeadWeights::load_in(library, catalog,
+        TargetHeadWeights::device_bytes(catalog)?, 16 << 20, Some(arenas.get(1)?)))?;
     collect(library, out, |f| head.visit("gpu1.head.", f))?;
     drop(head);
     use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
     for device in devices {
         for layer in 0..40 {
-            let shared = SharedWeights::load(device, catalog, layer, SharedWeights::load_peak_device_bytes())?;
+            let shared = SharedWeights::load_in(device, catalog, layer, SharedWeights::load_peak_device_bytes(),
+                Some(arenas.get(device.id)?))?;
             collect(library, out, |f| shared.visit(f))?;
         }
     }
@@ -235,24 +235,25 @@ pub(crate) fn mount_one_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::O
     out: &mut Digests) -> Result<()> {
     let device = Device { library, id: 0 };
     device.run(|| {
-        let weights = BackboneLaneWeights::load(library, catalog,
-            BackboneLaneWeights::device_bytes(library, catalog)?, 16 << 20)?;
+        let arenas = super::weight_layout::TargetArenas::new(library,
+            super::weight_layout::target_layout(catalog, None, false, super::v41_tensors::fp8_head(), false, false)?)?;
+        let arena = Some(arenas.get(device.id)?);
+        let weights = BackboneLaneWeights::load_in(library, catalog, 16 << 20, None, false, false, Some(&arenas))?;
         collect(library, out, |f| weights.visit(&mut |n, b| f(format!("single.{n}"), b)))?;
         drop(weights);
-        let producers = CacheProducerWeights::load(library, catalog,
-            CacheProducerWeights::device_bytes(library, catalog)?, 16 << 20)?;
+        let producers = CacheProducerWeights::load_in(library, catalog, 16 << 20, None, Some(&arenas))?;
         collect(library, out, |f| producers.visit(&mut |n, b| f(format!("single.{n}"), b)))?;
         drop(producers);
-        let index = IndexLaneWeights::load(library, catalog, IndexLaneWeights::device_bytes(library, catalog)?, 16 << 20)?;
+        let index = IndexLaneWeights::load_in(library, catalog, 16 << 20, None, Some(&arenas))?;
         collect(library, out, |f| index.visit(&mut |n, b| f(format!("single.{n}"), b)))?;
         drop(index);
         for i in 0..2 {
-            let engram = crate::families::deepseek_v41::v41_engram::layer::EngramLayerWeights::load(library, catalog,
-                i, 256 << 20, 16 << 20)?;
+            let engram = crate::families::deepseek_v41::v41_engram::layer::EngramLayerWeights::load_in(library, catalog,
+                i, 256 << 20, 16 << 20, arena)?;
             collect(library, out, |f| engram.visit(&format!("single.engram{i}."), f))?;
         }
-        let vocabulary = crate::families::deepseek_v41::v41_tensors::VocabularyHead::load(library, catalog,
-            crate::families::deepseek_v41::v41_tensors::VocabularyHead::plan(catalog)?, 16 << 20)?;
+        let vocabulary = crate::families::deepseek_v41::v41_tensors::VocabularyHead::load_in(library, catalog,
+            crate::families::deepseek_v41::v41_tensors::VocabularyHead::plan(catalog)?, 16 << 20, arena)?;
         collect(library, out, |f| vocabulary.visit("single.vocab.", f))?;
         Ok(())
     })
@@ -336,31 +337,31 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     let layers = std::env::var("CUTEAFD_V41_GOLDEN_TP2_LAYERS").ok().map(|v| v.parse()).transpose()?.unwrap_or(2);
     let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
     let socket_dir = tempfile::tempdir()?;
-    // Dense owners, recorded in groups the size of one GPU's memory headroom.
+    let map = CachePlacement::encoder_decoder();
+    let arenas = super::weight_layout::TargetArenas::new(&library,
+        super::weight_layout::target_layout(&catalog, Some(map), true, super::v41_tensors::fp8_head(), false, false)?)?;
+    // Bind the same final arena views as serving before recording delivery.
     let recorder = Recorder::start(true)?.context("recorder")?;
     let mut owners = Digests::new();
     let owners_ref = &mut owners;
     // Record the owners, keeping them alive until pushed and digested.
-    let map = CachePlacement::encoder_decoder();
-    let weights = BackboneLaneWeights::load_distributed(&library, &catalog, map,
-        BackboneLaneWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
-    let producers = CacheProducerWeights::load_distributed(&library, &catalog, map,
-        CacheProducerWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
-    let index = IndexLaneWeights::load_distributed(&library, &catalog, map,
-        IndexLaneWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
-    let engram = PlacedEngramWeights::load(&library, &catalog, map,
-        PlacedEngramWeights::device_bytes(&library, &catalog, map)?, 16 << 20)?;
-    let table = devices[0].own(|| NativeRtxTensors::load_embedding(&library, &catalog,
-        crate::shared::memory::EmbedPlacement::Gpu))?;
+    let weights = BackboneLaneWeights::load_in(&library, &catalog, 16 << 20, Some(map), false, false, Some(&arenas))?;
+    let producers = CacheProducerWeights::load_in(&library, &catalog, 16 << 20, Some(map), Some(&arenas))?;
+    let index = IndexLaneWeights::load_in(&library, &catalog, 16 << 20, Some(map), Some(&arenas))?;
+    let engram = PlacedEngramWeights::load_in(&library, &catalog, map, 16 << 20, Some(&arenas))?;
+    let table = devices[0].own(|| NativeRtxTensors::load_embedding_in(&library, &catalog,
+        crate::shared::memory::EmbedPlacement::Gpu, Some(arenas.get(0)?)))?;
     let vocab = [(0usize, 0..64640), (1, 64640..129280)].map(|(gpu, tokens)|
-        devices[gpu].own(|| VocabularyShard::load(&library, &catalog, tokens, 1 << 30, 16 << 20)));
+        devices[gpu].own(|| VocabularyShard::load_in(&library, &catalog, tokens, 1 << 30, 16 << 20,
+            Some(arenas.get(gpu as i32)?))));
     let vocab = vocab.into_iter().collect::<Result<Vec<_>>>()?;
-    let head = devices[1].own(|| TargetHeadWeights::load(&library, &catalog,
-        TargetHeadWeights::device_bytes(&catalog)?, 16 << 20))?;
+    let head = devices[1].own(|| TargetHeadWeights::load_in(&library, &catalog,
+        TargetHeadWeights::device_bytes(&catalog)?, 16 << 20, Some(arenas.get(1)?)))?;
     use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
     let mut shared = Vec::new();
     for device in devices {
-        for layer in 0..40 { shared.push(SharedWeights::load(device, &catalog, layer, SharedWeights::load_peak_device_bytes())?); }
+        for layer in 0..40 { shared.push(SharedWeights::load_in(device, &catalog, layer, SharedWeights::load_peak_device_bytes(),
+            Some(arenas.get(device.id)?))?); }
     }
     let draft = devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving(
         &library, &catalog, 80, 8, 32 << 30, 16 << 20))?;
