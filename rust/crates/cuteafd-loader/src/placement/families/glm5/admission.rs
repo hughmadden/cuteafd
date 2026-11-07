@@ -301,6 +301,48 @@ impl NativeLoad {
     }
 }
 
+/// Selected dense and expert push owners, charged before the complete recipe solve.
+pub fn push_host_envelope(checkpoint: &crate::plan::Checkpoint, cfg: &GlmDsaConfig,
+    layers: usize, ranks: usize, catalog: Option<&crate::OfficialV41Catalog>,
+    metadata: Option<&crate::plan::exlr8::residency::MetadataInput>, largest_native: u64)
+    -> anyhow::Result<Option<crate::push_load::PushHostEnvelope>> {
+    use anyhow::{ensure, Context};
+    if super::local_physical::LocalStorage::for_snapshot(&checkpoint.snapshot)?
+        == super::local_physical::LocalStorage::Mount { return Ok(None); }
+    ensure!((1..=2).contains(&ranks) && layers <= cfg.layers, "GLM push identity");
+    let largest = checkpoint.tensors.iter().filter(|t| !t.meta.name.contains(".experts.")
+        && !t.meta.name.starts_with("experts.")).map(|t| t.meta.byte_length).max().unwrap_or(0).max(largest_native);
+    let slots = cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64;
+    let slot = cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64;
+    let dense = crate::push_load::admitted_push_envelope(largest, slots as usize, slot)?;
+    let mut expert = vec![0u64; ranks];
+    let mut retained = vec![0u64; ranks];
+    for rank in 0..ranks {
+        for layer in cfg.first_moe_layer..layers {
+            if let Some(metadata) = metadata {
+                let plan = metadata.plan(layer, ranks, rank, crate::plan::exlr8::residency::ExpertSet::Routed)?;
+                expert[rank] = expert[rank].max(plan.descriptor_host_bytes()? as u64);
+                retained[rank] = retained[rank].checked_add(plan.host_bytes() as u64)
+                    .context("GLM retained push metadata overflow")?;
+            } else {
+                let catalog = catalog.context("GLM push experts require a catalog or selected EXLR8 metadata")?;
+                if let Some(manifest) = catalog.exl3() {
+                    let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?;
+                    expert[rank] = expert[rank].checked_add(plan.loads.iter()
+                        .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4)
+                        .context("GLM push validation overflow")?;
+                } else {
+                    expert[rank] = catalog.tensors().iter().filter(|t| t.metadata.name.ends_with("input_scale")
+                        || t.metadata.name.ends_with("weight_scale_2"))
+                        .map(|t| t.metadata.byte_length).max().unwrap_or(0).checked_mul(2)
+                        .context("GLM native push scratch overflow")?.max(2 << 20);
+                }
+            }
+        }
+    }
+    Ok(Some(crate::push_load::PushHostEnvelope::with_retained(expert, vec![dense; ranks], retained, slots, slot)?))
+}
+
 /// Target owners assembled from the same physical plans consumed by the loaders.
 /// These facts contain no sampled-free subtraction or admission decision.
 #[derive(Debug, Clone)]
@@ -822,7 +864,9 @@ impl<'a> ProductionInput<'a> {
         }
         if self.gpus == 2 {
             let core_rows = recipe.hooks.iter().any(|hook| hook.value.core.is_some());
-            let width = self.cfg.hidden as u64 * (self.exchange_element_bytes + if core_rows { 2 } else { 0 });
+            let partial = recipe.hooks.iter().filter_map(|hook| hook.value.core.as_ref())
+                .map(|core| core.attention_partial_bytes as u64).max().unwrap_or(0);
+            let width = self.cfg.hidden as u64 * (self.exchange_element_bytes + if core_rows { partial } else { 0 });
             let receive = self.prefill.rows.max(super::DECODE_ROWS).checked_mul(width)
                 .ok_or(Refusal::Overflow("GLM peer receive slots"))?;
             recipe.exchanges.push(Case { when: vec![When::Prefill(self.prefill)], value: ExchangeBuffers {
@@ -868,6 +912,7 @@ impl<'a> ProductionInput<'a> {
                     replicated.core_loading = Default::default();
                     replicated.kv_b_loading = Default::default();
                     replicated.row_loading = Default::default();
+                    replicated.attention_mount = Default::default();
                     let mut condition = when.clone();
                     condition.push(When::Embedding(*home));
                     recipe.weights.push(Case { when: condition, value: replicated });
@@ -890,6 +935,8 @@ impl<'a> ProductionInput<'a> {
                         self.cfg.hidden as u64 * self.exchange_element_bytes
                     } else { 0 },
                     core_rows: recipe.hooks[device as usize].value.core.is_some(),
+                    attention_partial_bytes: recipe.hooks[device as usize].value.core.as_ref()
+                        .map_or(2, |core| core.attention_partial_bytes as u64),
                 } });
             }
             let layers = (0..self.layers).map(|layer| GlmGraphLayer {

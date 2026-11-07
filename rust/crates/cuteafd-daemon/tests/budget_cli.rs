@@ -30,11 +30,16 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
 
 #[test]
 fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_input() {
-    // GLM Flash selects its immutable metadata view before resolving concurrency.
     let snapshot = tempfile::tempdir().unwrap();
-    std::fs::write(snapshot.path().join("config.json"), r#"{"model_type":"glm5_next"}"#).unwrap();
     std::fs::write(snapshot.path().join("model.safetensors.index.json"), r#"{"weight_map":{}}"#).unwrap();
     for family in ["serve-glmf", "serve-glm", "serve-mimo"] {
+        // Selected-view validation precedes concurrency for the GLM target.
+        let config = if family == "serve-glm" {
+            cuteafd_loader::plan::testing::glm5_config()
+        } else {
+            serde_json::json!({"model_type": "glm5_next"})
+        };
+        std::fs::write(snapshot.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
         for gib in [30u64, 32, 96] {
             let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
             for explicit in [None, Some(expected), Some(4)] {

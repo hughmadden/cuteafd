@@ -91,6 +91,7 @@ pub struct TargetBuffers {
     /// Optional TP2 payload and K6 row arenas; their hook-local owners are separate.
     pub payload_row_bytes: u64,
     pub core_rows: bool,
+    pub attention_partial_bytes: u64,
 }
 
 fn mul(a: u64, b: u64) -> Result<u64, Refusal> {
@@ -202,7 +203,7 @@ impl Builder {
         }
         if facts.core_rows {
             fields.extend([
-                ("core.attention", mul(cfg.hidden as u64, 2)?),
+                ("core.attention", mul(cfg.hidden as u64, facts.attention_partial_bytes)?),
                 ("core.down", mul(cfg.hidden as u64, 2)?),
                 ("core.reduction", mul(cfg.hidden as u64, 4)?),
             ]);

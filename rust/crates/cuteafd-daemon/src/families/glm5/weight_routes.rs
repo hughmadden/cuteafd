@@ -21,6 +21,7 @@ pub(super) enum Operation {
     },
     HeadVector(String),
     Core(SharedCoreLayout),
+    NativeAttention(cuteafd_loader::formats::native_attention::NativeLayout),
     TensorScales(Vec<String>),
 }
 
@@ -252,6 +253,13 @@ impl Routes<'_> {
                     (format!("core.{key}.svh"), extent(&[n, 2])?),
                 ]);
             }
+            Operation::NativeAttention(layout) => {
+                let [n, k] = layout.shape;
+                sizes.push((format!("native.{key}.values"), extent(&[n, k, if layout.fp8 { 1 } else { 2 }])?.max(256)));
+                if layout.fp8 {
+                    sizes.push((format!("native.{key}.scales"), extent(&[n.div_ceil(128), k.div_ceil(128), 4])?.max(256)));
+                }
+            }
             Operation::TensorScales(names) => {
                 ensure!(
                     !names.is_empty() && names.len() <= 2,
@@ -275,7 +283,7 @@ impl Routes<'_> {
             .iter()
             .flat_map(|&rank| {
                 sizes.iter().map(move |(name, bytes)| {
-                    let name = if name.starts_with("core.") {
+                    let name = if name.starts_with("core.") || name.starts_with("native.") {
                         name.clone()
                     } else {
                         format!("operand.{name}")
@@ -335,25 +343,10 @@ pub(super) fn layer_routes(
     ] {
         r.push(false, key, Operation::Tensor(r.weight(op)?))?;
     }
-    let first = cfg
-        .stem(layer, Op::QA)
-        .or_else(|| cfg.stem(layer, Op::QB))
-        .context("query projection")?;
-    let core_attention = core.get_weight(&first).is_some();
-    if !cfg.variant.is_glm() && !core_attention {
-        let found = [Op::KvA, Op::QB, Op::O]
-            .into_iter()
-            .filter_map(|op| cfg.weight(layer, op))
-            .map(|name| r.meta(&name).map(|meta| format!("{name} {:?}", meta.dtype)))
-            .collect::<Result<Vec<_>>>()?
-            .join(", ");
-        cuteafd_loader::families::glm5::core::validate_attention_format(
-            cfg,
-            layer,
-            core_attention,
-            found,
-        )?;
-    }
+    let core_attention = [Op::QA, Op::KvA, Op::QB, Op::O].into_iter()
+        .filter_map(|op| cfg.stem(layer, op)).all(|stem|
+            core.get_weight(&stem).is_some() || core.native.contains_key(&stem));
+    cuteafd_loader::families::glm5::core::validate_attention_format(cfg, layer, core)?;
     let attention = [Op::QA, Op::KvA, Op::QB, Op::KvB, Op::O]
         .into_iter()
         .filter_map(|op| cfg.weight(layer, op))
@@ -523,6 +516,14 @@ pub(super) fn layer_routes(
             last.ranks.retain(|&r| r == rank);
             last.requests
                 .retain(|request| request.location == Location::coordinator(rank as u8));
+        }
+    }
+    for (rank, layouts) in core.layer_native(cfg, layer, ranks, owner)?.into_iter().enumerate() {
+        for (key, layout) in layouts {
+            r.push(false, key, Operation::NativeAttention(layout))?;
+            let last = r.routes.last_mut().unwrap();
+            last.ranks.retain(|&r| r == rank);
+            last.requests.retain(|request| request.location == Location::coordinator(rank as u8));
         }
     }
     for route in r.routes {

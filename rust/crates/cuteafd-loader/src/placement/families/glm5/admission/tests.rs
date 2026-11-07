@@ -37,7 +37,7 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
         gpus, prefill,
         target: TargetFacts {
             weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
-                core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default() })],
+                core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: Default::default() })],
             hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
                 native: None, core: None, shared_workspace: None }).collect(),
             embedding_read: None, native_load: None,
@@ -584,7 +584,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
                         )),
                         full_prefill_logits: false,
                         payload_row_bytes: if local { cfg.hidden as u64 * 4 } else { 0 },
-                        core_rows: false,
+                        core_rows: false, attention_partial_bytes: 2,
                     },
                 });
             }
@@ -615,7 +615,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
                 ranks: 2,
                 core_loading: super::super::weights::CoreLoading::default(),
                 kv_b_loading: super::super::weights::KvBLoading::default(),
-                row_loading: super::super::weights::RowLoading::default(),
+                row_loading: super::super::weights::RowLoading::default(), attention_mount: Default::default(),
                 owners: vec![super::super::weights::WeightOwner {
                     allocation: Allocation::buffer(
                         "glm.weights.embedding",

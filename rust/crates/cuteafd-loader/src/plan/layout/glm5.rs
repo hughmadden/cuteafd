@@ -196,6 +196,11 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
     anyhow::ensure!((1..=2).contains(&ranks), "GLM coordinator ranks");
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+    if !core.native.is_empty() {
+        return crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
+            checkpoint, ranks, layers, owners, crate::families::glm5::native_bf16(), false,
+            crate::placement::planner::EmbeddingHome::Device(0))?.resident_groups();
+    }
     let trellis = !core.projections.is_empty();
     anyhow::ensure!(layers <= cfg.layers, "GLM resident layer extent exceeds checkpoint");
     anyhow::ensure!(owners.is_none_or(|owners| ranks == 2 && owners.len() == layers
@@ -534,8 +539,14 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         storage: LocalStorage::for_snapshot(&checkpoint.snapshot)?,
         route_checks: true, peer_diagnostics: false, activations: options.exlr8_prefill_activations };
     let source = local.as_ref().map(|local| LocalPhysicalSource::read(&cfg, &catalog, local, &physical, None)).transpose()?;
-    let (draft, additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
+    let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpus, maximum_pages)?;
+    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpus, Some(&catalog), None, 0)? {
+        additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }));
+    }
     use crate::plan::encoder::{EncoderRequest, EncoderHardware, EncoderGpuBudget, EncoderSparkBudget, EncoderKind};
     let towers = towers(report, checkpoint);
     let (weights, encoder_scratch) = match towers.vision {
@@ -689,8 +700,18 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 2 * glm::PAGE_ROWS } else { glm::PAGE_ROWS };
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(
         &options.rtx_bytes, context, options.pool_tokens, page_tokens, spark_ranks == 0).maximum_tokens();
-    let (draft, additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
-        context, attention, gpu_count, maximum_pool_tokens.div_ceil(page_tokens))?;
+    let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
+    let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
+        context, attention, gpu_count, maximum_pages)?;
+    let largest_native = records.iter().flat_map(|record| &record.components)
+        .map(|component| component.source.bytes as u64).max().unwrap_or(0);
+    if let Some(envelope) = push_host_envelope(checkpoint, &cfg, cfg.layers, gpu_count, None,
+        Some(metadata), largest_native)? {
+        additional.extend(envelope.allocations("glm.load.push")?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }));
+    }
     let geometry = cuteafd_core::ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
         topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
     let rings = cuteafd_core::SparkRings { max_frame_bytes: geometry.native_frame_budget(
@@ -808,6 +829,28 @@ mod tests {
                 assert!(ledger.phases.iter().any(|row| row.budget == host.id && row.phase == Phase::Load && row.owned > 0));
                 assert!(ledger.phases.iter().all(|row| row.owned + row.opaque <= row.available));
             }
+        }
+    }
+
+    #[test]
+    fn native_metadata_admission_does_not_reopen_full_forward_catalog() {
+        use crate::plan::exlr8::residency::MetadataInput;
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::exlr8::glm_admission_snapshot(dir.path());
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        assert_eq!(cfg.layers, 2);
+        // This fixture deliberately cannot enter the shipping full-forward catalog.
+        let error = crate::read_expert_catalog(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("78 layers/hidden6144/first routed3"), "{error:#}");
+        let metadata = MetadataInput::open(dir.path(), "k4").unwrap();
+        let manifest = crate::plan::testing::exlr8::glm_admission_programs();
+        for gpus in 1..=2 {
+            let options = native_fixture_options(gpus);
+            let (layout, _) = native_layout_with_metadata(&checkpoint, &options, 4, &manifest,
+                "k4", Some(&metadata), None, None).unwrap();
+            assert_eq!(layout.devices.len(), gpus);
+            assert_eq!(layout.pool_tokens, options.pool_tokens.unwrap());
         }
     }
 

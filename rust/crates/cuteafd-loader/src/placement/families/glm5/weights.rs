@@ -119,6 +119,35 @@ impl RowLoading {
     }
 }
 
+/// One native projection's serialized mount reader, including TP column reads.
+pub fn native_attention_mount(
+    layout: &crate::formats::native_attention::NativeLayout,
+    source_shape: [usize; 2],
+    convert_bf16: bool,
+) -> Result<crate::shared::dense_read::MountLoad> {
+    use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
+    let [n, k] = layout.shape;
+    ensure!(n > 0 && k > 0 && source_shape[0] >= n && source_shape[1] >= k,
+        "native attention mount geometry");
+    let width = if layout.fp8 && !convert_bf16 { 1 } else { 2 };
+    let row_bytes = source_shape[1].checked_mul(width).context("native source row overflow")?;
+    let packed_width = k.checked_mul(width).context("native packed row overflow")?;
+    if convert_bf16 {
+        ensure!(layout.fp8 && n % 128 == 0 && k % 128 == 0,
+            "native FP8 conversion requires whole blocks");
+        let rows = n.min((cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / packed_width / 128).max(1) * 128);
+        let mut load = MountLoad::read(ReadBatch::new(rows, row_bytes, packed_width, usize::MAX)?);
+        load.pinned_tables = cuteafd_ffi::programs::fp8_load_table_bytes(rows, 1)? as u64;
+        return Ok(load);
+    }
+    let mut load = MountLoad::read(ReadBatch::new(n, row_bytes, packed_width, STEP_BYTES)?);
+    if layout.fp8 {
+        load.merge(MountLoad::read(ReadBatch::new(n.div_ceil(128),
+            source_shape[1].div_ceil(128) * 4, k.div_ceil(128) * 4, STEP_BYTES)?));
+    }
+    Ok(load)
+}
+
 #[derive(Debug, Clone)]
 pub struct WeightInventory {
     pub ranks: usize,
@@ -126,6 +155,7 @@ pub struct WeightInventory {
     pub core_loading: CoreLoading,
     pub kv_b_loading: KvBLoading,
     pub row_loading: RowLoading,
+    pub attention_mount: crate::shared::dense_read::MountLoad,
 }
 
 impl WeightInventory {
@@ -137,10 +167,13 @@ impl WeightInventory {
         }
         let bytes = self.core_loading.heap_payload_bytes
             .max(self.kv_b_loading.heap_payload_bytes).max(self.row_loading.heap_payload_bytes);
-        if bytes == 0 {
-            return Ok(Vec::new());
-        }
-        Ok(vec![Component {
+        let mut components = self.attention_mount.allocations("glm.load.native_attention").into_iter()
+            .map(|owner| {
+                let curve = ByteCurve::fixed(owner.bytes, maximum_pages);
+                Component::allocation(owner, curve, false, maximum_pages)
+            }).collect::<Vec<_>>();
+        if bytes == 0 { return Ok(components); }
+        components.push(Component {
             activation: Activation::always(),
             bytes: ByteCurve::fixed(bytes, maximum_pages),
             kind: ComponentKind::Allowance(Allowance {
@@ -150,7 +183,8 @@ impl WeightInventory {
                 source: "GLM serialized target payload heap subset: max(K6 full four-member source including marker + local packed payload/suh/svh, BF16 KV-B source + full uk/uv outputs + largest single-rank upload slice, BF16 row reader all raw members + largest one-member FP32 grid); ordinary Rust heap, unmeasured assumption; excludes allocator/metadata/thread overhead, retained thread-local staging, device dequantization temporaries, other target operations, concurrent draft prefetch and embedding filler".into(),
                 assumed: true,
             }),
-        }])
+        });
+        Ok(components)
     }
 
     fn add(
@@ -347,25 +381,22 @@ impl WeightInventory {
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
             kv_b_loading: KvBLoading::default(),
-            row_loading: RowLoading::default(),
+            row_loading: RowLoading::default(), attention_mount: Default::default(),
         };
         for layer in 0..layers {
             let weight = |op| cfg.weight(layer, op).context("missing GLM variant operand");
             let qkv = [Op::QA, Op::KvA].into_iter().filter_map(|op| cfg.weight(layer, op)).collect::<Vec<_>>();
             let attention = [Op::QA, Op::KvA, Op::QB, Op::KvB, Op::O].into_iter()
                 .filter_map(|op| cfg.weight(layer, op)).collect::<Vec<_>>();
-            let first = cfg.weight(layer, Op::QA).or_else(|| cfg.weight(layer, Op::QB))
-                .context("GLM query projection")?;
-            let core_attention = core.get_weight(&first).is_some();
-            if !cfg.variant.is_glm() && !core_attention {
-                let found = [Op::KvA, Op::QB, Op::O].into_iter().filter_map(|op| cfg.weight(layer, op))
-                    .map(|name| headers.get(&name).map(|header| format!("{name} {:?}", header.dtype)))
-                    .collect::<Result<Vec<_>>>()?.join(", ");
-                crate::families::glm5::core::validate_attention_format(&cfg, layer, core_attention, found)?;
-            }
+            let staged = |op| cfg.stem(layer, op).is_some_and(|stem|
+                core.get_weight(&stem).is_some() || core.native.contains_key(&stem));
+            let core_attention = [Op::QA, Op::KvA, Op::QB, Op::O].into_iter()
+                .filter(|op| cfg.stem(layer, *op).is_some()).all(staged);
+            crate::families::glm5::core::validate_attention_format(&cfg, layer, &core)?;
             let bf16 = core_attention || native_bf16 && headers.all_bf16(&attention)?;
             let layouts =
                 core.layer_weights(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
+            let native_layouts = core.layer_native(&cfg, layer, ranks, owners.map(|owners| owners[layer]))?;
             if cfg.indexers[layer] == GlmIndexer::Full {
                 out.row_loading.include(&headers, &[
                     cfg.weight(layer, crate::families::glm5::names::Operand::IndexK)
@@ -618,6 +649,18 @@ impl WeightInventory {
                         )?;
                     }
                 }
+                for (name, layout) in &native_layouts[rank] {
+                    let source = core.native.get(&layout.stem).context("native attention source layout")?;
+                    out.attention_mount.merge(native_attention_mount(layout, source.shape,
+                        checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact)?);
+                    let [n, k] = layout.shape.map(|n| n as u64);
+                    out.add(rank, &format!("layer.{layer}.native.{name}.values"), "attention",
+                        if layout.fp8 { "fp8" } else { "bf16" }, product(&[n, k, if layout.fp8 { 1 } else { 2 }])?.max(256))?;
+                    if layout.fp8 {
+                        out.add(rank, &format!("layer.{layer}.native.{name}.scales"), "attention", "fp8-scale",
+                            product(&[n.div_ceil(128), k.div_ceil(128), 4])?.max(256))?;
+                    }
+                }
                 for (name, layout) in &layouts[rank] {
                     out.core(
                         rank,
@@ -676,7 +719,7 @@ impl WeightInventory {
         ensure!(plans.len() == self.ranks, "GLM native shared rank count");
         let mut owners = Self {
             ranks: self.ranks, owners: Vec::new(), core_loading: CoreLoading::default(),
-            kv_b_loading: KvBLoading::default(), row_loading: RowLoading::default(),
+            kv_b_loading: KvBLoading::default(), row_loading: RowLoading::default(), attention_mount: Default::default(),
         };
         for (rank, layers) in plans.iter().enumerate() {
             for plan in layers {
@@ -708,7 +751,7 @@ impl WeightInventory {
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
             kv_b_loading: KvBLoading::default(),
-            row_loading: RowLoading::default(),
+            row_loading: RowLoading::default(), attention_mount: Default::default(),
         };
         out.extend_native(selection, layers, &plans.iter().collect::<Vec<_>>())?;
         Ok(out)
@@ -731,7 +774,7 @@ impl WeightInventory {
             owners: Vec::new(),
             core_loading: CoreLoading::default(),
             kv_b_loading: KvBLoading::default(),
-            row_loading: RowLoading::default(),
+            row_loading: RowLoading::default(), attention_mount: Default::default(),
         };
         let mut embedding = false;
         for (rank, plan) in plans.iter().enumerate() {

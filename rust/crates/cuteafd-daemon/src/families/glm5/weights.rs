@@ -50,6 +50,7 @@ pub(crate) struct GlmLayer<'a> {
     pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
     /// Standard HF K6 payload/vector owners, separate from EXLR8 encodings.
     pub(crate) core: std::collections::BTreeMap<&'static str, CoreWeights<'a>>,
+    pub(crate) attention_native: std::collections::BTreeMap<&'static str, crate::shared::memory::device::DeviceOwner<'a, crate::shared::native_attention::NativeAttentionWeights<'a>>>,
 }
 
 /// The `{w}_fp8` / `{w}_scale` operand names of an FP8 weight, and its
@@ -118,6 +119,12 @@ impl GlmLayer<'_> {
                 out.push((format!("core.{name}.{component}"), owner.buffer));
             }
         }
+        for (name, weights) in &self.attention_native {
+            out.push((format!("native.{name}.values"), weights.values.buffer));
+            if let Some(scales) = &weights.scales {
+                out.push((format!("native.{name}.scales"), scales.buffer));
+            }
+        }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -138,6 +145,10 @@ impl GlmLayer<'_> {
             if let Some(w) = self.core.get(name) {
                 return trellis_ranges(w.payload.buffer, w.suh.buffer, w.svh.buffer);
             }
+            if let Some(weight) = self.attention_native.get(name) {
+                return std::iter::once(&weight.values).chain(weight.scales.as_ref())
+                    .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect();
+            }
             native_projection_ranges(name, |key| self.native.get(key)
                 .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)))
         })
@@ -151,6 +162,7 @@ impl GlmLayer<'_> {
     pub fn bytes(&self) -> usize {
         self.operands.values().chain(self.native.values()).map(|a| a.buffer.bytes).sum::<usize>()
             + self.core.values().map(|w| w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes).sum::<usize>()
+            + self.attention_native.values().map(|w| w.values.buffer.bytes + w.scales.as_ref().map_or(0, |s| s.buffer.bytes)).sum::<usize>()
     }
 
     /// A native operand's device buffer.
@@ -878,6 +890,7 @@ impl<'a> GlmLoader<'a> {
             split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
             attention_resident: owner.is_none_or(|owner| usize::from(owner) == rank),
             operands: HashMap::new(), native: HashMap::new(), native_projections: HashMap::new(), core: Default::default(),
+            attention_native: Default::default(),
         }).collect::<Vec<_>>();
         layer_routes(self.catalog, cfg, layer, checkpoint, core, ranks, owner, native_shared, bf16_programs(), |route| {
             let mut loaded = Vec::<(usize, &'static str, DeviceAllocation<'a>)>::new();
@@ -888,6 +901,51 @@ impl<'a> GlmLoader<'a> {
                     .into_iter().map(|(suffix, buffer)| (format!("glm.weights.gpu.{rank}.layer.{layer}.core.{}.{suffix}", route.key), buffer)).collect::<Vec<_>>();
                 self.check_weight_requests(&route.requests, &actual)?;
                 layers[rank].core.insert(route.key, weights);
+                return Ok(());
+            }
+            if let Operation::NativeAttention(layout) = route.operation {
+                use crate::shared::native_attention::{attention_records, AttentionRecord, NativeAttentionWeights};
+                let rank = route.ranks[0];
+                let device = crate::shared::memory::device::Device { library: self.library,
+                    id: if rank == 0 { self.library.cuda_get_device()? } else { self.peers[rank - 1].device } };
+                let weights = device.own(|| self.on_rank(rank, |stream| {
+                    let [n, k] = layout.shape;
+                    let values = DeviceAllocation::new(self.library, (n * k * if layout.fp8 { 1 } else { 2 }).max(256))?;
+                    let scales = layout.fp8.then(|| DeviceAllocation::new(self.library,
+                        (n.div_ceil(128) * k.div_ceil(128) * 4).max(256))).transpose()?;
+                    let selected = checkpoint.projection(&layout.stem)?;
+                    let cuteafd_loader::plan::checkpoint::ProjectionStorage::Native { shape, .. } = &selected.storage
+                        else { anyhow::bail!("native attention load selected compressed source"); };
+                    let receipt = cuteafd_loader::placement::families::glm5::weights::native_attention_mount(
+                        &layout, [shape[0], shape[1]],
+                        checkpoint.attention_mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact)?;
+                    let records = attention_records(self.catalog.snapshot(), &selected,
+                        checkpoint.attention_mode(), &layout, crate::shared::fp8_linear::Fp8Scales::Amax,
+                        values.buffer, scales.as_ref().map(|s| s.buffer))?;
+                    let mount = crate::shared::experts::rtx::dense::DenseLoad::mount(self.library);
+                    mount.admit_mount(receipt)?;
+                    for record in records {
+                        match (&self.push, record) {
+                            (Some(push), AttentionRecord::Operand(record)) => push.dense.operand(record)?,
+                            (Some(push), AttentionRecord::Step(record)) => push.dense.step(record)?,
+                            (None, AttentionRecord::Operand(record)) => mount.operand(record)?,
+                            (None, AttentionRecord::Step(record)) => mount.step(record, stream)?,
+                        }
+                    }
+                    // SAFETY: this rank owns the load stream and every destination
+                    // remains live until its queued load/transform work completes.
+                    if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
+                        self.library.quarantine_module_after_failed_drain();
+                        return Err(drain.context("GLM native attention owners quarantined after failed load drain"));
+                    }
+                    Ok(NativeAttentionWeights { layout, values, scales })
+                }))?;
+                let mut actual = vec![(format!("glm.weights.gpu.{rank}.layer.{layer}.native.{}.values", route.key), weights.values.buffer)];
+                if let Some(scales) = &weights.scales {
+                    actual.push((format!("glm.weights.gpu.{rank}.layer.{layer}.native.{}.scales", route.key), scales.buffer));
+                }
+                self.check_weight_requests(&route.requests, &actual)?;
+                layers[rank].attention_native.insert(route.key, weights);
                 return Ok(());
             }
             let first = route.ranks[0];
@@ -959,7 +1017,7 @@ impl<'a> GlmLoader<'a> {
                     Operation::HeadVector(name) => put(route.key, loader.head_vector(parts, &name)?)?,
                     Operation::TensorScales(names) => put(route.key, loader.upload_all(parts,
                         &loader.tensor_scales(&names)?.context("declared tensor scales missing")?)?)?,
-                    Operation::Core(_) => unreachable!(),
+                    Operation::Core(_) | Operation::NativeAttention(_) => unreachable!(),
                 }
                 Ok(())
             })?;
@@ -1004,7 +1062,9 @@ impl<'a> GlmLoader<'a> {
         ensure!(owners.is_none_or(|o| o.len() == layers && self.ranks() == 2 && o.iter().all(|&r| r < 2)),
             "whole attention needs one owner per layer and two ranks");
         let split = crate::shared::memory::load_timing::Split::start();
-        let mut checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())?;
+        let mut checkpoint = if let Some(view) = self.catalog.selected_view() {
+            cuteafd_loader::plan::Checkpoint::coordinator_view(view, false, false)?
+        } else { cuteafd_loader::plan::checkpoint::Checkpoint::inventory(self.catalog.snapshot())? };
         let core = CoreInventory::from_checkpoint(cfg, &checkpoint)?;
         // Inventory is header-light. Reuse only the native core headers already
         // opened by the catalog; recorded recipes need their exact rectangles.
@@ -1015,6 +1075,17 @@ impl<'a> GlmLoader<'a> {
                     let tensor = self.catalog.tensor(&name)?;
                     checkpoint.tensors.push(cuteafd_loader::plan::checkpoint::CheckpointTensor {
                         shard: tensor.shard.clone(), meta: tensor.metadata.clone() });
+                }
+            }
+        }
+        if !core.native.is_empty() {
+            let view = self.catalog.selected_view().context("GLM native attention selected view")?;
+            let native = cuteafd_loader::plan::Checkpoint::open_view_for_role(view,
+                "GLM native attention load records", |name| name.rsplit_once('.')
+                    .is_some_and(|(stem, _)| core.native.contains_key(stem)))?;
+            for tensor in native.tensors {
+                if !checkpoint.tensors.iter().any(|current| current.meta.name == tensor.meta.name) {
+                    checkpoint.tensors.push(tensor);
                 }
             }
         }
@@ -1111,7 +1182,7 @@ impl<'a> GlmLoader<'a> {
                         split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner,
                         attention_resident, operands, native,
                         native_projections: layer_records.projections.iter().map(|(&stem, (p, _))| (stem, p.clone())).collect(),
-                        core: Default::default() })
+                        core: Default::default(), attention_native: Default::default() })
                 })?;
                 share.push(part);
             }

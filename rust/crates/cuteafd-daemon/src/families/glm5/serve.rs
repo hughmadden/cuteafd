@@ -126,9 +126,14 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    let view = args.engine.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.engine.attention.select(&args.engine.snapshot))?;
+    args.engine.attention.validate_view(&view)?;
+    let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&view.config()?)?;
+    super::validate_selected_attention(&view, &cfg)?;
+    args.engine.attention.selected_view = Some(view);
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
-    let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(&args.engine.snapshot)?;
     cuteafd_core::concurrency::validate(cfg.family_id(), max_sequences as u64)?;
     args.prefix.resolve_entries(max_sequences);
     if cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)? {
@@ -656,7 +661,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             !weights.dense && !tp2.as_ref().is_some_and(|layers| layers.contains(&layer))) {
             transport.as_ref().context("GLM installed Spark transport missing")?.installed_grouping()?
         } else { Vec::new() };
-        let catalog = cuteafd_loader::read_expert_catalog(&opened.snapshot)?;
+        let catalog = &opened.catalog;
         let homes = resource::layer_homes(engine.weights.layers.iter().enumerate().map(|(layer, weights)| {
             let local = tp2.as_ref().is_some_and(|layers| layers.contains(&layer));
             (weights.dense, local, if local { engine.ranks() } else { remote.len() })
@@ -842,7 +847,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, "glm5", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
-                system_fingerprint: None,
+                system_fingerprint: Some(opened.view.fingerprint().to_owned()),
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
             if let Some(from) = probe::scoring(&job.probe) {

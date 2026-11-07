@@ -161,6 +161,10 @@ impl HookBuffers {
                         Category::Workspace,
                     )?;
                 }
+                if core.native_scratch[index] > 0 {
+                    b.add(&format!("{kind}.core.native.scratch"), core.native_scratch[index] as u64,
+                        workspace, Category::Workspace, None)?;
+                }
                 if let Some(stages) = &core.stages {
                     for (&field, &bytes) in &stages[index].extents {
                         b.add(

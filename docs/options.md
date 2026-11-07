@@ -326,7 +326,8 @@ context (auto), heads and two-GPU layers (#1305, #1308).
 Every key the launcher knows, checked against each launch path's real
 accept/refuse behaviour. `✓` means the family's config validation accepts it;
 `✗` means the launch stops with `unused configuration key: KEY` (exit 2).
-`SPARK_<rank>_*` covers ranks 0–7.
+`SPARK_<rank>_*` covers ranks 0–7. In the combined GLM 5.3 / ML4 column,
+`ATTENTION_MODE` is accepted for GLM 5.3 only; ML4 remains gated.
 
 | Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -382,7 +383,7 @@ accept/refuse behaviour. `✓` means the family's config validation accepts it;
 | `GLM5_FLASH_HEADROOM_GIB` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_GRAPH_BUDGET_MIB` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Attention and KV** | | | | | | | | | | |
-| `ATTENTION_MODE` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
+| `ATTENTION_MODE` | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
