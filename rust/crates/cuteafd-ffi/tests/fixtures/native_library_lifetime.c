@@ -601,6 +601,24 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
     event('Q');
     return 0;
 }
+int cuteafd_copy_h2d_2d_async(struct device_buffer dst, size_t dst_pitch,
+                            const void *source, size_t src_pitch,
+                            size_t width, size_t rows, void *stream) {
+    if (width > dst_pitch || width > src_pitch) return 1;
+    if (!width || !rows) return 0;
+    if ((rows - 1) > (SIZE_MAX - width) / dst_pitch
+            || (rows - 1) > (SIZE_MAX - width) / src_pitch
+            || (rows - 1) * dst_pitch + width > dst.bytes) return 1;
+    /* Reuse the ordinary upload's immediate, queued and deferred semantics. */
+    for (size_t row = 0; row < rows; ++row) {
+        struct device_buffer target = dst;
+        target.ptr = (char *)dst.ptr + row * dst_pitch;
+        target.bytes = width;
+        if (cuteafd_copy_h2d_async(target,
+                (const char *)source + row * src_pitch, width, stream)) return 1;
+    }
+    return 0;
+}
 int cuteafd_copy_h2d_batch_async(const struct device_buffer *dsts, const void *const *sources,
                                  const size_t *bytes, size_t count, void *stream) {
     for (size_t index = 0; index < count; ++index) {

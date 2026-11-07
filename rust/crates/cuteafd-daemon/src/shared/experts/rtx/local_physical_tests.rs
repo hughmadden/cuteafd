@@ -119,8 +119,13 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
     let path = root.path().join("model-00001-of-00001.safetensors");
     let file = std::fs::OpenOptions::new().write(true).open(&path)?;
     use std::os::unix::fs::FileExt;
+    let trellis_byte = |offset: usize| offset.wrapping_mul(17).wrapping_add(offset / 97) as u8;
     for tensor in cuteafd_loader::read_safetensors_metadata(&path)? {
         if tensor.name.ends_with(".mcg") { file.write_all_at(&0xcbac1fedu32.to_le_bytes(), tensor.byte_offset)?; }
+        if tensor.name.ends_with(".trellis") {
+            let bytes = (0..usize::try_from(tensor.byte_length)?).map(trellis_byte).collect::<Vec<_>>();
+            file.write_all_at(&bytes, tensor.byte_offset)?;
+        }
     }
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
     let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
@@ -208,6 +213,31 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
                         executor.allocation_receipts(&mut receipts, &format!("expert.routed.rank.{rank}"))?;
                         assert_eq!(receipts.receipts.iter().filter(|r| r.allocation.view.is_none()).map(|r| r.allocation.bytes).sum::<u64>(),
                             budgets[rank] as u64, "backend bytes omit a shared root or include pair owners");
+                        if world == 2 && storage == LocalStorage::Mount {
+                            let layer = selected.layers[0];
+                            let layout = catalog.exl3().unwrap().residency(cuteafd_loader::V41Exl3Layer::Backbone(layer), 2, rank)?;
+                            let tensor = format!("model.layers.{layer}.mlp.experts.0.gate_proj.trellis");
+                            let job = layout.loads.iter().find(|job| job.tensor == tensor).context("missing trellis load")?;
+                            let slice = catalog.exl3_tensor_slice(&tensor, 2, rank)?;
+                            assert!(slice.rows > 1 && slice.source_row_bytes > slice.selected_row_bytes);
+                            for &(index, offset) in &job.destinations {
+                                let id = format!("glm.expert.routed.rank.{rank}.weight.{layer}.{index}");
+                                let receipt = receipts.receipts.iter().find(|r| r.allocation.id == id).context("missing trellis receipt")?;
+                                let buffer = cuteafd_ffi::CuteafdDeviceBuffer {
+                                    ptr: (receipt.address as *mut u8).wrapping_add(offset).cast(), bytes: slice.bytes(),
+                                    device_id: physical[rank], flags: 0,
+                                };
+                                let mut actual = vec![0; slice.bytes()];
+                                devices[rank].run(|| library.copy_d2h(&mut actual, buffer))?;
+                                // Each compact destination row skips the other rank's source columns.
+                                for row in 0..slice.rows {
+                                    let source = row * slice.source_row_bytes + slice.column_start_bytes;
+                                    let expected = (source..source + slice.selected_row_bytes).map(trellis_byte).collect::<Vec<_>>();
+                                    assert_eq!(&actual[row * slice.selected_row_bytes..(row + 1) * slice.selected_row_bytes],
+                                        expected.as_slice(), "TP2 trellis rank {rank} row {row} physical {physical:?}");
+                                }
+                            }
+                        }
                     }
                     if world == 1 {
                         backend[0].allocation_receipts(&mut actual, "expert.routed.rank.0")?;
@@ -220,8 +250,17 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
                     crate::families::glm5::engine::resident_expert_weights(&mut actual.receipts)?;
                     assert!(actual.receipts.iter().any(|r| r.allocation.lifetime == Lifetime::RESIDENT));
                     assert!(actual.receipts.iter().any(|r| r.allocation.lifetime == Lifetime::TARGET));
-                    let actual_len = actual.receipts.len();
-                    let actual = actual.receipts.into_iter().map(|r| (r.allocation.id.clone(), r.allocation)).collect::<BTreeMap<_, _>>();
+                    let host = actual.receipts.iter().filter(|r| r.allocation.location == Location::HOST).collect::<Vec<_>>();
+                    assert_eq!(host.len(), usize::from(world == 2));
+                    if let Some(active) = host.first() {
+                        assert_eq!(active.allocation.id, "glm.expert.routed.active");
+                        assert_eq!(active.allocation.bytes, (selected.lanes * std::mem::size_of::<Option<usize>>()) as u64);
+                        assert_eq!(active.allocation.lifetime, Lifetime::TARGET);
+                        assert!(active.allocation.view.is_none() && active.address != 0);
+                    }
+                    let actual_len = actual.receipts.len() - host.len();
+                    let actual = actual.receipts.into_iter().filter(|r| r.allocation.location != Location::HOST)
+                        .map(|r| (r.allocation.id.clone(), r.allocation)).collect::<BTreeMap<_, _>>();
                     let expected_len = expected.owners.len() + expected.views.len();
                     let expected = coordinator.remap_weight_arenas(&expected.owners.into_iter().chain(expected.views).collect::<Vec<_>>())?
                         .into_iter().map(|a| (a.id.clone(), a)).collect::<BTreeMap<_, _>>();
