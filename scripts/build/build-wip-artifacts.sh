@@ -416,7 +416,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
       --package "$output_dir/fp8/$wip_package" --sparkinfer-revision "$fp8_revision" --role "$role" "${fp8_input_args[@]}"
   done
 done
-# Out-of-scope V4.1 manifests are explicit empty records, never a stale table.
+# V4.1 manifests. Out-of-scope ones are explicit empty records, never a stale table.
 if [[ "$v41_expert_aot" == ON ]]; then
   install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
 else
