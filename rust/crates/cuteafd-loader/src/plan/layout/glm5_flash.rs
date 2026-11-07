@@ -359,6 +359,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
         let mut process = glmf::admission::ProcessOwners::new(host, (8 << 30).max(host.0 / 10));
         process.remote_experts = remote_experts;
+        process.expert_usage = glmf::usage_geometry(&cfg, cfg.layers, options.expert_usage);
         if ranks == 2 && attention.mode == placement::AttentionPlacement::Layers && !native {
             let mut alternate = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks,
                 representation, attention.mode, (attention.first_owner ^ 1) as usize).map_err(anyhow::Error::msg)?;

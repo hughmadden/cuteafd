@@ -61,6 +61,12 @@ use std::time::Instant;
 /// What every GLM 5.3 Flash command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Count executed expert routes; --expert-usage=false disables telemetry.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+        num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub expert_usage: bool,
+    #[arg(skip)]
+    pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
     #[command(flatten)]
     pub attention: crate::cli::AttentionArgs,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
@@ -579,6 +585,30 @@ mod draft_cli_tests {
         let head = include_str!("head.rs");
         assert_eq!((head.matches("programs.program(").count(), head.matches("programs.program(\"glmf_head_fp8\"").count()),
             (1, 1));
+    }
+
+    #[test]
+    fn expert_usage_defaults_on_and_explicit_off_or_skip_disables() {
+        let cfg = GlmNextConfig::from_hf(&cuteafd_loader::plan::testing::glm5_flash_config(45)).unwrap();
+        for (flag, requested) in [(None, true), (Some("--expert-usage"), true),
+            (Some("--expert-usage=true"), true), (Some("--expert-usage=false"), false)] {
+            for skip in [false, true] {
+                let mut argv = vec!["test", "--snapshot", "/checkpoint", "--native-lib", "/native"];
+                argv.extend(flag);
+                if skip { argv.push("--skip-experts"); }
+                let args = Parse::try_parse_from(argv).unwrap().engine;
+                assert_eq!(args.expert_usage, requested);
+                let enabled = args.expert_usage_reader.configure(args.expert_usage, args.skip_experts).unwrap();
+                assert_eq!(enabled, requested && !skip);
+                // The admitted census is exactly the served routed layers, or none at all.
+                let geometry = cuteafd_loader::placement::families::glm5_flash::usage_geometry(&cfg, cfg.layers, enabled);
+                assert_eq!(geometry.is_some(), enabled);
+                // Clones (serve's worker and admission copies) share the one reader.
+                assert_eq!(args.clone().expert_usage_reader.require_enabled().is_ok(), enabled);
+            }
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--expert-usage=invalid"]).is_err());
     }
 
     #[test]
@@ -1873,7 +1903,8 @@ impl Opened {
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
         remote_draft: bool, attention: engine::GlmfAttention,
         native_admission: Option<&native::Admission>,
-        inventory: &crate::shared::inventory::RuntimeInventory)
+        inventory: &crate::shared::inventory::RuntimeInventory,
+        expert_usage: Option<&cuteafd_core::expert_usage::Geometry>)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet,
             Option<cuteafd_hostcache::config::Config>,
@@ -2036,6 +2067,7 @@ impl Opened {
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         let headroom = args.serving_prefix.as_ref().map_or(8 << 30, |prefix| prefix.host_cache_headroom_bytes).max(host.0 / 10);
         let mut process = admission::admission::ProcessOwners::new(host, headroom);
+        process.expert_usage = expert_usage.cloned();
         if split && attention.mode == placement::AttentionPlacement::Layers && native_admission.is_none()
             && core_charge.is_none() {
             process.alternate_resident = Some(runtime_resident_weights(&headers, &self.cfg, layers, devices.len(),
@@ -2138,6 +2170,9 @@ impl Opened {
             &self.checkpoint.config, &args.manifest, "glm5_flash", args.max_context)?;
         let args = &context_args;
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        // Skipped routed experts disable the census before admission, even when requested.
+        let expert_usage = cuteafd_loader::placement::families::glm5_flash::usage_geometry(&self.cfg, layers,
+            args.expert_usage_reader.configure(args.expert_usage, args.skip_experts).map_err(anyhow::Error::msg)?);
         let active_drafts = args.draft.as_deref().map(|path| -> Result<usize> {
             let (hidden, vocab, taps, drafts) = if dspark::is_dspark(path)? {
                 let cfg = dspark::DsparkConfig::read(path)?;
@@ -2312,10 +2347,12 @@ impl Opened {
         let admitted = if args.tp2_dflash_auto {
             draft_args.tp2_dflash = false;
             let whole = self.admit_candidate(&draft_args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, false, attention, native_admission.as_ref(), &inventory);
+                split_device, automatic_context, false, attention, native_admission.as_ref(), &inventory,
+                expert_usage.as_ref());
             draft_args.tp2_dflash = true;
             let split = self.admit_candidate(&draft_args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, false, attention, native_admission.as_ref(), &inventory);
+                split_device, automatic_context, false, attention, native_admission.as_ref(), &inventory,
+                expert_usage.as_ref());
             let whole_pool = whole.as_ref().ok().map(|a| a.0.pool_tokens);
             let split_pool = split.as_ref().ok().map(|a| a.0.pool_tokens);
             draft_args.tp2_dflash = cuteafd_loader::placement::families::glm5_flash::prefer_tp2_dflash(whole_pool, split_pool);
@@ -2323,7 +2360,8 @@ impl Opened {
             if draft_args.tp2_dflash { split } else { whole }
         } else {
             self.admit_candidate(args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, remote_draft, attention, native_admission.as_ref(), &inventory)
+                split_device, automatic_context, remote_draft, attention, native_admission.as_ref(), &inventory,
+                expert_usage.as_ref())
         }?;
         let args = &draft_args;
         let remote_draft = false;
@@ -2776,6 +2814,7 @@ impl Opened {
             max_context, args.prefill_rows, args.prefill_waves, args.prefill_span_rows, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
+        engine.initialize_usage(expert_usage, args.expert_usage_reader.clone())?;
         engine.admitted_host = admitted_host;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.attention_plan = attention_plan;
@@ -2902,7 +2941,11 @@ impl Opened {
             }, || {
                 engine.check_admitted_graphs(&admitted_graphs)?;
                 engine.check_tp2_routes()
-            }, || body(&engine));
+            }, || {
+                // Startup steps above counted nothing; every step from here on does.
+                engine.usage_active.set(true);
+                body(&engine)
+            });
         drop(engine);
         // SAFETY: the engine that used the streams is gone.
         unsafe { self.library.cuda_stream_destroy(stream)? };

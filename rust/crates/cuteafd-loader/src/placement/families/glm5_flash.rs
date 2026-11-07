@@ -25,6 +25,15 @@ pub const CONTEXT_PROGRAMS: [&str; 6] = ["glmf_scored_index_topk_decode_m64", "g
     "glmf_lse_combine2", "glmf_paged_staging_gather_kv", "glmf_paged_staging_gather_index",
     "glmf_index_expand_owned"];
 
+/// The executed-route census of the first `layers` served layers: the checkpoint's routed
+/// experts and top-k over every non-dense layer. None when disabled or no served layer routes.
+pub fn usage_geometry(cfg: &GlmNextConfig, layers: usize, enabled: bool) -> Option<cuteafd_core::expert_usage::Geometry> {
+    let layers = layers.min(cfg.layers);
+    let routed_layers = (0..layers).filter(|&layer| !cfg.dense[layer]).collect::<Vec<_>>();
+    (enabled && !routed_layers.is_empty()).then(|| cuteafd_core::expert_usage::Geometry {
+        layers, experts: cfg.experts, topk: cfg.topk, routed_layers })
+}
+
 /// Every attention mode uses the shared executor's admitted wave policy.
 pub fn admitted_prefill_waves(_mode: AttentionPlacement, requested: u64) -> Result<u64, PlacementError> {
     validate_layer_pipeline_lanes(requested, requested as usize)

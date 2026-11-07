@@ -190,7 +190,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
             e.ffn(w, layer, e.cfg.dense_intermediate, PREFILL_CAP, w.delta.buffer.ptr, rows)?;
         } else {
             e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
-                &self.steps[unit.index].0.spans())?;
+                &self.steps[unit.index].0.spans(), false)?;
             let w1 = self.peer(unit)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, unit.slot, w, w1, unit.rows.len(), rows, PREFILL_CAP)?;
@@ -211,7 +211,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
                 &self.ranked[unit.index], unit, index, self.total)?));
         }
         e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
-            &self.steps[unit.index].0.spans())?;
+            &self.steps[unit.index].0.spans(), false)?;
         let transport = self.transport.as_mut().context("Spark unit without its transport worker")?;
         // The shared expert runs while the worker sends and the Sparks compute.
         let wave = e.spark_send(w, index, unit.rows.len(), false, transport, unit.reply_origins()?,

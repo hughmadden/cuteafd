@@ -24,6 +24,9 @@ pub struct ProcessOwners {
     pub draft_push: Option<DraftPush>,
     /// Fixed rank-local GQA owners, not a movable single-home drafter.
     pub draft_tp2: Vec<crate::families::glm5::draft_physical::GlmDflashPhysicalLayout>,
+    /// Executed-route census ([`super::usage_geometry`]): counters on logical GPU 0, the only
+    /// canonical router producer (a head split's GPU 1 runs TP2 router replicas only).
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
 }
 
 /// Owners of the drafter's standalone coordinator push group (draft loading only):
@@ -197,7 +200,7 @@ impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
         Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, physical_sparks: 0, native_load: None, mount_load: None,
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
-            draft_push: None, draft_tp2: vec![] }
+            draft_push: None, draft_tp2: vec![], expert_usage: None }
     }
 
     pub fn serving(&mut self, i: &GlmfInputs<'_>, quota: u64, chunk: u64, host_embedding: u64,
@@ -653,6 +656,15 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
         contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
     }
+    if let Some(geometry) = &process.expert_usage {
+        if Some(geometry) != super::usage_geometry(i.cfg, i.layers, true).as_ref() {
+            return Err(invalid("Flash expert usage geometry differs from the served layers"));
+        }
+        // Rank 0's decode workspace and prefill lanes each hold the replay pair their routers read.
+        contract.components.extend(crate::placement::expert_usage::components(geometry, &[0], maximum)?);
+        contract.components.extend(crate::placement::expert_usage::replay_components("glmf.usage", 1,
+            i.prefill_lanes, maximum)?);
+    }
     if !process.draft_tp2.is_empty() {
         if gpus != 2 || process.draft_tp2.len() != 2 || i.drafter_bytes != 0 || i.drafter_bridge.is_some() {
             return Err(invalid("TP2 DFlash requires two fixed rank owners, not a movable"));
@@ -1035,5 +1047,66 @@ mod tests {
         let process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
         let err = prepare(&input, 188, true, process).err().unwrap().to_string();
         assert!(err.contains("--replay-records shared needs one coordinator GPU with Spark experts"), "{err}");
+    }
+
+    #[test]
+    fn expert_usage_charges_gpu0_counters_and_replay_pairs_only_when_enabled() {
+        use crate::placement::expert_usage::REPLAY_LOOKUP_BYTES;
+        use cuteafd_core::expert_usage::device_owner;
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let geometry = super::super::usage_geometry(&cfg, cfg.layers, true).unwrap();
+        assert_eq!((geometry.layers, geometry.experts, geometry.topk), (cfg.layers, cfg.experts, cfg.topk));
+        assert_eq!(geometry.routed_layers, (0..cfg.layers).filter(|&layer| !cfg.dense[layer]).collect::<Vec<_>>());
+        let table = geometry.table_bytes().unwrap() as u64;
+        for gpus in [1, 2] {
+            let input = crate::placement::families::glm5_flash::tests::inputs(&cfg, gpus, 96 << 30);
+            let solve = |usage: Option<cuteafd_core::expert_usage::Geometry>| {
+                let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+                process.expert_usage = usage;
+                prepare(&input, 188, true, process).unwrap().admit().unwrap()
+            };
+            let telemetry = |admitted: &AdmittedGlmf| admitted.solved.facts.allocations.iter()
+                .filter(|owner| owner.id.starts_with("expert-usage.") || owner.id.starts_with("glmf.usage."))
+                .cloned().collect::<Vec<_>>();
+            let off = solve(None);
+            assert!(telemetry(&off).is_empty());
+            let on = solve(Some(geometry.clone()));
+            let owners = telemetry(&on);
+            for suffix in ["counters", "snapshot", "pinned"] {
+                let owner = owners.iter().find(|owner| owner.id == device_owner(0, suffix)).unwrap();
+                assert_eq!(owner.bytes, table);
+                assert_eq!(owner.location, if suffix == "pinned" { p::Location::PINNED } else { p::Location::coordinator(0) });
+            }
+            // A head split's second GPU runs router replicas only: nothing of the census lives there.
+            assert!(owners.iter().all(|owner| owner.location != p::Location::coordinator(1)
+                && !owner.id.starts_with("expert-usage.gpu1")));
+            assert_eq!(owners.iter().find(|owner| owner.id == "expert-usage.history").unwrap().bytes,
+                geometry.host_bytes(1).unwrap() as u64);
+            assert_eq!(owners.iter().find(|owner| owner.id == "glmf.usage.lookup").unwrap().bytes,
+                REPLAY_LOOKUP_BYTES as u64);
+            // One replay pair for the decode workspace and each prefill lane.
+            let mut pairs = owners.iter().filter(|owner| owner.location == p::Location::coordinator(0)
+                && owner.id.starts_with("glmf.usage.")).map(|owner| owner.id.clone()).collect::<Vec<_>>();
+            pairs.sort();
+            assert_eq!(pairs, std::iter::once("glmf.usage.decode.0".to_string())
+                .chain((0..input.prefill_lanes).map(|lane| format!("glmf.usage.prefill.{lane}"))).collect::<Vec<_>>());
+            let device = owners.iter().filter(|owner| owner.location == p::Location::coordinator(0))
+                .map(|owner| owner.bytes).sum::<u64>();
+            assert_eq!(device, 2 * table + 256 * (1 + input.prefill_lanes));
+            assert!(on.placement.pool_tokens <= off.placement.pool_tokens);
+        }
+        // A census that is not the served layers' refuses before any solve.
+        let input = crate::placement::families::glm5_flash::tests::inputs(&cfg, 1, 96 << 30);
+        for wrong in [super::super::usage_geometry(&cfg, cfg.layers - 1, true).unwrap(),
+            cuteafd_core::expert_usage::Geometry { topk: cfg.topk + 1, ..geometry.clone() }] {
+            let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            process.expert_usage = Some(wrong);
+            assert!(prepare(&input, 188, true, process).is_err());
+        }
+        // Disabled, or no routed layer served: no census.
+        assert!(super::super::usage_geometry(&cfg, cfg.layers, false).is_none());
+        let dense = cfg.dense.iter().take_while(|&&dense| dense).count();
+        assert!(dense > 0 && super::super::usage_geometry(&cfg, dense, true).is_none());
+        assert_eq!(super::super::usage_geometry(&cfg, dense + 1, true).unwrap().routed_layers, [dense]);
     }
 }

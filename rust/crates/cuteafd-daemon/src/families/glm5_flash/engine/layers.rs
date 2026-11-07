@@ -397,7 +397,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         } else if layer.dense {
             e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows)?;
         } else {
-            e.moe_front(w, index, layer, real, rows, self.cap(), &[Span { first: 0, rows: real }])?;
+            e.moe_front(w, index, layer, real, rows, self.cap(), &[Span { first: 0, rows: real }],
+                self.tables[0].decode)?;
             e.probe_ring(index, w, real)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, self.lane, w, Some(w1), real, rows, self.cap())?;
