@@ -25,11 +25,10 @@ pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub(crate) attention: crate::cli::AttentionArgs,
     #[arg(long, default_value = "fp8")] kv_cache: cuteafd_core::MlaCacheFormat,
-    /// Prefill unit rows for scoring chunks; unset keeps whole chunks as one unit.
+    /// Prefill unit rows for scoring chunks; unset uses the shared serving policy.
     #[arg(long)] prefill_rows: Option<usize>,
-    /// Prefill units in flight while scoring (N=1 against N=2 at the same
-    /// units is byte-identical).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: u8,
+    /// Prefill units in flight while scoring; unset uses the shared serving policy.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: Option<u8>,
     #[arg(long)] pub(crate) snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
@@ -81,6 +80,15 @@ impl GoldenArgs {
     fn ffn_mode(&self) -> cuteafd_ffi::KimiFfnMode {
         if self.compensated_ffn { cuteafd_ffi::KimiFfnMode::Compensated }
         else { cuteafd_ffi::KimiFfnMode::default() }
+    }
+
+    fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+        Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
+            &cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
+            unit_rows: self.prefill_rows.map(|rows| rows as u64),
+            waves: self.prefill_waves.map(u64::from), span_rows: None, reserve_rows: None,
+        })?)
     }
 
     fn startup_graphs(&self) -> Result<bool> {
@@ -495,11 +503,8 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     // SAFETY: sealed runner supplies the DSO; all borrowing owners drop before it.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
-    let prefill = prefill_shape(args.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
-        unit_rows: args.prefill_rows.map(|rows| rows as u64),
-        waves: Some(u64::from(args.prefill_waves)), span_rows: None, reserve_rows: None,
-    })?;
+    let prefill = args.prefill()?;
+    cuteafd_bench::context::ResolvedSettings::prefill(prefill).publish();
     let rows = usize::try_from(prefill.span_rows)?;
     let verify = args.verify_rows.map(usize::from);
     let graphs = args.startup_graphs()?;
@@ -665,6 +670,40 @@ mod tests {
                 .filter_map(|(index, arg)| (!(at..at + 2).contains(&index)).then_some(*arg))).is_err());
         }
         assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(["--nll"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn golden_prefill_defaults_and_overrides_match_serving() -> Result<()> {
+        use clap::Parser;
+        for ranks in [0, 6] {
+            let peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", rank + 1))
+                .collect::<Vec<_>>().join(",");
+            for extra in [vec![], vec!["--prefill-waves", "2"],
+                vec!["--prefill-rows", "2048", "--prefill-waves", "1"]] {
+                let mut common = extra.clone();
+                if ranks > 0 { common.extend(["--peers", peers.as_str()]); }
+                let crate::cli::Commands::KimiGolden(golden) = crate::cli::Cli::try_parse_from(
+                    ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+                        "--golden", "/reference", "--save-logits", "/output"].into_iter()
+                        .chain(common.iter().copied()))?.command else { panic!("Kimi golden"); };
+                let crate::cli::Commands::ServeKimi(serve) = crate::cli::Cli::try_parse_from(
+                    ["cuteafd", "serve-kimi", "--snapshot", "/checkpoint", "--native-lib", "/native.so"].into_iter()
+                        .chain(common.iter().copied()))?.command else { panic!("Kimi serve"); };
+                assert_eq!(golden.prefill()?, serve.prefill()?);
+                if extra.is_empty() {
+                    assert_eq!(golden.prefill_waves, None);
+                    let shape = golden.prefill()?;
+                    assert_eq!((shape.unit_rows, shape.waves, shape.span_rows),
+                        if ranks == 0 { (4096, 1, 4096) } else { (2752, 3, 8256) });
+                }
+            }
+        }
+        for value in ["0", "5"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "kimi-golden", "--snapshot",
+                "/checkpoint", "--nll", "--golden", "/reference", "--save-logits", "/output",
+                "--prefill-waves", value]).is_err());
+        }
         Ok(())
     }
 
