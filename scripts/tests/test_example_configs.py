@@ -186,13 +186,20 @@ family, first, last = FAMILY, FIRST, LAST
 if family == "glm5_flash":
     # Launch coverage uses a whole-drafter plan, not a synthetic memory-fit decision.
     report["tp2_dflash"] = value("--tp2-dflash", "false") == "true"
+    requested = value("--replay-records", "own")
+    report["replay_records"] = ("shared" if int(value("--rtx", "1")) == 1
+        and int(value("--pool-tokens", "0")) == 0 and report["spark_ranks"] > 0 else "own") if requested == "auto" else requested
+selected = value("--speculator", "off")
+if family == "qwen4" and selected == "auto":
+    # Both Qwen4 starting checkpoints qualify; dense Qwen is a separate family.
+    selected = "mtp" if report["spark_ranks"] == 0 else "off"
 print(json.dumps(dict(report, spark_expert_world=report["spark_ranks"],
     spark_roles=[dict(rank=i, experts=True, layers=[], encoder=report.get("encoder") if i == 0 else None,
                       audio_encoder=None, drafter=None) for i in range(report["spark_ranks"])], version=1, family=family, executable=True, report=report,
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
     spark_admission="coordinator_authoritative", decode_lanes=1,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
-    speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
+    speculator=selected, prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
     # Match DeviceLayout's allocation ceiling, independently of host-inclusive capacity.
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=8 << 30)])
                                 for i in range(int(value("--rtx", "1")))] +

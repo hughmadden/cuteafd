@@ -29,6 +29,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
+        qwen_auto_mtp: false,
         attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
         vision: args.vision,
@@ -93,7 +94,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
-                glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
+                glmf_shared_replay: args.replay_records == crate::cli::PlanReplayRecords::Shared,
+                glmf_auto_replay: args.replay_records == crate::cli::PlanReplayRecords::Auto,
                 concurrency: args.concurrency,
                 dspark_draft_limit: args.dspark_draft_limit.unwrap_or(5),
                 tp2_dspark_experts: args.tp2_dspark_experts,
@@ -344,6 +346,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
+    options.qwen_auto_mtp = family == "qwen4" && args.speculator == "auto";
     let tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
     let tp2_dflash = tp2_dflash(&args, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
@@ -351,7 +354,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         layout.tp2_dspark_experts = tp2_dspark_experts;
         layout.tp2_dflash = tp2_dflash;
         layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(&args, family, &cfg);
-        if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
+        if !options.qwen_auto_mtp && !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
         resolve_mimo_drafter(layout, &args.speculator);
@@ -551,11 +554,12 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             else if let Some(depth) = cfg.get("MTP") { if depth == "0" { "off" } else { "mtp" }.into() }
             else if let Some(mode) = cfg.get("DSPARK") { if mode == "on" { "dspark" } else { "off" }.into() }
             else if family == "mimo_v2" && cfg.get("DFLASH").is_some_and(|v| v == "off") { "off".into() }
+            else if family == "qwen4" { "auto".into() }
             else { default.into() }
         });
     }
-    if args.speculator == "auto" { args.speculator = default.into(); }
-    anyhow::ensure!(["off", "mtp", "dspark", "dflash2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
+    if args.speculator == "auto" && family != "qwen4" { args.speculator = default.into(); }
+    anyhow::ensure!(["auto", "off", "mtp", "dspark", "dflash2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
     anyhow::ensure!(!(args.no_speculator && args.include_speculator), "--no-speculator conflicts with --include-speculator");
     if args.no_speculator {
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
@@ -566,7 +570,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3" | "muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
-        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
+        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41" | "mistral_large4", "dspark") => true,
         _ => false,
     };
@@ -600,6 +604,11 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         }
     }
     resolve_speculator(&mut args, snapshot, family, &cfg)?;
+    // File inventories have no admitted layout. Retain the checkpoint-native
+    // superset so fetching headers cannot omit a subsequently selected MTP owner.
+    if family == "qwen4" && args.speculator == "auto" {
+        args.speculator = if args.native_mtp_layers > 0 { "mtp" } else { "off" }.into();
+    }
     let needs_drafter = if let Some(layout) = &args.file_layout {
         let hosts: std::collections::BTreeMap<String, Vec<String>> =
             cuteafd_loader::read_json_file(layout)?;
@@ -1245,7 +1254,7 @@ mod tests {
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             headroom_gib: 2.0,
             graph_budget_mib: None,
-            replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
+            replay_records: crate::cli::PlanReplayRecords::Own,
             concurrency: 8,
             dspark_draft_limit: None,
             tp2_dspark_experts: false,
@@ -1435,6 +1444,36 @@ mod tests {
                 Some(&cfg["SPECULATOR_MODEL_REVISION"])).unwrap().snapshot_path.unwrap();
             assert_eq!(resolved.drafter_snapshot.as_deref(), Some(draft.as_path()), "{}", config.display());
         }
+    }
+
+    #[test]
+    fn qwen_speculator_auto_is_deferred_but_overrides_and_file_owners_are_explicit() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        let config = qwen4_config(4);
+        write_snapshot(target.path(), &config, &[t("mtp.layers.0.enorm.weight", "BF16", &[2560])], None);
+        for (selected, configured, disabled, expected) in [
+            ("auto", None, false, "auto"),
+            ("auto", Some("auto"), false, "auto"),
+            ("auto", Some("mtp"), false, "mtp"),
+            ("auto", Some("off"), false, "off"),
+            ("mtp", Some("off"), false, "mtp"),
+            ("off", Some("mtp"), false, "off"),
+            ("auto", None, true, "off"),
+        ] {
+            let mut request = args(target.path(), 2, false);
+            request.speculator = selected.into();
+            request.no_speculator = disabled;
+            let cfg = configured.map(|value| std::collections::BTreeMap::from([("SPECULATOR".into(), value.into())]))
+                .unwrap_or_default();
+            resolve_speculator(&mut request, target.path(), "qwen4", &cfg).unwrap();
+            assert_eq!(request.speculator, expected);
+        }
+        let files = file_args(args(target.path(), 2, false), target.path()).unwrap();
+        assert_eq!(files.speculator, "mtp", "file inventory retains MTP's checkpoint superset");
+        let mut off = args(target.path(), 2, false);
+        off.speculator = "off".into();
+        assert_eq!(file_args(off, target.path()).unwrap().speculator, "off");
     }
 
     #[test]
@@ -2204,7 +2243,11 @@ mod tests {
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);
         let knobs = custom.layout.as_ref().unwrap();
         assert_eq!((knobs.concurrency, knobs.state_slots, knobs.glmf_mark_lanes, knobs.mimo_prefix_entries,
-            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay), (16, Some(16), Some(16), 6, 1971 << 20, true));
+            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay, knobs.glmf_auto_replay),
+            (16, Some(16), Some(16), 6, 1971 << 20, true, false));
+        let auto_replay = layout(&["--replay-records", "auto"]);
+        let auto_knobs = auto_replay.layout.as_ref().unwrap();
+        assert_eq!((auto_knobs.glmf_shared_replay, auto_knobs.glmf_auto_replay), (false, true));
         for zero in ["--state-slots", "--mark-lanes"] {
             assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", zero, "0"]).is_err());
         }

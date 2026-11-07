@@ -1698,6 +1698,7 @@ pub(crate) struct IoLayout {
     hidden: usize,
     vocab: usize,
     core_head: bool,
+    full_prefill_logits: bool,
 }
 
 impl IoLayout {
@@ -1712,7 +1713,8 @@ impl IoLayout {
             && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows),
             "Kimi IO rank/row geometry");
         Ok(Self { rank, ranks, rows, hidden: cfg.hidden, vocab: cfg.vocab_size,
-            core_head: rank == ranks - 1 && core.get_weight("language_model.lm_head").is_some() })
+            core_head: rank == ranks - 1 && core.get_weight("language_model.lm_head").is_some(),
+            full_prefill_logits: false })
     }
 
     pub(crate) fn with_core(cfg:&KimiK3Config,rank:usize,rows:usize,
@@ -1720,9 +1722,18 @@ impl IoLayout {
         Self::for_ranks(cfg, rank, rows, core, 2)
     }
 
+    pub(crate) fn with_prefill_logits(mut self, enabled: bool) -> Self {
+        self.full_prefill_logits = enabled;
+        self
+    }
+
+    fn logit_rows(&self) -> usize {
+        if self.full_prefill_logits { self.rows } else { self.rows.min(64) }
+    }
+
     fn extents(&self) -> [usize; 3] {
-        cuteafd_loader::families::kimi_k3::allocation::io_extents_for_ranks(
-            self.vocab, self.rank, self.rows, self.core_head, self.ranks).expect("validated token IO owners")
+        cuteafd_loader::families::kimi_k3::allocation::io_extents_with_logits(
+            self.vocab, self.rank, self.rows, self.logit_rows(), self.core_head, self.ranks).expect("validated token IO owners")
     }
 
     pub(crate) fn demand(&self, lane: usize) -> Result<Demand> {
@@ -1775,6 +1786,8 @@ impl Drop for TokenIo<'_> {
 }
 
 impl TokenIo<'_> {
+    pub(crate) fn full_prefill_logits(&self) -> bool { self.layout.full_prefill_logits }
+
     pub(super) fn check_lane(&self, local: &LocalLane<'_>, rank: usize) -> Result<()> {
         ensure!(self.layout.rank == rank && self.layout.rows == local.rows()
             && Rc::ptr_eq(&self.stream, local.stream()) && Rc::ptr_eq(&self.weights, &local.global),
@@ -1803,21 +1816,32 @@ impl TokenIo<'_> {
         })
     }
 
-    /// Reuses at most 64 logits rows. Callers consume/download each span before
-    /// the next projection; wide prefill never allocates a full-context logit tensor.
+    /// Wide scoring retains all admitted outputs, but reuses the ordinary
+    /// 64-row head/scratch on the same stream for each output span.
     pub(crate) fn project(&self, input: CuteafdDeviceBuffer, rows: usize, local:&LocalLane<'_>) -> Result<CuteafdDeviceBuffer> {
-        ensure!(self.layout.rank == self.layout.ranks - 1 && (1..=self.layout.rows.min(64)).contains(&rows),
+        ensure!(self.layout.rank == self.layout.ranks - 1 && (1..=self.layout.logit_rows()).contains(&rows),
             "Kimi head rows exceed admitted IO capacity");
         self.check_lane(local,self.layout.rank)?;
+        let logits = self.logits.as_ref().context("Kimi terminal logits absent")?.buffer;
+        let output = view(logits, 0, rows * self.layout.vocab * 4)?;
+        for first in (0..rows).step_by(64) {
+            let count = (rows - first).min(64);
+            let input = view(input, first * self.layout.hidden * 2, count * self.layout.hidden * 2)?;
+            let output = view(output, first * self.layout.vocab * 4, count * self.layout.vocab * 4)?;
+            self.project_span(input, output, count, local)?;
+        }
+        Ok(output)
+    }
+
+    fn project_span(&self, input: CuteafdDeviceBuffer, logits: CuteafdDeviceBuffer,
+        rows: usize, local: &LocalLane<'_>) -> Result<()> {
         if let Some(weight)=&self.weights.core_head {
             let programs=local.programs.core.as_ref().context("K6 head programs not resolved")?;
             let scratch=local.lane.core.as_ref().context("K6 head scratch not admitted")?;
-            let logits=self.logits.as_ref().context("K6 logits not admitted")?.buffer;
             self.stream.device.run(||programs.projection(weight)?.local(rows,input,weight,scratch,logits,self.stream.raw))?;
-            return view(logits,0,rows*self.layout.vocab*4);
+            return Ok(());
         }
         let head = self.head.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi terminal head absent"))?;
-        let logits = self.logits.as_ref().ok_or_else(|| anyhow::anyhow!("Kimi terminal logits absent"))?.buffer;
         ensure!(input.device_id == self.stream.device.id && !input.ptr.is_null()
             && input.bytes >= rows * self.layout.hidden * 2, "Kimi head input extent/device");
         let weight = self.weights.buffer("head")?;
@@ -1832,7 +1856,7 @@ impl TokenIo<'_> {
             unsafe { crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
                 head.get(), input.ptr.cast_const(), weight.ptr.cast_const(), logits.ptr.cast(), rows, self.stream.raw) }
         })?;
-        view(logits, 0, rows * self.layout.vocab * 4)
+        Ok(())
     }
 }
 
@@ -2442,7 +2466,7 @@ mod tests {
         let weights = Rc::new(layout[0].upload(device, packed)?);
         let weak = Rc::downgrade(&weights);
         let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
-        let io = IoLayout { rank: 0, ranks: 2, rows: 16, hidden: 4, vocab: 8, core_head:false }
+        let io = IoLayout { rank: 0, ranks: 2, rows: 16, hidden: 4, vocab: 8, core_head:false, full_prefill_logits: false }
             .allocate(device, stream.clone(), weights.clone())?;
         drop(weights);
         drop(stream);
@@ -2469,6 +2493,24 @@ mod tests {
             buffer(0, 64, 0), buffer(usize::MAX - 16, 32, 0)] {
             assert!(io_disjoint(a, other).is_err());
             assert!(io_disjoint(other, a).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_prefill_output_is_opt_in_and_keeps_head_workspace_bounded() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        for ranks in [1, 2] {
+            for rank in 0..ranks {
+                let ordinary = IoLayout::for_ranks(&cfg, rank, 8256, &Default::default(), ranks)?;
+                let scoring = ordinary.clone().with_prefill_logits(true);
+                let a = ordinary.extents();
+                let b = scoring.extents();
+                assert_eq!(a[0], b[0]);
+                assert_eq!(a[2], b[2]);
+                assert_eq!(b[1] - a[1], if rank == ranks - 1 { (8256 - 64) * cfg.vocab_size * 4 } else { 0 });
+                assert_eq!(ordinary, scoring.with_prefill_logits(false));
+            }
         }
         Ok(())
     }

@@ -81,6 +81,8 @@ pub struct DeploymentSpec<'a> {
     pub rtx_gpus: usize,
     pub spark_ranks: usize,
     pub spark_expert_world: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_records: Option<&'static str>,
     pub spark_roles: Vec<SparkRankRoles>,
     pub prefill_unit_rows: u64,
     pub prefill_waves: u64,
@@ -130,17 +132,8 @@ impl<'a> DeploymentSpec<'a> {
         let family = report.family.as_deref().context("deployment requires a recognized family")?;
         let memory_layout = report.memory_layout.as_ref().context("deployment requires a memory layout")?;
         ensure!((1..=2).contains(&options.rtx_gpus), "deployment requires one or two RTX GPUs");
-        let layers: Vec<u32> = if let Some(placement) = &report.solver_placement {
-            placement.layers.iter().enumerate().filter_map(|(layer, home)|
-                (home.experts == crate::placement::ExpertHome::Spark).then_some(layer as u32)).collect()
-        } else {
-            // Failed or shape-only reports have no solved ownership to narrow.
-            let first = report.launch.as_ref().map_or(0, |launch| launch.first_expert_layer);
-            let end = report.launch.as_ref().and_then(|launch| launch.last_expert_layer.map(|l| l + 1))
-                .or_else(|| report.spec.as_ref().map(|spec| spec.layers.len())).unwrap_or(first);
-            (first..end).map(|layer| layer as u32).collect()
-        };
-        let ranks = if layers.is_empty() { 0 } else { report.spark_ranks };
+        let layers = report.spark_expert_layers();
+        let ranks = report.spark_expert_world();
         let encoder_ranks = report.encoder.as_ref().map_or_else(Vec::new, EncoderPlacement::spark_ranks);
         let audio_ranks = report.audio_encoder.as_ref().map_or_else(Vec::new, EncoderPlacement::spark_ranks);
         let physical = encoder_ranks.iter().chain(&audio_ranks).copied().max().map_or(ranks, |r| ranks.max(r + 1));
@@ -197,14 +190,15 @@ impl<'a> DeploymentSpec<'a> {
         let spark_tp_role = (family == "deepseek_v41" && !exl3 && explicit && topology.tp != 4)
             .then(|| format!("tp{}", topology.tp));
         Ok(Self { version: 1, family, snapshot: &report.snapshot,
-            rtx_gpus: options.rtx_gpus, spark_ranks: physical, spark_expert_world: ranks, spark_roles,
+            rtx_gpus: options.rtx_gpus, spark_ranks: physical, spark_expert_world: ranks,
+            replay_records: report.replay_records, spark_roles,
             prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
             prefill_waves: report.prefill_waves.unwrap_or(0),
             decode_lanes: report.decode_lanes,
             prefill_span_rows: report.prefill_span_rows.unwrap_or(0),
             prefill_reserve_rows: report.prefill_reserve_rows
                 .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS), topology, roles, peers,
-            speculator: &options.speculator, admission: &options.admission,
+            speculator: report.speculator.unwrap_or(&options.speculator), admission: &options.admission,
             spark_admission: SparkAdmission::CoordinatorAuthoritative,
             launch: report.launch.as_ref(), exlr8: native.map(|n| &n.selection),
             spark_requirements: native.map(|n| &n.sparks),

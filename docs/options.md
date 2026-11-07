@@ -155,7 +155,7 @@ Spark layer IDs and inactive hinted/loaded counts.
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `SPECULATOR` | family default | `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
+| `SPECULATOR` | family default | `auto` (Qwen4), `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
@@ -180,7 +180,7 @@ Spark layer IDs and inactive hinted/loaded counts.
 | `PREFILL_ROWS` | planner | multiple of 64, ≤4096 | Per-unit rows override. |
 | `PREFILL_WAVES` | planner | 0–4 | Units in flight. |
 | `PREFILL_SPAN_ROWS` | planner | positive int | GLM/MiMo shared span. |
-| `FULL_PREFILL_LOGITS` | engine/hidden | `on`, `off` | Keep every prefill row's logits (golden/NLL; 2.5 GiB at 4096 rows). |
+| `FULL_PREFILL_LOGITS` | engine/hidden | `on`, `off` | Keep every prefill row's logits (golden/NLL; 2.5 GiB at 4096 rows). Kimi admits a full-call output buffer only when on and projects in bounded 64-row spans; this diagnostic reservation may reduce its KV pool. |
 | `TARGET_HEAD` | `tensor` | `tensor`, `exact` | BF16 target head: tensor cores with FP32 accumulation, or the exact FP32 GEMM diagnostic. |
 | `FP8_EXPERT_PREFILL` | `auto` | `auto`, `w8a8`, `w8a16` | FP8 expert prefill arithmetic. |
 | `EXPERT_INPUT` | family default | `fp8`, `bf16`, `bf16-decode` | MiMo Spark expert inputs. |
@@ -192,7 +192,7 @@ Spark layer IDs and inactive hinted/loaded counts.
 | `GLM5_FLASH_EXL3_ROUTE_DUMP` | unset | absolute dir | Per-Spark EXL3 route dump. |
 | `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` | `200000` | positive int | Dump call cap. |
 | `GLM5_FLASH_ROUTE_RING_CHECK` | `off` | `on`, `off` | Diagnostic router-id copy through the local ring. |
-| `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared`, `own` | GLM Flash replay records. |
+| `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared`, `own` | GLM Flash replay records (`auto` selects `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`). |
 
 ## Media
 
@@ -300,6 +300,13 @@ Speculator (`SPECULATOR`):
 | `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) |
 | `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✗ | ✗ | ✗ |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ |
+
+Qwen4 unset/`auto` selects native MTP (depth 3) only for qualified local
+EXL3 or ModelOpt NVFP4 with one MTP stage and an admitted Spark expert
+world of zero. Configured Spark inventory and admitted vision-only ranks do
+not disable this default. Media-only Spark layouts still require an available
+worker and complete encoder admission. Other formats and Spark expert layouts
+default off. Explicit values win.
 
 KV precision (`KV_CACHE`; `SWA_KV_CACHE` is MiMo only):
 
@@ -436,7 +443,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `PREFILL_ROWS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ | ✓ |
 | `PREFILL_WAVES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `PREFILL_SPAN_ROWS` | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `FULL_PREFILL_LOGITS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ |
+| `FULL_PREFILL_LOGITS` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `TARGET_HEAD` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `FP8_EXPERT_PREFILL` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `EXPERT_INPUT` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |

@@ -451,6 +451,7 @@ def test_prepare_refuses_a_moved_pin_only_in_the_gated_source(tmp_path, monkeypa
 
 def test_gate_records_the_starting_head_and_fails_when_it_moves(tmp_path, monkeypatch):
     """A checkout that changes while the gate runs must not be credited with its tests."""
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'prepare', lambda source, root, owned=False: None)
     heads = iter(['aaaa', 'bbbb'])
     def checked(cmd, **k):
@@ -505,6 +506,7 @@ def test_slow_runs_only_explicit_cpu_tests(tmp_path, monkeypatch):
 def test_suites_overlap_without_changing_receipt_order(tmp_path, monkeypatch):
     import threading
     barrier = threading.Barrier(2, timeout=5)
+    monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'prepare', lambda *a, **k: None)
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: 'abc' if 'rev-parse' in cmd else '')
     def run(name):
@@ -724,3 +726,63 @@ def test_named_step5_refusal_cases_are_not_full_tier_exclusions():
                    for name in gate.FULL_TESTS)
     assert 'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count' in gate.FULL_TESTS
     assert 'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only' in gate.FULL_TESTS
+
+
+def test_gate_requirements_check_prefers_gate_venv_and_fails_fast_on_mismatch(tmp_path, monkeypatch):
+    expected = gate.parse_requirements()
+    assert len(expected) >= 40 and expected.get('pytest') == '9.1.1'
+    assert 'torch' not in expected and 'transformers' not in expected
+    main_repo = tmp_path / 'main'
+    worktree = tmp_path / 'worktree'
+    gate_venv = tmp_path / '.cache/cuteafd/gate-venv/bin'
+    for path in (main_repo / '.venv/bin', worktree, gate_venv):
+        path.mkdir(parents=True)
+    for python in (main_repo / '.venv/bin/python', gate_venv / 'python'):
+        python.write_text('#!/bin/sh\n')
+        python.chmod(0o755)
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setattr(gate, 'REPO', main_repo)
+    monkeypatch.setattr(gate, 'checked', lambda cmd, **k: str(main_repo / '.git') + '\n')
+    monkeypatch.setattr(gate, 'installed_packages', lambda python: dict(expected))
+    # Worktree without .venv linked prefers ~/.cache/cuteafd/gate-venv over main checkout's .venv.
+    assert gate.python_for(worktree) == gate_venv / 'python'
+    # Worktree with .venv linked uses its own .venv first.
+    (worktree / '.venv/bin').mkdir(parents=True)
+    worktree_py = worktree / '.venv/bin/python'
+    worktree_py.write_text('#!/bin/sh\n')
+    worktree_py.chmod(0o755)
+    assert gate.python_for(worktree) == worktree_py
+    # Mismatched venv fails fast with exact sync command: missing, wrong version, or extra quant packages.
+    for mutated, detail in (
+        ({k: v for k, v in expected.items() if k != 'pytest-xdist'}, 'missing: pytest-xdist==3.8.0'),
+        ({**expected, 'numpy': '1.26.4'}, 'version mismatch: numpy==1.26.4 (expected 2.5.3)'),
+        ({**expected, 'torch': '2.14.1+cu130', 'transformers': '5.19.0'}, 'unexpected packages: torch==2.14.1+cu130'),
+    ):
+        monkeypatch.setattr(gate, 'installed_packages', lambda python, m=mutated: m)
+        with pytest.raises(SystemExit) as refused:
+            gate.python_for(worktree)
+        message = str(refused.value)
+        assert detail in message and 'uv pip sync --python' in message
+
+
+@pytest.mark.parametrize('nextest', [False, True])
+def test_missing_installed_programs_manifest_surfaces_in_receipt_error(tmp_path, monkeypatch, nextest):
+    (tmp_path / 'logs').mkdir()
+    test_id = 'shared::experts::rtx::local_physical_tests::installed_glm_local_physical_equals_serving'
+    reason = f'required installed PROGRAMS.json missing: {tmp_path}/placement-inputs/current/PROGRAMS.json'
+    failed = f'test {test_id} ... FAILED\nError: {reason}\ntest result: FAILED. 8 passed; 1 failed; 0 ignored\n'
+    _fake(monkeypatch, [(0, BUILD_OK), (101, failed),
+                        (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])
+    if nextest:
+        monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest')
+        monkeypatch.setattr(gate, 'parse_nextest', lambda report: ([(8, 1, 0)], [test_id]))
+    result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=False), {})
+    assert result['status'] == 'failed' and result['failing'] == [test_id]
+    assert result['error'] == '1 failed; ' + reason
+    receipt = gate.render({'task': 't', 'verdict': 'failed', 'head': 'a' * 40, 'dirty': False, 'suites': [result]})
+    assert reason in receipt
+
+
+def test_help_documents_systemd_docker_supplementary_group():
+    assert 'SupplementaryGroups=docker' in gate.__doc__
+    assert 'gate-requirements.txt' in gate.__doc__

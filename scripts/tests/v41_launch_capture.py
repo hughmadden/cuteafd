@@ -155,6 +155,10 @@ if tool == "docker":
             if family == "glm5_flash":
                 # This launch-ABI fixture chooses whole; real fit is covered by planner tests.
                 report["tp2_dflash"] = value("--tp2-dflash", "false") == "true"
+                requested = value("--replay-records", "own")
+                resolved = ("shared" if int(value("--rtx", "1")) == 1
+                    and int(value("--pool-tokens", "0")) == 0 and int(ranks) > 0 else "own") if requested == "auto" else requested
+                report["replay_records"] = response["replay_records"] = resolved
             if family == "mimo_v2":
                 report["prefill_lanes"] = response["prefill_waves"]
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and int(ranks) not in (0, 4)

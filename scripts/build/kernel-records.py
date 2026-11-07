@@ -150,11 +150,7 @@ def compiler_identity(root, payload, capability):
             "ptxas_version": version,
             "ptxas_sha256": digest(Path(ptxas).read_bytes()), "sms": payload["sms"],
             "capability": list(capability), "exporter": payload["exporter"], "args": payload["args"],
-            "exporter_sha256": digest(exporter.read_bytes()),
-            "scripts": {str(path.relative_to(root)): digest(path.read_bytes()) for path in (
-                Path(root) / "scripts/build/kernel-records.py",
-                Path(root) / "scripts/build/compare-sm-exports.py",
-                Path(root) / "scripts/build/export-placement-inputs.py")}}
+            "exporter_sha256": digest(exporter.read_bytes())}
 
 
 def stage0_inputs(root, payload, capability):
@@ -164,6 +160,7 @@ def stage0_inputs(root, payload, capability):
     root = Path(root)
     rules_path = root / "scripts/build/kernel-input-rules.json"
     rules = json.loads(rules_path.read_text())
+    # Orchestration exclusions affect only globals; executed helpers still enter recorded reads.
     hashes = {}
     for directory in ("third_party/sparkinfer/b12x", "python/tools", "scripts/build", "docker"):
         for path in sorted((root / directory).rglob("*")):

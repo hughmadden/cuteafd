@@ -762,8 +762,12 @@ capture_kimi_real_planner_launch(*map(Path, sys.argv[2:]))
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
-from test_run_family_dispatch import capture_qwen4_real_planner_launch
-capture_qwen4_real_planner_launch(*map(Path, sys.argv[2:]))
+from test_run_family_dispatch import capture_qwen4_real_planner_launch, capture_qwen4_real_spark_launch
+args = list(map(Path, sys.argv[2:]))
+capture_qwen4_real_planner_launch(*args)
+if args[1].name == "qwen38-exl3-min.config":
+    args[-1] = args[-1] / "four-sparks"
+    capture_qwen4_real_spark_launch(*args)
 "#]).arg(root).arg(&snapshot).arg(&example).arg(env!("CARGO_BIN_EXE_cuteafd"))
                 .arg(&programs).arg(&hf_home).arg(temporary.path()).output().unwrap();
             assert!(output.status.success(), "{name} real launcher: {}", String::from_utf8_lossy(&output.stderr));

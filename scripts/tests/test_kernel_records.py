@@ -153,6 +153,76 @@ def test_stage0_candidates_require_globals_and_all_recorded_reads(tmp_path):
 
 
 @pytest.fixture
+def compiler_inputs(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    compiler = SimpleNamespace(_runtime_toolchain_key=lambda: "toolchain",
+                               _compile_environment_key=lambda: "environment")
+    monkeypatch.setitem(sys.modules, "b12x._lib", SimpleNamespace(compiler=compiler))
+    monkeypatch.setenv("CUTEAFD_EXPORT_IMAGE_ID", "sha256:test-image")
+    ptxas = tmp_path / "ptxas"
+    ptxas.write_bytes(b"compiler")
+    monkeypatch.setattr(records.shutil, "which", lambda _: str(ptxas))
+    monkeypatch.setattr(records.subprocess, "check_output", lambda *args, **kwargs: "ptxas test")
+    build = tmp_path / "scripts/build"
+    build.mkdir(parents=True)
+    (build / "kernel-input-rules.json").write_bytes((ROOT / "scripts/build/kernel-input-rules.json").read_bytes())
+    for script in ("kernel-records.py", "compare-sm-exports.py", "export-placement-inputs.py"):
+        (build / script).write_text("def report():\n    return 'old'\n")
+    exporter = tmp_path / "python/tools/aot/export.py"
+    exporter.parent.mkdir(parents=True)
+    exporter.write_text("TILE = 64\n")
+    payload = {"exporter": "export.py", "args": ["--geometry", "glmf"], "sms": 188}
+    return payload, exporter
+
+
+def test_orchestration_edits_keep_all_publication_jobs_reusable(tmp_path, compiler_inputs):
+    payload, exporter = compiler_inputs
+    spec = importlib.util.spec_from_file_location(
+        "identity_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    jobs = publisher.export_jobs()
+    for _, name, _ in jobs:
+        (exporter.parent / name).write_bytes(exporter.read_bytes())
+    previous = []
+    for _, name, args in jobs:
+        job = {**payload, "exporter": name, "args": args}
+        previous.append((job, {"stage0_inputs": records.stage0_inputs(tmp_path, job, (12, 0)),
+            "source_reads_sha256": {str(exporter.relative_to(tmp_path)): records.digest(exporter.read_bytes())}}))
+    for script in ("kernel-records.py", "compare-sm-exports.py", "export-placement-inputs.py"):
+        (tmp_path / "scripts/build" / script).write_text("def report():\n    return 'new rsync/reporting'\n")
+        for job, prior in previous:
+            assert records.job_candidates(tmp_path, prior, records.stage0_inputs(tmp_path, job, (12, 0))) == []
+    for job, prior in previous:
+        changed = {**job, "args": [*job["args"], "--changed-exporter-arg"]}
+        assert records.job_candidates(tmp_path, prior, records.stage0_inputs(tmp_path, changed, (12, 0))) == ["job-global-inputs"]
+
+
+@pytest.mark.parametrize("changed", ["exporter", "args", "global", "helper", "environment", "toolchain"])
+def test_compile_inputs_still_invalidate_stage0(tmp_path, monkeypatch, compiler_inputs, changed):
+    payload, exporter = compiler_inputs
+    inputs = records.stage0_inputs(tmp_path, payload, (12, 0))
+    prior = {"stage0_inputs": inputs, "source_reads_sha256": {
+        str(exporter.relative_to(tmp_path)): records.digest(exporter.read_bytes())}}
+    assert records.job_candidates(tmp_path, prior, inputs) == []
+    if changed == "exporter":
+        exporter.write_text("TILE = 128\n")
+    elif changed == "args":
+        payload = {**payload, "args": ["--geometry", "glm"]}
+    elif changed == "global":
+        (tmp_path / "scripts/build/geometry.json").write_text('{"tile": 128}')
+    elif changed == "helper":
+        (tmp_path / "scripts/build/dev-toolchain.py").write_text("TOOLCHAIN = 'changed'\n")
+    elif changed == "environment":
+        monkeypatch.setenv("CUTEAFD_EXL3_ROUTE_BLOCKS", "changed")
+    else:
+        monkeypatch.setenv("CUTEAFD_EXPORT_IMAGE_ID", "sha256:new-toolchain")
+    assert records.job_candidates(tmp_path, prior, records.stage0_inputs(tmp_path, payload, (12, 0))) == ["job-global-inputs"]
+
+
+@pytest.fixture
 def fake_cutlass(monkeypatch):
     import sys
     import types
@@ -259,9 +329,17 @@ def fake_worker(tmp_path, monkeypatch, fake_cutlass):
     import importlib.metadata
     import sys
     import types
-    spec = importlib.util.spec_from_file_location("installed_worker", ROOT / "scripts/build/compare-sm-exports.py")
+    build = tmp_path / "scripts/build"
+    build.mkdir(parents=True)
+    for name in ("compare-sm-exports.py", "kernel-records.py"):
+        (build / name).write_bytes((ROOT / "scripts/build" / name).read_bytes())
+    monkeypatch.setenv("CUTEAFD_SOURCE_ROOT", str(ROOT))
+    spec = importlib.util.spec_from_file_location("installed_worker", build / "compare-sm-exports.py")
     worker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(worker)
+    spec = importlib.util.spec_from_file_location("installed_records", build / "kernel-records.py")
+    worker_records = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(worker_records)
     monkeypatch.setattr(worker, "ROOT", tmp_path)
     monkeypatch.setattr(sys, "path", list(sys.path))
     monkeypatch.setattr(sys, "argv", list(sys.argv))
@@ -280,9 +358,9 @@ def fake_worker(tmp_path, monkeypatch, fake_cutlass):
         get_device_properties=lambda ordinal: types.SimpleNamespace(multi_processor_count=188),
         is_initialized=lambda: False)
     monkeypatch.setattr(importlib.metadata, "version", lambda name: "fake")
-    monkeypatch.setattr(records, "stage0_inputs", lambda *args: {"fake": True})
+    monkeypatch.setattr(worker_records, "stage0_inputs", lambda *args: {"fake": True})
     monkeypatch.setattr(worker, "load_file", lambda name, path:
-                        records if name == "placement_kernel_records" else types.SimpleNamespace(
+                        worker_records if name == "placement_kernel_records" else types.SimpleNamespace(
                             cuda_images=lambda blob: [(0, blob)]))
     exporter = tmp_path / "python/tools/aot/x.py"
     exporter.parent.mkdir(parents=True)
@@ -310,7 +388,17 @@ def test_job_reads_include_helpers_after_last_program(tmp_path, fake_worker):
     fake_worker({"sms": 188, "exporter": "x.py", "args": [],
                  "output": str(output), "program_records": True})
     summary = json.loads((output / "comparison-context.json").read_text())
-    assert {"recipe.py", "after.py"} <= summary["source_reads_sha256"].keys()
+    assert {"recipe.py", "after.py", "scripts/build/compare-sm-exports.py",
+            "scripts/build/kernel-records.py"} <= summary["source_reads_sha256"].keys()
+    for script in ("compare-sm-exports.py", "kernel-records.py"):
+        path = tmp_path / "scripts/build" / script
+        original = path.read_text()
+        path.write_text(original.replace("def worker(payload):", "def worker(payload):\n    compile_policy = 'changed'", 1)
+                        if script == "compare-sm-exports.py" else original.replace(
+                            "def construct(self, function, *args, **kwargs):",
+                            "def construct(self, function, *args, **kwargs):\n        compile_policy = 'changed'", 1))
+        assert records.job_candidates(tmp_path, summary, summary["stage0_inputs"]) == [f"scripts/build/{script}"]
+        path.write_text(original)
 
 
 @pytest.mark.parametrize("changed", ["args", "environment"])

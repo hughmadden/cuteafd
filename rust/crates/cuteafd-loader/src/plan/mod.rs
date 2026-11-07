@@ -364,6 +364,12 @@ pub struct PlanReport {
     /// Native EXLR8 trellis prefill activations the layout charged (EXLR8 native plans only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exlr8_prefill_activations: Option<exlr8::PrefillActivations>,
+    /// GLM Flash KDA replay-record storage (`own` or `shared`) resolved by the planner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_records: Option<&'static str>,
+    /// Qwen's automatic native MTP choice, charged by the same plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculator: Option<&'static str>,
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
@@ -376,6 +382,27 @@ pub struct PlanReport {
 }
 
 impl PlanReport {
+    pub fn spark_expert_layers(&self) -> Vec<u32> {
+        if let Some(placement) = &self.solver_placement {
+            placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                (home.experts == crate::placement::ExpertHome::Spark).then_some(layer as u32)).collect()
+        } else if self.placement == ExpertPlacement::Local || self.spark_ranks == 0
+            || self.spec.as_ref().is_some_and(|spec| spec.moe.is_none()) {
+            // A dense model has no experts to place, even beside media-only Spark ranks.
+            Vec::new()
+        } else {
+            // Failed or shape-only reports have no solved ownership to narrow.
+            let first = self.launch.as_ref().map_or(0, |launch| launch.first_expert_layer);
+            let end = self.launch.as_ref().and_then(|launch| launch.last_expert_layer.map(|l| l + 1))
+                .or_else(|| self.spec.as_ref().map(|spec| spec.layers.len())).unwrap_or(first);
+            (first..end).map(|layer| layer as u32).collect()
+        }
+    }
+
+    pub fn spark_expert_world(&self) -> usize {
+        if self.spark_expert_layers().is_empty() { 0 } else { self.spark_ranks }
+    }
+
     pub(crate) fn refuse_placement(&mut self, what: String, how: impl Into<String>) {
         self.fits = false;
         self.placement_supported = false;
@@ -412,6 +439,8 @@ pub struct PlanOptions {
     pub mapped_scale_host_budget_bytes: Option<u64>,
     /// Resolved target-checkpoint draft ownership; absent keeps family defaults.
     pub draft_ownership: Option<spec::DraftOwnership>,
+    /// Resolve qualified Qwen MTP from each candidate's admitted expert world.
+    pub qwen_auto_mtp: bool,
     pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub vision: MediaMode,
     pub audio: MediaMode,
@@ -436,6 +465,7 @@ impl Default for PlanOptions {
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
+            qwen_auto_mtp: false,
             attention_placement: None,
             vision: MediaMode::Auto,
             audio: MediaMode::Auto,
@@ -877,8 +907,41 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     }
 }
 
+/// Match the qualified local paths: one native stage, EXL3 or ModelOpt's
+/// four-bit weight groups (including its FP8 MTP package).
+pub fn qualified_qwen_mtp(config: &serde_json::Value) -> bool {
+    let text = config.get("text_config").unwrap_or(config);
+    let quant = &config["quantization_config"];
+    let method = quant.get("quant_method").or_else(|| quant.get("method")).and_then(serde_json::Value::as_str);
+    text["mtp_num_hidden_layers"] == 1 && (method == Some("exl3")
+        || method == Some("modelopt") && quant["config_groups"].as_object()
+            .is_some_and(|groups| groups.values().any(|group| group["weights"]["num_bits"] == 4)))
+}
+
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-    let mut report = plan_unrestricted(input, options)?;
+    let mut resolved = options.clone();
+    let auto = options.qwen_auto_mtp;
+    let choice = |world| {
+        if world == 0 && options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0)
+            && qualified_qwen_mtp(&input.checkpoint().config) { "mtp" } else { "off" }
+    };
+    let mut selected = choice(options.placement.spark_ranks());
+    if auto { resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected)); }
+    let mut report = plan_unrestricted(input, &resolved)?;
+    if auto {
+        let admitted = choice(report.spark_expert_world());
+        if admitted != selected {
+            // Rebuild every owner, workspace and cache charge, not just the JSON flag.
+            selected = admitted;
+            resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected));
+            report = plan_unrestricted(input, &resolved)?;
+            if choice(report.spark_expert_world()) != selected {
+                report.refuse_placement("Qwen auto MTP changes the admitted expert world".into(),
+                    "Select SPECULATOR=mtp or off explicitly for this placement.");
+            }
+        }
+        report.speculator = Some(selected);
+    }
     let _timer = PhaseTimer::new(&input.phases.admission, &[&input.phases.catalog, &input.phases.layout]);
     match spark_range::admit(input, options, &report) {
         Ok(()) => {},
@@ -953,6 +1016,8 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         expert_storage: None,
         hints: Vec::new(),
         exlr8_prefill_activations: None,
+        replay_records: None,
+        speculator: None,
         memory_layout: None,
         solver_placement: None,
         tp2_dflash: None,
@@ -1086,8 +1151,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
         let gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
+        let all_onboarded = options.layout.as_ref().is_some_and(|layout|
+            input.family_model().ok().is_some_and(|model| model.spec().moe_layers() > 0
+                && layout.resolve_onboard(model.spec().moe_layers())
+                    == Some(crate::placement::Onboard::Layers(model.spec().moe_layers()))));
         let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split)
-            && (family.id() != "qwen4" || options.placement == ExpertPlacement::Local);
+            && (family.id() != "qwen4" || options.placement == ExpertPlacement::Local || all_onboarded);
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {
@@ -1402,8 +1471,10 @@ fn finalize_media_report(report: &mut PlanReport, checkpoint: &Checkpoint,
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
     if spec.moe.is_none() {
-        report.placement = ExpertPlacement::Local;
-        report.spark_ranks = 0;
+        if !matches!(report.vision, MediaMode::Spark(_)) && !matches!(report.audio, MediaMode::Spark(_)) {
+            report.placement = ExpertPlacement::Local;
+            report.spark_ranks = 0;
+        }
         report.min_spark_ranks = Some(0);
     }
     let bytes_of = |owner: Owner| -> u64 {
@@ -1471,8 +1542,11 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             (_, None) => {} // the routed-expert component already reports its missing kernel
             (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
                 report.spark_rank_share = share(ranks).unwrap_or(0.0);
+                let all_onboarded = options.layout.as_ref()
+                    .and_then(|layout| layout.resolve_onboard(spec.moe_layers()))
+                    == Some(crate::placement::Onboard::Layers(spec.moe_layers()));
                 // Joint admission, not the available host count, chooses expert ownership.
-                if model.admits_expert_packages() && options.layout.is_some() {
+                if options.layout.is_some() && (model.admits_expert_packages() || all_onboarded) {
                     report.experts = Some(contract.clone());
                     return;
                 }
@@ -1559,15 +1633,22 @@ pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize
 /// checkpoint and catalog `input` already read.
 fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usize,
     explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+    plan_spark_count_with(input, options, available, explicit, |candidate| input.plan(candidate))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn plan_spark_count_with(input: &PlanInput, options: &PlanOptions, available: usize,
+    explicit: Option<usize>,
+    mut plan_one: impl FnMut(&PlanOptions) -> Result<PlanReport, PlanError>) -> Result<PlanReport, PlanError> {
     if available > 8 {
         return Err(PlanError::InvalidOption { option: "available Sparks", reason: "inventory exceeds transport limit 8".into() });
     }
     let count = explicit.unwrap_or(available);
-    let candidate = |ranks| -> Result<PlanReport, PlanError> {
+    let mut candidate = |ranks| -> Result<PlanReport, PlanError> {
         let mut candidate = PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
         };
-        let mut report = input.plan(&candidate)?;
+        let mut report = plan_one(&candidate)?;
         // Shared Recipe families admit one fixed prefill shape. Preserve their
         // typed refusal instead of retrying smaller reserves in a second solve.
         if ranks == 0 || candidate.layout.is_none()
@@ -1606,7 +1687,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
         let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
             let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
                 candidate.layout.as_mut().unwrap().prefill_reserve_rows = Some(reserve);
-                input.plan(&candidate)?
+                plan_one(&candidate)?
             };
             report.prefill_reserve_rows = Some(reserve);
             Ok(report)

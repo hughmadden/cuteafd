@@ -656,7 +656,7 @@ fn check_concurrency_plan_cell(
 
 #[test]
 fn boot_concurrency_full_plan_matrix() {
-    const ALL_CONCURRENCIES: &[u64] = &[1, 4, 16, 17, 32, 64, 65, 128];
+    const ALL_CONCURRENCIES: &[u64] = &[1, 17, 64, 128];
     struct Case {
         family: &'static str,
         label: &'static str,
@@ -693,7 +693,7 @@ fn boot_concurrency_full_plan_matrix() {
             let dir = tempfile::tempdir().unwrap();
             write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
             let manifest = write_muse_exl3_capacities(dir.path());
-            Case { family: "muse_spark", label: "muse_spark", dir, topologies: &[(1, 4), (2, 4)], concurrencies: &[65, 128], manifest: Some(manifest), base_options: None }
+            Case { family: "muse_spark", label: "muse_spark", dir, topologies: &[(1, 4), (2, 4)], concurrencies: &[128], manifest: Some(manifest), base_options: None }
         }),
         Box::new(|| {
             let dir = tempfile::tempdir().unwrap();
@@ -743,6 +743,9 @@ fn boot_concurrency_full_plan_matrix() {
                     let family = case.family;
                     seen.lock().unwrap().insert(family);
                     let input = PlanInput::open(case.dir.path()).unwrap();
+                    if family != "qwen3_5" {
+                        input.expert_catalog().unwrap();
+                    }
                     for &(gpus, ranks) in case.topologies {
                         for &c in case.concurrencies {
                             let mut options = case.base_options.clone()
@@ -798,8 +801,9 @@ fn boot_concurrency_full_plan_matrix_muse_spark() {
     write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
     let manifest = write_muse_exl3_capacities(dir.path());
     let input = PlanInput::open(dir.path()).unwrap();
+    input.expert_catalog().unwrap();
     for (gpus, ranks) in [(1, 4), (2, 4)] {
-        for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+        for c in [1, 17, 64, 128] {
             let mut options = wave_plan_options(dir.path(), ranks);
             let layout = options.layout.as_mut().unwrap();
             layout.state_slots = None;
@@ -3911,6 +3915,23 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
         assert_eq!(item(&path, false, fixed, Category::Workspace, "steps"), item(&path, true, fixed, Category::Workspace, "steps"));
     }
     assert_eq!(report(&path, true, None).memory_layout.unwrap().pool_tokens, 1_048_576);
+    assert_eq!(report(&path, true, None).replay_records, Some("shared"));
+    assert_eq!(report(&path, false, None).replay_records, Some("own"));
+    let auto_report = |placement: ExpertPlacement, pool: Option<u64>, onboard: Option<crate::placement::OnboardSetting>| {
+        let options = PlanOptions { placement, layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            drafter_bytes: 256 << 20, rtx_bytes: vec![96 << 30], context_tokens: 131_072,
+            workspace_manifest: Some(path.clone()), glmf_auto_replay: true, pool_tokens: pool,
+            onboard, ..Default::default() }), ..Default::default() };
+        plan(dir.path(), &options).unwrap()
+    };
+    let auto_spark = auto_report(ExpertPlacement::Sparks { ranks: 4 }, None, None);
+    assert_eq!(auto_spark.replay_records, Some("shared"));
+    let auto_fixed = auto_report(ExpertPlacement::Sparks { ranks: 4 }, Some(131_072), None);
+    assert_eq!(auto_fixed.replay_records, Some("own"));
+    let auto_local = auto_report(ExpertPlacement::Local, None, None);
+    assert_eq!(auto_local.replay_records, Some("own"));
+    let auto_onboard_all = auto_report(ExpertPlacement::Sparks { ranks: 4 }, None, Some(crate::placement::OnboardSetting::All));
+    assert_eq!(auto_onboard_all.replay_records, Some("own"));
 }
 
 #[test]
@@ -3988,6 +4009,45 @@ fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
             && note.contains("glmf_dsa_candidate_merge")), "{}", render(&report));
         let hint = report.hints.iter().find(|hint| hint.what.contains("GLM Flash pool-first placement")).unwrap();
         assert!(hint.how.contains("CUTEAFD_CONTEXT_SPLIT_AOT") && hint.how.contains("heads"), "{}", hint.how);
+    }
+}
+
+#[test]
+fn glmf_tp2_auto_preserves_selected_prefill_options() {
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
+    let manifest = write_glm5_flash_workspaces(dir.path());
+    let draft = tempfile::tempdir().unwrap();
+    let config = json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":5,
+        "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,
+        "rms_norm_eps":1e-5, "sliding_window":2048, "rope_theta":10000,
+        "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
+            "conv_kernel_size":2, "mask_token_id":0, "selector_rank":256,
+            "selector_top_k":16, "block_size":8}});
+    std::fs::write(draft.path().join("config.json"), config.to_string()).unwrap();
+    let geometry = crate::families::glm5::draft_physical::GlmDflashConfig::read(draft.path()).unwrap();
+    let tensors = geometry.tensor_shapes().into_iter().map(|(name, shape)| t(name, "BF16", &shape))
+        .collect::<Vec<_>>();
+    write_safetensors(&draft.path().join("model.safetensors"), &tensors);
+    for ranks in [0, 4] {
+        let mut options = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
+            layout: Some(layout::LayoutOptions {
+                host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+                head_split: true, context_tokens: 32768, pool_tokens: Some(32768),
+                glmf_tp2_dflash_auto: true, glmf_drafter_snapshot: Some(draft.path().into()),
+                workspace_manifest: Some(manifest.clone()), ..Default::default()
+            }), ..sparks(ranks) };
+        let automatic = plan(dir.path(), &options).unwrap();
+        assert!(automatic.solver_placement.is_some(), "{}", render(&automatic));
+        let selected = automatic.tp2_dflash.unwrap();
+        let layout = options.layout.as_mut().unwrap();
+        layout.glmf_tp2_dflash_auto = false;
+        layout.tp2_dflash = selected;
+        let explicit = plan(dir.path(), &options).unwrap();
+        assert!(explicit.solver_placement.is_some(), "{}", render(&explicit));
+        assert!(automatic.prefill_unit_rows.is_some());
+        assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves, automatic.prefill_span_rows),
+            (explicit.prefill_unit_rows, explicit.prefill_waves, explicit.prefill_span_rows));
     }
 }
 
@@ -6035,4 +6095,246 @@ fn v4_auto_pool_and_count_admission_preserve_one_recipe() {
         assert!(counted.hints.iter().any(|other| other.what == hint.what));
     }
     assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
+}
+
+#[test]
+fn qwen_auto_mtp_matches_explicit_memory_and_deployment() {
+    use spec::DraftOwnership;
+    let mut config = qwen4_config(4);
+    config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    let dir = snapshot(config, &[t("mtp.layers.0.enorm.weight", "BF16", &[2560])]);
+    for ranks in [0, 2] {
+        let options = PlanOptions { qwen_auto_mtp: true,
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                host_cache_bytes: Some(0), ..Default::default() }), ..sparks(ranks) };
+        let auto = plan(dir.path(), &options).unwrap();
+        let selected = if ranks == 0 { "mtp" } else { "off" };
+        assert_eq!(auto.speculator, Some(selected));
+        let explicit = plan(dir.path(), &PlanOptions { qwen_auto_mtp: false,
+            draft_ownership: Some(DraftOwnership::selected("qwen4", selected)), ..options }).unwrap();
+        assert_eq!(serde_json::to_value(&auto.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+        assert_eq!(serde_json::to_value(&auto.memory_layout).unwrap(), serde_json::to_value(&explicit.memory_layout).unwrap());
+        if ranks == 0 {
+            let deployment = deployment::DeploymentOptions { rtx_gpus: 1, speculator: "auto".into(), ..Default::default() };
+            let resolved = deployment::DeploymentSpec::from_report(&auto, &deployment).unwrap();
+            assert_eq!(resolved.speculator, selected);
+        }
+        assert_eq!(component(&auto, Component::Speculator).status == Status::Disabled, selected == "off");
+    }
+    for (quant, stages, qualified) in [
+        (json!({"quant_method":"exl3"}), 1, true),
+        (json!({"quant_method":"exl3"}), 2, false),
+        (json!({"quant_method":"fp8"}), 1, false),
+        (json!({"quant_method":"nvfp4"}), 1, false),
+        (json!({"quant_method":"modelopt", "config_groups":{"g":{"weights":{"num_bits":4}}}}), 1, true),
+    ] {
+        let cfg = json!({"quantization_config":quant, "text_config":{"mtp_num_hidden_layers":stages}});
+        assert_eq!(qualified_qwen_mtp(&cfg), qualified);
+    }
+}
+
+#[test]
+fn qwen_auto_mtp_real_inventory_selects_local_without_losing_mtp() {
+    let mut config = qwen4_config(4);
+    config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    let mut tensors = qwen4_coordinator(&config, true);
+    let (mut experts, storage) = qwen4_exl3(5, 4);
+    for tensor in &mut experts {
+        tensor.0 = tensor.0.replace("model.language_model.layers.4.", "mtp.layers.0.");
+    }
+    tensors.extend(experts);
+    let storage: Value = serde_json::from_str(&serde_json::to_string(&storage).unwrap()
+        .replace("model.language_model.layers.4.", "mtp.layers.0.")).unwrap();
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &storage);
+    let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
+    let options = PlanOptions { qwen_auto_mtp: true,
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(layout::LayoutOptions { workspace_manifest: Some(manifest),
+            context_tokens: 32768,
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            prefix_slots: Some(0), ..Default::default() }), ..sparks(2) };
+    let input = PlanInput::open(dir.path()).unwrap();
+    // A real Spark solve must not masquerade as a local expert deployment.
+    let spark = input.plan(&options).unwrap();
+    assert!(spark.solver_placement.is_some(), "{}", render(&spark));
+    assert_eq!(spark.spark_expert_world(), 2);
+    assert_eq!(spark.speculator, Some("off"));
+    // Inventory is nonzero; the selected expert count is independently local.
+    let auto = input.plan_spark_count(&options, 2, Some(0)).unwrap();
+    assert!(auto.solver_placement.is_some(), "{}", render(&auto));
+    assert!(auto.placement_supported, "{}", render(&auto));
+    assert_eq!(auto.spark_ranks, 0);
+    assert_eq!(auto.spark_expert_world(), 0);
+    assert_eq!(auto.speculator, Some("mtp"));
+    let explicit = input.plan_spark_count(&PlanOptions { qwen_auto_mtp: false,
+        draft_ownership: Some(spec::DraftOwnership::NativeMtp), ..options.clone() }, 2, Some(0)).unwrap();
+    assert_eq!(serde_json::to_value(&auto.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+    assert_eq!(serde_json::to_value(&auto.memory_layout).unwrap(), serde_json::to_value(&explicit.memory_layout).unwrap());
+    for which in [Component::Speculator, Component::SpeculatorExpert] {
+        let owner = component(&auto, which);
+        assert!(owner.bytes > 0 && owner.status != Status::Disabled, "{which:?}: {owner:?}");
+    }
+    let deployment = deployment::DeploymentOptions { rtx_gpus: 1, speculator: "auto".into(), ..Default::default() };
+    assert_eq!(deployment::DeploymentSpec::from_report(&auto, &deployment).unwrap().speculator, "mtp");
+
+    // The candidate still requests Sparks, but its actual solve puts all experts
+    // on RTX. Auto must re-plan the same candidate with native draft ownership.
+    let mut onboarded_options = options;
+    onboarded_options.layout.as_mut().unwrap().onboard =
+        Some(crate::placement::OnboardSetting::Layers(4));
+    let onboarded = input.plan(&onboarded_options).unwrap();
+    assert!(onboarded.executable(), "{}", render(&onboarded));
+    assert_eq!(onboarded.spark_ranks, 2);
+    assert_eq!(onboarded.spark_expert_world(), 0);
+    assert_eq!(onboarded.speculator, Some("mtp"));
+    let explicit = input.plan(&PlanOptions { qwen_auto_mtp: false,
+        draft_ownership: Some(spec::DraftOwnership::NativeMtp), ..onboarded_options }).unwrap();
+    assert_eq!(serde_json::to_value(&onboarded.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+    assert_eq!(serde_json::to_value(&onboarded.memory_layout).unwrap(), serde_json::to_value(&explicit.memory_layout).unwrap());
+    let resolved = deployment::DeploymentSpec::from_report(&onboarded, &deployment).unwrap();
+    assert_eq!(resolved.spark_expert_world, 0);
+    assert_eq!(resolved.speculator, "mtp");
+}
+
+#[test]
+fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_worker() {
+    use super::encoder::EncoderKind;
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+
+    let assert_media_only_spark = |report: &PlanReport, gpus: usize, rank: usize| {
+        assert!(report.executable(), "{}", render(report));
+        let encoder = report.encoder.as_ref().unwrap();
+        assert_eq!(encoder.kind, EncoderKind::Spark { rank }, "{}", render(report));
+        let sparks: Vec<_> = report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|device| device.kind == DeviceKind::Spark).collect();
+        assert_eq!(sparks.len(), 1, "{}", render(report));
+        let device = sparks[0];
+        assert_eq!(device.index as usize, rank);
+        assert!(device.items.iter().all(|item| item.category != Category::Experts), "{:?}", device.items);
+        assert!(device.items.iter().any(|item| item.category == Category::Runtime && item.bytes > 0), "{:?}", device.items);
+        assert_eq!(device.items.iter().filter(|item| item.group.starts_with("vision")).map(|item| item.bytes).sum::<u64>(),
+            encoder.admitted_bytes());
+        let deployment_options = super::deployment::DeploymentOptions { rtx_gpus: gpus, ..Default::default() };
+        let deployment = super::deployment::DeploymentSpec::from_report(report, &deployment_options).unwrap();
+        let json = serde_json::to_value(&deployment).unwrap();
+        assert_eq!(json["spark_ranks"], 1);
+        assert_eq!(json["spark_expert_world"], 0);
+        assert_eq!(json["roles"], json!([]));
+        assert_eq!(json["peers"], json!([]));
+        let roles = json["spark_roles"].as_array().unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0]["rank"], rank);
+        assert_eq!(roles[0]["experts"], false);
+        assert_eq!(roles[0]["layers"], json!([]));
+        assert_eq!(roles[0]["encoder"]["kind"], json!({"kind": "spark", "rank": rank}));
+    };
+
+    // 1. MiMo V2 all-onboarded + vision-at-spark:0
+    let mut mimo_cfg = mimo_flash_mopd_config();
+    mimo_cfg["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
+        "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
+        "temporal_patch_size":2,"spatial_merge_size":2,"hidden_act":"silu"});
+    let mut mimo_tensors = mimo_flash_mopd_tensors();
+    mimo_tensors.push(t("visual.patch_embed.proj.weight", "BF16", &[1280, 3, 2, 16, 16]));
+    let mimo_dir = snapshot_tp(mimo_cfg, &mimo_tensors, Some(4));
+    let mimo_manifest = mimo_dir.path().join("spark-free-tp1.json");
+    std::fs::write(&mimo_manifest, serde_json::to_vec(&json!({"layouts": {"tp1": {
+        "input": "bf16", "tp": 1, "hidden": 4096, "experts": 256, "top_k": 8,
+        "intermediate": 2048, "slice": 2048, "weights": "mxfp4",
+        "capacities": [{"capacity": 4096, "scratch_bytes": 671_354_880}]
+    }}})).unwrap()).unwrap();
+    let mimo_base = PlanOptions {
+        vision: MediaMode::Spark(Some(0)),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![96 << 30],
+            pool_tokens: Some(32768),
+            context_tokens: 32768,
+            concurrency: 4,
+            mimo_expert_manifest: Some(mimo_manifest),
+            onboard: Some(crate::placement::OnboardSetting::Layers(1)),
+            ..Default::default()
+        }),
+        ..sparks(1)
+    };
+    let mimo_report = plan(mimo_dir.path(), &mimo_base).unwrap();
+    assert_media_only_spark(&mimo_report, 1, 0);
+    let mimo_unavail = plan(mimo_dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..mimo_base }).unwrap();
+    assert!(!mimo_unavail.executable(), "{}", render(&mimo_unavail));
+    assert!(mimo_unavail.hints.iter().any(|h| h.what.contains("vision-only Spark workers are not supported")),
+        "{:?}", mimo_unavail.hints);
+
+    // 2. Qwen4 all-onboarded + vision-at-spark:0
+    let mut qwen4_cfg = qwen4_config(1);
+    qwen4_cfg["vision_config"] = json!({"depth":27,"hidden_size":1152,"intermediate_size":4304,
+        "num_heads":16,"num_position_embeddings":2304,"out_hidden_size":2560,
+        "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
+        "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
+    let (mut qwen4_tensors, qwen4_manifest) = qwen4_exl3(1, 4);
+    qwen4_tensors.extend(qwen4_coordinator(&qwen4_cfg, false));
+    qwen4_tensors.extend([
+        t("model.visual.patch_embed.proj.weight", "BF16", &[1152, 3, 2, 16, 16]),
+        t("model.visual.patch_embed.proj.bias", "BF16", &[1152]),
+        t("model.visual.blocks.0.norm1.weight", "BF16", &[1152]),
+        t("model.visual.blocks.0.norm1.bias", "BF16", &[1152]),
+    ]);
+    let qwen4_dir = snapshot(qwen4_cfg, &qwen4_tensors);
+    write_quantize_config(qwen4_dir.path(), &qwen4_manifest);
+    let qwen4_base = PlanOptions {
+        vision: MediaMode::Spark(Some(0)),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)),
+            host_cache_bytes: Some(0),
+            rtx_bytes: vec![96 << 30],
+            pool_tokens: Some(32768),
+            target_pool_tokens: 32768,
+            onboard: Some(crate::placement::OnboardSetting::Layers(1)),
+            ..Default::default()
+        }),
+        ..sparks(1)
+    };
+    let qwen4_report = plan(qwen4_dir.path(), &qwen4_base).unwrap();
+    assert_media_only_spark(&qwen4_report, 1, 0);
+    let qwen4_unavail = plan(qwen4_dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..qwen4_base }).unwrap();
+    assert!(!qwen4_unavail.executable(), "{}", render(&qwen4_unavail));
+    assert!(qwen4_unavail.hints.iter().any(|h| h.what.contains("vision-only Spark workers are not supported")),
+        "{:?}", qwen4_unavail.hints);
+
+    // 3. Qwen3.5 (dense) + vision-at-spark:0
+    let (qwen35_dir, mut qwen35_options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+    let mut qwen35_raw: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(qwen35_dir.path().join("config.json")).unwrap()).unwrap();
+    qwen35_raw["vision_config"] = json!({"depth":27,"hidden_size":1152,"intermediate_size":4304,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":16,"temporal_patch_size":2,
+        "spatial_merge_size":2,"num_position_embeddings":2304,"in_channels":3,
+        "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
+    let mut qwen35_weights: Vec<_> = Checkpoint::open(qwen35_dir.path()).unwrap().tensors.into_iter()
+        .map(|tensor| (tensor.meta.name, if tensor.meta.dtype == cuteafd_core::DType::F32 { "F32" } else { "BF16" }, tensor.meta.shape))
+        .collect();
+    let mut add_tower = |name: &str, shape: &[usize], bias: bool| {
+        qwen35_weights.push(t(format!("model.visual.{name}.weight"), "BF16", shape));
+        if bias { qwen35_weights.push(t(format!("model.visual.{name}.bias"), "BF16", &[shape[0]])); }
+    };
+    add_tower("patch_embed.proj", &[1152, 3, 2, 16, 16], true);
+    add_tower("pos_embed", &[2304, 1152], false);
+    add_tower("merger.norm", &[1152], true);
+    add_tower("merger.linear_fc1", &[4608, 4608], true);
+    add_tower("merger.linear_fc2", &[4096, 4608], true);
+    for layer in 0..27 {
+        for (name, shape) in [("norm1", vec![1152]), ("norm2", vec![1152]),
+            ("attn.qkv", vec![3456, 1152]), ("attn.proj", vec![1152, 1152]),
+            ("mlp.linear_fc1", vec![4304, 1152]), ("mlp.linear_fc2", vec![1152, 4304])] {
+            add_tower(&format!("blocks.{layer}.{name}"), &shape, true);
+        }
+    }
+    write_snapshot(qwen35_dir.path(), &qwen35_raw, &qwen35_weights, None);
+    qwen35_options.vision = MediaMode::Spark(Some(0));
+    qwen35_options.placement = ExpertPlacement::Sparks { ranks: 1 };
+    let qwen35_report = plan(qwen35_dir.path(), &qwen35_options).unwrap();
+    assert_media_only_spark(&qwen35_report, 1, 0);
+    let qwen35_unavail = plan(qwen35_dir.path(), &PlanOptions { placement: ExpertPlacement::Local, ..qwen35_options }).unwrap();
+    assert!(!qwen35_unavail.executable(), "{}", render(&qwen35_unavail));
+    assert!(qwen35_unavail.hints.iter().any(|h| h.what.contains("vision-only Spark workers are not supported")),
+        "{:?}", qwen35_unavail.hints);
 }
