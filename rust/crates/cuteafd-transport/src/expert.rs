@@ -15,6 +15,10 @@ mod roce;
 pub use roce::{SparkExpertPending, SparkExpertWave, SparkExperts, WaveReceipt};
 mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
+mod coordinator_routes;
+pub use coordinator_routes::{
+    coordinator_routes, mark_coordinator_routes, with_coordinator_routes, CoordinatorRouteWord, COORDINATOR_ROUTE_BIT,
+};
 mod native_group;
 pub use native_group::{
     SparkTopology, V41_MAX_NATIVE_GROUPS, V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_INACTIVE_OWNER,
@@ -169,8 +173,10 @@ fn validate_canonical_body(
         let mut ids = [u32::MAX; 16];
         for slot in 0..topk {
             let route = route_at(row_index as usize * topk + slot)?;
+            // A coordinator-owned route keeps its true id below the owner bit.
+            let expert_id = CoordinatorRouteWord::decode(route.expert_id, header.flags).expert_id;
             ensure!(
-                route.row_index == row_index && route.expert_id < geometry.experts,
+                route.row_index == row_index && expert_id < geometry.experts,
                 "invalid native expert route"
             );
             ensure!(
@@ -178,10 +184,10 @@ fn validate_canonical_body(
                 "invalid native FP32 routing weight"
             );
             ensure!(
-                !ids[..slot].contains(&route.expert_id),
+                !ids[..slot].contains(&expert_id),
                 "duplicate native expert route in one row"
             );
-            ids[slot] = route.expert_id;
+            ids[slot] = expert_id;
         }
     }
     Ok(())
@@ -198,7 +204,8 @@ fn validate_canonical(
     ensure!(matches!(response, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
         | crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES),
         "native request requires exactly one compact BF16 or per-expert partial response agreement");
-    ensure!(header.flags & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM | response | COMPRESSED_REPLY_FLAGS) == 0,
+    ensure!(header.flags & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM | response | COMPRESSED_REPLY_FLAGS
+        | crate::EXPERT_PROTOCOL_V2_FLAG_COORDINATOR_ROUTES) == 0,
         "native complete batches cannot use legacy reduction/compression or stream flags");
     ensure!(cuteafd_core::expert_geometry().partial_replies()
         == (response == crate::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES),
@@ -373,10 +380,11 @@ impl<'a> BackboneRequest<'a> {
             ids.len() >= count && weights.len() >= count,
             "native routing buffers are too short"
         );
+        // A GPU expert tier's coordinator routes reach the kernels as the unassigned expert.
+        let (flags, experts) = (self.view.header.flags, cuteafd_core::expert_geometry().experts);
         for index in 0..count {
             let route = self.view.route(index)?;
-            ids[index] = route.expert_id as i32;
-            weights[index] = route.gate_weight;
+            (ids[index], weights[index]) = coordinator_routes::unpacked(&route, flags, experts);
         }
         Ok(())
     }
@@ -438,7 +446,7 @@ impl<'a> BackboneRequest<'a> {
             output_payload_bytes: self.plane_bytes()? as u64,
             status: ExpertProtocolV2Status::Ok,
             // Request-only admission flags never appear in a response.
-            flags: header.flags & !V41_NATIVE_GROUP_REQUEST_FLAG,
+            flags: header.flags & !coordinator_routes::REQUEST_ONLY_FLAGS,
             executor_id,
             pace: None,
         })
@@ -1206,6 +1214,53 @@ mod tests {
                 .is_err()
         );
         assert!(BackboneRequest::parse(&frame, 15).is_err());
+    }
+    #[test]
+    fn coordinator_routes_parse_unpack_unassigned_and_never_reach_responses() -> Result<()> {
+        let experts = cuteafd_core::expert_geometry().experts;
+        let mut owned = request(16);
+        let plain = owned.clone();
+        let resident = |id: u32| id % 5 == 1;
+        let marked = with_coordinator_routes(&mut owned, experts, resident)?;
+        assert!(marked > 0);
+        BackboneRequest::validate_owned(&owned, 16)?;
+        let frame = owned.encode()?;
+        assert_eq!(frame.len(), plain.encode()?.len());
+        let native = BackboneRequest::parse(&frame, 16)?;
+        let (mut ids, mut weights) = (vec![-1; 96], vec![-1.; 96]);
+        native.copy_routes_into(&mut ids, &mut weights)?;
+        for (i, route) in plain.routes.iter().enumerate() {
+            if resident(route.expert_id) {
+                assert_eq!((ids[i], weights[i].to_bits()), (experts as i32, 0f32.to_bits()));
+            } else {
+                assert_eq!((ids[i], weights[i].to_bits()), (route.expert_id as i32, route.gate_weight.to_bits()));
+            }
+        }
+        let payload = vec![0; native.plane_bytes()?];
+        let response = native.response(11, &payload)?;
+        assert_eq!(response.header.flags & crate::EXPERT_PROTOCOL_V2_FLAG_COORDINATOR_ROUTES, 0);
+        response.to_owned()?.encode()?;
+        // Unflagged plain requests are unchanged by the decoder.
+        let plain_frame = plain.encode()?;
+        let native = BackboneRequest::parse(&plain_frame, 16)?;
+        native.copy_routes_into(&mut ids, &mut weights)?;
+        assert!(plain.routes.iter().enumerate().all(|(i, r)| ids[i] == r.expert_id as i32));
+        for kind in 0..5 {
+            let mut bad = owned.clone();
+            match kind {
+                // The bit without the flag is an out-of-range expert.
+                0 => bad.header.flags &= !crate::EXPERT_PROTOCOL_V2_FLAG_COORDINATOR_ROUTES,
+                // A marked duplicate of an unmarked route in the same row.
+                1 => { bad.routes[1].expert_id = bad.routes[0].expert_id ^ COORDINATOR_ROUTE_BIT; }
+                2 => bad.header.flags |= V41_NATIVE_GROUP_REQUEST_FLAG,
+                3 => bad.header.flags |= crate::EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION,
+                _ => bad.routes[0].expert_id = experts | COORDINATOR_ROUTE_BIT,
+            }
+            if kind == 0 && !bad.routes.iter().any(|r| r.expert_id & COORDINATOR_ROUTE_BIT != 0) { continue; }
+            assert!(BackboneRequest::validate_owned(&bad, 16).is_err(), "corruption {kind}");
+            if let Ok(frame) = bad.encode() { assert!(BackboneRequest::parse(&frame, 16).is_err(), "corruption {kind}"); }
+        }
+        Ok(())
     }
     #[test]
     fn native_request_rejects_invalid_routing_and_legacy_modes() {

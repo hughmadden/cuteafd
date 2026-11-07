@@ -126,11 +126,14 @@ pub struct StepContext {
 
 impl Wave {
     /// The wave's routes, read from `request` (owner bits of native group
-    /// requests are masked off); `weights` keeps narrow waves' gate weights.
+    /// requests and coordinator route bits are masked off); `weights` keeps
+    /// narrow waves' gate weights.
     pub fn from_request(request: &ExpertProtocolV2Request, transport: u64, pass: u64, ranks: usize,
         step: Option<StepContext>, weights: bool) -> Self {
         let mask = if request.header.flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
             NATIVE_GROUP_ID_MASK
+        } else if crate::expert::coordinator_routes(request.header.flags) {
+            !crate::expert::COORDINATOR_ROUTE_BIT
         } else {
             u32::MAX
         };
