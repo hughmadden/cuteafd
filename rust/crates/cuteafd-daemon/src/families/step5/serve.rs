@@ -359,7 +359,7 @@ fn with_backend<T>(args: &ServeArgs,
         spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 };
     let bootstrap = super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
-    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(&view, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
+    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(&view, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(),
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?, None)?) };
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
@@ -776,7 +776,7 @@ mod tests {
                 spark_layers: (3..91).filter(|layer| !admitted.ownership.onboarded(*layer)).collect(),
                 spark_ranks: 6, prefill_lanes: 1 };
             SparkAdmission::plan_view(checkpoint.view.as_ref().context("Step-5 Spark admission requires selected checkpoint view")?, ExpertGeometry::STEP5, Some(&catalog), &working,
-                6, None, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?, None)?;
+                6, spark_model(&exports, endpoint, 1, clients, TcpTransportConfig::default().max_frame_bytes)?, None)?;
             super::super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
@@ -1298,6 +1298,56 @@ mod tests {
 #[cfg(test)]
 mod push_admission_tests {
     use super::*;
+
+    #[test]
+    fn whole_zero_one_admission_matches_required_push_arena() -> Result<()> {
+        use cuteafd_loader::{placement::Onboard, plan::families::step5::admission::OnboardInputs};
+        use crate::shared::{experts::rtx::push::CoordinatorExperts,
+            memory::push_coordinator::CoordinatorExpertPlan};
+        let root = tempfile::tempdir()?;
+        let snapshot = root.path().join("snapshot");
+        cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        let manifest = root.path().join("PROGRAMS.json");
+        let package = root.path().join("exl3/exl3-step5-k46/rtx-tp1");
+        let rows = 2752;
+        let geometry = ExpertGeometry::STEP5;
+        for capacity in cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(rows)? {
+            let directory = package.join(format!("m{capacity}"));
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+                "capacity": capacity, "decode_capacity": capacity <= 80, "hidden": geometry.hidden,
+                "intermediate": geometry.intermediate, "experts": geometry.experts, "top_k": geometry.topk,
+                "tile": [64, 128, 64, 128], "output_dtype": "fp32", "activation": "silu_post_clamp",
+                "trellis_lut": {"bytes": 32}, "buffers": {
+                    "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 256,
+                        "zero_on_create": false}
+                }
+            }))?)?;
+        }
+        assert!(OnboardInputs::new(&catalog, Some(&manifest), rows, 1, 1, Onboard::Layers(0))?.is_none());
+        assert!(CoordinatorExpertPlan::whole(vec![], 0).is_err());
+        let admitted = OnboardInputs::new(&catalog, Some(&manifest), rows, 1, 1, Onboard::Layers(1))?
+            .context("one whole layer")?;
+        let resident = usize::try_from(admitted.costs[0].whole.resident)?;
+        let peak = resident + usize::try_from(admitted.workspace)?;
+        let push = OnboardBudget::Whole(peak).push_plan(&catalog, &package, &[3], rows, 1)?;
+        let CoordinatorExperts::Whole { owners } = push else { anyhow::bail!("whole push expected") };
+        assert_eq!(owners[0].budget, resident);
+        let residency = catalog.exl3().context("EXL3")?
+            .residency(cuteafd_loader::V41Exl3Layer::Backbone(3), 1, 0)?;
+        let plan = CoordinatorExpertPlan::whole(vec![residency], owners[0].budget)?;
+        assert_eq!(plan.layout.bytes(), resident);
+        // The old BF16 charge missed exactly the observed 22,544,384 bytes.
+        let missing = rows * geometry.hidden as usize * 2;
+        assert_eq!(missing, 22_544_384);
+        let underbudget = OnboardBudget::Whole(peak - missing).push_plan(&catalog, &package, &[3], rows, 1)?;
+        let CoordinatorExperts::Whole { owners } = underbudget else { anyhow::bail!("whole push expected") };
+        let residency = catalog.exl3().context("EXL3")?
+            .residency(cuteafd_loader::V41Exl3Layer::Backbone(3), 1, 0)?;
+        assert!(CoordinatorExpertPlan::whole(vec![residency], owners[0].budget).is_err());
+        Ok(())
+    }
 
     #[test]
     fn push_resident_budget_never_spends_execution_workspace() -> Result<()> {

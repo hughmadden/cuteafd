@@ -80,9 +80,6 @@ TP2_QUERY_PROJECTION=off
 TP2_OUTPUT_PROJECTION=off
 TP2_DSPARK_EXPERTS=
 release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
-topology_explicit=0
-spark_ep=1
-spark_admission=not-applicable
 spark_exl3_identity=
 gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
@@ -115,8 +112,6 @@ resolved_decode_lanes=2
             if encoder is not None:
                 setup+='\nVISION=auto\ncount_plan="$ENCODER_PLAN"\n'
             setup+=f'\nRTX_EXPERT_LAYERS={local_layers}\nSPARK_COUNT={spark_count}\nhosts=("${{hosts[@]:0:SPARK_COUNT}}")\n'
-            # Legacy geometry: release_spark_tp defaults to SPARK_COUNT and
-            # release_spark_ep to 1 when no explicit topology is configured.
             setup+=f'spark_tp={spark_count}\n'
             if spark_count == 2:
                 setup+='memory_policy_args=(--gpu-memory-cap 32GiB)\nKV_POOL_SIZE=2GiB\npeers=10.55.0.1:19441,10.55.0.2:19441\n'
@@ -162,8 +157,8 @@ resolved_decode_lanes=2
                               if tool == 'ssh' and '-s' in args]
                     self.assertEqual(len(starts), 4)
                     tails = [self.worker_tail(args) for _, args in starts]
-                    self.assertTrue(all(len(tail) == 20 for tail in tails), tails)
-                    self.assertTrue(all(tail[7:11] == ['4', '0', '4', '1'] for tail in tails))
+                    self.assertTrue(all(len(tail) == 17 for tail in tails), tails)
+                    self.assertTrue(all(tail[7] == '4' for tail in tails))
                     ready = [i for i, (tool, args) in enumerate(events)
                              if tool == 'ssh' and any('worker bootstrap ready' in arg for arg in args)]
                     self.assertFalse(any('/dev/tcp' in arg for tool, args in events
@@ -191,9 +186,9 @@ resolved_decode_lanes=2
         self.assertEqual(coordinator[coordinator.index('--encoder-plan-hash')+1],'ab'*32)
         tails=[self.worker_tail(args) for tool,args in events if tool=='ssh' and '-s' in args]
         self.assertEqual(len(tails),4)
-        self.assertTrue(all(tail[15:]==[tail[2] if tail[2] == '2' else '-1','19541','ab'*32,
+        self.assertTrue(all(tail[12:]==[tail[2] if tail[2] == '2' else '-1','19541','ab'*32,
             '0123456789012345678901234567890123456789','1'] for tail in tails))
-        self.assertIn('if [[ "$rank" == "${16:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
+        self.assertIn('if [[ "$rank" == "${13:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
 
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):
         result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce="fresh",rtx_expert_layers=0,spark_first_layer=0),spark_count=2)
@@ -202,8 +197,6 @@ resolved_decode_lanes=2
         self.assertEqual(len(starts),2)
         tails=[self.worker_tail(args) for args in starts]
         self.assertTrue(all(tail[7]=='2' for tail in tails))
-        # Legacy geometry tail: explicit flag off, TP=SPARK_COUNT, EP=1.
-        self.assertTrue(all(tail[8:11]==['0','2','1'] for tail in tails))
         coordinator=next(args for tool,args in events if tool=='docker' and args[0]=='run')
         self.assertEqual(coordinator[coordinator.index('--peers')+1], '10.55.0.1:19441,10.55.0.2:19441')
         self.assertEqual(coordinator[coordinator.index('--gpu-memory-cap')+1], '32GiB')

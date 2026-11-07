@@ -48,6 +48,10 @@ NATIVE_ARTIFACTS = _packages.native_spark_artifacts("v41")
 ROLE_ARTIFACT = {f"tp{world}": artifact for world, artifacts in NATIVE_ARTIFACTS.items()
                  for artifact in artifacts if artifact.name == f"spark_tp{world}"}
 ROLE_TP_DEGREE = {role: int(role.removeprefix("tp")) for role in ROLE_ARTIFACT}
+# Unequal worlds (TP5, TP7) run adjacent-width packages (`spark_wWIDTH`) shared
+# by key, not a degree-named role export.
+WIDTH_ROLE_ARTIFACTS = {f"tp{world}": artifacts for world, artifacts in NATIVE_ARTIFACTS.items()
+                        if f"tp{world}" not in ROLE_ARTIFACT and world != 4}
 ROLE_INFO_SYMBOL = {
     "tp2": "cuteafd_v41_spark_tp2_expert_info",
     "tp3": "cuteafd_v41_spark_tp3_expert_info",
@@ -93,8 +97,61 @@ def parse_roles(value: str) -> list[str]:
         if role not in allowed:
             fail(f"unsupported Spark TP role {role!r}; expected {', '.join(sorted(allowed))}")
     # Match CMake's v41_spark_tp_experts.cmake selection from the same
-    # native_spark_artifacts inventory; adjacent-width packages have own manifests.
+    # native_spark_artifacts inventory; adjacent-width packages have own manifests
+    # (`width_roles`).
     return [role for role in roles if role in ROLE_ARTIFACT]
+
+
+def width_roles(requested: str) -> list[str]:
+    return [role for role in requested.split(";") if role in WIDTH_ROLE_ARTIFACTS]
+
+
+def validate_width_role(role: str, native_build_dir: Path, symbols: set[str], symbol_tool: str) -> dict | None:
+    """Attest an unequal V4.1 world from its adjacent-width packages.
+
+    None when the build produced no V4.1 width package for this world (another
+    family's build of the same count, e.g. ML4). A partial or invalid V4.1 set
+    fails: the image must never advertise a world it cannot load."""
+    artifacts = WIDTH_ROLE_ARTIFACTS[role]
+    found = {artifact.name: native_build_dir / f"v41_{artifact.name}_experts" / "v41_experts.json"
+             for artifact in artifacts}
+    present = {name: path for name, path in found.items() if path.is_file()}
+    if not present:
+        return None
+    missing = sorted(set(found) - set(present))
+    if missing:
+        fail(f"V4.1 {role} needs width packages {sorted(found)}; missing {missing}")
+    packages = {}
+    for artifact in artifacts:
+        path = present[artifact.name]
+        payload = json.loads(path.read_text())
+        if payload.get("schema") != 1 or payload.get("capability") != EXPECTED_CAPABILITY:
+            fail(f"{path}: schema/capability differs from the SM121 native contract")
+        if payload.get("role") != artifact.name or payload.get("family", "v41") != "v41":
+            fail(f"{path}: role {payload.get('role')!r}, expected {artifact.name}")
+        geometry = payload.get("geometry") or {}
+        expected = {"experts": EXPECTED_EXPERTS, "hidden": EXPECTED_HIDDEN, "intermediate": artifact.logical,
+                    "kernel_intermediate": artifact.stored, "topk": EXPECTED_TOPK}
+        for key, value in expected.items():
+            if geometry.get(key) != value:
+                fail(f"{path}: geometry.{key} {geometry.get(key)!r}, expected {value}")
+        capacities = sorted({v.get("capacity_rows") for v in payload.get("variants") or [] if isinstance(v, dict)})
+        absent = [capacity for capacity in EXPECTED_CAPACITIES if capacity not in capacities]
+        if absent:
+            fail(f"{path}: variants do not cover capacities {absent}; have {capacities}")
+        hashes = payload.get("artifact_sha256")
+        if not isinstance(hashes, dict) or not any(name.endswith(".o") for name in hashes):
+            fail(f"{path}: artifact_sha256 lists no compiled object")
+        for name, digest in hashes.items():
+            if not (path.parent / name).is_file() or sha256_file(path.parent / name) != digest:
+                fail(f"{path}: artifact {name} is missing or does not match its hash")
+        if symbol_tool:
+            wanted = [f"cuteafd_v41_{artifact.name}_expert_{entry}" for entry in ("info", "launch")]
+            if any(symbol not in symbols for symbol in wanted):
+                fail(f"native library is missing {role} width symbols {wanted}")
+        packages[artifact.name] = {"file": str(path.relative_to(native_build_dir)), "sha256": sha256_file(path),
+                                   "logical": artifact.logical, "stored": artifact.stored}
+    return {"spark_tp_degree": int(role.removeprefix("tp")), "width_packages": packages}
 
 
 def dynamic_symbols(library: Path) -> tuple[set[str], str]:
@@ -190,7 +247,7 @@ def validate_role_export(role: str, manifest_path: Path, export_dir: Path, *, nv
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("coordinator", "expert"), required=True)
-    parser.add_argument("--requested", default="", help="semicolon-separated tp2/tp3/tp6 list")
+    parser.add_argument("--requested", default="", help="semicolon-separated tp2..tp8 list")
     parser.add_argument("--native-build-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--nvfp4", action="store_true", help="also require per-expert NVFP4 Spark TP3/TP6 exports")
@@ -203,7 +260,8 @@ def main() -> int:
     args = parser.parse_args()
 
     roles = parse_roles(args.requested)
-    if args.role != "expert" and roles:
+    widths = width_roles(args.requested)
+    if args.role != "expert" and (roles or widths):
         fail("only the expert role can build extra Spark TP roles")
 
     native_library_sha256 = None
@@ -213,7 +271,7 @@ def main() -> int:
         if not args.native_library.is_file():
             fail(f"native library not found: {args.native_library}")
         native_library_sha256 = sha256_file(args.native_library)
-        if roles:
+        if roles or widths:
             symbols, symbol_tool = dynamic_symbols(args.native_library)
     elif roles:
         fail("--native-library is required when requesting Spark TP roles")
@@ -235,6 +293,13 @@ def main() -> int:
                     f"{args.native_library} is missing {role} symbols {missing_symbols}; "
                     "the role module was not linked into the built library"
                 )
+
+    for role in widths:
+        attested = validate_width_role(role, args.native_build_dir, symbols, symbol_tool) \
+            if args.native_library is not None else None
+        if attested is not None:
+            manifests[role] = attested
+    roles = sorted(manifests, key=lambda role: int(role.removeprefix("tp")))
 
     nvfp4_manifests: dict[str, dict] = {}
     if args.nvfp4:

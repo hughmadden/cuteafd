@@ -1,6 +1,5 @@
 use super::{
     tests::request, BackboneRequest, SparkTopology, V41Tp4Tcp, V41_PARTIAL_ROW_BYTES,
-    V41_ROUTED_EXPERTS,
 };
 use crate::{ExpertProtocolV2Request, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN};
 use anyhow::Result;
@@ -282,50 +281,25 @@ async fn implicit_tp1_round_trips_chunks_and_reuses_connection() -> Result<()> {
 }
 
 #[test]
-fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
+fn generic_tcp_constructors_validate_world() -> Result<()> {
     let peers: Vec<SocketAddr> = (0..9)
         .map(|index| format!("127.0.0.1:{}", 25_000 + index).parse())
         .collect::<std::result::Result<_, _>>()?;
-    for topology in [
-        SparkTopology::NATIVE_TP2_EP1,
-        SparkTopology::NATIVE_TP3_EP1,
-        SparkTopology::NATIVE_TP4_EP1,
-        SparkTopology::NATIVE_TP2_EP2,
-        SparkTopology::NATIVE_TP3_EP2,
-        SparkTopology::NATIVE_TP2_EP3,
-        SparkTopology::NATIVE_TP6_EP1,
-    ] {
-        let world = topology.world_size();
-        let client = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config())?;
-        assert_eq!(client.world_size(), world);
-        assert_eq!(client.ownership_topology(), Some(topology));
-    }
     for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
-        let topology = SparkTopology::new(world as u8, 1)?;
-        if cuteafd_core::tp_units::spark_ownership_topology(world, 1) {
-            let client = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config())?;
-            assert_eq!(client.world_size(), world);
-        }
-        let legacy = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers[..world].len())?, &peers[..world], 80, config())?;
-        assert_eq!(legacy.world_size(), world);
+        let client = V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(world)?, &peers[..world], 80, config())?;
+        assert_eq!(client.world_size(), world);
     }
-        assert!(crate::expert::SparkWorld::canonical(9).is_err());
-        assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(3)?, &peers[..2], 80, config()).is_err());
-    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(SparkTopology::NATIVE_TP3_EP2)?,
-        &peers[..4],
-        80,
-        config()
-    )
-    .is_err());
-    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical([peers[0]; 3].len())?, &[peers[0]; 3], 80, config()).is_err());
-    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(peers[..3].len())?, &peers[..3], 0, config()).is_err());
+    assert!(crate::expert::SparkWorld::canonical(9).is_err());
+    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(3)?, &peers[..2], 80, config()).is_err());
+    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(3)?, &[peers[0]; 3], 80, config()).is_err());
+    assert!(V41Tp4Tcp::new_world(crate::expert::SparkWorld::canonical(3)?, &peers[..3], 0, config()).is_err());
     Ok(())
 }
 
 #[tokio::test]
 async fn pure_tp_one_through_eight_tcp_collects_every_rank() -> Result<()> {
     for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
-        let executors = SparkTopology::new(world as u8, 1)?.executor_ids();
+        let executors = SparkTopology::new(world as u8)?.executor_ids();
         let mut peers = Vec::new();
         let mut servers = Vec::new();
         for rank in 0..world {
@@ -355,105 +329,6 @@ async fn pure_tp_one_through_eight_tcp_collects_every_rank() -> Result<()> {
         }).await?;
         assert_eq!(received, vec![2; world]);
         for server in servers { timeout(Duration::from_secs(3), server).await???; }
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn six_rank_native_group_tcp_covers_every_group_and_rank() -> Result<()> {
-    let topology = SparkTopology::NATIVE_TP2_EP3;
-    let executors = topology.executor_ids();
-    let mut peers = Vec::new();
-    let mut servers = Vec::new();
-    for rank in 0..topology.world_size() {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        peers.push(listener.local_addr()?);
-        let executor_id = executors[rank];
-        servers.push(tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let frame = read_request(&mut stream).await?;
-            let native = BackboneRequest::parse_native_group(&frame, 2, topology)?;
-            for row in 0..native.rows() {
-                let payload = vec![rank as u8 + 1; V41_PARTIAL_ROW_BYTES as usize];
-                let mut indices = [0u32];
-                let response =
-                    native.response_chunk(executor_id, row, &payload, &mut indices, FRAME)?;
-                stream.write_all(&response.to_owned()?.encode()?).await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        }));
-    }
-    let mut request = request(2);
-    let owners: Vec<u8> = (0..V41_ROUTED_EXPERTS)
-        .map(|expert| (expert % topology.group_count() as usize) as u8)
-        .collect();
-    request.with_native_group_owners(&owners, topology)?;
-    let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 2, config())?;
-    let mut chunks = 0;
-    transport
-        .execute(&request, |rank, row, bytes| {
-            assert!(rank < topology.world_size());
-            assert!(row < 2);
-            assert_eq!(bytes.len(), V41_PARTIAL_ROW_BYTES as usize);
-            assert!(bytes.iter().all(|&byte| byte == rank as u8 + 1));
-            chunks += 1;
-            Ok(())
-        })
-        .await?;
-    assert_eq!(chunks, topology.world_size() * 2);
-    for server in servers {
-        timeout(Duration::from_secs(3), server).await???;
-    }
-    Ok(())
-}
-
-/// Pure TP6EP1: six disjoint intermediate slices of every expert, one
-/// unreplicated group, six rank planes on the wire. Every rank must carry its
-/// own shard bytes and the coordinator must receive exactly six of them.
-#[tokio::test]
-async fn six_rank_pure_tp6_tcp_returns_six_distinct_rank_planes() -> Result<()> {
-    let topology = SparkTopology::NATIVE_TP6_EP1;
-    let executors = topology.executor_ids();
-    let mut peers = Vec::new();
-    let mut servers = Vec::new();
-    for rank in 0..topology.world_size() {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        peers.push(listener.local_addr()?);
-        let executor_id = executors[rank];
-        servers.push(tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let frame = read_request(&mut stream).await?;
-            // Every rank of the single group parses the same owned batch and
-            // treats every route as its own shard's work.
-            let native = BackboneRequest::parse_native_group(&frame, 2, topology)?;
-            for row in 0..native.rows() {
-                let payload = vec![rank as u8 + 1; V41_PARTIAL_ROW_BYTES as usize];
-                let mut indices = [0u32];
-                let response =
-                    native.response_chunk(executor_id, row, &payload, &mut indices, FRAME)?;
-                stream.write_all(&response.to_owned()?.encode()?).await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        }));
-    }
-    let mut request = request(2);
-    let owners = vec![0u8; V41_ROUTED_EXPERTS];
-    request.with_native_group_owners(&owners, topology)?;
-    let mut transport = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers, 2, config())?;
-    let mut seen = std::collections::BTreeSet::new();
-    transport
-        .execute(&request, |rank, row, bytes| {
-            assert!(rank < 6);
-            assert!(row < 2);
-            assert_eq!(bytes.len(), V41_PARTIAL_ROW_BYTES as usize);
-            assert!(bytes.iter().all(|&byte| byte == rank as u8 + 1));
-            seen.insert(rank);
-            Ok(())
-        })
-        .await?;
-    assert_eq!(seen.len(), 6);
-    for server in servers {
-        timeout(Duration::from_secs(3), server).await???;
     }
     Ok(())
 }

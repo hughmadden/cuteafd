@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, io::{BufRead, BufReader, Read, Write}, net::{So
 pub mod push;
 
 const CONTROL_LIMIT: usize = 64 * 1024;
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 
 fn check_version(actual: u64, expected: u32) -> Result<()> {
     ensure!(actual == u64::from(expected),
@@ -24,8 +24,6 @@ pub struct WorkerIdentity {
     manifest: Option<cuteafd_loader::plan::checkpoint::identity::ManifestIdentity>,
     geometry: [u32; 5],
     world: u32,
-    topology: [u8; 2],
-    ownership_wire: bool,
 }
 
 impl WorkerIdentity {
@@ -49,8 +47,7 @@ impl WorkerIdentity {
         let identity = cuteafd_loader::plan::checkpoint::identity::CheckpointIdentity::from_view(view, manifest)?;
         Ok(Self { checkpoint: identity.fingerprint, manifest: identity.manifest,
             geometry: [geometry.hidden, geometry.experts, geometry.topk, geometry.intermediate, geometry.layers],
-            world: u32::try_from(world)?, topology: [selected.topology().tp(), selected.topology().ep()],
-            ownership_wire: selected.ownership_topology().is_some() })
+            world: u32::try_from(world)? })
     }
 }
 
@@ -204,13 +201,7 @@ impl WorkerSelection {
         }
         ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&(self.identity.world as usize)), "unsupported worker world");
         ensure!(self.identity.geometry.iter().all(|&value| value > 0), "invalid worker geometry");
-        let [tp, ep] = self.identity.topology;
-        let topology = crate::expert::SparkTopology::new(tp, ep)?;
-        let wire = if self.identity.ownership_wire { crate::expert::SparkWire::NativeOwnership }
-            else { crate::expert::SparkWire::Canonical };
-        let world = crate::expert::SparkWorld::new(topology, wire)?;
-        ensure!(world.topology().world_size() == self.identity.world as usize,
-            "worker topology/world mismatch");
+        crate::expert::SparkWorld::canonical(self.identity.world as usize)?;
         ensure!(self.ranges.iter().all(|range| range.first < range.end && range.end <= self.identity.geometry[4]),
             "worker layer range is outside checkpoint");
         ensure!(self.ranges.windows(2).all(|pair| pair[0].end < pair[1].first),
@@ -1014,7 +1005,7 @@ mod tests {
             hidden_row_stride_bytes: header.hidden_row_stride_bytes, hidden_payload_bytes: header.hidden_payload_bytes,
             flags: header.flags, request_wire_bytes: 0, response_wire_bytes: 0 }
     }
-    fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false } }
+    fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2 } }
     pub(super) fn executions(decode: u32, prefill: u32, unit: u32, units: u8) -> SparkExecutions {
         SparkExecutions::admit(&[decode], prefill, unit, units, &cuteafd_core::EXL3_CAPACITIES).unwrap()
     }
@@ -1076,7 +1067,7 @@ mod tests {
     #[test]
     fn exlr8_manifest_mismatch_rejects_control_handshake_without_publishing_seal() -> Result<()> {
         use cuteafd_loader::plan::checkpoint::identity::ManifestIdentity;
-        let mut coordinator = WorkerIdentity { world: 1, topology: [1, 1], ..identity() };
+        let mut coordinator = WorkerIdentity { world: 1, ..identity() };
         coordinator.manifest = Some(ManifestIdentity { name: "up1".into(), sha256: "a".repeat(64) });
         for content_mismatch in [false, true] {
             let mut worker = coordinator.clone();
@@ -1121,9 +1112,9 @@ mod tests {
         write(&mut client, &serde_json::json!({"message":"worker_selection_start",
             "selection":{"version":1}}))?;
         let error = receive_worker_selection(&server, 0, Duration::from_secs(3)).unwrap_err();
-        assert!(error.to_string().contains("version 1; expected 7"));
+        assert!(error.to_string().contains(&format!("version 1; expected {VERSION}")));
         let rejection = read::<serde_json::Value>(&client).unwrap_err();
-        assert!(rejection.to_string().contains("version 1; expected 7"));
+        assert!(rejection.to_string().contains(&format!("version 1; expected {VERSION}")));
         let envelope = serde_json::to_value(admission_selection())?;
         assert!(envelope["identity"].get("manifest").is_none());
         assert_eq!(envelope["version"], VERSION);
@@ -1177,7 +1168,7 @@ mod tests {
 
     pub(super) fn admission_selection() -> WorkerSelection {
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
-        WorkerSelection::new(WorkerIdentity { world: 1, topology: [1, 1], ..identity() }, &[13]).unwrap()
+        WorkerSelection::new(WorkerIdentity { world: 1, ..identity() }, &[13]).unwrap()
             .with_model(ModelAdmission { executions: executions(80, 4096, 4096, 1),
                 endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 }, partial_reply_bytes: None }],
                 rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } }).unwrap()
@@ -1434,7 +1425,6 @@ mod tests {
             let selection = WorkerSelection::new(WorkerIdentity {
                 checkpoint: "0".repeat(64), manifest: None,
                 geometry: [4096, 352, 8, 1536, 91], world: 6,
-                topology: [6, 1], ownership_wire: false,
             }, &(3..91).collect::<Vec<_>>())?.with_model(model)?;
             let mut reports = Vec::new();
             for rank in 0..6 {
@@ -1574,7 +1564,7 @@ mod tests {
                 if tp == 3 { "spark_tp3" } else { "spark_tp6" });
             let identity = WorkerIdentity {
                 geometry: [geometry.hidden, geometry.experts, geometry.topk, geometry.intermediate, geometry.layers],
-                world: u32::from(tp), topology: [tp, 1], ..identity()
+                world: u32::from(tp), ..identity()
             };
             let model = ModelAdmission::new(vec![
                 SparkEndpoint { capacity: verify, ingress: SparkIngress::Bf16, ring_depth: None, partial_reply_bytes: None },
@@ -1691,7 +1681,7 @@ mod tests {
         validate_admission_response(&selection, 0, Some(&report)).unwrap();
         assert!(validate_admission_response(&selection, 0, None).is_err());
         assert!(validate_admission_response(&selection, 1, Some(&report)).is_err());
-        let bare = WorkerSelection::new(WorkerIdentity { world: 1, topology: [1, 1], ..identity() }, &[13]).unwrap();
+        let bare = WorkerSelection::new(WorkerIdentity { world: 1, ..identity() }, &[13]).unwrap();
         assert_ne!(selection.digest().unwrap(), bare.digest().unwrap());
         assert!(validate_admission_response(&bare, 0, Some(&report)).is_err());
         for mutate in [0, 1, 2, 3] {
@@ -2041,8 +2031,6 @@ mod tests {
         assert!(WorkerSelection::new(identity(), &[]).unwrap().ranges().is_empty());
         let mut invalid = identity(); invalid.world = 9;
         assert!(WorkerSelection::new(invalid, &[]).is_err());
-        let mut invalid = identity(); invalid.topology = [2, 2];
-        assert!(WorkerSelection::new(invalid, &[]).is_err());
         assert!(WorkerSelection::new(identity(), &[u32::MAX as usize - 1, u32::MAX as usize]).is_err());
     }
     #[test]
@@ -2050,8 +2038,6 @@ mod tests {
         for world in [7, 8] {
             let mut identity = identity();
             identity.world = world;
-            identity.topology = [world as u8, 1];
-            identity.ownership_wire = false;
             identity.manifest = Some(cuteafd_loader::plan::checkpoint::identity::ManifestIdentity {
                 name: "up1".into(), sha256: "a".repeat(64),
             });
@@ -2073,30 +2059,19 @@ mod tests {
     }
 
     #[test]
-    fn worker_identity_requires_topology_and_wire_without_compatibility_defaults() {
+    fn worker_identity_requires_world_without_compatibility_defaults() {
         let encoded = serde_json::to_value(identity()).unwrap();
-        for field in ["topology", "ownership_wire"] {
-            let mut missing = encoded.clone();
-            missing.as_object_mut().unwrap().remove(field);
-            assert!(serde_json::from_value::<WorkerIdentity>(missing).is_err());
+        let mut missing = encoded.clone();
+        missing.as_object_mut().unwrap().remove("world");
+        assert!(serde_json::from_value::<WorkerIdentity>(missing).is_err());
+        for retired in ["topology", "ownership_wire"] {
+            let mut extra = encoded.clone();
+            extra[retired] = serde_json::json!(null);
+            assert!(serde_json::from_value::<WorkerIdentity>(extra).is_err(), "{retired}");
         }
-        let mut null = encoded;
-        null["topology"] = serde_json::Value::Null;
-        assert!(serde_json::from_value::<WorkerIdentity>(null).is_err());
-    }
-
-    #[test]
-    fn worker_identity_seals_wire_and_physical_topology_independently() {
-        let canonical = WorkerSelection::new(identity(), &[13]).unwrap();
-        let mut owned = identity();
-        owned.ownership_wire = true;
-        assert!(canonical.validate_for(&owned).is_err());
-        assert_ne!(canonical.digest().unwrap(), WorkerSelection::new(owned, &[13]).unwrap().digest().unwrap());
-        let canonical_four = WorkerIdentity { world: 4, topology: [4, 1], ..identity() };
-        let canonical = WorkerSelection::new(canonical_four.clone(), &[13]).unwrap();
-        let replicated = WorkerIdentity { topology: [2, 2], ownership_wire: true, ..canonical_four };
-        assert!(canonical.validate_for(&replicated).is_err());
-        assert!(WorkerSelection::new(replicated, &[13]).is_ok());
+        let two = WorkerSelection::new(identity(), &[13]).unwrap();
+        let four = WorkerIdentity { world: 4, ..identity() };
+        assert!(two.validate_for(&four).is_err());
     }
 
     #[test]

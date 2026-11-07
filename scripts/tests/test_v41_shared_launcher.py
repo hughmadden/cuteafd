@@ -175,11 +175,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         else:
             config = ROOT / "examples/configs" / f"{case}.config"
             overrides = {}
-        explicit_topology = any(line.startswith(("SPARK_TP=", "SPARK_EP="))
-                                for line in config.read_text().splitlines()) or any(
-                                    key in overrides for key in ("SPARK_TP", "SPARK_EP"))
-        for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--dspark-draft-limit"):
-            if flag in command and (flag not in ("--spark-tp", "--spark-ep") or explicit_topology):
+        for flag in ("--kv-pool-size", "--dspark-draft-limit"):
+            if flag in command:
                 additions += [flag, command[command.index(flag) + 1]]
         cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
         expected[expected.index("--prefix-cache-entries") + 2:expected.index("--prefix-cache-entries") + 2] = ["--host-cache-bytes", cache]
@@ -260,9 +257,9 @@ def test_v41_sim5090_launches_pinned_single_gpu_tp4() -> None:
     coordinator = containers[0]
     assert coordinator["env"]["CUTEAFD_SPARK_INTAKE"] == "pinned"
     command = dict(flag_values(coordinator["command"]))
-    for flag, value in {"--rtx-gpus": "1", "--spark-tp": "4", "--spark-ep": "1",
-                        "--max-context-tokens": "1048576"}.items():
+    for flag, value in {"--rtx-gpus": "1", "--max-context-tokens": "1048576"}.items():
         assert command[flag] == value
+    assert "--spark-tp" not in command and "--spark-ep" not in command
     assert len(containers) == 5
     for plan in result["plans"]:
         # The plan takes the resolved cap (the smaller of the card and the key), in bytes.

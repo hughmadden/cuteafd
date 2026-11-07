@@ -26,8 +26,7 @@ fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, wave
 /// The Spark admission (headers only), before any worker is contacted.
 pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     catalog: &cuteafd_loader::OfficialV41Catalog, local_layers: usize,
-    capacity: u32,
-    topology: Option<cuteafd_transport::expert::SparkTopology>)
+    capacity: u32)
     -> Result<Option<crate::shared::placement::SparkAdmission>> {
     let geometry = catalog.routed_experts().geometry()?;
     ensure!(local_layers <= geometry.layers as usize, "V4.1 local boundary exceeds checkpoint");
@@ -38,7 +37,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     }
     let slots = super::AdmittedPrefill::resolve(args)?.waves;
     spark_admission(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
-        &args.snapshot, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, catalog, local_layers, args.peers.len(), capacity, slots, topology).map(Some)
+        &args.snapshot, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, catalog, local_layers, args.peers.len(), capacity, slots).map(Some)
 }
 
 /// The Spark admission for `ranks` workers serving layers `local_layers..`,
@@ -46,12 +45,11 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
 /// `slots` prefill units buffered: what serve (and the GPU fixtures) start
 /// before any transport connects.
 pub(crate) fn spark_admission(view: &cuteafd_loader::plan::checkpoint::CheckpointView, catalog: &cuteafd_loader::OfficialV41Catalog,
-    local_layers: usize, ranks: usize, capacity: u32, slots: usize,
-    topology: Option<cuteafd_transport::expert::SparkTopology>) -> Result<crate::shared::placement::SparkAdmission> {
+    local_layers: usize, ranks: usize, capacity: u32, slots: usize) -> Result<crate::shared::placement::SparkAdmission> {
     let geometry = catalog.routed_experts().geometry()?;
     let working = SparkWorkingSet { spark_layers: (local_layers..geometry.layers as usize).collect(),
         rtx_layers: (0..local_layers).collect(), spark_ranks: ranks, prefill_lanes: slots as u64 };
-    crate::shared::placement::SparkAdmission::plan_view(view, geometry, Some(catalog), &working, ranks, topology,
+    crate::shared::placement::SparkAdmission::plan_view(view, geometry, Some(catalog), &working, ranks,
         spark_model(catalog, capacity, u8::try_from(slots)?, catalog.nvfp4().is_some())?, None)
 }
 

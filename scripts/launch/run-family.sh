@@ -510,8 +510,6 @@ release_load_config "$config"
 release_memory_args memory_policy_args release_memory_variable
 release_memory_args plan_memory_args release_memory_variable GPU_MEMORY_CAP
 release_memory_args spark_memory_args release_memory_variable GPU_MEMORY_CAP GPU_RESERVE FAMILY_RESERVE KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS
-v41_requested_budget=""
-[[ -z "$SPARK_MEMORY_CAP" ]] || v41_requested_budget="$(release_size_bytes "$SPARK_MEMORY_CAP")"
 # V4.1 serves its established ranges until its runtime consumes solver placement.
 attention_placement="${ATTENTION_PLACEMENT:-auto}"
 release_check_attention_placement "$attention_placement" deepseek_v41
@@ -524,17 +522,6 @@ if [[ -n "$wip_slot" ]]; then
   SPARK_EXPERT_DOCKER_INFERENCE="$SPARK_EXPERT_DOCKER_DEV"
 fi
 release_validate_tp2_options
-# RTX_GPUS can be overridden above, so re-check the explicit topology layout.
-release_validate_spark_topology
-topology_explicit=0
-release_spark_topology_explicit && topology_explicit=1
-spark_tp="$(release_spark_tp)"
-spark_ep="$(release_spark_ep)"
-# Canonical TP4 has no namespaced role; every other admitted native TP does.
-spark_tp_roles_required=""
-if ((topology_explicit)) && [[ "$spark_tp" != 4 ]]; then
-  spark_tp_roles_required="tp$spark_tp"
-fi
 [[ -z "$HTTP_QUEUE_DEPTH" || ( "$HTTP_QUEUE_DEPTH" =~ ^[1-9][0-9]*$ && "$HTTP_QUEUE_DEPTH" -le 4096 ) ]] || release_die "HTTP_QUEUE_DEPTH must be in 1..4096"
 [[ "$HTTP_QUEUE_WAIT_MS" =~ ^[0-9]+$ ]] || release_die "HTTP_QUEUE_WAIT_MS must be non-negative"
 [[ "$HOST_CACHE_BYTES" == auto || "$HOST_CACHE_BYTES" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "HOST_CACHE_BYTES must be auto, 0, or a byte size"
@@ -642,24 +629,6 @@ minimum_expert_layers=1
 expert_format=native
 model_is_nvfp4="$(jq -r '.quantization_config.moe_quant_algo // empty' "$hf_home/$snapshot_rel/config.json" 2>/dev/null || true)"
 [[ "$model_is_nvfp4" == "NVFP4" ]] && expert_format=nvfp4
-# Replicated groups require native experts; NVFP4 supports pure TP3/4/6.
-if ((topology_explicit)); then
-  if [[ "$model_is_nvfp4" == "NVFP4" ]]; then
-    [[ "$spark_ep" == 1 && ( "$spark_tp" == 3 || "$spark_tp" == 4 || "$spark_tp" == 6 ) ]] ||
-      release_die "NVFP4 supports pure SPARK_TP=3/4/6 SPARK_EP=1, not replicated groups"
-  fi
-fi
-# Auto placement must not pick an RTX boundary so low that the remote Spark
-# weights cannot fit the device budget. The floor is derived from the actual
-# budget and the resolved TP degree, not a hardcoded 20.
-# These tensor-window constants describe native weights, not compressed shards.
-if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto && -n "$v41_requested_budget" ]]; then
-  remote_capacity=$((v41_requested_budget / $(release_spark_layer_bytes "$spark_tp" "$expert_format")))
-  ((remote_capacity > 40)) && remote_capacity=40
-  topology_min_layers=$((40 - remote_capacity))
-  ((topology_min_layers < 1)) && topology_min_layers=1
-  ((minimum_expert_layers >= topology_min_layers)) || minimum_expert_layers="$topology_min_layers"
-fi
 gpu_selection_mode="$RTX_GPUS"
 # A 32 GB card serves V4.1 alone unless COORDINATOR_GPUS names the pair.
 if [[ "$gpu_selection_mode" == auto && "$COORDINATOR_GPUS" != *,* ]] &&
@@ -690,8 +659,6 @@ mapfile -t release_gpu_pci < <(jq -r '.gpus[].pci' <<<"$gpu_selection")
 gpu_uuid_csv="$(IFS=,; echo "${release_gpu_uuids[*]}")"
 gpu_index_csv="$(IFS=,; echo "${release_gpu_indices[*]}")"
 gpu_pci_csv="$(IFS=,; echo "${release_gpu_pci[*]}")"
-# The runtime solver, not launch-time estimates, selects and admits Spark owners.
-spark_admission="coordinator-authoritative typed admission"
 release_coordinator_device_args "${release_gpu_uuids[@]}"
 
 sparkinfer_commit="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
@@ -752,7 +719,6 @@ v41_prefill_waves="$(get PREFILL_WAVES)"
 [[ -z "$v41_prefill_waves" || "$v41_prefill_waves" =~ ^[1-4]$ ]] || release_die "PREFILL_WAVES must be 1 to 4 for DeepSeek V4.1"
 [[ -z "$v41_prefill_waves" ]] || count_args+=(--prefill-waves "$v41_prefill_waves")
 [[ "$SPECULATOR" != off ]] || count_args+=(--native-mtp-layers 0)
-((topology_explicit == 0)) || count_args+=(--spark-tp "$spark_tp" --spark-ep "$spark_ep")
 [[ -z "$KV_POOL_SIZE" ]] || count_args+=(--kv-pool-size "$KV_POOL_SIZE")
 count_args+=(--speculator "$SPECULATOR")
 [[ -z "$dspark_draft_limit" ]] || count_args+=(--dspark-draft-limit "$dspark_draft_limit")
@@ -791,18 +757,6 @@ V41_PREFILL_WAVES="$PREFILL_WAVES"
 V41_PREFILL_RESERVE_ROWS="$(jq -er '.prefill_reserve_rows | select(type == "number" and . > 0)' <<<"$count_plan")" ||
   release_die "the deepseek_v41 deployment plan names no prefill reserve"
 spark_tp="$(jq -er '.topology.tp' <<<"$count_plan")"
-spark_ep="$(jq -er '.topology.ep' <<<"$count_plan")"
-spark_wire="$(jq -er '.topology.wire' <<<"$count_plan")"
-topology_explicit=0
-case "$spark_wire" in
-  canonical) SPARK_TP= SPARK_EP= ;;
-  native_ownership)
-    topology_explicit=1
-    SPARK_TP="$spark_tp" SPARK_EP="$spark_ep"
-    ;;
-  *) release_die "unsupported planner Spark wire: $spark_wire" ;;
-esac
-(SPARK_COUNT="$spark_expert_world"; release_validate_spark_topology)
 spark_tp_roles_required="$(jq -r '.artifact_requirements.spark_tp_role // ""' <<<"$count_plan")"
 SPECULATOR="$(jq -er '.speculator' <<<"$count_plan")"
 KV_POOL_SIZE="$(jq -r '.admission.kv_pool_size // ""' <<<"$count_plan")"
@@ -882,14 +836,12 @@ REMOTE
 
 done
 
-# An explicit TP2/TP3/TP6 topology needs the matching SM121 expert role baked
+# A native Spark TP other than TP4 needs the matching SM121 expert role baked
 # into the Spark image. The published universal release pair advertises every
-# extra role at once (label `io.cuteafd.spark_tp_roles=tp2;tp3;tp6`, read with the pre-rename
-# `io.cuteafd.v41.spark_tp_roles` as a fallback), so one
-# published image pair serves all approved topologies and this launch selects the
-# role it needs. A prebuilt legacy image carries no role label and keeps working
-# for the default TP4EP1 path; an explicit topology is refused here, before any
-# service is stopped or replaced.
+# extra role at once (label `io.cuteafd.spark_tp_roles`, read with the pre-rename
+# `io.cuteafd.v41.spark_tp_roles` as a fallback), so one published image pair
+# serves every planned Spark count and this launch selects the role it needs.
+# A missing role is refused here, before any service is stopped or replaced.
 spark_advertised_roles=""
 if [[ -n "$spark_tp_roles_required" ]]; then
   for i in "${spark_expert_ranks[@]}"; do
@@ -937,7 +889,7 @@ PY
       if [[ -n "${wip_slot:-}" ]]; then
         release_die "$host WIP slot $wip_slot does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); rebuild with CUTEAFD_WIP_SPARK_TP_ROLES=$spark_tp_roles_required"
       fi
-      release_die "$host Spark image does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); refusing an unbuilt TP$spark_tp topology: use the published universal release pair, or rebuild with CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles_required"
+      release_die "$host Spark image does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); refusing an unbuilt TP$spark_tp world: use the published universal release pair, or rebuild with CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles_required"
     fi
     if [[ "${expert_format:-native}" == nvfp4 && -z "${wip_slot:-}" ]]; then
       release_ssh -o ConnectTimeout=10 "$host" docker run --rm --network none \
@@ -955,7 +907,7 @@ assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdiges
 fi
 
 peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -976,15 +928,9 @@ if ((dry_run)); then
   echo "  Spark ranks: $SPARK_COUNT; hosts: $(release_hosts_csv)"
   echo "  Spark peers: $peers"
   echo "  Spark owners: coordinator-authoritative typed admission"
-  if ((topology_explicit)); then
-    echo "  Spark topology: TP=$spark_tp EP=$spark_ep (group=rank/TP, tp_rank=rank%TP; no dummy ranks)"
-    while read -r global_rank group_index tp_rank; do
-      echo "    global=$global_rank group=$group_index tp_rank=$tp_rank"
-    done < <(release_spark_rank_map)
-    echo "  Spark weight admission (workspace/staging NOT accounted; not a feasibility claim): $spark_admission"
-    [[ -z "$spark_tp_roles_required" ]] ||
-      echo "  Spark image must advertise V41 expert role: $spark_tp_roles_required (selected rank advertises: ${spark_advertised_roles:-<unreadable>})"
-  fi
+  echo "  Spark TP: $spark_tp"
+  [[ -z "$spark_tp_roles_required" ]] ||
+    echo "  Spark image must advertise V41 expert role: $spark_tp_roles_required (selected rank advertises: ${spark_advertised_roles:-<unreadable>})"
   echo "  memory policy: ${memory_policy_args[*]:-defaults (full GPU cap, family reserves, 2M KV target)}"
   echo "  prefill batch tokens: $PREFILL_BATCH_TOKENS; expert capacity: $expert_capacity"
   echo "  dSpark draft: policy=$DSPARK_DRAFT_POLICY limit=${dspark_draft_limit:-5}"
@@ -1128,11 +1074,6 @@ fi
 [[ "$TP2_DSPARK_EXPERTS" != on ]] || args+=(--tp2-dspark-experts)
 [[ -z "$v41_l2_prefetch" ]] || args+=(--l2-prefetch "$v41_l2_prefetch")
 [[ "$v41_engram_warm" != on ]] || args+=(--engram-warm)
-# Explicit replicated topology is described to the coordinator once, and each
-# worker derives group=rank/TP and tp_rank=rank%TP from the same two flags.
-if ((topology_explicit)); then
-  args+=(--spark-tp "$spark_tp" --spark-ep "$spark_ep")
-fi
 release_serving_docker_args
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "${RELEASE_COORDINATOR_DEVICE_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
@@ -1153,7 +1094,7 @@ for i in "${spark_worker_ranks[@]}"; do
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
   worker_budget="$(release_spark_role_budget "$count_plan" "$i")" || exit 1
-  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$worker_budget" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_expert_world" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
+  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$worker_budget" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_expert_world" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
   worker_encoder_rank=-1
   for vision_rank in "${spark_vision_ranks[@]}"; do
     [[ "$vision_rank" != "$i" ]] || worker_encoder_rank="$i"
@@ -1178,21 +1119,18 @@ for i in "${spark_worker_ranks[@]}"; do
 set -euo pipefail
 namespace_root="${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}"
 image="$1"; name="$2"; rank="$3"; budget="$4"; port="$5"; snapshot_rel="$6"; fingerprint="$7"; world="$8"
-topology_explicit="$9"; topology_tp="${10}"; topology_ep="${11}"
-topology_args=()
-[[ "$topology_explicit" != 1 ]] || topology_args=(--spark-tp "$topology_tp" --spark-ep "$topology_ep")
 # Optional RDMA tuning, forwarded only when the operator set it.
-rdma_env="${12:-}"; execution_lanes="${13:-}"
+rdma_env="${9:-}"; execution_lanes="${10:-}"
 # The operator's RUST_LOG reaches the worker too (a quoted heredoc does not
 # see the caller's environment).
-rust_log="${14:-info}"
-wip_slot="${15:-__none__}"
+rust_log="${11:-info}"
+wip_slot="${12:-__none__}"
 wip_layout_slot="$wip_slot"
 encoder_args=()
-if [[ "$rank" == "${16:--1}" ]]; then
+if [[ "$rank" == "${13:--1}" ]]; then
   encoder_flag=--encoder
-  [[ "${20}" == 1 ]] || encoder_flag=--encoder-only
-  encoder_args=("$encoder_flag" --encoder-listen "0.0.0.0:${17}" --encoder-plan-hash "${18}" --encoder-revision "${19}" --encoder-max-tokens 1024)
+  [[ "${17}" == 1 ]] || encoder_flag=--encoder-only
+  encoder_args=("$encoder_flag" --encoder-listen "0.0.0.0:${14}" --encoder-plan-hash "${15}" --encoder-revision "${16}" --encoder-max-tokens 1024)
 fi
 wip_args=()
 if [[ "$wip_slot" != __none__ ]]; then
@@ -1236,7 +1174,7 @@ worker_mounts=("${RELEASE_HUB_MOUNTS[@]}")
 release_serving_docker_args
 cuteafd_cdi_gpu_args all || exit 2
 expert_args=(--rank "$rank" --device-budget-bytes "$budget")
-[[ "${20}" != 1 ]] || expert_args=(--rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}")
+[[ "${17}" != 1 ]] || expert_args=(--rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port")
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} "${worker_mounts[@]}" "$image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd ${memory_args[@]+"${memory_args[@]}"} expertd-native --snapshot "$worker_snapshot" --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${expert_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
@@ -2716,6 +2654,22 @@ for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
 done
 peers=()
 [[ -z "$deployment_peer_csv" ]] || IFS=, read -r -a peers <<<"$deployment_peer_csv"
+# Recipe registration is not proof that this seal/image contains its TP variants.
+package_requirements="$(jq -c '.artifact_requirements.spark_packages // {}' <<<"$deployment_json")"
+if [[ "$package_requirements" != '{}' ]]; then
+  for rank in "${spark_expert_ranks[@]}"; do
+    host="$(get "SPARK_${rank}_HOST")"
+    identity="$checkpoint_family $host image $spark_image"
+    if [[ -n "$wip_slot" ]]; then
+      slot_root="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip"
+      printf -v package_command '%q ' python3 - "$package_requirements" "$identity slot $wip_slot ($slot_root)" "$slot_root"
+    else
+      printf -v package_command '%q ' docker run --rm --network none -i --entrypoint python3 "$spark_image" - "$package_requirements" "$identity"
+    fi
+    timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "$package_command" < "$repo_root/scripts/launch/preflight-spark-packages.py" ||
+      release_die "$host is missing deployment Spark packages (before startup)"
+  done
+fi
 if ((dry_run)); then
   # No serving container, restart or remote staging below this point is allowed
   # during validation. Runtime-only proofs (including audio exports) stay pending.

@@ -210,7 +210,7 @@ impl<'a> Engine<'a> {
         model.validate(ExpertGeometry::KIMI_K3)?;
         let spark = SparkAdmission::plan_view(checkpoint.view.as_ref()
             .context("Kimi bootstrap requires the immutable selected checkpoint view")?, ExpertGeometry::KIMI_K3,
-            Some(&catalog), &admission.working_set(), peers.len(), None, model, None)?;
+            Some(&catalog), &admission.working_set(), peers.len(), model, None)?;
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).
         let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,

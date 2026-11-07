@@ -1,4 +1,4 @@
-"""CPU-only contract check for the replicated-group Spark TP2/TP3 AOT families.
+"""CPU-only contract check for the Spark TP2/TP3 AOT families.
 
 Compiles the real native wrapper translation units against a host-only CUDA
 shim and mock exported variant tables, then asserts the new symbol families

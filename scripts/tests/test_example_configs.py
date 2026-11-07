@@ -19,8 +19,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "examples" / "configs"
 STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|nvfp4)-reply)?\.config$")
-TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
-         "tp3ep2-native.config", "tp4ep1-explicit-native.config", "tp6ep1-native.config"}
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
@@ -84,6 +82,8 @@ CHECKPOINTS = {
     "stepfun-ai/Step-5-Preview-NVFP4": {"model_type": "step3p5", "num_hidden_layers": 8},
     "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6": {"model_type": "step3p5", "num_hidden_layers": 8},
     "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6": {"model_type": "kimi_k3", "num_hidden_layers": 8},
+    "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6": {"model_type": "mistral_large4", "text_config": {
+        "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}},
     # Drafters the starting configs name.
     "incoai/GLM-5.3-DFlash2": {"architectures": ["DFlash2DraftModel"]},
     "incoai/GLM-5.3-Flash-DFlash2": {"architectures": ["DFlash2DraftModel"]},
@@ -102,7 +102,7 @@ POOL_EXCEPTIONS = {("deepseek_v41", "POOL_TOKENS"): "auto"}
 
 
 def starting_configs() -> list[Path]:
-    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in TP_EP | QUALIFICATION | V4_PREP)
+    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in QUALIFICATION | V4_PREP)
 
 
 def keys(path: Path) -> dict[str, str]:
@@ -639,10 +639,6 @@ def test_ml4_smoke_entries_use_published_examples_and_minimum_sparks() -> None:
         assert keys(ROOT / entry["config"])["SPECULATOR"] == "dspark"
 
 
-def test_tp_ep_examples_are_left_alone() -> None:
-    assert TP_EP <= {p.name for p in EXAMPLES.glob("*.config")}
-
-
 def test_qualification_configs_exist_and_are_listed() -> None:
     assert QUALIFICATION <= {p.name for p in EXAMPLES.glob("*.config")}
     readme = (EXAMPLES / "README.md").read_text()
@@ -830,7 +826,7 @@ def test_glmf_exlr8_k4_cards_preserve_qualified_native_recipes(filename: str) ->
         assert values.get("VISION", "auto") == "auto"
         assert config["AUDIO"] == "off"
         assert config["EXPERT_BACKEND"] == ("spark" if sparks else "local")
-        for key in ("RTX_EXPERT_LAYERS", "EXLR8_DENSE_FROM", "SPARK_TP", "SPARK_EP"):
+        for key in ("RTX_EXPERT_LAYERS", "EXLR8_DENSE_FROM"):
             assert key not in values
         for image in ("COORDINATOR_DOCKER_INFERENCE", "SPARK_EXPERT_DOCKER_INFERENCE"):
             assert config[image] == pins[image]

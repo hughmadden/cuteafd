@@ -34,9 +34,6 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
             library.cuda_allocatable_memory_info()?.0)?;
         ensure!(plan.layout.bytes().checked_add(plan.scratch).is_some_and(|n| n <= config.device_budget),
             "native push transform exceeds device budget");
-        if config.declared_world.ownership_topology().is_some() {
-            ensure!(peak <= config.device_budget, "native push unified peak exceeds configured admission");
-        }
         let offer = Offer { rank: config.rank, host: host.into(), arena_bytes: plan.logical_bytes(),
             placement: plan.placement.clone() };
         tracing::info!(rank = config.rank, resident_bytes = resident, transform_bytes = plan.scratch,

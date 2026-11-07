@@ -71,7 +71,7 @@ case "$role" in
     exit 2
     ;;
 esac
-# Opt-in replicated-group Spark expert roles. Empty is the default and keeps
+# Opt-in Spark expert roles. Empty is the default and keeps
 # the historical Spark TP4 shard (and every release default) byte-identical.
 # Release images carry the audio tower: AUDIO=auto serves it for qualified checkpoints.
 audio_aot="${CUTEAFD_RELEASE_AUDIO_AOT:-ON}"

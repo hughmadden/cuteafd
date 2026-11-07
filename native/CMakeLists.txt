@@ -57,7 +57,7 @@ option(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT "Build full RTX backbone expert kerne
 option(CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT "Build dual RTX TP2 encoder expert kernels" OFF)
 option(CUTEAFD_V41_TP2_COMPACT_EXPERIMENT "Use experimental native compact TP2 experts at capacities 1/16" OFF)
 option(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT "Use experimental compact Spark experts through two live rows" OFF)
-# Opt-in replicated-group Spark TP2/TP3 expert shards. Empty (the default)
+# Opt-in Spark TP2/TP3 expert shards. Empty (the default)
 # compiles/links no new object or symbol, so every release default behaves
 # exactly as the historical Spark TP4 shard. Set to a semicolon list of
 # `tp2`/`tp3` on the SM121 expert build to pre-compile those AOT capacity
@@ -65,7 +65,7 @@ option(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT "Use experimental compact Spark expe
 # `spark_tp_degree` manifest field, so byte identity of exported JSON is not
 # claimed either way.)
 set(CUTEAFD_SPARK_TP_ROLES "" CACHE STRING
-  "Extra replicated-group Spark expert TP roles to build (tp2;tp3;tp6;tp8); empty builds only TP4")
+  "Extra Spark expert TP roles to build (tp2;tp3;tp6;tp8); empty builds only TP4")
 # Deprecated spelling, accepted for one release.
 if(DEFINED CUTEAFD_V41_SPARK_TP_ROLES AND NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUAL "")
   message(DEPRECATION "CUTEAFD_V41_SPARK_TP_ROLES is deprecated; use CUTEAFD_SPARK_TP_ROLES")

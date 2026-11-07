@@ -75,12 +75,6 @@ def geometry_worlds(geometry: str) -> list[int]:
     return package_worlds(family, format or 'fp8')
 
 
-def ownership_topology(tp: int, ep: int) -> bool:
-    """Wire qualification; the checkpoint still decides its own native recipe."""
-    return (ep == 1 and any(tp in package_worlds(family, 'mxfp4')
-                           for family in ('v41', 'dsv4f', 'dsv4p'))) or (tp, ep) in ((2, 2), (3, 2), (2, 3))
-
-
 # Stable legacy ABI ids. Unequal source ownership selects width-keyed artifacts.
 NATIVE_SPARK_ROLE_IDS = {2: 5, 3: 6, 4: 1, 6: 7, 8: 8}
 NATIVE_WIDTH_ROLE_BASE = 65536

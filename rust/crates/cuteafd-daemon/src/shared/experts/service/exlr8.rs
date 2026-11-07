@@ -196,7 +196,6 @@ impl<'w, 'a> Worker<'w, 'a> {
     fn execute(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, destination: Option<CuteafdDeviceBuffer>,
         mapped: Option<ProtocolV2RequestDevicePayload>) -> Result<()> {
-        ensure!(!request.is_native_group(), "EXLR8 requires canonical requests");
         request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32)?;
         ensure!(request.rows() > 0 && request.rows() as usize <= self.capacity,
             "EXLR8 request exceeds admitted capacity");

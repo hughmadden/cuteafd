@@ -159,7 +159,7 @@ fn plan_json_keeps_info_tracing_on_stderr() {
 }
 
 #[test]
-fn deployment_rejects_conflicting_modes_and_incomplete_topology() {
+fn deployment_rejects_conflicting_modes_and_retired_topology_flags() {
     for flags in [
         vec!["--deployment", "--files"],
         vec!["--deployment", "--role", "coordinator"],
@@ -780,8 +780,7 @@ if args[1].name == "qwen38-exl3-min.config":
         if let Some(revision) = config.get("MODEL_REVISION") {
             command.args(["--revision", revision]);
         }
-        for (key, flag) in [("SPARK_TP", "--spark-tp"), ("SPARK_EP", "--spark-ep"),
-            ("PREFILL_ROWS", "--prefill-rows"), ("PREFILL_BATCH_TOKENS", "--prefill-rows"),
+        for (key, flag) in [("PREFILL_ROWS", "--prefill-rows"), ("PREFILL_BATCH_TOKENS", "--prefill-rows"),
             ("PREFILL_WAVES", "--prefill-waves"), ("PREFILL_SPAN_ROWS", "--prefill-span-rows"),
             ("EXLR8_MANIFEST", "--exlr8-manifest")] {
             if let Some(value) = config.get(key) { command.args([flag, value]); }

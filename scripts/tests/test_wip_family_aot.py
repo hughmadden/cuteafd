@@ -228,9 +228,9 @@ def test_missing_or_malformed_programs_are_refused(tmp_path, contents):
         aot.check_programs('qwen4', tmp_path / 'missing.json')
 
 
-@pytest.mark.parametrize('count,tp,role', [('6', '2', 'tp2'), ('6', '6', 'tp6'), ('3', '3', 'tp3'), ('6', '', 'tp6'), ('8', '8', 'tp8')])
-def test_v41_direct_config_uses_explicit_spark_tp_role(count, tp, role):
-    values = {'FAMILY': 'deepseek_v41', 'SPARK_COUNT': count, 'SPARK_TP': tp}
+@pytest.mark.parametrize('count,role', [('6', 'tp6'), ('3', 'tp3'), ('8', 'tp8'), ('5', 'tp5')])
+def test_v41_direct_config_uses_the_spark_count_role(count, role):
+    values = {'FAMILY': 'deepseek_v41', 'SPARK_COUNT': count}
     _, scopes = aot.config_scopes(values)
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == role
 
