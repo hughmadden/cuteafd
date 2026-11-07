@@ -24,7 +24,9 @@ def _pin_module():
 
 
 class FakeHostTarget:
-    """The CuTe DSL HostTarget surface the pin touches (parsed triple/cpu/features)."""
+    """The CuTe DSL 4.8 HostTarget surface the pin touches (parsed triple/cpu/features)."""
+    _parse_target = staticmethod(lambda spec: _parse(spec))
+
     def __init__(self, val=''):
         self._triple, self._cpu, self._features = _parse(val)
         self.value = val
@@ -51,7 +53,7 @@ def _parse(spec):
 
 @pytest.fixture
 def fake_cutlass(monkeypatch):
-    compiler = types.SimpleNamespace(HostTarget=type('HostTarget', (FakeHostTarget,), {}), _parse_host_target=_parse)
+    compiler = types.SimpleNamespace(HostTarget=type('HostTarget', (FakeHostTarget,), {}))
     base = types.ModuleType('cutlass.base_dsl')
     base.compiler = compiler
     monkeypatch.setitem(sys.modules, 'cutlass', types.ModuleType('cutlass'))
