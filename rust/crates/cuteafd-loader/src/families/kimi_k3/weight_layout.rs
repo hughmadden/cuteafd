@@ -84,6 +84,7 @@ pub struct LayerLayout {
     pub operands: BTreeMap<&'static str, usize>,
     pub attention: WeightAttention,
     pub core: BTreeMap<&'static str, CoreWeightLayout>,
+    pub native: BTreeMap<&'static str, crate::formats::native_attention::NativeLayout>,
 }
 impl LayerLayout {
     pub fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode) -> Result<[Self; 2]> {
@@ -106,7 +107,7 @@ impl LayerLayout {
         ensure!(intermediate > 0 && intermediate % ranks == 0, "Kimi FFN intermediate does not divide TP2");
         let local = intermediate / ranks;
         let sum = |a: usize, b: usize| a.checked_add(b).context("Kimi weight extent overflow");
-        let mut pair = shares.into_iter().map(|attention| Self { operands: BTreeMap::new(), attention, core: BTreeMap::new() }).collect::<Vec<_>>();
+        let mut pair = shares.into_iter().map(|attention| Self { operands: BTreeMap::new(), attention, core: BTreeMap::new(), native: BTreeMap::new() }).collect::<Vec<_>>();
         for (index, rank) in pair.iter_mut().enumerate() {
             for name in ["attention.score", "ffn.score"] { rank.insert(name, &[cfg.hidden, 4])?; }
             for name in ["attention.norm", "ffn.norm"] { rank.insert(name, &[cfg.hidden, 2])?; }
@@ -234,7 +235,14 @@ impl LayerLayout {
         } else {
             let [mut n, mut k] = shape;
             match side { TrellisSide::Output => n /= ranks, TrellisSide::Input => k /= ranks }
-            self.insert(name, &[n, k, 2])?;
+            if let Some(projection) = inventory.native.get(stem) {
+                ensure!(projection.shape == shape, "Kimi {stem} native inventory differs from layer geometry");
+                self.native.insert(name, crate::formats::native_attention::NativeLayout {
+                    stem: stem.into(), shape: [n, k], fp8: projection.fp8,
+                    rank, ranks, split: projection.split });
+            } else {
+                self.insert(name, &[n, k, 2])?;
+            }
         }
         Ok(())
     }
@@ -245,15 +253,19 @@ impl LayerLayout {
     }
 
     pub fn bytes(&self) -> Result<usize> {
-        self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
-            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))
+        let base = self.operands.values().copied().chain(self.core.values().map(|layout| layout.bytes))
+            .try_fold(0usize, |n, size| n.checked_add(size).context("Kimi layer admission extent overflow"))?;
+        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
+            .context("Kimi native attention extent overflow"))
     }
 
     pub fn attention_bytes(&self) -> Result<usize> {
-        self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
+        let base = self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
             .map(|(_, bytes)| *bytes).chain(self.core.iter().filter(|(name, _)|
                 name.starts_with("mla.") || name.starts_with("kda.")).map(|(_, layout)| layout.bytes))
-            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))
+            .try_fold(0usize, |n, bytes| n.checked_add(bytes).context("Kimi attention extent overflow"))?;
+        self.native.values().try_fold(base, |sum, layout| sum.checked_add(usize::try_from(layout.bytes()?)?)
+            .context("Kimi native attention extent overflow"))
     }
 
 }

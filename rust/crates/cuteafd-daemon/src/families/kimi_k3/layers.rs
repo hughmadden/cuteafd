@@ -762,12 +762,15 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         Ok(())
     }
 
-    fn publish_core(&self,ffn:bool)->Result<()> {
-        let name=if ffn {"K6 FFN partial"}else{"K6 attention partial"};
-        ensure!(self.protocol.peer()?.slot_bytes()>=self.rows*7168*2,"Kimi K6 peer slot shorter than BF16 hidden rows");
+    fn publish_core(&self,layer:usize,ffn:bool)->Result<()> {
+        let partials=[self.local[0].core_partial(layer,ffn,self.rows)?,self.local[1].core_partial(layer,ffn,self.rows)?];
+        ensure!(std::mem::discriminant(&partials[0]) == std::mem::discriminant(&partials[1]),
+            "Kimi peer partial precision/basis differs between ranks");
         for rank in 0..2 {
+            let buffer=partials[rank].buffer();
+            ensure!(self.protocol.peer()?.slot_bytes()>=buffer.bytes,"Kimi peer slot shorter than typed partial");
             self.protocol.producers(self.lane,rank)?;
-            self.protocol.peer()?.push(rank,self.lane,self.local[rank].buffer(name)?.ptr,self.rows*7168*2)?;
+            self.protocol.peer()?.push(rank,self.lane,buffer.ptr,buffer.bytes)?;
         }
         Ok(())
     }
@@ -775,7 +778,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     fn publish_ffn(&self, layer: usize) -> Result<()> {
         if self.local[0].native_ffn(layer)? {
             ensure!(self.local[1].native_ffn(layer)?, "Kimi K6 FFN rank formats differ");
-            self.publish_core(true)
+            self.publish_core(layer,true)
         } else {
             self.publish("ffn output")
         }
@@ -783,8 +786,9 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     fn meet_core(&mut self,layer:usize,ffn:bool,destination:&str)->Result<()> {
         for rank in 0..2 {
             self.protocol.peer()?.wait(rank,self.lane)?;
-            let peer=CuteafdDeviceBuffer{ptr:self.protocol.peer()?.recv(rank,self.lane)?,
-                bytes:self.rows*7168*2,device_id:self.local[rank].stream().device.id,flags:0};
+            let partial=self.local[rank].core_partial(layer,ffn,self.rows)?;
+            let peer=partial.received(CuteafdDeviceBuffer{ptr:self.protocol.peer()?.recv(rank,self.lane)?,
+                bytes:partial.buffer().bytes,device_id:self.local[rank].stream().device.id,flags:0})?;
             self.protocol.peer()?.on(rank,||self.local[rank].reduce_core(layer,ffn,self.rows,peer,destination,
                 self.protocol.peer()?.stream(rank)))?;
             self.protocol.consumer(self.lane,rank)?;
@@ -866,7 +870,7 @@ impl LayerKernels for Bindings<'_, '_, '_> {
         for rank in 0..2 { self.attention_rank(layer, rank)?; }
         if self.local[0].native_attention(layer)? {
             ensure!(self.local[1].native_attention(layer)?,"Kimi K6 attention rank formats differ");
-            self.publish_core(false)?;self.meet_core(layer,false,"delta")
+            self.publish_core(layer,false)?;self.meet_core(layer,false,"delta")
         } else {
             self.publish("attention output")?;
             self.meet("attention output", "delta")
@@ -909,7 +913,7 @@ impl LayerKernels for Bindings<'_, '_, '_> {
         // joins, otherwise rank 0's device wait can block rank 1's publication.
         if self.local[0].native_attention(layer)? {
             ensure!(self.local[1].native_attention(layer)?, "Kimi K6 attention rank formats differ");
-            self.publish_core(false)?; self.meet_core(layer, false, "delta")
+            self.publish_core(layer,false)?; self.meet_core(layer, false, "delta")
         } else {
             self.publish("attention output")?;
             self.meet("attention output", "delta")

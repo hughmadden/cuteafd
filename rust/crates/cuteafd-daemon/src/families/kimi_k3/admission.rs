@@ -346,7 +346,8 @@ impl<'a> Admission<'a> {
                         budget: budgets[0] }] }
                 } else { CoordinatorExperts::Tp2 { layers: layers.clone(), budgets } })
             }).transpose()?;
-            let prepared = CoordinatorPush::prepare_admitted(&checkpoint.snapshot, Some(catalog), RANKS,
+            let prepared = CoordinatorPush::prepare_view_admitted(checkpoint.view.as_ref()
+                .context("Kimi push requires the immutable selected checkpoint view")?, Some(catalog), RANKS,
                 experts, self.push_host.clone())?;
             Ok((prepared, owners, records, dense))
         })?;
@@ -802,8 +803,9 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let scoring_bytes = kimi::host_scoring_bytes(lane_layouts[0][0].rows().min(64), lane_layouts[0][0].rows(), cfg.vocab_size)?;
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
-    let push_host = kimi::push_host_envelope(cfg, RANKS)?;
+    let push_host = kimi::selected_push_host_envelope(cfg, &core, RANKS)?;
     recipe.owners.extend(kimi::push_host_owners(&push_host, maximum_pages)?);
+    recipe.owners.extend(kimi::native_load_owners(&core, RANKS, maximum_pages)?);
     let mut host_budget = kimi::host_budget(host_total, host_available);
     host_budget.headroom = host_budget.headroom.max(prefix_args.map_or(0, |args| args.host_cache_headroom_bytes));
     budgets.push(host_budget);
