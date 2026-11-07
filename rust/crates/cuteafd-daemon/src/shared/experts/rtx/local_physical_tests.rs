@@ -115,7 +115,7 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
                     {"label":"v41_exl3_sum","pointer_slots":["output_ptr"],"scalar_slots":["active_m"]}],
                 "trellis_lut":{"file":"lut","bytes":16,"sha256":format!("{:x}",Sha256::digest([0u8;16]))},
                 "buffers":{
-                    "output":{"bytes":capacity*cfg.hidden*4,"dtype":"torch.float32","allocation":"output","zero_on_create":false},
+                    "output":{"bytes":capacity as usize*cfg.hidden*4,"dtype":"torch.float32","allocation":"output","zero_on_create":false},
                     "fc2":{"bytes":capacity*32,"dtype":"torch.float32","allocation":"fc2","zero_on_create":false},
                     "state":{"bytes":16,"dtype":"torch.int32","allocation":"state","zero_on_create":true}}
             });
