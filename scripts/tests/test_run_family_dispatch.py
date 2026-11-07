@@ -1464,7 +1464,7 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     # Single-owner placement retains the solver's Heads label with Whole-only modes.
     expected = "context" if gpus == 2 else "heads"
     assert deployment["report"]["attention_placement"] == expected, deployment
-    maximum = 1048576 if "-k6-" in example.name else 524288
+    maximum = 1048576
     served = min(maximum, deployment["memory_layout"]["pool_tokens"])
     assert any(note.startswith(f"Kimi API max context: {served} tokens;")
                for note in deployment["memory_layout"]["notes"]), deployment
