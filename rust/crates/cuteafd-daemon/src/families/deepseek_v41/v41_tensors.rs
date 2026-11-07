@@ -1,5 +1,6 @@
 //! Official coordinator tensors retain their native checkpoint representations.
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, device::Device,
+    weight_arena::{DeviceWeightArena, weight_allocation}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
@@ -90,6 +91,11 @@ impl<'a> NativeRtxTensors<'a> {
         device_budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, names, device_budget, staging_bytes, None)
+    }
+
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, names: &[String],
+        device_budget: usize, staging_bytes: usize, arena: Option<&DeviceWeightArena<'a>>) -> Result<Self> {
         let resident_bytes = Self::plan(catalog, names)?;
         ensure!(
             resident_bytes <= device_budget,
@@ -105,7 +111,8 @@ impl<'a> NativeRtxTensors<'a> {
         let mut tensors = BTreeMap::new();
         for name in names {
             let bytes = usize::try_from(catalog.device_tensor_bytes(name, None)?)?;
-            let allocation = DeviceAllocation::new(library, bytes)?;
+            let allocation = DeviceAllocation::from_allocation(weight_allocation(
+                Device { library, id: device }, arena, name, bytes)?);
             dense.operand(crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer,
                 lands: vec![(rect(catalog, name, None)?, 0)], bytes })?;
             tensors.insert(name.clone(), allocation);
@@ -129,6 +136,11 @@ impl<'a> NativeRtxTensors<'a> {
     }
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (name, allocation) in &self.tensors { allocation.inventory(inventory, name)?; }
+        if let Some((owner, _)) = &self.mapped_embedding { inventory.pinned("embed.weight", owner.buffer)?; }
+        Ok(())
     }
 }
 
