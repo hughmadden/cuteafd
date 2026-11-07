@@ -133,6 +133,8 @@ impl<'a> DeploymentSpec<'a> {
         let layers: Vec<u32> = if let Some(placement) = &report.solver_placement {
             placement.layers.iter().enumerate().filter_map(|(layer, home)|
                 (home.experts == crate::placement::ExpertHome::Spark).then_some(layer as u32)).collect()
+        } else if report.spec.as_ref().is_some_and(|spec| spec.moe.is_none()) {
+            Vec::new()
         } else {
             // Failed or shape-only reports have no solved ownership to narrow.
             let first = report.launch.as_ref().map_or(0, |launch| launch.first_expert_layer);

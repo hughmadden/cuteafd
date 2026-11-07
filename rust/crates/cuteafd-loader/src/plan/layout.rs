@@ -1140,7 +1140,7 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
 }
 
 /// Keep media-only physical ranks in the ledger without inventing expert ownership.
-fn ensure_tower_spark(devices: &mut Vec<DeviceLayout>, rank: usize, options: &LayoutOptions) {
+pub(crate) fn ensure_tower_spark(devices: &mut Vec<DeviceLayout>, rank: usize, options: &LayoutOptions) {
     if devices.iter().any(|device| device.kind == DeviceKind::Spark && device.index as usize == rank) { return; }
     devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
         capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes,

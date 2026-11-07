@@ -7,9 +7,13 @@ use anyhow::{Context, Result};
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, _ => 0 };
+    let routed = model.spec().moe_layers();
+    let all_onboarded = routed > 0
+        && options.resolve_onboard(routed) == Some(crate::placement::Onboard::Layers(routed));
+    let expert_world = if all_onboarded { 0 } else { spark_ranks };
     // MiMo's external chunk is independent of the shared live-slot arena.
     let external_span = options.prefill_span_rows.take().unwrap_or(16384);
-    let selected = super::resolve_prefill(input, report, options, spark_ranks,
+    let selected = super::resolve_prefill(input, report, options, expert_world,
         crate::serving_capacity::prefill_waves::PrefillLimits::default());
     options.prefill_span_rows = Some(external_span);
     if let Err(error) = selected { return unsupported_prefill(report, error); }
@@ -48,29 +52,36 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, worker_budget_bytes: 0,
             items: vec![runtime], kv_tokens: 0 }
     }).collect::<Vec<_>>();
-    let mut sparks = (0..spark_ranks).map(|rank| DeviceLayout { kind: DeviceKind::Spark,
+    let mut sparks = (0..expert_world).map(|rank| DeviceLayout { kind: DeviceKind::Spark,
         index: rank as u32, capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes, kv_tokens: 0,
         items: vec![cuteafd_core::memory_layout::spark_runtime_residual(),
             Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
+    if all_onboarded {
+        for rank in 0..spark_ranks {
+            ensure_tower_spark(&mut sparks, rank, options);
+        }
+    }
     // Media sees fixed target/pool demands and mandatory experts, not the
     // optional Auto prefix. Spark-free admission must reserve every expert.
     if report.encoder.is_none() {
         let towers = mimo_towers(report, checkpoint, model.spec().hidden as u64);
         let mut media_options = options.clone();
-        if spark_ranks > 0 && options.onboard.unwrap_or_default()
+        if expert_world > 0 && options.onboard.unwrap_or_default()
             == crate::placement::OnboardSetting::Auto {
             media_options.onboard = Some(crate::placement::OnboardSetting::Layers(0));
         }
         let mut admission = devices.clone();
         let no_media = vec![crate::placement::ResidentWeights::default(); ranks];
-        match apply_resolved(input, &mut media_options, &mut admission, &no_media, 0, spark_ranks, concurrency, context, manifest) {
+        match apply_resolved(input, &mut media_options, &mut admission, &no_media, 0, expert_world, concurrency, context, manifest) {
             Ok((placement, working, ..)) => {
-                if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
-                    report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
+                if !working.spark_layers.is_empty() {
+                    if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
+                        report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
+                    }
+                    // The tower's Spark headroom is what the worker has left after its
+                    // rank I/O; the final solve re-charges it for its own working set.
+                    spark_io(report, model, options, &working, &mut sparks, &mut notes);
                 }
-                // The tower's Spark headroom is what the worker has left after its
-                // rank I/O; the final solve re-charges it for its own working set.
-                spark_io(report, model, options, &working, &mut sparks, &mut notes);
                 resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(admission) {
@@ -89,7 +100,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                     device.items.push(Item::new(Category::Reserved, "unavailable target admission", "",
                         device.capacity_bytes, Basis::Formula));
                 }
-                let _ = spark_experts(input, options, &mut sparks, 0);
+                if expert_world > 0 {
+                    let _ = spark_experts(input, options, &mut sparks, 0);
+                }
                 resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for spark in &mut sparks { spark.items.retain(|item| item.group != "routed_expert"); }
@@ -116,17 +129,19 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         options.media_cache_bytes.unwrap_or((8u64 << 30).min(total / 20))
     } else { 0 };
     let selected = media_admission.map_err(anyhow::Error::from).and_then(|()|
-        apply_resolved(input, options, &mut devices, &loaded_media, media_cache, spark_ranks, concurrency, context, manifest));
+        apply_resolved(input, options, &mut devices, &loaded_media, media_cache, expert_world, concurrency, context, manifest));
     match selected {
         Ok((placement, working, ledger, host)) => {
             report.phase_ledger = Some(ledger);
             report.host_budget_bytes = host.host_budget_bytes;
             report.host_ledger = Some(host);
             report.prefill_span_rows = Some(external_span);
-            report.prefill_transports = Some(u64::from(spark_ranks > 0));
+            report.prefill_transports = Some(u64::from(!working.spark_layers.is_empty()));
             report.prefill_unit_rows = options.prefill_unit_rows;
             report.prefill_waves = Some(options.prefill_waves);
-            spark_io(report, model, options, &working, &mut sparks, &mut notes);
+            if !working.spark_layers.is_empty() {
+                spark_io(report, model, options, &working, &mut sparks, &mut notes);
+            }
             waste = replicated_weights(&placement);
             report.solver_placement = Some(placement.clone());
             pool_tokens = placement.pool_tokens;
@@ -134,7 +149,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             if let Some(tp2) = placement.tp2 {
                 notes.push(format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", tp2.layers, tp2.first, tp2.first + tp2.layers));
             }
-            if spark_ranks > 0 {
+            if !working.spark_layers.is_empty() {
                 let expert_bytes = spark_experts(input, options, &mut sparks, placement.onboard_layers);
                 if let Err(error) = expert_bytes { report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}")); }
             }
@@ -151,6 +166,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         notes.push(format!("MiMo DFlash context slots {slots}"));
     }
     if manifest.is_none() { notes.push("MiMo native scratch needs --workspace-manifest; native scratch is not qualified without it".into()); }
+    if all_onboarded {
+        let media_ranks: std::collections::BTreeSet<usize> = [report.encoder.as_ref(), report.audio_encoder.as_ref()]
+            .into_iter().flatten().flat_map(|encoder| encoder.spark_ranks()).collect();
+        sparks.retain(|device| media_ranks.contains(&(device.index as usize)));
+    }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
 }
