@@ -649,7 +649,9 @@ mod tests {
         checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
         let dir = tempfile::tempdir()?;
         let config = dir.path().join("config.json");
-        std::fs::write(&config, serde_json::to_vec(&checkpoint.config)?)?;
+        let mut view_config = checkpoint.config.clone();
+        view_config["quantization_config"].as_object_mut().unwrap().remove("attention_view");
+        std::fs::write(&config, serde_json::to_vec(&view_config)?)?;
         checkpoint.view = Some(crate::plan::checkpoint::CheckpointView::select(dir.path(),
             crate::plan::checkpoint::AttentionMode::Hqa)?);
         // Publication validation consumes retained headers, never the snapshot again.
