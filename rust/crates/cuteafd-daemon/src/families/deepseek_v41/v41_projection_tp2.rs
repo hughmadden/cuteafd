@@ -33,6 +33,11 @@ impl<'a> Weights<'a> {
     }
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
         kind: Kind, rank: usize, budget: usize) -> Result<Self> {
+        Self::load_in(device, catalog, layer, kind, rank, budget, None)
+    }
+    pub fn load_in(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
+        kind: Kind, rank: usize, budget: usize,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(layer<40 && rank<2 && budget>=Self::load_peak_device_bytes(kind),
             "invalid projection shard layer, rank or budget");
         let (k,n)=kind.geometry(); let n=n/2;
@@ -42,8 +47,9 @@ impl<'a> Weights<'a> {
             && catalog.tensor(&scale_name)?.metadata.shape==[2*n/32,k/32],
             "projection checkpoint geometry differs");
         let stream=Stream::new(device)?;
-        let weight=Allocation::new(device,k*n)?;
-        let scales=Allocation::new(device,k*n/32)?;
+        let weight=crate::shared::memory::weight_arena::weight_allocation(device,arena,&weight_name,k*n)?;
+        let scales=crate::shared::memory::weight_arena::weight_allocation(device,arena,
+            &super::weight_layout::packed_scale_name(&weight_name),k*n/32)?;
         let raw_scales=Allocation::new(device,k*n/1024)?;
         let mut staging=HostAllocation::new(device.library,k*n)?;
         for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {
