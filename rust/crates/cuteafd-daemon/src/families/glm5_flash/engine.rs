@@ -6348,6 +6348,7 @@ mod wide_decode_tests {
 
     #[test]
     fn runtime_startup_key_fingerprints_match_the_selected_shared_inventory() {
+        use super::{serving_graph_shapes, startup_tables, GraphKey, PAGE_ROWS};
         use cuteafd_loader::placement::inventory::DeclaredGraphSet;
         use cuteafd_loader::serving_capacity::glmf_graphs::{declared_fingerprints, DecodeBuckets};
         for (context, pool, verify) in [(8192, 32768, 64), (32768, 2_097_152, 127), (131_072, 2_097_152, 128)] {
