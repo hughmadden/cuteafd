@@ -116,8 +116,10 @@ impl Opened {
         let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream: streams[0].raw,
-            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)), arenas: None };
         let ranks = [(devices[0], streams[0].raw), (devices[1], streams[1].raw)];
+        let loader = loader.with_arenas(&self.cfg, &owners, &ranks, mtp, args.mtp_fp8_head,
+            args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu)?;
         let (embedding, model) = match dense_envelope {
             Some(envelope) => {
                 let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
@@ -136,8 +138,8 @@ impl Opened {
                     .map_err(crate::shared::experts::rtx::push::PushStartupError::Planning)?;
                 let split = crate::shared::memory::load_timing::Split::start();
                 let (pushed, embedding) = push.receive_with(devices.to_vec(), None, 0, Some(planned), ||
-                    crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-                        args.token_io.embed_placement, || Ok(())));
+                    crate::shared::token_io::TokenEmbedding::load_with(&self.library, self.embed_source()?,
+                        args.token_io.embed_placement, || Ok(()), |name, bytes| loader.embedding_allocation(name, bytes)));
                 let pushed = push_policy.committed(pushed).context("Qwen dual coordinator push delivery")?;
                 let (embedding, ()) = embedding?;
                 tracing::info!(pushed = pushed.is_some(), "Qwen dual coordinator dense operands landed");
@@ -147,11 +149,11 @@ impl Opened {
             None => {
                 anyhow::ensure!(media.operands.is_empty() && media.steps.is_empty(),
                     "Qwen dual media records exist only under a push namespace");
-                crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+                crate::shared::token_io::TokenEmbedding::load_with(&self.library, self.embed_source()?,
                     args.token_io.embed_placement, || {
                         let _scope = cuteafd_ffi::memory_ledger::scope("weights");
                         loader.model_placed(&self.cfg, &owners, &ranks, mtp, args.mtp_fp8_head)
-                    })?
+                    }, |name, bytes| loader.embedding_allocation(name, bytes))?
             }
         };
         let (projections, head) = model.check_single_residency(args.fp8_decode, args.mtp_fp8_head)?;

@@ -1173,7 +1173,7 @@ mod dual_push_tests {
         for (fp8_decode, fp8_head) in [(false, false), (true, false), (false, true), (true, true)] {
             let load = std::rc::Rc::new(DenseLoad::push(&library));
             let loader = super::super::weights::Qwen4Loader { library: &library, checkpoint: &checkpoint, fp8_decode,
-                fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(), dense: load.clone() };
+                fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(), dense: load.clone(), arenas: None };
             let ranks: Vec<_> = (0..2).map(|id| (Device { library: &library, id }, std::ptr::null_mut())).collect();
             let model = loader.model_placed(&cfg, &owners, &ranks, true, fp8_head)?;
             let mut records = load.sink.as_ref().context("push sink")?.take_all();
