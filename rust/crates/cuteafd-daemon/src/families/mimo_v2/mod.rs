@@ -1198,9 +1198,16 @@ impl Opened {
             Ok(loaded)
         })?;
         loader.release_transient();
-        crate::shared::inventory::startup_probe(&self.library,
-            &std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect::<Vec<_>>(),
-            "mimo_v2/weights-loaded", Default::default())?;
+        if crate::shared::inventory::startup_probe_enabled() {
+            let physical = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect::<Vec<_>>();
+            let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(model.allocation_receipts(&shares, &mtp_weights, devices)?);
+            census.owners(embedding.allocation_receipts(devices, "mimo.embedding")?);
+            census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+            crate::shared::inventory::startup_probe(&self.library, &physical, "mimo_v2/weights-loaded",
+                crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+        }
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {

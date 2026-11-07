@@ -89,6 +89,50 @@ impl MimoLayer<'_> {
     pub fn bytes(&self) -> usize {
         self.operands.values().map(|a| a.buffer.bytes).sum()
     }
+
+    /// Each operand as one arena view alias (or a standalone owner), by name.
+    pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        let mut operands = self.operands.iter().collect::<Vec<_>>();
+        operands.sort_by_key(|(operand, _)| **operand);
+        for (operand, owner) in operands { owner.inventory(inventory, &format!("{name}.{operand}"))?; }
+        Ok(())
+    }
+}
+
+impl MimoWeights<'_> {
+    /// Target and MTP weights as resident arena backings plus their view
+    /// aliases; `shares[r]` are rank `r + 1`'s layers of a head split.
+    pub(crate) fn allocation_receipts(&self, shares: &[Vec<MimoLayer<'_>>], mtp: &[MtpWeights<'_>],
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "mimo.weight",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Weights,
+            "target checkpoint owners");
+        for (layer, weights) in self.layers.iter().enumerate() {
+            weights.allocation_receipts(&mut inventory, &format!("rank.0.layer.{layer}"))?;
+        }
+        for (rank, layers) in shares.iter().enumerate() {
+            for (layer, weights) in layers.iter().enumerate() {
+                weights.allocation_receipts(&mut inventory, &format!("rank.{}.layer.{layer}", rank + 1))?;
+            }
+        }
+        self.norm.inventory(&mut inventory, "norm")?;
+        match &self.head {
+            MimoHead::Bf16(owner) => owner.inventory(&mut inventory, "head")?,
+            MimoHead::Fp8 { values, scales } => {
+                values.inventory(&mut inventory, "head.values")?;
+                scales.inventory(&mut inventory, "head.scales")?;
+            }
+        }
+        for (stage, weights) in mtp.iter().enumerate() {
+            weights.layer.allocation_receipts(&mut inventory, &format!("mtp.{stage}"))?;
+            for (extra, owner) in ["eh", "enorm", "hnorm", "final_norm"].into_iter().zip(&weights.extras) {
+                owner.inventory(&mut inventory, &format!("mtp.{stage}.{extra}"))?;
+            }
+        }
+        Ok(inventory.receipts)
+    }
 }
 
 pub(crate) struct MimoWeights<'a> {
