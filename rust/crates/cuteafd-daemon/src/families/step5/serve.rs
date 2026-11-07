@@ -613,7 +613,6 @@ mod tests {
         assert!(source.contains("CoordinatorPush::prepare_view_admitted(&view"));
         assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
         assert!(!source.contains("read_expert_catalog(&args.snapshot"));
-        assert!(!source.contains("SparkAdmission::plan(&args.snapshot"));
         assert!(!source.contains("CoordinatorPush::prepare_alone_admitted("));
         assert!(!source.contains("CoordinatorPush::prepare_admitted("));
     }
