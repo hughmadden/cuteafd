@@ -93,12 +93,16 @@ impl<'a> BackboneSharedWeights<'a> {
         budget: usize,
         staging: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes(library, catalog, layer)? <= budget,
             "backbone shared weights exceed budget"
         );
         let names = Self::names(layer)?;
-        let tensors = NativeRtxTensors::load(library, catalog, &names, budget, staging)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &names, budget, staging, arena)?;
         let mut scales = Vec::with_capacity(3);
         let stream = LoadStream {
             library,
@@ -109,10 +113,9 @@ impl<'a> BackboneSharedWeights<'a> {
             .enumerate()
         {
             let kernel = library.v41_fp8_matrix_kernel(1, k, n)?;
-            scales.push(DeviceAllocation::new(
-                library,
-                kernel.info().packed_weight_scale_bytes as usize,
-            )?);
+            scales.push(super::weight_layout::allocation(library, arena,
+                &super::weight_layout::packed_scale_name(&names[2 * i]),
+                kernel.info().packed_weight_scale_bytes as usize)?);
             unsafe {
                 crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, 
                     tensors.get(&names[2 * i + 1])?,
