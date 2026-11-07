@@ -89,9 +89,6 @@ pub(crate) struct EngineArgs {
     /// Split dSpark expert stages across the two coordinator GPUs.
     #[arg(long, requires_all = ["dspark", "split_device"], conflicts_with = "skip_routed_experts")]
     pub tp2_dspark_experts: bool,
-    /// GiB kept free on the coordinator GPU for workspaces and headroom.
-    #[arg(long, default_value_t = 10)]
-    pub reserve_gib: usize,
     /// Benchmarks and token gates only: MoE layers run the shared expert
     /// alone (no Sparks, no local experts; outputs do not match the model).
     #[arg(long, hide = true)]
@@ -507,7 +504,7 @@ pub(crate) fn with_engine<T>(
                     .saturating_sub(if rank == 0 { embedding_bytes } else { 0 }) }))
             })
         }).collect::<Result<Vec<_>>>()?;
-        // Physical capacity apart from the logical `--coordinator-gpu-budget-gib` ceiling.
+        // Physical capacity apart from the `--gpu-memory-cap` (`GPU_MEMORY_CAP`).
         let physical = devices.iter().map(|&device| crate::shared::peer_split::on_device(&loaded.library, device,
             || Ok(loaded.library.cuda_allocatable_memory_info()?.1 as u64))).collect::<Result<Vec<_>>>()?;
         inventory.record(loaded.family, &gpus.iter().map(|(_, b)| match b {

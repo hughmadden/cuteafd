@@ -159,20 +159,20 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_budget_is_global_and_survives_family_forwarding() {
+    fn memory_policy_is_global_and_survives_family_forwarding() {
         use clap::Parser;
-        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "--coordinator-gpu-budget-gib", "32",
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "--gpu-memory-cap", "32GiB", "--family-reserve", "1GiB",
             "serve", "--family", "qwen4", "--snapshot", "/m"]).unwrap();
-        assert_eq!(cli.coordinator_gpu_budget_gib, Some(32.0));
+        assert_eq!((cli.memory.gpu_memory_cap, cli.memory.family_reserve), (Some(32 << 30), Some(1 << 30)));
         let crate::cli::Commands::Serve(args) = cli.command else { panic!("serve") };
         let argv = argv(Kind::Serve, args).unwrap().unwrap();
         let mut argv = argv;
-        argv.extend(["--native-lib".into(), "/lib.so".into(), "--coordinator-gpu-budget-gib".into(), "32".into()]);
+        argv.extend(["--native-lib".into(), "/lib.so".into(), "--gpu-memory-cap".into(), "32GiB".into()]);
         let forwarded = crate::cli::Cli::try_parse_from(argv).unwrap();
-        assert_eq!(forwarded.coordinator_gpu_budget_gib, Some(32.0));
+        assert_eq!(forwarded.memory.gpu_memory_cap, Some(32 << 30));
         for (_, serve, _) in FAMILIES {
             let mut argv = vec!["cuteafd", *serve, "--snapshot", "/m", "--native-lib", "/lib.so",
-                "--coordinator-gpu-budget-gib", "32"];
+                "--gpu-memory-cap", "32GiB"];
             if matches!(*serve, "serve-native" | "serve-mimo" | "serve-glm" | "serve-dsv4") {
                 argv.extend(["--peers", "127.0.0.1:9,127.0.0.1:10"]);
             }
@@ -180,7 +180,7 @@ mod tests {
                 argv.extend(["--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]);
             }
             let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
-            assert_eq!(cli.coordinator_gpu_budget_gib, Some(32.0), "{serve}");
+            assert_eq!(cli.memory.gpu_memory_cap, Some(32 << 30), "{serve}");
         }
     }
 

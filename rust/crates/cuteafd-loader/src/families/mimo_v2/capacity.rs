@@ -176,6 +176,7 @@ pub fn mimo_capacity_profiles(
             device: runtime.device,
             reservations: loading_costs,
             pool_unit_bytes: 0,
+            reserve_bytes: 0,
         });
         let mut costs = resident.ranks[rank].clone();
         reserve(
@@ -191,6 +192,7 @@ pub fn mimo_capacity_profiles(
             device: runtime.device,
             reservations: costs.clone(),
             pool_unit_bytes: storage.persistent_unit_bytes,
+            reserve_bytes: 0,
         });
         if options.mark_slots > 0 && mark_bytes > 0 {
             reserve(
@@ -252,6 +254,7 @@ pub fn mimo_capacity_profiles(
             device: runtime.device,
             reservations: costs,
             pool_unit_bytes: unit_bytes,
+            reserve_bytes: 0,
         });
     }
     let resident_weights = resident.ranks.iter().zip(&options.ranks).map(|(owners, runtime)| {

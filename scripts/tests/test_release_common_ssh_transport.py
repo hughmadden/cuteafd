@@ -252,7 +252,6 @@ EXPERT_PORT=19441
 spark_prefix=cuteafd-spark-expert
 remote=cuteafd-spark-expert-seed0-19441
 expert_capacity=4096
-SPARK_DEVICE_BUDGET_BYTES=107374182400
 fingerprint=fp
 spark_first_layer=0
 SPARK_COUNT=2

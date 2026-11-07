@@ -1559,7 +1559,7 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
     assert values['MODEL_ID'] == 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
     expected = {
         'RTX_GPUS': '1', 'COORDINATOR_GPUS': '0',
-        'COORDINATOR_GPU_BUDGET_GIB': '31.8', 'SPARK_INTAKE': 'pinned',
+        'GPU_MEMORY_CAP': '31.8GiB', 'SPARK_INTAKE': 'pinned',
         'MAX_CONTEXT_TOKENS': '1048576',
         'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
     }

@@ -155,6 +155,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # These captures pin no device override: auto stays with the planner.
         budget_index = expected.index("--spark-budget-gib")
         del expected[budget_index:budget_index + 2]
+        # The logical GPU ceiling is the memory policy's GPU cap, in bytes.
+        cap_index = expected.index("--coordinator-gpu-budget-gib")
+        expected[cap_index:cap_index + 2] = ["--gpu-memory-cap",
+                                             str(int(float(expected[cap_index + 1]) * 2**30))]
         expected.insert(expected.index("--require-ready"), "--deployment")
         if case in KIT_CARDS:
             expected.remove("--require-ready")
@@ -174,7 +178,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         explicit_topology = any(line.startswith(("SPARK_TP=", "SPARK_EP="))
                                 for line in config.read_text().splitlines()) or any(
                                     key in overrides for key in ("SPARK_TP", "SPARK_EP"))
-        for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--memory-reservation", "--dspark-draft-limit"):
+        for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--dspark-draft-limit"):
             if flag in command and (flag not in ("--spark-tp", "--spark-ep") or explicit_topology):
                 additions += [flag, command[command.index(flag) + 1]]
         cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
@@ -261,7 +265,9 @@ def test_v41_sim5090_launches_pinned_single_gpu_tp4() -> None:
         assert command[flag] == value
     assert len(containers) == 5
     for plan in result["plans"]:
-        assert plan[plan.index("--coordinator-gpu-budget-gib") + 1] == "31.8"
+        # The plan takes the resolved cap (the smaller of the card and the key), in bytes.
+        assert plan[plan.index("--gpu-memory-cap") + 1] == str(int(31.8 * 2**30))
+        assert plan.count("--gpu-memory-cap") == 1
         # The planner sizes the reserve: the card pins no prefill rows (0 = automatic).
         assert plan[plan.index("--prefill-rows") + 1] == "0"
 

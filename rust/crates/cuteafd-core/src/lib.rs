@@ -41,6 +41,7 @@ pub mod concurrency;
 pub mod thermal;
 pub mod push_outcome;
 pub mod memory_layout;
+pub mod memory_policy;
 pub mod packed_head;
 pub mod media;
 pub use media::{AudioKey, ImageKey, MediaKey, MediaSpan};

@@ -106,7 +106,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         projections: cuteafd_loader::families::muse_spark::weight_layout::projections_with_manifest(
             &cfg, &core, GPUS, usize::try_from(prefill.unit_rows)?,
             Some(&cuteafd_loader::placement::inventory::ProgramsManifest::from_manifest(&manifest)?))?,
-        catalog: &catalog, manifest: &manifest, measured, headroom_bytes: 2 << 30, spark_ranks: SPARKS,
+        catalog: &catalog, manifest: &manifest, measured, headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: SPARKS,
         prefill, full_prefill_logits: false, slots: SEQUENCES as u64,
         mark_slots: mark.slots(shared::mark_bytes(&cfg, 1) as usize) as u64, max_context: None,
         pool_tokens: None, onboard: Onboard::Auto,

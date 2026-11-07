@@ -187,6 +187,7 @@ impl<'a> DenseEngine<'a> {
         tracing::info!(solve_us = solve_started.elapsed().as_micros() as u64,
             ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&admitted_plan))?,
             "dense Qwen admitted phase ledger");
+        cuteafd_loader::placement::reserve::log_plan(&admitted_plan, "qwen3_5");
         let pool_tokens = usize::try_from(admitted_plan.pool_tokens)?;
         tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
             head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format),

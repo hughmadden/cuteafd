@@ -20,7 +20,6 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub native_lib: &'a Path,
     pub peers: Vec<SocketAddr>,
     pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
-    pub spark_budget_gib: Option<f64>,
     /// Lane rows: `waves` prefill units of `rows / waves` each.
     pub rows: usize,
     /// Prefill units in flight (Spark waves outstanding, one return slot each).
@@ -125,11 +124,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             .collect::<Result<Vec<_>>>()?;
         Some((partials, devices[head].run(|| Ok(MlaDraftCombine::load(programs, "kimik3")?))?))
     } else { None };
-    let spark_budget_gib = options.spark_budget_gib.unwrap_or(
-        cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES as f64 / (1u64 << 30) as f64);
-    ensure!(spark_budget_gib.is_finite() && spark_budget_gib > 0.0
-        && spark_budget_gib < u64::MAX as f64 / (1u64 << 30) as f64,
-        "Kimi --spark-budget-gib must be finite, positive and representable");
+    // The per-Spark cap (`SPARK_MEMORY_CAP`), else Kimi's estimated complete ceiling.
+    let spark_budget_bytes = cuteafd_core::memory_policy::MemoryPolicy::current()
+        .spark_cap_bytes(cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES);
     let catalog = cuteafd_loader::read_expert_catalog_view(checkpoint.view.as_ref()
         .context("Kimi startup requires the immutable selected checkpoint view")?)?;
     let routed = cfg.dense.iter().filter(|dense| !**dense).count();
@@ -140,7 +137,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         spark_ranks, prefill_lanes: 1 };
     let spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
         &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
-        model, (spark_budget_gib * (1u64 << 30) as f64) as u64,
+        model, spark_budget_bytes,
         cuteafd_loader::families::kimi_k3::spark::reserve_bytes(spark_ranks, options.waves as u64, unit as u64)?)?;
     let rtx = if onboard.layers(routed) == Some(0) { None } else {
         let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
@@ -224,7 +221,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             rank, pending, arch.cublas_bytes, 1, RANKS)?);
     }
     let gpus = inventory.gpus.iter().map(|sample| {
-        GpuBudget { capacity_bytes: sample.total_bytes, headroom_bytes: 2 << 30,
+        GpuBudget { capacity_bytes: sample.total_bytes, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let peer_receive = [core.attention_receive_bytes(unit, RANKS)?,
@@ -254,7 +251,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     tracing::info!(placement = %admitted.placement.summary(), rtx_expert_layers = admitted.placement.onboard_layers,
         inactive_seeded_layers, inactive_loaded_layers = ownership.inactive_loaded_layers,
         prefix_marks = admitted.mark_selection.slots, marks = %admitted.mark_selection.summary(),
-        spark_budget_gib, reserve = "estimated until W9 census",
+        spark_budget_bytes, reserve = "estimated until W9 census",
         "Kimi admitted TP2 expert ownership");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context", &options.max_context.to_string());

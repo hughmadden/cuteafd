@@ -510,7 +510,7 @@
         "SPARK_2_LANE_A": "192.0.2.3",
         "SPARK_2_LANE_B": "198.51.100.3",
         "SPECULATOR": "dspark",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "BENCH_HARDWARE_CLASS": "5090"
       },
       "precheck": {
@@ -545,7 +545,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dspark",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090"
       },
@@ -581,7 +581,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dflash2",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090"
       },
@@ -617,7 +617,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dflash2",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090"
       },
@@ -653,7 +653,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dflash2",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090"
       },
@@ -689,7 +689,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dflash2",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090"
       },
@@ -721,7 +721,7 @@
         "EXPERT_PORT": "19940",
         "EXPERT_BACKEND": "spark",
         "SPECULATOR": "mtp",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "BENCH_HARDWARE_CLASS": "5090"
@@ -759,7 +759,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "mtp",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "BENCH_HARDWARE_CLASS": "5090"
       },
       "precheck": {

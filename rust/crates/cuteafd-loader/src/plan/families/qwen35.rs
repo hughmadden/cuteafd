@@ -177,7 +177,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let weights = qwen3_5::NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
     let capacity = options.rtx_bytes[0];
     // Physical card class fixes the CUDA context/module image and SM count;
-    // `--coordinator-gpu-budget-gib` only lowers the logical ceiling.
+    // `--gpu-memory-cap` only lowers the logical ceiling.
     let physical = ArchContext::for_device("sm_120", capacity);
     let sms = options.physical_sms.unwrap_or(physical.sms);
     let drafter = options.dense_qwen_drafter_snapshot.as_ref().map(|snapshot| {
@@ -234,7 +234,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
             plan.facts.allocations.iter().filter(|owner| owner.view.is_none()).count()),
     ];
     let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
-        capacity_bytes: capacity.saturating_sub(1 << 30), worker_budget_bytes: 0, items, kv_tokens: pool_tokens }];
+        capacity_bytes: capacity.saturating_sub(crate::placement::reserve::gpu("qwen3_5")), worker_budget_bytes: 0, items, kv_tokens: pool_tokens }];
     if spark_vision {
         let mut sparks = Vec::new();
         for rank in 0..report.spark_ranks {

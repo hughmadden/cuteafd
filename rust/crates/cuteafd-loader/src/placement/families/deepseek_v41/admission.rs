@@ -627,7 +627,7 @@ pub fn live_budgets(
                 phase: Phase::Load,
                 source: "measured free bytes before the whole-process recipe".into(),
             },
-            headroom: 0,
+            headroom: crate::placement::reserve::gpu("deepseek_v41"),
         })
         .collect::<Vec<_>>();
     budgets.extend(spark_bytes.iter().enumerate().map(|(rank, &bytes)| Budget {

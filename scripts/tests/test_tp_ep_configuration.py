@@ -306,7 +306,7 @@ class ExampleConfigTest(unittest.TestCase):
         result = load_file(
             EXAMPLES / "tp3ep1-native.config",
             'printf "%s\\n" "$RTX_GPUS" "$RTX_EXPERT_LAYERS" "$SPARK_COUNT" '
-            '"$SPARK_TP" "$SPARK_EP" "$SPARK_DEVICE_BUDGET_BYTES" '
+            '"$SPARK_TP" "$SPARK_EP" "$SPARK_MEMORY_CAP" '
             '"$(release_spark_layer_bytes "$SPARK_TP")"',
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -415,7 +415,8 @@ HTTP_QUEUE_WAIT_MS=25000
 RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
 KV_POOL_SIZE=
-MEMORY_RESERVATION=
+memory_policy_args=()
+spark_memory_args=()
 SPECULATOR=dspark
 EMBEDDING=gpu
 # These topology tests exercise the text-only legacy startup contract.
@@ -444,7 +445,6 @@ site_hub=0
 namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
-SPARK_DEVICE_BUDGET_BYTES=107374182400
 spark_prefix=worker
 hosts=({' '.join(hosts)})
 EXPERT_PORT=19441

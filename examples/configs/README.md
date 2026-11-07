@@ -199,7 +199,7 @@ load staging and runtime headroom are only known after the expert service
 reports them. Weight-only overflow is rejected before any service change. See
 [docs/tp-ep-configuration.md](../../docs/tp-ep-configuration.md).
 
-The TP×EP overlays set `SPARK_DEVICE_BUDGET_BYTES=109119320064`, the tested
+The TP×EP overlays set `SPARK_MEMORY_CAP=109119320064`, the tested
 fleet-wide floor (minimum of `MemTotal - 20 GiB` across the six hosts); the
 `tp4ep1` control carries no override and keeps the 100 GiB default fallback.
 

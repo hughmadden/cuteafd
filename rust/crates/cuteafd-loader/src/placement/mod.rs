@@ -25,6 +25,7 @@ pub mod inventory;
 pub mod planner;
 pub mod runtime_memory;
 mod pool;
+pub mod reserve;
 pub mod attention;
 mod residual;
 mod solve;
@@ -160,9 +161,10 @@ pub struct Inventory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuBudget {
+    /// The device cap: physical total bounded by `GPU_MEMORY_CAP`.
     pub capacity_bytes: u64,
-    /// Kept free for runtime growth and allocator slack; never allocated.
-    pub headroom_bytes: u64,
+    /// The memory policy's named reserve (`reserve::gpu`): kept free inside the cap.
+    pub reserve_bytes: u64,
     pub baseline: Baseline,
 }
 
@@ -182,8 +184,8 @@ impl GpuBudget {
     pub fn available(&self) -> u64 {
         match self.baseline {
             Baseline::Planned { context_bytes, loaded_bytes } => self.capacity_bytes
-                .saturating_sub(self.headroom_bytes).saturating_sub(context_bytes).saturating_sub(loaded_bytes),
-            Baseline::Measured { free_bytes } => free_bytes.saturating_sub(self.headroom_bytes),
+                .saturating_sub(self.reserve_bytes).saturating_sub(context_bytes).saturating_sub(loaded_bytes),
+            Baseline::Measured { free_bytes } => free_bytes.saturating_sub(self.reserve_bytes),
         }
     }
 }

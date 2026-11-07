@@ -31,8 +31,6 @@ pub(crate) struct ServeArgs {
     /// pool deciding the admitted context.
     #[arg(long)] pub max_context: Option<u64>,
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
-    /// Complete per-rank Spark allocation ceiling, estimated until the first worker census.
-    #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
@@ -92,8 +90,8 @@ impl ServeArgs {
     }
 
     fn spark_budget_bytes(&self) -> u64 {
-        self.spark_budget_gib.map_or(cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
-            |gib| (gib * (1u64 << 30) as f64) as u64)
+        cuteafd_core::memory_policy::MemoryPolicy::current()
+            .spark_cap_bytes(cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES)
     }
 
     pub(super) fn validate(&self) -> Result<()> {
@@ -110,9 +108,6 @@ impl ServeArgs {
             "Muse Spark serves its EXL3 TP experts on {worlds:?} distinct Spark endpoints, not {}", self.peers.len());
         ensure!(self.max_context.is_none_or(|context| (1..=1 << 20).contains(&context)),
             "Muse Spark context exceeds the checkpoint's 1M extent");
-        ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0
-            && gib < u64::MAX as f64 / (1u64 << 30) as f64),
-            "Muse Spark requires a finite positive --spark-budget-gib");
         self.prefill()?;
         for (name, mode, peers, hash, revision) in [
             ("vision", self.vision, &self.vision_peers, &self.encoder_plan_hash, &self.encoder_revision),
@@ -208,7 +203,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         manifest: &manifest, projections,
         measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
             free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
-        headroom_bytes: 2 << 30, spark_ranks: args.peers.len(), prefill: args.prefill()?,
+        headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: args.peers.len(), prefill: args.prefill()?,
         full_prefill_logits: args.full_prefill_logits, slots: u64::from(args.max_sequences),
         mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
             .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
@@ -740,7 +735,6 @@ mod tests {
         for extra in [vec!["--peers", nine.as_str()], vec!["--peers", "127.0.0.1:1,127.0.0.1:1"],
             vec!["--peers", PEERS, "--device", "1", "--split-device", "1"], vec!["--peers", PEERS, "--split-device", "0"],
             vec!["--peers", PEERS, "--max-context", "1048577"], vec!["--peers", PEERS, "--max-context", "0"],
-            vec!["--peers", PEERS, "--spark-budget-gib", "0"], vec!["--peers", PEERS, "--spark-budget-gib", "NaN"],
             vec!["--peers", PEERS, "--prefill-rows", "4097"], vec!["--peers", PEERS, "--prefix-partial", "on"],
             vec!["--peers", PEERS, "--expert-partial-bf16-max-rows", "8"]] {
             assert!(args(&extra)?.validate().is_err(), "{extra:?}");

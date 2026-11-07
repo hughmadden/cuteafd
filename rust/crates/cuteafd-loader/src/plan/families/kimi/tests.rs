@@ -458,7 +458,8 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     assert_eq!(rtx.len(), 2);
     for gpu in &rtx {
         assert!(category(gpu, Category::Experts) > 0);
-        assert_eq!(category(gpu, Category::Reserved), 2 * super::GIB);
+        // The Kimi family reserve constant is 0: no reserved item.
+        assert_eq!(category(gpu, Category::Reserved), crate::placement::reserve::gpu("kimi_k3"));
     }
     assert_eq!(category(rtx[0], Category::Experts), category(rtx[1], Category::Experts));
     // Numeric overrides are strict, never silently increased to satisfy the workers.

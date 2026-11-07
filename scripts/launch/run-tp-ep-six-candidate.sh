@@ -36,7 +36,7 @@ fail() { echo "six-candidate: $*" >&2; exit 2; }
 count="$(value SPARK_COUNT)"
 tp="$(value SPARK_TP)"
 ep="$(value SPARK_EP)"
-budget="$(value SPARK_DEVICE_BUDGET_BYTES)"
+budget="$(value SPARK_MEMORY_CAP)"
 rtx="$(value RTX_GPUS)"
 layers="$(value RTX_EXPERT_LAYERS)"
 speculator="$(value SPECULATOR)"
@@ -48,14 +48,14 @@ case "$rtx:$tp:$ep" in
   1:3:2 | 2:2:3 | 2:3:2 | 1:6:1 | 2:6:1) ;;
   *) fail "approved six-rank arms are 1rtx6-tp3ep2 (1:3:2), 2rtx6-tp2ep3 (2:2:3), 2rtx6-tp3ep2 (2:3:2), and the pure unreplicated 1rtx6-tp6ep1 (1:6:1) / 2rtx6-tp6ep1 (2:6:1); got ${rtx}:${tp}:${ep}" ;;
 esac
-[[ "$budget" =~ ^[0-9]+$ ]] || fail "SPARK_DEVICE_BUDGET_BYTES must be an integer, got '${budget}'"
+[[ "$budget" =~ ^[0-9]+$ ]] || fail "SPARK_MEMORY_CAP must be a plain byte count, got '${budget}'"
 # Length/string bound, never Bash arithmetic: a 2^64 digit string must not wrap.
 canonical="$budget"
 while [[ "$canonical" == 0* && ${#canonical} -gt 1 ]]; do canonical="${canonical#0}"; done
-[[ "$canonical" != "0" ]] || fail "SPARK_DEVICE_BUDGET_BYTES must be positive"
+[[ "$canonical" != "0" ]] || fail "SPARK_MEMORY_CAP must be positive"
 if (( ${#canonical} > ${#max_budget} )) ||
   { (( ${#canonical} == ${#max_budget} )) && [[ "$canonical" > "$max_budget" ]]; }; then
-  fail "SPARK_DEVICE_BUDGET_BYTES ${budget} exceeds the global minimum-of-six ${max_budget}"
+  fail "SPARK_MEMORY_CAP ${budget} exceeds the global minimum-of-six ${max_budget}"
 fi
 [[ "$rtx" == "1" || "$rtx" == "2" ]] || fail "RTX_GPUS must be 1 or 2, got '${rtx}'"
 [[ "$speculator" == "dspark" ]] || fail "SPECULATOR must be dspark"

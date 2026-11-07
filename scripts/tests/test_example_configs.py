@@ -203,8 +203,8 @@ print(json.dumps(dict(report, spark_expert_world=report["spark_ranks"],
     # Match DeviceLayout's allocation ceiling, independently of host-inclusive capacity.
     memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=8 << 30)])
                                 for i in range(int(value("--rtx", "1")))] +
-                               [dict(kind="spark", index=i, capacity_bytes=int(float(value("--spark-budget-gib", "108")) * 2**30),
-                                     worker_budget_bytes=int(float(value("--spark-budget-gib", "108")) * 2**30),
+                               [dict(kind="spark", index=i, capacity_bytes=int(value("--spark-memory-cap", str(108 << 30))),
+                                     worker_budget_bytes=int(value("--spark-memory-cap", str(108 << 30))),
                                      items=[], kv_tokens=0) for i in range(report["spark_ranks"])]))))
 """.replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))
             .replace("FIRST", first).replace("LAST", "None" if last == "-1" else last))
