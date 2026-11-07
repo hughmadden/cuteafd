@@ -110,6 +110,19 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   not bake in one card's SM count or L2 size; query them at runtime
   (`cudaDevAttr`) for grid, wave and prefetch sizing, and let the placement
   planner handle the memory difference between cards.
+- Static weights live in packed arenas, in every family (TJ, 2026-11-08).
+  One preplanned allocation per physical device per independently retired
+  weight set holds the target core and globals. Tensors are views at
+  aligned offsets of it. Optional drafters, onboarding transactions and
+  native media towers each get their own arena. Transient conversion
+  storage stays outside. A loader that issues a separate device allocation
+  per tensor is a defect, not a style choice. The rule applies to
+  coordinator loaders, Spark mount paths and RTX onboarding alike.
+- Every device allocation has a named, measured owner that admission
+  charges exactly once: the arena's physical bytes plus its single
+  allocation tail, never the payload plus the arena on top. A new loader
+  or family is not complete until its arenas are inventoried as one
+  backing with aliases and its admission charges them.
 - Multimodal input is supported only through a family's officially bundled
   encoder (the vision/audio tower the checkpoint actually ships). Don't
   attach a third-party encoder to a text checkpoint opportunistically.
