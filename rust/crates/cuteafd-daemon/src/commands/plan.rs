@@ -189,8 +189,8 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
     };
     let enabled = args.tp2_dflash.unwrap_or(configured);
     anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
-        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash")),
-        "TP2_DFLASH requires MiMo/Kimi/GLM Flash, --layout, --rtx 2 and DFlash2");
+        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark")),
+        "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
     Ok(enabled)
 }
 

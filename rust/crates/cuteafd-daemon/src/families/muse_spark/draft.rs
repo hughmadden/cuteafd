@@ -42,7 +42,8 @@ impl<'a> MuseDraft<'a> {
     /// bounds a draft batch and the context slots (the admitted charge).
     pub(crate) fn load(programs: &'a cuteafd_ffi::programs::Programs<'a>, cfg: &MuseSparkConfig, head: &RankResources<'a>, stream: *mut c_void, snapshot: &Path,
         table: &crate::shared::token_io::TokenEmbedding<'_>, admitted: &cuteafd_loader::placement::families::muse_spark::MuseDrafter,
-        kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
+        kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        exchange: Option<std::rc::Rc<crate::shared::peer_split::PeerExchange<'a>>>) -> Result<Self> {
         let device = head.device;
         let config = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
         ensure!(config.hidden == cfg.hidden && config.vocab == cfg.vocab_size && config.block == admitted.block
@@ -53,10 +54,21 @@ impl<'a> MuseDraft<'a> {
         };
         let mask = table.host_rows(&[config.mask_token])?;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
-        let drafter = device.run(|| DflashDrafter::load(device.library, programs, snapshot, file, stream, admitted.context_slots,
-            admitted.sequences, mask, true,
-            cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
-            crate::shared::fp8_linear::Fp8Scales::Amax, crate::shared::fp8_linear::Fp8Rows::W8a16, kv_cache))?;
+        ensure!(exchange.is_some() == !admitted.tp2.is_empty(), "Muse draft split differs from admission");
+        let drafter = device.run(|| {
+            use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only;
+            use crate::shared::fp8_linear::{Fp8Scales, Fp8Rows};
+            if let Some(exchange) = exchange {
+                ensure!(exchange.device(1) == device.id && exchange.stream(1) == stream,
+                    "Muse drafter lead differs from the target head rank");
+                DflashDrafter::load_tp2_on(device.library, programs, snapshot, file, admitted.context_slots,
+                    admitted.sequences, mask, true, Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
+                    kv_cache, exchange, 1)
+            } else {
+                DflashDrafter::load(device.library, programs, snapshot, file, stream, admitted.context_slots,
+                    admitted.sequences, mask, true, Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16, kv_cache)
+            }
+        })?;
         let stored_width = head.globals.head.as_ref().context("Muse drafter on a rank without the head")?.shape[0];
         let rows = admitted.sequences * admitted.block;
         ensure!(admitted.head_scratch == (rows * (stored_width + cfg.vocab_size) * 4) as u64,
@@ -68,6 +80,10 @@ impl<'a> MuseDraft<'a> {
         Ok(Self { drafter, stored: Allocation::new(device, rows * stored_width * 4)?,
             trimmed: Allocation::new(device, rows * cfg.vocab_size * 4)?, ids: Allocation::new(device, rows * 4)?,
             stream, device, block: admitted.block, rows })
+    }
+
+    pub(crate) fn prepare_workspace(&self) -> Result<()> {
+        self.device.run(|| self.drafter.prepare_workspace())
     }
 
     /// Copies the head rank's `hidden` rows `[first, first + n)` after `layer`

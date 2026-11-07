@@ -47,6 +47,9 @@ pub(crate) struct ServeArgs {
     /// Opt in to a DFlash2 drafter snapshot (RadixArk/Muse-Spark-Open-DFlash2); it runs
     /// beside the target head and reads the target's exact head (softcap and multiplier).
     #[arg(long)] pub draft: Option<PathBuf>,
+    /// Split DFlash attention/FFN across the active RTX pair; opt-in until qualified.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the drafter's block.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=15))]
     pub draft_fixed: Option<u8>,
@@ -97,6 +100,8 @@ impl ServeArgs {
     pub(super) fn validate(&self) -> Result<()> {
         cuteafd_core::concurrency::validate("muse_spark", u64::from(self.max_sequences))?;
         let devices = self.devices();
+        ensure!(!self.tp2_dflash || (devices.len() == 2 && self.draft.is_some()),
+            "Muse TP2 DFlash requires --split-device and --draft");
         cuteafd_loader::placement::families::muse_spark::executor(devices.len())?;
         ensure!(devices.iter().all(|&device| device >= 0)
             && devices.iter().collect::<std::collections::HashSet<_>>().len() == devices.len(),
@@ -222,9 +227,14 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             let head_device = crate::shared::memory::device::Device { library: &library,
                 id: *device_ids.last().context("Muse devices")? };
             let sms = head_device.run(|| library.sm_count())?;
-            cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
+            let drafter = cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
                 usize::from(args.max_sequences), usize::from(args.max_sequences), head, sms as u64,
-                args.draft_kv_cache)
+                args.draft_kv_cache)?;
+            if args.tp2_dflash {
+                let sms = devices.iter().map(|device| device.run(|| library.sm_count()).map(|sms| sms as u64))
+                    .collect::<Result<Vec<_>>>()?;
+                drafter.with_tp2(snapshot, &sms, args.draft_kv_cache)
+            } else { Ok(drafter) }
         }).transpose()?, media: Some(super::media::inventory(&view,
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
@@ -280,6 +290,13 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let admission = admission_plan.start_with(&args.peers, coordinator)?;
     let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
         .collect::<Result<Vec<_>>>()?;
+    let peer = (gpus == 2).then(|| -> Result<_> {
+        let sizes = super::peer::slot_sizes(cfg.hidden, cfg.expert_hidden, cfg.topk,
+            usize::try_from(prefill.unit_rows)?, !onboarded.is_empty())?;
+        super::peer::MusePeer::new(&library, [0, 1].map(|rank|
+            crate::shared::peer_split::RankDevice { device: devices[rank].id, stream: streams[rank].raw }),
+            sizes, super::peer::decode_peer_bytes(cfg.hidden, cfg.expert_hidden, cfg.topk, !onboarded.is_empty())?)
+    }).transpose()?;
     let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(Some(admission), || {
         let load = || -> Result<_> {
             let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
@@ -299,7 +316,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                         programs.get(home).context("Muse drafter programs")?, &cfg,
                         ranks.get(home).context("Muse drafter rank")?,
                         streams.get(home).context("Muse drafter stream")?.raw, snapshot, &embedding, admitted,
-                        args.draft_kv_cache)?)
+                        args.draft_kv_cache, if args.tp2_dflash { Some(peer.as_ref().context("Muse TP2 draft peer")?.shared()) }
+                            else { None })?)
                 }
                 (None, None) => None,
                 _ => anyhow::bail!("Muse drafter admission differs from --draft"),
@@ -338,7 +356,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         sequences, args.peers.len())?;
     let mut engine = super::engine::MuseEngine::connect(&library, &cfg, &ranks, streams, args.peers.clone(),
         super::engine::LinkPlan { spark, cutoff, unit_rows: usize::try_from(prefill.unit_rows)?,
-            waves: usize::try_from(prefill.waves)?, intake_row_bytes }, !local.is_empty())?;
+            waves: usize::try_from(prefill.waves)?, intake_row_bytes }, peer)?;
+    if let Some(draft) = &draft { draft.prepare_workspace()?; }
     tracing::info!(ranks = engine.ranks.len(), peer = engine.peer.is_some(), vocab = embedding.vocab(),
         placement = %placement.summary(), pool_tokens = placement.pool_tokens, "Muse Spark brought up");
     // The admitted context: the pool clamps an automatic one.

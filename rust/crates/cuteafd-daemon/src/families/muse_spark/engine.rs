@@ -201,16 +201,10 @@ impl<'r, 'a: 'r> MuseEngine<'r, 'a> {
     /// sealed, and every rank's intake plane at the admitted row width.
     pub(crate) fn connect(library_owner: &'r std::sync::Arc<cuteafd_ffi::NativeLibrary>, cfg: &MuseSparkConfig,
         ranks: &'r [RankResources<'a>], streams: Vec<Rc<crate::shared::memory::device::Stream<'a>>>,
-        peers: Vec<std::net::SocketAddr>, link: LinkPlan, onboarded: bool) -> Result<Self> {
+        peers: Vec<std::net::SocketAddr>, link: LinkPlan, peer: Option<super::peer::MusePeer<'a>>) -> Result<Self> {
         ensure!(!ranks.is_empty() && ranks.len() == streams.len() && ranks.iter().enumerate()
             .all(|(rank, r)| r.rank == rank && r.ranks == ranks.len() && r.device.id == streams[rank].device.id),
             "Muse engine ranks, streams and devices disagree");
-        let peer = (ranks.len() == 2).then(|| -> Result<super::peer::MusePeer<'a>> {
-            let sizes = super::peer::slot_sizes(cfg.hidden, cfg.expert_hidden, cfg.topk, link.unit_rows, onboarded)?;
-            super::peer::MusePeer::new(ranks[0].device.library, [0, 1].map(|rank|
-                crate::shared::peer_split::RankDevice { device: ranks[rank].device.id, stream: streams[rank].raw }), sizes,
-                super::peer::decode_peer_bytes(cfg.hidden, cfg.expert_hidden, cfg.topk, onboarded)?)
-        }).transpose()?;
         let world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let config = cuteafd_transport::TcpTransportConfig { max_frame_bytes: link.spark.max_frame_bytes,
             timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };

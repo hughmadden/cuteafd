@@ -151,16 +151,18 @@ fn installed_tp2_dflash_physical_layout_equals_both_rank_receipts() -> Result<()
     let exchange = Rc::new(PeerExchange::new(&library,
         [0, 1].map(|rank| RankDevice { device: rank as i32, stream: streams[rank].raw }),
         1, 65536, 65536)?);
+    for lead in 0..2 {
+    library.cuda_set_device(lead as i32)?;
     for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
         for kv in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
             let capacity = GlmDraftCapacity::new(20, 16, cfg.block)?;
             let layouts = cuteafd_loader::placement::families::glm5_flash::drafter_tp2_inventory(
                 &snapshot, capacity, &[library.sm_count()? as u64; 2], representation,
                 fp8_linear::Fp8Rows::Wide.code() as u8, kv)?;
-            let (drafter, _) = crate::shared::experts::rtx::dense::recording(|| DflashDrafter::load_tp2(
+            let (drafter, _) = crate::shared::experts::rtx::dense::recording(|| DflashDrafter::load_tp2_on(
                 &library, &programs, &snapshot, Vec::new(), 20, 16, vec![0; cfg.hidden * 2],
                 true, representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::Wide,
-                kv, exchange.clone()))?;
+                kv, exchange.clone(), lead))?;
             *drafter.workspace.borrow_mut() = Some(drafter.workspace(16)?);
             drafter.prime_metadata()?;
             let peer = &drafter.head_split.as_ref().context("missing head split")?.peer;
@@ -171,7 +173,7 @@ fn installed_tp2_dflash_physical_layout_equals_both_rank_receipts() -> Result<()
             let actual: BTreeMap<_, _> = drafter.allocation_receipts(CoordinatorDevices::new(&[0, 1])?, "draft")?
                 .into_iter().map(|receipt| (receipt.allocation.id.clone(), receipt.allocation)).collect();
             let expected: BTreeMap<_, _> = layouts.iter().enumerate().flat_map(|(rank, layout)|
-                layout.allocations(if rank == 0 { "draft" } else { "draft.peer" }, Location::coordinator(rank as u8)))
+                layout.allocations(if rank == 0 { "draft" } else { "draft.peer" }, Location::coordinator((rank ^ lead) as u8)))
                 .map(|allocation| (allocation.id.clone(), allocation)).collect();
             assert_eq!(actual, expected, "{representation:?}, {kv}");
             assert!(matches!(peer.head_ops, DraftHeadOps::Peer));
@@ -188,6 +190,7 @@ fn installed_tp2_dflash_physical_layout_equals_both_rank_receipts() -> Result<()
             drop(drafter);
             fixture.finish_ordered_uploads(&library)?;
         }
+    }
     }
     Ok(())
 }
