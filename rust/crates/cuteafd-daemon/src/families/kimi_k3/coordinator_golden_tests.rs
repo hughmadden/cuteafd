@@ -94,6 +94,16 @@ pub(crate) fn layer_digests(library: &NativeLibrary, prefix: &str, weights: &Lay
         out.insert(format!("{prefix}.{name}"), digest(library, allocation)?);
     }
     for (name, core) in &weights.core { core_digests(library, &format!("{prefix}.{name}"), core, out)?; }
+    for (name, native) in &weights.native {
+        for (part, allocation) in [("values", Some(&native.values)), ("scales", native.scales.as_ref())] {
+            if let Some(allocation) = allocation {
+                let mut bytes = vec![0u8; allocation.buffer.bytes];
+                Device { library, id: allocation.buffer.device_id }.run(||
+                    library.copy_d2h(&mut bytes, allocation.buffer))?;
+                out.insert(format!("{prefix}.{name}.{part}"), format!("{:x}", Sha256::digest(&bytes)));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -282,7 +292,14 @@ fn small_checkpoint(root: &std::path::Path) -> Result<(KimiK3Config, CoreInvento
         t(format!("{p}.norm.weight"), "BF16", &[h]), t(format!("{p}.output_attn_res_norm.weight"), "BF16", &[h]),
         t(format!("{p}.output_attn_res_proj.weight"), "BF16", &[1, h])];
     let mut core = Vec::<(String, [usize; 2], usize, Exl3Codebook)>::new();
+    let mut selected_native = BTreeMap::new();
     let mut native = |tensors: &mut Vec<Tensor>, stem: String, n: usize, k: usize, stored: usize, book: Exl3Codebook| {
+        if stem.ends_with(".q_b_proj") || stem == "language_model.model.layers.1.self_attn.o_proj" {
+            tensors.push(t(format!("{stem}.weight"), "BF16", &[n, k]));
+            selected_native.insert(stem.clone(), cuteafd_loader::formats::native_attention::NativeProjection {
+                shape: [n, k], fp8: false, split: split(&stem).expect("fixture native split") });
+            return;
+        }
         tensors.push(t(format!("{stem}.trellis"), "I16", &[k / 16, stored / 16, 96]));
         tensors.push(t(format!("{stem}.suh"), "F16", &[k]));
         tensors.push(t(format!("{stem}.svh"), "F16", &[stored]));
@@ -352,7 +369,7 @@ fn small_checkpoint(root: &std::path::Path) -> Result<(KimiK3Config, CoreInvento
         }
         std::fs::File::options().write(true).open(root.join(&tensor.shard))?.write_all_at(&bytes, meta.byte_offset)?;
     }
-    let mut inventory = CoreInventory::default();
+    let mut inventory = CoreInventory { native: selected_native, ..Default::default() };
     for (stem, shape, stored, book) in core {
         let members = ["trellis", "suh", "svh", book.marker()].map(|s| checkpoint.tensors.iter()
             .find(|t| t.meta.name == format!("{stem}.{s}")).map(|t| (s, t.meta.clone())));
@@ -409,8 +426,10 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
             && (ranks == 2 || !expected.keys().any(|key| key.starts_with("global.1."))),
             "entry and terminal operands follow physical owners");
         ensure!(expected.keys().any(|k| k.ends_with("mla.uk")) && expected.keys().any(|k| k.contains("head.payload"))
-            && expected.keys().any(|k| k.ends_with("kda.a_log")) && expected.keys().any(|k| k.ends_with("ffn.down.payload")),
-            "fixture covers absorption, the K6 head, A_log and input-side K6");
+            && expected.keys().any(|k| k.ends_with("kda.a_log")) && expected.keys().any(|k| k.ends_with("ffn.down.payload"))
+            && expected.keys().any(|k| k.ends_with("mla.q_b.values"))
+            && expected.keys().any(|k| k.ends_with("kda.output.values")),
+            "fixture covers absorption, the K6 head, A_log, input-side K6 and native TP slices");
         // Mount fill of the records.
         let load = DenseLoad::mount(&library);
         let (global, layers) = recorded_for_ranks(&library, &model, &load, ranks)?;
