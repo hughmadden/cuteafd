@@ -193,7 +193,7 @@ Spark layer IDs and inactive hinted/loaded counts.
 | `GLM5_FLASH_EXL3_ROUTE_DUMP` | unset | absolute dir | Per-Spark EXL3 route dump. |
 | `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` | `200000` | positive int | Dump call cap. |
 | `GLM5_FLASH_ROUTE_RING_CHECK` | `off` | `on`, `off` | Diagnostic router-id copy through the local ring. |
-| `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared`, `own` | GLM Flash replay records. |
+| `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared`, `own` | GLM Flash replay records (`auto` selects `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`). |
 
 ## Media
 

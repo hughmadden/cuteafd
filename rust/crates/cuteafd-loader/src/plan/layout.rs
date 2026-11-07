@@ -99,6 +99,9 @@ pub struct LayoutOptions {
     /// out of the state, and the scratch holds at least them. Supported with one GPU and Spark
     /// experts, for either an automatic or an explicit pool.
     pub glmf_shared_replay: bool,
+    /// Resolve GLM 5.3 Flash's replay records from the admitted expert world (`--replay-records auto`):
+    /// `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`.
+    pub glmf_auto_replay: bool,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
     /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
@@ -276,6 +279,7 @@ impl Default for LayoutOptions {
             graph_budget_bytes: None,
             glmf_pool_marks: false,
             glmf_shared_replay: false,
+            glmf_auto_replay: false,
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,

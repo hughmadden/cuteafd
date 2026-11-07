@@ -93,7 +93,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
-                glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
+                glmf_shared_replay: args.replay_records == crate::cli::PlanReplayRecords::Shared,
+                glmf_auto_replay: args.replay_records == crate::cli::PlanReplayRecords::Auto,
                 concurrency: args.concurrency,
                 dspark_draft_limit: args.dspark_draft_limit.unwrap_or(5),
                 tp2_dspark_experts: args.tp2_dspark_experts,
@@ -1149,7 +1150,7 @@ mod tests {
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             headroom_gib: 2.0,
             graph_budget_mib: None,
-            replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
+            replay_records: crate::cli::PlanReplayRecords::Own,
             concurrency: 8,
             dspark_draft_limit: None,
             tp2_dspark_experts: false,
@@ -2108,7 +2109,11 @@ mod tests {
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);
         let knobs = custom.layout.as_ref().unwrap();
         assert_eq!((knobs.concurrency, knobs.state_slots, knobs.glmf_mark_lanes, knobs.mimo_prefix_entries,
-            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay), (16, Some(16), Some(16), 6, 1971 << 20, true));
+            knobs.mimo_prefix_mark_bytes, knobs.glmf_shared_replay, knobs.glmf_auto_replay),
+            (16, Some(16), Some(16), 6, 1971 << 20, true, false));
+        let auto_replay = layout(&["--replay-records", "auto"]);
+        let auto_knobs = auto_replay.layout.as_ref().unwrap();
+        assert_eq!((auto_knobs.glmf_shared_replay, auto_knobs.glmf_auto_replay), (false, true));
         for zero in ["--state-slots", "--mark-lanes"] {
             assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", zero, "0"]).is_err());
         }
