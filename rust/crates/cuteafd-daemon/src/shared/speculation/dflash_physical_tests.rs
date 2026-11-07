@@ -56,14 +56,18 @@ fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("physical/draft/1", requests[&1].clone())?)?;
     let first = arena.view(&requests[&1][0].0, requests[&1][0].1)?.buffer;
     let stream = Stream::new(device)?;
+    let mut bound = Vec::new();
     let (drafter, records) = device.run(|| crate::shared::experts::rtx::dense::recording(||
         DflashDrafter::load_with(&library, &programs, snapshot, Vec::new(), stream.raw, 2, 1,
             vec![0; cfg.hidden * 2], false, representation, fp8_linear::Fp8Scales::Amax,
             fp8_linear::Fp8Rows::W8a16, Qwen4KvCache::Bf16, |physical, name, bytes| {
                 assert_eq!(physical, 1);
-                arena.view(name, bytes)
+                let view = arena.view(name, bytes)?;
+                bound.push((name.to_owned(), view.buffer.ptr as usize - first.ptr as usize, view.buffer.bytes));
+                Ok(view)
             })))?;
     assert!(!records.operands.is_empty());
+    assert_arena_bindings(arena.layout(), &requests[&1], &bound);
     drop(arena);
     let devices = CoordinatorDevices::new(&[1])?;
     let before = drafter.allocation_receipts(devices, "draft")?;
@@ -377,4 +381,148 @@ fn native_tp2_gqa_cross_owner_restore_is_byte_exact() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn assert_arena_bindings(layout: &cuteafd_loader::serving_capacity::WeightArenaLayout,
+    requests: &[(String, usize)], bound: &[(String, usize, usize)]) {
+    let mut end = 0usize;
+    let mut names = std::collections::BTreeSet::new();
+    assert_eq!(requests.len(), bound.len());
+    assert_eq!(requests.len(), layout.views().len());
+    for ((name, bytes), (actual, offset, extent)) in requests.iter().zip(bound) {
+        let aligned = end.div_ceil(256) * 256;
+        assert!(names.insert(name));
+        assert_eq!((actual, *offset, *extent), (name, aligned, *bytes));
+        let view = layout.view(name).expect("planned view");
+        assert_eq!((view.offset(), view.bytes()), (aligned, *bytes));
+        assert!(*offset >= end && *offset - end < 256, "only alignment gaps are allowed");
+        end = offset + extent;
+    }
+    assert_eq!(end, layout.bytes(), "no unexplained trailing gap");
+}
+
+/// Full production MLA geometry, sparse checkpoint and allocation-only DSO.
+/// Exercises the real loader, not a second test-only traversal or numerical oracle.
+pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
+    &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+    &cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<()>) -> Result<()> {
+    use cuteafd_loader::{formats::dflash::MlaDflashConfig,
+        plan::testing::{t, write_safetensors}, serving_capacity::WeightArenaLayout};
+    use crate::shared::memory::{device::Stream, weight_arena::DeviceWeightArena};
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.extent_only(&library)?;
+    fixture.quiet_events(&library, true)?;
+    fixture.configure_memory(&library, 1, 96usize << 30)?;
+    let device = Device { library: &library, id: 1 };
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let snapshot = root.path();
+    std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&serde_json::json!({
+        "architectures":["DFlash2DraftModel"], "hidden_size":7168,
+        "intermediate_size":128, "num_hidden_layers":2, "num_attention_heads":64,
+        "num_key_value_heads":64, "q_lora_rank":1536, "kv_lora_rank":512,
+        "qk_nope_head_dim":128, "qk_rope_head_dim":64, "v_head_dim":128,
+        "rms_norm_eps":1e-5, "vocab_size":256, "draft_vocab_size":256,
+        "max_position_embeddings":65536, "num_target_layers":93,
+        "layer_types":["sliding_attention","full_attention"], "sliding_window":4096,
+        "use_sliding_window":true, "is_causal":false, "mla_use_output_gate":false,
+        "attention_bias":false, "hidden_act":"silu", "fc_norm":false,
+        "rope_parameters":{"rope_type":"yarn", "rope_theta":50000., "factor":32.,
+            "original_max_position_embeddings":32768, "beta_fast":32, "beta_slow":1,
+            "mscale":1., "mscale_all_dim":1.},
+        "dflash_config":{"attention_mode":"mla", "block_size":8,
+            "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
+            "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":0}
+    }))?)?;
+    let cfg = MlaDflashConfig::read(snapshot)?;
+    write_safetensors(&snapshot.join("model.safetensors"), &cfg.tensor_shapes().iter()
+        .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
+    for cache in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
+        for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+            let layout = cfg.runtime_layout(representation, GlmDraftCapacity::new(2, 1, 8)?,
+                8192, 16384, library.sm_count()?, fp8_linear::Fp8Rows::W8a16.code() as u8, cache)?;
+            let p = layout.program();
+            let shapes = [(7168, 256), (128, 7168), (14336, 7168), (7168, 1792), (7168, 256)]
+                .into_iter().collect::<std::collections::BTreeSet<_>>();
+            let mut entries = shapes.into_iter().map(|(k,n)| serde_json::json!({
+                "name":format!("draft_bf16_k{k}_n{n}"), "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
+                "scalars":[], "capacity_rows":TAP_ROWS, "geometry":{"width":k,"outputs":n,
+                    "output_dtype":"torch.bfloat16", "reduction":"ordered_k16", "tiles_by_rows":[[16,1,4,16,64,6]]}
+            })).collect::<Vec<_>>();
+            for (index, suffix, pointers, scalars, window) in [
+                (0,"producer",vec!["x","kv_slots","positions","inv_freq","w_qkv_a","q_a_norm","kv_a_norm",
+                    "w_q_b","w_uk","kv_cache","query","q_resid","scratch"],"fi",None),
+                (1,"attention_full",vec!["query","kv_cache","page_table","cache_seqlens","cu_seqlens_q","attn","lse","scratch"],"iilif",None),
+                (1,"attention_w4096",vec!["query","kv_cache","page_table","cache_seqlens","cu_seqlens_q","attn","lse","scratch"],"iilif",Some(4096)),
+                (2,"output",vec!["attn","w_uv","w_o","out","scratch"],"i",None),
+            ] {
+                let mut geometry = serde_json::json!({"name":"mla_block_draft", "heads":64,"hidden":7168,
+                    "q_lora_rank":1536,"kv_lora_rank":512,"qk_nope_dim":128,"qk_rope_dim":64,
+                    "v_head_dim":128,"page_rows":64,"norm_eps":1e-5,"window_size":window,"kv_cache":cache.label()});
+                match index {
+                    0 => { geometry["rotary_style"] = "interleaved".into(); geometry["rotary_dim"] = 64.into(); }
+                    1 => {
+                        for (key,value) in [("max_context",p.context),("num_splits",p.splits),
+                            ("chunks_per_split",p.chunks_per_split),("partial_output_bytes",p.partial_output_bytes),
+                            ("partial_lse_bytes",p.partial_lse_bytes),("scratch_bytes",p.scratch[1])] { geometry[key] = value.into(); }
+                        geometry["noncausal_block"] = true.into();
+                    }
+                    _ => geometry["output_gate"] = false.into(),
+                }
+                let cache_suffix = if index == 2 { "" } else { cache.program_suffix() };
+                entries.push(serde_json::json!({"name":format!("kimik3_mla_draft_{suffix}{cache_suffix}_m64"),
+                    "pointers":pointers.iter().map(|name| serde_json::json!({"name":name})).collect::<Vec<_>>(),
+                    "scalars":scalars.bytes().enumerate().map(|(i,kind)| serde_json::json!({"name":format!("s{i}"),
+                        "type":match kind { b'i'=>"int32", b'l'=>"int64", _=>"float32" }})).collect::<Vec<_>>(),
+                    "capacity_rows":64,"geometry":geometry,"scratch_bytes_at_capacity":{"scratch":p.scratch[index]}}));
+            }
+            fixture.register_programs(&library, &entries)?;
+            let manifest = snapshot.join("programs.json");
+            std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+            let programs = library.programs()?.with_manifest(&manifest)?;
+            let requests = DflashDrafter::mla_arena_requests(snapshot, representation, 1)?;
+            let planned = WeightArenaLayout::new("kimi/draft/1", requests[&1].clone())?;
+            assert_eq!(planned.payload_bytes() as u64, layout.weights().resident_bytes()?);
+            assert_eq!(planned.padding_bytes(), 0);
+            let arena = DeviceWeightArena::new(device, planned.clone())?;
+            let base = arena.view(&requests[&1][0].0, requests[&1][0].1)?.buffer.ptr as usize;
+            let stream = Stream::new(device)?;
+            let mut bound = Vec::new();
+            let (drafter, records) = device.run(|| crate::shared::experts::rtx::dense::recording(||
+                DflashDrafter::load_mla_with(&library, &programs, "kimik3", snapshot, Vec::new(), stream.raw,
+                    layout.clone(), representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16, None,
+                    |physical, name, bytes| {
+                        assert_eq!(physical, 1);
+                        let view = arena.view(name, bytes)?;
+                        bound.push((name.to_owned(), view.buffer.ptr as usize - base, view.buffer.bytes));
+                        Ok(view)
+                    })))?;
+            assert!(!records.operands.is_empty());
+            assert_arena_bindings(&planned, &requests[&1], &bound);
+            drop(arena);
+            device.run(|| verify(&drafter, &layout, &planned))?;
+            stream.drain()?;
+            drop(drafter);
+            fixture.finish_ordered_uploads(&library)?;
+            assert_eq!(fixture.mapped_bytes(&library)?, 0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn mla_arena_requests_exactly_cover_real_loader_bindings() -> Result<()> {
+    with_mla_arena_fixture(|drafter, _, planned| {
+        let mut census = crate::shared::memory::receipts::Census::default();
+        census.owners(drafter.allocation_receipts(CoordinatorDevices::new(&[1])?, "draft")?);
+        census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        let root = census.receipts.iter().find(|receipt| receipt.allocation.id == planned.id()).context("draft root")?;
+        assert_eq!(root.allocation.bytes, planned.bytes() as u64);
+        assert_eq!(root.allocation.lifetime.first, cuteafd_loader::placement::planner::Phase::DraftLoad);
+        let aliases = census.receipts.iter().filter(|receipt| receipt.allocation.view.as_ref()
+            .is_some_and(|view| view.backing == planned.id())).collect::<Vec<_>>();
+        assert_eq!(aliases.len(), planned.views().len());
+        assert_eq!(aliases.iter().map(|receipt| receipt.allocation.bytes).sum::<u64>(), root.allocation.bytes);
+        Ok(())
+    })
 }

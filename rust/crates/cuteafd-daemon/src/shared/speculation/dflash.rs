@@ -51,7 +51,7 @@ mod allocation;
 pub(crate) mod context_split;
 #[cfg(test)]
 #[path = "dflash_physical_tests.rs"]
-mod physical_tests;
+pub(crate) mod physical_tests;
 
 /// The drafters' exact vocabulary head (`--draft-head exact`) of `rows` rows: 2..=24 rows on the
 /// few-row FP32 kernel (one read of the head per 8 rows), others on the pedantic cuBLAS head;
@@ -1108,6 +1108,15 @@ impl<'a> DflashDrafter<'a> {
         Ok(requests)
     }
 
+    /// Shared header-only MLA requests; all immutable weights live on the head
+    /// device even when the mutable context cache is split across two devices.
+    pub(crate) fn mla_arena_requests(snapshot: &Path, representation: GlmDraftRepresentation,
+        device: i32) -> Result<std::collections::BTreeMap<i32, Vec<(String, usize)>>> {
+        ensure!(device >= 0, "invalid MLA DFlash arena device");
+        Ok(std::collections::BTreeMap::from([(device,
+            super::weights::mla_arena_requests(snapshot, representation)?)]))
+    }
+
     /// Reuses the target's peer exchange and cooperative streams; no extra transport owners.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_tp2(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
@@ -1303,39 +1312,23 @@ impl<'a> DflashDrafter<'a> {
             Ok(program)
         }).collect::<Result<Vec<_>>>()?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
-        let tensor = |name: &str, shape: &[usize]| load.tensor(name, shape);
-        let matrix = |parts: &[(&str, usize)], cols: usize| load.matrix(parts, cols,
-            representation == GlmDraftRepresentation::Fp8Only, scales, stream);
-        let (h, inter) = (cfg.hidden, cfg.intermediate);
+        let weights = super::weights::mla_weight_recipe(&native,
+            |parts| load.tensor_parts(parts),
+            |parts, cols| load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream),
+            |name| load.absorb(name, native.mla.heads, native.mla.nope, native.mla.value, native.mla.kv_rank, stream))?;
         let mut layers = Vec::with_capacity(cfg.layers);
-        for (index, program) in programs.into_iter().enumerate() {
-            let p = format!("layers.{index}");
-            let a = format!("{p}.self_attn");
-            let geometry = &native.mla;
-            let (uk, uv) = load.absorb(&format!("{a}.kv_b_proj.weight"), geometry.heads,
-                geometry.nope, geometry.value, geometry.kv_rank, stream)?;
+        for (index, (program, weight)) in programs.into_iter().zip(weights.layers).enumerate() {
             layers.push(DraftLayer {
-                input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
-                post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                body: LayerBody::Dflash {
-                    attn_conv: matrix(&[(&format!("{p}.attention_conv.kernel_projection.weight"), cfg.conv_width())], h)?,
-                    attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-                    mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), cfg.conv_width())], h)?,
-                    mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-                },
-                attention: DraftAttention::Mla(MlaAttention { program,
-                    qkv_a: load.concat(&[(&format!("{a}.q_a_proj.weight"), geometry.q_rank),
-                        (&format!("{a}.kv_a_proj_with_mqa.weight"), geometry.kv_rank + geometry.rope)], h)?,
-                    q_norm: tensor(&format!("{a}.q_a_layernorm.weight"), &[geometry.q_rank])?,
-                    kv_norm: tensor(&format!("{a}.kv_a_layernorm.weight"), &[geometry.kv_rank])?,
-                    q_b: tensor(&format!("{a}.q_b_proj.weight"), &[geometry.heads * (geometry.nope + geometry.rope), geometry.q_rank])?,
-                    uk, uv, output: tensor(&format!("{a}.o_proj.weight"), &[h, geometry.heads * geometry.value])?,
+                input_norm: weight.input_norm, post_norm: weight.post_norm,
+                body: LayerBody::Dflash { attn_conv: weight.attn_conv, attn_base: weight.attn_base,
+                    mlp_conv: weight.mlp_conv, mlp_base: weight.mlp_base },
+                attention: DraftAttention::Mla(MlaAttention { program, qkv_a: weight.qkv_a,
+                    q_norm: weight.q_norm, kv_norm: weight.kv_norm, q_b: weight.q_b,
+                    uk: weight.uk, uv: weight.uv, output: weight.output,
                     cache: owners.take(&format!("layer.{index}.cache"))?,
                     page_table: owners.take(&format!("layer.{index}.page_table"))?,
                 }),
-                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), cfg.intermediate),
-                    (&format!("{p}.mlp.up_proj.weight"), cfg.intermediate)], h)?,
-                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], cfg.intermediate)?,
+                gate_up: weight.gate_up, down: weight.down,
             });
         }
         let workspace = Workspace::admitted_mla(library, &cfg, layout.capacity().max_batch_sequences, &layout, &mut owners)?;
@@ -1344,13 +1337,10 @@ impl<'a> DflashDrafter<'a> {
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream, slots: layout.capacity().context_slots,
             max_sequences: layout.capacity().max_batch_sequences,
-            fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?, context_fc: None, physical: None, head_split: None, projections,
-            hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
-            head_ops: DraftHeadOps::Selector {
-                projection: matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h)?,
-                predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
-                successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
-            }, layers,
+            fc: weights.fc, context_fc: None, physical: None, head_split: None, projections,
+            hidden_norm: weights.hidden_norm, norm: weights.norm,
+            head_ops: DraftHeadOps::Selector { projection: weights.selector.0,
+                predecessor: weights.selector.1, successor: weights.selector.2 }, layers,
             taps: owners.take("taps")?, fused: owners.take("fused")?, fused_norm: owners.take("fused_norm")?,
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),

@@ -874,7 +874,9 @@ impl Recipe for KimiRecipe {
         if let Some(draft) = &self.draft {
             let rank = (self.gpus - 1) as u8;
             contract.variables.push(Variable::DraftHome(vec![rank]));
-            let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            // Kimi constructs the drafter before target loading, so its backing
+            // already exists throughout Load (unlike post-target GQA drafters).
+            let lifetime = Lifetime::RESIDENT;
             for (index, owner) in draft.owners.iter().enumerate() {
                 let allocation = Allocation::buffer(format!("draft.{index}"),
                     Location::coordinator(owner.gpu), owner.bytes_at_first, lifetime,
@@ -1074,6 +1076,35 @@ mod tests {
             owners: vec![],
             fixed: vec![FixedOwner { rank: 0, category: Category::Prefix, group: "Kimi exact KDA marks".into(),
                 bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }],
+        }
+    }
+
+    #[test]
+    fn draft_resident_weights_are_counted_once_in_target_load_peak() {
+        let mut recipe = recipe();
+        recipe.draft = Some(Draft { context_split: false, owners: vec![DraftOwner {
+            gpu: 0, category: Category::Drafter, group: "MLA DFlash owned weights".into(),
+            bytes_at_first: 512, bytes_per_page: 0, weights_at_first: 512, weights_per_page: 0,
+        }], staging_at_first: 128, staging_per_page: 0 });
+        let contract = recipe.prepare(&single()).unwrap();
+        let selected = vec![0; contract.variables.len()];
+        let facts = contract.facts(&selected, 1).unwrap();
+        assert_eq!(facts.phase_order, PhaseOrder::DRAFT_THEN_TARGET);
+        let owners = facts.allocations.iter().filter(|owner| owner.id == "draft.0").collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].lifetime, Lifetime::RESIDENT);
+        assert_eq!(facts.resident_weights.iter().filter(|owner| owner.id == "draft.0")
+            .map(|owner| owner.weights.0).sum::<u64>(), 512);
+        let budget = Budget { id: "gpu0".into(), locations: vec![Location::coordinator(0)],
+            physical_bytes: 1 << 30, logical_bytes: 1 << 30, headroom: 0,
+            baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false } };
+        let with_draft = evaluate(&facts, &[budget.clone()]).unwrap();
+        let mut without = facts.clone();
+        without.allocations.retain(|owner| !owner.id.starts_with("draft."));
+        without.resident_weights.retain(|owner| !owner.id.starts_with("draft."));
+        let without_draft = evaluate(&without, &[budget]).unwrap();
+        for (with, without) in with_draft.iter().zip(without_draft) {
+            assert_eq!(with.owned - without.owned, if with.phase == Phase::DraftLoad { 640 } else { 512 });
         }
     }
 

@@ -260,8 +260,19 @@ impl<'a> Admission<'a> {
                 Some(crate::shared::speculation::dflash::context_split::ContextOwner::allocate(
                     programs, &layout, streams, peer, stream)?)
             } else { None };
-            DflashDrafter::load_mla(device.library, programs, "kimik3", snapshot, file, stream, layout,
-                representation, scales, rows, split)
+            let requests = DflashDrafter::mla_arena_requests(snapshot, representation, device.id)?;
+            let arena_layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                format!("kimi/draft/{}", device.id), requests[&device.id].clone())?;
+            // MLA's shipped dimensions are 256-aligned. Refuse a new unadmitted
+            // padding extent instead of silently growing the drafter owner.
+            ensure!(arena_layout.payload_bytes() as u64 == layout.weights().resident_bytes()?
+                && arena_layout.padding_bytes() == 0, "Kimi draft arena differs from admitted immutable weights");
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, arena_layout)?;
+            DflashDrafter::load_mla_with(device.library, programs, "kimik3", snapshot, file, stream, layout,
+                representation, scales, rows, split, |physical, name, bytes| {
+                    ensure!(physical == device.id, "Kimi draft arena physical owner changed");
+                    arena.view(name, bytes)
+                })
         }))
     }
 

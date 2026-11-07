@@ -182,6 +182,10 @@ impl<'a, 'b> Load<'a, 'b> {
         self.operand(vec![self.source.rect(name, shape)?])
     }
 
+    pub(crate) fn tensor_parts(&self, parts: &[(&str, Vec<usize>)]) -> Result<DeviceAllocation<'a>> {
+        self.operand(parts.iter().map(|(name, shape)| self.source.rect(name, shape)).collect::<Result<_>>()?)
+    }
+
     pub fn tensor_shard(&self, name: &str, shape: &[usize], axis: ShardAxis,
         rank: usize, ranks: usize) -> Result<DeviceAllocation<'a>> {
         self.operand(vec![shard(self.source.rect(name, shape)?, axis, rank, ranks)?])
@@ -338,10 +342,113 @@ pub(crate) fn gqa_weight_recipe<T, M>(
     })
 }
 
+pub(crate) struct MlaLayerWeights<T, M> {
+    pub input_norm: T, pub post_norm: T,
+    pub attn_conv: M, pub attn_base: T, pub mlp_conv: M, pub mlp_base: T,
+    pub qkv_a: T, pub q_norm: T, pub kv_norm: T, pub q_b: T,
+    pub uk: T, pub uv: T, pub output: T, pub gate_up: M, pub down: M,
+}
+
+pub(crate) struct MlaWeights<T, M> {
+    pub layers: Vec<MlaLayerWeights<T, M>>,
+    pub fc: M, pub hidden_norm: T, pub norm: T, pub selector: (M, T, T),
+}
+
+/// Shared MLA immutable traversal: header requests and `load_mla_with` bind the
+/// same names, representations and absorption destinations, never KV or scratch.
+pub(crate) fn mla_weight_recipe<T, M>(
+    cfg: &cuteafd_loader::formats::dflash::MlaDflashConfig,
+    tensor: impl Fn(&[(&str, Vec<usize>)]) -> Result<T>,
+    matrix: impl Fn(&[(&str, usize)], usize) -> Result<M>,
+    absorb: impl Fn(&str) -> Result<(T, T)>,
+) -> Result<MlaWeights<T, M>> {
+    use cuteafd_core::coordinator_programs::MlaDraftKind;
+    ensure!(cfg.kind == MlaDraftKind::Dflash2, "MLA DFlash arena recipe requires DFlash2");
+    let m = &cfg.mla;
+    let h = m.hidden;
+    let one = |name: &str, shape: &[usize]| tensor(&[(name, shape.to_vec())]);
+    let mut layers = Vec::with_capacity(cfg.windows.len());
+    for index in 0..cfg.windows.len() {
+        let p = format!("layers.{index}");
+        let a = format!("{p}.self_attn");
+        let (uk, uv) = absorb(&format!("{a}.kv_b_proj.weight"))?;
+        layers.push(MlaLayerWeights {
+            input_norm: one(&format!("{p}.input_layernorm.weight"), &[h])?,
+            post_norm: one(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
+            attn_conv: matrix(&[(&format!("{p}.attention_conv.kernel_projection.weight"), 4 * h / cfg.group)], h)?,
+            attn_base: one(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
+            mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), 4 * h / cfg.group)], h)?,
+            mlp_base: one(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
+            qkv_a: tensor(&[(&format!("{a}.q_a_proj.weight"), vec![m.q_rank, h]),
+                (&format!("{a}.kv_a_proj_with_mqa.weight"), vec![m.kv_rank + m.rope, h])])?,
+            q_norm: one(&format!("{a}.q_a_layernorm.weight"), &[m.q_rank])?,
+            kv_norm: one(&format!("{a}.kv_a_layernorm.weight"), &[m.kv_rank])?,
+            q_b: one(&format!("{a}.q_b_proj.weight"), &[m.heads * (m.nope + m.rope), m.q_rank])?,
+            uk, uv, output: one(&format!("{a}.o_proj.weight"), &[h, m.heads * m.value])?,
+            gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), cfg.intermediate),
+                (&format!("{p}.mlp.up_proj.weight"), cfg.intermediate)], h)?,
+            down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], cfg.intermediate)?,
+        });
+    }
+    Ok(MlaWeights { layers, fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?,
+        hidden_norm: one("hidden_norm.weight", &[h])?, norm: one("norm.weight", &[h])?,
+        selector: (matrix(&[("candidate_selector.hidden_projection.weight", cfg.selector_rank)], h)?,
+            one("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.selector_rank])?,
+            one("candidate_selector.successor_codebook", &[cfg.vocab, cfg.selector_rank])?),
+    })
+}
+
+fn matrix_requests(requests: &std::cell::RefCell<Vec<(String, usize)>>, rects: &[Rect],
+    representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation) -> Result<()> {
+    use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
+    let name = rects.iter().map(|rect| rect.name.as_str()).collect::<Vec<_>>().join("+");
+    let bytes = rects.iter().try_fold(0usize, |n, rect| n.checked_add(rect.bytes()))
+        .context("DFlash recipe matrix overflow")?;
+    if representation == GlmDraftRepresentation::Bf16Only {
+        requests.borrow_mut().push((name, bytes.max(256)));
+    } else {
+        let k = rects.first().context("DFlash recipe matrix missing parts")?.width() / 2;
+        let n = rects.iter().try_fold(0usize, |n, rect| n.checked_add(rect.rows.len()))
+            .context("DFlash recipe matrix rows overflow")?;
+        ensure!(n > 0 && k > 0 && n % 16 == 0 && k % 128 == 0
+            && rects.iter().all(|r| r.width() == k * 2), "DFlash recipe FP8 shape {n}/{k}");
+        let payload = n.checked_mul(k).context("DFlash recipe FP8 extent overflow")?;
+        requests.borrow_mut().extend([(format!("{name}.payload"), payload),
+            (format!("{name}.scales"), payload / 128 * 4)]);
+    }
+    Ok(())
+}
+
+pub(crate) fn mla_arena_requests(snapshot: &Path,
+    representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation)
+    -> Result<Vec<(String, usize)>> {
+    let cfg = cuteafd_loader::formats::dflash::MlaDflashConfig::read(snapshot)?;
+    let source = Source::open(snapshot)?;
+    for (name, shape) in cfg.tensor_shapes() { source.rect(&name, &shape)?; }
+    let requests = std::cell::RefCell::new(Vec::new());
+    mla_weight_recipe(&cfg,
+        |parts| {
+            let bytes = parts.iter().try_fold(0usize, |n, (name, shape)|
+                n.checked_add(source.rect(name, shape)?.bytes()).context("MLA tensor extent overflow"))?;
+            requests.borrow_mut().push((parts.iter().map(|(name, _)| *name).collect::<Vec<_>>().join("+"), bytes.max(256)));
+            Ok(())
+        },
+        |parts, cols| matrix_requests(&requests, &source.parts(parts, cols)?, representation),
+        |name| {
+            let m = &cfg.mla;
+            source.rect(name, &[m.heads * (m.nope + m.value), m.kv_rank])?;
+            let (_, _, uk, uv) = absorb_geometry(m.heads, m.nope, m.value, m.kv_rank)?;
+            requests.borrow_mut().extend([(format!("{name}.uk"), m.heads * uk),
+                (format!("{name}.uv"), m.heads * uv)]);
+            Ok(((), ()))
+        })?;
+    Ok(requests.into_inner())
+}
+
 pub(crate) fn gqa_arena_requests(snapshot: &Path,
     representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation,
     rank: usize, ranks: usize) -> Result<Vec<(String, usize)>> {
-    use cuteafd_loader::families::glm5::{draft_physical::GlmDflashConfig, draft_representation::GlmDraftRepresentation};
+    use cuteafd_loader::families::glm5::draft_physical::GlmDflashConfig;
     let cfg = GlmDflashConfig::read(snapshot)?;
     let source = Source::open(snapshot)?;
     for (name, shape) in cfg.tensor_shapes() { source.rect(&name, &shape)?; }
@@ -354,22 +461,7 @@ pub(crate) fn gqa_arena_requests(snapshot: &Path,
         },
         |parts, cols, axis| {
             let rects = source.matrix_rects(parts, cols, axis, rank, ranks)?;
-            let name = rects.iter().map(|rect| rect.name.as_str()).collect::<Vec<_>>().join("+");
-            let bytes = rects.iter().try_fold(0usize, |n, rect| n.checked_add(rect.bytes()))
-                .context("DFlash recipe matrix overflow")?;
-            if representation == GlmDraftRepresentation::Bf16Only {
-                requests.borrow_mut().push((name, bytes.max(256)));
-            } else {
-                let k = rects.first().context("DFlash recipe matrix missing parts")?.width() / 2;
-                let n = rects.iter().try_fold(0usize, |n, rect| n.checked_add(rect.rows.len()))
-                    .context("DFlash recipe matrix rows overflow")?;
-                ensure!(n > 0 && k > 0 && n % 16 == 0 && k % 128 == 0
-                    && rects.iter().all(|r| r.width() == k * 2), "DFlash recipe FP8 shape {n}/{k}");
-                let payload = n.checked_mul(k).context("DFlash recipe FP8 extent overflow")?;
-                requests.borrow_mut().extend([(format!("{name}.payload"), payload),
-                    (format!("{name}.scales"), payload / 128 * 4)]);
-            }
-            Ok(())
+            matrix_requests(&requests, &rects, representation)
         })?;
     Ok(requests.into_inner())
 }
@@ -573,10 +665,21 @@ mod tests {
                     let path = snapshot.join("model.safetensors");
                     device.run(|| {
                     let requested = std::cell::RefCell::new(Vec::new());
+                    let mut end = 0usize;
+                    let mut base = None;
                     let mut allocate = |id, name: &str, bytes| {
                         assert_eq!(id, device.id);
                         requested.borrow_mut().push((name.to_owned(), bytes));
-                        weight_allocation(device, arena, name, bytes)
+                        let owner = weight_allocation(device, arena, name, bytes)?;
+                        if let Some(arena) = arena {
+                            let offset = end.div_ceil(256) * 256;
+                            let root = *base.get_or_insert(owner.buffer.ptr as usize);
+                            assert_eq!(owner.buffer.ptr as usize - root, offset);
+                            let view = arena.layout().view(name).expect("GQA planned view");
+                            assert_eq!((view.offset(), view.bytes()), (offset, bytes));
+                            end = offset + bytes;
+                        }
+                        Ok(owner)
                     };
                     let bytes = if dense::is_recording() { Vec::new() } else { std::fs::read(&path)? };
                     let load = Load::with_prefetched(&library, &snapshot, bytes)?.with_allocator(&mut allocate);
@@ -596,6 +699,10 @@ mod tests {
                     drop(load);
                     drop(allocate);
                     assert_eq!(requested.into_inner(), expected);
+                    if let Some(arena) = arena {
+                        assert_eq!(end, arena.layout().bytes());
+                        assert_eq!(expected.len(), arena.layout().views().len());
+                    }
                     Ok(owners.into_inner())
                     })
                 }

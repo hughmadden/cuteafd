@@ -6,8 +6,15 @@ use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Phase, Re
 
 impl DflashDrafter<'_> {
     pub(crate) fn allocation_receipts(&self, devices: CoordinatorDevices<'_>, prefix: &str) -> Result<Vec<Receipt>> {
-        let mut inventory = Inventory::new(devices, prefix,
-            Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "draft owners");
+        self.allocation_receipts_with_lifetime(devices, prefix,
+            Lifetime { first: Phase::DraftLoad, last: Phase::Growth })
+    }
+
+    /// The caller supplies its actual construction phase; Kimi co-loads before
+    /// target weights, while ordinary post-target drafters begin in DraftLoad.
+    pub(crate) fn allocation_receipts_with_lifetime(&self, devices: CoordinatorDevices<'_>, prefix: &str,
+        lifetime: Lifetime) -> Result<Vec<Receipt>> {
+        let mut inventory = Inventory::new(devices, prefix, lifetime, Category::Drafter, "draft owners");
         self.fc.allocation_receipts(&mut inventory, "weight.fc")?;
         for (name, owner) in [("hidden_norm", &self.hidden_norm), ("norm", &self.norm),
             ("taps", &self.taps), ("fused", &self.fused), ("fused_norm", &self.fused_norm),
@@ -138,7 +145,7 @@ impl DflashDrafter<'_> {
             inventory.device("workspace.reduced", split.reduced.buffer)?;
             inventory.device("peer.workspace.reduced", split.peer_reduced.buffer)?;
             inventory.receipts.extend(split.peer.device.run(||
-                split.peer.allocation_receipts(devices, &format!("{prefix}.peer")))?);
+                split.peer.allocation_receipts_with_lifetime(devices, &format!("{prefix}.peer"), lifetime))?);
         }
         Ok(inventory.receipts)
     }
