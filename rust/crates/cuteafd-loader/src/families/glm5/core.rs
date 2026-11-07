@@ -59,14 +59,6 @@ pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) ->
     if !cfg.variant.is_glm() || checkpoint.attention_mode() == AttentionMode::Compact
         || checkpoint.config.pointer("/quantization_config/attention_view").is_none() { return Ok(()); }
     let layers = cfg.layers.checked_add(cfg.mtp_layers).context("GLM publication layer overflow")?;
-    let names = (0..layers).flat_map(|layer| ["q_b_proj", "o_proj"].map(|leaf|
-        format!("model.layers.{layer}.self_attn.{leaf}.weight"))).collect::<std::collections::BTreeSet<_>>();
-    let headers = checkpoint.view.as_ref().filter(|_| names.iter()
-        .any(|name| !checkpoint.has_header(name)))
-        .map(|view| Checkpoint::open_view_for_role(view, "GLM complete native attention publication", |name|
-            name.rsplit_once('.').is_some_and(|(stem, _)| names.contains(&format!("{stem}.weight")))))
-        .transpose()?;
-    let checkpoint = headers.as_ref().unwrap_or(checkpoint);
     for layer in 0..layers {
         for (leaf, expected) in [
             ("q_b_proj", vec![cfg.heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank]),
@@ -191,7 +183,7 @@ impl CoreInventory {
             |stem| split(cfg, stem).map(|split| CoreContract { split, bits: 6,
                 padded_outputs: kv_a.contains(stem) }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
-        if let Some(view) = &checkpoint.view {
+        if checkpoint.view.is_some() {
             let native_stems = (0..cfg.layers).flat_map(|layer| {
                 let operands = core_operands(cfg, layer).into_iter()
                     .filter(|(_, op, _)| matches!(op, Op::QA | Op::KvA | Op::QB | Op::O))
@@ -201,11 +193,6 @@ impl CoreInventory {
                         && checkpoint.config.pointer("/quantization_config/attention_view").is_some();
                 operands.into_iter().filter(|stem| staged && !inventory.projections.contains_key(stem)).collect::<Vec<_>>()
             }).collect::<std::collections::BTreeSet<_>>();
-            let missing_headers = native_stems.iter().any(|stem| !checkpoint.has_header(&format!("{stem}.weight")));
-            let native_headers = missing_headers.then(|| Checkpoint::open_view_for_role(view,
-                "GLM selected native attention", |name| name.rsplit_once('.')
-                    .is_some_and(|(stem, _)| native_stems.contains(stem)))).transpose()?;
-            let native_checkpoint = native_headers.as_ref().unwrap_or(checkpoint);
             for layer in 0..cfg.layers {
                 let operands = core_operands(cfg, layer).into_iter()
                     .filter(|(_, op, _)| matches!(op, Op::QA | Op::KvA | Op::QB | Op::O)).collect::<Vec<_>>();
@@ -214,7 +201,7 @@ impl CoreInventory {
                 for (_, op, split) in operands {
                     let Some(stem) = cfg.stem(layer, op) else { continue; };
                     if inventory.projections.contains_key(&stem) { continue; }
-                    let selected = native_checkpoint.projection(&stem)?;
+                    let selected = checkpoint.projection(&stem)?;
                     let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape } = &selected.storage else { continue; };
                     let expected = expected(cfg).remove(&format!("{stem}.weight")).context("GLM native shape")?;
                     ensure!(shape == &expected && matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
@@ -660,6 +647,13 @@ mod tests {
             }
         }
         checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        let dir = tempfile::tempdir()?;
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, serde_json::to_vec(&checkpoint.config)?)?;
+        checkpoint.view = Some(crate::plan::checkpoint::CheckpointView::select(dir.path(),
+            crate::plan::checkpoint::AttentionMode::Hqa)?);
+        // Publication validation consumes retained headers, never the snapshot again.
+        std::fs::remove_file(config)?;
         validate_native_attention(&cfg, &checkpoint)?;
         let mtp = format!("model.layers.{}.self_attn.o_proj", cfg.layers);
         assert_eq!(split(&cfg, &mtp), None);
@@ -668,6 +662,8 @@ mod tests {
         tensor.meta.shape[1] -= 128;
         assert!(validate_native_attention(&cfg, &checkpoint).unwrap_err().to_string().contains(&mtp));
         checkpoint.tensors.retain(|tensor| tensor.meta.name != format!("{mtp}.weight"));
+        let error = validate_native_attention(&cfg, &checkpoint).unwrap_err().to_string();
+        assert!(error.contains(&mtp) && error.contains("selected projection headers missing"), "{error}");
         checkpoint.weight_map.remove(&format!("{mtp}.weight"));
         assert!(validate_native_attention(&cfg, &checkpoint).is_err());
         Ok(())
@@ -701,6 +697,7 @@ mod tests {
             }
             checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
             checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
+            std::fs::remove_file(dir.path().join("config.json"))?;
             let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
             assert_eq!(core.native.len(), 2);
             for (ranks, owner) in [(1, None), (2, None), (2, Some(1))] {
@@ -714,6 +711,8 @@ mod tests {
                 }
             }
             checkpoint.tensors.retain(|tensor| tensor.meta.name != cfg.weight(0, Op::O).unwrap());
+            let error = CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap_err().to_string();
+            assert!(error.contains("o_proj") && error.contains("selected projection headers missing"), "{error}");
             checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
             assert!(CoreInventory::from_checkpoint(&cfg, &checkpoint).is_err());
         }
