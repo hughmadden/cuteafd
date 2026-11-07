@@ -336,7 +336,7 @@ mod tests {
             let owners = device.run(|| {
                 if recorded {
                     let (owners, records) = recording(|| load(&reader, Some(&arena)))?;
-                    testing::replay(device, RankLayout::new(records.operands, records.steps, 0)?, root.path(), 1, 0)?;
+                    testing::replay(device, RankLayout::new(records.operands, records.steps, device.id)?, root.path(), 1, 0)?;
                     Ok(owners)
                 } else { load(&reader, Some(&arena)) }
             })?;
