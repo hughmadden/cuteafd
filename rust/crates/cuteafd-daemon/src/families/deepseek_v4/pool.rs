@@ -29,7 +29,11 @@ pub(crate) struct PoolShape {
 
 impl PoolShape {
     pub fn new(sequences: usize, prefill_rows: usize, units: usize) -> Self {
-        Self { sequences, ring_pages: (prefill_rows + WINDOW).div_ceil(SOURCE_PAGE_TOKENS), units }
+        // Window + one prefill unit, 256-row pages: the shared ring rule. The
+        // planner's `deepseek_v4_cache_geometry` charges the same pages.
+        let ring = cuteafd_core::prefix::swa_ring(WINDOW as u64, prefill_rows.max(1) as u64,
+            SOURCE_PAGE_TOKENS as u64).expect("V4 window, unit and page constants are nonzero");
+        Self { sequences, ring_pages: (ring.rows / SOURCE_PAGE_TOKENS as u64) as usize, units }
     }
 
     /// Units for `pool_tokens` tokens across sequences plus one partial unit per sequence.

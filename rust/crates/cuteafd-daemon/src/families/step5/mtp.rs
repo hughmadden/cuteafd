@@ -386,8 +386,7 @@ impl<'a> StageOwner<'a> {
         let source = cache.request_component(span, sequence)?;
         let element = if self.stage == 0 { 2 } else { 4 };
         let target = self.input.planes[5].buffer;
-        let ring = cuteafd_core::prefix::AppendRing { window: cache.layout().mtp_hidden_rows
-            - cache.layout().step_rows, step: cache.layout().step_rows, rows: cache.layout().mtp_hidden_rows };
+        let ring = cache.layout().mtp_history.context("Step-5 MTP hidden history ring")?;
         self.stream.device.run(|| {
             for run in ring.runs(base, rows as u64).context("Step-5 predictor source history extent")? {
                 let input = slice(source, run.slot as usize * H * element, run.rows as usize * H * element)?;
@@ -532,9 +531,7 @@ impl<'e, 'a> StageStep<'e, 'a> {
             table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(),
             pages: self.cache.layout().mtp_ring.rows as usize / 64,
         })?;
-        let history_ring = cuteafd_core::prefix::AppendRing {
-            window: self.cache.layout().mtp_hidden_rows - self.cache.layout().step_rows,
-            step: self.cache.layout().step_rows, rows: self.cache.layout().mtp_hidden_rows };
+        let history_ring = self.cache.layout().mtp_history.context("Step-5 MTP hidden history ring")?;
         for run in history_ring.proposal(self.coordinates.base, rows as u64)
             .context("Step-5 predictor own history ring")? {
             let source = slice(owner.attention.output(), run.offset as usize * H * 4, run.rows as usize * H * 4)?;
