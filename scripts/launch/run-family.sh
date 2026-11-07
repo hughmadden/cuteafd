@@ -2660,7 +2660,9 @@ if [[ "$package_requirements" != '{}' ]]; then
     host="$(get "SPARK_${rank}_HOST")"
     identity="$checkpoint_family $host image $spark_image"
     if [[ -n "$wip_slot" ]]; then
-      slot_root="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip"
+      # Each Spark resolves its own home (~ expands there): the coordinator's HOME
+      # need not be the Spark's, as on hosts whose HOME is moved off a small root.
+      slot_root="${WIP_ROOT:-~/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip"
       printf -v package_command '%q ' python3 - "$package_requirements" "$identity slot $wip_slot ($slot_root)" "$slot_root"
     else
       printf -v package_command '%q ' docker run --rm --network none -i --entrypoint python3 "$spark_image" - "$package_requirements" "$identity"
