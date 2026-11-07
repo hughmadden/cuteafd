@@ -11,7 +11,8 @@
 //      stream (quads gathered from the ragged interleave, the two-class lookup)
 //      gives back the source;
 //   2. cuteafd_kx7_decode reproduces every source weight bit for bit;
-//   3. cuteafd_kx7_linear equals the BF16 cuBLAS linear over the source weights
+//   3. cuteafd_kx7_linear equals, at 1..64 rows, the fused GEMV's BF16 twin over the source weights
+//      (and is width-invariant); above 64 rows, the BF16 cuBLAS linear over the source weights
 //      bit for bit at 1 to 300 rows, and a CUDA graph of it replays bit for bit;
 //   4. invalid packs (format, header size, shape, alignment, tables,
 //      workspace) are refused.
@@ -290,15 +291,37 @@ void device_part(const Pack& p, cudaStream_t s) {
   CUDA_MUST(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
   CUDA_MUST(cudaMemcpy(dw, p.source.data(), n * k * 2, cudaMemcpyHostToDevice));
   std::vector<uint16_t> a(size_t(max_rows) * n), b(a.size());
-  for (int rows : {1, 7, 16, 17, 64, 65, 128, 129, 300}) {
+  // Rows 1..64 run the fused GEMV: bit for bit its BF16 twin over the source weights. Wider steps
+  // decode once and run the BF16 cuBLAS GEMM: bit for bit that GEMM over the source weights.
+  for (int rows : {1, 2, 7, 8, 9, 16, 17, 31, 32, 33, 48, 63, 64, 65, 128, 129, 300}) {
     const size_t bytes = size_t(rows) * n * 2;
-    MUST(cuteafd_cuda_linear_bf16_cublas_async(static_cast<const uint16_t*>(dx), static_cast<const uint16_t*>(dw),
-                                               nullptr, static_cast<uint16_t*>(ref), size_t(rows), k, n, s));
+    const bool fused = rows <= 64 && p.n % 32 == 0 && p.k % 256 == 0;
+    if (fused) {
+      CUDA_MUST(cudaError_t(cuteafd_kx7_reference_gemv(dx, dw, ref, rows, int32_t(n), int32_t(k), s)));
+    } else {
+      MUST(cuteafd_cuda_linear_bf16_cublas_async(static_cast<const uint16_t*>(dx), static_cast<const uint16_t*>(dw),
+                                                 nullptr, static_cast<uint16_t*>(ref), size_t(rows), k, n, s));
+    }
     MUST(cuteafd_kx7_linear(dx, &d.header, res, rows, ws, ws_bytes, s));
     CUDA_MUST(cudaMemcpyAsync(a.data(), ref, bytes, cudaMemcpyDeviceToHost, s));
     CUDA_MUST(cudaMemcpyAsync(b.data(), res, bytes, cudaMemcpyDeviceToHost, s));
     CUDA_MUST(cudaStreamSynchronize(s));
-    check(std::memcmp(a.data(), b.data(), bytes) == 0, "kx7 linear equals the BF16 cuBLAS linear", p.name, rows);
+    check(std::memcmp(a.data(), b.data(), bytes) == 0,
+          fused ? "kx7 GEMV equals its BF16 twin" : "kx7 linear equals the BF16 cuBLAS linear", p.name, rows);
+  }
+  // A row's bits do not depend on the step's width inside the GEMV (1..64 rows): row 0 of every
+  // width equals row 0 of a one-row call.
+  if (p.n % 32 == 0 && p.k % 256 == 0) {
+    std::vector<uint16_t> one(n), wide(size_t(64) * n);
+    MUST(cuteafd_kx7_linear(dx, &d.header, res, 1, ws, ws_bytes, s));
+    CUDA_MUST(cudaMemcpyAsync(one.data(), res, n * 2, cudaMemcpyDeviceToHost, s));
+    CUDA_MUST(cudaStreamSynchronize(s));
+    for (int rows : {2, 16, 17, 32, 33, 64}) {
+      MUST(cuteafd_kx7_linear(dx, &d.header, res, rows, ws, ws_bytes, s));
+      CUDA_MUST(cudaMemcpyAsync(wide.data(), res, n * 2, cudaMemcpyDeviceToHost, s));
+      CUDA_MUST(cudaStreamSynchronize(s));
+      check(std::memcmp(one.data(), wide.data(), n * 2) == 0, "row 0 is invariant to the step width", p.name, rows);
+    }
   }
   const int rows = 64;
   const size_t bytes = size_t(rows) * n * 2;
@@ -343,7 +366,7 @@ void device_part(const Pack& p, cudaStream_t s) {
         "invalid workspace shapes", p.name);
   CUDA_MUST(cudaGetLastError());
   for (void* ptr : {dx, dw, ref, res, ws}) cudaFree(ptr);
-  std::printf("device %-22s [%d, %d]: decode exact, linear bit for bit the BF16 cuBLAS linear (1..300 rows, graph)\n",
+  std::printf("device %-22s [%d, %d]: decode exact, GEMV bit for bit its BF16 twin (1..64 rows, width-invariant), linear bit for bit cuBLAS (65..300), graph\n",
               p.name.c_str(), p.n, p.k);
 }
 

@@ -1,8 +1,11 @@
 // KX7: BF16 matrices held as an exact code over their 16-bit patterns
 // (cuteafd_core::kx7, format v1.1), for GLM 5.3 Flash's FP8-born KDA
-// projections. This file is v0, correct first: a decode of every stream into a
-// BF16 workspace and the BF16 cuBLAS GEMM the BF16 path runs over it, so a KX7
-// linear is bit for bit that GEMM over the source weights.
+// projections. Decode and verify steps (1..64 rows) run the fused GEMV
+// (kx7_gemv.cuh): each lane decodes its stream straight into MMA fragments, bit
+// for bit the GEMV's BF16 twin over the source weights and invariant to the
+// step's width. Prefill and wider steps decode every stream into a BF16
+// workspace and run the BF16 cuBLAS GEMM over it, bit for bit that GEMM over the
+// source weights.
 //
 // The pack (built and verified on the host by cuteafd_core::kx7) reaches this
 // file as a cuteafd_kx7_pack_t (cuteafd_kx7.h): its header scalars and device
@@ -29,6 +32,7 @@
 #include "cuteafd_kx7.h"
 #include "cuteafd_native.h"
 #include "kx7_decode.cuh"
+#include "kx7_gemv.cuh"
 
 namespace {
 
@@ -41,9 +45,11 @@ constexpr uint32_t kQuadStride = 512;
 constexpr uint32_t kV11TableWords = (1u << KX7_PBITS) + (1u << 12) / 2;
 constexpr size_t kSmemBytes = kV11TableWords * 4 + size_t(kWarps) * KX7_RING_BYTES;
 static_assert(kSmemBytes <= 48 * 1024, "the decode stays within the default shared memory");
-// Row classes the fused KX7 kernels will take, at the dispatch point in cuteafd_kx7_linear.
-constexpr int32_t kGemvRows = 16;
-constexpr int32_t kTileRows = 128;
+// The fused GEMV takes decode and verify steps up to this many rows (four 16-row activation
+// tiles); wider steps and prefill decode once and run the BF16 GEMM.
+constexpr int32_t kGemvRows = 64;
+// The GEMV's K warps are the pack's K slices.
+constexpr int kGemvSlices = 4;
 
 bool aligned(const void* p, uintptr_t bytes) { return reinterpret_cast<uintptr_t>(p) % bytes == 0; }
 
@@ -93,6 +99,41 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+// The GEMV's CTAs own 32 weight rows in every configuration.
+constexpr int32_t kGemvCols = 32;
+
+// Whether a call takes the fused GEMV: a decode/verify width, the GEMV's K split, whole CTAs.
+bool gemv_applies(int32_t rows, int32_t n, int32_t slices) {
+  return rows >= 1 && rows <= kGemvRows && slices == kGemvSlices && n % kGemvCols == 0;
+}
+
+// One GEMV configuration <KS, RG, G, MT> launched over `pack`.
+template <int RG, int G, int MT>
+int32_t launch_gemv(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32_t rows, cudaStream_t s) {
+  using Geo = kx7gemv::Geometry<kGemvSlices, RG, G, MT>;
+  constexpr int smem = Geo::kx7_smem(int(kV11TableWords));
+  static_assert(smem <= 48 * 1024, "the GEMV stays within the default shared memory");
+  static_assert(Geo::COLS == kGemvCols, "every GEMV configuration owns kGemvCols weight rows per CTA");
+  if (p->n % Geo::COLS != 0) return cudaErrorInvalidValue;
+  kx7gemv::kx7_gemv_kernel<kGemvSlices, RG, G, MT><<<p->n / Geo::COLS, Geo::THREADS, smem, s>>>(
+      static_cast<const uint16_t*>(x), rows, p->n, p->k, static_cast<const uint8_t*>(p->streams),
+      static_cast<const uint32_t*>(p->offsets), static_cast<const uint16_t*>(p->lengths), p->streams_per_row,
+      p->quad_stride, int(p->ragged), static_cast<const uint32_t*>(p->tables), int(p->table_words), p->esc_shift,
+      p->esc_mask, static_cast<__nv_bfloat16*>(out));
+  return cudaGetLastError();
+}
+
+// The GEMV for `rows` <= kGemvRows: one, two or four activation tiles, the configurations measured
+// best on an RTX 5090 for GLM 5.3 Flash's [8192, 4096] q/k/v and [4096, 8192] o_proj. Every
+// configuration has K split 4 and the same per-element K order and fold, so a row's bits do not
+// depend on the row count.
+int32_t gemv(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32_t rows, cudaStream_t s) {
+  if (rows <= 16) return launch_gemv<4, 1, 1>(p, x, out, rows, s);
+  if (rows <= 32) return launch_gemv<4, 1, 2>(p, x, out, rows, s);
+  if (p->n >= 8192) return launch_gemv<4, 1, 4>(p, x, out, rows, s);
+  return launch_gemv<2, 2, 4>(p, x, out, rows, s);
+}
+
 }  // namespace
 
 // Bytes cuteafd_kx7_linear needs as `workspace` for `rows` activation rows over an [n, k]
@@ -119,8 +160,8 @@ extern "C" int32_t cuteafd_kx7_decode(const cuteafd_kx7_pack_t* pack, void* out_
   return cudaGetLastError();
 }
 
-// out [rows, n] BF16 = x [rows, k] BF16 @ W^T for W = `pack` [n, k] (FP32 accumulation, the
-// BF16 path's cuBLAS GEMM). `workspace` holds `workspace_bytes` >= cuteafd_kx7_workspace and
+// out [rows, n] BF16 = x [rows, k] BF16 @ W^T for W = `pack` [n, k] (FP32 accumulation): the
+// fused GEMV at 1..64 rows, else decode + the BF16 cuBLAS GEMM. `workspace` holds `workspace_bytes` >= cuteafd_kx7_workspace and
 // is the caller's for the call's duration (one is enough for every pack launched in order on
 // one stream). Asynchronous on `stream` and graph capturable. Returns 0, a cudaError_t, or for
 // a failed GEMM the native status.
@@ -129,20 +170,38 @@ extern "C" int32_t cuteafd_kx7_linear(const void* x, const cuteafd_kx7_pack_t* p
   if (!x || !out || !workspace || rows < 1 || !valid_v11(pack)) return cudaErrorInvalidValue;
   const int32_t n = pack->n, k = pack->k;
   if (workspace_bytes < cuteafd_kx7_workspace(rows, n, k)) return cudaErrorInvalidValue;
-  // ---- Dispatch point (the fused kernels land here, bit for bit the BF16 programs they
-  // replace, with no workspace pass):
-  //   rows <= kGemvRows (16):        the KX7 GEMV, each lane decoding its stream into bf16x2
-  //                                  MMA fragments (MmaFp8Gemv's grid, K order and fold);
-  //   kGemvRows < rows <= kTileRows (17..128): the KX7 tile GEMM, producer warps decoding the
-  //                                  next stage's weight tile into shared memory;
-  //   rows > kTileRows (prefill):    decode once, then the BF16 GEMM below.
-  // Until they land every row count takes the v0 path: decode, then the GEMM.
-  (void)kGemvRows;
-  (void)kTileRows;
+  // Decode and verify steps: the fused GEMV, each lane decoding its stream straight into MMA
+  // fragments (no workspace pass). Wider steps and prefill: decode once, then the BF16 GEMM.
+  if (gemv_applies(rows, pack->n, pack->slices)) return gemv(pack, x, out, rows, static_cast<cudaStream_t>(stream));
   const int32_t decoded = cuteafd_kx7_decode(pack, workspace, stream);
   if (decoded != 0) return decoded;
   const cuteafd_status_t gemm = cuteafd_cuda_linear_bf16_cublas_async(
       static_cast<const uint16_t*>(x), static_cast<const uint16_t*>(workspace), nullptr, static_cast<uint16_t*>(out),
       size_t(rows), size_t(k), size_t(n), stream);
   return gemm == CUTEAFD_STATUS_OK ? 0 : int32_t(gemm);
+}
+
+// Test support: the GEMV's BF16 twin over row-major BF16 weights w [n, k] (the same structure and
+// configurations as the KX7 GEMV for `rows` <= 64), so a test can show the KX7 GEMV equals it bit for
+// bit. Returns a cudaError_t; cudaErrorInvalidValue outside the GEMV's row range.
+extern "C" int32_t cuteafd_kx7_reference_gemv(const void* x, const void* w, void* out, int32_t rows, int32_t n,
+                                               int32_t k, void* stream) {
+  if (!x || !w || !out || !gemv_applies(rows, n, kGemvSlices) || k % (64 * kGemvSlices) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  auto run = [&](auto geo, auto kernel) -> int32_t {
+    using Geo = decltype(geo);
+    if (n % Geo::COLS != 0) return cudaErrorInvalidValue;
+    kernel<<<n / Geo::COLS, Geo::THREADS, Geo::bf16_smem(), s>>>(static_cast<const uint16_t*>(x), rows, n, k,
+                                                                 static_cast<const uint16_t*>(w),
+                                                                 static_cast<__nv_bfloat16*>(out));
+    return cudaGetLastError();
+  };
+  using kx7gemv::Geometry;
+  using kx7gemv::bf16_gemv_kernel;
+  if (rows <= 16) return run(Geometry<kGemvSlices, 4, 1, 1>{}, bf16_gemv_kernel<kGemvSlices, 4, 1, 1>);
+  if (rows <= 32) return run(Geometry<kGemvSlices, 4, 1, 2>{}, bf16_gemv_kernel<kGemvSlices, 4, 1, 2>);
+  if (n >= 8192) return run(Geometry<kGemvSlices, 4, 1, 4>{}, bf16_gemv_kernel<kGemvSlices, 4, 1, 4>);
+  return run(Geometry<kGemvSlices, 2, 2, 4>{}, bf16_gemv_kernel<kGemvSlices, 2, 2, 4>);
 }

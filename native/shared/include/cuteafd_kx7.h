@@ -48,6 +48,11 @@ int32_t cuteafd_kx7_decode(const cuteafd_kx7_pack_t* pack, void* out_bf16, void*
 int32_t cuteafd_kx7_linear(const void* x, const cuteafd_kx7_pack_t* pack, void* out, int32_t rows,
                            void* workspace, size_t workspace_bytes, void* stream);
 
+// Test support: the KX7 GEMV's BF16 twin over row-major BF16 w [n, k], for rows 1..64 (the
+// GEMV's range): bit for bit what cuteafd_kx7_linear gives for a pack of w at those rows.
+int32_t cuteafd_kx7_reference_gemv(const void* x, const void* w, void* out, int32_t rows, int32_t n, int32_t k,
+                                   void* stream);
+
 #ifdef __cplusplus
 }
 #endif
