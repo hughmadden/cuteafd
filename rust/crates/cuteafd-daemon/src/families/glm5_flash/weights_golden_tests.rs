@@ -215,6 +215,24 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
         }
         let head = (gpus == 2 && !oshard).then(|| loader.fp8(&["lm_head.weight".to_string()],
             crate::families::glm5_flash::fp8::Layout::Row128)).transpose()?;
+        let physical = (0..gpus as i32).collect::<Vec<_>>();
+        let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "fixture",
+            cuteafd_loader::placement::planner::Lifetime::TARGET,
+            cuteafd_core::memory_layout::Category::Weights, "target weights");
+        for (prefix, share) in &operands { share.inventory(&mut inventory, prefix)?; }
+        if let Some((values, scales)) = &head {
+            values.inventory(&mut inventory, "head.values")?;
+            scales.inventory(&mut inventory, "head.scales")?;
+        }
+        let mut census = crate::shared::memory::receipts::Census::default();
+        census.owners(inventory.receipts);
+        census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        let roots = census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).collect::<Vec<_>>();
+        assert_eq!(roots.len(), gpus);
+        assert_eq!(roots.iter().map(|receipt| receipt.allocation.bytes).sum::<u64>(),
+            loader.arenas.values().map(|arena| arena.layout().bytes() as u64).sum::<u64>());
+        assert!(census.receipts.iter().filter(|receipt| receipt.allocation.view.is_some()).count() > gpus);
         let all = load.sink.as_ref().context("push sink")?.take_all();
         let (records, steps) = (&all.operands, &all.steps);
         let landed: usize = records.iter().map(|r| r.bytes).sum();
