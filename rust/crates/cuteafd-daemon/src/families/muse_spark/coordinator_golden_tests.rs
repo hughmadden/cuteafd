@@ -154,13 +154,19 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         .with_context(|| format!("Muse checkpoint lacks {name}"))?;
     let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
     let ((embedding, weights), records) = dense::recording(|| {
+        let arenas = devices.iter().enumerate().map(|(rank, &device)| {
+            let layers = built.layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(
+                    rank, GPUS, &built.global, &layers)?)
+        }).collect::<Result<Vec<_>>>()?;
         devices[0].run(|| TokenEmbedding::load(&library, source.clone(),
             crate::shared::memory::EmbedPlacement::Gpu, || {
                 let mut loaded = Vec::with_capacity(GPUS);
                 for (rank, device) in devices.iter().enumerate() {
                     loaded.push(device.run(|| Ok::<_, anyhow::Error>((
-                        load_rank(*device, &cfg, &checkpoint, &built.layouts, rank)?,
-                        GlobalWeights::load(*device, &checkpoint, &built.global, rank, GPUS)?)))?);
+                        load_rank(*device, &cfg, &checkpoint, &built.layouts, rank, &arenas[rank])?,
+                        GlobalWeights::load(*device, &checkpoint, &built.global, rank, GPUS, &arenas[rank])?)))?);
                 }
                 Ok(loaded)
             }))

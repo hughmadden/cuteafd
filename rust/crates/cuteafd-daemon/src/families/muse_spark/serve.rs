@@ -299,11 +299,17 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     }).transpose()?;
     let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(Some(admission), || {
         let load = || -> Result<_> {
+            let arenas = devices.iter().enumerate().map(|(rank, &device)| {
+                let layers = built.layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
+                crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                    cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(
+                        rank, gpus, &built.global, &layers)?)
+            }).collect::<Result<Vec<_>>>()?;
             let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
                 crate::shared::memory::EmbedPlacement::Gpu, || {
                     devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
                         super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
-                            checkpoint: &checkpoint, built: &built, placement, rank, slots: sequences as u64,
+                            checkpoint: &checkpoint, built: &built, placement, rank, slots: sequences as u64, arena: &arenas[rank],
                             unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
                         .collect::<Result<Vec<_>>>()
                 }))?;

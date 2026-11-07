@@ -10,6 +10,34 @@ use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout}
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
+/// Final target storage on one physical GPU; conversion inputs and the
+/// independently selected drafter/onboarding scopes are not retained here.
+pub fn coordinator_arena(rank: usize, ranks: usize, global: &GlobalLayout, layers: &[&LayerLayout])
+    -> Result<crate::serving_capacity::WeightArenaLayout> {
+    ensure!(matches!(ranks, 1 | 2) && rank < ranks, "Muse arena rank {rank} of {ranks}");
+    let mut tensors = vec![("global.final_norm".to_owned(), global.final_norm)];
+    if rank == 0 { tensors.push(("embedding.table".into(), global.embedding)); }
+    if rank + 1 == ranks {
+        if let Some(head) = &global.head { tensors.extend(head.arena_tensors(&head.stem)?); }
+        else { tensors.push(("global.head".into(), global.head_bf16)); }
+    }
+    for (layer, layout) in layers.iter().enumerate() {
+        tensors.extend(layout.operands.iter().map(|(name, bytes)| (format!("layers.{layer}.{name}"), *bytes)));
+        for core in layout.core.values() { tensors.extend(core.arena_tensors(&core.stem)?); }
+        for native in layout.native.values() {
+            let [n, k] = native.shape;
+            tensors.push((format!("{}.values", native.stem), n.checked_mul(k)
+                .and_then(|bytes| bytes.checked_mul(if native.fp8 { 1 } else { 2 }))
+                .context("Muse native arena values overflow")?));
+            if native.fp8 {
+                tensors.push((format!("{}.scales", native.stem), n.div_ceil(128).checked_mul(k.div_ceil(128))
+                    .and_then(|bytes| bytes.checked_mul(4)).context("Muse native arena scales overflow")?));
+            }
+        }
+    }
+    crate::serving_capacity::WeightArenaLayout::new(format!("muse/coordinator/{rank}"), tensors)
+}
+
 /// One rank's operands of one layer: plain operand bytes by name, and K6 core
 /// layouts by name. Names are the device binding names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +282,90 @@ pub fn projections_with_manifest(cfg: &MuseSparkConfig, core: &CoreInventory, ra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "reads the installed Muse checkpoint headers"]
+    fn installed_coordinator_arena_inventory() -> Result<()> {
+        let hub = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
+        let snapshot = hub.join("hub/models--wrldsuksgo2mars--Muse-Spark-Open-EXL3-K4-Core-K6/snapshots/89998fb177acd9a862ac8bd4fb79bfd50e940c97");
+        let checkpoint = crate::plan::Checkpoint::inventory(&snapshot)?;
+        let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let global = GlobalLayout::new(&cfg, &core)?;
+        for ranks in [1, 2] {
+            let layers = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, ranks, &core))
+                .collect::<Result<Vec<_>>>()?;
+            for rank in 0..ranks {
+                let local = layers.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
+                let arena = coordinator_arena(rank, ranks, &global, &local)?;
+                let large = arena.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
+                let rounding = |bytes: usize| bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+                eprintln!("Muse installed inventory TP{ranks} rank{rank}: N={} payload={} large_N={} large_bytes={} old_large_slack={} arena={} padding={} final_tail={}",
+                    arena.views().len(), arena.payload_bytes(), large.len(),
+                    large.iter().map(|view| view.bytes()).sum::<usize>(),
+                    large.iter().map(|view| rounding(view.bytes())).sum::<usize>(), arena.bytes(),
+                    arena.padding_bytes(), rounding(arena.bytes()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_arenas_cover_final_tp1_and_tp2_formats() -> Result<()> {
+        use super::super::core::{CoreSplit, NativeProjection};
+        let dir = tempfile::tempdir()?;
+        crate::plan::testing::write_muse_spark_snapshot(dir.path(), &[]);
+        let checkpoint = crate::plan::Checkpoint::inventory(dir.path())?;
+        let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+        let release = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let mut native = release.clone();
+        for (stem, projection) in &release.projections {
+            if !stem.contains(".self_attn.") { continue; }
+            native.projections.remove(stem);
+            native.native.insert(stem.clone(), NativeProjection { shape: projection.shape, fp8: true,
+                split: projection.split });
+        }
+        // The served head stays K6; BF16 head variants remain CPU-layout coverage.
+        let mut native_bf16 = native.clone();
+        for projection in native_bf16.native.values_mut() { projection.fp8 = false; }
+        for (format, core) in [("K6", release), ("native-fp8", native), ("native-bf16", native_bf16),
+            ("bf16", CoreInventory::default())] {
+            let global = GlobalLayout::new(&cfg, &core)?;
+            for ranks in [1, 2] {
+                let layers = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, ranks, &core))
+                    .collect::<Result<Vec<_>>>()?;
+                for rank in 0..ranks {
+                    let local = layers.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
+                    let arena = coordinator_arena(rank, ranks, &global, &local)?;
+                    let payload = local.iter().map(|layer| layer.bytes()).collect::<Result<Vec<_>>>()?
+                        .iter().sum::<usize>() + global.final_norm + if rank == 0 { global.embedding } else { 0 }
+                        + if rank + 1 == ranks { global.head_bytes() } else { 0 };
+                    assert_eq!(arena.payload_bytes(), payload);
+                    let mut ordered = arena.views().values().copied().collect::<Vec<_>>();
+                    ordered.sort_by_key(|view| view.offset());
+                    assert!(ordered.windows(2).all(|pair| pair[0].offset() + pair[0].bytes() <= pair[1].offset()));
+                    assert!(ordered.iter().all(|view| view.offset() % 256 == 0));
+                    assert_eq!(ordered.last().map(|view| view.offset() + view.bytes()), Some(arena.bytes()));
+                    assert_eq!(arena.view("embedding.table").is_some(), rank == 0);
+                    assert_eq!(arena.padding_bytes(), arena.bytes() - payload);
+                    let large = ordered.iter().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
+                    let rounding = |bytes: usize| bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+                    eprintln!("Muse arena inventory {format} TP{ranks} rank{rank}: N={} payload={} large_N={} large_bytes={} old_large_slack={} arena={} padding={} final_tail={}",
+                        ordered.len(), payload, large.len(), large.iter().map(|view| view.bytes()).sum::<usize>(),
+                        large.iter().map(|view| rounding(view.bytes())).sum::<usize>(), arena.bytes(),
+                        arena.padding_bytes(), rounding(arena.bytes()));
+                    for native in local.iter().flat_map(|layer| layer.native.values()) {
+                        assert!(matches!(native.split, CoreSplit::Input | CoreSplit::Output));
+                        assert!(arena.view(&format!("{}.values", native.stem)).is_some());
+                        assert_eq!(arena.view(&format!("{}.scales", native.stem)).is_some(), native.fp8);
+                        assert!(arena.view(&format!("{}.weight", native.stem)).is_none(), "no conversion source residency");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn release_layer_layout_on_one_and_two_gpus() {
