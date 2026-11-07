@@ -1141,7 +1141,11 @@ deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio
     replay_records=report.get("replay_records"), spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=expert_world, ep=ep,
                   wire="native_ownership" if explicit and expert_world else "canonical"), peers=peers,
-    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
+    speculator=("mtp" if expert_world == 0 and config.get("text_config", config).get("mtp_num_hidden_layers") == 1
+        and (config.get("quantization_config", {}).get("quant_method") == "exl3"
+             or config.get("quantization_config", {}).get("quant_method") == "modelopt"
+             and any(group.get("weights", {}).get("num_bits") == 4 for group in config["quantization_config"].get("config_groups", {}).values()))
+        else "off") if family == "qwen4" and value("--speculator") == "auto" else value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
@@ -3924,6 +3928,59 @@ def test_qwen_local_mtp_default_preserves_overrides(tmp_path: Path, keys: str, d
         assert "--mtp " not in launch
     else:
         assert f"--mtp {depth}" in launch
+
+
+@pytest.mark.parametrize("method", ["exl3", "modelopt"])
+@pytest.mark.parametrize("inventory,world,tower", [(0, 0, False), (3, 0, False), (3, 0, True), (2, 2, False)])
+@pytest.mark.parametrize("override", [None, "auto", "mtp", "off"])
+def test_qwen_auto_mtp_follows_admitted_world(tmp_path, method, inventory, world, tower, override):
+    quant = {"quant_method": method}
+    if method == "modelopt":
+        quant["config_groups"] = {"experts": {"weights": {"num_bits": 4}}}
+    config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": quant}
+    placement = {"kind": {"kind": "spark", "rank": 2}, "replicas": []}
+    roles = ([dict(rank=2, experts=False, layers=[], encoder=placement, audio_encoder=None, drafter=None)]
+             if tower else [dict(rank=i, experts=True, layers=[1], encoder=None, audio_encoder=None, drafter=None)
+                            for i in range(world)])
+    keys = f"RTX_GPUS=1\nSPARK_COUNT={inventory}\nAUDIO=off\n"
+    keys += "VISION=spark:2\n" if tower else "VISION=off\n"
+    if tower:
+        config["vision_config"] = {"depth": 2}
+    if override is not None:
+        keys += f"SPECULATOR={override}\n"
+    result = _family_launch_result(tmp_path, config, "test/model", keys,
+        extra_args=("--wip", "qwen-auto-policy"),
+        encoder_plan={"placement_supported": not tower, "fits": not tower,
+            "spark_expert_world": world, "spark_roles": roles, "encoder": placement if tower else None,
+            "hints": ["vision-only Spark workers are not supported"] if tower else []})
+    plan = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan " in line)
+    assert plan[plan.index("--speculator") + 1] == (override or "auto")
+    if tower:
+        assert result.returncode != 0 and "vision-only Spark workers are not supported" in result.stderr
+        assert "cuteafd serve-qwen4 --snapshot" not in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-qwen4 --snapshot" in line)
+    expected = override == "mtp" or override in (None, "auto") and world == 0
+    assert ("--mtp" in serve) == expected, serve
+    if expected:
+        assert serve[serve.index("--mtp") + 1] == "3"
+    assert ("--local-experts" in serve) == (world == 0)
+
+
+def test_qwen_explicit_speculator_must_match_deployment(tmp_path):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+        "SPARK_COUNT=0\nSPECULATOR=off\n", deployment_overrides={"speculator": "mtp"})
+    assert result.returncode != 0 and "deployment changed resolved speculator" in result.stderr
+
+
+@pytest.mark.parametrize("value", [None, "auto", "bogus"])
+def test_glmf_missing_resolved_replay_records_is_an_error(tmp_path, value):
+    result = _family_launch_result(tmp_path, GLMF_VISION, "test/model",
+        "SPARK_COUNT=0\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        deployment_overrides={"replay_records": value})
+    assert result.returncode != 0 and "does not name resolved replay records" in result.stderr
+    assert "cuteafd serve-glmf --snapshot" not in result.stderr
 
 
 def test_qwen_spark_mtp_keeps_the_draft_layer_on_coordinator(tmp_path: Path) -> None:

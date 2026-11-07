@@ -367,6 +367,9 @@ pub struct PlanReport {
     /// GLM Flash KDA replay-record storage (`own` or `shared`) resolved by the planner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_records: Option<&'static str>,
+    /// Qwen's automatic native MTP choice, charged by the same plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speculator: Option<&'static str>,
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
@@ -434,6 +437,8 @@ pub struct PlanOptions {
     pub mapped_scale_host_budget_bytes: Option<u64>,
     /// Resolved target-checkpoint draft ownership; absent keeps family defaults.
     pub draft_ownership: Option<spec::DraftOwnership>,
+    /// Resolve qualified Qwen MTP from each candidate's admitted expert world.
+    pub qwen_auto_mtp: bool,
     pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub vision: MediaMode,
     pub audio: MediaMode,
@@ -458,6 +463,7 @@ impl Default for PlanOptions {
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
+            qwen_auto_mtp: false,
             attention_placement: None,
             vision: MediaMode::Auto,
             audio: MediaMode::Auto,
@@ -899,8 +905,41 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     }
 }
 
+/// Match the qualified local paths: one native stage, EXL3 or ModelOpt's
+/// four-bit weight groups (including its FP8 MTP package).
+pub fn qualified_qwen_mtp(config: &serde_json::Value) -> bool {
+    let text = config.get("text_config").unwrap_or(config);
+    let quant = &config["quantization_config"];
+    let method = quant.get("quant_method").or_else(|| quant.get("method")).and_then(serde_json::Value::as_str);
+    text["mtp_num_hidden_layers"] == 1 && (method == Some("exl3")
+        || method == Some("modelopt") && quant["config_groups"].as_object()
+            .is_some_and(|groups| groups.values().any(|group| group["weights"]["num_bits"] == 4)))
+}
+
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-    let mut report = plan_unrestricted(input, options)?;
+    let mut resolved = options.clone();
+    let auto = options.qwen_auto_mtp;
+    let choice = |world| {
+        if world == 0 && options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0)
+            && qualified_qwen_mtp(&input.checkpoint().config) { "mtp" } else { "off" }
+    };
+    let mut selected = choice(options.placement.spark_ranks());
+    if auto { resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected)); }
+    let mut report = plan_unrestricted(input, &resolved)?;
+    if auto {
+        let admitted = choice(report.spark_expert_world());
+        if admitted != selected {
+            // Rebuild every owner, workspace and cache charge, not just the JSON flag.
+            selected = admitted;
+            resolved.draft_ownership = Some(spec::DraftOwnership::selected("qwen4", selected));
+            report = plan_unrestricted(input, &resolved)?;
+            if choice(report.spark_expert_world()) != selected {
+                report.refuse_placement("Qwen auto MTP changes the admitted expert world".into(),
+                    "Select SPECULATOR=mtp or off explicitly for this placement.");
+            }
+        }
+        report.speculator = Some(selected);
+    }
     let _timer = PhaseTimer::new(&input.phases.admission, &[&input.phases.catalog, &input.phases.layout]);
     match spark_range::admit(input, options, &report) {
         Ok(()) => {},
@@ -976,6 +1015,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         hints: Vec::new(),
         exlr8_prefill_activations: None,
         replay_records: None,
+        speculator: None,
         memory_layout: None,
         solver_placement: None,
         tp2_dflash: None,

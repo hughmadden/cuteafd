@@ -29,6 +29,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
+        qwen_auto_mtp: false,
         attention_placement: cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(|reason| PlanError::InvalidOption { option: "--attention-placement", reason })?,
         vision: args.vision,
@@ -345,6 +346,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     validate_glmf_precision(&args, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
+    options.qwen_auto_mtp = family == "qwen4" && args.speculator == "auto";
     let tp2_dspark_experts = tp2_dspark_experts(&args, family, &cfg)?;
     let tp2_dflash = tp2_dflash(&args, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
@@ -352,7 +354,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         layout.tp2_dspark_experts = tp2_dspark_experts;
         layout.tp2_dflash = tp2_dflash;
         layout.glmf_tp2_dflash_auto = glmf_tp2_dflash_auto(&args, family, &cfg);
-        if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
+        if !options.qwen_auto_mtp && !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
         resolve_mimo_drafter(layout, &args.speculator);
@@ -552,11 +554,12 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             else if let Some(depth) = cfg.get("MTP") { if depth == "0" { "off" } else { "mtp" }.into() }
             else if let Some(mode) = cfg.get("DSPARK") { if mode == "on" { "dspark" } else { "off" }.into() }
             else if family == "mimo_v2" && cfg.get("DFLASH").is_some_and(|v| v == "off") { "off".into() }
+            else if family == "qwen4" { "auto".into() }
             else { default.into() }
         });
     }
-    if args.speculator == "auto" { args.speculator = default.into(); }
-    anyhow::ensure!(["off", "mtp", "dspark", "dflash2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
+    if args.speculator == "auto" && family != "qwen4" { args.speculator = default.into(); }
+    anyhow::ensure!(["auto", "off", "mtp", "dspark", "dflash2"].contains(&args.speculator.as_str()), "unknown SPECULATOR={}", args.speculator);
     anyhow::ensure!(!(args.no_speculator && args.include_speculator), "--no-speculator conflicts with --include-speculator");
     if args.no_speculator {
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
@@ -567,7 +570,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3" | "muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
-        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
+        | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41" | "mistral_large4", "dspark") => true,
         _ => false,
     };

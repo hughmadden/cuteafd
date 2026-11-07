@@ -155,7 +155,7 @@ Spark layer IDs and inactive hinted/loaded counts.
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `SPECULATOR` | family default | `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
+| `SPECULATOR` | family default | `auto` (Qwen4), `off`, `dflash2`, `dspark`, `mtp` | Which fail is in the table below. |
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
@@ -300,6 +300,12 @@ Speculator (`SPECULATOR`):
 | `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) |
 | `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✗ | ✗ | ✗ |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ |
+
+Qwen4 unset/`auto` selects native MTP (depth 3) only for qualified local
+EXL3 or ModelOpt NVFP4 with one MTP stage and an admitted Spark expert
+world of zero. Configured Spark inventory and vision-only ranks do not
+disable this default; tower-only Qwen layouts remain unsupported. Other
+formats and Spark expert layouts default off. Explicit values win.
 
 KV precision (`KV_CACHE`; `SWA_KV_CACHE` is MiMo only):
 

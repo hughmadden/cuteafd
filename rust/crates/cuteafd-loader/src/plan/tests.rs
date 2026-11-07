@@ -6053,3 +6053,31 @@ fn v4_auto_pool_and_count_admission_preserve_one_recipe() {
     }
     assert!(!counted.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));
 }
+
+#[test]
+fn qwen_auto_mtp_matches_explicit_memory_and_deployment() {
+    use spec::DraftOwnership;
+    let mut config = qwen4_config(4);
+    config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    let dir = snapshot(config, &[t("mtp.layers.0.enorm.weight", "BF16", &[2560])]);
+    for ranks in [0, 2] {
+        let options = PlanOptions { qwen_auto_mtp: true, ..sparks(ranks) };
+        let auto = plan(dir.path(), &options).unwrap();
+        let selected = if ranks == 0 { "mtp" } else { "off" };
+        assert_eq!(auto.speculator, Some(selected));
+        let explicit = plan(dir.path(), &PlanOptions { qwen_auto_mtp: false,
+            draft_ownership: Some(DraftOwnership::selected("qwen4", selected)), ..options }).unwrap();
+        assert_eq!(serde_json::to_value(&auto.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+        assert_eq!(component(&auto, Component::Speculator).status == Status::Disabled, selected == "off");
+    }
+    for (quant, stages, qualified) in [
+        (json!({"quant_method":"exl3"}), 1, true),
+        (json!({"quant_method":"exl3"}), 2, false),
+        (json!({"quant_method":"fp8"}), 1, false),
+        (json!({"quant_method":"nvfp4"}), 1, false),
+        (json!({"quant_method":"modelopt", "config_groups":{"g":{"weights":{"num_bits":4}}}}), 1, true),
+    ] {
+        let cfg = json!({"quantization_config":quant, "text_config":{"mtp_num_hidden_layers":stages}});
+        assert_eq!(qualified_qwen_mtp(&cfg), qualified);
+    }
+}
