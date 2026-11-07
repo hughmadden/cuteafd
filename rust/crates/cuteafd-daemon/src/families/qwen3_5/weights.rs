@@ -4,8 +4,9 @@ use crate::shared::qwen::weights::WeightReader;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::families::qwen::HybridAttention;
-use cuteafd_loader::{families::qwen3_5::Qwen35Config, plan::checkpoint::Checkpoint,
-    serving_capacity::WeightArenaLayout};
+use cuteafd_loader::families::qwen3_5::Qwen35Config;
+#[cfg(test)]
+use cuteafd_loader::{plan::checkpoint::Checkpoint, serving_capacity::WeightArenaLayout};
 use std::{collections::HashMap, ffi::c_void};
 
 const PREFIX: &str = "model.language_model.";
