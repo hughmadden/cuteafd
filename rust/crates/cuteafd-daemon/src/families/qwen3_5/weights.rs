@@ -121,7 +121,8 @@ mod tests {
                     let (dtype, shape) = match spec.storage {
                         Storage::Fp8 => (DType::F8E4M3, vec![128, 128]),
                         Storage::Scales => (DType::Bf16, vec![1, 1]),
-                        Storage::F32 | Storage::NativeNorm => (DType::Bf16, vec![1]),
+                        Storage::F32 => (DType::Bf16, vec![129]),
+                        Storage::NativeNorm => (DType::Bf16, vec![128]),
                         Storage::Bf16 => (DType::Bf16, vec![128, 128]),
                     };
                     add(name, dtype, shape);
@@ -171,7 +172,15 @@ mod tests {
                 assert_eq!(target.view("embedding.table").unwrap().bytes(), 32768);
                 assert_eq!(target.view("head.weight").unwrap().bytes(), 32768);
                 let p = format!("{PREFIX}layers.0");
-                assert_eq!(target.view(&format!("{p}/a_log")).unwrap().bytes(), 256);
+                assert_eq!(target.view(&format!("{p}/a_log")).unwrap().bytes(), 516);
+                assert!(target.padding_bytes() > 0);
+                for tensor in &mut checkpoint.tensors {
+                    if ["conv1d.weight", "A_log", "dt_bias"].iter().any(|suffix| tensor.meta.name.ends_with(suffix)) {
+                        tensor.meta.dtype = DType::F32;
+                        tensor.meta.byte_length *= 2;
+                    }
+                }
+                assert_eq!(target_arena(&checkpoint, &cfg, DType::Bf16, format)?, target);
                 if format.fp8() {
                     assert_eq!(target.view(&format!("{p}/w_qkvz_scale")).unwrap().bytes(), 256);
                     assert!(target.view(&format!("{p}/w_in")).is_none());
