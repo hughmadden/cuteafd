@@ -39,7 +39,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let attention = if gpus == 1 { report.requested_attention.unwrap_or(AttentionPlacement::Heads) }
         else { crate::families::kimi_k3::resolve_attention(report.requested_attention, gpus) };
     report.attention_placement = attention;
-    let context = if opts.context_tokens == 0 { crate::families::kimi_k3::default_context(&model.core) as u64 } else { opts.context_tokens };
+    let context = if opts.context_tokens == 0 { cfg.max_position as u64 } else { opts.context_tokens };
     memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
     if context > COMPILED_CAPACITY {
         report.refuse_placement(format!("Kimi context {context} exceeds compiled capacity {COMPILED_CAPACITY}"),

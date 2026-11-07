@@ -810,7 +810,7 @@ mod draft_prefix_tests {
                 ..Default::default()
             })?;
             let (base, context, concurrency) = selected_host_geometry(&mut report, &options, checkpoint, model, &input)?;
-            assert_eq!(context, crate::families::kimi_k3::DEFAULT_CONTEXT as u64);
+            assert_eq!(context, (crate::families::kimi_k3::COMPILED_CONTEXT as u64).min(report.memory_layout.as_ref().unwrap().pool_tokens));
             assert_eq!(concurrency, 2);
             assert_eq!(base.page_bytes, 24 * 64 * format.record_bytes() as u64);
             options.kimi_drafter_snapshot = Some(draft.path().to_path_buf());
@@ -1576,10 +1576,9 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         ensure!(shape.native_layers == 3, "V4.1 dSpark retains all three stages");
         mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
     }
-    let mut context = shape.context_tokens;
-    if options.context_tokens == 0 {
-        context = model.default_context_tokens().unwrap_or(context);
-    }
+    let context = if id == "kimi_k3" && options.context_tokens == 0 {
+        shape.context_tokens.min(report.memory_layout.as_ref().map_or(shape.context_tokens, |memory| memory.pool_tokens))
+    } else { shape.context_tokens };
     if id == "kimi_k3" {
         if let Some(snapshot) = &options.kimi_drafter_snapshot {
             let draft = crate::formats::dflash::MlaDflashConfig::read(snapshot)?;

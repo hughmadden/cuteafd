@@ -89,9 +89,6 @@ pub trait FamilyModel: Send + Sync {
         Ok(None)
     }
 
-    /// A checkpoint-derived API context cap when the operator leaves it automatic.
-    fn default_context_tokens(&self) -> Option<u64> { None }
-
     /// Routed-expert weight bytes one Spark rank may hold when the operator
     /// sets no `--spark-memory-cap`. Families whose release needs more state
     /// the measured reason with their override.

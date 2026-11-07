@@ -2189,9 +2189,8 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn automatic_pool_grows_beyond_default_context_floor() -> Result<()> {
+    fn automatic_pool_serves_model_maximum_clamped_to_admission() -> Result<()> {
         use cuteafd_core::memory_policy::AGENTIC_FLOOR_TOKENS;
-        use cuteafd_loader::families::kimi_k3::DEFAULT_CONTEXT;
         use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
@@ -2200,12 +2199,12 @@ pub(super) mod tests {
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
             let mut i = inputs(&cfg);
             i.cache_format = format;
-            i.serving_context = cuteafd_loader::placement::planner::Context::automatic(DEFAULT_CONTEXT as u64);
-            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, test_unit(i.rows, i.waves, i.unit_rows), DEFAULT_CONTEXT,
+            i.serving_context = cuteafd_loader::placement::planner::Context::automatic(cfg.max_position as u64);
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, test_unit(i.rows, i.waves, i.unit_rows), cfg.max_position,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             let request = request(i)?;
             assert_eq!(request.pool.floor, AGENTIC_FLOOR_TOKENS);
-            assert_eq!(request.pool.compiled_context, DEFAULT_CONTEXT as u64);
+            assert_eq!(request.pool.compiled_context, cfg.max_position as u64);
             assert!(request.pool.target > request.pool.floor);
             assert!(solve(&request)?.pool_tokens > request.pool.floor);
             let report = plan_input.plan(&PlanOptions {
@@ -2219,7 +2218,8 @@ pub(super) mod tests {
             ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
             let memory = report.memory_layout.context("Kimi default planned layout")?;
             assert!(memory.pool_tokens > AGENTIC_FLOOR_TOKENS);
-            assert!(memory.notes.iter().any(|note| note.contains("API max context: 524288 tokens; compiled max context: 1048576 tokens")));
+            let served = (cfg.max_position as u64).min(memory.pool_tokens);
+            assert!(memory.notes.iter().any(|note| note.contains(&format!("API max context: {served} tokens; compiled max context: 1048576 tokens"))));
         }
         Ok(())
     }
