@@ -3974,7 +3974,7 @@ def test_qwen_auto_mtp_follows_admitted_world(tmp_path, method, inventory, world
         keys += f"SPECULATOR={override}\n"
     result = _family_launch_result(tmp_path, config, "test/model", keys,
         extra_args=("--wip", "qwen-auto-policy"),
-        encoder_plan={"placement_supported": True, "fits": True,
+        encoder_plan={"placement_supported": True, "fits": True, "encoder_plan_hash": "ab" * 32,
             "spark_expert_world": world, "spark_roles": roles, "encoder": placement if tower else None})
     plan = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan " in line)
     assert plan[plan.index("--speculator") + 1] == (override or "auto")
