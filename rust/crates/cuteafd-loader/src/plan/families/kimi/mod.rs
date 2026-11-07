@@ -317,9 +317,6 @@ impl FamilyModel for Model {
         self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)
     }
     fn native_serving_admission(&self) -> bool { true }
-    fn default_context_tokens(&self) -> Option<u64> {
-        Some(crate::families::kimi_k3::default_context(&self.core) as u64)
-    }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }

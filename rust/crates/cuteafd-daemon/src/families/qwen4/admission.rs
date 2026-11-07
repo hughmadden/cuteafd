@@ -858,7 +858,7 @@ mod tests {
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(dir.path())?;
         let mut args = Cli::try_parse_from(["serve", "--snapshot", dir.path().to_str().unwrap(),
             "--native-lib", lib.to_str().unwrap(), "--local-experts", "--split-device", "1",
-            "--prefill-rows", "64", "--max-context", "131072", "--pool-tokens", "0"])?.engine;
+            "--prefill-rows", "64", "--max-context-tokens", "131072", "--pool-tokens", "0"])?.engine;
         args.mtp = if mtp { 3 } else { 0 };
         args.planner_prefix_bytes = Some(0);
         args.planner_graph_modes = Some((8, true));
@@ -967,7 +967,7 @@ mod tests {
                     "marks" | "startup graphs" | "decode step" | "prefill step"))
                     .map(|i| i.bytes).sum::<u64>();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
-                    "--native-lib", "/nonexistent/lib.so", "--max-context", &context.to_string(),
+                    "--native-lib", "/nonexistent/lib.so", "--max-context-tokens", &context.to_string(),
                     "--slots", &concurrency.to_string(),
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
@@ -1031,7 +1031,7 @@ mod tests {
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
             &cuteafd_loader::plan::testing::qwen4_config(48))?;
         let local = Cli::try_parse_from(["serve", "--snapshot", "/absent/checkpoint", "--native-lib", "/absent/native.so",
-            "--local-experts", "--max-context", "32768"])?.engine;
+            "--local-experts", "--max-context-tokens", "32768"])?.engine;
         let mut with_peers = local.clone();
         with_peers.peers = Some("127.0.0.1:1234,127.0.0.1:1235".into());
         let input = |args, source, pending| -> anyhow::Result<_> {

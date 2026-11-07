@@ -256,7 +256,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         spark_budget_bytes, reserve = "estimated until W9 census",
         "Kimi admitted TP2 expert ownership");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
-    cuteafd_bench::context::set_resolved("max-context", &options.max_context.to_string());
+    cuteafd_bench::context::set_resolved("max-context-tokens", &options.max_context.to_string());
     let plan = admitted.execution_plan()?;
     let admission_free = inventory.gpus.iter().map(|sample| sample.free_bytes).collect::<Vec<_>>();
     let admitted_bytes = admitted.placement.items.iter().map(|items| items.iter().map(|item| item.bytes).sum::<u64>())

@@ -160,7 +160,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `ATTENTION_MODE` | `hqa` | `hqa`, `compact`, `fp8-compact` | Per qualified checkpoint family in `scripts/lib/attention-variants.json` (shared by launcher, launch-key registry and daemon; no separate per-family key gate): default native HQA bundle, parent compact bundle, or deterministic load/push FP8 conversion of native BF16. Already-FP8 HQA cannot be converted again. Step-5 converts native O only, including private MTP O, and retains F32 TP2 partials. Selected for the model lifetime. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
-| `MAX_CONTEXT_TOKENS` | automatic | 1–1048576 | Omitted: serve min(model maximum context, admitted pool). Explicit: pin context and require the pool to cover it. |
+| `MAX_CONTEXT_TOKENS` | `auto` | `auto`, 1–1048576 | `auto`: serve min(model maximum context, admitted pool). A number pins context and requires the pool to cover it. Plan and every serve command use `--max-context-tokens` with `auto` or a number; explicit CLI overrides the config. Compiled workspace/table extent is internal, not a user context setting. |
 | `MAX_OUTPUT_TOKENS` | `131072` | integer | Generation cap. |
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
 | `SWA_KV_CACHE` | `int8` | `bf16`, `int8`, `fp8` | MiMo sliding/MTP rings. |
@@ -431,7 +431,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `ATTENTION_MODE` | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
-| `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
 | `SWA_KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |

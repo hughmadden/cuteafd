@@ -101,8 +101,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (layers 0-2 are the dense ones).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<usize>)]
     pub max_context: usize,
     /// Tokens the MLA record pools hold across sequences.
     #[arg(long, default_value_t = 32_768)]
@@ -522,7 +522,7 @@ mod draft_cli_tests {
     fn resolved_flash_capacity_and_native_flags_are_runtime_facts() {
         let mut args = Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l"]).unwrap().engine;
         crate::commands::bench::assert_resolved_family_seam("glm5_flash",
-            &["max-context", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device", "attention-plan-rows"], || {
+            &["max-context-tokens", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device", "attention-plan-rows"], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
                 serve::resolve_serving_capacity(&mut args, 16);
                 native::normalize(&mut args);

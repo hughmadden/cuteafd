@@ -19,16 +19,6 @@ pub fn resolve_attention(requested: Option<crate::placement::AttentionPlacement>
     requested.unwrap_or(if ranks == 2 { crate::placement::AttentionPlacement::Context }
         else { crate::placement::AttentionPlacement::Layers })
 }
-/// Default context for a BF16 (K2-class) core: one full-length conversation
-/// would leave little pool beside the BF16 core weights.
-pub const DEFAULT_CONTEXT: usize = 524_288;
-
-/// The default API/allocation context from the checkpoint's own core: a
-/// header-native K6 core frees the memory for the full compiled 1M extent with
-/// the full pool and onboard experts (TJ, 2026-10-22); BF16 cores keep 512K.
-pub fn default_context(core: &core::CoreInventory) -> usize {
-    if core.projections.is_empty() { DEFAULT_CONTEXT } else { COMPILED_CONTEXT }
-}
 pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
 
 /// TP6 retained EXL3 arenas/private capacities plus 4096-row K32 input/routes

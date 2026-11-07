@@ -84,7 +84,7 @@ pub(crate) struct ServeArgs {
     /// Immutable target and native predictor KV storage.
     #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<u64>)]
     max_context: u64,
     /// Prefill unit rows (PLAN "Prefill contract"); a prefill call holds
     /// `--prefill-waves` units; zero selects the shared topology shape.
@@ -348,7 +348,7 @@ fn with_backend<T>(args: &ServeArgs,
     // are validated against the ownership it selected.
     let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract, native_selection)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
-    cuteafd_bench::context::set_resolved("max-context", &admission.solved.served_context().to_string());
+    cuteafd_bench::context::set_resolved("max-context-tokens", &admission.solved.served_context().to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup planning complete");
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
@@ -1222,7 +1222,7 @@ mod tests {
                 .collect::<std::result::Result<_, _>>()?;
             args.validate()?;
             let (shape, model) = crate::commands::bench::assert_resolved_family_seam("step5",
-                &["max-context", "pool-tokens", "rtx-expert-layers"], || {
+                &["max-context-tokens", "pool-tokens", "rtx-expert-layers"], || {
                     args.prefix.resolve_entries(args.max_sequences as usize);
                     let shape = args.shape()?;
                     args.prefill_rows = unit as u32;

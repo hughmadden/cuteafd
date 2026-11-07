@@ -47,8 +47,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers.
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<usize>)]
     pub max_context: usize,
     /// Tokens the K/V record pools hold across sequences (0: planner admission).
     #[arg(long, default_value_t = 32_768)]
@@ -367,7 +367,7 @@ mod weight_representation_tests {
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
             let shape = crate::commands::bench::assert_resolved_family_seam("qwen4",
-                &["max-context", "pool-tokens", "slots", "mtp", "rtx-expert-layers", "attention-plan-rows"], || {
+                &["max-context-tokens", "pool-tokens", "slots", "mtp", "rtx-expert-layers", "attention-plan-rows"], || {
                     crate::commands::bench::fixture_prefix().resolve_entries(16);
                     let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
                     let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;

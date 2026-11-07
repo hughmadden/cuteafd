@@ -349,7 +349,7 @@
    "0",
    "--prefill-rows",
    "0",
-   "--context-tokens",
+   "--max-context-tokens",
    "1048576",
    "--concurrency",
    "16",

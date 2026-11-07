@@ -651,7 +651,7 @@ mod ownership_tests {
         let mut args = Parse::try_parse_from(["test", "--snapshot", &env("CUTEAFD_GOLDEN_SNAPSHOT")?,
             "--native-lib", &env("CUTEAFD_NATIVE_LIB")?, "--manifest", &env("CUTEAFD_PROGRAM_MANIFEST")?,
             "--peers", &env("CUTEAFD_GOLDEN_PEERS")?, "--dspark", "--pool-tokens", "0",
-            "--max-context", "1048576", "--rtx-expert-layers", "0", "--draft-window-marks", "2"] )?.engine;
+            "--max-context-tokens", "1048576", "--rtx-expert-layers", "0", "--draft-window-marks", "2"] )?.engine;
         super::super::resolve_prefill(&mut args)?;
         let opened = super::super::open(&args)?;
         ensure!(opened.cfg.variant.ml4().is_some(), "native proof requires ML4");

@@ -1176,7 +1176,7 @@ release_load_config() {
   HOST_CACHE_BYTES=auto
   API_KEY_FILE="${API_KEY_FILE:-}"
   ENABLE_BENCH=off
-  MAX_CONTEXT_TOKENS=
+  MAX_CONTEXT_TOKENS=auto
   MAX_OUTPUT_TOKENS=131072
   KV_DECODE_RESERVE_CHUNK=
   KV_RESERVE_DRAIN_BUFFER=
@@ -1364,7 +1364,7 @@ release_load_config() {
     release_die "INSTANCE must be [A-Za-z0-9_.-]"
   [[ -z "$POOL_TOKENS" || "$POOL_TOKENS" == auto || "$POOL_TOKENS" =~ ^[0-9]+$ ]] || release_die "POOL_TOKENS must be auto or a non-negative integer"
   [[ -z "$POOL_TOKENS" || -z "$KV_POOL_SIZE" ]] || release_die "POOL_TOKENS conflicts with KV_POOL_SIZE"
-  for release_integer_name in KV_POOL_TOKENS MAX_CONTEXT_TOKENS KV_DECODE_RESERVE_CHUNK; do
+  for release_integer_name in KV_POOL_TOKENS KV_DECODE_RESERVE_CHUNK; do
     value="${!release_integer_name}"
     [[ -z "$value" || "$value" =~ ^[1-9][0-9]*$ ]] || release_die "$release_integer_name must be a positive integer"
   done
@@ -1374,9 +1374,10 @@ release_load_config() {
     release_die "KV_RESERVE_DRAIN_BUFFER must be a non-negative integer"
   [[ -z "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS" || "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS" =~ ^(-1|[0-9]+)$ ]] ||
     release_die "KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS must be -1 or a non-negative integer"
+  MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-auto}"
   if [[ "$mode" == launch ]]; then
-    [[ -z "$MAX_CONTEXT_TOKENS" ]] || ((MAX_CONTEXT_TOKENS <= 1048576)) ||
-      release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
+    [[ "$MAX_CONTEXT_TOKENS" == auto ]] || { [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]{0,6}$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)); } ||
+      release_die "MAX_CONTEXT_TOKENS must be auto or in 1..1048576"
   fi
   if [[ "$mode" == launch && -n "$KV_POOL_TOKENS" ]]; then
     ((KV_POOL_TOKENS % 64 == 0)) || release_die "KV_POOL_TOKENS must be a multiple of 64"

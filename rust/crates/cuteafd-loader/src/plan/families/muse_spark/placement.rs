@@ -45,7 +45,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let context = if opts.context_tokens == 0 { cfg.max_position as u64 } else { opts.context_tokens };
     if context > cfg.max_position as u64 {
         report.refuse_placement(format!("Muse Spark context {context} exceeds the checkpoint's {}", cfg.max_position),
-            "Lower --context-tokens to at most 1M.");
+            "Lower --max-context-tokens to at most 1M.");
         return memory;
     }
     if !model.complete {

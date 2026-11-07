@@ -1257,7 +1257,7 @@ pub(super) mod tests {
         let mut args = Cli::try_parse_from(["serve", "--snapshot", "/fixture", "--native-lib", "/native",
             "--peers", "127.0.0.1:19000,127.0.0.1:19001,127.0.0.1:19002,127.0.0.1:19003,127.0.0.1:19004,127.0.0.1:19005",
             "--prefill-rows", "4096", "--prefill-waves", "2", "--host-cache-bytes", "0"])?.serve;
-        crate::commands::bench::assert_resolved_family_seam("kimi_k3", &["max-context"], || {
+        crate::commands::bench::assert_resolved_family_seam("kimi_k3", &["max-context-tokens"], || {
             args.prefix.resolve_entries(args.max_sequences as usize);
             let shape = args.prefill()?;
             let mut i = inputs(&cfg);
@@ -1878,7 +1878,7 @@ pub(super) mod tests {
                 "--workspace-manifest".into(), manifest_path.as_os_str().to_owned(),
                 "--coordinator-weight-budget-gib".into(), gib.to_string().into(),
                 "--attention-placement".into(), "heads".into(), "--rtx-expert-layers".into(), "0".into(),
-                "--context-tokens".into(), "262144".into(), "--pool-tokens".into(), "262144".into(),
+                "--max-context-tokens".into(), "262144".into(), "--pool-tokens".into(), "262144".into(),
                 "--concurrency".into(), "2".into(), "--prefix-slots".into(), "0".into(),
                 "--host-cache-bytes".into(), "0".into(), "--prefill-rows".into(), "2048".into(),
                 "--prefill-waves".into(), "2".into(), "--kv-cache".into(), "bf16".into(),
@@ -2125,7 +2125,7 @@ pub(super) mod tests {
             for context in [262_144, 524_288, 1_048_576] {
                 let text = context.to_string();
                 let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-kimi", "--snapshot", "/fixture",
-                    "--native-lib", "/fixture.so", "--max-context", &text, "--pool-tokens", &text,
+                    "--native-lib", "/fixture.so", "--max-context-tokens", &text, "--pool-tokens", &text,
                     "--kv-cache", format.label()])?;
                 let crate::cli::Commands::ServeKimi(args) = cli.command else { panic!("Kimi command") };
                 let mut i = inputs(&cfg);
@@ -2189,9 +2189,8 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn automatic_pool_grows_beyond_default_context_floor() -> Result<()> {
+    fn automatic_pool_serves_model_maximum_clamped_to_admission() -> Result<()> {
         use cuteafd_core::memory_policy::AGENTIC_FLOOR_TOKENS;
-        use cuteafd_loader::families::kimi_k3::DEFAULT_CONTEXT;
         use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
         let snapshot = tempfile::tempdir()?;
         testing::write_kimi_snapshot(snapshot.path(), true);
@@ -2200,12 +2199,12 @@ pub(super) mod tests {
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
             let mut i = inputs(&cfg);
             i.cache_format = format;
-            i.serving_context = cuteafd_loader::placement::planner::Context::automatic(DEFAULT_CONTEXT as u64);
-            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, test_unit(i.rows, i.waves, i.unit_rows), DEFAULT_CONTEXT,
+            i.serving_context = cuteafd_loader::placement::planner::Context::automatic(cfg.max_position as u64);
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, test_unit(i.rows, i.waves, i.unit_rows), cfg.max_position,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             let request = request(i)?;
             assert_eq!(request.pool.floor, AGENTIC_FLOOR_TOKENS);
-            assert_eq!(request.pool.compiled_context, DEFAULT_CONTEXT as u64);
+            assert_eq!(request.pool.compiled_context, cfg.max_position as u64);
             assert!(request.pool.target > request.pool.floor);
             assert!(solve(&request)?.pool_tokens > request.pool.floor);
             let report = plan_input.plan(&PlanOptions {
@@ -2219,7 +2218,8 @@ pub(super) mod tests {
             ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
             let memory = report.memory_layout.context("Kimi default planned layout")?;
             assert!(memory.pool_tokens > AGENTIC_FLOOR_TOKENS);
-            assert!(memory.notes.iter().any(|note| note.contains("API max context: 524288 tokens; compiled max context: 1048576 tokens")));
+            let served = (cfg.max_position as u64).min(memory.pool_tokens);
+            assert!(memory.notes.iter().any(|note| note.contains(&format!("API max context: {served} tokens; compiled max context: 1048576 tokens"))));
         }
         Ok(())
     }

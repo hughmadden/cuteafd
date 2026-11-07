@@ -100,7 +100,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let admitted = prepared.admit(request)?;
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "muse_spark");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
-    cuteafd_bench::context::ResolvedSettings::prefill(options.prefill).value("max-context", admitted.solved.request.context.served(admitted.solved.pool_tokens)).publish();
+    cuteafd_bench::context::ResolvedSettings::prefill(options.prefill).value("max-context-tokens", admitted.solved.request.context.served(admitted.solved.pool_tokens)).publish();
     Ok(admitted)
 }
 

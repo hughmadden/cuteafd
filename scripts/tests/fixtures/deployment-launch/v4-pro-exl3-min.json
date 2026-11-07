@@ -90,6 +90,8 @@
       "0.0.0.0:8806",
       "--max-sequences",
       "16",
+      "--max-context-tokens",
+      "auto",
       "--max-output-tokens",
       "131072",
       "--dspark",

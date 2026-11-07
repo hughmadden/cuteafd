@@ -134,7 +134,7 @@ impl<'a> DenseEngine<'a> {
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         mut cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
         prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool,
-        serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool)>, verify_check: bool) -> Result<Self> {
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
         let reader = WeightReader { library, checkpoint };
         let format = super::weights::DenseFormat::detect(&reader)?;
@@ -161,7 +161,7 @@ impl<'a> DenseEngine<'a> {
         let budgets = qwen3_5::sampled_budgets(free as u64, total as u64, None, host)?;
         let request = Request {
             context: cuteafd_loader::placement::planner::Context::resolve(cfg.max_context as u64,
-                serving.is_none().then_some(cfg.max_context as u64)),
+                serving.map_or(Some(cfg.max_context as u64), |(_, _, _, context)| context)),
             pool: requested_pool.filter(|&n| n > 0).map(Pin::Exact).unwrap_or(Pin::Auto),
             onboard: Pin::Auto,
             prefill: Pin::Exact(PrefillShape { rows: ROWS as u64, waves: 1 }),
@@ -171,7 +171,7 @@ impl<'a> DenseEngine<'a> {
         };
         let geometry = qwen3_5::host_prefix_geometry(&cfg,
             kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, mark_bytes as u64);
-        let host_config = serving.map(|(prefix, concurrency, _)| prefix.resolve_host_config(
+        let host_config = serving.map(|(prefix, concurrency, _, _)| prefix.resolve_host_config(
             cuteafd_engine::prefix::FamilyLayout { page_rows: 64, pages: cfg.max_context.div_ceil(64),
                 page_bytes: geometry.page_bytes as usize, mark_bytes, draft_bytes: 0,
                 rule: cuteafd_engine::prefix::ReuseRule::EXACT,
@@ -181,7 +181,7 @@ impl<'a> DenseEngine<'a> {
         let admitted_plan = qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
             weights: &weight_bytes, buffers: &buffers, slots,
             record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
-            serving: serving.map(|(_, _, device_sampling)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),
+            serving: serving.map(|(_, _, device_sampling, _)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),
             host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
                 quota_bytes: host_config.as_ref().map_or(0, |config| config.bytes),
                 chunk_bytes: host_config.as_ref().map_or(0, |config| config.chunk_bytes) }, verify_check })?;
