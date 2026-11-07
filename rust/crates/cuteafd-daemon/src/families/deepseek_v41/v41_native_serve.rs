@@ -479,27 +479,17 @@ fn worker(
             "V4.1 required push supports All or Off vocabulary mode, not Packed or Draft");
         Ok(())
     })?;
+    let embedding = admission::embedding_placement(args.embedding_placement, device_total);
+    let target_arenas = super::weight_layout::TargetArenas::new(&lib,
+        super::weight_layout::target_layout(&catalog, None,
+            embedding == crate::shared::memory::EmbedPlacement::Gpu,
+            super::v41_tensors::fp8_head(), false, false)?)?;
+    let arena = Some(target_arenas.get(lib.cuda_get_device()?)?);
     let recorder = dense::Recorder::start(push_policy == PushPolicy::Required)?;
-    let weights = BackboneLaneWeights::load(
-        &lib,
-        &catalog,
-        BackboneLaneWeights::device_bytes(&lib, &catalog)?,
-        16 * 1024 * 1024,
-    )?;
-    let producers = CacheProducerWeights::load(
-        &lib,
-        &catalog,
-        CacheProducerWeights::device_bytes(&lib, &catalog)?,
-        16 * 1024 * 1024,
-    )?;
-    let index_weights = IndexLaneWeights::load(
-        &lib,
-        &catalog,
-        IndexLaneWeights::device_bytes(&lib, &catalog)?,
-        16 * 1024 * 1024,
-    )?;
-    let table = NativeRtxTensors::load_embedding(&lib, &catalog,
-        admission::embedding_placement(args.embedding_placement, device_total))?;
+    let weights = BackboneLaneWeights::load_in(&lib, &catalog, 16 << 20, None, false, false, Some(&target_arenas))?;
+    let producers = CacheProducerWeights::load_in(&lib, &catalog, 16 << 20, None, Some(&target_arenas))?;
+    let index_weights = IndexLaneWeights::load_in(&lib, &catalog, 16 << 20, None, Some(&target_arenas))?;
+    let table = NativeRtxTensors::load_embedding_in(&lib, &catalog, embedding, arena)?;
     eprintln!(
         "native target backbone/index/embedding weights loaded in {:.3}s",
         start.elapsed().as_secs_f64()
@@ -509,20 +499,14 @@ fn worker(
     let attention_plan = attention_plan(&args)?;
     let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots, &pool)?;
     let engram_weights = [0, 1]
-        .map(|i| EngramLayerWeights::load(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024))
+        .map(|i| EngramLayerWeights::load_in(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024, arena))
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
-    let vocabulary = VocabularyHead::load(
-        &lib,
-        &catalog,
-        VocabularyHead::plan(&catalog)?,
-        16 * 1024 * 1024,
+    let vocabulary = VocabularyHead::load_in(
+        &lib, &catalog, VocabularyHead::plan(&catalog)?, 16 << 20, arena,
     )?;
-    let head_weights = TargetHeadWeights::load(
-        &lib,
-        &catalog,
-        TargetHeadWeights::device_bytes(&catalog)?,
-        16 * 1024 * 1024,
+    let head_weights = TargetHeadWeights::load_in(
+        &lib, &catalog, TargetHeadWeights::device_bytes(&catalog)?, 16 << 20, arena,
     )?;
     let mut records = recorder.map(|recorder| recorder.finish());
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
