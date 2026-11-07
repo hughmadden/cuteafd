@@ -19,11 +19,12 @@ impl Default for GlmfRepresentation {
 /// Device bytes admitted for one KX7 KDA projection `[n, k]` (`--kda-exact kx7`, format v1.1),
 /// as the loader allocates its four buffers (each at least 256 bytes): the streams' bound of 8
 /// bits a weight plus the read-ahead, the exact stream offsets and lengths, and the two-class
-/// decode tables. The size is known only after packing (FP8-born BF16 takes about 7.5 bits a
-/// weight in v1.1); the loader logs the slack and refuses a pack above the bound.
+/// decode tables of either resident code (the two-class code, or the Huffman fallback of a
+/// matrix whose ESC cannot fit; `cuteafd_core::kx7::resident_bound`). The size is known only after
+/// packing (FP8-born BF16 takes about 7.5 bits a weight in v1.1); the loader logs the slack and
+/// refuses a pack above the bound.
 pub fn kx7_projection_bytes(n: usize, k: usize) -> Result<u64, String> {
-    use cuteafd_core::kx7::{Kx7DeviceBytes, V11_CODE, V11_LAYOUT};
-    Ok(Kx7DeviceBytes::bound(n, k, V11_LAYOUT, V11_CODE).map_err(|e| e.to_string())?.total(256))
+    Ok(cuteafd_core::kx7::resident_bound(n, k).map_err(|e| e.to_string())?.total(256))
 }
 
 /// The one resident form of the vocabulary head `lm_head.weight` [vocab, hidden] that target
@@ -374,8 +375,8 @@ mod tests {
     fn kx7_kda_charges_the_bound_in_place_of_bf16() {
         use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
         let (q, o) = (kx7_projection_bytes(8192, 4096).unwrap(), kx7_projection_bytes(4096, 8192).unwrap());
-        assert_eq!((q, o), (34_357_268, 33_964_052));
-        assert_eq!(34 * (3 * q + o), 4_659_219_104);
+        assert_eq!((q, o), (34_406_420, 34_013_204));
+        assert_eq!(34 * (3 * q + o), 4_665_903_776);
         assert_eq!(34 * 4 * 8192 * 4096 * 2u64, 9_126_805_504);
         let dir = tempfile::tempdir().unwrap();
         let config = glm5_flash_config(6);
@@ -520,7 +521,7 @@ mod tests {
             let (bf16, kx7) = (resident_weights(&checkpoint, &cfg, cfg.layers, 1, bf16).unwrap(),
                 resident_weights(&checkpoint, &cfg, cfg.layers, 1, kx7).unwrap());
             let kda = cfg.attention.iter().filter(|a| **a == GlmNextAttention::Kda).count() as u64;
-            assert_eq!(bf16[0].weights - kx7[0].weights, kda * (4 * 67_108_864 - 3 * 34_357_268 - 33_964_052), "{model}");
+            assert_eq!(bf16[0].weights - kx7[0].weights, kda * (4 * 67_108_864 - 3 * 34_406_420 - 34_013_204), "{model}");
             let split = resident_weights(&checkpoint, &cfg, cfg.layers, 2, Default::default()).unwrap();
             assert_eq!((split[0].weights, split[1].weights),
                 (5_660_947_200, 4_907_587_072 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");

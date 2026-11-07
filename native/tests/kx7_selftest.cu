@@ -36,6 +36,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <map>
 #include <vector>
 
 #include "cuteafd_kx7.h"
@@ -109,7 +110,7 @@ long long json_int(const std::string& json, const std::string& key) {
 struct Pack {
   std::string name;
   int n = 0, k = 0, slices = 0, pbits = 0, rare_bits = 0, esc_len = 0, esc_index = -1;
-  bool ragged = false;
+  bool ragged = false, huffman = false;
   std::vector<uint16_t> table, rare, lengths, source;
   std::vector<uint32_t> offsets, lut, packer_lut;
   std::vector<uint8_t> streams;  // with 16 zero bytes after
@@ -138,6 +139,54 @@ std::vector<uint32_t> build_lut(const Pack& p) {
   return w;
 }
 
+// Huffman fallback decode tables (the reference build_lut's two-level form): 2^pbits primary
+// entries (leaf pattern << 16 | len, or a sub-table index << 16 | (32 - its bits) << 8 | 0xFF),
+// then the sub-tables of the codes longer than pbits, in prefix order.
+std::vector<uint32_t> build_lut_huffman(const Pack& p) {
+  const int P = p.pbits;
+  std::vector<uint8_t> lens(65536, 0);
+  std::vector<uint32_t> codes(65536, 0);
+  uint32_t code = 0, prev = 0;
+  size_t i = 16;
+  for (uint32_t l = 1; l <= 16; ++l) {
+    for (uint32_t c = 0; c < p.table[l - 1]; ++c, ++i) {
+      code <<= l - prev;
+      prev = l;
+      lens[p.table[i]] = uint8_t(l);
+      codes[p.table[i]] = code++;
+    }
+  }
+  std::vector<uint32_t> w(size_t(1) << P, 0);
+  std::map<uint32_t, int> maxlen_of;
+  for (int sym = 0; sym < 65536; ++sym) {
+    const int l = lens[sym];
+    if (!l) continue;
+    if (l <= P) {
+      std::fill(w.begin() + (codes[sym] << (P - l)), w.begin() + ((codes[sym] + 1) << (P - l)), uint32_t(sym) << 16 | l);
+    } else {
+      const uint32_t prefix = codes[sym] >> (l - P);
+      maxlen_of[prefix] = std::max(maxlen_of[prefix], l);
+    }
+  }
+  std::map<uint32_t, uint32_t> base_of;
+  for (const auto& [prefix, maxlen] : maxlen_of) {
+    const int bits = maxlen - P;
+    base_of[prefix] = uint32_t(w.size());
+    w[prefix] = uint32_t(w.size()) << 16 | uint32_t(32 - bits) << 8 | 0xFFu;
+    w.resize(w.size() + (size_t(1) << bits), 0);
+  }
+  for (int sym = 0; sym < 65536; ++sym) {
+    const int l = lens[sym];
+    if (l <= P) continue;
+    const uint32_t prefix = codes[sym] >> (l - P);
+    const int bits = maxlen_of[prefix] - P;
+    const uint32_t rem = codes[sym] & ((1u << (l - P)) - 1u);
+    std::fill(w.begin() + base_of[prefix] + (rem << (bits - (l - P))),
+              w.begin() + base_of[prefix] + ((rem + 1) << (bits - (l - P))), uint32_t(sym) << 16 | l);
+  }
+  return w;
+}
+
 Pack load(const std::string& dir) {
   Pack p;
   p.name = dir.substr(dir.find_last_of('/') + 1);
@@ -152,23 +201,26 @@ Pack load(const std::string& dir) {
   p.esc_len = int(json_int(j, "esc_len"));
   p.esc_index = int(json_int(j, "esc_index"));
   p.ragged = j.find("\"ragged\": true") != std::string::npos;
-  const bool v11 = j.find("\"code\": \"twoclass\"") != std::string::npos && json_int(j, "quad_stride") == 512 &&
-                   json_int(j, "interleave_rows") == 8 && p.ragged && p.slices == 4 && p.pbits == 11 &&
-                   p.rare_bits == 12;
-  if (!v11) {
-    std::fprintf(stderr, "%s: not a KX7 v1.1 pack (twoclass p11 r12, lane16 ksplit 4, ragged 8-row interleave)\n",
-                 dir.c_str());
+  p.huffman = j.find("\"code\": \"huffman\"") != std::string::npos;
+  if (p.huffman) p.pbits = 11;  // the device tables' primary width for the Huffman fallback (KX7_PBITS)
+  const bool layout = json_int(j, "quad_stride") == 512 && json_int(j, "interleave_rows") == 8 && p.ragged &&
+                      p.slices == 4;
+  const bool code = p.huffman || (j.find("\"code\": \"twoclass\"") != std::string::npos && p.pbits == 11 &&
+                                  p.rare_bits == 12);
+  if (!layout || !code) {
+    std::fprintf(stderr, "%s: not a KX7 v1.1 pack (lane16 ksplit 4, ragged 8-row interleave; twoclass p11 r12 or "
+                 "its Huffman fallback)\n", dir.c_str());
     std::exit(1);
   }
   p.table = words<uint16_t>(slurp(dir + "/table.bin"));
-  p.rare = words<uint16_t>(slurp(dir + "/rare.bin"));
+  if (!p.huffman) p.rare = words<uint16_t>(slurp(dir + "/rare.bin"));
   p.offsets = words<uint32_t>(slurp(dir + "/offsets.bin"));
   p.lengths = words<uint16_t>(slurp(dir + "/lengths.bin"));
   p.source = words<uint16_t>(slurp(dir + "/source.bf16.bin"));
   p.packer_lut = words<uint32_t>(slurp(dir + "/device_tables.bin", false));
   p.streams = slurp(dir + "/streams.bin");
   p.streams.resize(p.streams.size() + 16, 0);
-  p.lut = build_lut(p);
+  p.lut = p.huffman ? build_lut_huffman(p) : build_lut(p);
   return p;
 }
 
@@ -218,9 +270,16 @@ bool host_part(const Pack& p) {
           nbits += 32;
           next += 4;
         }
-        const uint32_t peek = uint32_t(buf >> 48), e = p.lut[peek >> (16 - p.pbits)];
+        const uint32_t peek = uint32_t(buf >> 48);
+        uint32_t e = p.lut[peek >> (16 - p.pbits)];
         uint32_t sym = e >> 16;
-        if (((e >> 8) & 0xff) == 0xff) sym = rare[(peek >> (16 - p.esc_len - p.rare_bits)) & ((1u << p.rare_bits) - 1)];
+        if (p.huffman && (e & 0xff) == 0xff) {  // a code past pbits: its sub-table
+          const uint32_t sub = ((peek << 16) << p.pbits) >> ((e >> 8) & 0xff);
+          e = p.lut[(e >> 16) + sub];
+          sym = e >> 16;
+        } else if (!p.huffman && ((e >> 8) & 0xff) == 0xff) {
+          sym = rare[(peek >> (16 - p.esc_len - p.rare_bits)) & ((1u << p.rare_bits) - 1)];
+        }
         buf <<= (e & 0xff);
         nbits -= (e & 0xff);
         bad += sym != p.source[row * p.k + slice * width + 64 * c + 16 * t + i];
@@ -245,9 +304,10 @@ struct DevicePack {
       CUDA_MUST(cudaMalloc(&buffers[i], bytes[i]));
       CUDA_MUST(cudaMemcpy(buffers[i], host[i], bytes[i], cudaMemcpyHostToDevice));
     }
-    header = {uint32_t(sizeof(cuteafd_kx7_pack_t)), CUTEAFD_KX7_FORMAT_V11, p.n, p.k, p.slices, 4 * p.slices,
-              p.k / (4 * p.slices), 512u, p.ragged ? 1u : 0u, uint32_t(31 - p.esc_len - p.rare_bits),
-              (1u << (p.rare_bits + 1)) - 2u, uint32_t(p.lut.size()), buffers[0], buffers[1], buffers[2], buffers[3]};
+    header = {uint32_t(sizeof(cuteafd_kx7_pack_t)), p.huffman ? CUTEAFD_KX7_FORMAT_V11_HUFFMAN : CUTEAFD_KX7_FORMAT_V11,
+              p.n, p.k, p.slices, 4 * p.slices, p.k / (4 * p.slices), 512u, p.ragged ? 1u : 0u,
+              p.huffman ? 0u : uint32_t(31 - p.esc_len - p.rare_bits), p.huffman ? 0u : (1u << (p.rare_bits + 1)) - 2u,
+              uint32_t(p.lut.size()), buffers[0], buffers[1], buffers[2], buffers[3]};
   }
   ~DevicePack() {
     for (void* b : buffers) cudaFree(b);

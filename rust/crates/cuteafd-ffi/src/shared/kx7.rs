@@ -44,6 +44,12 @@ pub type Kx7Buffers = [P; 4];
 impl Kx7DevicePack {
     /// `CUTEAFD_KX7_FORMAT_V11`: KX7 v1.1 (`cuteafd_core::kx7::V11_LAYOUT` and `V11_CODE`).
     pub const FORMAT_V11: u32 = 11;
+    /// `CUTEAFD_KX7_FORMAT_V11_HUFFMAN`: v1.1's stream layout under its Huffman fallback code (a
+    /// matrix whose two-class ESC cannot fit 16 bits): two-level decode tables, no ESC.
+    pub const FORMAT_V11_HUFFMAN: u32 = 12;
+    /// The most decode-table words a resident Huffman pack may take (`CUTEAFD_KX7_MAX_HUFFMAN_WORDS`;
+    /// the kernels hold the tables in shared memory).
+    pub const MAX_HUFFMAN_WORDS: usize = 16384;
     /// v1.1's bytes between a stream's interleaved quads.
     pub const V11_QUAD_STRIDE: u32 = 512;
 
@@ -60,6 +66,21 @@ impl Kx7DevicePack {
             quad_stride: Self::V11_QUAD_STRIDE, ragged: 1, esc_shift: 31 - esc_len - rare_bits,
             esc_mask: (1u32 << (rare_bits + 1)) - 2, table_words: u32::try_from(table_words)?,
             tables, offsets, lengths, streams })
+    }
+}
+
+impl Kx7DevicePack {
+    /// A v1.1-layout pack of an [n, k] matrix over `slices` K slices under the Huffman fallback
+    /// code, with `table_words` (at most [`Self::MAX_HUFFMAN_WORDS`]) of two-level decode tables.
+    pub fn v11_huffman(n: usize, k: usize, slices: usize, table_words: usize, buffers: Kx7Buffers) -> Result<Self> {
+        ensure!(table_words > 2048 && table_words <= Self::MAX_HUFFMAN_WORDS,
+            "KX7 v1.1 Huffman header: [{n}, {k}] with {table_words} table words (resident packs take 2049..={})",
+            Self::MAX_HUFFMAN_WORDS);
+        let mut pack = Self::v11(n, k, slices, 0, 1, table_words, buffers)?;
+        pack.format = Self::FORMAT_V11_HUFFMAN;
+        pack.esc_shift = 0;
+        pack.esc_mask = 0;
+        Ok(pack)
     }
 }
 
