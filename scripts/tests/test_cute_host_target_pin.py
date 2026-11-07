@@ -105,7 +105,10 @@ def test_every_exporter_imports_the_pin_and_the_native_key_carries_it():
     assert '\n_pin_cute_host_target()\nHOST_TARGET = host_target()\n' in SOURCE
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     key = build[build.index('wip_native_key() {'):build.index('\n}\n', build.index('wip_native_key() {'))]
-    assert 'CUTEAFD_CUTE_HOST_TARGET' in key and '/python/' not in key and 'find native python' in key
+    assert 'CUTEAFD_CUTE_HOST_TARGET' in key and '/python/' not in key
+    # The whole native, python and build-helper tree (minus declared non-inputs) is keyed.
+    assert 'scripts/build/native-key-files.py' in key
+    assert "TREES = ('native', 'python', 'scripts/build')" in (ROOT / 'scripts/build/native-key-files.py').read_text()
 
 
 def test_manifests_record_the_compiled_target_not_the_export_hosts_gpu_name():

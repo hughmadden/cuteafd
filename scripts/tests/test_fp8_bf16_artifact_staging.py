@@ -502,7 +502,7 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
     # An earlier opt-in in the same slot must disappear after opting out.
     write_package(output / "fp8/fp8-mimo-bf16", input_kind="bf16")
     script = (REPO / f"scripts/build/build-{kind}-artifacts.sh").read_text()
-    body = script.split("# Exact FP8 expert packages", 1)[1].split("\ninstall -m 0644", 1)[0]
+    body = script.split("# Exact FP8 expert packages", 1)[1].split("\ninstall -m 0644", 1)[0].split("\n# V4.1 manifests.", 1)[0]
     body = "# Exact FP8 expert packages" + body
     # The release script initializes this array in its preceding EXL3 staging block.
     preamble = "set -euo pipefail\nIFS=';' read -ra release_family_list <<<\"$expert_families\"\n"

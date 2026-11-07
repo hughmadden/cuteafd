@@ -1196,7 +1196,7 @@ mod tests {
     #[test]
     fn tp2_dflash_plan_and_direct_serve_defaults_agree() {
         use clap::{CommandFactory, FromArgMatches, Parser};
-        for (family, command) in [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi")] {
+        for (family, command) in [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi"), ("muse_spark", "serve-muse")] {
             for split in [false, true] {
                 for draft in [false, true] {
                     for explicit in [None, Some(false), Some(true)] {
@@ -1218,6 +1218,7 @@ mod tests {
                         let served = match parsed.command {
                             crate::cli::Commands::ServeMimo(args) => args.engine.tp2_dflash,
                             crate::cli::Commands::ServeKimi(args) => args.tp2_dflash,
+                            crate::cli::Commands::ServeMuse(args) => args.tp2_dflash,
                             _ => panic!("expected serve"),
                         };
                         let resolved = tp2_dflash(&planned, family, &Default::default());
@@ -1246,13 +1247,11 @@ mod tests {
         }
         let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
             else { panic!("expected plan") };
-        for family in ["mimo_v2", "kimi_k3", "glm5_flash"] {
+        for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
             assert!(tp2_dflash(&request, family, &Default::default()).unwrap());
             assert!(!tp2_dflash(&request, family, &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).unwrap());
         }
-        assert!(!tp2_dflash(&request, "muse_spark", &Default::default()).unwrap());
-        assert!(tp2_dflash(&request, "muse_spark", &cfg).unwrap());
         request.rtx = 1;
         for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
             assert!(!tp2_dflash(&request, family, &Default::default()).unwrap());

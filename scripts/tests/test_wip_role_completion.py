@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize('value', [None, 'ON', 'OFF', 'on', 'ON; touch /bad'])
 def test_wip_audio_aot_reaches_both_native_architectures(role, arch, value):
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    options = 'v41_expert_aot=' + script.split('v41_expert_aot=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
+    options = 'expert_families=' + script.split('expert_families=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
     cmake = 'cmake \\\n' + script.split('\ncmake \\\n', 1)[1].split('\ncmake --build', 1)[0]
     env = {key: val for key, val in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
     if value is not None:
@@ -427,6 +427,8 @@ def test_v41_exact_workspace_manifests_survive_artifact_staging(tmp_path, script
             expected["mxfp4_dspark_tp2.json"] = payload
     env = {**os.environ, source_var: str(build), "output_dir": str(output),
            "coordinator_aot": "ON" if coordinator else "OFF", "nvfp4_aot": "ON" if nvfp4 else "OFF",
+           # WIP: the V4.1 switches a V4.1-scoped build derives from these.
+           "v41_coordinator_aot": "ON" if coordinator else "OFF", "v41_nvfp4_aot": "ON" if nvfp4 else "OFF",
            "CUTEAFD_RELEASE_NVFP4_AOT": "ON" if nvfp4 else "OFF"}
     result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + block], env=env,
                             capture_output=True, text=True, timeout=10)

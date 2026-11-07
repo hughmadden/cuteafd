@@ -43,6 +43,8 @@ PREVIOUS_RELEASE_FLOOR = {
     } | {'qwen4:nvfp4=6', 'qwen4:nvfp4a4=6'},
 }
 DEFAULT_MATRIX = 'scripts/bench/release-smoke-v4.json'
+# WIP scope switches with no release key: release images always build V4.1 and vision.
+WIP_ONLY = {'V41_AOT', 'VISION_ATTENTION_AOT'}
 
 
 # Retained package/layout floor from the stopped v2.0.0 images.
@@ -134,6 +136,8 @@ def derive(repo, matrix, scope='all', environ=None):
             if suffix == 'COORDINATOR_EXPERT_FAMILIES':
                 suffix = 'EXPERT_FAMILIES'
             target = PREFIX + suffix
+            if suffix in WIP_ONLY:
+                continue
             if suffix.endswith('_AOT') and value == 'ON':
                 result[target] = 'ON'
             elif suffix in LISTS:
