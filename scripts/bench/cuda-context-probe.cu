@@ -107,9 +107,11 @@ static void lt_handles(int device, int count, bool with_blas) {
   CUDA(cudaMemset(weight, 0, weight_bytes));
   CUDA(cudaMemset(input, 0, input_bytes));
   const auto before_blas = used(device);
+  const auto host_before_blas = mem_available_kb();
   cublasHandle_t blas = nullptr;
   if (with_blas) BLAS(cublasCreate(&blas));
   const auto baseline = used(device);
+  const auto host_baseline = mem_available_kb();
   std::vector<cublasLtHandle_t> owners(count);
   std::vector<void*> workspaces(count);
   std::vector<cublasLtMatmulDesc_t> operations(count);
@@ -149,11 +151,13 @@ static void lt_handles(int device, int count, bool with_blas) {
     std::printf("{\"mode\":\"lt\",\"with_blas\":%s,\"device\":%d,\"sm\":\"sm_%d%d\","
         "\"driver\":%d,\"count\":%d,\"existing_blas_bytes\":%lld,\"create_bytes\":%lld,"
         "\"workspace_bytes\":%lld,\"plan_bytes\":%lld,\"matmul_bytes\":%lld,"
-        "\"total_bytes\":%lld,\"algorithm_workspace_bytes\":%zu}\n",
+        "\"total_bytes\":%lld,\"algorithm_workspace_bytes\":%zu,"
+        "\"host_existing_blas_bytes\":%lld,\"host_total_bytes\":%lld}\n",
         with_blas ? "true" : "false", device, prop.major, prop.minor, driver, i + 1,
         (long long)baseline - before_blas, (long long)created - before,
         (long long)workspace - created, (long long)planned - workspace,
-        (long long)after - planned, (long long)after - baseline, candidate.workspaceSize);
+        (long long)after - planned, (long long)after - baseline, candidate.workspaceSize,
+        1024 * (host_before_blas - host_baseline), 1024 * (host_baseline - mem_available_kb()));
     std::fflush(stdout);
   }
   for (int i = 0; i < count; ++i) {
