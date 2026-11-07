@@ -581,7 +581,7 @@ case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2"
 [[ "$RTX_EXPERT_LAYERS" != all ]] || RTX_EXPERT_LAYERS=40
 ((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
 [[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] || release_die "PREFIX_CACHE_ENTRIES must be auto or non-negative"
-[[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)) || release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
+[[ "$MAX_CONTEXT_TOKENS" == auto ]] || { [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]{0,6}$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)); } || release_die "MAX_CONTEXT_TOKENS must be auto or in 1..1048576"
 [[ "$MAX_OUTPUT_TOKENS" =~ ^-?[0-9]+$ ]] || release_die "MAX_OUTPUT_TOKENS must be an integer (<= 0: bounded only by the context)"
 [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] && ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) || release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
 [[ -z "$KV_POOL_SIZE" || "$KV_POOL_SIZE" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "KV_POOL_SIZE has an invalid unit"
@@ -735,7 +735,7 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --vision "$VISION" --audio off \
   --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   "${plan_memory_args[@]}" --gpu-memory-cap "$profile_cap" --coordinator-weight-budget-gib "$(release_gib "$profile_cap")" \
-  --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
+  --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --max-context-tokens "$MAX_CONTEXT_TOKENS" \
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES")"
 release_validate_deployment "$count_plan" deepseek_v41
 release_deployment_spark_roles "$count_plan" "$SPARK_COUNT"
@@ -1558,7 +1558,6 @@ case "$family:$speculator" in
 esac
 draft_args=()
 embedding="$(get EMBEDDING gpu)"
-default_context=0
 # Coordinator GPUs (the shared resolution V4.1 uses too): COORDINATOR_GPUS names
 # one or two, primary first; unset takes the lowest-index GPU, plus the next for a
 # two-GPU layout. RTX_GPUS and COORDINATOR_SPLIT say how many a launch asks for;
@@ -1615,9 +1614,9 @@ if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash 
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
 case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == glm5_flash && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
-[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
-  release_die "TP2_DFLASH requires MiMo/Kimi/GLM Flash, two selected RTX GPUs and DFlash2"
-if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && "$tp2_dflash" != auto ]]; then
+[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
+  release_die "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, two selected RTX GPUs and DFlash2"
+if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
   # Forward false as well: an explicit off must survive future default changes.
   tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"
   family_args+=(--tp2-dflash "$tp2_dflash_bool")
@@ -2310,7 +2309,7 @@ audio_encoder_hash=""
     plan_cap="$(python3 -c 'import sys;f,t,b=map(int,sys.argv[1:]);print(max(1,b-(t-f)*2**20))' "$free_mib" "$total_mib" "$profile_cap")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
-  if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && "$tp2_dflash" != auto ]]; then
+  if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
@@ -2349,8 +2348,7 @@ audio_encoder_hash=""
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--mimo-swa-kv-cache "$mimo_swa_kv")
     plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
-    plan_draft_args+=(--context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
-      --expert-input "${expert_input:-fp8}")
+    plan_draft_args+=(--expert-input "${expert_input:-fp8}")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
     [[ "$(get DECODE_GRAPHS off)" != on ]] || plan_draft_args+=(--mimo-decode-graphs)
@@ -2452,8 +2450,9 @@ audio_encoder_hash=""
     [[ "$speculator" != mtp ]] || plan_mtp_depth="$(get SPECULATOR_DEPTH "$mtp_depth")"
     plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth" --kv-cache "$step5_kv_cache")
   fi
+  plan_draft_args+=(--max-context-tokens "$(get MAX_CONTEXT_TOKENS auto)")
   for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
-    'MAX_CONTEXT_TOKENS:--context-tokens' 'PREFILL_BATCH_TOKENS:--prefill-rows' \
+    'PREFILL_BATCH_TOKENS:--prefill-rows' \
     'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do
     key_name="${pair%%:*}"; flag="${pair#*:}"
     [[ "$family:$key_name" != mimo_v2:PREFILL_BATCH_TOKENS ]] || continue
@@ -2859,10 +2858,8 @@ for key in CUTEAFD_TP2_EXCHANGE CUTEAFD_ROUTE_CHECK; do
 done
 release_serving_docker_args
 release_coordinator_device_args "${coordinator_uuids[@]}"
-context_args=(--max-context "$(get MAX_CONTEXT_TOKENS "$default_context")")
-[[ "$family" != qwen3_5 ]] || context_args=()
-# Kimi K3 and Step-5: unset keeps the serve command's own context extent.
-((standalone_family == 0)) || [[ -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
+# Automatic context passes unchanged through planner and serve admission.
+context_args=(--max-context-tokens "$(get MAX_CONTEXT_TOKENS auto)")
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${RELEASE_COORDINATOR_DEVICE_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \

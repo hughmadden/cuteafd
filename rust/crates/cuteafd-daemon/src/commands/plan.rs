@@ -73,7 +73,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 force_gpu_embedding: args.embedding_placement == Some(crate::shared::token_io::EmbedPlacement::Gpu),
                 onboard: args.rtx_expert_layers,
                 exchange_f32: args.exchange_f32,
-                context_tokens: args.context_tokens,
+                context_tokens: args.context_tokens.unwrap_or(0),
                 prefill_rows: args.prefill_rows,
                 full_prefill_logits: args.full_prefill_logits,
                 expert_usage: args.expert_usage.unwrap_or(true),
@@ -139,6 +139,15 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     Ok(options)
 }
 
+fn resolve_context_tokens(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    if args.context_tokens.is_none() {
+        args.context_tokens = cfg.get("MAX_CONTEXT_TOKENS").filter(|value| !value.is_empty())
+            .map(|value| crate::shared::context::parse_tokens::<u64>(value)
+                .map_err(|error| anyhow::anyhow!("MAX_CONTEXT_TOKENS: {error}"))).transpose()?;
+    }
+    Ok(())
+}
+
 fn resolve_expert_usage(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     let configured = match cfg.get("EXPERT_USAGE").map(String::as_str) {
         None | Some("") | Some("on") => true,
@@ -189,8 +198,8 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
     };
     let enabled = args.tp2_dflash.unwrap_or(configured);
     anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
-        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash")),
-        "TP2_DFLASH requires MiMo/Kimi/GLM Flash, --layout, --rtx 2 and DFlash2");
+        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark")),
+        "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
     Ok(enabled)
 }
 
@@ -241,6 +250,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
         resolve_expert_usage(&mut args, &cfg)?;
+        resolve_context_tokens(&mut args, &cfg)?;
         args.available_sparks = (0..8).take_while(|rank|
             cfg.get(&format!("SPARK_{rank}_HOST")).is_some_and(|host| !host.is_empty())).count();
         if args.spark_ranks.is_none() {
@@ -845,6 +855,115 @@ mod tests {
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
 
+    fn configured_context(flags: &[&str]) -> cuteafd_loader::placement::planner::Context {
+        use clap::Parser;
+        let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/configs/muse-spark-exl3-min.config");
+        let argv = [vec!["cuteafd", "plan", "model", "--layout", "--config", config.to_str().unwrap()],
+            flags.to_vec()].concat();
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from(argv).unwrap().command
+            else { panic!("plan") };
+        let cfg = launch_config(request.config.as_deref()).unwrap();
+        resolve_context_tokens(&mut request, &cfg).unwrap();
+        let layout = options(&request).unwrap().layout.unwrap();
+        let value = flags.get(1).copied().unwrap_or(&cfg["MAX_CONTEXT_TOKENS"]);
+        let crate::cli::Commands::ServeMuse(serve) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "serve-muse", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--max-context-tokens", value]).unwrap().command else { panic!("serve-muse") };
+        let served = cuteafd_loader::placement::planner::Context::resolve(1048576, serve.max_context);
+        let planned = cuteafd_loader::placement::planner::Context::resolve(1048576,
+            (layout.context_tokens > 0).then_some(layout.context_tokens));
+        assert_eq!(planned, served);
+        planned
+    }
+
+    #[test]
+    fn installed_kimi_min_auto_context_matches_serve_and_admitted_pool() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::placement::planner::Context;
+        let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/configs/kimi-k3-exl3-k6-min.config");
+        let cfg = launch_config(Some(&config))?;
+        let hf_home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(PathBuf::from)
+            .unwrap_or_else(default_hf_home);
+        let snapshot = cuteafd_loader::model_cache_dir(&hf_home, &cfg["MODEL_ID"])
+            .join("snapshots").join(&cfg["MODEL_REVISION"]);
+        if !snapshot.is_dir() {
+            eprintln!("installed Kimi minimum checkpoint absent; skipping installed context check");
+            return Ok(());
+        }
+        let manifest = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
+        anyhow::ensure!(manifest.is_file(), "installed Kimi context check requires {}", manifest.display());
+        let cli = crate::cli::Cli::try_parse_from([
+            "cuteafd", "plan", snapshot.to_str().unwrap(), "--layout", "--config", config.to_str().unwrap(),
+            "--rtx", "1", "--spark-ranks", "6", "--speculator", "dflash2", "--vision", "off", "--audio", "off",
+            "--workspace-manifest", manifest.to_str().unwrap(), "--prefill-rows", "1024",
+            "--spark-memory-cap", "118111600640"])?;
+        let crate::cli::Commands::Plan(mut request) = cli.command else { panic!("plan") };
+        request.memory = cli.memory;
+        request.hf_home = Some(hf_home);
+        resolve_context_tokens(&mut request, &cfg)?;
+        let mut request = file_args(request, &snapshot)?;
+        let mut selected = options(&request)?;
+        resolve_speculator(&mut request, &snapshot, "kimi_k3", &cfg)?;
+        selected.layout.as_mut().unwrap().kimi_drafter_snapshot = request.drafter_snapshot.clone();
+        let report = plan(&snapshot, &selected)?;
+        anyhow::ensure!(report.fits && report.placement_supported, "installed Kimi minimum refused: {:?}", report.hints);
+        let memory = report.memory_layout.context("installed Kimi minimum memory layout")?;
+        let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let maximum = cuteafd_loader::serving_capacity::checkpoint_context_limit(&checkpoint)?.context("Kimi model maximum")?;
+        let crate::cli::Commands::ServeKimi(serve) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "serve-kimi", "--snapshot", snapshot.to_str().unwrap(), "--native-lib", "/native.so",
+            "--max-context-tokens", cfg.get("MAX_CONTEXT_TOKENS").map(String::as_str).unwrap_or("auto")])?.command
+            else { panic!("serve-kimi") };
+        let served = crate::shared::context::pool_context("kimi_k3",
+            Context::resolve(maximum, serve.max_context.map(|tokens| tokens as u64)), memory.pool_tokens as usize)?;
+        assert_eq!(served as u64, maximum.min(memory.pool_tokens));
+        assert!(served <= cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT);
+        assert!(memory.notes.iter().any(|note| note.starts_with(&format!("Kimi API max context: {served} tokens;"))),
+            "{:?}", memory.notes);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_config_uses_installed_muse_context_pin() {
+        use cuteafd_loader::placement::planner::{Context, Pin};
+        assert_eq!(configured_context(&[]), Context { maximum: 1048576, pin: Pin::Exact(634304) });
+    }
+
+    #[test]
+    fn plan_context_cli_overrides_installed_muse_config() {
+        use cuteafd_loader::placement::planner::{Context, Pin};
+        assert_eq!(configured_context(&["--max-context-tokens", "131072"]),
+            Context { maximum: 1048576, pin: Pin::Exact(131072) });
+        assert_eq!(configured_context(&["--max-context-tokens", "auto"]), Context::automatic(1048576));
+    }
+
+    #[test]
+    fn plan_config_context_omitted_or_empty_stays_automatic() {
+        for configured in [None, Some(""), Some("auto")] {
+            let mut request = args(std::path::Path::new("model"), 4, false);
+            request.context_tokens = None;
+            let cfg = configured.map(|value| ("MAX_CONTEXT_TOKENS".into(), value.into()))
+                .into_iter().collect();
+            resolve_context_tokens(&mut request, &cfg).unwrap();
+            assert_eq!(options(&request).unwrap().layout.unwrap().context_tokens, 0);
+        }
+    }
+
+    #[test]
+    fn plan_config_context_rejects_non_launcher_values() {
+        for value in ["0", "-1", "+1", "01", "1048577", "18446744073709551616"] {
+            let mut request = args(std::path::Path::new("model"), 4, false);
+            request.context_tokens = None;
+            let cfg = [("MAX_CONTEXT_TOKENS".into(), value.into())].into_iter().collect();
+            assert!(resolve_context_tokens(&mut request, &cfg).unwrap_err().to_string()
+                .contains("MAX_CONTEXT_TOKENS: context must be auto or a positive integer in 1..1048576"), "{value}");
+        }
+    }
+
     #[test]
     fn plan_prefill_waves_and_span_reach_both_layout_fields() {
         use clap::Parser;
@@ -1120,7 +1239,7 @@ mod tests {
             let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
                 argv.into_iter().chain(["--tp2-dflash", explicit])).unwrap().command
                 else { panic!("expected plan") };
-            for family in ["mimo_v2", "kimi_k3", "glm5_flash"] {
+            for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
                 assert_eq!(tp2_dflash(&request, family, &cfg).unwrap(), expected);
             }
             assert_eq!(options(&request).unwrap().layout.unwrap().tp2_dflash, expected);
@@ -1132,8 +1251,10 @@ mod tests {
             assert!(!tp2_dflash(&request, family, &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).unwrap());
         }
+        assert!(!tp2_dflash(&request, "muse_spark", &Default::default()).unwrap());
+        assert!(tp2_dflash(&request, "muse_spark", &cfg).unwrap());
         request.rtx = 1;
-        for family in ["mimo_v2", "kimi_k3", "glm5_flash"] {
+        for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
             assert!(!tp2_dflash(&request, family, &Default::default()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).is_err());
         }
@@ -1235,7 +1356,7 @@ mod tests {
             deprecated_peer_expert_ranges: false,
             exchange_f32: false,
             attention_placement: "auto".into(),
-            context_tokens: 262144,
+            context_tokens: Some(262144),
             prefill_rows: 0,
             full_prefill_logits: false, expert_usage: Some(false),
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,

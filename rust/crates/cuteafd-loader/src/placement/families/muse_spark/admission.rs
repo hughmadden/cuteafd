@@ -65,7 +65,7 @@ fn dense_push_staging(core: &CoreInventory, gpus: usize) -> Result<(u64, String)
 /// The largest coordinator KV pool this deployment admits, from the one shared
 /// pool policy. Both edges call this before either solves.
 pub fn maximum_pool_tokens(capacities: &[u64], context: u64, requested: Option<u64>) -> u64 {
-    PoolPolicy::resolve(capacities, context, requested, PAGE_ROWS, false).maximum_tokens()
+    PoolPolicy::resolve(capacities, context, requested, PAGE_ROWS).maximum_tokens()
 }
 
 /// One coordinator GPU's planned budget: the CUDA context is the forecast
@@ -96,10 +96,10 @@ pub fn spark_budget(rank: u8, bytes: u64) -> Budget {
 }
 
 /// The one request both edges submit; no edge re-derives a pin.
-pub fn production_request(context: u64, pool: Option<u64>, onboard: Onboard, prefill: PrefillShape,
+pub fn production_request(context: impl Into<crate::placement::planner::Context>, pool: Option<u64>, onboard: Onboard, prefill: PrefillShape,
     operation: Operation, resident_weight_limit: Option<ResidentWeights>,
     spark_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats) -> Request {
-    Request { context,
+    Request { context: context.into(),
         pool: PoolPolicy::normalize_request(pool).map_or(Pin::Auto, Pin::Exact),
         onboard: match onboard { Onboard::Auto => Pin::Auto, Onboard::Layers(n) => Pin::Exact(n as u64) },
         prefill: Pin::Exact(prefill), operation, resident_weight_limit, spark_reply_formats }
@@ -591,9 +591,20 @@ impl<'a> ProductionInput<'a> {
                         "routed experts (intermediate slices)", maximum_pages));
                 }
                 if count < cfg.layers {
+                    let runtime = cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+                        .ok_or(Refusal::Overflow("Muse Spark reserve"))?;
+                    let owners = spark_budget.overhead.get(rank).copied().unwrap_or(0)
+                        .checked_sub(runtime).ok_or(Refusal::Overflow("Muse Spark owner decomposition"))?;
                     components.extend(buffer(format!("muse.spark.io.{rank}.{count}"), location,
-                        spark_budget.overhead.get(rank).copied().unwrap_or(0), Lifetime::RESIDENT,
-                        Category::Runtime, "Spark I/O slots and runtime reserve", maximum_pages));
+                        owners, Lifetime::RESIDENT, Category::Workspace, "Spark I/O and execution owners", maximum_pages));
+                    components.extend(buffer(format!("muse.spark.startup.{rank}.{count}"), location,
+                        runtime, Lifetime::RESIDENT, Category::Runtime,
+                        cuteafd_core::memory_layout::spark_runtime_reserve_group(), maximum_pages));
+                    let resident = spark_budget.resident[rank][count..].iter().sum();
+                    components.extend(buffer(format!("muse.spark.arena-growth.{rank}.{count}"), location,
+                        cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(resident),
+                        Lifetime::RESIDENT, Category::Workspace,
+                        cuteafd_core::memory_layout::SPARK_ARENA_DRIVER_OVERHEAD_GROUP, maximum_pages));
                 }
             }
             let envelope = crate::push_load::PushHostEnvelope::new(validation.clone(), vec![dense_bound; gpus],
@@ -808,7 +819,7 @@ impl Recipe for MuseRecipe<'_> {
         if !(1..=2).contains(&self.gpus)
             || self.cfg.layers == 0
             || self.context == 0
-            || request.context != self.context
+            || request.context.maximum != self.context
             || self.maximum_pages == 0
             || self.maximum_pages == u64::MAX
             || self.prefill.rows == 0
@@ -868,10 +879,33 @@ impl Recipe for MuseRecipe<'_> {
             let home = u8::try_from(self.gpus - 1).map_err(|_| Refusal::Overflow("Muse GPUs"))?;
             let variable = contract.variables.len();
             contract.variables.push(Variable::DraftHome(vec![home]));
-            let bytes = [drafter.owned, drafter.scratch, drafter.head_scratch, drafter.runtime].into_iter()
+            if !drafter.tp2.is_empty() {
+                if self.gpus != 2 || drafter.tp2.len() != 2 {
+                    return Err(invalid("Muse TP2 drafter needs two rank-local layouts"));
+                }
+                for (rank, layout) in drafter.tp2.iter().enumerate() {
+                    let location = Location::coordinator((1 - rank) as u8);
+                    let prefix = format!("muse.drafter.rank{rank}");
+                    for owner in layout.allocations(&prefix, location) {
+                        let bytes = ByteCurve::fixed(owner.bytes, self.maximum_pages);
+                        contract.components.push(Component::allocation(owner, bytes, false, self.maximum_pages));
+                    }
+                    for owner in layout.weight_owners() {
+                        contract.components.push(Component::resident_weight(ResidentWeight {
+                            id: format!("{prefix}.{}", owner.id), location,
+                            weights: ResidentWeights(owner.bytes),
+                        }, ByteCurve::fixed(owner.bytes, self.maximum_pages)));
+                    }
+                }
+            }
+            let owned = if drafter.tp2.is_empty() {
+                drafter.owned.checked_add(drafter.scratch).ok_or(Refusal::Overflow("Muse drafter"))?
+            } else { 0 };
+            let resident = if drafter.tp2.is_empty() { drafter.weights.0 } else { 0 };
+            let bytes = [owned, drafter.head_scratch, drafter.runtime].into_iter()
                 .try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).ok_or(Refusal::Overflow("Muse drafter"))?;
             for mut component in weights("muse.drafter".into(), Location::coordinator(home), bytes,
-                drafter.weights.0, Category::Drafter, "Drafter", self.maximum_pages)? {
+                resident, Category::Drafter, "Drafter", self.maximum_pages)? {
                 component.activation = Activation::choice(variable, 0);
                 contract.components.push(component);
             }

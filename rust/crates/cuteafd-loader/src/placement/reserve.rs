@@ -172,8 +172,7 @@ pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: 
     use cuteafd_core::memory_layout::DeviceKind as Layout;
     let policy = MemoryPolicy::current();
     let smallest = physical_card;
-    let spark_free = !layout.devices.iter().any(|device| device.kind == Layout::Spark);
-    let Ok(kv) = policy.kv(smallest, context, spark_free) else { return Vec::new() };
+    let Ok(kv) = policy.kv(smallest, context) else { return Vec::new() };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: layout.pool_tokens };
     layout.devices.iter().map(|device| {
         let (kind, named) = match device.kind {
@@ -198,8 +197,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
     let smallest = plan.budgets.iter().filter(|budget| budget.locations.iter()
         .any(|location| matches!(location.device, Device::Coordinator(_))))
         .map(|budget| budget.physical_bytes).min().unwrap_or(u64::MAX);
-    let spark_free = !plan.budgets.iter().any(|budget| budget.locations.iter().any(|location| matches!(location.device, Device::Spark(_))));
-    let Ok(kv) = policy.kv(smallest, plan.request.context, spark_free) else { return };
+    let Ok(kv) = policy.kv(smallest, plan.request.context.maximum) else { return };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: plan.pool_tokens };
     for budget in &plan.budgets {
         let (kind, location) = match budget.locations.first().map(|location| location.device) {
@@ -225,7 +223,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
 pub fn log_placement(placement: &super::Placement, request: &super::PlacementRequest) {
     let policy = MemoryPolicy::current();
     let smallest = request.inventory.gpus.iter().map(|gpu| gpu.capacity_bytes).min().unwrap_or(u64::MAX);
-    let Ok(kv) = policy.kv(smallest, request.pool.compiled_context, request.inventory.spark_ranks == 0) else { return };
+    let Ok(kv) = policy.kv(smallest, request.pool.compiled_context) else { return };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: placement.pool_tokens };
     for (gpu, (budget, items)) in request.inventory.gpus.iter().zip(&placement.items).enumerate() {
         let line = cuteafd_core::memory_policy::render_line(&breakdown(format!("rtx{gpu}"), DeviceKind::Gpu,
@@ -287,7 +285,7 @@ mod tests {
                 Item::new(Category::Kv, "records", "", 20 << 30, Basis::Formula)] };
         let spark = DeviceLayout { kind: Kind::Spark, index: 0, capacity_bytes: 121 << 30, worker_budget_bytes: 108 << 30,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed", "", 90 << 30, Basis::Exact),
-                cuteafd_core::memory_layout::spark_runtime_residual()] };
+                cuteafd_core::memory_layout::spark_worker_process_resident_item()] };
         let layout = MemoryLayout { devices: vec![gpu, spark], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
         let lines = MemoryPolicy { family_reserve: Some(1 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
@@ -295,12 +293,12 @@ mod tests {
         // The GPU cap is the plan's cap, not the layout capacity already less the reserve.
         assert!(lines[0].starts_with("rtx0: cap 98304MiB; weights 40960MiB"), "{}", lines[0]);
         assert!(lines[0].contains("reserve 1624MiB [context+modules 600MiB, family reserve 1024MiB]"), "{}", lines[0]);
-        // With Sparks the default min is the serving context (no 256K agentic floor).
-        assert!(lines[0].contains("KV target 2097152 min 1048576 max 2097152, pool 1048576 tokens / 20480MiB"), "{}", lines[0]);
+        // The same shared default minimum applies with Sparks.
+        assert!(lines[0].contains("KV target 2097152 min 262144 max 2097152, pool 1048576 tokens / 20480MiB"), "{}", lines[0]);
         // A Spark's cap is its worker ceiling; its residual is a named component.
         assert!(lines[1].starts_with("spark0: cap 110592MiB; weights 92160MiB"), "{}", lines[1]);
         // Sparks carry no family reserve; the residual is their named component.
-        assert!(lines[1].contains("reserve 2560MiB [Spark runtime residual 2560MiB]"), "{}", lines[1]);
+        assert!(lines[1].contains("reserve 1523MiB [Spark worker process resident 1523MiB]"), "{}", lines[1]);
         let overridden = MemoryPolicy { spark_reserve: Some(3 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
         assert!(overridden[1].contains("(overridden)") && overridden[1].contains("SPARK_RESERVE 3072MiB"), "{}", overridden[1]);

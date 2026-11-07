@@ -650,7 +650,7 @@ mod tests {
                 native_lib: &args.native_lib, peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
                 rows: usize::try_from(prefill.span_rows)?,
                 waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
-                slots: usize::from(args.max_sequences), marks: 1,
+                context: cuteafd_loader::placement::planner::Context::resolve(args.max_context.unwrap_or(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT) as u64, args.max_context.map(|n| n as u64)), slots: usize::from(args.max_sequences), marks: 1,
                 max_context: args.max_context.unwrap_or(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT),
                 pool_tokens: args.pool_tokens, graphs: true, full_prefill_logits: false, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
                 hosted_layers: None, draft: Some(super::super::draft::Options {

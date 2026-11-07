@@ -626,8 +626,8 @@ pub(crate) fn with_engine<T>(
     } else { None };
     // The solver charged staging over the compiled extent it was given.
     let context_extent = max_context;
-    max_context = crate::shared::context::pool_context("deepseek_v4", max_context, args.max_context == 0,
-        usize::try_from(placement.pool_tokens)?, 256)?;
+    max_context = crate::shared::context::pool_context("deepseek_v4", cuteafd_loader::placement::planner::Context::resolve(max_context as u64,
+        (args.max_context > 0).then_some(args.max_context as u64)), usize::try_from(placement.pool_tokens)?)?;
     let shape = pool::PoolShape::new(
         args.max_sequences,
         prefill_rows,

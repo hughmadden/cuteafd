@@ -183,6 +183,20 @@ pub struct MuseDrafter {
     pub sequences: usize,
     pub block: usize,
     pub head_dim: usize,
+    /// Logical drafter ranks: selector/head lead first (GPU1), peer second (GPU0).
+    pub tp2: Vec<crate::families::glm5::draft_physical::GlmDflashPhysicalLayout>,
+}
+
+impl MuseDrafter {
+    pub fn with_tp2(mut self, snapshot: &std::path::Path, sms: &[u64],
+        kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<Self> {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        ensure!(sms.len() == 2, "Muse TP2 DFlash needs two GPUs");
+        let capacity = GlmDraftCapacity::new(self.context_slots, self.sequences, self.block)?;
+        self.tp2 = super::glm5_flash::drafter_tp2_inventory(snapshot, capacity, &[sms[1], sms[0]],
+            GlmDraftRepresentation::Bf16Only, 2, kv_cache)?;
+        Ok(self)
+    }
 }
 
 /// The drafter's own config against the target: hidden, vocabulary, taps,
@@ -219,7 +233,7 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
     let runtime = u64::try_from(rows * 4)? + probe;
     Ok(MuseDrafter { owned: residency.owned, weights: residency.weights, scratch: residency.scratch,
         head_scratch, runtime, context_slots: capacity.context_slots,
-        sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize })
+        sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize, tp2: Vec::new() })
 }
 
 /// The combine's rank tables the coordinator uploads per wave: BF16, wide and other compressed
@@ -363,7 +377,8 @@ pub fn spark_executions(waves: u64, unit_rows: u64) -> Result<cuteafd_core::Spar
 pub fn spark_reserve_bytes(world: usize, waves: u64, unit_rows: u64) -> Result<u64> {
     let owners = spark_executions(waves, unit_rows)?.workspace_bytes(|extent| owner_bytes(world, extent))?
         .and_then(|bytes| bytes.total()).context("Muse Spark owner reserve overflow")?;
-    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + owners)
+    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+        .and_then(|bytes| bytes.checked_add(owners)).context("Muse Spark reserve overflow")
 }
 
 pub fn owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent) -> Result<cuteafd_core::OwnerBytes> {

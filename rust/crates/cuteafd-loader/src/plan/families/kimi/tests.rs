@@ -699,14 +699,13 @@ fn header_native_k6_core_is_admitted_by_default() -> Result<()> {
 }
 
 #[test]
-fn default_context_follows_the_checkpoint_core() -> Result<()> {
-    use crate::families::kimi_k3::{default_context, COMPILED_CONTEXT, DEFAULT_CONTEXT};
+fn automatic_context_uses_model_maximum_for_every_core() -> Result<()> {
     let k6 = tempfile::tempdir()?;
     testing::write_kimi_core_snapshot(k6.path(), false);
     let bf16 = snapshot(false);
-    for (dir, expected) in [(k6.path(), COMPILED_CONTEXT), (bf16.path(), DEFAULT_CONTEXT)] {
+    for dir in [k6.path(), bf16.path()] {
         let checkpoint = Checkpoint::open(dir)?;
-        assert_eq!(default_context(&Model::open(&checkpoint)?.core), expected);
+        let expected = Model::open(&checkpoint)?.cfg.max_position;
         // The planner's unset context selects the same extent; an explicit one wins.
         let report = testing::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
             layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;

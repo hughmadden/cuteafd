@@ -92,7 +92,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         mark_slots: options.mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
         local: options.local, drafter: options.drafter, fixed, media }.prepare()?;
-    let request = shared::production_request(context, options.pool_tokens, options.onboard,
+    let request = shared::production_request(cuteafd_loader::placement::planner::Context::resolve(context, options.max_context), options.pool_tokens, options.onboard,
         cuteafd_loader::placement::planner::PrefillShape { rows: options.prefill.unit_rows, waves: options.prefill.waves },
         if options.full_prefill_logits { cuteafd_loader::placement::planner::Operation::Scoring }
         else { cuteafd_loader::placement::planner::Operation::Serving },
@@ -100,7 +100,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let admitted = prepared.admit(request)?;
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "muse_spark");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
-    cuteafd_bench::context::ResolvedSettings::prefill(options.prefill).value("max-context", context).publish();
+    cuteafd_bench::context::ResolvedSettings::prefill(options.prefill).value("max-context-tokens", admitted.solved.request.context.served(admitted.solved.pool_tokens)).publish();
     Ok(admitted)
 }
 
@@ -172,15 +172,25 @@ mod tests {
             }
         }
         let mut host_rings = std::collections::BTreeSet::new();
-        for (cutoff_rows, formats, drafter, draft_kv) in cases {
-            let label = format!("cutoff {cutoff_rows} {formats:?} drafter {drafter:?} {draft_kv:?}");
+        let cases = cases.into_iter().flat_map(|(cutoff, formats, draft, kv)| {
+            let mut cases = vec![(cutoff, formats, draft, kv, false)];
+            if draft.is_some() { cases.push((cutoff, formats, draft, kv, true)); }
+            cases
+        });
+        for (cutoff_rows, formats, drafter, draft_kv, tp2) in cases {
+            let label = format!("cutoff {cutoff_rows} {formats:?} drafter {drafter:?} {draft_kv:?} TP2={tp2}");
             let snapshot = drafter.map(|name| -> Result<_> {
                 let dir = tempfile::tempdir()?;
-                std::fs::copy(drafters.join(name), dir.path().join("config.json"))?;
+                let config: serde_json::Value = serde_json::from_slice(&std::fs::read(drafters.join(name))?)?;
+                std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
+                let geometry = crate::shared::speculation::dflash::DflashConfig::read(dir.path())?;
+                let tensors = geometry.tensor_shapes().into_iter().map(|(name, shape)|
+                    testing::t(name, "BF16", &shape)).collect::<Vec<_>>();
+                testing::write_safetensors(&dir.path().join("model.safetensors"), &tensors);
                 Ok(dir)
             }).transpose()?;
             let opts = LayoutOptions { context_tokens: 786432, host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
-                head_split: true, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
+                head_split: true, tp2_dflash: tp2, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
                 muse_partial_bf16_max_rows: cutoff_rows, spark_reply_formats: formats, draft_kv_cache: draft_kv,
                 muse_drafter_snapshot: snapshot.as_ref().map(|d| d.path().to_path_buf()), ..Default::default() };
             let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
@@ -193,7 +203,9 @@ mod tests {
             let served_drafter = snapshot.as_ref().map(|d| -> Result<_> {
                 let config: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("config.json"))?)?;
                 let sms = cuteafd_loader::placement::ArchContext::for_device("sm_120", total).sms;
-                shared::drafter_inventory(&cfg, &config, 16, 16, 202_112, u64::from(sms), draft_kv)
+                let draft = shared::drafter_inventory(&cfg, &config, 16, 16, 202_112, u64::from(sms), draft_kv)?;
+                if tp2 { draft.with_tp2(d.path(), &[u64::from(sms); 2], draft_kv) }
+                else { Ok(draft) }
             }).transpose()?;
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
             let live = crate::commands::bench::assert_resolved_family_seam("muse_spark", &[], || {

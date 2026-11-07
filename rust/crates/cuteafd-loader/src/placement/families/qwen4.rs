@@ -44,8 +44,8 @@ pub struct QwenInputs<'a> {
     /// Checkpoint owners already charged to the physical baseline.
     pub loaded_weights: ResidentWeights,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
-    /// True only when the operator left context automatic.
-    pub automatic_context: bool,
+    /// Shared model extent and optional operator context pin.
+    pub context: crate::placement::planner::Context,
     pub admission: QwenAdmissionInputs<'a>,
     pub capacity_bytes: u64,
     pub baseline: Baseline,
@@ -68,8 +68,8 @@ const WHOLE_OWNER_0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner 
 /// context floor.
 pub fn single_policy(inputs: &QwenInputs<'_>) -> PoolPolicy {
     PoolPolicy::resolve(&[inputs.capacity_bytes], inputs.max_context, inputs.requested_pool,
-        QWEN_UNIT_ROWS as u64, inputs.spark_ranks == 0)
-        .with_automatic_context(inputs.automatic_context)
+        QWEN_UNIT_ROWS as u64)
+        .with_context(inputs.context)
 }
 
 /// Serving context and the finite compiled pool extent, both derived from the
@@ -83,7 +83,7 @@ fn single_extent(policy: &PoolPolicy) -> Result<(u64, u64), Refusal> {
     if policy.floor == 0 || tokens == 0 || pages == 0 || pages == u64::MAX {
         return Err(Refusal::InvalidFact("invalid Qwen single-owner pool extent".into()));
     }
-    Ok((policy.floor, pages))
+    Ok((policy.compiled_context, pages))
 }
 
 /// One normalization for both routes: an omitted or zero pool is automatic and
@@ -203,7 +203,7 @@ impl<'a> QwenSingle<'a> {
     pub fn request(&self) -> Result<Request, Refusal> {
         let inputs = self.inputs;
         let policy = single_policy(inputs);
-        Ok(Request { context: self.context, pool: pool_pin(&policy, QWEN_UNIT_ROWS as u64)?,
+        Ok(Request { context: inputs.context, pool: pool_pin(&policy, QWEN_UNIT_ROWS as u64)?,
             onboard: Pin::Auto, prefill: Pin::Exact(prefill_of(&inputs.admission)),
             operation: Operation::Serving, resident_weight_limit: inputs.resident_weight_limit,
             spark_reply_formats: reply_formats(inputs.spark_reply_format, inputs.spark_ranks) })
@@ -278,7 +278,7 @@ impl Recipe for QwenSingle<'_> {
         let cfg = a.cfg;
         let page = QWEN_UNIT_ROWS as u64;
         let gpu = Location::coordinator(0);
-        if request.context != self.context || self.maximum_pages == 0
+        if request.context.maximum != self.context || self.maximum_pages == 0
             || self.maximum_pages == u64::MAX || a.layers == 0 || a.layers > cfg.layers
         {
             return Err(Refusal::InvalidFact("invalid Qwen single-owner extent".into()));
@@ -705,8 +705,8 @@ pub fn dual_peer_diagnostics(enabled: bool) -> Vec<Demand> {
 }
 pub struct QwenDualInputs<'a> {
     pub resident_weight_limit: Option<ResidentWeights>,
-    /// True only when the operator left context automatic.
-    pub automatic_context: bool,
+    /// Shared model extent and optional operator context pin.
+    pub context: crate::placement::planner::Context,
     pub admission: QwenAdmissionInputs<'a>,
     pub owner_manifests: [Option<&'a serde_json::Value>; 2],
     pub gpus: [GpuBudget; 2],
@@ -745,8 +745,8 @@ pub fn dual_owners(layers: usize) -> Vec<usize> {
 /// ranks' page tables for the same admitted pool.
 fn dual_policy(inputs: &QwenDualInputs<'_>) -> PoolPolicy {
     PoolPolicy::resolve(&inputs.gpus.map(|gpu| gpu.capacity_bytes), inputs.max_context,
-        inputs.requested_pool, QWEN_UNIT_ROWS as u64, inputs.spark_ranks == 0)
-        .with_automatic_context(inputs.automatic_context)
+        inputs.requested_pool, QWEN_UNIT_ROWS as u64)
+        .with_context(inputs.context)
 }
 
 /// TP2 arenas follow the executor's load chronology: one workspace opened once,
@@ -841,14 +841,14 @@ impl<'a> QwenDual<'a> {
             }
             None => None,
         };
-        Ok(Self { inputs, owners, context: policy.floor, maximum_pages, arena, resident,
+        Ok(Self { inputs, owners, context: policy.compiled_context, maximum_pages, arena, resident,
             hop_spec, hop_bytes, graphs })
     }
 
     pub fn request(&self) -> Result<Request, Refusal> {
         let inputs = self.inputs;
         let policy = dual_policy(inputs);
-        Ok(Request { context: self.context, pool: pool_pin(&policy, QWEN_UNIT_ROWS as u64)?,
+        Ok(Request { context: inputs.context, pool: pool_pin(&policy, QWEN_UNIT_ROWS as u64)?,
             onboard: Pin::Auto, prefill: Pin::Exact(prefill_of(&inputs.admission)),
             operation: Operation::Serving, resident_weight_limit: inputs.resident_weight_limit,
             spark_reply_formats: reply_formats(SparkReplyFormat::Bf16, inputs.spark_ranks) })
@@ -921,7 +921,7 @@ impl Recipe for QwenDual<'_> {
         let a = &inputs.admission;
         let cfg = a.cfg;
         let page = QWEN_UNIT_ROWS as u64;
-        if request.context != self.context || self.maximum_pages == 0 {
+        if request.context.maximum != self.context || self.maximum_pages == 0 {
             return Err(Refusal::InvalidFact("invalid Qwen dual extent".into()));
         }
         let compute = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(cfg, layers, mtp,
@@ -1169,7 +1169,7 @@ mod tests {
         let experts = vec![Some(tp2_cost()); 4];
         let gib = 1u64 << 30;
         let inputs = QwenDualInputs {
-            resident_weight_limit: None, automatic_context: false,
+            resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
@@ -1391,7 +1391,7 @@ mod tests {
         loaded: ResidentWeights, limit: Option<ResidentWeights>) -> QwenInputs<'a> {
         let gib = 1u64 << 30;
         QwenInputs { resident_weight_limit: limit, loaded_weights: loaded,
-            spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+            spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg, layers: cfg.layers, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
@@ -1484,7 +1484,7 @@ mod tests {
             half: costs, tp2: true, whole_supported: true, spark_ok: true })).collect();
         let gib = 1u64 << 30;
         let build = |startup| QwenDualInputs {
-            resident_weight_limit: None, automatic_context: false,
+            resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },

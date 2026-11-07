@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--candidate-url', required=True)
     parser.add_argument('--tokenizer', type=Path, required=True)
     parser.add_argument('--context-file', type=Path, required=True)
-    parser.add_argument('--context-tokens', type=int, nargs='+', default=[4096, 16384, 24576])
+    parser.add_argument('--max-context-tokens', type=int, nargs='+', default=[4096, 16384, 24576])
     parser.add_argument('--tokens', type=int, default=512)
     parser.add_argument('--pairs', type=int, default=4)
     parser.add_argument('--cold-prefill', action='store_true',

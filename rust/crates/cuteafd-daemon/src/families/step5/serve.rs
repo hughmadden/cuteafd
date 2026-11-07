@@ -84,7 +84,7 @@ pub(crate) struct ServeArgs {
     /// Immutable target and native predictor KV storage.
     #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
-    #[arg(long, default_value_t = 1_048_576)]
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<u64>)]
     max_context: u64,
     /// Prefill unit rows (PLAN "Prefill contract"); a prefill call holds
     /// `--prefill-waves` units; zero selects the shared topology shape.
@@ -156,7 +156,8 @@ impl ServeArgs {
             "Step-5 requires a shared width-class Spark recipe");
         ensure!(self.peers.iter().enumerate().all(|(i, peer)| !self.peers[..i].contains(peer)),
             "Step-5 Spark peers must be distinct");
-        ensure!((262_144..=1_048_576).contains(&self.max_context), "Step-5 request context must be 256K..=1M");
+        ensure!(self.max_context == 0 || (262_144..=1_048_576).contains(&self.max_context),
+            "Step-5 request context must be automatic or 256K..=1M");
         ensure!(u64::from(self.max_sequences) <= shape.unit_rows,
             "Step-5 sequence capacity exceeds row capacity");
         ensure!(u64::from(self.mtp) < shape.unit_rows,
@@ -259,7 +260,10 @@ fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crat
 fn with_backend<T>(args: &ServeArgs,
     run: impl FnOnce(&Step5Backend<'_, '_>, usize) -> Result<T>) -> Result<T> {
     let shape = args.shape()?;
+    let serving_context = cuteafd_loader::placement::planner::Context::resolve(
+        if args.max_context == 0 { 1_048_576 } else { args.max_context }, (args.max_context > 0).then_some(args.max_context));
     let mut resolved = args.clone();
+    resolved.max_context = serving_context.maximum;
     resolved.prefill_rows = u32::try_from(shape.unit_rows)?;
     resolved.prefill_waves = u8::try_from(shape.waves)?;
     let args = &resolved;
@@ -320,7 +324,7 @@ fn with_backend<T>(args: &ServeArgs,
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         full_prefill_logits: args.full_prefill_logits,
         waves: usize::from(args.prefill_waves), unit: args.prefill_rows as usize,
-        sequences: usize::from(args.max_sequences), context: args.max_context,
+        sequences: usize::from(args.max_sequences), context: args.max_context, serving_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
         peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code,
@@ -344,7 +348,7 @@ fn with_backend<T>(args: &ServeArgs,
     // are validated against the ownership it selected.
     let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract, native_selection)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
-    cuteafd_bench::context::set_resolved("max-context", &args.max_context.to_string());
+    cuteafd_bench::context::set_resolved("max-context-tokens", &admission.solved.served_context().to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup planning complete");
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
@@ -511,6 +515,7 @@ fn with_backend<T>(args: &ServeArgs,
     let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
         transport, 92, 1)?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
+        .with_served_context(usize::try_from(admission.solved.served_context())?)?
         .with_admitted_host(admission.host_cache_bytes, admission.host_geometry)
         .with_full_prefill_logits(args.full_prefill_logits)
         .with_prefill_depth(crate::shared::prefill_depth::PrefillDepth::new(usize::from(args.prefill_waves),
@@ -711,7 +716,7 @@ mod tests {
         assert_eq!(args.max_context, 262_144);
         assert_eq!(args.pool_tokens, Some(args.max_context));
         let policy = cuteafd_loader::placement::PoolPolicy::resolve(
-            &[96 << 30; 2], args.max_context, args.pool_tokens, 64, false);
+            &[96 << 30; 2], args.max_context, args.pool_tokens, 64);
         policy.validate_explicit()?;
         assert_eq!(policy.compiled_context, args.max_context);
         assert!(args.max_context >= 640 + u64::from(args.mtp));
@@ -758,7 +763,7 @@ mod tests {
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 reserve_bytes: 0 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
+            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, serving_context: cuteafd_loader::placement::planner::Context::pinned(args.max_context), requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
@@ -1179,7 +1184,7 @@ mod tests {
     fn target_serving_defaults_and_invalid_owners() -> Result<()> {
         let mut args = args();
         args.validate()?;
-        assert_eq!((args.max_context, args.max_sequences, args.mtp), (1_048_576, 16, 3));
+        assert_eq!((args.max_context, args.max_sequences, args.mtp), (0, 16, 3));
         assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
         assert_eq!(cuteafd_loader::plan::layout::LayoutOptions::default().step5_kv, args.kv_cache);
         for format in ["bf16", "fp8"] {
@@ -1217,7 +1222,7 @@ mod tests {
                 .collect::<std::result::Result<_, _>>()?;
             args.validate()?;
             let (shape, model) = crate::commands::bench::assert_resolved_family_seam("step5",
-                &["max-context", "pool-tokens", "rtx-expert-layers"], || {
+                &["max-context-tokens", "pool-tokens", "rtx-expert-layers"], || {
                     args.prefix.resolve_entries(args.max_sequences as usize);
                     let shape = args.shape()?;
                     args.prefill_rows = unit as u32;

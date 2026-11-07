@@ -156,8 +156,6 @@ mod tests {
         assert_eq!(answer, (768, true));
         assert_eq!(seen, [2048, 768]);
         assert_eq!(solve_graph_pool(2048, |_| -> Result<_, ()> { Ok((512, false)) }).unwrap(), (512, false));
-        assert_eq!(admitted_graph_context(2048, 1024, true), 768);
-        assert_eq!(admitted_graph_context(2048, 1024, false), 2048);
     }
 
     #[test]
@@ -265,9 +263,4 @@ pub fn solve_graph_pool<E>(initial: usize, mut admit: impl FnMut(usize) -> Resul
         if !startup || pool >= candidate { return Ok((candidate.min(pool), startup)); }
         candidate = pool;
     }
-}
-
-/// Context chosen by the automatic serving policy after pool admission.
-pub fn admitted_graph_context(context: usize, pool: usize, automatic: bool) -> usize {
-    if automatic && context > pool { pool.saturating_sub(UNIT_ROWS) } else { context }
 }

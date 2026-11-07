@@ -54,7 +54,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }).collect::<Vec<_>>();
     let mut sparks = (0..expert_world).map(|rank| DeviceLayout { kind: DeviceKind::Spark,
         index: rank as u32, capacity_bytes: options.spark_bytes, worker_budget_bytes: options.spark_bytes, kv_tokens: 0,
-        items: vec![cuteafd_core::memory_layout::spark_runtime_residual(),
+        items: vec![cuteafd_core::memory_layout::spark_worker_process_resident_item(),
             Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
     if all_onboarded {
         for rank in 0..spark_ranks {
@@ -82,6 +82,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                     // rank I/O; the final solve re-charges it for its own working set.
                     spark_io(report, model, options, &working, &mut sparks, &mut notes);
                 }
+                for device in &mut sparks {
+                    if cuteafd_core::memory_layout::charge_spark_runtime(device).is_none() {
+                        return unsupported_prefill(report, anyhow::anyhow!("Spark arena reserve overflow"));
+                    }
+                }
                 resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(admission) {
@@ -102,6 +107,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 }
                 if expert_world > 0 {
                     let _ = spark_experts(input, options, &mut sparks, 0);
+                }
+                for device in &mut sparks {
+                    if cuteafd_core::memory_layout::charge_spark_runtime(device).is_none() {
+                        return unsupported_prefill(report, anyhow::anyhow!("Spark arena reserve overflow"));
+                    }
                 }
                 resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
@@ -538,7 +548,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
     let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv };
     let maximum_pool_tokens = admission::maximum_pool_tokens(&options.rtx_bytes[..ranks], context,
-        options.pool_tokens, profiles.steady.pool_unit_rows, spark_ranks == 0);
+        options.pool_tokens, profiles.steady.pool_unit_rows);
     let prefill = PrefillShape { rows, waves: lanes as u64 };
     let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
     let embedding = if use_host_embedding(checkpoint, options) { EmbeddingHome::HostPinned }
@@ -551,7 +561,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
             assumed: false }).collect(),
         super::recipe_host_memory(options)?,
         options.spark_bytes, spark_ranks)?;
-    let request = admission::production_request(context, options.pool_tokens, onboard, prefill,
+    let request = admission::production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill,
         operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let prepared = ProductionInput {
         expert_usage: options.expert_usage,

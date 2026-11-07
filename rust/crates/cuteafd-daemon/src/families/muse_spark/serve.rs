@@ -27,9 +27,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
-    /// API ceiling and compiled extent; unset takes the checkpoint's 1M with the
-    /// pool deciding the admitted context.
-    #[arg(long)] pub max_context: Option<u64>,
+    /// Served context: auto fits the admitted pool, bounded by the checkpoint maximum; a number pins it.
+    #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<u64>)]
+    pub max_context: Option<u64>,
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
@@ -47,6 +47,9 @@ pub(crate) struct ServeArgs {
     /// Opt in to a DFlash2 drafter snapshot (RadixArk/Muse-Spark-Open-DFlash2); it runs
     /// beside the target head and reads the target's exact head (softcap and multiplier).
     #[arg(long)] pub draft: Option<PathBuf>,
+    /// Split DFlash attention/FFN across the active RTX pair; opt-in until qualified.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the drafter's block.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=15))]
     pub draft_fixed: Option<u8>,
@@ -97,6 +100,8 @@ impl ServeArgs {
     pub(super) fn validate(&self) -> Result<()> {
         cuteafd_core::concurrency::validate("muse_spark", u64::from(self.max_sequences))?;
         let devices = self.devices();
+        ensure!(!self.tp2_dflash || (devices.len() == 2 && self.draft.is_some()),
+            "Muse TP2 DFlash requires --split-device and --draft");
         cuteafd_loader::placement::families::muse_spark::executor(devices.len())?;
         ensure!(devices.iter().all(|&device| device >= 0)
             && devices.iter().collect::<std::collections::HashSet<_>>().len() == devices.len(),
@@ -106,7 +111,7 @@ impl ServeArgs {
         let worlds = cuteafd_loader::plan::experts::spark_worlds(cuteafd_loader::plan::families::muse_spark::PACKAGE, 4096);
         ensure!((self.peers.is_empty() || worlds.contains(&self.peers.len())) && distinct == self.peers.len(),
             "Muse Spark serves its EXL3 TP experts on {worlds:?} distinct Spark endpoints, not {}", self.peers.len());
-        ensure!(self.max_context.is_none_or(|context| (1..=1 << 20).contains(&context)),
+        ensure!(self.max_context.is_none_or(|context| context == 0 || (1..=1 << 20).contains(&context)),
             "Muse Spark context exceeds the checkpoint's 1M extent");
         self.prefill()?;
         for (name, mode, peers, hash, revision) in [
@@ -207,7 +212,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         full_prefill_logits: args.full_prefill_logits, slots: u64::from(args.max_sequences),
         mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
             .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
-        max_context: args.max_context,
+        max_context: args.max_context.filter(|&tokens| tokens > 0),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
         spark_budget_bytes: args.spark_budget_bytes(),
         partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
@@ -222,15 +227,20 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             let head_device = crate::shared::memory::device::Device { library: &library,
                 id: *device_ids.last().context("Muse devices")? };
             let sms = head_device.run(|| library.sm_count())?;
-            cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
+            let drafter = cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
                 usize::from(args.max_sequences), usize::from(args.max_sequences), head, sms as u64,
-                args.draft_kv_cache)
+                args.draft_kv_cache)?;
+            if args.tp2_dflash {
+                let sms = devices.iter().map(|device| device.run(|| library.sm_count()).map(|sms| sms as u64))
+                    .collect::<Result<Vec<_>>>()?;
+                drafter.with_tp2(snapshot, &sms, args.draft_kv_cache)
+            } else { Ok(drafter) }
         }).transpose()?, media: Some(super::media::inventory(&view,
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
     let placement = &built.placement;
     cuteafd_bench::context::ResolvedSettings::placement(placement).publish();
-    cuteafd_bench::context::set_resolved("max-context", &args.max_context.unwrap_or(cfg.max_position as u64).to_string());
+    cuteafd_bench::context::set_resolved("max-context-tokens", &cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens).to_string());
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
@@ -243,7 +253,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let admission_plan = crate::shared::placement::SparkAdmission::plan_view(&view,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(),
         spark.model.clone(), None)?;
-    let context = args.max_context.unwrap_or(cfg.max_position as u64);
+    let context = cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens);
     // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over
     // peer access), filled in the background while the layers load.
     let name = "model.language_model.embed_tokens.weight";
@@ -280,6 +290,13 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let admission = admission_plan.start_with(&args.peers, coordinator)?;
     let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
         .collect::<Result<Vec<_>>>()?;
+    let peer = (gpus == 2).then(|| -> Result<_> {
+        let sizes = super::peer::slot_sizes(cfg.hidden, cfg.expert_hidden, cfg.topk,
+            usize::try_from(prefill.unit_rows)?, !onboarded.is_empty())?;
+        super::peer::MusePeer::new(&library, [0, 1].map(|rank|
+            crate::shared::peer_split::RankDevice { device: devices[rank].id, stream: streams[rank].raw }),
+            sizes, super::peer::decode_peer_bytes(cfg.hidden, cfg.expert_hidden, cfg.topk, !onboarded.is_empty())?)
+    }).transpose()?;
     let (embedding, ranks, local, draft) = crate::shared::placement::load_while_admitting(Some(admission), || {
         let load = || -> Result<_> {
             let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
@@ -299,7 +316,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                         programs.get(home).context("Muse drafter programs")?, &cfg,
                         ranks.get(home).context("Muse drafter rank")?,
                         streams.get(home).context("Muse drafter stream")?.raw, snapshot, &embedding, admitted,
-                        args.draft_kv_cache)?)
+                        args.draft_kv_cache, if args.tp2_dflash { Some(peer.as_ref().context("Muse TP2 draft peer")?.shared()) }
+                            else { None })?)
                 }
                 (None, None) => None,
                 _ => anyhow::bail!("Muse drafter admission differs from --draft"),
@@ -338,7 +356,8 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         sequences, args.peers.len())?;
     let mut engine = super::engine::MuseEngine::connect(&library, &cfg, &ranks, streams, args.peers.clone(),
         super::engine::LinkPlan { spark, cutoff, unit_rows: usize::try_from(prefill.unit_rows)?,
-            waves: usize::try_from(prefill.waves)?, intake_row_bytes }, !local.is_empty())?;
+            waves: usize::try_from(prefill.waves)?, intake_row_bytes }, peer)?;
+    if let Some(draft) = &draft { draft.prepare_workspace()?; }
     tracing::info!(ranks = engine.ranks.len(), peer = engine.peer.is_some(), vocab = embedding.vocab(),
         placement = %placement.summary(), pool_tokens = placement.pool_tokens, "Muse Spark brought up");
     // The admitted context: the pool clamps an automatic one.
@@ -451,6 +470,22 @@ mod tests {
     const PEERS: &str = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
 
     #[test]
+    fn tp2_dflash_requires_a_drafter_and_two_distinct_devices() -> Result<()> {
+        let mut a = args(&["--peers", PEERS])?;
+        assert!(!a.tp2_dflash);
+        a.tp2_dflash = true;
+        assert!(a.validate().is_err());
+        a.draft = Some("/draft".into());
+        assert!(a.validate().is_err());
+        a.split_device = Some(1);
+        a.validate()?;
+        a.tp2_dflash = false;
+        a.split_device = None;
+        a.validate()?;
+        Ok(())
+    }
+
+    #[test]
     fn worker_error_logs_full_chain_before_owner_teardown() {
         use std::sync::Mutex;
         #[derive(Clone)]
@@ -521,7 +556,7 @@ mod tests {
     fn live_tp2_one_token_forward_and_selection() -> Result<()> {
         use crate::shared::{qwen::scheduler::Backend as _, token_io::{RowSelect, SelectBatch, SelectPlacement, TokenSelector}};
         let mut args = args(&["--split-device", "1", "--rtx-expert-layers", "0",
-            "--pool-tokens", "16384", "--max-context", "8192", "--max-sequences", "1"])?;
+            "--pool-tokens", "16384", "--max-context-tokens", "8192", "--max-sequences", "1"])?;
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
         args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
@@ -734,10 +769,10 @@ mod tests {
         }
         for extra in [vec!["--peers", nine.as_str()], vec!["--peers", "127.0.0.1:1,127.0.0.1:1"],
             vec!["--peers", PEERS, "--device", "1", "--split-device", "1"], vec!["--peers", PEERS, "--split-device", "0"],
-            vec!["--peers", PEERS, "--max-context", "1048577"], vec!["--peers", PEERS, "--max-context", "0"],
+            vec!["--peers", PEERS, "--max-context-tokens", "1048577"], vec!["--peers", PEERS, "--max-context-tokens", "0"],
             vec!["--peers", PEERS, "--prefill-rows", "4097"], vec!["--peers", PEERS, "--prefix-partial", "on"],
             vec!["--peers", PEERS, "--expert-partial-bf16-max-rows", "8"]] {
-            assert!(args(&extra)?.validate().is_err(), "{extra:?}");
+            assert!(args(&extra).is_err() || args(&extra)?.validate().is_err(), "{extra:?}");
         }
         assert!(args(&["--peers", PEERS, "--max-sequences", "65"]).is_err());
         Ok(())

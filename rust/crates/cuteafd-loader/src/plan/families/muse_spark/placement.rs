@@ -45,7 +45,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let context = if opts.context_tokens == 0 { cfg.max_position as u64 } else { opts.context_tokens };
     if context > cfg.max_position as u64 {
         report.refuse_placement(format!("Muse Spark context {context} exceeds the checkpoint's {}", cfg.max_position),
-            "Lower --context-tokens to at most 1M.");
+            "Lower --max-context-tokens to at most 1M.");
         return memory;
     }
     if !model.complete {
@@ -100,8 +100,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let head = model.core.get_weight(crate::families::muse_spark::core::HEAD)
             .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
         let sms = opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", cards[gpus - 1].physical_bytes).sms);
-        crate::placement::families::muse_spark::drafter_inventory(cfg, &config, usize::try_from(slots)?,
-            usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)
+        let drafter = shared::drafter_inventory(cfg, &config, usize::try_from(slots)?,
+            usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)?;
+        if opts.tp2_dflash { drafter.with_tp2(snapshot, &vec![u64::from(sms); gpus], opts.draft_kv_cache) }
+        else { Ok(drafter) }
     }).transpose() {
         Ok(drafter) => drafter,
         Err(error) => {
@@ -188,7 +190,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.encoder = Some(vision.clone());
         report.audio_encoder = Some(audio.clone());
     }
-    let request = shared::production_request(context, opts.pool_tokens, onboard,
+    let request = shared::production_request(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)), opts.pool_tokens, onboard,
         PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
         if opts.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
         Some(ResidentWeights(opts.weight_budget_bytes)), opts.spark_reply_formats);

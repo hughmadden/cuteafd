@@ -115,22 +115,38 @@ Each device has one cap, and weights, KV, workspaces and the reserve all live in
 The planner fixes the layout (layer placement, onboarding, buffers) for `KV_TARGET_TOKENS`;
 the pool then grows into what the fixed layout leaves, up to `KV_MAX_TOKENS`, and the launch
 is refused below `KV_MIN_TOKENS`. The reserve is the sum of named, measured components
-(CUDA context and cuBLAS, loaded code, graphs, runtime growth, the Spark runtime residual)
-plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the whole reserve and zero
-every built-in component. Startup and `cuteafd plan` print one line per device with the cap,
+(CUDA context and cuBLAS, loaded code, graphs, runtime growth, Spark worker process residency)
+plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the reserve components.
+Startup and `cuteafd plan` print one line per device with the cap,
 weights, workspaces, every reserve component and the KV target, min, max and pool.
+The coordinator charges the SM121 worker process census (1,596,606,464 B,
+moa/driver 580.178.04, 2026-11-07, #1454) inside `SPARK_MEMORY_CAP`:
+steady anonymous PSS + file PSS + context-phase consumption, subtracting
+context-phase file PSS growth to avoid overlap. The worker's live admission
+checks future allocations against `MemAvailable`, so it does not charge that
+already-resident process/context a second time. The historical 109,760,512-B
+unattributed startup remainder is not an owner and is not charged.
+Arena driver metadata is a workspace owner, not a replaceable reserve:
+48 B per 4096-B page (40 B vmalloc metadata + 8 B secondary page tables).
+This is calibrated from real-worker kernel fields at 40.508, 75.059 and
+103.652 GiB (zero-intercept fits 10.052338 + 1.949590 MiB/GiB).
+Source attributes 16 B/page to `nvidia_pte_t` and 8 B/page to the retained DMA
+page array; 16 B/page of vmalloc remains unattributed. Neither the fit's
+intercept nor whole-host reclaim residuals are charged as fixed allowances.
+Driver bytes survive `SPARK_RESERVE`, including zero. Ring, workspace,
+validation and upload owners also stay separate and are charged once.
 Sizes take `B`, `MB`, `GB`, `MiB` or `GiB` (a bare number is bytes); there are no percentages.
 Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`, ...).
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `KV_TARGET_TOKENS` | 2M; 1M on cards of 32 GB or less | positive count | KV the layout is sized for: layer placement, onboarding, buffers. |
-| `KV_MIN_TOKENS` | the serving context; at least 256K on Spark-free layouts | positive count | Refuse the launch below this; missing the target is fine down to it. With Sparks an automatic context may be clamped to the pool. |
+| `KV_MIN_TOKENS` | min(256K, model max context, KV target), on every layout | positive count | Refuse automatic pools below this; missing the target is fine down to it. Automatic context serves min(model max context, admitted pool); an explicit context still requires the pool to cover it. |
 | `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
-| `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark ceiling (worker allocation ceiling and routed-weight budget); the cap is what leaves room for the OS. |
+| `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark engine ceiling, including worker process residency and routed weights; the outside-cap gap leaves room for OS/services. |
 | `GPU_RESERVE` | auto | size | Sets the total GPU reserve; every built-in GPU reserve component becomes 0. Still inside the cap. |
-| `SPARK_RESERVE` | auto | size | Same as `GPU_RESERVE`, for Sparks. |
+| `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
 | `FAMILY_RESERVE` | per-family constant (0; GLM 5.3 Flash 2 GiB until #1442) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |
@@ -144,7 +160,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `ATTENTION_MODE` | `hqa` | `hqa`, `compact`, `fp8-compact` | Per qualified checkpoint family in `scripts/lib/attention-variants.json` (shared by launcher, launch-key registry and daemon; no separate per-family key gate): default native HQA bundle, parent compact bundle, or deterministic load/push FP8 conversion of native BF16. Already-FP8 HQA cannot be converted again. Step-5 converts native O only, including private MTP O, and retains F32 TP2 partials. Selected for the model lifetime. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
-| `MAX_CONTEXT_TOKENS` | `1048576` | 1–1048576 | Context cap. |
+| `MAX_CONTEXT_TOKENS` | `auto` | `auto`, 1–1048576 | `auto`: serve min(model maximum context, admitted pool). A number pins context and requires the pool to cover it. Plan and every serve command use `--max-context-tokens` with `auto` or a number; explicit CLI overrides the config. Compiled workspace/table extent is internal, not a user context setting. |
 | `MAX_OUTPUT_TOKENS` | `131072` | integer | Generation cap. |
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
 | `SWA_KV_CACHE` | `int8` | `bf16`, `int8`, `fp8` | MiMo sliding/MTP rings. |
@@ -244,7 +260,7 @@ weights and scratch alongside the KV pool and routed experts.
 | `GLM5_FLASH_TARGET_HEAD` | `auto` | `auto`, `tensor`, `exact` | GLM Flash's `TARGET_HEAD` spelling. |
 | `TP2_ATTENTION`, `TP2_QUERY_PROJECTION`, `TP2_OUTPUT_PROJECTION` | `off` | `on`, `off` | V4.1 TP2 projections on the RTX pair. |
 | `TP2_DSPARK_EXPERTS` | `on` with dual RTX + dSpark, otherwise `off` | `on`, `off` | V4/V4.1 TP2 draft experts; requires two RTX GPUs and dSpark. Explicit `off` retains GPU0-only draft experts. |
-| `TP2_DFLASH` | MiMo/Kimi dual-RTX DFlash2: `on`; GLM Flash: planner choice; otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. GLM Flash compares the whole GPU0 drafter with a head split: larger admitted pool wins, ties split for balance. Omit the key for this automatic choice; explicit `on` or `off` wins. Auto requires two GPUs and checkpoint-derived drafter owners (`--drafter-gib` keeps whole placement). GLM Flash selector weights and head-only workspace stay on GPU0. Plan accepts `--draft-fp8 true|false` (omission defaults to FP8 for GLM Flash) and `--draft-linear w8a16|wide|w8a8` and charges the same representation and scratch as serve. MiMo and GLM Flash split query/KV heads and MLP neurons, retaining replicated residual/convolution owners. Kimi splits cache and attention by Context; producer weights and FFN stay on GPU1. CLI false overrides config on. |
+| `TP2_DFLASH` | MiMo/Kimi dual-RTX DFlash2: `on`; GLM Flash: planner choice; otherwise: `off` | `on`, `off` | DFlash tensor parallelism on an active two-RTX split with DFlash2. Muse supports explicit `on` (default `off` pending qualification): rank-local query/KV heads and MLP neurons use the existing target peer exchange; selector and vocabulary head stay on GPU1. GLM Flash compares the whole GPU0 drafter with a head split: larger admitted pool wins, ties split for balance. Omit the key for this automatic choice; explicit `on` or `off` wins. Auto requires two GPUs and checkpoint-derived drafter owners (`--drafter-gib` keeps whole placement). GLM Flash selector weights and head-only workspace stay on GPU0. Plan accepts `--draft-fp8 true|false` (omission defaults to FP8 for GLM Flash) and `--draft-linear w8a16|wide|w8a8` and charges the same representation and scratch as serve. MiMo and GLM Flash split query/KV heads and MLP neurons, retaining replicated residual/convolution owners. Kimi splits cache and attention by Context; producer weights and FFN stay on GPU1. CLI false overrides config on. |
 
 ## Concurrency and serving
 
@@ -415,7 +431,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `ATTENTION_MODE` | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `ATTENTION_PLAN_ROWS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
-| `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
+| `MAX_CONTEXT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
 | `SWA_KV_CACHE` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -499,7 +515,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `TP2_QUERY_PROJECTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `TP2_OUTPUT_PROJECTION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `TP2_DSPARK_EXPERTS` | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `TP2_DFLASH` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
+| `TP2_DFLASH` | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✓ |
 | **Concurrency and serving** | | | | | | | | | | |
 | `ADDR` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `CONCURRENCY` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

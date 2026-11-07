@@ -19,16 +19,6 @@ pub fn resolve_attention(requested: Option<crate::placement::AttentionPlacement>
     requested.unwrap_or(if ranks == 2 { crate::placement::AttentionPlacement::Context }
         else { crate::placement::AttentionPlacement::Layers })
 }
-/// Default context for a BF16 (K2-class) core: one full-length conversation
-/// would leave little pool beside the BF16 core weights.
-pub const DEFAULT_CONTEXT: usize = 524_288;
-
-/// The default API/allocation context from the checkpoint's own core: a
-/// header-native K6 core frees the memory for the full compiled 1M extent with
-/// the full pool and onboard experts (TJ, 2026-10-22); BF16 cores keep 512K.
-pub fn default_context(core: &core::CoreInventory) -> usize {
-    if core.projections.is_empty() { DEFAULT_CONTEXT } else { COMPILED_CONTEXT }
-}
 pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
 
 /// TP6 retained EXL3 arenas/private capacities plus 4096-row K32 input/routes
@@ -52,7 +42,9 @@ pub fn spark_owner_bytes(extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cu
 pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
     let owners = spark_executions(waves, unit_rows)?.workspace_bytes(spark_owner_bytes)?
         .and_then(|bytes| bytes.total()).ok_or_else(|| anyhow::anyhow!("Kimi Spark owner reserve overflow"))?;
-    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + owners)
+    cuteafd_core::memory_layout::spark_runtime_reserve_bytes(0)
+        .and_then(|runtime| runtime.checked_add(owners))
+        .ok_or_else(|| anyhow::anyhow!("Kimi Spark runtime reserve overflow"))
 }
 
 /// Target taps for one prefill call (`rows` lane rows) while the common MLA

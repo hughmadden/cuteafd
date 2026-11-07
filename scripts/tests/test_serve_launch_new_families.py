@@ -60,11 +60,11 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--max-sequences") == "16"
     assert _flag(serve, "--embedding-placement") == "gpu"
     assert _flag(serve, "--prefix-cache-entries") == "20"
-    # serve-kimi's own defaults stay its own: the checkpoint core picks the context (1M for a K6
-    # core, 512K for BF16; 1M compiled), automatic KV pool;
-    # the planner picks the onboarded layers; it takes no speculator or media options.
+    # Automatic context follows the model maximum and admitted KV pool for every core.
+    # The planner picks onboarded layers; no speculator or media options are passed.
     assert _flag(serve, "--rtx-expert-layers") == "auto"
-    for absent in ("--max-context", "--pool-tokens", "--vision", "--audio",
+    assert _flag(serve, "--max-context-tokens") == "auto"
+    for absent in ("--pool-tokens", "--vision", "--audio",
                    "--draft", "--draft-fp8", "--mtp", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -103,7 +103,7 @@ def test_kimi_forwards_typed_keys_when_set(tmp_path: Path) -> None:
                   "serve-kimi --snapshot")
     assert _flag(serve, "--rtx-expert-layers") == "5"
     assert _flag(serve, "--pool-tokens") == "1048576"
-    assert _flag(serve, "--max-context") == "262144"
+    assert _flag(serve, "--max-context-tokens") == "262144"
     assert _flag(serve, "--max-sequences") == "8"
 
 
@@ -284,7 +284,8 @@ def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None
                                    extra_args=("--wip", "k3"), encoder_plan=PLANNED)
     serve = _line(result, "serve-kimi --snapshot")
     assert _flag(serve, "--rtx-expert-layers") == "auto"
-    assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
+    assert "--pool-tokens" not in serve.split()
+    assert _flag(serve, "--max-context-tokens") == "auto"
 
 
 @pytest.mark.parametrize("recipe", ["example", "release", "gate"])
@@ -324,7 +325,8 @@ def test_kimi_min_recipe_launches_one_physical_owner_with_pinned_prefill_shape(t
     assert _flag(plan, "--prefill-rows") == _flag(serve, "--prefill-rows") == "1024"
     assert (_flag(plan, "--prefill-waves") or "3") == _flag(serve, "--prefill-waves") == "3"
     assert _flag(serve, "--rtx-expert-layers") == "auto"
-    assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
+    assert "--pool-tokens" not in serve.split()
+    assert _flag(serve, "--max-context-tokens") == "auto"
     workers = [line for line in result.stderr.splitlines() if "expertd-native" in line]
     assert len(workers) == 6 and all(f"--device-budget-bytes {110 << 30} " in worker for worker in workers)
 
@@ -400,7 +402,8 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert _flag(serve, "--mtp") == "3"
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert ((_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")) == (gpus == 2)
-    for absent in ("--max-context", "--pool-tokens", "--rtx-expert-layers", "--vision", "--audio",
+    assert _flag(serve, "--max-context-tokens") == "auto"
+    for absent in ("--pool-tokens", "--rtx-expert-layers", "--vision", "--audio",
                    "--draft", "--draft-fp8", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -590,7 +593,8 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert _flag(serve, "--vision") == _flag(serve, "--audio") == "off"
-    for absent in ("--max-context", "--pool-tokens", "--draft", "--mtp", "--kv-cache",
+    assert _flag(serve, "--max-context-tokens") == "auto"
+    for absent in ("--pool-tokens", "--draft", "--mtp", "--kv-cache",
                    "--prefill-packing", "--expert-partial-bf16-max-rows", "--spark-prefill-reply-format", "--spark-decode-reply-format"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -626,6 +630,19 @@ def test_muse_default_drafter_is_pinned_and_off_is_explicit(tmp_path: Path, mode
     else:
         snapshot = str(tmp_path / f"hf/hub/models--{drafter.replace('/', '--')}/snapshots/{revision}")
         assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
+
+
+@pytest.mark.parametrize("selection,expected", [(None, "false"), ("off", "false"), ("on", "true")])
+def test_muse_tp2_dflash_reaches_plan_and_serve(tmp_path: Path, selection, expected) -> None:
+    drafter = "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
+    revision = "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
+    _snapshot(tmp_path / "hf", drafter, {}, revision=revision)
+    keys = "SPECULATOR=dflash2\n"
+    if selection is not None:
+        keys += f"TP2_DFLASH={selection}\n"
+    result = _muse(tmp_path, keys)
+    serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
+    assert _flag(serve, "--tp2-dflash") == _flag(plan, "--tp2-dflash") == expected
 
 
 @pytest.mark.parametrize("setting", ["", "off", "on"])
@@ -687,7 +704,7 @@ def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     assert _flag(plan, "--spark-decode-reply-format") == "nvfp4"
     assert _flag(serve, "--rtx-expert-layers") == "3"
     assert _flag(serve, "--pool-tokens") == "1048576"
-    assert _flag(serve, "--max-context") == "262144"
+    assert _flag(serve, "--max-context-tokens") == "262144"
     assert _flag(serve, "--max-sequences") == "8"
     assert _flag(serve, "--expert-partial-bf16-max-rows") == "128"
     assert "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT=fp8" in serve

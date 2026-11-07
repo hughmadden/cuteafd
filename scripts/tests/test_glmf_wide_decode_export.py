@@ -1147,3 +1147,16 @@ def test_glmf_tp2_drafter_exports_every_rank_local_projection(exporter):
     assert {shape for shape, families in shapes.items() if "dflash2-glmf-tp2" in families} == expected
     assert "dflash-convolution" in shapes[4096, 1024]
     assert "dflash-selector" in shapes[4096, 256]
+
+
+@pytest.mark.parametrize("family,heads,kv,intermediate", [
+    ("dflash2-muse-radix", 64, 8, 28672),
+    ("dflash2-muse-nvidia", 128, 16, 24576),
+])
+def test_muse_tp2_drafter_exports_every_rank_local_projection(exporter, family, heads, kv, intermediate):
+    shapes = exporter.draft_bf16_shapes()
+    expected = {(40960, 8192), (8192, (heads // 2 + kv) * (128 if heads == 64 else 64)),
+                (8192, kv * (128 if heads == 64 else 64)),
+                (heads // 2 * (128 if heads == 64 else 64), 8192),
+                (8192, intermediate), (intermediate // 2, 8192)}
+    assert {shape for shape, families in shapes.items() if family + "-tp2" in families} == expected
