@@ -1,66 +1,86 @@
-//! KX7 v1: an exact (lossless) code for BF16 matrices whose values were born FP8, the
-//! storage of GLM-5.3-Flash's KDA `q/k/v/o` projections. Pure CPU: the packer, the decode
-//! tables a GPU loads, and a scalar reference decoder that walks every stream the way one
-//! GPU lane does, so it is the executable reference for the kernels.
+//! KX7: an exact (lossless) code for BF16 matrices whose values were born FP8, the storage
+//! of GLM-5.3-Flash's KDA `q/k/v/o` projections. Pure CPU: the packer, the decode tables the
+//! reference kernels load, and a scalar decoder that walks every stream the way one GPU lane
+//! does, so it is the executable reference for the kernels. Format v1.1, the one the GEMV
+//! reads, is [`V11_LAYOUT`] with [`V11_CODE`]; its file set is byte-identical to the KX7
+//! reference tool's (`kdaexact.py --layout lane16 --ksplit 4 --interleave 8 --ragged --code
+//! twoclass --pbits 11 --dump`).
 //!
-//! The code. Each 16-bit BF16 pattern is one symbol. One canonical Huffman code per pack
-//! (per fused source): the unlimited Huffman lengths when the longest is at most 16 bits,
-//! else package-merge limited to 16, with every tie broken exactly as the reference tool
-//! (`kdaexact.py`: heap ties by pattern rank then node creation order, package-merge by a
-//! stable sort on weight with packages ahead of leaves). Codes are canonical: symbols in
-//! (length, pattern) order, first code 0, next = (prev + 1) << (len - prevlen). Bits are
-//! written MSB-first within each byte.
+//! Codes ([`CodeKind`]); each 16-bit BF16 pattern is one symbol, bits are MSB-first, codes
+//! canonical (symbols in (length, value) order, first code 0, next = (prev + 1) << (len -
+//! prevlen)), and every tie is broken as the tool breaks it (heap ties by symbol rank then
+//! node creation order; package-merge by a stable sort on weight, packages ahead of leaves):
 //!
-//! The core is layout-agnostic. A [`Kx7Layout`] only says which (row, col) positions each
-//! stream holds, in order, how streams are aligned, and which streams together cover a band
-//! of whole rows; histogram, code, bit packing and the lane walk never look further.
-//! Layouts:
+//! * `Huffman`: one code over all patterns, the unlimited Huffman lengths when the longest
+//!   is at most 16 bits, else package-merge limited to 16.
+//! * `TwoClass { pbits, rare_bits }`: patterns whose unlimited Huffman length exceeds pbits
+//!   are rare (the most frequent rare ones promoted until at most 2^rare_bits remain); one
+//!   code limited to pbits covers the frequent patterns and an ESC symbol weighted by the
+//!   rare mass (ESC sorts after every pattern); a rare pattern is ESC's code followed by
+//!   rare_bits raw bits, its rank among the rare patterns by value. Every code fits 16 bits.
 //!
-//! * `frag32(S)`: K is cut into S slices; one stream per (slice s, 16-row tile t, lane l of
-//!   32), ordered s, t, l. Per 16-wide K step j of its slice the stream holds the 8 values of
-//!   lane l's `mma.m16n8k16` A fragment, with g = l / 4, c = 2 (l % 4), r0 = 16t + g,
-//!   r1 = r0 + 8, k0 = 16j: W[r0][k0+c], W[r0][k0+c+1], W[r1][k0+c], W[r1][k0+c+1],
-//!   W[r0][k0+c+8], W[r0][k0+c+9], W[r1][k0+c+8], W[r1][k0+c+9]. Streams 16-byte aligned.
-//! * `lane16(S)`: as `kdaexact.py --layout lane16 --ksplit S` (SPEC 2.2): a row holds 4S
-//!   streams; stream s*4 + t of row r covers inputs s*K/S + 64c + 16t + i, c over the
-//!   slice's 64-wide chunks, i = 0..15. Streams ordered row-major, byte-aligned, so the
-//!   table, streams and index are byte-identical to that tool's `dump_pack` files.
+//! Layouts ([`Kx7Layout`]): the core never looks past each stream's ordered (row, col) list:
 //!
-//! The pack. A 32-word header ([`Kx7Header::to_words`]), the code table (u16 counts of
-//! symbols per code length 1..16, then the symbols in canonical order: `dump_pack`'s
-//! `table.bin`), one u32 byte offset per stream in stream order plus a final total
-//! (`offsets.bin`), and the concatenated streams (`streams.bin`), each zero-padded to its
-//! layout's alignment. Decode tables are built from the code table by a separate function
-//! ([`two_level_tables`]) so their format can change without touching the pack.
+//! * `lane16(S)`: a row holds 4S streams; stream s*4 + t of row r covers inputs
+//!   s*K/S + 64c + 16t + i, c over the slice's 64-wide chunks, i = 0..15; stream id
+//!   r * 4S + s*4 + t.
+//! * `frag32(S)`: one stream per (slice s, 16-row tile t, lane l of 32), id (s * n/16 + t) *
+//!   32 + l; per 16-wide K step j it holds lane l's `mma.m16n8k16` A fragment, g = l / 4,
+//!   c = 2 (l % 4), r0 = 16t + g, r1 = r0 + 8, k0 = 16j: W[r0][k0+c], W[r0][k0+c+1],
+//!   W[r1][k0+c], W[r1][k0+c+1], W[r0][k0+c+8], W[r0][k0+c+9], W[r1][k0+c+8], W[r1][k0+c+9].
 //!
-//! A lane may read up to [`READ_AHEAD_BYTES`] past the end of its stream (it refills 32 bits
-//! whenever fewer than 32 are buffered). A device copy of the streams must therefore carry
-//! that many bytes after the last stream; the reference decoder reads them as zeros.
+//! Placement ([`Placement`]): every stream's bytes are its bits zero-padded to a whole byte
+//! (its length, `lengths.bin`). `Contiguous { align }` concatenates streams in id order, each
+//! padded to `align`. `Interleaved { ragged }` (lane16): the 32 streams of each 8-row block
+//! and slice, lane l = 4 (row % 8) + t, are cut into 16-byte quads (zero-padded to a whole
+//! quad); quad q of lane l sits at group_base + (q * 32 + l) * 16 for q below the group's
+//! shortest stream in quads (ragged) or its longest (padded, shorter streams zero-filled);
+//! ragged, each lane's remaining quads then follow contiguously in lane order. Groups follow
+//! in (block, slice) order. `offsets.bin` holds each stream's quad 0 address and the total.
+//!
+//! A lane may read up to [`READ_AHEAD_BYTES`] past the end of its stream; the reference
+//! decoder reads them as zeros, and a device copy needs that many zero bytes after the
+//! streams.
 use rayon::prelude::*;
+use serde_json::{json, Value};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
+use std::path::Path;
 use thiserror::Error;
 
-/// Header word 0: the bytes "KX7\0" read as a little-endian u32.
-pub const MAGIC: u32 = u32::from_le_bytes(*b"KX7\0");
 pub const VERSION: u32 = 1;
 /// Longest code, bits.
 pub const MAXLEN: u32 = 16;
-/// Header words; table sections and the stream index follow on 16-byte boundaries.
-pub const HEADER_WORDS: usize = 32;
 /// Most source tensors one pack can fuse.
 pub const MAX_PARTS: usize = 8;
-/// Header word 12 for the code of this module: canonical Huffman limited to [`MAXLEN`].
-pub const CODE_HUFFMAN: u32 = 1;
 /// Bytes a lane may read past the end of its stream.
 pub const READ_AHEAD_BYTES: usize = 16;
 /// The lane16 K split the reference kernels use.
 pub const LANE16_DEFAULT_SLICES: usize = 4;
-/// Code-table words before the symbols: one u16 count per code length 1..=16.
+/// u16 counts (code lengths 1..=16) at the head of `table.bin`.
 pub const TABLE_COUNTS: usize = 16;
+/// A stream quad, bytes.
+pub const QUAD: usize = 16;
+/// Rows of one interleaved group: 8 rows x 4 lanes = the 32 lanes of a warp.
+pub const INTERLEAVE_ROWS: usize = 8;
+/// Distance between consecutive interleaved quads of one stream.
+pub const QUAD_STRIDE: usize = 32 * QUAD;
+/// The two-class code's escape symbol (sorts after every 16-bit pattern).
+pub const ESC: u32 = 1 << 16;
+/// ESC's slot in `table.bin` (the header's `esc_index` names the slot).
+pub const ESC_SLOT: u16 = 0xFFFF;
+/// Primary table bits of the reference kernels (`KX7_PBITS`).
+pub const DEVICE_PBITS: u32 = 11;
+/// Low byte of a Huffman node entry; byte 1 of a two-class ESC entry.
+pub const ENTRY_NODE: u32 = 0xFF;
+/// Format v1.1: lane16, K split 4, 8-row ragged interleave.
+pub const V11_LAYOUT: Kx7Layout =
+    Kx7Layout { kind: LayoutKind::Lane16, slices: 4, placement: Placement::Interleaved { ragged: true } };
+/// Format v1.1: the two-class code with an 11-bit primary and 12 rare bits.
+pub const V11_CODE: CodeKind = CodeKind::TwoClass { pbits: 11, rare_bits: 12 };
 
 const PATTERNS: usize = 1 << 16;
-/// Streams one packing task writes; streams of a task are contiguous.
+/// Streams one contiguous packing task writes.
 const ENCODE_GROUP: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -71,59 +91,69 @@ pub enum Kx7Error {
     Source { reason: &'static str, expected: usize, found: usize },
     #[error("KX7 code: {reason}")]
     Code { reason: String },
-    #[error("KX7 header word {word} ({field}) is {found}: {reason}")]
-    Header { word: usize, field: &'static str, found: u32, reason: &'static str },
-    #[error("KX7 {what} truncated: needs {need}, has {have}")]
-    Truncated { what: &'static str, need: usize, have: usize },
     #[error("KX7 table: {reason}")]
     Table { reason: String },
-    #[error("KX7 index entry {entry} is {found}: {reason}")]
+    #[error("KX7 header {field}: {reason}")]
+    Header { field: &'static str, reason: String },
+    #[error("KX7 {what} truncated: needs {need}, has {have}")]
+    Truncated { what: &'static str, need: usize, have: usize },
+    #[error("KX7 offset {entry} is {found}: {reason}")]
     Index { entry: usize, found: u64, reason: &'static str },
-    #[error("KX7 streams total {bytes} bytes, past the u32 index range")]
+    #[error("KX7 streams total {bytes} bytes, past the u32 offset range")]
     StreamsTooLarge { bytes: u64 },
+    #[error("KX7 stream {stream} takes {bytes} bytes, past the u16 length range")]
+    StreamTooLong { stream: usize, bytes: u64 },
     #[error("KX7 stream {stream}: pattern {pattern:#06x} has no codeword")]
     Uncoded { stream: usize, pattern: u16 },
     #[error("KX7 stream {stream}, symbol {symbol}: the bits match no codeword")]
     InvalidCode { stream: usize, symbol: usize },
-    #[error("KX7 stream {stream} reads past the streams and their {READ_AHEAD_BYTES}-byte read-ahead")]
+    #[error("KX7 stream {stream} reads past its bytes and their {READ_AHEAD_BYTES}-byte read-ahead")]
     Overrun { stream: usize },
-    #[error("KX7 stream {stream}: its symbols take {expected} padded bytes, the index gives {actual}")]
+    #[error("KX7 stream {stream}: its symbols take {expected} bytes, lengths.bin gives {actual}")]
     StreamLength { stream: usize, expected: usize, actual: usize },
     #[error("KX7 stream {stream}: padding after the last symbol is not zero")]
     Padding { stream: usize },
     #[error("KX7 verification failed at [{row}, {col}]: source {expected:#06x}, decoded {actual:#06x}")]
     Mismatch { row: usize, col: usize, expected: u16, actual: u16 },
+    #[error("KX7 {path}: {reason}")]
+    Io { path: String, reason: String },
 }
 
 type Result<T> = std::result::Result<T, Kx7Error>;
 
 // ---------------------------------------------------------------- layouts
 
-/// Header word 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutKind {
-    Frag32 = 1,
-    Lane16 = 2,
+    Frag32,
+    Lane16,
 }
 
 impl LayoutKind {
-    fn from_word(w: u32) -> Option<Self> {
-        match w {
-            1 => Some(Self::Frag32),
-            2 => Some(Self::Lane16),
-            _ => None,
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Frag32 => "frag32",
+            Self::Lane16 => "lane16",
         }
     }
 }
 
-/// Which positions each stream holds and how streams are aligned (module docs).
+/// Where stream bytes go (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Streams in id order, each padded to `align` bytes (a power of two up to 256).
+    Contiguous { align: usize },
+    /// lane16 only: 8-row x slice groups of 32 quad-interleaved streams.
+    Interleaved { ragged: bool },
+}
+
+/// Which positions each stream holds and where its bytes go (module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kx7Layout {
     pub kind: LayoutKind,
     /// K slices S.
     pub slices: usize,
-    /// Byte alignment of every stream start and length (a power of two up to 256).
-    pub align: usize,
+    pub placement: Placement,
 }
 
 /// frag32's split: the smallest S in {1, 2, 4, 8} that gives at least 1024 (slice, tile)
@@ -139,14 +169,17 @@ pub fn default_slices(n: usize, k: usize) -> usize {
 }
 
 impl Kx7Layout {
-    pub fn frag32(slices: usize) -> Self {
-        Self { kind: LayoutKind::Frag32, slices, align: 16 }
+    pub const fn frag32(slices: usize) -> Self {
+        Self { kind: LayoutKind::Frag32, slices, placement: Placement::Contiguous { align: 16 } }
     }
-    pub fn lane16(slices: usize) -> Self {
-        Self { kind: LayoutKind::Lane16, slices, align: 1 }
+    pub const fn lane16(slices: usize) -> Self {
+        Self { kind: LayoutKind::Lane16, slices, placement: Placement::Contiguous { align: 1 } }
     }
-    pub fn with_align(self, align: usize) -> Self {
-        Self { align, ..self }
+    pub const fn with_align(self, align: usize) -> Self {
+        Self { placement: Placement::Contiguous { align }, ..self }
+    }
+    pub const fn interleaved(self, ragged: bool) -> Self {
+        Self { placement: Placement::Interleaved { ragged }, ..self }
     }
 
     fn shape_error(&self, n: usize, k: usize, reason: &'static str) -> Kx7Error {
@@ -162,8 +195,17 @@ impl Kx7Layout {
         if s == 0 || s > 256 {
             return Err(self.shape_error(n, k, "needs 1 <= S <= 256"));
         }
-        if !self.align.is_power_of_two() || self.align > 256 {
-            return Err(self.shape_error(n, k, "needs the alignment a power of two up to 256"));
+        match self.placement {
+            Placement::Contiguous { align } if !align.is_power_of_two() || align > 256 => {
+                return Err(self.shape_error(n, k, "needs the alignment a power of two up to 256"))
+            }
+            Placement::Interleaved { .. } if self.kind != LayoutKind::Lane16 => {
+                return Err(self.shape_error(n, k, "interleaving needs lane16"))
+            }
+            Placement::Interleaved { .. } if n % INTERLEAVE_ROWS != 0 => {
+                return Err(self.shape_error(n, k, "interleaving needs n % 8 == 0"))
+            }
+            _ => {}
         }
         match self.kind {
             LayoutKind::Frag32 if n % 16 != 0 => Err(self.shape_error(n, k, "frag32 needs n % 16 == 0")),
@@ -195,7 +237,7 @@ impl Kx7Layout {
         }
     }
 
-    /// The streams of band `band`, in stream order.
+    /// The streams of band `band`, in id order.
     pub fn band_streams(&self, n: usize, band: usize, out: &mut Vec<usize>) {
         out.clear();
         match self.kind {
@@ -247,6 +289,99 @@ impl Kx7Layout {
                     out.extend((base..base + 16).map(|col| (row, col)));
                 }
             }
+        }
+    }
+
+    /// Interleaved placement: the 32 streams of group `g` ((block, slice) order) by lane.
+    fn group_streams(&self, g: usize) -> [usize; 32] {
+        let spr = 4 * self.slices;
+        let (block, slice) = (g / self.slices, g % self.slices);
+        std::array::from_fn(|l| (INTERLEAVE_ROWS * block + l / 4) * spr + slice * 4 + l % 4)
+    }
+
+    /// Interleaved placement: the group of stream `stream` and its lane.
+    fn group_of(&self, stream: usize) -> (usize, usize) {
+        let spr = 4 * self.slices;
+        let (row, w) = (stream / spr, stream % spr);
+        ((row / INTERLEAVE_ROWS) * self.slices + w / 4, 4 * (row % INTERLEAVE_ROWS) + w % 4)
+    }
+}
+
+fn quads(len: u16) -> usize {
+    (len as usize).div_ceil(QUAD)
+}
+
+/// Where the bytes of one stream sit: quad q at `first + q * stride` for q < `interleaved`,
+/// else `tail + (q - interleaved) * 16`; `span` bytes in all (its padded extent).
+struct Extent {
+    first: usize,
+    stride: usize,
+    interleaved: usize,
+    tail: usize,
+    span: usize,
+}
+
+impl Extent {
+    fn quad(&self, q: usize) -> usize {
+        if q < self.interleaved {
+            self.first + q * self.stride
+        } else {
+            self.tail + (q - self.interleaved) * QUAD
+        }
+    }
+}
+
+/// Stream byte offsets (its first byte, or quad 0, then the total) from the stream lengths.
+fn place(layout: &Kx7Layout, n: usize, k: usize, lengths: &[u16]) -> Result<Vec<u32>> {
+    let ns = layout.streams(n, k);
+    let mut offsets = vec![0u32; ns + 1];
+    let mut total = 0u64;
+    let fits = |t: u64| if t > u32::MAX as u64 { Err(Kx7Error::StreamsTooLarge { bytes: t }) } else { Ok(t as u32) };
+    match layout.placement {
+        Placement::Contiguous { align } => {
+            for (i, &len) in lengths.iter().enumerate() {
+                offsets[i] = fits(total)?;
+                total += (len as u64).next_multiple_of(align as u64);
+            }
+        }
+        Placement::Interleaved { ragged } => {
+            for g in 0..(n / INTERLEAVE_ROWS) * layout.slices {
+                let ids = layout.group_streams(g);
+                let nq = ids.map(|i| quads(lengths[i]));
+                let most = *nq.iter().max().expect("32 lanes");
+                let rounds = if ragged { *nq.iter().min().expect("32 lanes") } else { most };
+                for (l, &i) in ids.iter().enumerate() {
+                    offsets[i] = fits(total + (l * QUAD) as u64)?;
+                }
+                let tails: usize = nq.iter().map(|&q| q.saturating_sub(rounds)).sum();
+                total += (rounds * QUAD_STRIDE + tails * QUAD) as u64;
+            }
+        }
+    }
+    offsets[ns] = fits(total)?;
+    Ok(offsets)
+}
+
+/// The extent of stream `stream` under validated offsets and lengths.
+fn extent(layout: &Kx7Layout, offsets: &[u32], lengths: &[u16], stream: usize) -> Extent {
+    let first = offsets[stream] as usize;
+    match layout.placement {
+        Placement::Contiguous { align } => {
+            let span = (lengths[stream] as usize).next_multiple_of(align);
+            Extent { first, stride: QUAD, interleaved: usize::MAX, tail: 0, span }
+        }
+        Placement::Interleaved { ragged } => {
+            let (g, lane) = layout.group_of(stream);
+            let nq = layout.group_streams(g).map(|i| quads(lengths[i]));
+            let own = nq[lane];
+            if !ragged {
+                let rounds = *nq.iter().max().expect("32 lanes");
+                return Extent { first, stride: QUAD_STRIDE, interleaved: rounds, tail: 0, span: rounds * QUAD };
+            }
+            let rounds = *nq.iter().min().expect("32 lanes");
+            let before: usize = nq[..lane].iter().map(|&q| q - rounds).sum();
+            let tail = first - lane * QUAD + rounds * QUAD_STRIDE + before * QUAD;
+            Extent { first, stride: QUAD_STRIDE, interleaved: rounds, tail, span: own * QUAD }
         }
     }
 }
@@ -346,9 +481,8 @@ pub fn histogram(src: &Kx7Source<'_>) -> Vec<u64> {
 
 // ---------------------------------------------------------------- code lengths
 
-/// Unlimited Huffman depths of `freqs` (symbols in ascending pattern order), as
-/// `kdaexact.py: _huffman_lengths`: a min-heap on (weight, id), leaves numbered by rank,
-/// merged nodes from n upward in creation order.
+/// Unlimited Huffman depths of `freqs` (in symbol order), as the tool's `_huffman_lengths`:
+/// a min-heap on (weight, id), leaves numbered by position, merged nodes from n upward.
 fn huffman_depths(freqs: &[u64]) -> Vec<u32> {
     let n = freqs.len();
     if n == 1 {
@@ -379,10 +513,10 @@ enum Coin {
     Package(u32, u32),
 }
 
-/// Length-limited depths by package-merge, as `kdaexact.py: package_merge`: `items` are
-/// (weight, pattern) sorted ascending; each level is the stable sort by weight of the
-/// previous level's pairs followed by the leaves, so packages precede leaves on ties.
-fn package_merge(items: &[(u64, u16)], maxlen: u32) -> Result<Vec<u32>> {
+/// Length-limited depths by package-merge, as the tool's `package_merge`: `items` are
+/// (weight, symbol) sorted ascending; each level is the stable sort by weight of the previous
+/// level's pairs followed by the leaves, so packages precede leaves on ties.
+fn package_merge(items: &[(u64, u32)], maxlen: u32) -> Result<Vec<u32>> {
     let n = items.len();
     if n == 1 {
         return Ok(vec![1]);
@@ -436,262 +570,358 @@ fn package_merge(items: &[(u64, u16)], maxlen: u32) -> Result<Vec<u32>> {
     Ok(lengths)
 }
 
-/// Code lengths per pattern (65,536 entries, 0 = absent) with every length at most
-/// [`MAXLEN`]: `kdaexact.py: length_limited_lengths(f, 16)`, tie for tie.
-pub fn code_lengths(hist: &[u64]) -> Result<Vec<u8>> {
+/// Code lengths of (weight, symbol) items listed in ascending symbol order, limited to
+/// `maxlen`: unlimited Huffman when it fits, else package-merge.
+fn limited_lengths(items: &[(u64, u32)], maxlen: u32) -> Result<Vec<u32>> {
+    let freqs: Vec<u64> = items.iter().map(|&(f, _)| f).collect();
+    let depths = huffman_depths(&freqs);
+    if depths.iter().all(|&d| d <= maxlen) {
+        return Ok(depths);
+    }
+    let mut sorted: Vec<(u64, u32, usize)> = items.iter().enumerate().map(|(i, &(f, s))| (f, s, i)).collect();
+    sorted.sort_unstable();
+    let merged = package_merge(&sorted.iter().map(|&(f, s, _)| (f, s)).collect::<Vec<_>>(), maxlen)?;
+    let mut out = vec![0u32; items.len()];
+    for (&(_, _, i), &d) in sorted.iter().zip(&merged) {
+        out[i] = d;
+    }
+    Ok(out)
+}
+
+fn used_patterns(hist: &[u64]) -> Result<Vec<(u64, u32)>> {
     if hist.len() != PATTERNS {
         return Err(Kx7Error::Code { reason: format!("histogram has {} bins, not 65536", hist.len()) });
     }
-    let syms: Vec<u16> = (0..PATTERNS).filter(|&s| hist[s] > 0).map(|s| s as u16).collect();
-    if syms.is_empty() {
+    let items: Vec<(u64, u32)> = (0..PATTERNS).filter(|&s| hist[s] > 0).map(|s| (hist[s], s as u32)).collect();
+    if items.is_empty() {
         return Err(Kx7Error::Code { reason: "empty histogram".into() });
     }
-    let freqs: Vec<u64> = syms.iter().map(|&s| hist[s as usize]).collect();
-    let mut depths = huffman_depths(&freqs);
+    Ok(items)
+}
+
+/// Huffman code lengths per pattern (65,536 entries, 0 = absent), at most [`MAXLEN`]: the
+/// tool's `length_limited_lengths(f, 16)`, tie for tie.
+pub fn code_lengths(hist: &[u64]) -> Result<Vec<u8>> {
+    let items = used_patterns(hist)?;
     let mut lengths = vec![0u8; PATTERNS];
-    if depths.iter().any(|&d| d > MAXLEN) {
-        let mut items: Vec<(u64, u16)> = freqs.iter().copied().zip(syms.iter().copied()).collect();
-        items.sort_unstable();
-        depths = package_merge(&items, MAXLEN)?;
-        for (&(_, s), &d) in items.iter().zip(&depths) {
-            lengths[s as usize] = d as u8;
-        }
-    } else {
-        for (&s, &d) in syms.iter().zip(&depths) {
-            lengths[s as usize] = d as u8;
-        }
+    for (&(_, s), d) in items.iter().zip(limited_lengths(&items, MAXLEN)?) {
+        lengths[s as usize] = d as u8;
     }
     Ok(lengths)
 }
 
-// ---------------------------------------------------------------- canonical code
+// ---------------------------------------------------------------- codes
 
-/// A canonical prefix code over 16-bit patterns, lengths 1..=16.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalCode {
-    lengths: Vec<u8>,
-    symbols: Vec<u16>,
-    counts: [u32; MAXLEN as usize + 1],
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeKind {
+    Huffman,
+    TwoClass { pbits: u32, rare_bits: u32 },
 }
 
-impl CanonicalCode {
-    /// From per-pattern lengths (65,536 entries, 0 = absent).
-    pub fn from_lengths(lengths: Vec<u8>) -> Result<Self> {
-        if lengths.len() != PATTERNS {
-            return Err(Kx7Error::Code { reason: format!("{} lengths, not 65536", lengths.len()) });
+impl CodeKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Huffman => "huffman",
+            Self::TwoClass { .. } => "twoclass",
         }
-        let mut counts = [0u32; MAXLEN as usize + 1];
-        for &l in &lengths {
-            if l as u32 > MAXLEN {
-                return Err(Kx7Error::Code { reason: format!("a code of {l} bits exceeds {MAXLEN}") });
+    }
+}
+
+/// One pack's code: the canonical code over its table symbols (ESC among them for the
+/// two-class code) and, two-class, the rare patterns in rank order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kx7Code {
+    kind: CodeKind,
+    /// (length, symbol) in canonical order; ESC is [`ESC`].
+    order: Vec<(u32, u32)>,
+    rare: Vec<u16>,
+    esc_index: Option<usize>,
+    esc_len: u32,
+    /// Per pattern: `code << 8 | length` (0 = absent), rare patterns included.
+    codewords: Vec<u32>,
+}
+
+impl Kx7Code {
+    /// The code of a histogram.
+    pub fn build(hist: &[u64], kind: CodeKind) -> Result<Self> {
+        let items = used_patterns(hist)?;
+        let code_err = |reason: String| Kx7Error::Code { reason };
+        match kind {
+            CodeKind::Huffman => {
+                let lengths = limited_lengths(&items, MAXLEN)?;
+                let mut order: Vec<(u32, u32)> = items.iter().zip(lengths).map(|(&(_, s), l)| (l, s)).collect();
+                order.sort_unstable();
+                Self::assemble(kind, order, Vec::new()).map_err(code_err)
             }
-            counts[l as usize] += 1;
+            CodeKind::TwoClass { pbits, rare_bits } => {
+                check_two_class(pbits, rare_bits).map_err(code_err)?;
+                // The tool's twoclass_code: rare = unlimited length > pbits, ordered by
+                // (-weight, pattern); the most frequent are promoted until 2^rare_bits remain.
+                let depths = huffman_depths(&items.iter().map(|&(f, _)| f).collect::<Vec<_>>());
+                let mut rare: Vec<(u64, u32)> =
+                    items.iter().zip(&depths).filter(|&(_, &d)| d > pbits).map(|(&it, _)| it).collect();
+                rare.sort_unstable_by_key(|&(f, s)| (Reverse(f), s));
+                let keep = rare.len().min(1 << rare_bits);
+                rare.drain(..rare.len() - keep);
+                let mut is_rare = vec![false; PATTERNS];
+                rare.iter().for_each(|&(_, s)| is_rare[s as usize] = true);
+                let mut coded: Vec<(u64, u32)> = items.iter().copied().filter(|&(_, s)| !is_rare[s as usize]).collect();
+                if !rare.is_empty() {
+                    coded.push((rare.iter().map(|&(f, _)| f).sum(), ESC));
+                }
+                let lengths = limited_lengths(&coded, pbits)?;
+                let mut order: Vec<(u32, u32)> = coded.iter().zip(lengths).map(|(&(_, s), l)| (l, s)).collect();
+                order.sort_unstable();
+                let mut rare: Vec<u16> = rare.iter().map(|&(_, s)| s as u16).collect();
+                rare.sort_unstable();
+                Self::assemble(kind, order, rare).map_err(code_err)
+            }
         }
-        counts[0] = 0;
-        let mut symbols = Vec::with_capacity(counts.iter().sum::<u32>() as usize);
-        for len in 1..=MAXLEN as u8 {
-            symbols.extend((0..PATTERNS).filter(|&s| lengths[s] == len).map(|s| s as u16));
-        }
-        Self::checked(lengths, symbols, counts).map_err(|reason| Kx7Error::Code { reason })
     }
 
-    /// The code of a histogram: [`code_lengths`] then canonical assignment.
-    pub fn from_histogram(hist: &[u64]) -> Result<Self> {
-        Self::from_lengths(code_lengths(hist)?)
-    }
-
-    /// From a code table: u16 counts for lengths 1..=16, then the symbols in canonical order.
-    /// A u16 count wraps, so the one code with all 65,536 patterns at 16 bits stores 0.
-    pub fn from_table(table: &[u16]) -> Result<Self> {
+    /// From `table.bin` (u16 counts for lengths 1..=16, then the symbols in canonical order,
+    /// [`ESC_SLOT`] at `esc_index`) and `rare.bin` (two-class: patterns in rank order). A u16
+    /// count wraps: the one Huffman code with all 65,536 patterns at 16 bits stores 0.
+    pub fn from_tables(kind: CodeKind, table: &[u16], rare: &[u16], esc_index: Option<usize>) -> Result<Self> {
+        let bad = |reason: String| Kx7Error::Table { reason };
         if table.len() < TABLE_COUNTS {
             return Err(Kx7Error::Truncated { what: "code table", need: TABLE_COUNTS, have: table.len() });
         }
-        let symbols = table[TABLE_COUNTS..].to_vec();
-        let mut counts = [0u32; MAXLEN as usize + 1];
-        for (l, &c) in table[..TABLE_COUNTS].iter().enumerate() {
-            counts[l + 1] = c as u32;
-        }
+        let symbols = &table[TABLE_COUNTS..];
+        let mut counts: Vec<usize> = table[..TABLE_COUNTS].iter().map(|&c| c as usize).collect();
         if symbols.len() == PATTERNS && counts.iter().all(|&c| c == 0) {
-            counts[MAXLEN as usize] = PATTERNS as u32;
+            counts[MAXLEN as usize - 1] = PATTERNS;
         }
-        let total: u32 = counts.iter().sum();
-        if total as usize != symbols.len() {
-            return Err(Kx7Error::Table {
-                reason: format!("counts sum to {total}, the table holds {} symbols", symbols.len()),
-            });
+        let total: usize = counts.iter().sum();
+        if total != symbols.len() {
+            return Err(bad(format!("counts sum to {total}, the table holds {} symbols", symbols.len())));
         }
-        let mut lengths = vec![0u8; PATTERNS];
-        let mut i = 0;
-        for len in 1..=MAXLEN as usize {
-            for _ in 0..counts[len] {
-                let s = symbols[i] as usize;
-                if lengths[s] != 0 {
-                    return Err(Kx7Error::Table { reason: format!("pattern {s:#06x} appears twice") });
-                }
-                lengths[s] = len as u8;
-                i += 1;
+        if let Some(e) = esc_index {
+            if kind == CodeKind::Huffman || e >= symbols.len() || symbols[e] != ESC_SLOT {
+                return Err(bad(format!("esc_index {e} names no ESC slot")));
             }
         }
-        Self::checked(lengths, symbols, counts).map_err(|reason| Kx7Error::Table { reason })
+        let mut order = Vec::with_capacity(total);
+        for (l, &c) in counts.iter().enumerate() {
+            for _ in 0..c {
+                let i = order.len();
+                order.push((l as u32 + 1, if esc_index == Some(i) { ESC } else { symbols[i] as u32 }));
+            }
+        }
+        Self::assemble(kind, order, rare.to_vec()).map_err(bad)
     }
 
-    fn checked(
-        lengths: Vec<u8>,
-        symbols: Vec<u16>,
-        counts: [u32; MAXLEN as usize + 1],
-    ) -> std::result::Result<Self, String> {
-        if symbols.is_empty() {
+    /// Validates a canonical order (and rare list) and derives every codeword.
+    fn assemble(kind: CodeKind, order: Vec<(u32, u32)>, rare: Vec<u16>) -> std::result::Result<Self, String> {
+        let limit = match kind {
+            CodeKind::Huffman => MAXLEN,
+            CodeKind::TwoClass { pbits, rare_bits } => {
+                check_two_class(pbits, rare_bits)?;
+                pbits
+            }
+        };
+        if order.is_empty() {
             return Err("no symbols".into());
         }
-        if symbols.len() == 1 && counts[1] != 1 {
+        if order.len() == 1 && order[0].0 != 1 {
             return Err("a one-symbol code must be one bit long".into());
         }
-        let kraft: u64 = (1..=MAXLEN as usize).map(|l| (counts[l] as u64) << (MAXLEN as usize - l)).sum();
+        for w in order.windows(2) {
+            if w[0] >= w[1] {
+                return Err(format!("symbols {:#x}, {:#x} are not in (length, value) order", w[0].1, w[1].1));
+            }
+        }
+        if let Some(&(l, s)) = order.iter().find(|&&(l, s)| l == 0 || l > limit || s > ESC) {
+            return Err(format!("symbol {s:#x} takes {l} bits (1 to {limit} allowed)"));
+        }
+        let kraft: u64 = order.iter().map(|&(l, _)| 1u64 << (MAXLEN - l)).sum();
         if kraft > 1 << MAXLEN {
             return Err(format!("Kraft sum {kraft}/65536 exceeds 1"));
         }
-        for w in symbols.windows(2) {
-            let (la, lb) = (lengths[w[0] as usize], lengths[w[1] as usize]);
-            if la > lb || (la == lb && w[0] >= w[1]) {
-                return Err(format!("symbols {:#06x}, {:#06x} are not in (length, pattern) order", w[0], w[1]));
+        let esc_index = order.iter().position(|&(_, s)| s == ESC);
+        let mut codewords = vec![0u32; PATTERNS];
+        let (mut code, mut prev, mut esc) = (0u32, 0u32, (0u32, 0u32));
+        for &(l, s) in &order {
+            code <<= l - prev;
+            if s == ESC {
+                esc = (code, l);
+            } else if codewords[s as usize] != 0 {
+                return Err(format!("pattern {s:#06x} appears twice"));
+            } else {
+                codewords[s as usize] = code << 8 | l;
             }
+            code += 1;
+            prev = l;
         }
-        Ok(Self { lengths, symbols, counts })
+        match kind {
+            CodeKind::Huffman if esc_index.is_some() || !rare.is_empty() => {
+                return Err("a Huffman code has no ESC or rare symbols".into())
+            }
+            CodeKind::TwoClass { rare_bits, .. } => {
+                if esc_index.is_some() == rare.is_empty() {
+                    return Err("ESC must be coded exactly when rare symbols exist".into());
+                }
+                if rare.len() > 1 << rare_bits {
+                    return Err(format!("{} rare symbols exceed 2^{rare_bits}", rare.len()));
+                }
+                if !rare.is_empty() && esc.1 + rare_bits > MAXLEN {
+                    return Err(format!("ESC code {} bits + {rare_bits} raw bits exceeds 16", esc.1));
+                }
+                for (rank, &s) in rare.iter().enumerate() {
+                    if rank > 0 && rare[rank - 1] >= s {
+                        return Err(format!("rare patterns {:#06x}, {s:#06x} are not ascending", rare[rank - 1]));
+                    }
+                    if codewords[s as usize] != 0 {
+                        return Err(format!("pattern {s:#06x} is both frequent and rare"));
+                    }
+                    codewords[s as usize] = ((esc.0 << rare_bits) | rank as u32) << 8 | (esc.1 + rare_bits);
+                }
+            }
+            _ => {}
+        }
+        Ok(Self { kind, order, rare, esc_index, esc_len: esc.1, codewords })
     }
 
+    pub fn kind(&self) -> CodeKind {
+        self.kind
+    }
+    /// Table symbols (ESC included): the header's `n_sym`.
     pub fn n_sym(&self) -> usize {
-        self.symbols.len()
+        self.order.len()
     }
-    /// Symbols in canonical order.
-    pub fn symbols(&self) -> &[u16] {
-        &self.symbols
+    pub fn n_frequent(&self) -> usize {
+        self.order.len() - usize::from(self.esc_index.is_some())
     }
-    /// Per-pattern lengths, 0 = absent.
-    pub fn lengths(&self) -> &[u8] {
-        &self.lengths
+    pub fn n_rare(&self) -> usize {
+        self.rare.len()
     }
-    /// Symbols of length `len` (1..=16).
-    pub fn count(&self, len: u32) -> u32 {
-        self.counts[len as usize]
+    /// ESC's position in the canonical order.
+    pub fn esc_index(&self) -> Option<usize> {
+        self.esc_index
     }
-
-    /// The first code of each length 0..=17, not left-aligned (canonical recurrence).
-    fn first_codes(&self) -> [u32; MAXLEN as usize + 2] {
-        let mut first = [0u32; MAXLEN as usize + 2];
-        for l in 1..=MAXLEN as usize + 1 {
-            first[l] = (first[l - 1] + self.counts[l - 1]) << 1;
-        }
-        first
+    /// ESC's code length (0 without rare symbols).
+    pub fn esc_len(&self) -> u32 {
+        self.esc_len
     }
-
-    /// Left-aligned (16-bit) first code of length `len`.
-    fn start(&self, len: u32) -> u32 {
-        self.first_codes()[len as usize] << (MAXLEN - len)
+    /// Rare patterns in rank order.
+    pub fn rare(&self) -> &[u16] {
+        &self.rare
     }
-
     /// Per pattern: `code << 8 | length` (0 = absent).
-    pub fn codewords(&self) -> Vec<u32> {
-        let mut first = self.first_codes();
-        let mut out = vec![0u32; PATTERNS];
-        for &s in &self.symbols {
-            let l = self.lengths[s as usize] as usize;
-            out[s as usize] = first[l] << 8 | l as u32;
-            first[l] += 1;
+    pub fn codewords(&self) -> &[u32] {
+        &self.codewords
+    }
+    /// Per pattern code length in bits (0 = absent), rare patterns at ESC + raw bits.
+    pub fn length(&self, pattern: u16) -> u32 {
+        self.codewords[pattern as usize] & 0xff
+    }
+    /// Patterns with a codeword (frequent and rare).
+    pub fn coded_patterns(&self) -> usize {
+        self.codewords.iter().filter(|&&c| c != 0).count()
+    }
+    /// The header's `maxlen`: 16, or ESC + rare bits for the two-class code (as the tool).
+    pub fn maxlen(&self) -> u32 {
+        match self.kind {
+            CodeKind::Huffman => MAXLEN,
+            CodeKind::TwoClass { rare_bits, .. } => self.esc_len + rare_bits,
         }
-        out
     }
 
-    /// The code table: u16 counts for lengths 1..=16 (wrapping), then the symbols.
+    /// `table.bin`: u16 counts for lengths 1..=16 (wrapping), then the symbols in canonical
+    /// order with [`ESC_SLOT`] for ESC.
     pub fn table(&self) -> Vec<u16> {
-        let mut t: Vec<u16> = self.counts[1..].iter().map(|&c| c as u16).collect();
-        t.extend_from_slice(&self.symbols);
+        let mut t = vec![0u16; TABLE_COUNTS];
+        for &(l, _) in &self.order {
+            t[l as usize - 1] = t[l as usize - 1].wrapping_add(1);
+        }
+        t.extend(self.order.iter().map(|&(_, s)| if s == ESC { ESC_SLOT } else { s as u16 }));
         t
     }
-}
 
-// ---------------------------------------------------------------- decode tables
-
-/// Table section word 0 for [`two_level_tables`].
-pub const TABLE_TWO_LEVEL: u32 = 1;
-/// Primary table index bits: the top 11 of a 16-bit peek.
-pub const PRIMARY_BITS: u32 = 11;
-/// Word offsets inside a two-level table section.
-pub const TL_PRIMARY: usize = 4;
-pub const TL_LONG: usize = TL_PRIMARY + (1 << PRIMARY_BITS);
-pub const TL_COUNTS: usize = TL_LONG + 4 * TL_LONG_LENGTHS;
-pub const TL_SYMBOLS: usize = TL_COUNTS + MAXLEN as usize;
-/// Long code lengths PRIMARY_BITS + 1 ..= MAXLEN.
-pub const TL_LONG_LENGTHS: usize = (MAXLEN - PRIMARY_BITS) as usize;
-/// Primary entry flags (low byte).
-pub const FLAG_LONG: u32 = 0;
-pub const FLAG_LEAF: u32 = 1;
-pub const FLAG_UNUSED: u32 = 2;
-
-/// The two-level decode tables a GPU loads (into shared memory), as one u32 section:
-///
-/// | words | content |
-/// |---|---|
-/// | 0 | [`TABLE_TWO_LEVEL`] |
-/// | 1 | n_sym |
-/// | 2 | [`PRIMARY_BITS`] (11) |
-/// | 3 | section words: `TL_SYMBOLS + ceil(n_sym / 2)` |
-/// | 4 .. 2052 | primary[2048], indexed by `peek16 >> 5` |
-/// | 2052 .. 2072 | long[L - 12] for L = 12..=16: {limit, start, base, count} |
-/// | 2072 .. 2088 | counts[L - 1] for L = 1..=16 |
-/// | 2088 .. | the symbols in canonical order, u16 pairs (symbol 2i in the low half) |
-///
-/// A primary entry is `pattern << 16 | len << 8 | flag`: flag 1, a leaf (len <= 11);
-/// flag 0, a long code whose `len` is the shortest code length under that 11-bit prefix
-/// (where the length search starts) and pattern 0; flag 2, a prefix no code takes. For the
-/// long arrays, `start` is the first code of length L left-aligned to 16 bits, `limit` the
-/// exclusive end of length-L codes in that space (`start + count << (16 - L)`), and `base`
-/// the canonical index of length L's first symbol, so a long code decodes as
-/// `L = len; while peek >= limit[L] { L++ }`, `symbols[base[L] + ((peek - start[L]) >> (16 - L))]`.
-/// A one-symbol code fills every primary entry with its leaf (len 1), as `kdaexact.py`.
-/// Sections 4, 2052, 2072 and 2088 words are 16-byte aligned.
-pub fn two_level_tables(code: &CanonicalCode) -> Vec<u32> {
-    let n_sym = code.n_sym();
-    let mut t = vec![0u32; TL_SYMBOLS + n_sym.div_ceil(2)];
-    t[0] = TABLE_TWO_LEVEL;
-    t[1] = n_sym as u32;
-    t[2] = PRIMARY_BITS;
-    t[3] = t.len() as u32;
-    let primary = &mut t[TL_PRIMARY..TL_LONG];
-    primary.fill(FLAG_UNUSED);
-    if n_sym == 1 {
-        primary.fill((code.symbols[0] as u32) << 16 | 1 << 8 | FLAG_LEAF);
-    } else {
-        let cw = code.codewords();
-        for &s in code.symbols.iter().rev() {
-            let (c, l) = (cw[s as usize] >> 8, cw[s as usize] & 0xff);
-            if l <= PRIMARY_BITS {
-                let lo = (c << (PRIMARY_BITS - l)) as usize;
-                let hi = ((c + 1) << (PRIMARY_BITS - l)) as usize;
-                primary[lo..hi].fill((s as u32) << 16 | l << 8 | FLAG_LEAF);
-            } else {
-                // Reverse canonical order: the last write per prefix is its shortest code.
-                primary[(c >> (l - PRIMARY_BITS)) as usize] = l << 8 | FLAG_LONG;
+    /// The decode tables of the reference kernels (`build_lut`), as u32 words for shared
+    /// memory. Huffman: 2^pbits primary entries, a leaf `pattern << 16 | len` or, for a prefix
+    /// of longer codes, a node `index << 16 | (32 - bits) << 8 | 0xFF` naming a sub-table of
+    /// 2^bits leaves (bits = longest code under the prefix - pbits) at word `index`; sub-tables
+    /// follow in prefix order. Two-class: 2^pbits entries, a leaf or, for ESC,
+    /// `0xFF << 8 | (esc_len + rare_bits)`, then 2^rare_bits u16 rare patterns by rank (zero
+    /// padded), two to a word. Unused entries are 0.
+    pub fn device_tables(&self, pbits: u32) -> Result<Vec<u32>> {
+        let bad = |reason: String| Kx7Error::Table { reason };
+        if pbits == 0 || pbits > MAXLEN {
+            return Err(bad(format!("{pbits} primary bits")));
+        }
+        let primary = 1usize << pbits;
+        let mut words = vec![0u32; primary];
+        let mut code = 0u32;
+        let mut prev = 0u32;
+        let mut long: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for &(l, s) in &self.order {
+            code <<= l - prev;
+            prev = l;
+            let c = code;
+            code += 1;
+            if l > pbits {
+                if s == ESC || matches!(self.kind, CodeKind::TwoClass { .. }) {
+                    return Err(bad(format!("a two-class code of {l} bits exceeds {pbits} primary bits")));
+                }
+                long.push((c >> (l - pbits), l, s, c));
+                continue;
+            }
+            let entry = match (self.kind, s == ESC) {
+                (CodeKind::TwoClass { rare_bits, .. }, true) => ENTRY_NODE << 8 | (l + rare_bits),
+                _ => s << 16 | l,
+            };
+            words[(c << (pbits - l)) as usize..((c + 1) << (pbits - l)) as usize].fill(entry);
+        }
+        match self.kind {
+            CodeKind::TwoClass { rare_bits, .. } => {
+                let start = words.len();
+                words.resize(start + (1usize << rare_bits).div_ceil(2), 0);
+                for (i, &r) in self.rare.iter().enumerate() {
+                    words[start + i / 2] |= (r as u32) << (16 * (i % 2));
+                }
+            }
+            CodeKind::Huffman => {
+                let mut longest: BTreeMap<u32, u32> = BTreeMap::new();
+                for &(p, l, _, _) in &long {
+                    let e = longest.entry(p).or_insert(l);
+                    *e = (*e).max(l);
+                }
+                let mut base: BTreeMap<u32, usize> = BTreeMap::new();
+                for (&p, &l) in &longest {
+                    let index = words.len();
+                    if index >= PATTERNS {
+                        return Err(bad("sub-tables pass the 16-bit entry index".into()));
+                    }
+                    base.insert(p, index);
+                    words[p as usize] = (index as u32) << 16 | (32 - (l - pbits)) << 8 | ENTRY_NODE;
+                    words.resize(index + (1 << (l - pbits)), 0);
+                }
+                for &(p, l, s, c) in &long {
+                    let bits = longest[&p] - pbits;
+                    let rem = c & ((1 << (l - pbits)) - 1);
+                    let shift = bits - (l - pbits);
+                    let at = base[&p];
+                    words[at + (rem << shift) as usize..at + ((rem + 1) << shift) as usize].fill(s << 16 | l);
+                }
             }
         }
+        Ok(words)
     }
-    let mut base = 0u32;
-    for l in 1..=MAXLEN {
-        if l > PRIMARY_BITS {
-            let start = code.start(l);
-            let e = TL_LONG + 4 * (l - PRIMARY_BITS - 1) as usize;
-            t[e..e + 4].copy_from_slice(&[start + (code.count(l) << (MAXLEN - l)), start, base, code.count(l)]);
-        }
-        t[TL_COUNTS + l as usize - 1] = code.count(l);
-        base += code.count(l);
-    }
-    for (i, &s) in code.symbols.iter().enumerate() {
-        t[TL_SYMBOLS + i / 2] |= (s as u32) << (16 * (i % 2));
-    }
-    t
 }
 
-/// The bit reader of one GPU lane: a 64-bit buffer whose valid bits sit at the top, refilled
-/// with the next big-endian 32-bit word whenever it holds fewer than 32 bits.
+fn check_two_class(pbits: u32, rare_bits: u32) -> std::result::Result<(), String> {
+    if pbits == 0 || pbits > MAXLEN || rare_bits == 0 || rare_bits >= MAXLEN {
+        return Err(format!("two-class needs 1 <= pbits <= 16 and 1 <= rare_bits <= 15 (got {pbits}, {rare_bits})"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- lane decoding
+
+/// The bit reader of one GPU lane over its stream's bytes: a 64-bit buffer whose valid bits
+/// sit at the top, refilled with the next big-endian 32-bit word whenever it holds fewer than
+/// 32 bits.
 pub struct LaneBits<'a> {
     bytes: &'a [u8],
     next: usize,
@@ -701,8 +931,8 @@ pub struct LaneBits<'a> {
 }
 
 impl<'a> LaneBits<'a> {
-    fn new(bytes: &'a [u8], start: usize) -> Self {
-        Self { bytes, next: start, buf: 0, nbits: 0, consumed: 0 }
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, next: 0, buf: 0, nbits: 0, consumed: 0 }
     }
 
     fn refill(&mut self) -> bool {
@@ -738,107 +968,69 @@ pub trait SymbolDecoder: Sync {
     fn next(&self, bits: &mut LaneBits<'_>) -> Option<u16>;
 }
 
-/// The decoder of a [`two_level_tables`] section.
+/// A decoder over [`Kx7Code::device_tables`], step for step the reference kernels' lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TwoLevelDecoder {
-    primary: Vec<u32>,
-    long: [[u32; 4]; TL_LONG_LENGTHS],
-    symbols: Vec<u16>,
+pub struct DeviceDecoder {
+    kind: CodeKind,
+    pbits: u32,
+    words: Vec<u32>,
+    esc_len: u32,
+    n_rare: usize,
 }
 
-impl TwoLevelDecoder {
-    /// Parses a table section and checks it word for word against the tables its own counts
-    /// and symbols rebuild; returns the decoder and that code.
-    pub fn parse(t: &[u32]) -> Result<(Self, CanonicalCode)> {
-        if t.len() < TL_SYMBOLS {
-            return Err(Kx7Error::Truncated { what: "two-level tables", need: TL_SYMBOLS, have: t.len() });
-        }
-        if t[0] != TABLE_TWO_LEVEL || t[2] != PRIMARY_BITS {
-            return Err(Kx7Error::Table {
-                reason: format!("kind {} with {} primary bits is not two-level/11", t[0], t[2]),
-            });
-        }
-        let n_sym = t[1] as usize;
-        let words = TL_SYMBOLS + n_sym.div_ceil(2);
-        if n_sym > PATTERNS || t[3] as usize != words || t.len() != words {
-            return Err(Kx7Error::Truncated { what: "two-level tables", need: words, have: t.len() });
-        }
-        let mut table: Vec<u16> = t[TL_COUNTS..TL_SYMBOLS].iter().map(|&c| c as u16).collect();
-        table.extend((0..n_sym).map(|i| (t[TL_SYMBOLS + i / 2] >> (16 * (i % 2))) as u16));
-        let code = CanonicalCode::from_table(&table)?;
-        let rebuilt = two_level_tables(&code);
-        if let Some(w) = (0..words).find(|&w| rebuilt[w] != t[w]) {
-            return Err(Kx7Error::Table {
-                reason: format!("word {w} is {:#x}, the code gives {:#x}", t[w], rebuilt[w]),
-            });
-        }
-        let mut long = [[0u32; 4]; TL_LONG_LENGTHS];
-        for (i, e) in long.iter_mut().enumerate() {
-            e.copy_from_slice(&t[TL_LONG + 4 * i..TL_LONG + 4 * i + 4]);
-        }
-        let decoder = Self { primary: t[TL_PRIMARY..TL_LONG].to_vec(), long, symbols: code.symbols.clone() };
-        Ok((decoder, code))
+impl DeviceDecoder {
+    pub fn new(code: &Kx7Code, pbits: u32) -> Result<Self> {
+        let words = code.device_tables(pbits)?;
+        Ok(Self { kind: code.kind, pbits, words, esc_len: code.esc_len, n_rare: code.n_rare() })
+    }
+
+    /// The table words it decodes with.
+    pub fn words(&self) -> &[u32] {
+        &self.words
     }
 }
 
-impl SymbolDecoder for TwoLevelDecoder {
+impl SymbolDecoder for DeviceDecoder {
     fn next(&self, bits: &mut LaneBits<'_>) -> Option<u16> {
         let peek = bits.peek16();
-        let e = self.primary[(peek >> (MAXLEN - PRIMARY_BITS)) as usize];
-        let mut len = (e >> 8) & 0xff;
-        match e & 0xff {
-            FLAG_LEAF => {
-                bits.consume(len);
-                Some((e >> 16) as u16)
-            }
-            FLAG_LONG => loop {
-                if len > MAXLEN || len <= PRIMARY_BITS {
+        let mut e = self.words[(peek >> (MAXLEN - self.pbits)) as usize];
+        let sym = match self.kind {
+            CodeKind::TwoClass { rare_bits, .. } if (e >> 8) & 0xff == ENTRY_NODE => {
+                let rank = (peek >> (MAXLEN - self.esc_len - rare_bits)) & ((1 << rare_bits) - 1);
+                if rank as usize >= self.n_rare {
                     return None;
                 }
-                let [limit, start, base, _] = self.long[(len - PRIMARY_BITS - 1) as usize];
-                if peek < limit {
-                    let offset = peek.wrapping_sub(start) >> (MAXLEN - len);
-                    let sym = *self.symbols.get(base.wrapping_add(offset) as usize)?;
-                    bits.consume(len);
-                    return Some(sym);
+                let w = self.words[(1 << self.pbits) + rank as usize / 2];
+                (w >> (16 * (rank % 2))) as u16
+            }
+            CodeKind::TwoClass { .. } => (e >> 16) as u16,
+            CodeKind::Huffman => {
+                if e & 0xff > MAXLEN {
+                    let shr = (e >> 8) & 0xff;
+                    let sub = ((peek << 16) << self.pbits) >> shr;
+                    e = *self.words.get(((e >> 16) + sub) as usize)?;
                 }
-                len += 1;
-            },
-            _ => None,
+                (e >> 16) as u16
+            }
+        };
+        let len = e & 0xff;
+        if len == 0 || len > MAXLEN {
+            return None;
         }
+        bits.consume(len);
+        Some(sym)
     }
 }
 
-// ---------------------------------------------------------------- header
+// ---------------------------------------------------------------- pack
 
-/// The pack header, 32 u32 words:
-///
-/// | word | field |
-/// |---|---|
-/// | 0 | [`MAGIC`] ("KX7\0") |
-/// | 1 | [`VERSION`] (1) |
-/// | 2 | layout: 1 frag32, 2 lane16 |
-/// | 3 | n, rows over all parts |
-/// | 4 | k |
-/// | 5 | S, K slices |
-/// | 6 | maxlen (16) |
-/// | 7 | n_sym |
-/// | 8 | stream bytes (the index's final entry) |
-/// | 9 | streams |
-/// | 10 | symbols per stream |
-/// | 11 | stream alignment, bytes |
-/// | 12 | code: [`CODE_HUFFMAN`] |
-/// | 13 | parts (1..=8) |
-/// | 14, 15 | 0 |
-/// | 16 .. 24 | exclusive end row of each part (part i covers [end[i-1], end[i])), unused 0 |
-/// | 24 .. 32 | 0 |
+/// What a pack codes and how it is laid out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kx7Header {
     pub layout: Kx7Layout,
     pub n: usize,
     pub k: usize,
-    pub n_sym: usize,
-    pub stream_bytes: usize,
+    /// Exclusive end row of each fused part.
     pub part_ends: Vec<usize>,
 }
 
@@ -849,167 +1041,346 @@ impl Kx7Header {
     pub fn symbols_per_stream(&self) -> usize {
         self.layout.symbols_per_stream(self.k)
     }
-
-    pub fn to_words(&self) -> [u32; HEADER_WORDS] {
-        let mut w = [0u32; HEADER_WORDS];
-        w[..14].copy_from_slice(&[
-            MAGIC,
-            VERSION,
-            self.layout.kind as u32,
-            self.n as u32,
-            self.k as u32,
-            self.layout.slices as u32,
-            MAXLEN,
-            self.n_sym as u32,
-            self.stream_bytes as u32,
-            self.streams() as u32,
-            self.symbols_per_stream() as u32,
-            self.layout.align as u32,
-            CODE_HUFFMAN,
-            self.part_ends.len() as u32,
-        ]);
-        for (i, &e) in self.part_ends.iter().enumerate() {
-            w[16 + i] = e as u32;
-        }
-        w
+    pub fn streams_per_row(&self) -> usize {
+        self.streams() / self.n
     }
 
-    pub fn from_words(w: &[u32]) -> Result<Self> {
-        if w.len() < HEADER_WORDS {
-            return Err(Kx7Error::Truncated { what: "header", need: HEADER_WORDS, have: w.len() });
+    fn check(&self) -> Result<()> {
+        self.layout.check(self.n, self.k)?;
+        let ends = &self.part_ends;
+        if ends.is_empty() || ends.len() > MAX_PARTS || ends.windows(2).any(|w| w[0] >= w[1]) || ends[0] == 0 {
+            return Err(Kx7Error::Header {
+                field: "components",
+                reason: format!("part ends {ends:?} must rise, 1 to 8 parts"),
+            });
         }
-        let bad = |word: usize, field: &'static str, reason: &'static str| Kx7Error::Header {
-            word,
-            field,
-            found: w[word],
-            reason,
-        };
-        if w[0] != MAGIC {
-            return Err(bad(0, "magic", "not \"KX7\\0\""));
+        if *ends.last().expect("parts") != self.n {
+            return Err(Kx7Error::Header {
+                field: "components",
+                reason: format!("the last part must end at row {}", self.n),
+            });
         }
-        if w[1] != VERSION {
-            return Err(bad(1, "version", "only version 1 is defined"));
-        }
-        let kind = LayoutKind::from_word(w[2]).ok_or_else(|| bad(2, "layout", "not 1 (frag32) or 2 (lane16)"))?;
-        if w[6] != MAXLEN {
-            return Err(bad(6, "maxlen", "must be 16"));
-        }
-        if w[12] != CODE_HUFFMAN {
-            return Err(bad(12, "code", "must be 1 (canonical Huffman)"));
-        }
-        let layout = Kx7Layout { kind, slices: w[5] as usize, align: w[11] as usize };
-        let (n, k) = (w[3] as usize, w[4] as usize);
-        layout.check(n, k)?;
-        if w[7] == 0 || w[7] as usize > PATTERNS {
-            return Err(bad(7, "n_sym", "must be 1 to 65536"));
-        }
-        if w[9] as usize != layout.streams(n, k) {
-            return Err(bad(9, "streams", "disagrees with the layout"));
-        }
-        if w[10] as usize != layout.symbols_per_stream(k) {
-            return Err(bad(10, "symbols per stream", "disagrees with the layout"));
-        }
-        let parts = w[13] as usize;
-        if parts == 0 || parts > MAX_PARTS {
-            return Err(bad(13, "parts", "must be 1 to 8"));
-        }
-        let mut part_ends = Vec::with_capacity(parts);
-        for i in 0..parts {
-            let end = w[16 + i] as usize;
-            if end <= part_ends.last().copied().unwrap_or(0) || end > n {
-                return Err(bad(16 + i, "part end", "part ends must rise within n"));
-            }
-            part_ends.push(end);
-        }
-        if part_ends[parts - 1] != n {
-            return Err(bad(16 + parts - 1, "part end", "the last part must end at n"));
-        }
-        if let Some(i) = [14, 15].into_iter().chain(16 + parts..HEADER_WORDS).find(|&i| w[i] != 0) {
-            return Err(bad(i, "reserved", "must be 0"));
-        }
-        Ok(Self { layout, n, k, n_sym: w[7] as usize, stream_bytes: w[8] as usize, part_ends })
+        Ok(())
     }
 }
 
-// ---------------------------------------------------------------- pack
+/// Names for `header.json` (the tool's `label` and component names).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Kx7Labels {
+    pub label: String,
+    /// One name per fused part.
+    pub components: Vec<String>,
+}
 
-/// One packed matrix: header, code, stream index and streams (module docs).
+/// One packed matrix: its file set in memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kx7Pack {
     header: Kx7Header,
-    code: CanonicalCode,
-    index: Vec<u32>,
+    code: Kx7Code,
+    offsets: Vec<u32>,
+    lengths: Vec<u16>,
     streams: Vec<u8>,
+}
+
+fn le16(v: &[u16]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+fn le32(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+fn round4(x: f64) -> f64 {
+    format!("{x:.4}").parse().expect("a formatted float")
+}
+fn round5(x: f64) -> f64 {
+    format!("{x:.5}").parse().expect("a formatted float")
 }
 
 impl Kx7Pack {
     pub fn header(&self) -> &Kx7Header {
         &self.header
     }
-    pub fn code(&self) -> &CanonicalCode {
+    pub fn code(&self) -> &Kx7Code {
         &self.code
     }
-    /// u32 byte offset of every stream, in stream order, then the total.
-    pub fn index(&self) -> &[u32] {
-        &self.index
+    /// u32 offset of every stream (its first byte or quad 0), then the total (`offsets.bin`).
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
     }
+    /// u16 byte length of every stream (`lengths.bin`).
+    pub fn lengths(&self) -> &[u16] {
+        &self.lengths
+    }
+    /// `streams.bin`.
     pub fn streams(&self) -> &[u8] {
         &self.streams
     }
-    /// The code table (`dump_pack`'s table.bin).
-    pub fn table(&self) -> Vec<u16> {
-        self.code.table()
+    pub fn table_bin(&self) -> Vec<u8> {
+        le16(&self.code.table())
     }
-    /// The two-level decode tables for this pack's code.
-    pub fn decode_tables(&self) -> Vec<u32> {
-        two_level_tables(&self.code)
+    /// `rare.bin` (two-class codes only).
+    pub fn rare_bin(&self) -> Option<Vec<u8>> {
+        matches!(self.code.kind, CodeKind::TwoClass { .. }).then(|| le16(&self.code.rare))
+    }
+    pub fn offsets_bin(&self) -> Vec<u8> {
+        le32(&self.offsets)
+    }
+    pub fn lengths_bin(&self) -> Vec<u8> {
+        le16(&self.lengths)
+    }
+    /// Stream bytes beyond the streams' own lengths (alignment and interleave padding).
+    pub fn padding_bytes(&self) -> usize {
+        self.streams.len() - self.lengths.iter().map(|&l| l as usize).sum::<usize>()
+    }
+    /// Primary bits a decoder uses: the two-class code's, else [`DEVICE_PBITS`].
+    pub fn device_pbits(&self) -> u32 {
+        match self.code.kind {
+            CodeKind::TwoClass { pbits, .. } => pbits,
+            CodeKind::Huffman => DEVICE_PBITS,
+        }
+    }
+    /// The reference kernels' decode tables for this pack.
+    pub fn device_tables(&self) -> Result<Vec<u32>> {
+        self.code.device_tables(self.device_pbits())
     }
 
-    /// Bytes held: header, code table, index and streams.
+    /// Bytes held: streams, u32 offsets, u16 lengths, table and rare table.
     pub fn stored_bytes(&self) -> usize {
-        4 * HEADER_WORDS + 2 * (TABLE_COUNTS + self.code.n_sym()) + 4 * self.index.len() + self.streams.len()
+        self.streams.len()
+            + 4 * self.offsets.len()
+            + 2 * self.lengths.len()
+            + 2 * (TABLE_COUNTS + self.code.n_sym())
+            + 2 * self.code.n_rare()
     }
 
-    /// Reassembles and validates a pack from its parts.
-    pub fn from_parts(header: &[u32], table: &[u16], index: Vec<u32>, streams: Vec<u8>) -> Result<Self> {
-        let header = Kx7Header::from_words(header)?;
-        let code = CanonicalCode::from_table(table)?;
-        if code.n_sym() != header.n_sym {
-            return Err(Kx7Error::Table {
-                reason: format!("{} symbols, the header says {}", code.n_sym(), header.n_sym),
-            });
-        }
+    /// Reassembles and validates a pack: the offsets must be exactly the placement of the
+    /// lengths, and the streams exactly as long as the placement says.
+    pub fn from_parts(
+        header: Kx7Header,
+        code: Kx7Code,
+        offsets: Vec<u32>,
+        lengths: Vec<u16>,
+        streams: Vec<u8>,
+    ) -> Result<Self> {
+        header.check()?;
         let ns = header.streams();
-        if index.len() != ns + 1 {
-            return Err(Kx7Error::Truncated { what: "stream index", need: ns + 1, have: index.len() });
+        if lengths.len() != ns {
+            return Err(Kx7Error::Truncated { what: "stream lengths", need: ns, have: lengths.len() });
         }
-        if index[0] != 0 {
-            return Err(Kx7Error::Index { entry: 0, found: index[0] as u64, reason: "the first stream starts at 0" });
+        if offsets.len() != ns + 1 {
+            return Err(Kx7Error::Truncated { what: "stream offsets", need: ns + 1, have: offsets.len() });
         }
-        let align = header.layout.align as u32;
-        for (i, w) in index.windows(2).enumerate() {
-            if w[1] < w[0] {
-                return Err(Kx7Error::Index { entry: i + 1, found: w[1] as u64, reason: "offsets must not fall" });
-            }
-            if w[1] % align != 0 {
-                return Err(Kx7Error::Index {
-                    entry: i + 1,
-                    found: w[1] as u64,
-                    reason: "offset breaks the alignment",
-                });
-            }
-        }
-        if index[ns] as usize != header.stream_bytes {
+        let want = place(&header.layout, header.n, header.k, &lengths)?;
+        if let Some(i) = (0..=ns).find(|&i| want[i] != offsets[i]) {
             return Err(Kx7Error::Index {
-                entry: ns,
-                found: index[ns] as u64,
-                reason: "the total differs from the header",
+                entry: i,
+                found: offsets[i] as u64,
+                reason: "not where the lengths place it",
             });
         }
-        if streams.len() != header.stream_bytes {
-            return Err(Kx7Error::Truncated { what: "streams", need: header.stream_bytes, have: streams.len() });
+        if streams.len() != offsets[ns] as usize {
+            return Err(Kx7Error::Truncated { what: "streams", need: offsets[ns] as usize, have: streams.len() });
         }
-        Ok(Self { header, code, index, streams })
+        Ok(Self { header, code, offsets, lengths, streams })
+    }
+
+    /// `header.json`: the tool's structural and byte-accounting fields (rates rounded as it
+    /// rounds them; no histogram statistics or timings).
+    pub fn header_json(&self, labels: &Kx7Labels, with_source: bool) -> String {
+        let (h, c) = (&self.header, &self.code);
+        let weights = (h.n * h.k) as f64;
+        let ns = h.streams();
+        let stat_table = 2 * TABLE_COUNTS + 2 * c.coded_patterns();
+        let stream_bpw = self.streams.len() as f64 * 8.0 / weights;
+        let index_bpw = 16.0 * ns as f64 / weights;
+        let table_bpw = stat_table as f64 * 8.0 / weights;
+        let mut j = serde_json::Map::new();
+        let mut put = |key: &str, v: Value| {
+            j.insert(key.to_string(), v);
+        };
+        put("magic", json!("KX7"));
+        put("version", json!(VERSION));
+        put("label", json!(labels.label));
+        put("shape", json!([h.n, h.k]));
+        put("n", json!(h.n * h.k));
+        put("chunk", json!(h.symbols_per_stream()));
+        put("layout", json!(h.layout.kind.name()));
+        put("ksplit", json!(h.layout.slices));
+        put("maxlen", json!(c.maxlen()));
+        put("code", json!(c.kind.name()));
+        put("distinct_patterns", json!(c.coded_patterns()));
+        put("table_bytes", json!(2 * (TABLE_COUNTS + c.n_sym())));
+        if let CodeKind::TwoClass { pbits, rare_bits } = c.kind {
+            put("pbits", json!(pbits));
+            put("rare_bits", json!(rare_bits));
+            put("esc_len", json!(c.esc_len));
+            put("n_frequent", json!(c.n_frequent()));
+            put("n_rare", json!(c.n_rare()));
+        }
+        match h.layout.placement {
+            Placement::Interleaved { ragged } => {
+                put("interleave_rows", json!(INTERLEAVE_ROWS));
+                put("quad_stride", json!(QUAD_STRIDE));
+                put("ragged", json!(ragged));
+                put("padding_bytes", json!(self.padding_bytes()));
+                put("padding_bpw", json!(round4(self.padding_bytes() as f64 * 8.0 / weights)));
+            }
+            Placement::Contiguous { align } => {
+                put("stream_align", json!(align));
+                put("padding_bytes", json!(self.padding_bytes()));
+            }
+        }
+        put("stream_bytes", json!(self.streams.len()));
+        put("chunks", json!(ns));
+        put("stream_bpw", json!(round4(stream_bpw)));
+        put("index_bpw", json!(round4(index_bpw)));
+        put("table_bpw", json!(round5(table_bpw)));
+        put("total_bpw", json!(round4(stream_bpw + index_bpw + table_bpw)));
+        put("bytes_bf16", json!(2 * h.n * h.k));
+        put("bytes_kx7", json!(self.streams.len() + 2 * ns + stat_table));
+        if matches!(c.kind, CodeKind::TwoClass { .. }) {
+            put("esc_index", json!(c.esc_index.map_or(-1, |e| e as i64)));
+            put("rare_format", json!("u16 [n_rare] patterns in rank order; rank = the rare_bits raw bits after ESC"));
+        }
+        if !matches!(h.layout.placement, Placement::Interleaved { .. }) {
+            put("quad_stride", json!(QUAD));
+        }
+        put("lengths_format", json!("u16 [N*streams_per_row] byte length of each stream (lengths.bin)"));
+        put("n_sym", json!(c.n_sym()));
+        put("streams_per_row", json!(h.streams_per_row()));
+        put("symbols_per_stream", json!(h.symbols_per_stream()));
+        let components: Vec<Value> = h
+            .part_ends
+            .iter()
+            .enumerate()
+            .map(|(i, &end)| {
+                let start = if i == 0 { 0 } else { h.part_ends[i - 1] };
+                json!({"name": labels.components.get(i).cloned().unwrap_or_default(), "rows": [start, end]})
+            })
+            .collect();
+        put("components", Value::Array(components));
+        let rare = matches!(c.kind, CodeKind::TwoClass { .. });
+        put(
+            "files",
+            json!({"table": "table.bin", "streams": "streams.bin", "offsets": "offsets.bin",
+                   "source": if with_source { json!("source.bf16.bin") } else { Value::Null },
+                   "rare": if rare { json!("rare.bin") } else { Value::Null }, "lengths": "lengths.bin"}),
+        );
+        put(
+            "offsets_format",
+            json!(concat!(
+                "u32 [N*streams_per_row + 1] byte offsets of each stream (its first quad) into streams.bin, ",
+                "final = total; stream byte p at offset + (p // 16) * quad_stride + p % 16"
+            )),
+        );
+        put("table_format", json!("u16 counts[16] for code lengths 1..16, then n_sym symbols u16 in canonical order"));
+        serde_json::to_string_pretty(&Value::Object(j)).expect("JSON") + "\n"
+    }
+
+    /// Writes the file set to `dir` (created if missing); `source` adds `source.bf16.bin`.
+    pub fn dump(&self, dir: &Path, labels: &Kx7Labels, source: Option<&Kx7Source<'_>>) -> Result<()> {
+        let io =
+            |path: &Path, e: std::io::Error| Kx7Error::Io { path: path.display().to_string(), reason: e.to_string() };
+        std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).map_err(|e| io(&p, e))
+        };
+        write("header.json", self.header_json(labels, source.is_some()).as_bytes())?;
+        write("table.bin", &self.table_bin())?;
+        if let Some(rare) = self.rare_bin() {
+            write("rare.bin", &rare)?;
+        }
+        write("streams.bin", &self.streams)?;
+        write("offsets.bin", &self.offsets_bin())?;
+        write("lengths.bin", &self.lengths_bin())?;
+        if let Some(src) = source {
+            write("source.bf16.bin", &src.rows.iter().flat_map(|r| le16(r)).collect::<Vec<u8>>())?;
+        }
+        Ok(())
+    }
+
+    /// Reads and validates a file set (this module's or the tool's `dump_pack`).
+    pub fn load(dir: &Path) -> Result<Self> {
+        let read = |name: &str| {
+            let p = dir.join(name);
+            std::fs::read(&p).map_err(|e| Kx7Error::Io { path: p.display().to_string(), reason: e.to_string() })
+        };
+        let u16s = |b: Vec<u8>| -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+        let text = read("header.json")?;
+        let j: Value = serde_json::from_slice(&text)
+            .map_err(|e| Kx7Error::Header { field: "header.json", reason: e.to_string() })?;
+        let missing = |field: &'static str| Kx7Error::Header { field, reason: "missing or not a number".into() };
+        let int = |field: &'static str| j[field].as_u64().map(|v| v as usize).ok_or_else(|| missing(field));
+        let shape = j["shape"].as_array().filter(|s| s.len() == 2).ok_or_else(|| missing("shape"))?;
+        let (n, k) = (
+            shape[0].as_u64().ok_or_else(|| missing("shape"))? as usize,
+            shape[1].as_u64().ok_or_else(|| missing("shape"))? as usize,
+        );
+        let kind = match j["layout"].as_str() {
+            Some("lane16") => LayoutKind::Lane16,
+            Some("frag32") => LayoutKind::Frag32,
+            other => {
+                return Err(Kx7Error::Header { field: "layout", reason: format!("{other:?} is not lane16 or frag32") })
+            }
+        };
+        let slices = int("ksplit")?;
+        let placement = match (j["quad_stride"].as_u64(), j["interleave_rows"].as_u64()) {
+            (Some(512), Some(8)) => Placement::Interleaved { ragged: j["ragged"].as_bool().unwrap_or(false) },
+            (Some(16) | None, None | Some(0)) => Placement::Contiguous {
+                align: j["stream_align"]
+                    .as_u64()
+                    .map_or(if kind == LayoutKind::Frag32 { 16 } else { 1 }, |a| a as usize),
+            },
+            (q, r) => {
+                return Err(Kx7Error::Header {
+                    field: "quad_stride",
+                    reason: format!("{q:?} with {r:?} interleave rows"),
+                })
+            }
+        };
+        let layout = Kx7Layout { kind, slices, placement };
+        let code_kind = match j["code"].as_str().unwrap_or("huffman") {
+            "huffman" => CodeKind::Huffman,
+            "twoclass" => CodeKind::TwoClass { pbits: int("pbits")? as u32, rare_bits: int("rare_bits")? as u32 },
+            other => {
+                return Err(Kx7Error::Header { field: "code", reason: format!("{other:?} is not huffman or twoclass") })
+            }
+        };
+        let esc_index = j["esc_index"].as_i64().and_then(|e| usize::try_from(e).ok());
+        let rare = match code_kind {
+            CodeKind::TwoClass { .. } => u16s(read("rare.bin")?),
+            CodeKind::Huffman => Vec::new(),
+        };
+        let code = Kx7Code::from_tables(code_kind, &u16s(read("table.bin")?), &rare, esc_index)?;
+        let mut part_ends = Vec::new();
+        for c in j["components"].as_array().into_iter().flatten() {
+            part_ends.push(c["rows"][1].as_u64().ok_or_else(|| missing("components"))? as usize);
+        }
+        if part_ends.is_empty() {
+            part_ends.push(n);
+        }
+        let header = Kx7Header { layout, n, k, part_ends };
+        let offsets =
+            read("offsets.bin")?.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let pack = Self::from_parts(header, code, offsets, u16s(read("lengths.bin")?), read("streams.bin")?)?;
+        let agree = [
+            ("n_sym", pack.code.n_sym()),
+            ("streams_per_row", pack.header.streams_per_row()),
+            ("symbols_per_stream", pack.header.symbols_per_stream()),
+            ("stream_bytes", pack.streams.len()),
+            ("maxlen", pack.code.maxlen() as usize),
+        ];
+        let two_class = [("n_rare", pack.code.n_rare()), ("esc_len", pack.code.esc_len as usize)];
+        let checks =
+            agree.iter().chain(if matches!(code_kind, CodeKind::TwoClass { .. }) { &two_class[..] } else { &[] });
+        for &(field, value) in checks {
+            if let Some(v) = j[field].as_u64() {
+                if v as usize != value {
+                    return Err(Kx7Error::Header { field, reason: format!("{v} disagrees with the files' {value}") });
+                }
+            }
+        }
+        Ok(pack)
     }
 }
 
@@ -1042,17 +1413,30 @@ impl BitWriter<'_> {
     }
 }
 
+fn write_stream(src: &Kx7Source<'_>, codewords: &[u32], pos: &[(usize, usize)], out: &mut [u8]) {
+    let mut w = BitWriter { out, pos: 0, acc: 0, n: 0 };
+    for &(r, c) in pos {
+        let cw = codewords[src.rows[r][c] as usize];
+        w.put(cw >> 8, cw & 0xff);
+    }
+    w.finish();
+}
+
 /// Packs every stream of `layout` over `src` with a per-pattern codebook (`code << 8 | len`,
-/// len <= 24; [`CanonicalCode::codewords`]): returns the index and the streams. Two parallel
-/// passes, stream lengths then bits; the output does not depend on the thread count.
-pub fn pack_streams(src: &Kx7Source<'_>, layout: Kx7Layout, codewords: &[u32]) -> Result<(Vec<u32>, Vec<u8>)> {
+/// len <= 24): returns offsets, lengths and streams. Two parallel passes, lengths then bits;
+/// the output does not depend on the thread count.
+pub fn pack_streams(
+    src: &Kx7Source<'_>,
+    layout: Kx7Layout,
+    codewords: &[u32],
+) -> Result<(Vec<u32>, Vec<u16>, Vec<u8>)> {
     let (n, k) = (src.n(), src.k());
     layout.check(n, k)?;
     if codewords.len() != PATTERNS {
         return Err(Kx7Error::Code { reason: format!("{} codewords, not 65536", codewords.len()) });
     }
     let ns = layout.streams(n, k);
-    let bits: Vec<u64> = (0..ns)
+    let lengths: Vec<u16> = (0..ns)
         .into_par_iter()
         .map_init(Vec::new, |pos, stream| {
             layout.positions(n, k, stream, pos);
@@ -1065,72 +1449,102 @@ pub fn pack_streams(src: &Kx7Source<'_>, layout: Kx7Layout, codewords: &[u32]) -
                 }
                 bits += len as u64;
             }
-            Ok(bits)
+            u16::try_from(bits.div_ceil(8)).map_err(|_| Kx7Error::StreamTooLong { stream, bytes: bits.div_ceil(8) })
         })
         .collect::<Result<_>>()?;
-    let mut index = Vec::with_capacity(ns + 1);
-    let mut total = 0u64;
-    index.push(0);
-    for &b in &bits {
-        total += b.div_ceil(8).next_multiple_of(layout.align as u64);
-        if total > u32::MAX as u64 {
-            return Err(Kx7Error::StreamsTooLarge { bytes: total });
-        }
-        index.push(total as u32);
-    }
-    let mut streams = vec![0u8; total as usize];
-    let mut groups = Vec::with_capacity(ns.div_ceil(ENCODE_GROUP));
+    let offsets = place(&layout, n, k, &lengths)?;
+    let mut streams = vec![0u8; offsets[ns] as usize];
+    // Contiguous output regions, each holding whole streams: runs of streams, or groups.
+    let regions: Vec<(usize, Vec<usize>)> = match layout.placement {
+        Placement::Contiguous { .. } => (0..ns)
+            .step_by(ENCODE_GROUP)
+            .map(|a| (offsets[a] as usize, (a..(a + ENCODE_GROUP).min(ns)).collect()))
+            .collect(),
+        Placement::Interleaved { .. } => (0..(n / INTERLEAVE_ROWS) * layout.slices)
+            .map(|g| {
+                let ids = layout.group_streams(g);
+                (offsets[ids[0]] as usize, ids.to_vec())
+            })
+            .collect(),
+    };
+    let mut slices = Vec::with_capacity(regions.len());
     let mut rest = streams.as_mut_slice();
-    for first in (0..ns).step_by(ENCODE_GROUP) {
-        let end = (first + ENCODE_GROUP).min(ns);
-        let (head, tail) = std::mem::take(&mut rest).split_at_mut((index[end] - index[first]) as usize);
-        groups.push((first, end, head));
+    for (i, (start, ids)) in regions.iter().enumerate() {
+        let end = regions.get(i + 1).map_or(offsets[ns] as usize, |r| r.0);
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(end - start);
+        slices.push((*start, ids, head));
         rest = tail;
     }
-    groups.into_par_iter().for_each_init(Vec::new, |pos, (first, end, buf)| {
-        let base = index[first] as usize;
-        for stream in first..end {
-            layout.positions(n, k, stream, pos);
-            let region = &mut buf[index[stream] as usize - base..index[stream + 1] as usize - base];
-            let mut w = BitWriter { out: region, pos: 0, acc: 0, n: 0 };
-            for &(r, c) in pos.iter() {
-                let cw = codewords[src.rows[r][c] as usize];
-                w.put(cw >> 8, cw & 0xff);
+    slices.into_par_iter().for_each_init(
+        || (Vec::new(), Vec::new()),
+        |(pos, scratch), (base, ids, region)| {
+            for &stream in ids.iter() {
+                layout.positions(n, k, stream, pos);
+                let e = extent(&layout, &offsets, &lengths, stream);
+                match layout.placement {
+                    Placement::Contiguous { .. } => {
+                        let at = e.first - base;
+                        write_stream(src, codewords, pos, &mut region[at..at + lengths[stream] as usize]);
+                    }
+                    Placement::Interleaved { .. } => {
+                        let nq = quads(lengths[stream]);
+                        scratch.clear();
+                        scratch.resize(nq * QUAD, 0u8);
+                        write_stream(src, codewords, pos, scratch);
+                        for q in 0..nq {
+                            let at = e.quad(q) - base;
+                            region[at..at + QUAD].copy_from_slice(&scratch[q * QUAD..(q + 1) * QUAD]);
+                        }
+                    }
+                }
             }
-            w.finish();
-        }
-    });
-    Ok((index, streams))
+        },
+    );
+    Ok((offsets, lengths, streams))
 }
 
-/// Packs `src` in `layout` under its own canonical Huffman code.
-pub fn encode(src: &Kx7Source<'_>, layout: Kx7Layout) -> Result<Kx7Pack> {
+/// Packs `src` in `layout` under its own code of `kind`. Refuses a code the reference
+/// kernels' tables cannot hold (a Huffman code whose sub-tables pass the 16-bit entry index).
+pub fn encode(src: &Kx7Source<'_>, layout: Kx7Layout, kind: CodeKind) -> Result<Kx7Pack> {
     layout.check(src.n(), src.k())?;
-    let code = CanonicalCode::from_histogram(&histogram(src))?;
-    let (index, streams) = pack_streams(src, layout, &code.codewords())?;
-    let header = Kx7Header {
-        layout,
-        n: src.n(),
-        k: src.k(),
-        n_sym: code.n_sym(),
-        stream_bytes: streams.len(),
-        part_ends: src.part_ends.clone(),
-    };
-    Ok(Kx7Pack { header, code, index, streams })
+    let code = Kx7Code::build(&histogram(src), kind)?;
+    let header = Kx7Header { layout, n: src.n(), k: src.k(), part_ends: src.part_ends.clone() };
+    let mut pack = Kx7Pack { header, code, offsets: Vec::new(), lengths: Vec::new(), streams: Vec::new() };
+    pack.device_tables()?;
+    (pack.offsets, pack.lengths, pack.streams) = pack_streams(src, layout, pack.code.codewords())?;
+    Ok(pack)
 }
 
 /// Packs one row-major [n, k] matrix.
-pub fn encode_matrix(w: &[u16], n: usize, k: usize, layout: Kx7Layout) -> Result<Kx7Pack> {
-    encode(&Kx7Source::matrix(w, n, k)?, layout)
+pub fn encode_matrix(w: &[u16], n: usize, k: usize, layout: Kx7Layout, kind: CodeKind) -> Result<Kx7Pack> {
+    encode(&Kx7Source::matrix(w, n, k)?, layout, kind)
 }
 
 // ---------------------------------------------------------------- decode
 
-/// Decodes one stream as a lane does, then checks it fills its index entry exactly
-/// (padding to the alignment, zero bits after the last symbol).
-fn walk_stream<D: SymbolDecoder>(dec: &D, pack: &Kx7Pack, stream: usize, out: &mut [u16]) -> Result<()> {
-    let (start, end) = (pack.index[stream] as usize, pack.index[stream + 1] as usize);
-    let mut bits = LaneBits::new(&pack.streams, start);
+/// Decodes one stream as a lane does: gathers its quads (interleaved) or bytes (contiguous),
+/// walks them, then checks the bits fill its length exactly and the padding is zero.
+fn walk_stream<D: SymbolDecoder>(
+    dec: &D,
+    pack: &Kx7Pack,
+    stream: usize,
+    scratch: &mut Vec<u8>,
+    out: &mut [u16],
+) -> Result<()> {
+    let layout = &pack.header.layout;
+    let e = extent(layout, &pack.offsets, &pack.lengths, stream);
+    let bytes: &[u8] = match layout.placement {
+        Placement::Contiguous { .. } => &pack.streams[e.first..e.first + e.span],
+        Placement::Interleaved { .. } => {
+            scratch.clear();
+            for q in 0..e.span / QUAD {
+                let at = e.quad(q);
+                scratch.extend_from_slice(&pack.streams[at..at + QUAD]);
+            }
+            scratch
+        }
+    };
+    let mut bits = LaneBits::new(bytes);
     for (symbol, o) in out.iter_mut().enumerate() {
         if !bits.refill() {
             return Err(Kx7Error::Overrun { stream });
@@ -1138,13 +1552,12 @@ fn walk_stream<D: SymbolDecoder>(dec: &D, pack: &Kx7Pack, stream: usize, out: &m
         *o = dec.next(&mut bits).ok_or(Kx7Error::InvalidCode { stream, symbol })?;
     }
     let used = bits.consumed.div_ceil(8) as usize;
-    let padded = used.next_multiple_of(pack.header.layout.align);
-    if padded != end - start {
-        return Err(Kx7Error::StreamLength { stream, expected: padded, actual: end - start });
+    let len = pack.lengths[stream] as usize;
+    if used != len {
+        return Err(Kx7Error::StreamLength { stream, expected: used, actual: len });
     }
     let tail_bits = (bits.consumed % 8) as u32;
-    let partial = tail_bits != 0 && pack.streams[start + used - 1] & (0xffu8 >> tail_bits) != 0;
-    if partial || pack.streams[start + used..end].iter().any(|&b| b != 0) {
+    if (tail_bits != 0 && bytes[used - 1] & (0xffu8 >> tail_bits) != 0) || bytes[used..].iter().any(|&b| b != 0) {
         return Err(Kx7Error::Padding { stream });
     }
     Ok(())
@@ -1156,11 +1569,11 @@ pub fn decode_with<D: SymbolDecoder>(pack: &Kx7Pack, dec: &D) -> Result<Vec<u16>
     let band_rows = layout.band_rows();
     let mut out = vec![0u16; n * k];
     out.par_chunks_mut(band_rows * k).enumerate().try_for_each_init(
-        || (Vec::new(), Vec::new(), vec![0u16; layout.symbols_per_stream(k)]),
-        |(streams, pos, syms), (band, chunk)| {
+        || (Vec::new(), Vec::new(), Vec::new(), vec![0u16; layout.symbols_per_stream(k)]),
+        |(streams, pos, scratch, syms), (band, chunk)| {
             layout.band_streams(n, band, streams);
             for &stream in streams.iter() {
-                walk_stream(dec, pack, stream, syms)?;
+                walk_stream(dec, pack, stream, scratch, syms)?;
                 layout.positions(n, k, stream, pos);
                 for (&(r, c), &v) in pos.iter().zip(syms.iter()) {
                     chunk[(r - band * band_rows) * k + c] = v;
@@ -1172,11 +1585,10 @@ pub fn decode_with<D: SymbolDecoder>(pack: &Kx7Pack, dec: &D) -> Result<Vec<u16>
     Ok(out)
 }
 
-/// The reference decoder: builds this pack's two-level tables (the image a GPU loads),
-/// parses them back and walks every stream with them.
+/// The reference decoder: the reference kernels' tables ([`Kx7Pack::device_tables`]) and
+/// lookup, every stream walked from where the placement puts it.
 pub fn decode(pack: &Kx7Pack) -> Result<Vec<u16>> {
-    let (dec, _) = TwoLevelDecoder::parse(&pack.decode_tables())?;
-    decode_with(pack, &dec)
+    decode_with(pack, &DeviceDecoder::new(&pack.code, pack.device_pbits())?)
 }
 
 /// Decodes and compares bit for bit; the error names the first differing position.
@@ -1200,704 +1612,4 @@ pub fn verify_matrix(pack: &Kx7Pack, w: &[u16]) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use sha2::{Digest, Sha256};
-    use std::collections::HashSet;
-
-    /// SplitMix64: fixtures must be identical on every machine, so no floating-point
-    /// library calls (only IEEE-exact +, *, /, sqrt).
-    struct Mix(u64);
-
-    impl Mix {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n
-        }
-        fn unit(&mut self) -> f64 {
-            (self.next() >> 11) as f64 / (1u64 << 53) as f64
-        }
-    }
-
-    /// 85% exactly an E4M3 value times a power of two (3 mantissa bits), 15% ordinary BF16 at
-    /// the same 16 exponents (the shape of `kdaexact.py`'s self-test fixture).
-    fn fp8_born(n: usize, k: usize, seed: u64) -> Vec<u16> {
-        fp8_born_over(n, k, seed, 16)
-    }
-
-    fn fp8_born_over(n: usize, k: usize, seed: u64, exponents: u64) -> Vec<u16> {
-        let mut r = Mix(seed);
-        (0..n * k)
-            .map(|_| {
-                let sign = (r.below(2) as u16) << 15;
-                let exp = (112 + r.below(exponents) as u16) << 7;
-                let mant = if r.unit() < 0.85 { (r.below(8) as u16) << 4 } else { r.below(128) as u16 };
-                sign | exp | mant
-            })
-            .collect()
-    }
-
-    /// Zipf(1.5) over `ranks` ranks, rank r mapped to pattern (r + 1) * 40503 mod 2^16 so
-    /// frequency order and pattern order differ: steep enough that the unlimited Huffman code
-    /// exceeds 16 bits and package-merge takes over.
-    fn zipf(n: usize, k: usize, seed: u64, ranks: usize) -> Vec<u16> {
-        let mut cdf = Vec::with_capacity(ranks);
-        let mut total = 0.0f64;
-        for r in 1..=ranks {
-            let x = r as f64;
-            total += 1.0 / (x * x.sqrt());
-            cdf.push(total);
-        }
-        let mut g = Mix(seed);
-        (0..n * k)
-            .map(|_| {
-                let u = g.unit() * total;
-                let rank = cdf.partition_point(|&c| c < u).min(ranks - 1);
-                ((rank as u32 + 1).wrapping_mul(40503) & 0xffff) as u16
-            })
-            .collect()
-    }
-
-    /// Every pattern of 16 exponents x 128 mantissas x 2 signs equally often, shuffled.
-    fn uniform4096(n: usize, k: usize, seed: u64) -> Vec<u16> {
-        let mut w: Vec<u16> = (0..n * k)
-            .map(|i| {
-                let p = i % 4096;
-                ((p >> 11) as u16) << 15 | (112 + ((p >> 7) & 15) as u16) << 7 | (p & 127) as u16
-            })
-            .collect();
-        let mut g = Mix(seed);
-        for i in (1..w.len()).rev() {
-            w.swap(i, g.below(i as u64 + 1) as usize);
-        }
-        w
-    }
-
-    fn round_trip(w: &[u16], n: usize, k: usize, layout: Kx7Layout) -> Kx7Pack {
-        let pack = encode_matrix(w, n, k, layout).unwrap();
-        verify_matrix(&pack, w).unwrap();
-        assert_eq!(decode(&pack).unwrap(), w);
-        let h = pack.header();
-        let again =
-            Kx7Pack::from_parts(&h.to_words(), &pack.table(), pack.index().to_vec(), pack.streams().to_vec()).unwrap();
-        assert_eq!(again, pack);
-        pack
-    }
-
-    fn sha(bytes: &[u8]) -> String {
-        Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
-    }
-    fn le16(v: &[u16]) -> Vec<u8> {
-        v.iter().flat_map(|x| x.to_le_bytes()).collect()
-    }
-    fn le32(v: &[u32]) -> Vec<u8> {
-        v.iter().flat_map(|x| x.to_le_bytes()).collect()
-    }
-
-    #[test]
-    fn kx7_default_slices() {
-        assert_eq!(default_slices(8192, 4096), 2);
-        assert_eq!(default_slices(4096, 8192), 4);
-        assert_eq!(default_slices(24576, 4096), 1);
-        assert_eq!(default_slices(16, 16), 1);
-        assert_eq!(default_slices(64, 4096), 8);
-        assert_eq!(default_slices(64, 32), 2);
-    }
-
-    #[test]
-    fn kx7_layouts_are_permutations_with_exact_bands() {
-        let cases = [
-            (Kx7Layout::frag32(1), 32, 128),
-            (Kx7Layout::frag32(2), 48, 128),
-            (Kx7Layout::frag32(4), 16, 256),
-            (Kx7Layout::lane16(1), 3, 256),
-            (Kx7Layout::lane16(2), 5, 256),
-            (Kx7Layout::lane16(4), 2, 512),
-        ];
-        for (layout, n, k) in cases {
-            layout.check(n, k).unwrap();
-            let mut seen = vec![false; n * k];
-            let mut pos = Vec::new();
-            for s in 0..layout.streams(n, k) {
-                layout.positions(n, k, s, &mut pos);
-                assert_eq!(pos.len(), layout.symbols_per_stream(k));
-                for &(r, c) in &pos {
-                    assert!(!std::mem::replace(&mut seen[r * k + c], true), "{layout:?} covers ({r}, {c}) twice");
-                }
-            }
-            assert!(seen.iter().all(|&x| x), "{layout:?} misses positions");
-            let mut covered = HashSet::new();
-            let mut band = Vec::new();
-            for b in 0..n / layout.band_rows() {
-                layout.band_streams(n, b, &mut band);
-                for &s in &band {
-                    assert!(covered.insert(s));
-                    layout.positions(n, k, s, &mut pos);
-                    assert!(pos.iter().all(|&(r, _)| r / layout.band_rows() == b));
-                }
-            }
-            assert_eq!(covered.len(), layout.streams(n, k));
-        }
-    }
-
-    #[test]
-    fn kx7_frag32_streams_hold_mma_a_fragments() {
-        let (n, k) = (32, 64);
-        let layout = Kx7Layout::frag32(2);
-        // Stream (s = 1, t = 1, l = 5): g = 1, c = 2, rows 17 and 25, slice 1 = steps 2..4.
-        let mut pos = Vec::new();
-        layout.positions(n, k, (1 * 2 + 1) * 32 + 5, &mut pos);
-        let mut want = Vec::new();
-        for j in 2..4 {
-            let k0 = 16 * j + 2;
-            want.extend([
-                (17, k0),
-                (17, k0 + 1),
-                (25, k0),
-                (25, k0 + 1),
-                (17, k0 + 8),
-                (17, k0 + 9),
-                (25, k0 + 8),
-                (25, k0 + 9),
-            ]);
-        }
-        assert_eq!(pos, want);
-    }
-
-    #[test]
-    fn kx7_lane16_follows_kdaexact_ksplit_permutation() {
-        // kdaexact.py lane16_permutation(K, ksplit): row-major streams of K / (4 S) inputs,
-        // stream s * 4 + t of a row covering s * K / S + 64 c + 16 t + i.
-        for (k, s) in [(256, 1), (1024, 4), (4096, 4), (512, 2)] {
-            let ks = k / s;
-            let mut perm = Vec::new();
-            for sl in 0..s {
-                for t in 0..4 {
-                    for c in 0..ks / 64 {
-                        perm.extend(sl * ks + 64 * c + 16 * t..sl * ks + 64 * c + 16 * t + 16);
-                    }
-                }
-            }
-            let layout = Kx7Layout::lane16(s);
-            let (n, spr) = (3, 4 * s);
-            let mut pos = Vec::new();
-            for stream in 0..layout.streams(n, k) {
-                layout.positions(n, k, stream, &mut pos);
-                let c = layout.symbols_per_stream(k);
-                let w = stream % spr;
-                let want: Vec<_> = perm[w * c..(w + 1) * c].iter().map(|&col| (stream / spr, col)).collect();
-                assert_eq!(pos, want);
-            }
-        }
-    }
-
-    #[test]
-    fn kx7_round_trips_fp8_born_fixtures() {
-        let cases = [
-            (16, 16, Kx7Layout::frag32(1)),
-            (64, 4096, Kx7Layout::frag32(2)),
-            (32, 8192, Kx7Layout::frag32(4)),
-            (64, 4096, Kx7Layout::frag32(default_slices(64, 4096))),
-            (16, 64, Kx7Layout::lane16(1)),
-            (64, 4096, Kx7Layout::lane16(LANE16_DEFAULT_SLICES)),
-            (32, 8192, Kx7Layout::lane16(4).with_align(16)),
-        ];
-        for (i, (n, k, layout)) in cases.into_iter().enumerate() {
-            let w = fp8_born(n, k, 100 + i as u64);
-            let pack = round_trip(&w, n, k, layout);
-            let bpw = pack.stored_bytes() as f64 * 8.0 / (n * k) as f64;
-            assert!(n * k < 65536 || bpw < 10.5, "{layout:?} [{n}, {k}]: {bpw} bits/weight");
-        }
-    }
-
-    #[test]
-    fn kx7_round_trips_odd_distributions() {
-        // One symbol: a 1-bit code, every primary entry its leaf.
-        for (n, k) in [(16, 16), (64, 4096)] {
-            let w = vec![0x3c00u16; n * k];
-            let pack = round_trip(&w, n, k, Kx7Layout::frag32(1));
-            assert_eq!(pack.code().symbols(), &[0x3c00]);
-            assert_eq!(pack.code().count(1), 1);
-            assert!(pack.decode_tables()[TL_PRIMARY..TL_LONG].iter().all(|&e| e == 0x3c00 << 16 | 1 << 8 | FLAG_LEAF));
-            if k % 64 == 0 {
-                round_trip(&w, n, k, Kx7Layout::lane16(4));
-            }
-        }
-        // 4,096 equally frequent patterns: every code 12 bits, every symbol on the long path.
-        let w = uniform4096(64, 4096, 7);
-        let pack = round_trip(&w, 64, 4096, Kx7Layout::frag32(2));
-        assert_eq!((pack.code().n_sym(), pack.code().count(12)), (4096, 4096));
-        assert!(pack.decode_tables()[TL_PRIMARY..TL_LONG].iter().all(|&e| e == 12 << 8 | FLAG_LONG));
-        round_trip(&w, 64, 4096, Kx7Layout::lane16(4));
-        // Skewed: the unlimited code passes 16 bits and package-merge caps it.
-        let w = zipf(64, 4096, 11, 8192);
-        let hist = histogram(&Kx7Source::matrix(&w, 64, 4096).unwrap());
-        let freqs: Vec<u64> = hist.iter().copied().filter(|&f| f > 0).collect();
-        assert!(huffman_depths(&freqs).into_iter().max().unwrap() > 16);
-        let pack = round_trip(&w, 64, 4096, Kx7Layout::frag32(2));
-        assert!(pack.code().count(16) > 0);
-        round_trip(&w, 64, 4096, Kx7Layout::lane16(4));
-        // Random patterns over most of the alphabet.
-        let mut g = Mix(3);
-        let w: Vec<u16> = (0..64 * 2048).map(|_| g.next() as u16).collect();
-        round_trip(&w, 64, 2048, Kx7Layout::frag32(2));
-        // All 65,536 patterns, 4 times each: every code 16 bits, the u16 count wraps to 0.
-        let w: Vec<u16> = (0..256 * 1024).map(|i| (i as u32).wrapping_mul(40503) as u16).collect();
-        let pack = round_trip(&w, 256, 1024, Kx7Layout::lane16(4));
-        assert_eq!((pack.code().n_sym(), pack.code().count(16), pack.table()[15]), (65536, 65536, 0));
-    }
-
-    #[test]
-    fn kx7_fused_source_round_trips_under_one_code() {
-        let k = 4096;
-        let (q, kk, v) = (fp8_born(16, k, 21), fp8_born(32, k, 22), zipf(16, k, 23, 4096));
-        let src = Kx7Source::fused(&[(&q, 16), (&kk, 32), (&v, 16)], k).unwrap();
-        let whole: Vec<u16> = [q.as_slice(), &kk, &v].concat();
-        for layout in [Kx7Layout::lane16(4), Kx7Layout::frag32(2)] {
-            let pack = encode(&src, layout).unwrap();
-            verify(&pack, &src).unwrap();
-            assert_eq!(decode(&pack).unwrap(), whole);
-            assert_eq!(pack.header().part_ends, vec![16, 48, 64]);
-            let words = pack.header().to_words();
-            assert_eq!((words[13], &words[16..20]), (3, &[16u32, 48, 64, 0][..]));
-            // The same rows as one matrix give the same streams; only the part record differs.
-            let single = encode_matrix(&whole, 64, k, layout).unwrap();
-            assert_eq!(
-                (single.streams(), single.index(), single.table()),
-                (pack.streams(), pack.index(), pack.table())
-            );
-            assert!(matches!(verify(&single, &src), Err(Kx7Error::Source { .. })));
-        }
-    }
-
-    #[test]
-    fn kx7_encoding_is_deterministic() {
-        let w = fp8_born(64, 4096, 5);
-        for layout in [Kx7Layout::frag32(2), Kx7Layout::lane16(4)] {
-            let a = encode_matrix(&w, 64, 4096, layout).unwrap();
-            let b = encode_matrix(&w, 64, 4096, layout).unwrap();
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-            let c = pool.install(|| encode_matrix(&w, 64, 4096, layout).unwrap());
-            for p in [&b, &c] {
-                assert_eq!(p.header().to_words(), a.header().to_words());
-                assert_eq!((p.table(), p.index(), p.streams()), (a.table(), a.index(), a.streams()));
-                assert_eq!(p.decode_tables(), a.decode_tables());
-            }
-        }
-    }
-
-    #[test]
-    fn kx7_tables_decode_every_codeword() {
-        for w in [fp8_born(64, 4096, 9), zipf(64, 4096, 10, 8192), uniform4096(16, 4096, 2)] {
-            let code = CanonicalCode::from_histogram(&histogram(&Kx7Source::matrix(&w, w.len() / 4096, 4096).unwrap()))
-                .unwrap();
-            let (dec, back) = TwoLevelDecoder::parse(&two_level_tables(&code)).unwrap();
-            assert_eq!(back, code);
-            let cw = code.codewords();
-            let mut g = Mix(1);
-            for &s in code.symbols() {
-                let (c, l) = (cw[s as usize] >> 8, cw[s as usize] & 0xff);
-                // The codeword left-aligned in a 32-bit word, random bits after it.
-                let word = c << (32 - l) | (g.next() as u32 >> l);
-                let bytes = word.to_be_bytes();
-                let mut bits = LaneBits::new(&bytes, 0);
-                assert!(bits.refill());
-                assert_eq!(dec.next(&mut bits), Some(s));
-                assert_eq!(bits.consumed, l as u64);
-            }
-        }
-    }
-
-    /// Expected values from the KX7 reference tool, `kdaexact.py`. Produced by running the
-    /// ignored test `kx7_dump_reference_fixtures` (raw little-endian u16 files), then, with
-    /// python3 -I and numpy, for each fixture `a` ([64, 4096]):
-    /// `f = np.bincount(a.ravel(), minlength=65536)`, `lens = length_limited_lengths(f, 16)`
-    /// (`lengths`: one hex digit, length - 1, per used pattern in ascending pattern order;
-    /// `unlimited_max`: `length_limited_lengths(f, 64).max()`), and from the tool's
-    /// `--ksplit`/`--dump` revision `run(a, 0, 16, layout='lane16', ksplit=4, pack=p)` then
-    /// `dump_pack(d, a, r, p, source=False)`: the SHA-256 of its table.bin, streams.bin and
-    /// offsets.bin. Both revisions gave identical lengths.
-    const REFERENCE: &str = include_str!("fixtures/kx7_reference.json");
-
-    fn reference_fixtures() -> Vec<(&'static str, usize, usize, Vec<u16>)> {
-        vec![
-            ("fp8_born", 64, 4096, fp8_born(64, 4096, 0x4b58_3701)),
-            ("fp8_narrow", 64, 4096, fp8_born_over(64, 4096, 0x4b58_3703, 8)),
-            ("zipf", 64, 4096, zipf(64, 4096, 0x4b58_3702, 8192)),
-        ]
-    }
-
-    #[test]
-    fn kx7_code_lengths_and_lane16_pack_match_kdaexact() {
-        let reference: serde_json::Value = serde_json::from_str(REFERENCE).unwrap();
-        for (name, n, k, w) in reference_fixtures() {
-            let r = &reference["fixtures"][name];
-            assert_eq!((r["n"].as_u64(), r["k"].as_u64()), (Some(n as u64), Some(k as u64)), "{name}");
-            let hist = histogram(&Kx7Source::matrix(&w, n, k).unwrap());
-            let lengths = code_lengths(&hist).unwrap();
-            let got: String =
-                lengths.iter().filter(|&&l| l > 0).map(|&l| char::from_digit(l as u32 - 1, 16).unwrap()).collect();
-            assert_eq!(got, r["lengths"].as_str().unwrap(), "{name}: code lengths differ from kdaexact.py");
-            let freqs: Vec<u64> = hist.iter().copied().filter(|&f| f > 0).collect();
-            let unlimited = huffman_depths(&freqs).into_iter().max().unwrap();
-            assert_eq!(unlimited as u64, r["unlimited_max"].as_u64().unwrap(), "{name}");
-            let pack = encode_matrix(&w, n, k, Kx7Layout::lane16(4)).unwrap();
-            let d = &r["lane16_ksplit4"];
-            assert_eq!(sha(&le16(&pack.table())), d["table_sha256"].as_str().unwrap(), "{name}: table.bin");
-            assert_eq!(sha(pack.streams()), d["streams_sha256"].as_str().unwrap(), "{name}: streams.bin");
-            assert_eq!(sha(&le32(pack.index())), d["offsets_sha256"].as_str().unwrap(), "{name}: offsets.bin");
-        }
-        // Coverage: fp8_narrow takes the unlimited Huffman code, the others package-merge.
-        let r = &reference["fixtures"];
-        assert!(r["fp8_narrow"]["unlimited_max"].as_u64().unwrap() <= 16);
-        assert!(
-            r["fp8_born"]["unlimited_max"].as_u64().unwrap() > 16 && r["zipf"]["unlimited_max"].as_u64().unwrap() > 16
-        );
-    }
-
-    #[test]
-    #[ignore = "writes the reference fixtures to CUTEAFD_KX7_FIXTURE_DIR"]
-    fn kx7_dump_reference_fixtures() {
-        let dir = std::env::var("CUTEAFD_KX7_FIXTURE_DIR").expect("set CUTEAFD_KX7_FIXTURE_DIR");
-        for (name, n, k, w) in reference_fixtures() {
-            std::fs::write(format!("{dir}/{name}.{n}x{k}.u16"), le16(&w)).unwrap();
-        }
-    }
-
-    #[test]
-    fn kx7_refuses_bad_shapes() {
-        let w = vec![0u16; 64 * 256];
-        let shape = |r: Result<Kx7Pack>| matches!(r, Err(Kx7Error::Shape { .. }));
-        assert!(shape(encode_matrix(&w[..8 * 256], 8, 256, Kx7Layout::frag32(1))));
-        assert!(shape(encode_matrix(&w[..64 * 40], 64, 40, Kx7Layout::frag32(1))));
-        assert!(shape(encode_matrix(&w, 64, 256, Kx7Layout::frag32(32))));
-        assert!(shape(encode_matrix(&w, 64, 256, Kx7Layout::frag32(0))));
-        assert!(shape(encode_matrix(&w, 64, 256, Kx7Layout::lane16(8))));
-        assert!(shape(encode_matrix(&w, 64, 256, Kx7Layout::lane16(1).with_align(3))));
-        assert!(matches!(encode_matrix(&w, 64, 255, Kx7Layout::frag32(1)), Err(Kx7Error::Source { .. })));
-        assert!(matches!(Kx7Source::fused(&[], 256), Err(Kx7Error::Source { .. })));
-        assert!(matches!(Kx7Source::fused(&[(&w[..256], 1); 9], 256), Err(Kx7Error::Source { .. })));
-        assert!(matches!(Kx7Source::fused(&[(&w[..256], 1), (&w[..0], 0)], 256), Err(Kx7Error::Source { .. })));
-        let src = Kx7Source::matrix(&w, 64, 256).unwrap();
-        let mut cw = vec![0u32; PATTERNS];
-        assert!(matches!(pack_streams(&src, Kx7Layout::lane16(1), &cw), Err(Kx7Error::Uncoded { pattern: 0, .. })));
-        cw.truncate(10);
-        assert!(matches!(pack_streams(&src, Kx7Layout::lane16(1), &cw), Err(Kx7Error::Code { .. })));
-    }
-
-    fn sample_pack() -> Kx7Pack {
-        let (q, k) = (fp8_born(16, 1024, 31), fp8_born(16, 1024, 32));
-        encode(&Kx7Source::fused(&[(&q, 16), (&k, 16)], 1024).unwrap(), Kx7Layout::frag32(2)).unwrap()
-    }
-
-    fn reassemble(header: &[u32], table: &[u16], index: Vec<u32>, streams: Vec<u8>) -> Result<Kx7Pack> {
-        Kx7Pack::from_parts(header, table, index, streams)
-    }
-
-    #[test]
-    fn kx7_refuses_bad_headers() {
-        let p = sample_pack();
-        let good = p.header().to_words();
-        let header = |word: usize, value: u32| {
-            let mut h = good;
-            h[word] = value;
-            reassemble(&h, &p.table(), p.index().to_vec(), p.streams().to_vec())
-        };
-        let at = |r: Result<Kx7Pack>| match r {
-            Err(Kx7Error::Header { word, .. }) => Some(word),
-            _ => None,
-        };
-        assert_eq!(at(header(0, u32::from_le_bytes(*b"KX8\0"))), Some(0));
-        assert_eq!(at(header(1, 2)), Some(1));
-        assert_eq!(at(header(2, 3)), Some(2));
-        assert_eq!(at(header(6, 15)), Some(6));
-        assert_eq!(at(header(7, 0)), Some(7));
-        assert_eq!(at(header(9, good[9] + 32)), Some(9));
-        assert_eq!(at(header(10, 7)), Some(10));
-        assert_eq!(at(header(12, 2)), Some(12));
-        assert_eq!(at(header(13, 0)), Some(13));
-        assert_eq!(at(header(13, 9)), Some(13));
-        assert_eq!(at(header(13, 3)), Some(18));
-        assert_eq!(at(header(16, 33)), Some(16));
-        assert_eq!(at(header(16, 32)), Some(17));
-        assert_eq!(at(header(17, 31)), Some(17));
-        assert_eq!(at(header(14, 1)), Some(14));
-        assert_eq!(at(header(31, 1)), Some(31));
-        assert!(matches!(header(3, 24), Err(Kx7Error::Shape { .. })));
-        assert!(matches!(header(5, 3), Err(Kx7Error::Shape { .. })));
-        assert!(matches!(header(11, 24), Err(Kx7Error::Shape { .. })));
-        assert!(matches!(header(7, good[7] + 1), Err(Kx7Error::Table { .. })));
-        assert!(matches!(header(8, good[8] + 16), Err(Kx7Error::Index { .. })));
-        assert!(matches!(
-            reassemble(&good[..31], &p.table(), p.index().to_vec(), p.streams().to_vec()),
-            Err(Kx7Error::Truncated { what: "header", .. })
-        ));
-    }
-
-    #[test]
-    fn kx7_refuses_bad_tables() {
-        let p = sample_pack();
-        let h = p.header().to_words();
-        let table = |t: Vec<u16>| reassemble(&h, &t, p.index().to_vec(), p.streams().to_vec());
-        let good = p.table();
-        assert!(matches!(table(good[..10].to_vec()), Err(Kx7Error::Truncated { what: "code table", .. })));
-        assert!(matches!(table(good[..good.len() - 1].to_vec()), Err(Kx7Error::Table { .. })));
-        let first_len = (0..16).find(|&l| good[l] >= 2).unwrap();
-        let first_sym = TABLE_COUNTS + good[..first_len].iter().map(|&c| c as usize).sum::<usize>();
-        let mut swapped = good.clone();
-        swapped.swap(first_sym, first_sym + 1);
-        assert!(matches!(table(swapped), Err(Kx7Error::Table { .. })));
-        let mut twice = good.clone();
-        twice[first_sym + 1] = twice[first_sym];
-        assert!(matches!(table(twice), Err(Kx7Error::Table { .. })));
-        let mut kraft = good.clone();
-        let (long, short) = ((0..16).rev().find(|&l| kraft[l] > 0).unwrap(), (0..16).find(|&l| kraft[l] > 0).unwrap());
-        kraft[long] -= 1;
-        kraft[short] += 1;
-        assert!(matches!(table(kraft), Err(Kx7Error::Table { .. })));
-        let mut one = vec![0u16; 16];
-        one[2] = 1;
-        one.push(0x3c00);
-        assert!(matches!(CanonicalCode::from_table(&one), Err(Kx7Error::Table { .. })));
-        assert!(matches!(CanonicalCode::from_lengths(vec![0; PATTERNS]), Err(Kx7Error::Code { .. })));
-        assert!(matches!(code_lengths(&vec![0; PATTERNS]), Err(Kx7Error::Code { .. })));
-        // Decode-table sections: truncation, kind, and any word the code does not give.
-        let t = p.decode_tables();
-        assert!(TwoLevelDecoder::parse(&t).is_ok());
-        assert!(matches!(TwoLevelDecoder::parse(&t[..100]), Err(Kx7Error::Truncated { .. })));
-        assert!(matches!(TwoLevelDecoder::parse(&t[..t.len() - 1]), Err(Kx7Error::Truncated { .. })));
-        for (word, value) in [
-            (0, 2),
-            (2, 12),
-            (TL_PRIMARY + 5, t[TL_PRIMARY + 5] ^ 1 << 8),
-            (TL_LONG + 1, 7),
-            (TL_SYMBOLS, t[TL_SYMBOLS] ^ 1),
-        ] {
-            let mut bad = t.clone();
-            bad[word] = value;
-            assert!(matches!(TwoLevelDecoder::parse(&bad), Err(Kx7Error::Table { .. })), "word {word}");
-        }
-    }
-
-    #[test]
-    fn kx7_refuses_bad_index_and_streams() {
-        let p = sample_pack();
-        let (h, t) = (p.header().to_words(), p.table());
-        let index = |f: &dyn Fn(&mut Vec<u32>)| {
-            let mut i = p.index().to_vec();
-            f(&mut i);
-            reassemble(&h, &t, i, p.streams().to_vec())
-        };
-        assert!(matches!(
-            index(&|i| {
-                i.pop();
-            }),
-            Err(Kx7Error::Truncated { what: "stream index", .. })
-        ));
-        assert!(matches!(index(&|i| i[0] = 16), Err(Kx7Error::Index { entry: 0, .. })));
-        assert!(matches!(index(&|i| i[5] = i[7]), Err(Kx7Error::Index { entry: 6, .. })));
-        assert!(matches!(index(&|i| i[5] += 1), Err(Kx7Error::Index { entry: 5, .. })));
-        let last = p.index().len() - 1;
-        assert!(matches!(index(&|i| i[last] += 16), Err(Kx7Error::Index { .. })));
-        let mut short = p.streams().to_vec();
-        short.pop();
-        assert!(matches!(
-            reassemble(&h, &t, p.index().to_vec(), short),
-            Err(Kx7Error::Truncated { what: "streams", .. })
-        ));
-        // A stream boundary moved by one alignment unit: both neighbours misdecode.
-        let moved = index(&|i| i[3] += 16).unwrap();
-        assert!(matches!(
-            decode(&moved),
-            Err(Kx7Error::StreamLength { .. } | Kx7Error::InvalidCode { .. } | Kx7Error::Padding { .. })
-        ));
-    }
-
-    #[test]
-    fn kx7_detects_corrupt_streams() {
-        let w = fp8_born(32, 1024, 41);
-        let p = encode_matrix(&w, 32, 1024, Kx7Layout::frag32(2)).unwrap();
-        let rebuilt = |streams: Vec<u8>| {
-            Kx7Pack::from_parts(&p.header().to_words(), &p.table(), p.index().to_vec(), streams).unwrap()
-        };
-        // Nonzero padding after a stream's last symbol.
-        let pad = (0..p.header().streams()).find(|&s| {
-            let mut bits = 0u64;
-            let mut pos = Vec::new();
-            p.header().layout.positions(32, 1024, s, &mut pos);
-            for &(r, c) in &pos {
-                bits += p.code().lengths()[w[r * 1024 + c] as usize] as u64;
-            }
-            bits.div_ceil(8) < (p.index()[s + 1] - p.index()[s]) as u64
-        });
-        let s = pad.expect("a stream with a padding byte");
-        let mut streams = p.streams().to_vec();
-        streams[p.index()[s + 1] as usize - 1] = 0x80;
-        assert_eq!(decode(&rebuilt(streams)), Err(Kx7Error::Padding { stream: s }));
-        // Flipped bits inside streams: never a silent wrong answer.
-        let mut g = Mix(77);
-        for _ in 0..200 {
-            let mut streams = p.streams().to_vec();
-            let at = g.below(streams.len() as u64) as usize;
-            streams[at] ^= 1 << g.below(8);
-            match verify_matrix(&rebuilt(streams), &w) {
-                Err(
-                    Kx7Error::Mismatch { .. }
-                    | Kx7Error::StreamLength { .. }
-                    | Kx7Error::InvalidCode { .. }
-                    | Kx7Error::Padding { .. }
-                    | Kx7Error::Overrun { .. },
-                ) => {}
-                other => panic!("flip at byte {at}: {other:?}"),
-            }
-        }
-        // A mismatch names its first position.
-        let mut other = w.clone();
-        other[5 * 1024 + 77] ^= 1;
-        assert_eq!(
-            verify_matrix(&p, &other),
-            Err(Kx7Error::Mismatch { row: 5, col: 77, expected: other[5 * 1024 + 77], actual: w[5 * 1024 + 77] })
-        );
-    }
-
-    // ------------------------------------------------------------ real tensors
-
-    struct Shards {
-        tensors: std::collections::HashMap<String, (std::path::PathBuf, u64, Vec<usize>)>,
-    }
-
-    impl Shards {
-        fn open(dir: &str) -> Self {
-            use std::io::Read;
-            let mut tensors = std::collections::HashMap::new();
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
-                    continue;
-                }
-                let mut f = std::fs::File::open(&path).unwrap();
-                let mut len = [0u8; 8];
-                f.read_exact(&mut len).unwrap();
-                let len = u64::from_le_bytes(len);
-                let mut json = vec![0u8; len as usize];
-                f.read_exact(&mut json).unwrap();
-                let header: serde_json::Value = serde_json::from_slice(&json).unwrap();
-                for (name, meta) in header.as_object().unwrap() {
-                    if name == "__metadata__" || meta["dtype"] != "BF16" {
-                        continue;
-                    }
-                    let shape =
-                        meta["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect();
-                    let start = meta["data_offsets"][0].as_u64().unwrap();
-                    tensors.insert(name.clone(), (path.clone(), 8 + len + start, shape));
-                }
-            }
-            Self { tensors }
-        }
-
-        fn load(&self, name: &str) -> (Vec<u16>, usize, usize) {
-            use std::io::{Read, Seek, SeekFrom};
-            let (path, offset, shape) = self.tensors.get(name).unwrap_or_else(|| panic!("{name} not in the shards"));
-            let (n, k) = (shape[0], shape[1]);
-            let mut f = std::fs::File::open(path).unwrap();
-            f.seek(SeekFrom::Start(*offset)).unwrap();
-            let mut bytes = vec![0u8; 2 * n * k];
-            f.read_exact(&mut bytes).unwrap();
-            (bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect(), n, k)
-        }
-    }
-
-    fn seconds<T>(f: impl FnOnce() -> T) -> (T, f64) {
-        let t = std::time::Instant::now();
-        let out = f();
-        (out, t.elapsed().as_secs_f64())
-    }
-
-    #[test]
-    #[ignore = "reads GLM-5.3-Flash safetensors shards from CUTEAFD_KX7_SHARDS"]
-    fn kx7_real_glm_tensors() {
-        let dir =
-            std::env::var("CUTEAFD_KX7_SHARDS").expect("set CUTEAFD_KX7_SHARDS to a GLM-5.3-Flash shard directory");
-        let layer: usize = std::env::var("CUTEAFD_KX7_LAYER").ok().and_then(|l| l.parse().ok()).unwrap_or(10);
-        let shards = Shards::open(&dir);
-        let name = |p: &str| format!("model.language_model.layers.{layer}.self_attn.{p}_proj.weight");
-        let (q, k, v, o) =
-            (shards.load(&name("q")), shards.load(&name("k")), shards.load(&name("v")), shards.load(&name("o")));
-        let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-        let threads = rayon::current_num_threads();
-        type Case<'a> = (&'a str, Vec<(&'a [u16], usize)>, usize, Kx7Layout);
-        let cases: Vec<Case> = vec![
-            ("k_proj", vec![(k.0.as_slice(), k.1)], k.2, Kx7Layout::frag32(default_slices(k.1, k.2))),
-            ("o_proj", vec![(o.0.as_slice(), o.1)], o.2, Kx7Layout::frag32(default_slices(o.1, o.2))),
-            ("k_proj", vec![(k.0.as_slice(), k.1)], k.2, Kx7Layout::lane16(4)),
-            ("o_proj", vec![(o.0.as_slice(), o.1)], o.2, Kx7Layout::lane16(4)),
-            (
-                "q;k;v",
-                vec![(q.0.as_slice(), q.1), (k.0.as_slice(), k.1), (v.0.as_slice(), v.1)],
-                k.2,
-                Kx7Layout::lane16(4),
-            ),
-            (
-                "q;k;v",
-                vec![(q.0.as_slice(), q.1), (k.0.as_slice(), k.1), (v.0.as_slice(), v.1)],
-                k.2,
-                Kx7Layout::frag32(default_slices(q.1 + k.1 + v.1, k.2)),
-            ),
-        ];
-        println!("layer {layer}, {threads} threads");
-        for (label, parts, kk, layout) in cases {
-            let src = Kx7Source::fused(&parts, kk).unwrap();
-            let weights = (src.n() * kk) as f64;
-            let hist = histogram(&src);
-            let code = CanonicalCode::from_histogram(&hist).unwrap();
-            let mass = |min: u8| {
-                hist.iter().zip(code.lengths()).filter(|&(_, &l)| l > min).map(|(&f, _)| f).sum::<u64>() as f64
-                    / weights
-            };
-            let rate = hist.iter().zip(code.lengths()).map(|(&f, &l)| f * l as u64).sum::<u64>() as f64 / weights;
-            let entropy: f64 = hist
-                .iter()
-                .filter(|&&f| f > 0)
-                .map(|&f| {
-                    let p = f as f64 / weights;
-                    -p * p.log2()
-                })
-                .sum();
-            let (pack1, enc1) = seconds(|| one.install(|| encode(&src, layout).unwrap()));
-            let (pack, enc) = seconds(|| encode(&src, layout).unwrap());
-            assert_eq!((pack1.streams(), pack1.index()), (pack.streams(), pack.index()));
-            let (out1, dec1) = seconds(|| one.install(|| decode(&pack).unwrap()));
-            let (_, dec) = seconds(|| decode(&pack).unwrap());
-            for (r, row) in src.rows.iter().enumerate() {
-                assert_eq!(*row, &out1[r * kk..(r + 1) * kk], "{label} row {r}");
-            }
-            verify(&pack, &src).unwrap();
-            let h = pack.header();
-            let stream_bpw = pack.streams().len() as f64 * 8.0 / weights;
-            let index_bpw = pack.index().len() as f64 * 32.0 / weights;
-            let table_bpw = (4 * HEADER_WORDS + 2 * pack.table().len()) as f64 * 8.0 / weights;
-            println!(
-                "{label} [{}, {kk}] {:?} S={} align={}: {} streams x {} symbols, n_sym {}, H {entropy:.4}, \
-                 code rate {rate:.4}; bits/weight stream {stream_bpw:.4} + index {index_bpw:.4} + header/table {table_bpw:.5} = {:.4}; \
-                 symbol mass with code > 11 bits {:.4}, > 12 bits {:.4}; decode tables {} B; \
-                 encode {enc1:.2} s (1 thread) / {enc:.3} s ({threads}); decode {dec1:.2} s / {dec:.3} s",
-                h.n, layout.kind, layout.slices, layout.align, h.streams(), h.symbols_per_stream(), h.n_sym,
-                pack.stored_bytes() as f64 * 8.0 / weights, mass(11), mass(12), 4 * pack.decode_tables().len(),
-            );
-            if layout.kind == LayoutKind::Lane16 {
-                println!(
-                    "  sha256 table.bin {} streams.bin {} offsets.bin {}",
-                    sha(&le16(&pack.table())),
-                    sha(pack.streams()),
-                    sha(&le32(pack.index()))
-                );
-            }
-        }
-    }
-}
+mod tests;
