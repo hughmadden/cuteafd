@@ -365,19 +365,20 @@ impl<'a> GlmfEngine<'a> {
         let (q,k,v,out,scratch) = (s.stage("q")?,s.stage("k")?,s.stage("v")?,s.stage("values")?,s.stage("scratch")?);
         let input = Self::core_buffer(row_at(&w.x, first, self.cfg.hidden * 2), rows*self.cfg.hidden*2, w.x.buffer.device_id);
         for (name, output) in [("q",q),("k",k),("v",v)] {
-            self.core_linear(rank,w,layer,&format!("self_attn.{name}_proj"),input,output,rows,0,cap)?;
+            self.timed(&format!("kda staged {name}_proj"), ||
+                self.core_linear(rank,w,layer,&format!("self_attn.{name}_proj"),input,output,rows,0,cap))?;
         }
         // KX7 layers run their state's staged core; native K6 is qualified at F32 state only.
         let program = if kx7_attention(layer) { kx7_kda_core(self.kda_state.into(), cap) } else { format!("kda_core_{cap}") };
-        self.core_stage(rank,layer.attention_share.split(),&program,&[
+        self.timed(&format!("kda staged {program}"), || self.core_stage(rank,layer.attention_share.split(),&program,&[
             ("x",input.ptr),("q",q.ptr),("k",k.ptr),("v",v.ptr),("gate",q.ptr),("w_fab",layer.ptr("w_aux")?),
             ("w_f",layer.ptr("w_fg")?),("conv_w",layer.ptr("conv_w")?),("a_log",layer.ptr("a_log")?),
             ("dt_bias",layer.ptr("dt_bias")?),("o_norm",layer.ptr("o_norm")?),("conv_state",conv),("state",state),
             ("slots",row_at(&w.kda_slots,first,4)),("seq_first",row_at(&w.seq_first,first,4)),("out",out.ptr),
-            ("replay",replay),("scratch",scratch.ptr)],&[count,Scalar::I32(i32::from(spec))])?;
+            ("replay",replay),("scratch",scratch.ptr)],&[count,Scalar::I32(i32::from(spec))]))?;
         let destination = Self::core_buffer(w.delta.buffer.ptr.wrapping_byte_add(first*self.cfg.hidden*2),
             rows*self.cfg.hidden*2,w.x.buffer.device_id);
-        self.core_linear(rank,w,layer,"self_attn.o_proj",out,destination,rows,0,cap)
+        self.timed("kda staged o_proj", || self.core_linear(rank,w,layer,"self_attn.o_proj",out,destination,rows,0,cap))
     }
     pub(super) fn core_mla_producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, count: Scalar,
         cap: &str, cache: *mut c_void) -> Result<()> {
