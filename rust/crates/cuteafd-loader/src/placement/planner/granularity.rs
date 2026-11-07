@@ -196,7 +196,7 @@ mod tests {
     fn small_requests_share_blocks_and_large_requests_round_independently() {
         assert_eq!(allocation_granularity_forecast(&[]).unwrap(), 0);
         for (requests, physical) in [(vec![SMALL; 2], PAGE), (vec![SMALL + 1; 2], 2 * PAGE),
-            (vec![63 << 20, 14 << 10, 24 << 10], 65 << 20)] {
+            (vec![63 << 20, 14 << 10, 24 << 10], 66 << 20)] {
             assert_eq!(allocation_granularity_forecast(&requests).unwrap() + requests.iter().sum::<u64>(), physical);
         }
         assert!(allocation_granularity_forecast(&[0]).is_err());

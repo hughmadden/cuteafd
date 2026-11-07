@@ -1249,7 +1249,7 @@ fn ordinary_heap_subset(component: &Component) -> bool {
             && group.members.iter().all(|owner| owner.location == Location::HOST),
         ComponentKind::Allowance(allowance) => allowance.location == Location::HOST,
         ComponentKind::Reservation(_) | ComponentKind::ResidentWeight(_)
-            | ComponentKind::DriverPageTables { .. } => false,
+            | ComponentKind::DriverPageTables { .. } | ComponentKind::AllocationGranularity(_) => false,
     }
 }
 
