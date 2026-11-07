@@ -1612,3 +1612,34 @@ def test_placement_selection_ignores_card_publication_but_tracks_retirement(tmp_
     assert publisher.live_configs(tmp_path) == before
     matrix.write_text(json.dumps({'retired': [{'config': 'examples/configs/live.config'}], 'cells': []}))
     assert publisher.live_configs(tmp_path) == []
+
+
+def test_placement_publication_rsync_host_syncs_directory_and_current_symlink(tmp_path, monkeypatch):
+    publisher = compare_sm.load_file('test_placement_rsync', ROOT / 'scripts/build/export-placement-inputs.py')
+    published = tmp_path / 'placement-inputs/37ae6dccee42f4c3ba637e95dc8232b5398be644'
+    published.mkdir(parents=True)
+    with pytest.raises(ValueError, match='missing published placement input'):
+        publisher.rsync_publication(published, ['maxq'], timeout=30)
+    (published / 'INPUTS.json').write_text('{}')
+    (published / 'PROGRAMS.json').write_text('{}')
+    rsync_calls = []
+
+    def fake_run(cmd, **kwargs):
+        rsync_calls.append((cmd, kwargs))
+        if len(rsync_calls) == 2:
+            link = Path(cmd[3])
+            assert link.is_symlink() and link.readlink() == Path(published.name)
+
+    monkeypatch.setattr(publisher.subprocess, 'run', fake_run)
+    monkeypatch.setattr(publisher.sys, 'argv', [
+        'export-placement-inputs.py', '--output', str(published), '--rsync-host', 'maxq', '--timeout', '45'])
+    publisher.main()
+    assert len(rsync_calls) == 2
+    assert rsync_calls[0][0] == ['rsync', '-a', '--delete', '--mkpath', f'{published}/', f'maxq:{published}/']
+    assert rsync_calls[1][0][:3] == ['rsync', '-a', '--mkpath']
+    assert rsync_calls[1][0][4] == f'maxq:{published.parent}/'
+    assert all(call[1]['check'] is True and call[1]['timeout'] == 45 for call in rsync_calls)
+    monkeypatch.setattr(publisher.sys, 'argv', ['export-placement-inputs.py', '--output', str(published)])
+    with pytest.raises(SystemExit) as refused:
+        publisher.main()
+    assert refused.value.code == 2
