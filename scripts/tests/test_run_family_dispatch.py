@@ -1471,7 +1471,7 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert len(plans) == 1
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
     assert plans[0][plans[0].index("--attention-placement") + 1] == "auto"
-    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "serve-kimi --snapshot" in line)
     assert "--pool-tokens" not in serve
     assert "CUTEAFD_ATTENTION_PLACEMENT=auto" in serve
     assert ("--split-device" in serve) == (gpus == 2)
@@ -2913,7 +2913,7 @@ def test_kimi_packed_prefill_mode_forwarding(tmp_path, mode):
         extra_args=("--wip", "packed-kimi"),
         encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30})
     assert result.returncode == 0, result.stderr
-    launch = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    launch = next(shlex.split(line) for line in result.stderr.splitlines() if "serve-kimi --snapshot" in line)
     if mode is None:
         assert "--prefill-packing" not in launch
     else:
