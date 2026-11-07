@@ -47,5 +47,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Full-plan tests spend most of their time in dependency JSON/map code.
+[profile.test.package."*"]
+opt-level = 2
+
 [profile.test.package.cuteafd-loader]
 opt-level = 2

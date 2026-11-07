@@ -328,6 +328,52 @@ mod tests {
     }
 
     #[test]
+    fn flash_workspace_reuses_validated_census_without_rebuilding_loads() -> Result<()> {
+        use crate::plan::{exlr8::{native::flash_routed_workspace, residency::MetadataInput}, testing};
+        let mut cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&testing::glm5_flash_config(4))?;
+        cfg.dense = vec![true, true, true, false];
+        let entries = [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped,
+            ExecutionVariant::Prefill].map(|variant| {
+                let mut value = entry(variant, PrefillActivations::A16);
+                let groups = value["geometry"]["max_groups"].as_u64().unwrap();
+                value["name"] = json!(variant.program(KernelFamily::GlmFlash, PrefillActivations::A16));
+                value["geometry"]["hidden"] = json!(4096);
+                value["geometry"]["fc1_splits"] = json!(4);
+                value["geometry"]["swiglu_limit"] = json!(10.0);
+                value["scratch_bytes_at_capacity"] = json!({"fc1":groups*16*2*4*16*128*4,
+                    "intermediate":groups*16*16*128*2,"fc2":groups*16*4096*4});
+                value
+            });
+        let programs = json!({"programs": entries});
+        for padded in [false, true] {
+            let root = tempfile::tempdir()?;
+            testing::exlr8::fixture(root.path(), padded);
+            let metadata = MetadataInput::open(root.path(), "mixed")?;
+            let mut expected = Vec::new();
+            for ranks in 1..=8 {
+                let units = (0..ranks).map(|rank| metadata.plan(3, ranks, rank, ExpertSet::Routed)
+                    .map(|plan| plan.compact_unit_limit())).collect::<std::result::Result<Vec<_>, _>>()?
+                    .into_iter().max().unwrap();
+                for rows in [1, 64, 65, 2752, 4096] {
+                    let bytes = routed_workspace(&programs, KernelFamily::GlmFlash, rows, units, PrefillActivations::A16)?;
+                    assert_eq!(flash_routed_workspace(&metadata, &cfg, &programs, ranks, rows)?, bytes);
+                    expected.push((ranks, rows, bytes));
+                }
+            }
+            let path = root.path().join("experts/exlr8-layer-003.k2.safetensors");
+            std::fs::OpenOptions::new().write(true).open(path)?.set_len(8)?;
+            for (ranks, rows, bytes) in expected {
+                assert_eq!(flash_routed_workspace(&metadata, &cfg, &programs, ranks, rows)?, bytes);
+            }
+            assert!(metadata.plan(3, 2, 0, ExpertSet::Routed).is_err());
+            let fresh = MetadataInput::open(root.path(), "mixed")?;
+            assert!(flash_routed_workspace(&fresh, &cfg, &programs, 2, 4096).is_err());
+            assert!(flash_routed_workspace(&metadata, &cfg, &programs, 9, 4096).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn shared_arenas_use_the_runtime_layout_for_both_families() {
         for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
             let manifest = shared_entries(family);
