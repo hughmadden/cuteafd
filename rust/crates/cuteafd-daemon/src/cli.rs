@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
 pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
-    matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash") && split && draft
+    matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark") && split && draft
 }
 
 /// Resolve the topology-dependent bool once, without losing an explicit false.
@@ -28,6 +28,7 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
         Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
+        Commands::ServeMuse(args) => (&mut args.tp2_dflash, "muse_spark", args.split_device.is_some(), args.draft.is_some()),
         _ => return,
     };
     let Some((_, sub)) = matches.subcommand() else { return };
