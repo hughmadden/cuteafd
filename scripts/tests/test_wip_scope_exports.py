@@ -166,3 +166,57 @@ def test_wip_forwards_both_switches_to_both_legs_and_the_build_key():
     for key in ('V41_AOT', 'VISION_ATTENTION_AOT'):
         assert f'CUTEAFD_WIP_{key}=' in coordinator and f'CUTEAFD_WIP_{key}=' in expert
     assert 'VISION_ATTENTION_AOT V41_AOT CARGO_FEATURES; do' in wip
+
+
+def native_key(source, tmp_path):
+    """build-wip-artifacts.sh's wip_native_key over SOURCE (environment held fixed)."""
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    start = script.index('wip_native_key() {')
+    function = script[start:script.index('\n}\n', start) + 3]
+    clean = {key: value for key, value in os.environ.items() if not key.startswith(('CUTEAFD_WIP_', 'CUTEAFD_CUTE'))}
+    # As in a real build, the environment carries keyed scope switches.
+    env = {**clean, 'CUTEAFD_WIP_DEV_IMAGE_ID': 'sha256:fixture', 'CUTEAFD_WIP_HOST_ISA': 'x86-64-v4',
+           'CUTEAFD_WIP_KIMIK3_AOT': 'ON', 'role': 'coordinator', 'cuda_arch': '120',
+           'source_dir': str(source), 'audio_aot': 'OFF', 'exl3_aot': 'ON', 'nvfp4_aot': 'ON',
+           'coordinator_aot': 'ON', 'xgrammar': 'ON', 'v41_expert_aot': 'OFF', 'v41_coordinator_aot': 'OFF',
+           'v41_nvfp4_aot': 'OFF', 'vision_attention_aot': 'OFF'}
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + function + 'wip_native_key\n'],
+                            env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+@pytest.fixture
+def source_copy(tmp_path):
+    source = tmp_path / 'source'
+    files = ['scripts/build/kernel-input-rules.json', 'scripts/build/native-key-files.py',
+             'scripts/build/kernel-records.py', 'scripts/build/compare-sm-exports.py',
+             'scripts/build/export-placement-inputs.py', 'scripts/build/build-wip-artifacts.sh',
+             'python/tools/aot/export_b12x_dsv4_aot.py', 'python/tools/lib/spark_packages.py',
+             'native/CMakeLists.txt', 'third_party/sparkinfer.lock.json']
+    for name in files:
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_bytes((ROOT / name).read_bytes())
+    (source / 'scripts/tests').mkdir(parents=True)
+    (source / 'python/tests').mkdir(parents=True)
+    (source / 'python/tests/test_fixture.py').write_text('x = 1\n')
+    return source
+
+
+@pytest.mark.parametrize('name', ['scripts/build/kernel-records.py', 'scripts/build/compare-sm-exports.py',
+                                  'scripts/build/export-placement-inputs.py', 'python/tests/test_fixture.py'])
+def test_non_input_tooling_leaves_the_native_key_unchanged(source_copy, tmp_path, name):
+    before = native_key(source_copy, tmp_path)
+    with (source_copy / name).open('a') as handle:
+        handle.write('\n# edit\n')
+    assert native_key(source_copy, tmp_path) == before
+
+
+@pytest.mark.parametrize('name', ['python/tools/aot/export_b12x_dsv4_aot.py', 'python/tools/lib/spark_packages.py',
+                                  'native/CMakeLists.txt', 'scripts/build/build-wip-artifacts.sh',
+                                  'scripts/build/kernel-input-rules.json'])
+def test_exporter_and_build_inputs_change_the_native_key(source_copy, tmp_path, name):
+    before = native_key(source_copy, tmp_path)
+    with (source_copy / name).open('a') as handle:
+        handle.write('\n')
+    assert native_key(source_copy, tmp_path) != before

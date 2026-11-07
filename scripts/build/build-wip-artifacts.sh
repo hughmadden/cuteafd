@@ -241,10 +241,11 @@ wip_native_key() {
     # an override, or "native", changes every exported object's host code.
     printf 'cute-host-target %s\n' "${CUTEAFD_CUTE_HOST_TARGET-<pinned default>}"
     # Pinned submodule trees by their verified lock digests (sparkinfer, xgrammar,
-    # transformers), then every native, exporter and build-helper file.
+    # transformers), then every native, exporter and build-helper file that is a
+    # build input: kernel-input-rules.json's ignore list (tests, benchmarks, docs,
+    # records/comparison/placement tooling) never invalidates an entry.
     cat "$source_dir/third_party/"*.lock.json
-    (cd "$source_dir" && find native python scripts/build -type f ! -name '*.pyc' ! -path '*/__pycache__/*' -print0 |
-      LC_ALL=C sort -z | xargs -0 sha256sum)
+    python3 "$source_dir/scripts/build/native-key-files.py" "$source_dir"
   } | sha256sum | awk '{print $1}'
 }
 if [[ "$phase" == export ]]; then
