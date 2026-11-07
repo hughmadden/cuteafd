@@ -218,7 +218,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
         let physical = (0..gpus as i32).collect::<Vec<_>>();
         let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "fixture",
-            cuteafd_loader::placement::planner::Lifetime::TARGET,
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
             cuteafd_core::memory_layout::Category::Weights, "target weights");
         for (prefix, share) in &operands { share.inventory(&mut inventory, prefix)?; }
         if let Some((values, scales)) = &head {

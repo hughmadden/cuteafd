@@ -311,8 +311,12 @@ mod tests {
             let facts = DenseFacts::new(records.clone(), selection.clone(), cfg.layers, shared.clone())?;
             let body = (0..world).map(|rank| NativeDenseRecords::new(root.path(), cfg.layers, world, rank, &BTreeMap::new())
                 .map(|r| r.plan)).collect::<Result<Vec<_>>>()?;
-            let dense = (0..world).map(|rank| NativeDenseRecords::new(root.path(), cfg.layers, world, rank, &BTreeMap::new()))
+            let mut dense = (0..world).map(|rank| NativeDenseRecords::new(root.path(), cfg.layers, world, rank, &BTreeMap::new()))
                 .collect::<Result<Vec<_>>>()?;
+            // This sparse header fixture represents only its first KDA and MLA layers.
+            for rank in &mut dense {
+                rank.layers.retain(|layer| !layer.plain.is_empty() || !layer.projections.is_empty() || layer.kv_b.is_some());
+            }
             for embedding_rank in 0..world {
                 let layouts = Admission::target_layouts(&facts, &dense, &cfg, embedding_rank)?;
                 let vocabulary = VocabularyPlan::new(&facts.records, &selection, world, 0, cfg.hidden, cfg.vocab_size)?;

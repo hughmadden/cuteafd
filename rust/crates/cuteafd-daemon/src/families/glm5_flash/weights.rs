@@ -142,7 +142,7 @@ impl GlmfWeights<'_> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::Lifetime;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices,
-            "glm5_flash.target", Lifetime::TARGET, Category::Weights, "target weights");
+            "glm5_flash.target", Lifetime::RESIDENT, Category::Weights, "target weights");
         self.norm.inventory(&mut inventory, "norm")?;
         self.head.inventory(&mut inventory)?;
         for (rank, layers) in std::iter::once(self.layers.as_slice()).chain(peers.iter().map(Vec::as_slice)).enumerate() {
