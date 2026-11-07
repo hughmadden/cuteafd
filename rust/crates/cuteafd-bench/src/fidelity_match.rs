@@ -23,6 +23,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "Qwen/Qwen3.5-9B", siblings: &["Qwen/Qwen3.5-9B"], revision: dataset::QWEN35_9B_REVISION, config: dataset::QWEN35_9B_CONFIG },
     Publication { root: "Qwen/Qwen3.8-27B", siblings: &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"], revision: dataset::QWEN38_27B_REVISION, config: dataset::QWEN38_27B_CONFIG },
     Publication { root: "moonshotai/Kimi-K3", siblings: &["moonshotai/Kimi-K3"], revision: dataset::KIMI_K3_REVISION, config: dataset::KIMI_K3_CONFIG },
+    Publication { root: "moonshotai/Kimi-K3.1-Pro", siblings: &["moonshotai/Kimi-K3.1-Pro"], revision: dataset::KIMI_K31_REVISION, config: dataset::KIMI_K31_CONFIG },
     Publication { root: "meta-models/Muse-Spark-Open-816B-A42B", siblings: &["meta-models/Muse-Spark-Open-816B-A42B"], revision: dataset::MUSE_SPARK_REVISION, config: dataset::MUSE_SPARK_CONFIG },
     // Official native NVFP4/MXFP8 release; MiniMax publishes no BF16 master.
     Publication { root: "MiniMaxAI/MiniMax-M3.1-Flash", siblings: &["MiniMaxAI/MiniMax-M3.1-Flash"], revision: dataset::MINIMAX_M3_REVISION, config: dataset::MINIMAX_M3_CONFIG },
@@ -47,7 +48,6 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("meta-models/Muse-Spark-Open-816B-A42B", &["meta-models/Muse-Spark-Open-816B-A42B"]),
     ("mistralai/Mistral-Large-4-1T-A52B", &["mistralai/Mistral-Large-4-1T-A52B"]),
     ("MiniMaxAI/MiniMax-M3.1-Flash", &["MiniMaxAI/MiniMax-M3.1-Flash"]),
-    // PUBLICATIONS and immutable dataset constants follow the completed additive upload.
     ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
 ];
 
@@ -346,14 +346,24 @@ mod tests {
     }
 
     #[test]
-    fn kimi_k31_root_is_distinct_and_unpublished_until_immutable_pins_exist() {
+    fn kimi_k31_root_and_quant_resolve_independently_of_kimi_k3() {
         let root = "moonshotai/Kimi-K3.1-Pro";
         assert_eq!(official_root(root), Some(root));
-        assert!(official(root).is_none());
         let tmp = tempfile::tempdir().unwrap();
         add(tmp.path(), root, "base_model: moonshotai/Kimi-K3");
-        assert!(resolve_in(root, None, tmp.path()).is_err());
+        let reference = resolve_in(root, None, tmp.path()).unwrap();
+        assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+            (root, dataset::KIMI_K31_REVISION, dataset::KIMI_K31_CONFIG));
+        assert_eq!(reference.resolved_chain, vec![vec![root.to_string()]]);
+        let quant = add(tmp.path(), "test/kimi-k31-quant", "base_model: moonshotai/Kimi-K3.1-Pro\nbase_model_relation: quantized");
+        let reference = resolve_in("test/kimi-k31-quant", Some(&quant), tmp.path()).unwrap();
+        assert_eq!(reference.reference_match, "base_model");
+        assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+            (root, dataset::KIMI_K31_REVISION, dataset::KIMI_K31_CONFIG));
+        assert_eq!(reference.resolved_chain, vec![vec!["test/kimi-k31-quant".to_string(), root.to_string()]]);
+        assert!(resolve_in("someone/Kimi-K3.1-Pro-EXL3", None, tmp.path()).is_err());
         assert_eq!(official("moonshotai/Kimi-K3").unwrap().config, dataset::KIMI_K3_CONFIG);
+        assert_ne!(dataset::KIMI_K31_CONFIG, dataset::KIMI_K3_CONFIG);
     }
 
     #[test]

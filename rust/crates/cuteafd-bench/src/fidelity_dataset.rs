@@ -45,6 +45,9 @@ pub const V41_1017_MANIFEST_SHA256: &str = "0eb4afedef4561ac86876d6c8285e2e0ab73
 pub const KIMI_K3_REVISION: &str = "a98e1b9d6b622eec1ccc66fd21b5d48ff11d7c01";
 pub const KIMI_K3_CONFIG: &str = "kimi-k3-v2_20261019_own-text-effort-matched-mxfp4-f32";
 pub const KIMI_K3_MANIFEST_SHA256: &str = "815442612c25cd1fb5c3b1eb9dde2deb93e395b7d98bcbbdd5a52c829c9fd5cd";
+pub const KIMI_K31_REVISION: &str = "777591fb926da184844a9d44fa95017cd9128133";
+pub const KIMI_K31_CONFIG: &str = "kimi-k31-v1_20261105_own-text-effort-matched-mxfp4-f32";
+pub const KIMI_K31_MANIFEST_SHA256: &str = "59f2c71b10474fb702308fa8b180bc394ef61bc070270fdb6f147a207f5d8fa1";
 pub const MUSE_SPARK_REVISION: &str = "d18a3b292cc0a279998123f2ddd16999869bb658";
 pub const MUSE_SPARK_CONFIG: &str = "muse-spark-v1_20261031_own-text-bf16";
 pub const MUSE_SPARK_MANIFEST_SHA256: &str = "b9ec12b2e008a87d20f88edfe731252b5298d8f4da31cb34a96e5451a92bc717";
@@ -357,6 +360,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
             (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
             (KIMI_K3_REVISION, KIMI_K3_CONFIG) => Some(KIMI_K3_MANIFEST_SHA256),
+            (KIMI_K31_REVISION, KIMI_K31_CONFIG) => Some(KIMI_K31_MANIFEST_SHA256),
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG) => Some(MUSE_SPARK_MANIFEST_SHA256),
             (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG) => Some(MISTRAL_LARGE4_MANIFEST_SHA256),
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG) => Some(MINIMAX_M3_MANIFEST_SHA256),
@@ -1052,6 +1056,7 @@ mod tests {
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG),
             (QWEN38_27B_REVISION, QWEN38_27B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
             (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG),
+            (KIMI_K31_REVISION, KIMI_K31_CONFIG),
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG),
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
@@ -1134,6 +1139,16 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 12679);
             assert_eq!(balance["prefill"]["generated_positions"], 12080);
+        }
+        if commit == KIMI_K31_REVISION && config == KIMI_K31_CONFIG {
+            assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3.1-Pro");
+            assert_eq!(reference.windows.len(), 72);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "moonshotai/Kimi-K3.1-Pro");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 12493);
+            assert_eq!(balance["prefill"]["generated_positions"], 11848);
         }
         if commit == KIMI_K3_REVISION && config == KIMI_K3_CONFIG {
             assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3");
