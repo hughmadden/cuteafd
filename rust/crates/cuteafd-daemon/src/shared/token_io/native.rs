@@ -765,6 +765,55 @@ mod tests {
     }
 
     #[test]
+    fn glm_native_owner_totals_match_admission_with_whole_and_tp2_experts() -> Result<()> {
+        use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::Location};
+        use cuteafd_loader::plan::exlr8::residency::{ExpertSet, MetadataInput};
+        use cuteafd_loader::shared::token_table::native_embedding_owner_bytes;
+        // Mixed K2/K3/K4, including both tight and padded native payloads.
+        for padded in [false, true] {
+            let root = tempfile::tempdir()?;
+            cuteafd_loader::plan::testing::exlr8::fixture(root.path(), padded);
+            let metadata = MetadataInput::open(root.path(), "mixed")?;
+            let records = [record(root.path(), EMBEDDING), record(root.path(), HEAD)];
+            for world in [1, 2] {
+                let plans = (0..world).map(|rank| VocabularyPlan::new(
+                    &records, &selection(false), world, rank, 8, 256)).collect::<Result<Vec<_>>>()?;
+                let admitted = WeightInventory::from_native(&selection(false), 4,
+                    &plans.iter().map(|plan| plan.dense.clone()).collect::<Vec<_>>())?;
+                for rank in 0..world {
+                    let vocabulary = &plans[rank];
+                    let native_embedding = vocabulary.dense.tensors.iter().find(|s| s.tensor == EMBEDDING);
+                    let head_bytes = vocabulary.dense.tensors.iter().filter(|s| s.tensor == HEAD)
+                        .map(|s| row_requests(s).map(|requests| requests.iter().map(|r| r.1).sum::<usize>()))
+                        .collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>();
+                    let embedding_bytes = native_embedding.map(|s| row_requests(s)
+                        .map(|requests| requests.iter().map(|r| r.1).sum::<usize>()))
+                        .transpose()?.map_or(0, native_embedding_owner_bytes);
+                    let admitted_target = admitted.owners.iter().filter(|owner|
+                        owner.allocation.location == Location::coordinator(rank as u8))
+                        .map(|owner| owner.allocation.bytes as usize).sum::<usize>();
+                    // Fresh loader residency and the planner's cached census must agree
+                    // for zero, one and two resident Whole layers (or TP2 halves).
+                    let loaded_layer = metadata.plan(3, world, rank, ExpertSet::Routed)?;
+                    let cost = cuteafd_loader::plan::exlr8::routed_expert_costs(&metadata, &[3])?[0];
+                    let admitted_layer = if world == 1 { cost.whole.resident } else { cost.half[rank].resident } as usize;
+                    for onboard in 0..=2 {
+                        assert_eq!(embedding_bytes + head_bytes + onboard * loaded_layer.resident_bytes,
+                            admitted_target + onboard * admitted_layer,
+                            "padded={padded}, world={world}, rank={rank}, onboard={onboard}");
+                    }
+                    if rank == 0 {
+                        assert_eq!(embedding_bytes + head_bytes - vocabulary.resident_bytes(), 256);
+                        assert_eq!(admitted.owners.iter().filter(|owner|
+                            owner.allocation.id == "glm.weights.embedding").count(), 1);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn flash_vocabulary_selects_only_target_tables_with_native_mtp_present() -> Result<()> {
         const EMBED: &str = "model.language_model.embed_tokens.weight";
         const N: usize = 154880;

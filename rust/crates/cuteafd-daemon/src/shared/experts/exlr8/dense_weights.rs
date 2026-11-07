@@ -578,6 +578,75 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUTEAFD_EXLR8_GLM_SNAPSHOT; headers only, no GPU"]
+    fn published_glm_native_owner_totals_match_whole_and_tp2_admission() -> Result<()> {
+        use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::Location};
+        use cuteafd_loader::plan::exlr8::residency::{ExpertSet, MetadataInput};
+        use cuteafd_loader::shared::token_table::native_embedding_owner_bytes;
+        let root = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_GLM_SNAPSHOT")
+            .context("CUTEAFD_EXLR8_GLM_SNAPSHOT")?);
+        let config = serde_json::from_slice(&std::fs::read(root.join("config.json"))?)?;
+        let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&config)?;
+        let selection = DenseSelection::from_hf(&config)?;
+        let records = DenseRecord::inventory(&root)?.into_iter().filter_map(|record|
+            match selection.role(&record.tensor, cfg.layers) {
+                Ok(cuteafd_loader::plan::exlr8::dense::DenseRole::Excluded) => None,
+                Ok(_) => Some(Ok(record)),
+                Err(error) => Some(Err(error)),
+            }).collect::<Result<Vec<_>>>()?;
+        let metadata = MetadataInput::open(&root, "up1")?;
+        for world in [1, 2] {
+            let plans = (0..world).map(|rank| DensePlan::for_rank(&records, world, rank))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut admitted = WeightInventory::from_native(&selection, cfg.layers, &plans)?;
+            let shared = (0..world).map(|rank| (cfg.first_moe_layer..cfg.layers)
+                .map(|layer| metadata.plan(layer, world, rank, ExpertSet::Shared))
+                .collect::<std::result::Result<Vec<_>, _>>())
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            admitted.extend_shared(&shared)?;
+            for rank in 0..world {
+                let loaded = NativeDenseRecords::new(&root, cfg.layers, world, rank, &BTreeMap::new())?;
+                let mut actual = if rank == 0 { DenseTransform::Identity.allocation_bytes(&loaded.norm)? } else { 0 };
+                for layer in &loaded.layers {
+                    layer_requests(layer, &[], |request| {
+                        actual += request.owners.iter().map(|(_, bytes)| bytes).sum::<usize>();
+                        Ok(())
+                    })?;
+                }
+                for name in selection.vocabulary_names() {
+                    let slice = plans[rank].tensors.iter().find(|slice| slice.tensor == name);
+                    if let Some(slice) = slice {
+                        let bytes = slice.components.iter().map(|c| slice.transform.allocation_bytes(c))
+                            .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().sum::<usize>();
+                        actual += if selection.resident_group(&slice.tensor, cfg.layers)? == "embedding" {
+                            native_embedding_owner_bytes(bytes)
+                        } else { bytes };
+                    }
+                }
+                actual += shared[rank].iter().map(|plan| plan.resident_bytes).sum::<usize>();
+                let expected = admitted.owners.iter().filter(|owner|
+                    owner.allocation.location == Location::coordinator(rank as u8))
+                    .map(|owner| owner.allocation.bytes as usize).sum::<usize>();
+                assert_eq!(actual, expected, "TP{world} rank{rank}");
+                eprintln!("TP{world} rank{rank}: actual={actual}, admitted={expected}; native placeholder={}",
+                    if rank == 0 { native_embedding_owner_bytes(0) } else { 0 });
+                for onboard in 1..=2 {
+                    let layers = cfg.first_moe_layer..cfg.first_moe_layer + onboard;
+                    let loaded_experts = layers.clone().map(|layer| metadata.plan(layer, world, rank, ExpertSet::Routed))
+                        .collect::<std::result::Result<Vec<_>, _>>()?.iter().map(|p| p.resident_bytes).sum::<usize>();
+                    let admitted_experts = cuteafd_loader::plan::exlr8::routed_expert_costs(
+                        &metadata, &layers.collect::<Vec<_>>())?.iter().map(|cost|
+                            if world == 1 { cost.whole.resident } else { cost.half[rank].resident })
+                        .sum::<u64>() as usize;
+                    assert_eq!(actual + loaded_experts, expected + admitted_experts);
+                    eprintln!("TP{world} rank{rank} onboard={onboard}: expert owners={loaded_experts}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires both native EXLR8 checkpoints; headers only, no GPU"]
     fn published_glm_and_flash_shared_loader_matches_admission() {
         for (variable, family) in [("CUTEAFD_EXLR8_GLM_SNAPSHOT", "glm"), ("CUTEAFD_EXLR8_FLASH_SNAPSHOT", "flash")] {

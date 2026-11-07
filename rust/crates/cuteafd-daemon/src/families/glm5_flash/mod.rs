@@ -151,19 +151,6 @@ pub(crate) struct EngineArgs {
     /// Shared prefill span; 0 resolves to waves times per-unit rows.
     #[arg(long, default_value_t = 0)]
     pub prefill_span_rows: usize,
-    /// GPU memory (GiB) an automatic pool leaves free for growth the start-up cannot measure
-    /// (lazily loaded kernels, cuBLAS, allocator rounding), when every other allocation precedes
-    /// the pool (one GPU, Spark experts): the pool takes the rest, less the graph reserve and the
-    /// cache state. The planner's default; 1 suits a 32 GB card.
-    #[arg(long, default_value_t = 2.0)]
-    pub headroom_gib: f64,
-    /// Device memory (MiB) the captured decode graphs may hold on each GPU: past it the least
-    /// recently launched executables are destroyed between steps and recaptured when needed.
-    /// Unset: unbounded. The KV admission keeps this much free for them on every GPU, and one
-    /// planned before start-up (a head split, local experts, a fixed pool) at least the planner's
-    /// 1.5 GiB graph allowance (unset: the startup set's reserve, else the allowance).
-    #[arg(long)]
-    pub graph_budget_mib: Option<u64>,
     /// Where the KDA speculative replay records live: `own`, their own allocation (321 MB with 64
     /// decode rows), or `shared`, the prefill lanes' scratch, which no decode step reads (782 MB with
     /// the 4,096-row KDA prefill programs). A record lives only from a speculative verify to its
@@ -1062,11 +1049,11 @@ mod draft_cli_tests {
     const SPARKS: [&str; 2] = ["--peers", "127.0.0.1:19441"];
 
     #[test]
-    fn shared_admission_preserves_headroom_and_onboarding_options() {
-        assert_eq!(parse(&[]).headroom_bytes().unwrap(),
-            cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes);
-        assert_eq!(parse(&["--headroom-gib", "1"]).headroom_bytes().unwrap(), 1 << 30);
-        assert!(parse(&["--headroom-gib=-1"]).headroom_bytes().is_err());
+    fn shared_admission_rejects_family_headroom_and_preserves_onboarding_options() {
+        for removed in [&["--headroom-gib", "1"][..], &["--graph-budget-mib", "512"]] {
+            assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
+                .chain(removed.iter().copied())).is_err(), "{removed:?}");
+        }
         for (option, expected) in [("auto", "auto"), ("all", "all"), ("3", "3")] {
             assert_eq!(parse(&["--rtx-expert-layers", option]).rtx_expert_layers.unwrap().to_string(), expected);
         }
@@ -1548,6 +1535,10 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     Ok(())
 }
 
+/// Internal lazy decode-graph allowance per GPU when startup capture is off
+/// (formerly `--graph-budget-mib`'s default). A graph component of the auto reserve.
+const LAZY_GRAPH_ALLOWANCE_BYTES: u64 = 1536 << 20;
+
 impl EngineArgs {
     /// The target head's mode: explicit `--target-head`, else the shared setting (tensor by
     /// default). The FP8 head's own program ignores it.
@@ -1556,15 +1547,9 @@ impl EngineArgs {
     }
 
     /// Whether serving captures every decode graph at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless
-    /// 0): a graph budget (`--graph-budget-mib`) bounds lazily captured graphs instead.
+    /// 0). Off, admission keeps the internal lazy-graph allowance instead.
     pub(crate) fn startup_graphs(&self) -> bool {
-        engine::startup_graphs_enabled() && self.graph_budget_mib.is_none()
-    }
-
-    /// `--headroom-gib` in bytes.
-    pub(crate) fn headroom_bytes(&self) -> Result<u64> {
-        ensure!(self.headroom_gib.is_finite() && self.headroom_gib >= 0.0, "--headroom-gib must be a size in GiB");
-        Ok((self.headroom_gib * (1u64 << 30) as f64) as u64)
+        engine::startup_graphs_enabled()
     }
 
     /// The rows every routed-expert resource holds (the dense NVFP4 package, local FP8 or EXL3
@@ -1985,14 +1970,14 @@ impl Opened {
         let graphs = if args.startup_graphs() {
             admission::startup_graph_bound(&self.cfg, layers, args.max_context, pool,
                 sequences, speculation, devices.len(), args.decode_rows, sms)
-        } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
+        } else { placement::GraphSet::budget(&vec![cuteafd_loader::placement::reserve::gpu_component(LAZY_GRAPH_ALLOWANCE_BYTES); devices.len()]) };
         let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
         let onboard = runtime_onboard(args, self.native, routed, experts.len());
         let inputs = admission::GlmfInputs {
             resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes })).collect(),
-            pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
+            pending_code, headroom_bytes: cuteafd_loader::placement::reserve::gpu("glm5_flash"), spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
@@ -2043,6 +2028,9 @@ impl Opened {
             process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);
         }
         let admitted = admission::admission::prepare(&inputs, sms, true, process)?.admit()?;
+        // Under TP2_DFLASH auto both drafter candidates are admitted; each logs its breakdown.
+        tracing::info!(target: "cuteafd::memory_policy", tp2_dflash = args.tp2_dflash, "GLM Flash admission candidate");
+        cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5_flash");
         tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
             "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
@@ -2347,8 +2335,8 @@ impl Opened {
         let tp2_layers = admitted_expert_layers(&self.cfg, &placement.layers,
             cuteafd_loader::placement::ExpertHome::RtxTp2, args.skip_experts)?;
         let startup_graphs = admitted_graphs.lifetime == cuteafd_loader::placement::Lifetime::Startup;
-        ensure!(tp2_layers.is_empty() || startup_graphs, "GLM Flash TP2 experts require startup graphs; remove \
-            --graph-budget-mib and set CUTEAFD_GLMF_STARTUP_GRAPHS=1 (post-ready captures are not admitted)");
+        ensure!(tp2_layers.is_empty() || startup_graphs, "GLM Flash TP2 experts require startup graphs; \
+            set CUTEAFD_GLMF_STARTUP_GRAPHS=1 (post-ready captures are not admitted)");
         let tp2_devices = || -> Result<[crate::shared::memory::device::Device<'_>; 2]> {
             let peer = peer_stream.context("TP2 placement without peer device")?;
             Ok([crate::shared::memory::device::Device { library: &self.library, id: args.device },
@@ -2699,9 +2687,9 @@ impl Opened {
         let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
             cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        if engine::startup_graphs_enabled() && !startup_graphs {
-            tracing::info!(graph_budget_mib = ?args.graph_budget_mib,
-                "GLM Flash decode graphs captured lazily within the graph budget, not at startup");
+        if !startup_graphs {
+            tracing::info!(allowance_bytes = LAZY_GRAPH_ALLOWANCE_BYTES,
+                "GLM Flash decode graphs captured lazily within the graph allowance, not at startup");
         }
         let max_context = crate::shared::context::pool_context("glm5_flash", args.max_context, automatic_context, pool_tokens, 256)?;
         let step_experts = admitted_step_experts(&self.cfg, &placement, args.skip_experts, self.fp8().is_some())?;
@@ -2756,7 +2744,7 @@ impl Opened {
             engine.attach_context(args.max_context, manifest)?;
         }
         probe("peer-exchanges")?;
-        engine.set_graph_budget(args.graph_budget_mib.map(|mib| mib << 20));
+        engine.set_graph_budget(None);
         engine.full_prefill_logits = args.full_prefill_logits;
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
         // `all`: every group with FP8 weights (BF16 KDA has none to run W8A8 over).

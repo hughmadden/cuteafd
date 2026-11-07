@@ -228,6 +228,10 @@ if [[ -f "$repo_root/scripts/build/assert-build-filesystem.py" && "$host_artifac
 fi
 
 release_load_config "$config"
+# The worker allocation ceiling: SPARK_MEMORY_CAP, else the candidate's
+# historical 100 GiB worker budget.
+spark_budget_bytes=107374182400
+[[ -z "$SPARK_MEMORY_CAP" ]] || spark_budget_bytes="$(release_size_bytes "$SPARK_MEMORY_CAP")"
 case "$SPECULATOR" in
   dspark|off) ;;
   *) release_die "SPECULATOR must be dspark or off for DeepSeek V4.1" ;;
@@ -431,7 +435,9 @@ coordinator_argv() {
     --spark-tp "$spark_tp"
     --spark-ep "$spark_ep"
   )
-  [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
+  local -a memory_args=()
+  release_memory_args memory_args release_memory_variable
+  args+=("${memory_args[@]}")
   [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
   [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
   [[ -z "$KV_POOL_SIZE" ]] || args+=(--kv-pool-size "$KV_POOL_SIZE")
@@ -439,7 +445,6 @@ coordinator_argv() {
     planner_tokens="$POOL_TOKENS"; [[ "$planner_tokens" != auto ]] || planner_tokens=0
     args+=(--pool-tokens "$planner_tokens")
   fi
-  [[ -z "$MEMORY_RESERVATION" ]] || args+=(--memory-reservation "$MEMORY_RESERVATION")
   [[ "$SPECULATOR" != dspark ]] || args+=(--dspark --dspark-draft-limit "$dspark_draft_limit")
   [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)
   [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
@@ -464,7 +469,7 @@ expert_argv() {
     --world "$spark_world"
     --spark-tp "$spark_tp"
     --spark-ep "$spark_ep"
-    --device-budget-bytes "$SPARK_DEVICE_BUDGET_BYTES"
+    --device-budget-bytes "$spark_budget_bytes"
     --listen "0.0.0.0:$expert_port"
   )
   printf '%s\0' "${args[@]}"

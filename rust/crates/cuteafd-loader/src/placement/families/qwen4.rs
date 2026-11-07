@@ -860,7 +860,7 @@ impl<'a> QwenDual<'a> {
             physical_bytes: budget.capacity_bytes, logical_bytes: budget.capacity_bytes,
             baseline: plan_baseline(&budget.baseline, budget.capacity_bytes,
                 &format!("qwen4 dual owner{gpu}"))?,
-            headroom: budget.headroom_bytes })).collect::<Result<Vec<_>, Refusal>>()?;
+            headroom: budget.reserve_bytes })).collect::<Result<Vec<_>, Refusal>>()?;
         budgets.push(self.inputs.host.budget()?);
         Ok(budgets)
     }
@@ -1174,7 +1174,7 @@ mod tests {
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
             owner_manifests: [None; 2],
-            gpus: [GpuBudget { capacity_bytes: 96 * gib, headroom_bytes: 0,
+            gpus: [GpuBudget { capacity_bytes: 96 * gib, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: 96 * gib } }; 2],
             layer_weights: &weights, layer_experts: &experts, layer_extra: &extra,
             fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
@@ -1489,7 +1489,7 @@ mod tests {
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
             owner_manifests: [None; 2],
-            gpus: [GpuBudget { capacity_bytes: 96 * gib, headroom_bytes: 0,
+            gpus: [GpuBudget { capacity_bytes: 96 * gib, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: 96 * gib } }; 2],
             layer_weights: &weights, layer_experts: &experts,
             layer_extra: &extra, fixed: Vec::new(),

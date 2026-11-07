@@ -372,7 +372,7 @@ async fn run() -> Result<()> {
         match Cli::from_arg_matches(&matches) {
             Ok(mut cli) => {
                 cli::resolve_tp2_dflash(&mut cli.command, &matches);
-                (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
+                (cli.command, matches, cli.memory, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
                     cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
                         idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
                             prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
@@ -383,9 +383,6 @@ async fn run() -> Result<()> {
     };
     let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply, initial_weight_budget) =
         parse(Cli::command().get_matches());
-    for replacement in cli::deprecated_budget_flags(std::env::args()) {
-        eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
-    }
     let mut selected_view = None;
     // `serve` and `golden` pick the family and stand for its own command.
     let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget) = match command {
@@ -450,21 +447,23 @@ async fn run() -> Result<()> {
         let bytes = cuteafd_loader::plan::budget_bytes("--coordinator-weight-budget-gib", gib)?;
         shared::memory::budget::set_resident_weight_limit(cuteafd_loader::placement::ResidentWeights(bytes))?;
     }
-    let coordinator_budget_gib = family_budget.or(initial_budget);
+    let memory = family_budget.or(initial_budget);
+    let policy = memory.policy();
+    policy.validate()?;
     if let Commands::Plan(args) = &mut command {
-        args.coordinator_gpu_budget_gib = coordinator_budget_gib;
-    } else if let Some(gib) = coordinator_budget_gib {
+        args.memory = memory;
+    } else if let Some(cap) = policy.gpu_cap {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
             | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
             | Commands::ServeDsv4(_) | Commands::V41Golden(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
             | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_) | Commands::MuseGolden(_)),
-            "--coordinator-gpu-budget-gib applies only to coordinator serve/golden and plan commands");
-        let budget = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib)?;
-        cuteafd_ffi::set_coordinator_gpu_budget(budget.0)?;
-        tracing::info!(gib, bytes = budget.0, "installed per-GPU coordinator memory budget; SM count and L2 unchanged");
+            "--gpu-memory-cap applies only to coordinator serve/golden and plan commands");
+        cuteafd_ffi::set_coordinator_gpu_budget(cap)?;
+        tracing::info!(bytes = cap, "installed per-GPU memory cap; SM count and L2 unchanged");
     }
+    policy.install().map_err(anyhow::Error::msg)?;
     // A serve command's resolved options, for the server's benchmark reports.
-    commands::bench::capture(&matches, coordinator_budget_gib)?;
+    commands::bench::capture(&matches, memory)?;
     // Memory ledger reports for the long-running roles (device use by category).
     match &command {
         Commands::Expertd(_) => {

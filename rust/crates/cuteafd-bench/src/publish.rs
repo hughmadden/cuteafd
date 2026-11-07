@@ -1348,6 +1348,14 @@ mod tests {
         assert!(crate::render::card::card_svg(&p.report).contains("simulated 5090"));
         p.report.server.configuration.settings.last_mut().unwrap().value = Some("NaN".into());
         assert_eq!(coordinator_budget(&p.report), None);
+        // Current servers record the memory policy's cap in bytes; it wins over
+        // the name published reports from before the policy carry.
+        p.report.server.configuration.settings.push(crate::report::Setting {
+            name: "gpu-memory-cap".into(), value: Some((32u64 << 30).to_string()),
+            default: None, source: "cli".into(),
+        });
+        assert_eq!(coordinator_budget(&p.report), Some(32.0));
+        assert!(p.report.server.hardware_line().contains("capped at 32 GiB"), "{}", p.report.server.hardware_line());
     }
 
     #[test]

@@ -189,7 +189,7 @@ mod tests {
                 device: rank as u32,
                 pool_unit_bytes: storage.persistent_unit_bytes + storage.pool_metadata_unit_bytes + 256,
                 reservations: vec![MemoryReservation { name: format!("state.rank{rank}"),
-                    bytes: 64 << 20 }],
+                    bytes: 64 << 20 }], reserve_bytes: 0,
             }).collect(),
         };
         let _ = context;
@@ -198,7 +198,7 @@ mod tests {
 
     fn phase_profiles(profile: &CapacityProfile) -> crate::families::mimo_v2::capacity::MimoCapacityProfiles {
         crate::families::mimo_v2::capacity::MimoCapacityProfiles { resident_weights: vec![ResidentWeights(0); profile.devices.len()],
-            loading: profile.devices.iter().map(|costs| DeviceCosts { device: costs.device, reservations: vec![], pool_unit_bytes: 0 }).collect(),
+            loading: profile.devices.iter().map(|costs| DeviceCosts { device: costs.device, reservations: vec![], pool_unit_bytes: 0, reserve_bytes: 0 }).collect(),
             post_target_kv: profile.devices.clone(), steady: profile.clone() }
     }
 

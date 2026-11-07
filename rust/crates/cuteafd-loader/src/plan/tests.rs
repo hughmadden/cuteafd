@@ -3058,29 +3058,27 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             assert_eq!(runtime[0].pool_unit_device_bytes, (2 * crate::serving_capacity::V4_PACKED_MEMBERS as u64 + 64) * 4);
             assert_eq!(records.bytes, (cache.ranks[0].persistent_unit_bytes
                 + cache.ranks[0].pool_metadata_unit_bytes + runtime[0].pool_unit_device_bytes) * (32768 / 256));
-            let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
-            // Default headroom is independent of the separately charged workspaces and code.
-            let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;
-            assert_eq!(total - device.capacity_bytes, crate::serving_capacity::deepseek_v4_headroom_bytes(
-                total, 10 << 30, steps.bytes + code, graph));
+            // The named reserve is the V4 family constant (0), independent of
+            // the separately charged workspaces, code and graphs.
+            assert_eq!(total - device.capacity_bytes, crate::placement::reserve::gpu("deepseek_v4"));
         }
     }
 }
 
 #[test]
-fn v4_missing_workspace_manifest_keeps_conservative_small_card_reserve() {
+fn v4_missing_workspace_manifest_keeps_only_the_named_reserve() {
     use cuteafd_core::serving_capacity::GpuMemoryBudget;
     let dir = v4_snapshot();
     let total = GpuMemoryBudget::from_gib(31.8).unwrap().0;
-    let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+    let solve = || plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         rtx_bytes: vec![total], workspace_manifest: Some(dir.path().join("absent.json")),
         ..Default::default()
-    }), ..sparks(2) }).unwrap();
-    let device = report.memory_layout.unwrap().devices.remove(0);
-    let workspace = device.items.iter().find(|i| i.group == "steps").unwrap().bytes;
-    let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
-    assert_eq!(total - device.capacity_bytes,
-        (10u64 << 30).saturating_sub(workspace + graph).max(3 << 30));
+    }), ..sparks(2) }).unwrap().memory_layout.unwrap().devices.remove(0);
+    // No small-card floor or 3 GiB minimum: the default reserve is the family constant.
+    assert_eq!(total - solve().capacity_bytes, crate::placement::reserve::gpu("deepseek_v4"));
+    let reserved = cuteafd_core::memory_policy::MemoryPolicy { family_reserve: Some(3 << 30), ..Default::default() }
+        .scoped(solve);
+    assert_eq!(total - reserved.capacity_bytes, 3 << 30);
 }
 
 #[test]
@@ -3382,9 +3380,10 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     // Per-slot native scratch supports every admitted wave count and unit width.
     for (lanes, rows, headroom) in [(2u64, 4096u64, 2u64 << 30), (3, 2752, 1 << 30), (4, 2048, 1 << 30)] {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30], prefill_lanes: lanes,
-            prefill_rows: rows, headroom_bytes: headroom, context_tokens: 131_072, workspace_manifest: Some(path.clone()),
+            prefill_rows: rows, context_tokens: 131_072, workspace_manifest: Some(path.clone()),
             ..Default::default() }), ..sparks(4) };
-        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        let memory = cuteafd_core::memory_policy::MemoryPolicy { family_reserve: Some(headroom), ..Default::default() }
+            .scoped(|| plan(dir.path(), &options)).unwrap().memory_layout.unwrap();
         let gpu = &memory.devices[0];
         assert_eq!(gpu.capacity_bytes, (32 << 30) - headroom);
         // What the engine allocates from the same arithmetic and manifest.
@@ -3454,13 +3453,6 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let refused = plan(dir.path(), &options(4, 4096)).unwrap();
     assert!(!refused.placement_supported);
     assert!(refused.hints.iter().any(|hint| hint.what.contains("live-slot reserve")));
-    // A graph budget replaces the graph allowance, as the engine's admission reserves it.
-    let mut budgeted = options(2, 4096);
-    budgeted.layout.as_mut().unwrap().graph_budget_bytes = Some(512 << 20);
-    let gpu = plan(dir.path(), &budgeted).unwrap().memory_layout.unwrap().devices.remove(0);
-    let graphs: Vec<_> = gpu.items.iter().filter(|i| i.group.starts_with("graph")).map(|i| (i.group.as_str(), i.bytes))
-        .collect();
-    assert_eq!(graphs, [("graph growth", 512 << 20)]);
 }
 
 #[test]
@@ -3528,7 +3520,6 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             prefill_rows: 4096, prefill_lanes: lanes, state_slots: Some(8), prefix_slots: Some(8),
             glmf_drafter_disabled: true, glmf_prefill_expanded: false,
             glmf_representation: resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false },
-            graph_budget_bytes: Some(64 << 20),
             workspace_manifest: Some(path.clone()), ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
         let report = plan(dir.path(), &options).unwrap();
@@ -3539,7 +3530,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
-                loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: opts.headroom_bytes,
+                loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: crate::placement::reserve::gpu("glm5_flash"),
             spark_ranks: peers, prefill_lanes: lanes, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262144, sequences: 8, speculation: false, state_slots: 8, mark_slots: 8,
             pool_marks: false, index: opts.glmf_index, kda_state_bytes: 4, shared_replay: false,
@@ -3548,7 +3539,9 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             workspace: glmf::step_workspace_demands(&cfg, lanes as usize, 4096, 64, shape, decode, prefill),
             local_workspace: glmf::step_workspace_demands(&cfg, lanes as usize, 4096, 64,
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
-            graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
+            // The plan's own startup graph bound (no graph-budget user key).
+            graphs: glmf::startup_graph_bound(&cfg, cfg.layers, 262144, 2 << 20, 8, false, 2, 64, 188),
+            experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
             drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
@@ -4074,35 +4067,6 @@ fn glmf_tp2_auto_manual_budget_and_spark_range_keep_whole_single_gpu() {
         .all(|blocker| !blocker.contains("TP2 DFlash requires"))), "{single:?}");
 }
 
-/// A GLM 5.3 Flash graph budget is kept as the engine's KV admission keeps it: the budget itself on one
-/// GPU with Spark experts and an automatic pool (measured), else the budget or the graph allowance,
-/// whichever is larger, on every GPU (a head split, a fixed pool, local experts: planned).
-#[test]
-fn glm5_flash_layout_keeps_the_graph_budget_as_the_admission_does() {
-    use cuteafd_core::memory_layout::DeviceKind;
-    let dir = snapshot(glm5_flash_config(2), &glm5_flash_tensors(&glm5_flash_config(2)));
-    // Each coordinator GPU's graph item for `gpus` GPUs, a pool (None: automatic), `ranks` Sparks (0:
-    // local experts) and a budget of `mib` MiB.
-    let graphs = |gpus: usize, pool: Option<u64>, ranks: usize, mib: u64| -> Vec<(String, u64)> {
-        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![96 << 30; gpus],
-            pool_tokens: pool, graph_budget_bytes: Some(mib << 20), ..Default::default() }),
-            attention_placement: Some(AttentionPlacement::Heads), ..sparks(ranks) };
-        let memory = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-        memory.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| d.items.iter()
-            .filter(|i| i.group.starts_with("graph")).map(|i| (i.group.clone(), i.bytes))).collect()
-    };
-    let budget = |mib: u64| ("graph growth".to_string(), mib << 20);
-    // Measured: the budget itself, below the allowance or above it.
-    assert_eq!(graphs(1, None, 4, 512), [budget(512)]);
-    assert_eq!(graphs(1, None, 4, 4096), [budget(4096)]);
-    // Planned: a fixed pool, local experts, a head split (both GPUs).
-    for (gpus, pool, ranks) in [(1, Some(131_072), 4), (2, None, 4), (2, Some(131_072), 4)] {
-        assert_eq!(graphs(gpus, pool, ranks, 512), vec![budget(512); gpus], "{gpus} {pool:?} {ranks}");
-        assert_eq!(graphs(gpus, pool, ranks, 1536), vec![budget(1536); gpus], "{gpus} {pool:?} {ranks}");
-        assert_eq!(graphs(gpus, pool, ranks, 4096), vec![budget(4096); gpus], "{gpus} {pool:?} {ranks}");
-    }
-}
-
 #[test]
 fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_override() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
@@ -4338,8 +4302,8 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     options.layout.as_mut().unwrap().rtx_bytes[0] =
         probe.devices[0].used_bytes()
             - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
-            + bytes + options.layout.as_ref().unwrap().headroom_bytes
-                .max(cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
+            + bytes + crate::placement::families::mimo_v2::admission::device_headroom(0,
+                crate::families::mimo_v2::admission::spark_intake_probe_bytes(true, None).unwrap());
     let gpu_report = plan(dir.path(), &options).unwrap();
     assert!(!gpu_report.fits, "the GPU plan cannot reach the context floor");
     assert_eq!(gpu_report.memory_layout.as_ref().unwrap().devices[1].by_category()
@@ -4375,8 +4339,10 @@ fn mimo_small_card_auto_embedding_and_full_context() {
     }), ..sparks(4) };
     let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
     assert!(!base.devices[0].by_category().contains_key(&Category::Embedding));
-    assert_eq!(base.devices[0].capacity_bytes,
-        (32u64 << 30) - cuteafd_core::serving_capacity::SMALL_CARD_HEADROOM_BYTES);
+    // No small-card floor: the cap less the named reserve (0 by default).
+    // Rank 0 keeps the drained Spark intake probe free (the named reserve is 0).
+    assert_eq!(base.devices[0].capacity_bytes, (32u64 << 30) - crate::placement::families::mimo_v2::admission::device_headroom(0,
+        crate::families::mimo_v2::admission::spark_intake_probe_bytes(true, None).unwrap()));
     assert!(base.pool_tokens >= 1_048_576, "{}", base.render());
     assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;
@@ -5368,7 +5334,7 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
     let required: u64 = gpu.items.iter().map(|item| item.bytes).sum();
     let mut constrained = options.clone();
     let layout = constrained.layout.as_mut().unwrap();
-    layout.rtx_bytes = vec![required + layout.headroom_bytes + (256 << 20)];
+    layout.rtx_bytes = vec![required + crate::placement::reserve::gpu("glm5_flash") + (256 << 20)];
     layout.pool_tokens = None;
     let off = plan(dir.path(), &constrained).unwrap();
     assert!(off.fits, "{}", render(&off));
@@ -5508,7 +5474,8 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
     // turns vision off with the solver's reason instead of shrinking the pool.
     let base = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..options.clone() }).unwrap();
     let used = base.memory_layout.as_ref().unwrap().devices[0].used_bytes();
-    let tight = layout::LayoutOptions { rtx_bytes: vec![used + (4 << 30)], ..options.layout.clone().unwrap() };
+    // 1 GiB of slack: below the 1.35 GB tower (no family reserve hides it now).
+    let tight = layout::LayoutOptions { rtx_bytes: vec![used + (1 << 30)], ..options.layout.clone().unwrap() };
     let crowded = plan(dir.path(), &PlanOptions { layout: Some(tight), ..options.clone() }).unwrap();
     let declined = crowded.encoder.as_ref().unwrap();
     assert_eq!(declined.kind, EncoderKind::Off, "{}", render(&crowded));

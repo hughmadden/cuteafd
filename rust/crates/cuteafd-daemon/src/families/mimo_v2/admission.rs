@@ -233,10 +233,7 @@ fn preflight_shape(
     prefix_draft: bool,
     automatic_context: bool,
 ) -> Result<Preflight> {
-    use cuteafd_core::serving_capacity::{
-        CapacityPolicy, DeviceMemory,
-        small_card_headroom_bytes,
-    };
+    use cuteafd_core::serving_capacity::{CapacityPolicy, DeviceMemory};
     use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
     use cuteafd_loader::families::mimo_v2::capacity::{
         mimo_capacity_profiles, MimoCapacityOptions, MimoRankRuntime,
@@ -334,14 +331,11 @@ fn preflight_shape(
             && layers == cfg.layers
             && (routed_layers == 0 || backend != ExpertBackend::None),
     )?;
-    let graph_exec_bytes = tensor_bytes(
-        "MiMo decode graph executable bound",
-        &[args.decode_graph_reserve_kib, 1024],
-    )?;
-    let graph_driver_margin = tensor_bytes(
-        "MiMo decode graph driver margin",
-        &[args.decode_graph_driver_reserve_mib, 1 << 20],
-    )?;
+    // Internal graph components of the auto reserve (calibrated per-executable
+    // storage; the provisional driver margin is zero under GPU_RESERVE).
+    let graph_exec_bytes = cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES;
+    let graph_driver_margin = cuteafd_loader::placement::reserve::gpu_component(
+        cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES);
     let graph_reservations = (0..ranks)
         .map(|rank| graph_plan.reservations(rank, graph_exec_bytes, graph_driver_margin))
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -511,7 +505,6 @@ fn preflight_shape(
         spark_profiles.steady.pool_unit_rows, spark_ranks == 0);
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
-        small_card_headroom: true,
         target_pool_tokens: maximum_pool_tokens,
         max_context_tokens: Some(args.max_context as u64),
         pool_tokens: Some(maximum_pool_tokens),
@@ -520,11 +513,6 @@ fn preflight_shape(
     let report = reservation_report(&spark_profiles.steady, &memory, policy)?;
     let intake_probe_bytes = cuteafd_loader::families::mimo_v2::admission::spark_intake_probe_bytes(
         spark_ranks > 0, std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref())?;
-    for sample in &memory {
-        debug_assert_eq!(cuteafd_loader::families::mimo_v2::admission::headroom_bytes(sample.total_bytes, false),
-            sample.total_bytes - cuteafd_core::serving_capacity::admission_ceiling(sample.total_bytes, 97,
-                small_card_headroom_bytes(sample.total_bytes))?);
-    }
     let prefill = PrefillShape {
         rows: args.prefill_rows.max(64) as u64,
         waves: transport_lanes as u64,
@@ -540,13 +528,12 @@ fn preflight_shape(
     let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
     let budgets = contract::production_budgets(
         &memory.iter().map(|sample| (sample.total_bytes, sample.total_bytes)).collect::<Vec<_>>(),
-        &(0..memory.len()).map(|rank| contract::device_headroom(
-            memory[rank].total_bytes, rank, intake_probe_bytes, 0)).collect::<Vec<_>>(),
+        &(0..memory.len()).map(|rank| contract::device_headroom(rank, intake_probe_bytes)).collect::<Vec<_>>(),
         memory.iter().map(|sample| Baseline::Sampled {
             free: sample.baseline_free_bytes, phase: Phase::Load,
             source: "measured post-module free memory".into() }).collect(),
         cuteafd_loader::formats::mapped_preload::host_memory_before_process()?,
-        cuteafd_loader::plan::layout::DEFAULT_SPARK_DEVICE_BYTES, spark_ranks)?;
+        cuteafd_loader::placement::reserve::spark_cap(), spark_ranks)?;
     let request = contract::production_request(
         args.max_context as u64, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         args.onboard.resolve(routed_layers), prefill, operation,
@@ -578,6 +565,7 @@ fn preflight_shape(
     let intake_probe_bytes = if working.spark_ranks > 0 { intake_probe_bytes } else { 0 };
     tracing::info!(phases = %serde_json::to_string(&admitted.solved.phases)?,
         "MiMo admitted phase ledger before allocations");
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "mimo_v2");
     tracing::info!(placement = %placement.summary(), "MiMo shared admission solve");
     let pool_tokens = capacity.allocated_gpu_kv_tokens;
     let shortfall_tokens = (args.max_context as u64).saturating_sub(pool_tokens);
@@ -632,12 +620,9 @@ fn reservation_report(
             .total_bytes
             .checked_sub(sample.baseline_free_bytes)
             .context("invalid physical GPU memory sample")?;
-        let minimum_free = if policy.small_card_headroom {
-            cuteafd_core::serving_capacity::small_card_headroom_bytes(sample.total_bytes)
-        } else { 0 };
-        let budget = cuteafd_core::serving_capacity::admission_ceiling(
-            sample.total_bytes, policy.gpu_occupancy_percent, minimum_free)?
-            .saturating_sub(non_engine);
+        let minimum_free = cuteafd_loader::placement::families::mimo_v2::admission::device_headroom(
+            usize::try_from(costs.device).unwrap_or(usize::MAX), 0);
+        let budget = sample.total_bytes.saturating_sub(minimum_free).saturating_sub(non_engine);
         let mut fixed = std::collections::BTreeMap::<&str, u64>::new();
         for cost in &costs.reservations {
             let category = cost
@@ -933,7 +918,7 @@ mod tests {
         let profile = CapacityProfile {
             context: ContextLimits { checkpoint_max_tokens: 1048576, compiled_index_max_tokens: None },
             pool_unit_rows: 64,
-            devices: vec![DeviceCosts { device: 0, pool_unit_bytes: 64, reservations: vec![] }],
+            devices: vec![DeviceCosts { device: 0, pool_unit_bytes: 64, reservations: vec![], reserve_bytes: 0 }],
             host_prefix_bytes: 0,
         };
         let policy = CapacityPolicy { pool_tokens: Some(962560), ..CapacityPolicy::default() };
@@ -969,6 +954,7 @@ mod tests {
             devices: vec![DeviceCosts {
                 device: 1,
                 pool_unit_bytes: 3200,
+                reserve_bytes: 0,
                 reservations: [
                     ("model.layers.0.values", 1000),
                     ("draft.weights", 1000),
@@ -991,17 +977,18 @@ mod tests {
         }];
         let policy = CapacityPolicy {
             max_context_tokens: Some(32),
-            pool_tokens: Some(63),
+            pool_tokens: Some(127),
             ..CapacityPolicy::default()
         };
         let report: serde_json::Value =
             serde_json::from_str(&reservation_report(&profile, &memory, policy).unwrap()).unwrap();
-        assert_eq!(report["requested_pool_tokens"], 64);
+        assert_eq!(report["requested_pool_tokens"], 128);
         let device = &report["devices"][0];
-        assert_eq!(device["engine_budget_bytes"], 8700);
+        // Total less sampled occupancy (1000) and the named reserve (0): no 97% ceiling.
+        assert_eq!(device["engine_budget_bytes"], 9000);
         assert_eq!(device["fixed_bytes"], 5524);
-        assert_eq!(device["requested_pool_bytes"], 3200);
-        assert_eq!(device["complete_requested_bytes"], 8724);
+        assert_eq!(device["requested_pool_bytes"], 6400);
+        assert_eq!(device["complete_requested_bytes"], 11924);
         assert_eq!(device["fixed_categories"]["draft"], 1000);
         assert_eq!(device["fixed_categories"]["prefill"], 2000);
         assert!(

@@ -104,7 +104,8 @@ impl EmbedSource {
 
     pub(crate) fn placeholder_request(id: &str, rank: u8)
         -> Result<cuteafd_loader::placement::planner::Allocation> {
-        Self::request(id, cuteafd_loader::placement::planner::EmbeddingHome::Device(rank), 256)
+        Self::request(id, cuteafd_loader::placement::planner::EmbeddingHome::Device(rank),
+            cuteafd_loader::shared::token_table::native_embedding_owner_bytes(0))
     }
 
     fn request(id: &str, home: cuteafd_loader::placement::planner::EmbeddingHome, bytes: usize)
@@ -260,6 +261,13 @@ impl<'a> TokenEmbedding<'a> {
     pub(crate) fn device_bytes(&self) -> usize {
         self.row_fp8.as_ref().map_or_else(|| self.table.device_bytes(),
             |owner| owner.embedding.residency().bytes)
+    }
+
+    /// All owned device allocations, including the native table placeholder.
+    pub(crate) fn device_owner_bytes(&self) -> usize {
+        self.row_fp8.as_ref().map_or_else(|| self.table.device_bytes(),
+            |owner| cuteafd_loader::shared::token_table::native_embedding_owner_bytes(
+                owner.embedding.residency().bytes))
     }
 
     pub(crate) fn validate_residency(&self, device: i32, bytes: u64) -> Result<()> {

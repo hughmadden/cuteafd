@@ -163,7 +163,7 @@ pub const ARCH_CONTEXTS: &[ArchContext] = &[
 ];
 
 /// The coordinator GPU budget `cuteafd plan` lays out without a device or a
-/// `--coordinator-gpu-budget-gib`: the RTX PRO 6000's CUDA-reported total
+/// `--gpu-memory-cap`: the RTX PRO 6000's CUDA-reported total
 /// (94.97 GiB; the card's nominal 95.5 GiB is not what CUDA hands out).
 pub const PRO_TOTAL_BYTES: u64 = 101_973_491_712;
 
@@ -176,7 +176,7 @@ impl ArchContext {
     }
 
     /// The planner's coordinator class: SM120, sized by its card budget. A
-    /// simulated small card (`--coordinator-gpu-budget-gib` on a PRO) keeps the
+    /// simulated small card (`--gpu-memory-cap` on a PRO) keeps the
     /// PRO's SM count: the simulation caps memory only.
     pub fn coordinator(total_bytes: u64, simulated_on: Option<&'static ArchContext>) -> ArchContext {
         let class = *Self::for_device("sm_120", total_bytes);

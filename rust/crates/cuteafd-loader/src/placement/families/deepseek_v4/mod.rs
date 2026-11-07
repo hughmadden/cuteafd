@@ -15,7 +15,7 @@ use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::placement::*;
 use crate::placement::inventory::GraphSet;
 use crate::serving_capacity::{deepseek_v4_cache_geometry, deepseek_v4_expert_cost, deepseek_v4_expert_exchange_bytes,
-    deepseek_v4_headroom_bytes, deepseek_v4_layer_unit_bytes, deepseek_v4_peer_exchange_bytes, V4ExpertCost,
+    deepseek_v4_layer_unit_bytes, deepseek_v4_peer_exchange_bytes, V4ExpertCost,
     V4WorkspaceRank};
 use cuteafd_core::memory_layout::{Basis, Category};
 
@@ -31,8 +31,6 @@ pub const WORKSPACE_BYTES: [u64; 3] = [gib(480), gib(414), gib(355)];
 /// The largest pool a fixed onboard fills: V4's compressed slots are i32
 /// indices of `tokens / 4` C4 groups, so 2^31 tokens stays well inside them.
 pub const POOL_CEILING_TOKENS: u64 = 1 << 31;
-/// Default `--reserve-gib`.
-pub const RESERVE_BYTES: u64 = 10 << 30;
 
 const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 
@@ -50,19 +48,15 @@ pub struct V4Inputs {
     pub weights: crate::families::deepseek_v4::resident::WeightInventory,
     /// dSpark stages that hold caches (all the checkpoint's stages).
     pub cache_stages: usize,
-    /// Per-GPU total bytes and baseline; one or two entries. Exact workspaces
-    /// use a fixed headroom floor unless the caller requests a larger envelope.
+    /// Per-GPU cap and baseline; one or two entries. Each keeps the memory
+    /// policy's named reserve (`placement::reserve::gpu("deepseek_v4")`) free.
     pub gpus: Vec<(u64, Baseline)>,
-    /// Lower bound for that reserve (`plan --headroom-gib`).
-    pub headroom_floor: u64,
     pub spark_ranks: usize,
     pub sequences: u64,
     pub prefill_rows: u64,
     pub prefill_waves: u64,
     pub decode_rows: u64,
     pub max_context: u64,
-    /// `--reserve-gib` in bytes; values above the default retain a total envelope.
-    pub reserve_bytes: u64,
     /// Prefix mark slots (`MarkArena::slots_for`), 0 without a prefix cache.
     pub mark_slots: u64,
     /// Exact per-rank step workspaces from the program manifest, or `None`
@@ -232,13 +226,7 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>, Vec<u6
         let probe = if rank == 0 && !inputs.draft.is_empty() { draft_probe_bytes(&inputs.cfg, inputs.decode_rows)? } else { 0 };
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
             .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake + probe;
-        let headroom = if inputs.workspace.is_some() {
-            deepseek_v4_headroom_bytes(inputs.gpus[rank].0, inputs.reserve_bytes,
-                workspace + exchange + inputs.code_bytes.get(rank).copied().unwrap_or(0), GRAPH_BYTES[role])
-        } else {
-            inputs.reserve_bytes.saturating_sub(workspace + exchange + GRAPH_BYTES[role]).max(3 << 30)
-        }.max(inputs.headroom_floor);
-        reserves.push(headroom);
+        reserves.push(crate::placement::reserve::gpu("deepseek_v4"));
         let basis = if inputs.workspace.is_some() { Basis::Formula } else { Basis::Estimated };
         demands.push(Demand::new(gpu, Category::Kv, "state", state, Basis::Formula));
         demands.push(Demand::new(gpu, Category::Kv, "RoPE context tables", context, Basis::Formula));
@@ -324,9 +312,9 @@ mod default_tests {
                     cfg: cfg.clone(), weights: crate::families::deepseek_v4::resident::WeightInventory {
                         c4_attention: Vec::new(), fixed: Vec::new(), startup: Default::default() },
                     cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned {
-                        context_bytes: 0, loaded_bytes: 0 }); gpus], headroom_floor: 0,
+                        context_bytes: 0, loaded_bytes: 0 }); gpus],
                     spark_ranks: 6, sequences: 16, prefill_rows: 2752, prefill_waves: 3,
-                    decode_rows: 64, max_context: 262144, reserve_bytes: 3 << 30, mark_slots: 0,
+                    decode_rows: 64, max_context: 262144, mark_slots: 0,
                     workspace: None, experts: Vec::new(), draft: Vec::new(), draft_half: Vec::new(), experts_half: Vec::new(),
                     tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
                     first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
@@ -397,8 +385,8 @@ mod default_tests {
             weights: crate::families::deepseek_v4::resident::WeightInventory {
                 c4_attention: vec![ModeBytes::default(); cfg.n_layers], fixed: Vec::new(), startup: Default::default() },
             cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2],
-            headroom_floor: 0, spark_ranks: 6, sequences: 1, prefill_rows: 4096, prefill_waves: 3,
-            decode_rows: 64, max_context: 262144, reserve_bytes: RESERVE_BYTES, mark_slots: 0,
+            spark_ranks: 6, sequences: 1, prefill_rows: 4096, prefill_waves: 3,
+            decode_rows: 64, max_context: 262144, mark_slots: 0,
             workspace: None, experts: Vec::new(), draft: Vec::new(), draft_half: Vec::new(), experts_half: Vec::new(),
             tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0, first_routed: 0,
             requested_pool: Some(262144), onboard: Onboard::Layers(0), full_prefill_logits: 0,

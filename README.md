@@ -285,11 +285,11 @@ restores the saved originals. Details: [Host tuning](docs/host-tuning.md).
    directory) reports what the checkpoint needs — tensors, formats, shapes,
    and which kernels are missing — before you touch a GPU. Add `--layout
    --rtx 1|2 --pool-tokens 0` for per-device weights, cache admission,
-   workspaces and Spark ranks. `--coordinator-gpu-budget-gib 31.8` sets the
-   logical per-GPU ceiling for plan, serve and golden (plan defaults to 95.5
-   GiB). Plan's separate `--coordinator-weight-budget-gib` caps only weights
-   (default 80 GiB). The old `--rtx-budget-gib`, `--rtx-gib` and
-   `--coordinator-budget-gib` spellings remain deprecated aliases.
+   workspaces and Spark ranks. `--gpu-memory-cap 31.8GiB` sets the total
+   per-GPU ceiling for plan, serve and golden (default: the full device); the
+   reserve and KV target/min/max keys are in [docs/options.md](docs/options.md).
+   Plan's separate `--coordinator-weight-budget-gib` caps only weights
+   (default 80 GiB).
    V4 Flash/Pro workspace formulas use the
    matching image manifest (`--workspace-manifest PROGRAMS.json`). The
    image also supplies EXL3 allocation manifests; when exporting metadata,

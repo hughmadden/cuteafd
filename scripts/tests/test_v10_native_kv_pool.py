@@ -82,11 +82,11 @@ def load_config() -> dict[str, str]:
     """Load the profile through the real release loader (bash only, no hardware)."""
     probe = (
         'repo_root=$PWD; release_load_config "$1"; '
-        'read -r profile_gib default_concurrency <<<"$(release_coordinator_profile 102641958912 "$COORDINATOR_GPU_BUDGET_GIB")"; '
+        'read -r profile_gib default_concurrency <<<"$(release_coordinator_profile 102641958912 "$GPU_MEMORY_CAP")"; '
         '((RELEASE_CONCURRENCY_EXPLICIT)) || CONCURRENCY=$default_concurrency; '
         'printf "%s\\n" "$KV_POOL_SIZE" "$CONCURRENCY" "$PREFIX_CACHE_ENTRIES" '
         '"$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" '
-        '"$RTX_EXPERT_LAYERS" "$MEMORY_RESERVATION" "$SPARK_COUNT" "$SPARK_TP" "$SPARK_EP"'
+        '"$RTX_EXPERT_LAYERS" "$GPU_MEMORY_CAP" "$SPARK_COUNT" "$SPARK_TP" "$SPARK_EP"'
     )
     result = subprocess.run(
         ["bash", "-euc", "source scripts/lib/release-common.sh; " + probe, "test", str(CONFIG)],
@@ -95,7 +95,7 @@ def load_config() -> dict[str, str]:
     assert result.returncode == 0, result.stderr
     keys = ("KV_POOL_SIZE", "CONCURRENCY", "PREFIX_CACHE_ENTRIES", "MAX_CONTEXT_TOKENS",
             "MAX_OUTPUT_TOKENS", "PREFILL_BATCH_TOKENS", "RTX_EXPERT_LAYERS",
-            "MEMORY_RESERVATION", "SPARK_COUNT", "SPARK_TP", "SPARK_EP")
+            "GPU_MEMORY_CAP", "SPARK_COUNT", "SPARK_TP", "SPARK_EP")
     return dict(zip(keys, result.stdout.splitlines()))
 
 
@@ -131,7 +131,7 @@ def planned_groups(selector, values: dict[str, str]) -> int:
 def test_profile_pins_exactly_one_kv_pool_size():
     values = load_config()
     assert values["KV_POOL_SIZE"] == EXPECTED_POOL
-    assert values["MEMORY_RESERVATION"] == ""
+    assert values["GPU_MEMORY_CAP"] == ""
     lines = [line for line in CONFIG.read_text().splitlines()
              if line.startswith("KV_POOL_SIZE=")]
     assert lines == [f"KV_POOL_SIZE={EXPECTED_POOL}"], lines

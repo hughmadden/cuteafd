@@ -92,7 +92,7 @@ impl Opened {
             owner_manifests: manifests.each_ref().map(Some),
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,
             gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: baselines[rank].0,
-                baseline: baselines[rank].1, headroom_bytes: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) }),
+                baseline: baselines[rank].1, reserve_bytes: cuteafd_loader::placement::reserve::gpu("qwen4") }),
             layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,
             layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace, pending_code_bytes: pending,
             max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
@@ -104,6 +104,7 @@ impl Opened {
         })?;
         tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
             "Qwen dual admitted phase ledger");
+        cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
         cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,

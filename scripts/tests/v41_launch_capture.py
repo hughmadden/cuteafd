@@ -170,10 +170,10 @@ if tool == "docker":
                           "wire": "native_ownership" if explicit_topology else "canonical"},
                 artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and explicit_topology and tp != 4 else None},
                 speculator=value("--speculator"),
-                admission={"kv_pool_size": value("--kv-pool-size"), "memory_reservation": value("--memory-reservation")},
+                admission={"kv_pool_size": value("--kv-pool-size"), "memory_policy": {}},
                 peers=value("--deployment-peers", "").split(",")[:int(ranks)],
                 # DeviceLayout.worker_budget_bytes excludes host reserve and the report's weight ceiling.
-                memory_layout=fake_deployment_memory_layout(value("--rtx", "1"), ranks, value("--spark-budget-gib", "108")))
+                memory_layout=fake_deployment_memory_layout(value("--rtx", "1"), ranks, value("--spark-memory-cap")))
         print(json.dumps(response))
         sys.exit(0)
     if args and args[0] == "run" and "--entrypoint" in args and "python3" in args:

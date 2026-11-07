@@ -268,7 +268,7 @@ def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_pat
     config = {"model_type": model_type, "num_hidden_layers": 4, "first_k_dense_replace": 3}
     keys = "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
     if explicit is not None:
-        keys += f"SPARK_DEVICE_BUDGET_BYTES={explicit}\n"
+        keys += f"SPARK_MEMORY_CAP={explicit}\n"
     device_budget = explicit or (108 << 30)
     result = _family_launch_result(tmp_path, config, "test/budget", keys,
                                   encoder_plan={"placement_supported": True, "fits": True,
@@ -278,11 +278,13 @@ def test_spark_budget_default_is_planner_owned_and_explicit_ceiling_wins(tmp_pat
     assert plans
     for plan in plans:
         if explicit is None:
-            assert "--spark-budget-gib" not in plan
+            assert "--spark-memory-cap" not in plan
         else:
-            assert float(plan[plan.index("--spark-budget-gib") + 1]) == explicit / 2**30
-    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+            assert plan[plan.index("--spark-memory-cap") + 1] == str(explicit)
+    workers = [line for line in result.stderr.splitlines() if "expertd-native" in line]
     assert len(workers) == 4
+    # The worker's own reserve components follow the same cap (a global flag).
+    assert all(("--spark-memory-cap" in worker) == (explicit is not None) for worker in workers)
     assert all(f"--device-budget-bytes {device_budget} " in worker for worker in workers)
 
 
@@ -1051,7 +1053,7 @@ exec python3 -c "$code" "$@"
             '#!/usr/bin/env bash\nprintf \'{"object":"list","data":[{"id":"%s"}]}\\n\' '
             '"${STUB_SERVED_MODEL_ID:-deepseek-ai/DeepSeek-V4.1-Flash}"\n')
     deployment_stub = tmp_path / "deployment-stub.py"
-    deployment_stub.write_text("""import json, os, subprocess, sys
+    deployment_stub.write_text("""import json, os, re, subprocess, sys
 args = sys.argv[1:]
 if os.environ.get("STUB_REAL_PLANNER"):
     # The stub runs on the host, so honor the container's bind namespace.
@@ -1101,7 +1103,10 @@ gpus = int(value("--rtx", "1"))
 if family == "glm5_flash":
     report.setdefault("tp2_dflash", gpus == 2 and value("--speculator") == "dflash2"
         and value("--tp2-dflash", "true") == "true")
-spark_capacity = int(float(value("--spark-budget-gib")) * 2**30) if value("--spark-budget-gib") else (
+def size_bytes(text):
+    match = re.fullmatch(r"([0-9]+(?:\\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)?", text)
+    return int(float(match.group(1)) * {None: 1, "B": 1, "MB": 10**6, "GB": 10**9, "MiB": 2**20, "GiB": 2**30}[match.group(2)])
+spark_capacity = size_bytes(value("--spark-memory-cap")) if value("--spark-memory-cap") else (
     report.get("spark_budget_bytes", 108 << 30) if family in {"kimi_k3", "step5"} else 108 << 30)
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4", "mistral_large4"}
@@ -1146,7 +1151,7 @@ deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio
              or config.get("quantization_config", {}).get("quant_method") == "modelopt"
              and any(group.get("weights", {}).get("num_bits") == 4 for group in config["quantization_config"].get("config_groups", {}).values()))
         else "off") if family == "qwen4" and value("--speculator") == "auto" else value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
-    admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
+    admission=dict(kv_pool_size=value("--kv-pool-size"), memory_policy={}),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
     artifact_requirements=dict(spark_tp_role=f"tp{expert_world}" if family == "deepseek_v41" and explicit and expert_world not in (0, 4) else None), report=report,
@@ -1470,7 +1475,7 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     assert len(plans) == 1
     assert plans[0][plans[0].index("--pool-tokens") + 1] == "0"
     assert plans[0][plans[0].index("--attention-placement") + 1] == "auto"
-    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "serve-kimi --snapshot" in line)
     assert "--pool-tokens" not in serve
     assert "CUTEAFD_ATTENTION_PLACEMENT=auto" in serve
     assert ("--split-device" in serve) == (gpus == 2)
@@ -1900,7 +1905,7 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
 @pytest.mark.parametrize("budget,total,embedding", [("", 32768, "host"), ("31.8", 98304, "host"), ("", 98304, "gpu")])
 def test_mimo_full_context_profile_respects_physical_and_logical_memory(tmp_path, budget, total, embedding):
     config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
-    keys = f"COORDINATOR_GPU_BUDGET_GIB={budget}\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    keys = f"GPU_MEMORY_CAP={budget + 'GiB' if budget else ''}\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, gpu_total_mib=total)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
@@ -1917,14 +1922,15 @@ def test_family_prelaunch_plan_uses_coordinator_card_memory(tmp_path, family, bu
         tmp_path, ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
                    if family == "glm5" else {"model_type": "deepseek_v4"}
                    if family == "deepseek_v4" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family]), "test/model",
-        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        f"GPU_MEMORY_CAP={budget + 'GiB' if budget else ''}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
         gpu_total_mib=total, gpu_free_mib=total)
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     args = plan.split()
     expected = float(budget) if budget else total / 1024
-    for flag in ("--coordinator-gpu-budget-gib", "--coordinator-weight-budget-gib"):
-        assert float(args[args.index(flag) + 1]) == expected
+    assert int(args[args.index("--gpu-memory-cap") + 1]) == int(expected * 2**30)
+    assert float(args[args.index("--coordinator-weight-budget-gib") + 1]) == int(expected * 2**30) / 2**30
+    assert args.count("--gpu-memory-cap") == 1
     assert "94.97" not in plan
 
 
@@ -1941,7 +1947,7 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
               if family == "deepseek_v4" else {"model_type": "deepseek_v41"}
               if family == "deepseek_v41" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
     model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
-    keys = (f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS={rtx_gpus}\n"
+    keys = (f"GPU_MEMORY_CAP={budget + 'GiB' if budget else ''}\nRTX_GPUS={rtx_gpus}\n"
             "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
     if family == "deepseek_v41":
         keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
@@ -2776,16 +2782,18 @@ def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact
     ("PREFILL_WAVES=4\nPREFILL_ROWS=2048\n",
      ["--prefill-waves 4", "--prefill-rows 2048", "--prefill-span-rows 8192"], []),
     ("PREFILL_WAVES=1\n", ["--prefill-waves 1", "--prefill-rows 4096", "--prefill-span-rows 4096"], []),
-    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1", "--prefill-waves 3"], []),
-    ("GLM5_FLASH_GRAPH_BUDGET_MIB=512\n", ["--graph-budget-mib 512"], ["--headroom-gib"]),
+    # The shared memory policy replaces GLM Flash's own headroom and graph-budget keys.
+    ("FAMILY_RESERVE=1GiB\n", ["cuteafd --family-reserve 1GiB serve-glmf", "--prefill-waves 3"],
+     ["--headroom-gib", "--graph-budget-mib", "--gpu-reserve"]),
+    ("GPU_RESERVE=2GiB\n", ["cuteafd --gpu-reserve 2GiB serve-glmf"], ["--headroom-gib", "--graph-budget-mib"]),
 ])
-def test_glmf_resolved_units_and_optional_headroom_are_forwarded(tmp_path, keys, expected, absent):
+def test_glmf_resolved_units_and_memory_policy_are_forwarded(tmp_path, keys, expected, absent):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    launch = next(line for line in result.stderr.splitlines() if "serve-glmf --snapshot" in line)
     for option in expected:
         assert option in launch, launch
     argv = shlex.split(launch)
@@ -2806,17 +2814,77 @@ def test_glmf_resolved_units_and_optional_headroom_are_forwarded(tmp_path, keys,
     ("PREFILL_ROWS", "2000", "PREFILL_ROWS must be a multiple of 64"),
     ("PREFILL_ROWS", "8192", "PREFILL_ROWS must be a multiple of 64"),
     ("PREFILL_ROWS", "0", "PREFILL_ROWS must be a multiple of 64"),
-    ("GLM5_FLASH_HEADROOM_GIB", "-1", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
-    ("GLM5_FLASH_HEADROOM_GIB", "1GiB", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
-    ("GLM5_FLASH_GRAPH_BUDGET_MIB", "0", "GLM5_FLASH_GRAPH_BUDGET_MIB must be a positive whole number"),
+    # Deleted outright: no alias and no removed-key diagnostic.
+    ("GLM5_FLASH_HEADROOM_GIB", "1", "unknown configuration key: GLM5_FLASH_HEADROOM_GIB"),
+    ("GLM5_FLASH_GRAPH_BUDGET_MIB", "512", "unknown configuration key: GLM5_FLASH_GRAPH_BUDGET_MIB"),
+    ("FAMILY_RESERVE", "-1", "FAMILY_RESERVE must be a size"),
+    ("FAMILY_RESERVE", "10%", "FAMILY_RESERVE must be a size"),
+    ("GPU_RESERVE", "1TiB", "GPU_RESERVE must be a size"),
 ])
-def test_glmf_invalid_units_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
+def test_glmf_invalid_units_or_memory_keys_fail_before_workers_launch(tmp_path, key, value, message):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf", f"{key}={value}\n")
     assert result.returncode == 2 and message in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+MEMORY_POLICY_KEYS = {
+    "GPU_MEMORY_CAP": ("--gpu-memory-cap", "80GiB"), "SPARK_MEMORY_CAP": ("--spark-memory-cap", "100GiB"),
+    "GPU_RESERVE": ("--gpu-reserve", "3GiB"), "SPARK_RESERVE": ("--spark-reserve", "2.5GiB"),
+    "FAMILY_RESERVE": ("--family-reserve", "512MiB"), "KV_TARGET_TOKENS": ("--kv-target-tokens", "1048576"),
+    "KV_MIN_TOKENS": ("--kv-min-tokens", "131072"), "KV_MAX_TOKENS": ("--kv-max-tokens", "4194304"),
+}
+
+
+@pytest.mark.parametrize("family", ["glm5_flash", "glm5", "mimo_v2", "deepseek_v4", "qwen4"])
+def test_every_memory_policy_key_reaches_the_plan_and_the_serve_argv(tmp_path, family):
+    config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+              if family == "glm5" else {"model_type": "deepseek_v4"}
+              if family == "deepseek_v4" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family])
+    keys = "RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + "".join(
+        f"{key}={value}\n" for key, (_, value) in MEMORY_POLICY_KEYS.items())
+    result = _family_launch_result(tmp_path, config, "test/model", keys)
+    assert result.returncode == 0, result.stderr
+    plan = shlex.split(next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line))
+    serve = shlex.split(next(line for line in result.stderr.splitlines() if " serve-" in line and "--snapshot" in line))
+    serve = serve[serve.index("cuteafd"):]
+    subcommand = next(index for index, token in enumerate(serve) if token.startswith("serve-"))
+    for key, (flag, value) in MEMORY_POLICY_KEYS.items():
+        # Global flags: they precede the serve subcommand.
+        assert serve.count(flag) == 1 and serve.index(flag) < subcommand, (key, serve)
+        assert serve[serve.index(flag) + 1] == value, (key, serve)
+        if key == "GPU_MEMORY_CAP":
+            # The plan takes the resolved cap: the smaller of the card and the key, in bytes
+            # (Qwen4 also subtracts NVML-reported foreign occupancy from it).
+            used = (98304 - 97000) << 20 if family == "qwen4" else 0
+            assert plan.count(flag) == 1 and plan[plan.index(flag) + 1] == str((80 << 30) - used), plan
+        else:
+            assert plan.count(flag) == 1 and plan[plan.index(flag) + 1] == value, (key, plan)
+    workers = [shlex.split(line) for line in result.stderr.splitlines() if "expertd-native" in line]
+    for worker in workers:
+        assert worker[worker.index("--spark-memory-cap") + 1] == "100GiB"
+        assert worker[worker.index("--spark-reserve") + 1] == "2.5GiB"
+        assert "--gpu-memory-cap" not in worker and "--family-reserve" not in worker
+
+
+@pytest.mark.parametrize("key,value", [("GPU_MEMORY_CAP", "90%"), ("SPARK_MEMORY_CAP", "50%"),
+    ("GPU_RESERVE", "2TiB"), ("SPARK_RESERVE", "1.0000001GiB"), ("FAMILY_RESERVE", "1 GiB"),
+    ("KV_TARGET_TOKENS", "2M"), ("KV_MIN_TOKENS", "0"), ("KV_MAX_TOKENS", "-1")])
+def test_memory_policy_keys_reject_percentages_and_invalid_units(tmp_path, key, value):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model", f"{key}={value}\n")
+    assert result.returncode != 0
+    assert f"{key} must be" in result.stderr or "unquoted whitespace" in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
+@pytest.mark.parametrize("key", ["COORDINATOR_GPU_BUDGET_GIB", "MEMORY_RESERVATION", "SPARK_DEVICE_BUDGET_BYTES",
+                                 "GLM5_FLASH_HEADROOM_GIB", "GLM5_FLASH_GRAPH_BUDGET_MIB", "COORDINATOR_GPU_HEADROOM_GIB"])
+def test_replaced_memory_keys_are_unknown(tmp_path, key):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model", f"{key}=1\n")
+    assert result.returncode != 0
+    assert f"unknown configuration key: {key}" in result.stderr
 
 
 GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
@@ -2873,7 +2941,7 @@ def test_kimi_packed_prefill_mode_forwarding(tmp_path, mode):
         extra_args=("--wip", "packed-kimi"),
         encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30})
     assert result.returncode == 0, result.stderr
-    launch = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-kimi" in line)
+    launch = next(shlex.split(line) for line in result.stderr.splitlines() if "serve-kimi --snapshot" in line)
     if mode is None:
         assert "--prefill-packing" not in launch
     else:
@@ -3804,47 +3872,50 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
 @pytest.mark.parametrize("family_config", [*SPLIT_CONFIGS.values(),
     {"model_type": "deepseek_v4"},
     {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}])
-def test_coordinator_gpu_budget_is_forwarded_only_to_the_coordinator(tmp_path, family_config):
+def test_gpu_memory_cap_is_forwarded_only_to_the_coordinator(tmp_path, family_config):
     model = "zai-org/GLM-5.3-Flash" if family_config.get("model_type") == "glm5_next" else "test/model"
     result = _family_launch_result(tmp_path, family_config, model,
-                                  "COORDINATOR_GPU_BUDGET_GIB=32.5\n")
+                                  "GPU_MEMORY_CAP=32.5GiB\n")
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line and " serve-" in line)
-    assert "cuteafd --coordinator-gpu-budget-gib 32.5 serve-" in launch
+    launch = next(line for line in result.stderr.splitlines() if "--gpu-memory-cap" in line and " serve-" in line)
+    assert "cuteafd --gpu-memory-cap 32.5GiB serve-" in launch
     for line in result.stderr.splitlines():
         if "expertd-native" in line:
-            assert "--coordinator-gpu-budget-gib" not in line
+            assert "--gpu-memory-cap" not in line
 
 
-@pytest.mark.parametrize("budget", ["0", "-1", "NaN", "inf", "32GiB", "0.0000000000001", "9999999999999999999999"])
-def test_coordinator_gpu_budget_rejects_invalid_values_before_side_effects(tmp_path, budget):
+@pytest.mark.parametrize("budget", ["0", "-1", "NaN", "inf", "90%", "32TiB", "0.0000001GiB", "32 GiB"])
+def test_gpu_memory_cap_rejects_invalid_values_before_side_effects(tmp_path, budget):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
-                                  f"COORDINATOR_GPU_BUDGET_GIB={budget}\n")
+                                  f"GPU_MEMORY_CAP={budget}\n")
     assert result.returncode != 0
-    assert "COORDINATOR_GPU_BUDGET_GIB must be" in result.stderr
+    assert "GPU_MEMORY_CAP must be" in result.stderr
     assert "docker " not in result.stderr and "ssh " not in result.stderr and "nest " not in result.stderr
 
 
 def test_qwen_backend_preflight_charges_physical_usage_against_the_ceiling(tmp_path):
     result = _family_launch_result(tmp_path,
         {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
-        "COORDINATOR_GPU_BUDGET_GIB=32\n", preferred_ranks=1,
+        "GPU_MEMORY_CAP=32GiB\n", preferred_ranks=1,
         gpu_free_mib=90 * 1024, gpu_total_mib=96 * 1024)
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
-    assert "--coordinator-gpu-budget-gib 26.0" in preflight and "--coordinator-weight-budget-gib 26.0" in preflight
+    assert f"--gpu-memory-cap {26 << 30}" in preflight and "--coordinator-weight-budget-gib 26.0" in preflight
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen4" in line)
-    assert "--coordinator-gpu-budget-gib 32" in launch and "--peers" in launch
+    assert "--gpu-memory-cap 32GiB" in launch and "--peers" in launch
 
 
-def test_budget_key_is_accepted_for_cleanup_and_native_launchers(tmp_path):
+def test_memory_keys_are_accepted_for_cleanup_and_native_launchers(tmp_path):
     config = tmp_path / "budget.config"
-    config.write_text("COORDINATOR_GPU_BUDGET_GIB=32\n")
-    result = subprocess.run(["bash", "-c", 'source "$1"; release_load_config "$2" stop; printf "%s" "$COORDINATOR_GPU_BUDGET_GIB"',
+    config.write_text("GPU_MEMORY_CAP=32GiB\nSPARK_RESERVE=3GiB\nKV_MAX_TOKENS=4194304\n")
+    result = subprocess.run(["bash", "-c", 'source "$1"; release_load_config "$2" stop; '
+        'release_memory_args out release_memory_variable; printf "%s " "${out[@]}"',
         "bash", str(ROOT / "scripts/lib/release-common.sh"), str(config)], capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0 and result.stdout == "32", result.stderr
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["--gpu-memory-cap", "32GiB", "--spark-reserve", "3GiB",
+                                     "--kv-max-tokens", "4194304"]
     for file in ("scripts/launch/run-family.sh", "scripts/launch/run-tp-ep-native-candidate.sh"):
-        assert 'args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")' in (ROOT / file).read_text()
+        assert "release_memory_args" in (ROOT / file).read_text()
 
 
 @pytest.mark.parametrize("keys,expected", [
@@ -4031,16 +4102,16 @@ def test_qwen_unqualified_explicit_mtp_keeps_the_existing_depth(tmp_path: Path, 
     assert "--local-experts" in launch and "--mtp 1" in launch
 
 
-@pytest.mark.parametrize("restart,admitted_gib", [(False, 12000 / 1024), (True, 96000 / 1024)])
+@pytest.mark.parametrize("restart,admitted_mib", [(False, 12000), (True, 96000)])
 def test_qwen_restart_admission_credits_only_its_own_gpu_memory(tmp_path: Path, restart: bool,
-                                                              admitted_gib: float) -> None:
+                                                              admitted_mib: int) -> None:
     result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}},
                                   "test/model", "INSTANCE=own\nSPARK_COUNT=0\n", preferred_ranks=0, restart=restart,
                                   gpu_free_mib=12000, container_pids=(123,),
                                   gpu_allocations=((123, 84000), (456, 2000)))
     assert result.returncode == 0, result.stderr
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
-    assert f"--coordinator-gpu-budget-gib {admitted_gib}" in preflight
+    assert f"--gpu-memory-cap {admitted_mib << 20}" in preflight
 
 
 def test_spark_admission_inherits_release_readiness_bound(tmp_path: Path) -> None:
@@ -4877,7 +4948,7 @@ def test_launcher_plans_against_cuda_total_not_nvml_total(tmp_path, family, budg
         api_port = listener.getsockname()[1]
     result = _family_launch_result(tmp_path, config,
         "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model",
-        f"ADDR=127.0.0.1:{api_port}\nCOORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+        f"ADDR=127.0.0.1:{api_port}\nGPU_MEMORY_CAP={budget + 'GiB' if budget else ''}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
         + ("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
            if family == "deepseek_v41" else ""),
         gpu_total_mib=97887, gpu_free_mib=97887, cuda_total_bytes=total,
@@ -4885,9 +4956,9 @@ def test_launcher_plans_against_cuda_total_not_nvml_total(tmp_path, family, budg
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if " plan " in line and "--deployment" in line)
     args = plan.split()
-    expected = min(total / 2**30, float(budget) if budget else float("inf"))
-    assert float(args[args.index("--coordinator-gpu-budget-gib") + 1]) == expected
-    assert expected < 97887 / 1024
+    expected = min(total, int(float(budget) * 2**30) if budget else total)
+    assert int(args[args.index("--gpu-memory-cap") + 1]) == expected
+    assert expected < 97887 << 20
 
 
 @pytest.mark.parametrize("restart", [False, True])
@@ -4901,7 +4972,7 @@ def test_qwen_external_occupancy_is_nvml_used_subtracted_from_cuda_capacity(tmp_
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line).split()
     used = (97887 - 12000 - (84000 if restart else 0)) * 2**20
-    assert float(plan[plan.index("--coordinator-gpu-budget-gib") + 1]) == (total - used) / 2**30
+    assert int(plan[plan.index("--gpu-memory-cap") + 1]) == total - used
 
 
 def test_namespace_root_and_push_endpoint_reach_both_serving_roles(tmp_path):
@@ -5054,12 +5125,12 @@ def test_dry_run_total_capacity_ignores_foreign_gpu_memory_and_preserves_live_la
     tmp_path: Path, budget: str, expected_gib: float,
 ) -> None:
     config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}
-    keys = f"SPARK_COUNT=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\nCOORDINATOR_GPU_BUDGET_GIB={budget}\n"
+    keys = f"SPARK_COUNT=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\nGPU_MEMORY_CAP={budget + 'GiB' if budget else ''}\n"
     total_mib = 96 * 1024
     busy_free_mib = 12 * 1024
 
     # 1. Opt-in --dry-run --total-capacity succeeds while foreign processes hold 84 GiB,
-    # never queries memory.free, and resolves plan_gib to total capacity or explicit budget.
+    # never queries memory.free, and resolves the plan cap to total capacity or the explicit cap.
     opt_in_dir = tmp_path / f"opt-in-{budget or 'total'}"
     opt_in_smi_log = tmp_path / f"opt-in-{budget or 'total'}-smi.log"
     opt_in = _family_launch_result(
@@ -5073,8 +5144,8 @@ def test_dry_run_total_capacity_ignores_foreign_gpu_memory_and_preserves_live_la
     assert "docker run -d" not in opt_in.stderr
     assert "memory.free" not in opt_in_smi_log.read_text()
     plan_argv = shlex.split(next(line for line in opt_in.stderr.splitlines() if "cuteafd plan" in line))
-    for flag in ("--coordinator-gpu-budget-gib", "--coordinator-weight-budget-gib"):
-        assert float(plan_argv[plan_argv.index(flag) + 1]) == expected_gib
+    assert int(plan_argv[plan_argv.index("--gpu-memory-cap") + 1]) == int(expected_gib * 2**30)
+    assert float(plan_argv[plan_argv.index("--coordinator-weight-budget-gib") + 1]) == expected_gib
 
     # 2. Plain --dry-run without --total-capacity still queries live memory.free and fails
     # when foreign memory leaves less free VRAM than the deployment requires.
@@ -5110,7 +5181,7 @@ def test_dry_run_total_capacity_ignores_foreign_gpu_memory_and_preserves_live_la
     assert live.returncode == 0, live.stderr
     assert "memory.free" in live_smi_log.read_text()
     live_plan = shlex.split(next(line for line in live.stderr.splitlines() if "cuteafd plan" in line))
-    assert float(live_plan[live_plan.index("--coordinator-gpu-budget-gib") + 1]) == expected_gib - 6.0
+    assert int(live_plan[live_plan.index("--gpu-memory-cap") + 1]) == int((expected_gib - 6.0) * 2**30)
 
 
 
