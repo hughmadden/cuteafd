@@ -601,6 +601,7 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     assert len(workers) == 6 and all("--world 6 " in worker for worker in workers)
     plan = _line(result, "cuteafd plan")
     assert _flag(plan, "--speculator") == "off" and "--drafter-snapshot" not in plan.split()
+    assert _flag(serve, "--tp2-dflash") == _flag(plan, "--tp2-dflash") == "false"
     assert "--vision auto --audio auto" in plan
     lines = result.stderr.splitlines()
     probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
@@ -632,7 +633,7 @@ def test_muse_default_drafter_is_pinned_and_off_is_explicit(tmp_path: Path, mode
         assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
 
 
-@pytest.mark.parametrize("selection,expected", [(None, "false"), ("off", "false"), ("on", "true")])
+@pytest.mark.parametrize("selection,expected", [(None, "true"), ("off", "false"), ("on", "true")])
 def test_muse_tp2_dflash_reaches_plan_and_serve(tmp_path: Path, selection, expected) -> None:
     drafter = "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
     revision = "22e2669e4c60689f9bff0749a34d9d8e59ce7cd6"
