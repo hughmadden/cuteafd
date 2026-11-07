@@ -31,6 +31,21 @@ fn full_backing_peak_refuses_before_allocation() -> Result<()> {
 }
 
 #[test]
+fn selected_prefix_retains_earlier_maximum_staging_and_padding() -> Result<()> {
+    let first = layout(0, "fixture", [("first".into(), 257)])?;
+    let union = layout(0, "fixture", [("first".into(), 257), ("last".into(), 257)])?;
+    let budget = 1600;
+    assert!(fits(&first, 1024, 0, budget)?);
+    // A later small staging request fits after the earlier payload, but the
+    // earlier maximum staging must still fit alongside the complete arena.
+    assert!(257 + 257 <= budget);
+    assert!(!fits(&union, 1024, 0, budget)?);
+    assert!(fits(&union, 1024, 31, union.bytes() + 1024 + 31)?);
+    assert!(fits(&union, usize::MAX, 0, usize::MAX).is_err());
+    Ok(())
+}
+
+#[test]
 fn exl3_selected_tp1_tp2_regions_preserve_composite_layers() -> Result<()> {
     use crate::shared::experts::{exl3, layer::ExpertLayer};
     use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};

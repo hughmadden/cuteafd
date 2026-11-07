@@ -49,3 +49,10 @@ pub(crate) fn admit(layout: &WeightArenaLayout, staging: usize, workspace: usize
     Ok(())
 }
 
+
+pub(crate) fn fits(layout: &WeightArenaLayout, staging: usize, workspace: usize,
+    available: usize) -> Result<bool> {
+    let peak = layout.bytes().checked_add(staging).and_then(|n| n.checked_add(workspace))
+        .context("expert arena startup peak overflow")?;
+    Ok(peak <= available)
+}

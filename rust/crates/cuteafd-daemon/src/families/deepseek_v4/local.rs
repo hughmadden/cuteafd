@@ -317,30 +317,33 @@ impl<'a> LocalExperts<'a> {
         tracing::info!(budget, workspace, scratch_bytes, "loading coordinator expert layers");
         let mut selected_backbone = backbone.len();
         let arena = if pushed.is_none() {
-            // Preserve the old fit prefix before admitting its earlier full backing.
-            let mut available = remaining;
+            let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
             let mut selections = Vec::new();
             let mut staging = 0;
             for stage in 0..draft_stages {
                 let layer = ExpertLayer::BackboneFull { layer: shape.layers + stage };
                 let plan = ExpertWeights::plan(library, catalog, layer)?;
-                ensure!(plan.peak_device_bytes()? <= available, "dSpark stage {stage} experts exceed local budget");
-                available -= plan.resident_bytes;
                 staging = staging.max(plan.device_staging_bytes);
                 selections.push(layer);
+                let layout = ExpertWeights::arena_layout(device, catalog, selections.iter().copied())?;
+                crate::shared::experts::weight_layout::admit(&layout, staging, workspace, budget)
+                    .with_context(|| format!("dSpark stage {stage} experts exceed local budget"))?;
             }
             selected_backbone = 0;
             for &layer in backbone {
                 let selection = ExpertLayer::BackboneFull { layer };
                 let plan = ExpertWeights::plan(library, catalog, selection)?;
-                if plan.peak_device_bytes()? > available { break; }
-                available -= plan.resident_bytes;
-                staging = staging.max(plan.device_staging_bytes);
                 selections.push(selection);
+                let candidate_staging = staging.max(plan.device_staging_bytes);
+                let layout = ExpertWeights::arena_layout(device, catalog, selections.iter().copied())?;
+                if !crate::shared::experts::weight_layout::fits(&layout, candidate_staging, workspace, budget)? {
+                    selections.pop();
+                    break;
+                }
+                staging = candidate_staging;
                 selected_backbone += 1;
             }
             if selections.is_empty() { return Ok(None); }
-            let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
             let layout = ExpertWeights::arena_layout(device, catalog, selections.iter().copied())?;
             crate::shared::experts::weight_layout::admit(&layout, staging, workspace, budget)?;
             Some(ExpertWeights::arena(device, catalog, selections)?)
