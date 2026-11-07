@@ -317,6 +317,10 @@ mod tests {
                         LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] };
                 for mode in modes {
                     for layer in 0..cfg.layers {
+                        if ranks == 2 && cfg.attention[layer] == KimiAttention::Kda && mode != LayerMode::HeadSplit {
+                            assert!(LayerLayout::ranks_with_core(&cfg, layer, mode, inventory, ranks).is_err());
+                            continue;
+                        }
                         for mut layout in LayerLayout::ranks_with_core(&cfg, layer, mode, inventory, ranks)? {
                             // Both native storage variants use the same physical partition.
                             for fp8 in [false, true] {
