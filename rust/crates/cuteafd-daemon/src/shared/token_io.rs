@@ -157,6 +157,10 @@ impl<'a> TokenEmbedding<'a> {
         use cuteafd_loader::placement::planner::Lifetime;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
             Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Embedding, "token embedding");
+        if let ResidentWeight::Device(owner) = &self.table {
+            ensure!(owner.backing.as_ref().and_then(|allocation| allocation.weight_backing()).is_none(),
+                "arena-backed embedding requires allocation_receipts, not table_receipt");
+        }
         match &self.table {
             ResidentWeight::Device(owner) => inventory.device(name, owner.buffer)?,
             ResidentWeight::Host { storage, .. } => inventory.pinned(name, storage.buffer)?,
@@ -1322,6 +1326,10 @@ mod tests {
         assert_eq!(receipts.len(), 2);
         assert_eq!(receipts[0].allocation.id, "test/embedding");
         assert_eq!(receipts[1].allocation.view.as_ref().context("embedding view")?.backing, "test/embedding");
+        let error = packed.table_receipt(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?, "embedding", "table")
+            .err().context("singular receipt must reject arena views")?;
+        assert!(error.to_string().contains("allocation_receipts"));
         // Mapped-host embeddings remain immediate and never enter the GPU group.
         let ((host, ()), host_records) = dense::recording(||
             TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Host, || Ok(())))?;
