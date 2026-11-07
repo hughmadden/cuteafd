@@ -817,8 +817,9 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert update.index("self.put(&context.slots") < update.index("ready()?") < update.index("self.linear(")
     draft = shared.split("    fn draft_from(", 1)[1].split("let (s, l)", 1)[0]
     assert "if let AttentionWorkspace::Gqa(attention) = &w.attention" in draft
-    for metadata in ("w.positions", "attention.tables", "w.anchors"):
+    for metadata in ("w.positions", "attention.tables", "head.anchors"):
         assert draft.index(f"self.put(&{metadata}") < draft.index("input(&ids, w.h.buffer")
+    assert "if let Some(head) = &w.head { self.put(&head.anchors" in draft
     transport = remote.split("    pub fn update(", 1)[1].split("    pub fn put_taps(", 1)[0]
     assert "self.synchronize()?" not in transport
     assert "cuda_stream_synchronize" not in transport
@@ -1097,6 +1098,9 @@ report.update(spark_ranks=ranks)
 if family == "mimo_v2":
     report["prefill_lanes"] = 3
 gpus = int(value("--rtx", "1"))
+if family == "glm5_flash":
+    report.setdefault("tp2_dflash", gpus == 2 and value("--speculator") == "dflash2"
+        and value("--tp2-dflash", "true") == "true")
 spark_capacity = int(float(value("--spark-budget-gib")) * 2**30) if value("--spark-budget-gib") else (
     report.get("spark_budget_bytes", 108 << 30) if family in {"kimi_k3", "step5"} else 108 << 30)
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
