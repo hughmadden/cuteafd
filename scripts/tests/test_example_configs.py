@@ -183,6 +183,9 @@ def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 report = json.loads(REPORT)
 family, first, last = FAMILY, FIRST, LAST
+if family == "glm5_flash":
+    # Launch coverage uses a whole-drafter plan, not a synthetic memory-fit decision.
+    report["tp2_dflash"] = value("--tp2-dflash", "false") == "true"
 print(json.dumps(dict(report, spark_expert_world=report["spark_ranks"],
     spark_roles=[dict(rank=i, experts=True, layers=[], encoder=report.get("encoder") if i == 0 else None,
                       audio_encoder=None, drafter=None) for i in range(report["spark_ranks"])], version=1, family=family, executable=True, report=report,

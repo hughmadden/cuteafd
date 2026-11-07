@@ -338,10 +338,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             ensure!(device.id == meta.stream.device.id, "Step-5 final output/head device mismatch");
             let cache = self.ranks[head_rank].borrow();
             if let Some(history) = cache.layout().ranks[head_rank].mtp_hidden {
-                let ring = cuteafd_core::prefix::AppendRing {
-                    window: cache.layout().mtp_hidden_rows - cache.layout().step_rows,
-                    step: cache.layout().step_rows, rows: cache.layout().mtp_hidden_rows,
-                };
+                let ring = cache.layout().mtp_history.context("Step-5 MTP hidden history ring")?;
                 for sequence in &descriptors {
                     let target = cache.request_component(history, sequence.sequence)?;
                     for run in ring.proposal(sequence.base as u64, sequence.rows as u64)

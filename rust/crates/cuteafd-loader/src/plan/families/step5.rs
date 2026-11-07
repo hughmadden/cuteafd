@@ -512,9 +512,10 @@ impl FamilyModel for Model {
     }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        let unit = options.prefill_rows.max(64);
         let layout = crate::serving_capacity::step5::Step5CacheLayout::new(
-            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, options.prefill_rows.max(64),
-            options.prefill_rows.max(64), options.step5_kv)?;
+            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, unit,
+            options.prefill_span_rows.max(unit), options.step5_kv)?;
         Ok(Some(layout.geometry))
     }
     fn activation(&self, layer: usize, shared: bool) -> Option<FfnActivation> {

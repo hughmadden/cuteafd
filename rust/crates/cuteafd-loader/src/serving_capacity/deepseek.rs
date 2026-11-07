@@ -58,10 +58,11 @@ pub fn deepseek_v4_cache_geometry(
             product("V4 C128 carry", &[c128, 2 * 256 * 512 * 4])?,
         ],
     )?;
-    let ring_pages = prefill_rows
-        .checked_add(128)
+    // One unit at a time, never the whole wave: the shared ring rule
+    // ([`cuteafd_core::prefix::swa_ring`]) is what the pool allocates.
+    let ring_pages = cuteafd_core::prefix::swa_ring(cfg.window_size as u64, prefill_rows, 256)
         .ok_or(CacheGeometryError::Overflow("V4 ring rows"))?
-        .div_ceil(256);
+        .rows / 256;
     let window = product("V4 window ring", &[ring_pages, 149_760])?;
     let mut costs = Vec::with_capacity(ranks);
     for rank in 0..ranks {
@@ -289,6 +290,15 @@ mod tests {
             assert_eq!(
                 small.active_state_per_sequence_bytes,
                 cfg.n_layers as u64 * 2 * 149_760 + carry + expected_unit
+            );
+            // The window ring follows the step it is given: one prefill unit
+            // (12 pages), not the admitted multi-wave span (33 pages at three
+            // waves of 2752). The pool allocates the same unit-sized ring.
+            let unit = deepseek_v4_cache_geometry(&cfg, 1, 2752, 0).unwrap().ranks[0];
+            let span = deepseek_v4_cache_geometry(&cfg, 1, 8256, 0).unwrap().ranks[0];
+            assert_eq!(
+                span.active_state_per_sequence_bytes - unit.active_state_per_sequence_bytes,
+                cfg.n_layers as u64 * 21 * 149_760
             );
             let draft = deepseek_v4_cache_geometry(&cfg, 2, 4096, 3).unwrap();
             assert_eq!(draft.ranks[1], rank);

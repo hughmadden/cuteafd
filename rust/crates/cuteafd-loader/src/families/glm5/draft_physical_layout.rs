@@ -18,8 +18,23 @@ pub struct GlmDflashPhysicalLayout {
 impl GlmDflashPhysicalLayout {
     pub fn read(snapshot: &Path, representation: GlmDraftRepresentation, capacity: GlmDraftCapacity,
         sm_count: usize, fp8_mode: u8, kv_cache: Qwen4KvCache) -> Result<Self> {
+        Self::read_tp(snapshot, representation, capacity, sm_count, fp8_mode, kv_cache, 0, 1)
+    }
+
+    pub fn read_tp(snapshot: &Path, representation: GlmDraftRepresentation, capacity: GlmDraftCapacity,
+        sm_count: usize, fp8_mode: u8, kv_cache: Qwen4KvCache, rank: usize, ranks: usize) -> Result<Self> {
+        ensure!(rank < ranks, "invalid DFlash rank {rank}/{ranks}");
         let cfg = GlmDflashConfig::read(snapshot)?;
-        let layout = Self::new(&cfg, representation, capacity, sm_count, fp8_mode, kv_cache)?;
+        let mut layout = Self::new(&cfg.for_tp(ranks)?, representation, capacity, sm_count, fp8_mode, kv_cache)?;
+        if ranks == 2 {
+            layout.owners.push(Allocation::buffer("workspace.reduced", Location::coordinator(0),
+                (capacity.block_rows * cfg.hidden * 2).max(256) as u64,
+                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "draft owners"));
+        }
+        if rank > 0 {
+            layout.owners.retain(|owner| !Self::head_owner(&owner.id));
+            layout.weight_owners.retain(|id| !Self::head_owner(id));
+        }
         let path = snapshot.join("model.safetensors");
         let file_bytes = std::fs::metadata(&path)?.len();
         let headers: BTreeMap<_, _> = crate::read_safetensors_metadata(&path)?.into_iter()
@@ -130,6 +145,14 @@ impl GlmDflashPhysicalLayout {
                 .map(|name| format!("layer.{index}.{name}")));
         }
         Ok(Self { owners, weight_owners })
+    }
+
+    fn head_owner(id: &str) -> bool {
+        id.starts_with("head.") || matches!(id.strip_suffix(".upload").unwrap_or(id),
+            "workspace.logits" | "workspace.head" | "workspace.anchors" | "workspace.ids" |
+            "workspace.tokens" | "workspace.landing" | "workspace.dflash.unary" |
+            "workspace.dflash.candidates" | "workspace.dflash.projected" |
+            "workspace.dflash.features" | "workspace.dflash.topk")
     }
 
     /// Relative ids remain identical to the serving receipt visitor.

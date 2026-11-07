@@ -158,6 +158,10 @@ pub struct LayoutOptions {
     pub tp2_dspark_experts: bool,
     /// External DFlash attention/FFN split over the two target ranks.
     pub tp2_dflash: bool,
+    /// GLM Flash compares whole movable and head-split physical drafter plans.
+    pub glmf_tp2_dflash_auto: bool,
+    pub glmf_draft_representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+    pub glmf_draft_fp8_mode: u8,
     /// Shared GQA drafter rings, independent of target KV and weight precision.
     pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
@@ -309,6 +313,9 @@ impl Default for LayoutOptions {
             dspark_draft_limit: 5,
             tp2_dspark_experts: false,
             tp2_dflash: false,
+            glmf_tp2_dflash_auto: false,
+            glmf_draft_representation: crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
+            glmf_draft_fp8_mode: 0,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: false,
@@ -1538,7 +1545,9 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
         mimo_kv: crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
         dense_qwen_kv: options.dense_qwen_kv, qwen_kv: options.qwen_kv, mla_kv: options.mla_kv,
-        step5_kv: options.step5_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
+        step5_kv: options.step5_kv,
+        prefill_rows: report.prefill_unit_rows.unwrap_or(admitted_rows.unwrap_or(shape.prefill_rows)),
+        prefill_span_rows: admitted_rows.unwrap_or(0),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
         glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
     // Qwen's dual-owner layout partitions whole layers. Its host snapshot
