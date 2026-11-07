@@ -80,6 +80,9 @@ impl<'a> PackedHead<'a> {
         self.storage.inventory(inventory, &format!("{name}.packed12"))
     }
 
+    /// The head's one allocation (planes, table and status).
+    pub fn buffer(&self) -> CuteafdDeviceBuffer { self.storage.buffer }
+
     /// Values outside their rows' windows, and the most in any row.
     pub fn exceptions(&self) -> (u64, u64) { (self.status.exceptions, self.status.max_row_exceptions) }
 
@@ -87,14 +90,14 @@ impl<'a> PackedHead<'a> {
     /// weights, or with `coarse` the coarse plane alone (mantissa bits 3..0 at their midpoint).
     ///
     /// # Safety
-    /// `x` and `out` are live device buffers of those shapes; `scratch` was sized by [`scratch`]
-    /// for at least `rows` rows of this head.
+    /// `x` and `out` are live device buffers of those shapes; `scratch` is live device memory
+    /// of at least `packed_head_workspace(rows)` bytes (as [`scratch`] sizes it).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn apply(&self, library: &NativeLibrary, x: *const c_void, out: *mut c_void, out_f32: bool, rows: usize,
-        coarse: bool, scratch: &DeviceAllocation<'_>, stream: *mut c_void) -> Result<()> {
+        coarse: bool, scratch: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
         // SAFETY: the caller's contract; the planes are this head's live regions.
         unsafe { library.packed_head_linear(x, &planes(self.storage.buffer, &self.layout), out, out_f32, rows, self.k,
-            self.n, coarse, scratch.buffer.ptr, scratch.buffer.bytes, stream) }
+            self.n, coarse, scratch.ptr, scratch.bytes, stream) }
     }
 }
 

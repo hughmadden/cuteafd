@@ -109,6 +109,27 @@ impl PackedHeadLayout {
     pub fn offset(&self, region: Region) -> usize { self.offsets[region as usize] }
 }
 
+/// Activation rows of one GEMV pass (`gemv_tiles.cuh` kMaxRows): more rows run in passes.
+pub const PASS_ROWS: u64 = 64;
+
+/// The GEMV's K splits of an `[n, k]` head on an `sms`-SM device (`gemv_tiles.cuh`
+/// split_plan): enough 16-row tile x split warps for 16 per SM, at most one split per
+/// 128-wide K block.
+pub fn gemv_splits(n: u64, k: u64, sms: u64) -> u64 {
+    let (tiles, blocks) = ((n / 16).max(1), (k / 128).max(1));
+    let wanted = (sms * 16).div_ceil(tiles).clamp(1, blocks);
+    blocks.div_ceil(blocks.div_ceil(wanted))
+}
+
+/// Scratch bytes `cuteafd_packed_head_workspace` gives `rows` rows of an `[n, k]` head on
+/// an `sms`-SM device: one pass's B fragments and, when the split plan splits K, the
+/// pass's partial sums. Rows past [`PASS_ROWS`] add nothing (they run in further passes).
+pub fn workspace_bytes(rows: u64, k: u64, n: u64, sms: u64) -> u64 {
+    if rows == 0 { return 0; }
+    let splits = gemv_splits(n, k, sms);
+    align256(k * PASS_ROWS * 2) + if splits > 1 { align256(splits * rows.min(PASS_ROWS) * n * 4) } else { 0 }
+}
+
 /// The native pack's status words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackStatus {
@@ -331,6 +352,43 @@ mod tests {
         for (n, k) in [(0, 5120), (8, 5120), (16, 64), (16, 0), (65_536, 65_536)] {
             assert_eq!(PackedHeadLayout::new(n, k), Err(PackedHeadError::Shape { n, k }));
         }
+    }
+
+    /// GLM 5.3 Flash's [154880, 4096] head: 956 MB (BF16 1.27 GB, row-K128 FP8 654 MB).
+    #[test]
+    fn layout_admits_the_glm_flash_head_exactly() {
+        let layout = PackedHeadLayout::new(154_880, 4096).unwrap();
+        assert_eq!(layout.capacity, 619_520);
+        assert_eq!(layout.total_bytes(), 956_074_752);
+        assert_eq!(PackedHeadLayout::bytes(154_880, 4096), 956_074_752);
+        assert!(layout.total_bytes() as f64 / (154_880.0 * 4096.0) < 1.5 * 1.005);
+    }
+
+    /// The scratch mirror of `cuteafd_packed_head_workspace`: vocabulary heads keep one K
+    /// split on real cards (V4.1's halves split only past 252 SMs, GLM Flash's head past
+    /// 605); a narrow head splits K and adds one pass's FP32 partials.
+    #[test]
+    fn workspace_mirrors_the_native_split_plan() {
+        let fragments = 5120 * 64 * 2;
+        for n in [129_280, 64_640] {
+            assert_eq!(gemv_splits(n, 5120, 188), 1);
+            assert_eq!(workspace_bytes(64, 5120, n, 188), fragments);
+        }
+        assert_eq!(gemv_splits(64_640, 5120, 253), 2);
+        // 256 tiles x 12 wanted splits over 40 K blocks: 4 blocks each, 10 splits.
+        assert_eq!(gemv_splits(4096, 5120, 188), 10);
+        assert_eq!(workspace_bytes(16, 5120, 4096, 188), fragments + 10 * 16 * 4096 * 4);
+        assert_eq!(workspace_bytes(4096, 5120, 4096, 188), workspace_bytes(64, 5120, 4096, 188));
+        assert_eq!(workspace_bytes(0, 5120, 4096, 188), 0);
+        for sms in [48, 170, 188, 605] {
+            assert_eq!(gemv_splits(154_880, 4096, sms), 1, "{sms} SMs");
+            for rows in [1, 16, 64, 128, 4096] {
+                assert_eq!(workspace_bytes(rows, 4096, 154_880, sms), 4096 * 64 * 2, "{sms} SMs, {rows} rows");
+            }
+        }
+        assert_eq!(gemv_splits(154_880, 4096, 606), 2);
+        // At most one split per 128-wide K block.
+        assert_eq!(gemv_splits(16, 256, 1000), 2);
     }
 
     #[test]
