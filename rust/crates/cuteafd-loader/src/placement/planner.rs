@@ -1,7 +1,8 @@
 //! Pure, phase-aware allocation planning. Recipes describe one legal candidate;
 //! policy, exact pins and allocation reconciliation belong here, not in families.
 use super::{LayerMode, ResidentWeights};
-use cuteafd_core::{spark_reply::SparkReplyFormats, memory_layout::{Basis, Category, Item}};
+use cuteafd_core::{spark_reply::SparkReplyFormats, memory_layout::{Basis, Category, Item, DRIVER_PAGE_TABLES_GROUP}};
+pub use cuteafd_core::memory_layout::DriverPageTableModel;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -438,10 +439,42 @@ pub struct Facts {
     pub sequential: Vec<Sequential>,
     pub reservations: Vec<Reservation>,
     pub allowances: Vec<Allowance>,
+    /// Keep derivation identity when a solved ledger is used to prepare again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub driver_page_tables: Vec<DriverPageTable>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allocation_granularity: Vec<AllocationGranularity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverPageTable {
+    pub model: DriverPageTableModel,
+    pub location: Location,
+    pub lifetime: Lifetime,
+    pub backing: String,
+    /// Physical backing extent, not a reservation, view or driver allocation.
+    pub mapped_bytes: u64,
+}
+impl DriverPageTable {
+    pub fn bytes(&self) -> u64 { self.model.bytes(self.mapped_bytes) }
+    pub fn source(&self) -> String {
+        format!("{} ({})", self.backing, self.model.source())
+    }
+}
+
+/// SM120 driver 13020: Portable|Mapped allocation and Portable registration,
+/// 1/4/16/32 GiB on both RTX PRO 6000s, 2026-11-07 owner probe. Exact slope
+/// 1/512, zero intercept and residuals; cudaMalloc control had no extra charge.
+/// Fractional bytes round only once per backing, never once per pool page.
+pub fn driver_page_table_bytes(mapped_bytes: u64) -> u64 {
+    DriverPageTableModel::Sm120Portable.bytes(mapped_bytes)
 }
 
 mod contract;
 mod search;
+mod granularity;
+pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence,
+    ALLOCATION_GRANULARITY_GROUP, allocation_granularity_forecast, allocation_granularity_component};
 pub mod native_attention;
 pub mod serving;
 pub use contract::{
@@ -504,6 +537,14 @@ impl ResolvedPlan {
                 && allowance.lifetime.contains(Phase::Ready, self.facts.phase_order))
             .map(|allowance| Item::new(Category::Runtime, &allowance.source, "", allowance.bytes,
                 if allowance.assumed { Basis::Estimated } else { Basis::Calibrated })));
+        items.extend(self.facts.driver_page_tables.iter().filter(|mapping|
+            mapping.location == location && mapping.lifetime.contains(Phase::Ready, self.facts.phase_order))
+            .map(|mapping| Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, mapping.source(), mapping.bytes(), Basis::Calibrated)));
+        for owner in self.facts.allocation_granularity.iter().filter(|owner|
+            owner.location == location && owner.lifetime.contains(Phase::Ready, self.facts.phase_order)) {
+            items.push(Item::new(Category::Runtime, ALLOCATION_GRANULARITY_GROUP,
+                owner.source(), owner.bytes()?, owner.basis()));
+        }
         Ok(items)
     }
     pub fn remaining(&self, budget: &str, phase: Phase) -> Option<u64> {
@@ -595,6 +636,8 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
             .any(|a| !locations.contains(&a.location))
         || facts.resident_weights.iter().any(|w| !locations.contains(&w.location))
         || facts.reservations.iter().any(|r| !locations.contains(&r.location))
+        || facts.driver_page_tables.iter().any(|mapping| !locations.contains(&mapping.location))
+        || facts.allocation_granularity.iter().any(|owner| !locations.contains(&owner.location))
     {
         return Err(Refusal::InvalidFact(
             "allocation outside memory budgets".into(),
@@ -692,6 +735,35 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
             return Err(Refusal::InvalidFact("invalid opaque allowance".into()));
         }
     }
+    let mut mapped = BTreeSet::new();
+    for mapping in &facts.driver_page_tables {
+        let backing = ids.get(&mapping.backing).filter(|owner| owner.view.is_none())
+            .map(|owner| (owner.location, owner.bytes, owner.lifetime))
+            .or_else(|| facts.sequential.iter().find(|group| group.id == mapping.backing)
+                .map(|group| (group.members[0].location, group.peak(), group.members[0].lifetime)));
+        let backing_location = match (mapping.model, mapping.location) {
+            (DriverPageTableModel::Sm120Portable,
+                Location { device: Device::Coordinator(_), domain: Domain::Device }) => Some(Location::PINNED),
+            (DriverPageTableModel::Sm121Arena,
+                location @ Location { device: Device::Spark(_), domain: Domain::Managed })
+                if ids.get(&mapping.backing).is_some_and(|owner| owner.category == Category::Experts) => Some(location),
+            _ => None,
+        };
+        if backing_location.is_none()
+            || !mapped.insert((mapping.location, mapping.backing.as_str()))
+            || backing != backing_location.map(|location| (location, mapping.mapped_bytes, mapping.lifetime))
+        {
+            return Err(Refusal::InvalidFact(format!("invalid driver page-table backing {}", mapping.backing)));
+        }
+    }
+    let mut granular_backings = BTreeSet::new();
+    let mut granular_ids = BTreeSet::new();
+    for owner in &facts.allocation_granularity {
+        if !granular_ids.insert(&owner.id) {
+            return Err(Refusal::InvalidFact("duplicate cudaMalloc granularity owner".into()));
+        }
+        owner.validate_backings(facts, &mut granular_backings)?;
+    }
     Ok(())
 }
 
@@ -752,6 +824,16 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                     n.checked_add(a.bytes)
                         .ok_or(Refusal::Overflow("phase allowances"))
                 })?;
+            let opaque = facts.driver_page_tables.iter()
+                .filter(|mapping| mapping.lifetime.contains(phase, facts.phase_order)
+                    && budget.locations.contains(&mapping.location))
+                .try_fold(opaque, |n, mapping| n.checked_add(mapping.bytes())
+                    .ok_or(Refusal::Overflow("driver page tables")))?;
+            let opaque = facts.allocation_granularity.iter()
+                .filter(|owner| owner.lifetime.contains(phase, facts.phase_order)
+                    && budget.locations.contains(&owner.location))
+                .try_fold(opaque, |sum, owner| sum.checked_add(owner.bytes()?)
+                    .ok_or(Refusal::Overflow("allocation granularity")))?;
             let required = owned
                 .checked_add(opaque)
                 .ok_or(Refusal::Overflow("phase peak"))?;
@@ -874,7 +956,8 @@ pub fn reconcile_legacy_mla_events(
     events: &[OwnerEvent],
 ) -> Result<(), Refusal> {
     if !facts.phase_order.at_or_before(phase, Phase::Warmup) || !facts.deferred.is_empty()
-        || !facts.allowances.is_empty() || !facts.reservations.is_empty() {
+        || !facts.allowances.is_empty() || !facts.reservations.is_empty() || !facts.driver_page_tables.is_empty()
+        || !facts.allocation_granularity.is_empty() {
         return Err(Refusal::InvalidFact(
             "legacy MLA bridge only checks startup owners".into(),
         ));

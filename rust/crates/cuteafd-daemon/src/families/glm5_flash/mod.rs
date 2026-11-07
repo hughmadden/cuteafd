@@ -1835,7 +1835,8 @@ impl Opened {
             Option<cuteafd_hostcache::config::Config>,
             Option<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad>,
             Option<cuteafd_loader::push_load::PushHostEnvelope>,
-            Option<cuteafd_loader::shared::dense_read::MountLoad>)> {
+            Option<cuteafd_loader::shared::dense_read::MountLoad>,
+            cuteafd_loader::placement::planner::ResolvedPlan, Vec<String>)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
         use cuteafd_loader::serving_capacity::{glmf_core_step_scratch, glmf_table_pages,
@@ -2038,7 +2039,8 @@ impl Opened {
             "GLM Flash placement has no matching movable executor");
         placement::draft::require_home(&placement, "GLM Flash",
             if remote_draft { &[0, 1] } else { &[0] })?;
-        Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host, admitted.mount_load))
+        Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host,
+            admitted.mount_load, admitted.solved, admitted.declared_graphs))
     }
 
     /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
@@ -2270,7 +2272,8 @@ impl Opened {
         let args = &draft_args;
         let remote_draft = false;
         cuteafd_bench::context::set_resolved("tp2-dflash", if args.tp2_dflash { "on" } else { "off" });
-        let (placement, admitted_graphs, working, admitted_host, admitted_native_load, admitted_push_host, admitted_mount_load) = admitted;
+        let (placement, admitted_graphs, working, admitted_host, admitted_native_load,
+            admitted_push_host, admitted_mount_load, mut admitted_plan, declared_graphs) = admitted;
         if let Some(receipt) = admitted_mount_load { loader.dense.admit_mount(receipt)?; }
         let media = prepare_media()?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
@@ -2826,7 +2829,45 @@ impl Opened {
         engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
             (16, engine.drafter.is_some()), |sequences, speculation| {
-                engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?;
+                if let Some(capture) = engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)? {
+                    use cuteafd_loader::placement::inventory::{GraphCensus, GraphCensusIdentity};
+                    let measured = cuteafd_loader::placement::planner::serving::reconcile_startup_graphs(
+                        &mut admitted_plan, "glmf.graphs", &admitted_graphs, &declared_graphs, &capture.ranks)?;
+                    cuteafd_loader::placement::reserve::log_plan(&admitted_plan, "glm5_flash captured");
+                    use sha2::{Digest, Sha256};
+                    let hash = |path: &std::path::Path| -> Result<String> {
+                        let mut file = std::fs::File::open(path)?;
+                        let mut digest = Sha256::new();
+                        std::io::copy(&mut file, &mut digest)?;
+                        Ok(format!("{:x}", digest.finalize()))
+                    };
+                    let programs_sha256 = hash(&args.manifest)?;
+                    let native_sha256 = hash(self.library.loaded_path())?;
+                    let layout = serde_json::to_string(&serde_json::json!({
+                        "family": "glm5_flash", "context": max_context, "pool": pool_tokens,
+                        "sequences": sequences.min(args.decode_rows), "speculation": speculation,
+                        "args": format!("{args:?}"), "decisions": admitted_plan.decisions,
+                        "spark_ranks": working.spark_ranks,
+                    }))?;
+                    for (rank, (graph, gpu)) in measured.ranks.iter().zip(&inventory.gpus).enumerate() {
+                        let identity = GraphCensusIdentity {
+                            declared_graphs: declared_graphs[rank].clone(),
+                            programs_sha256: programs_sha256.clone(), native_sha256: native_sha256.clone(),
+                            toolchain: env!("CUTEAFD_BUILD_TOOLCHAIN").into(),
+                            gpu_class: format!("{}/{}/{}", gpu.arch, gpu.sms, gpu.total_bytes),
+                            driver: gpu.driver.clone(), layout: layout.clone(),
+                        };
+                        identity.validate().map_err(anyhow::Error::msg)?;
+                        let census = GraphCensus { identity, executables: graph.executables, bytes: graph.bytes,
+                            evidence: "GLM Flash synchronized startup capture after exact masked-segment prewarm; tracked device growth excluded".into(),
+                            producing_commit: env!("CUTEAFD_BUILD_COMMIT").into() };
+                        tracing::info!(target: "cuteafd::placement", rank, census = %serde_json::to_string(&census)?,
+                            "startup graph residency census");
+                    }
+                } else {
+                    ensure!(admitted_graphs.lifetime != cuteafd_loader::placement::Lifetime::Startup,
+                        "startup graphs were admitted but the executor did not capture them");
+                }
                 probe("graph-capture")
             }, || {
                 engine.check_admitted_graphs(&admitted_graphs)?;

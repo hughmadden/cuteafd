@@ -196,8 +196,11 @@ pub enum ComponentKind {
     Sequential(Sequential),
     Reservation(Reservation),
     Allowance(Allowance),
+    /// `bytes` is the physical backing extent, not its driver residency.
+    DriverPageTables { model: DriverPageTableModel, location: Location, lifetime: Lifetime, backing: String },
     /// Weight residency can outlive or precede the future allocation ledger.
     ResidentWeight(ResidentWeight),
+    AllocationGranularity(AllocationGranularity),
 }
 #[derive(Debug, Clone)]
 pub struct Component {
@@ -269,7 +272,9 @@ impl Component {
                 .map(|a| (a.location, a.lifetime, false)),
             ComponentKind::Reservation(r) => Some((r.location, r.lifetime, false)),
             ComponentKind::Allowance(a) => Some((a.location, a.lifetime, true)),
+            ComponentKind::DriverPageTables { location, lifetime, .. } => Some((*location, *lifetime, true)),
             ComponentKind::ResidentWeight(_) => None,
+            ComponentKind::AllocationGranularity(owner) => Some((owner.location, owner.lifetime, true)),
         }
     }
 }
@@ -329,6 +334,18 @@ impl Contract {
             bytes: ByteCurve::fixed(a.bytes, maximum_pages),
             kind: ComponentKind::Allowance(a),
         }));
+        components.extend(facts.driver_page_tables.into_iter().map(|mapping| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(mapping.mapped_bytes, maximum_pages),
+            kind: ComponentKind::DriverPageTables {
+                model: mapping.model, location: mapping.location, lifetime: mapping.lifetime, backing: mapping.backing,
+            },
+        }));
+        components.extend(facts.allocation_granularity.into_iter().map(|owner| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(owner.bytes().unwrap_or(0), maximum_pages),
+            kind: ComponentKind::AllocationGranularity(owner),
+        }));
         components.extend(facts.resident_weights.into_iter().map(|owner| {
             let bytes = ByteCurve::fixed(owner.weights.0, maximum_pages);
             Component::resident_weight(owner, bytes)
@@ -358,9 +375,40 @@ impl Contract {
             .ok_or_else(|| Refusal::InvalidFact(format!("unknown component {id}")))?;
         component.byte_extent(curve)
     }
+    /// Portable CUDA host backings map into every coordinator context. Aliases
+    /// do not register storage again; Spark arena page tables have their own row.
+    pub fn add_driver_page_tables(&mut self) {
+        self.components.retain(|component| !matches!(component.kind,
+            ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm120Portable, .. }));
+        let mut mappings = Vec::new();
+        for component in &self.components {
+            let owner = match &component.kind {
+                ComponentKind::Allocation { template, .. }
+                    if template.location == Location::PINNED && template.view.is_none() =>
+                    Some((template.id.clone(), template.lifetime)),
+                ComponentKind::Sequential(group) if group.members.first()
+                    .is_some_and(|member| member.location == Location::PINNED) =>
+                    Some((group.id.clone(), group.members[0].lifetime)),
+                _ => None,
+            };
+            if let Some((backing, lifetime)) = owner {
+                for gpu in 0..self.gpus {
+                    mappings.push(Component {
+                        activation: component.activation.clone(),
+                        bytes: component.bytes.clone(),
+                        kind: ComponentKind::DriverPageTables {
+                            model: DriverPageTableModel::Sm120Portable,
+                            location: Location::coordinator(gpu as u8), lifetime, backing: backing.clone(),
+                        },
+                    });
+                }
+            }
+        }
+        self.components.extend(mappings);
+    }
     pub fn facts(&self, selected: &[usize], pages: u64) -> Result<Facts, Refusal> {
         self.decisions(selected)?;
-        let mut result = Facts { resident_weights: vec![],
+        let mut result = Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
             phase_order: self.phase_order,
             allocations: vec![],
             deferred: vec![],
@@ -372,7 +420,7 @@ impl Contract {
                 continue;
             }
             let bytes = component.bytes.at(pages)?;
-            if bytes == 0 && !matches!(component.kind, ComponentKind::ResidentWeight(_)) {
+            if bytes == 0 && !matches!(component.kind, ComponentKind::ResidentWeight(_) | ComponentKind::AllocationGranularity(_)) {
                 continue;
             }
             match &component.kind {
@@ -414,6 +462,17 @@ impl Contract {
                     let mut allowance = template.clone();
                     allowance.bytes = bytes;
                     result.allowances.push(allowance);
+                }
+                ComponentKind::DriverPageTables { model, location, lifetime, backing } => {
+                    result.driver_page_tables.push(DriverPageTable {
+                        model: *model, location: *location, lifetime: *lifetime, backing: backing.clone(), mapped_bytes: bytes,
+                    });
+                }
+                ComponentKind::AllocationGranularity(owner) => {
+                    if bytes != owner.bytes()? {
+                        return Err(Refusal::InvalidFact("cudaMalloc granularity curve differs from physical inventory".into()));
+                    }
+                    result.allocation_granularity.push(owner.clone());
                 }
                 ComponentKind::ResidentWeight(template) => {
                     let mut owner = template.clone();
@@ -730,8 +789,13 @@ impl Contract {
                     return Err(Refusal::InvalidFact(format!("invalid resident weight {}", owner.id)));
                 }
             }
+            if let ComponentKind::AllocationGranularity(owner) = &component.kind {
+                if component.bytes != ByteCurve::fixed(owner.bytes()?, self.maximum_pages) {
+                    return Err(Refusal::InvalidFact("variable cudaMalloc granularity inventory".into()));
+                }
+            }
             if let ComponentKind::Reservation(reservation) = &component.kind {
-                let facts = Facts { resident_weights: vec![], phase_order: self.phase_order, allocations: vec![], deferred: vec![],
+                let facts = Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![], phase_order: self.phase_order, allocations: vec![], deferred: vec![],
                     sequential: vec![], reservations: vec![reservation.clone()], allowances: vec![] };
                 validate_owners(&facts)?;
             }

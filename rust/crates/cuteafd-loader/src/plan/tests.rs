@@ -28,7 +28,7 @@ fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
     let at = |phase| Lifetime { first: phase, last: phase };
     let owner = |id, location, bytes, lifetime| Allocation::buffer(id, location, bytes,
         lifetime, Category::Workspace, id);
-    let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET,
+    let facts = Facts { allocation_granularity: vec![], driver_page_tables: vec![], phase_order: PhaseOrder::DRAFT_THEN_TARGET,
         resident_weights: vec![], deferred: vec![],
         allocations: vec![
             owner("gpu0.load", Location::coordinator(0), 700, at(Phase::Load)),
@@ -3518,7 +3518,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             rtx_bytes: vec![placement::inventory::PRO_TOTAL_BYTES; 2], head_split: true,
             context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(setting),
             prefill_rows: 4096, prefill_lanes: lanes, state_slots: Some(8), prefix_slots: Some(8),
-            glmf_drafter_disabled: true, glmf_prefill_expanded: false,
+            glmf_drafter_disabled: true, glmf_prefill_expanded: false, host_cache_bytes: Some(0),
             glmf_representation: resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false },
             workspace_manifest: Some(path.clone()), ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
@@ -3527,10 +3527,14 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(opts.context_tokens), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
-            gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
-                context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
-                    + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
-                loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: crate::placement::reserve::gpu("glm5_flash"),
+            gpus: opts.rtx_bytes.iter().map(|&total| (total, Baseline::Planned {
+                context_bytes: placement::ArchContext::coordinator(total, None).context_bytes,
+                loaded_bytes: 0 })).collect(),
+            pending_code: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)|
+                placement::inventory::loaded_code_allowance("glmf", "fp8", true, rank as u8,
+                    placement::ArchContext::for_device("sm_120", total),
+                    Some(&placement::ProgramSet::from_manifest(&manifest, &["glmf", "glmf2"]))).bytes).collect(),
+            headroom_bytes: crate::placement::reserve::gpu("glm5_flash"),
             spark_ranks: peers, prefill_lanes: lanes, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262144, sequences: 8, speculation: false, state_slots: 8, mark_slots: 8,
             pool_marks: false, index: opts.glmf_index, kda_state_bytes: 4, shared_replay: false,
@@ -4191,17 +4195,26 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
     let disabled = plan(dir.path(), &options(true)).unwrap().memory_layout.unwrap();
     assert!(enabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
     assert!(!disabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
-    let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
-        .find(|i| i.group == "graphs").unwrap().bytes;
+    let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| {
+        let owner = layout.devices[0].items.iter()
+            .find(|i| i.group == "startup graphs: glmf.graphs.0").unwrap();
+        assert_eq!(owner.basis, cuteafd_core::memory_layout::Basis::Estimated);
+        owner.bytes
+    };
     assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
-    // The measured loaded code (`placement::inventory::LOADED_CODE`) replaces the per-workspace
-    // runtime allowance: it already holds the workspaces' and the drafter's untracked memory.
-    let code = crate::placement::loaded_code("glmf", "*", false, 0).unwrap().bytes;
-    for layout in [&enabled, &disabled] {
-        assert!(!layout.devices[0].items.iter().any(|i| i.group == "workspace runtime overhead"));
-        let context = layout.devices[0].items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
+    assert!(crate::placement::loaded_code("glmf", "*", false, 0).is_none());
+    for (layout, handles) in [(&enabled, 3), (&disabled, 2)] {
+        let items = &layout.devices[0].items;
+        assert!(!items.iter().any(|i| i.group == "workspace runtime overhead"));
+        let context = items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
         assert_eq!(context, crate::placement::ArchContext::coordinator(crate::placement::inventory::PRO_TOTAL_BYTES,
-            None).context_bytes + code);
+            None).context_bytes);
+        let code = items.iter().find(|i| i.group.starts_with("selected-program loaded code estimate")).unwrap();
+        assert_eq!(code.basis, cuteafd_core::memory_layout::Basis::Estimated);
+        assert_eq!(items.iter().filter(|i| i.group.starts_with("cuBLAS handles:"))
+            .map(|i| i.bytes).sum::<u64>(), handles * (64 << 20));
+        assert_eq!(items.iter().filter(|i| i.group.starts_with("BLAS device initialization"))
+            .map(|i| i.bytes).sum::<u64>(), 2 << 20);
     }
 }
 
@@ -5533,7 +5546,14 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     let released = (14 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
     assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
     assert_eq!(marks(&legacy) - marks(&staged), released);
-    assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(), released as i64);
+    let prefix_driver = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
+        .filter(|item| item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP
+            && item.format.starts_with("glmf.host.prefix."))
+        .map(|item| item.bytes).sum::<u64>();
+    let mapped_prefix = prefix_driver(&staged) - prefix_driver(&legacy);
+    assert_eq!(mapped_prefix, (32u64 << 30) / 512);
+    assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(),
+        released as i64 - mapped_prefix as i64);
     assert_eq!(released, 1_771_438_080);
     // An explicit arena (0: none) is taken as given.
     let mut none = layout(96 << 30, 16);

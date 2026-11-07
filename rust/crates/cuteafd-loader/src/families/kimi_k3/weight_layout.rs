@@ -72,6 +72,11 @@ impl GlobalLayout {
             .context("Kimi global weight extent overflow"))
     }
 
+    pub fn allocation_extents(&self) -> Vec<u64> {
+        self.operands.values().map(|&bytes| bytes as u64)
+            .chain(self.core_head.iter().flat_map(CoreWeightLayout::allocation_extents)).collect()
+    }
+
     pub fn demand(&self) -> Result<Demand> {
         let bytes = self.bytes()? as u64;
         Ok(Demand::new(self.rank as u8, Category::Weights, "Kimi global weights", bytes, Basis::Exact)
@@ -259,6 +264,21 @@ impl LayerLayout {
             .context("Kimi native attention extent overflow"))
     }
 
+    /// None selects every physical owner; Some partitions the same requests
+    /// into attention and non-attention logical planner groups, without aliases.
+    pub fn allocation_extents(&self, attention: Option<bool>) -> Result<Vec<u64>> {
+        let selected = |name: &&str| attention.is_none_or(|wanted|
+            wanted == (name.starts_with("mla.") || name.starts_with("kda.")));
+        let mut requests = self.operands.iter().filter(|(name, _)| selected(name))
+            .map(|(_, &bytes)| bytes as u64)
+            .chain(self.core.iter().filter(|(name, _)| selected(name))
+                .flat_map(|(_, layout)| layout.allocation_extents())).collect::<Vec<_>>();
+        for (name, layout) in &self.native {
+            if selected(name) { requests.extend(layout.allocation_extents()?); }
+        }
+        Ok(requests)
+    }
+
     pub fn attention_bytes(&self) -> Result<usize> {
         let base = self.operands.iter().filter(|(name, _)| name.starts_with("mla.") || name.starts_with("kda."))
             .map(|(_, bytes)| *bytes).chain(self.core.iter().filter(|(name, _)|
@@ -279,6 +299,51 @@ fn extent(dimensions: &[usize]) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::placement::FfnMode;
+
+    #[test]
+    fn physical_weight_requests_partition_exact_payloads_for_bf16_k6_and_native_attention() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        crate::plan::testing::write_kimi_core_snapshot(dir.path(), false);
+        let checkpoint = crate::plan::checkpoint::Checkpoint::open(dir.path())?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let core = crate::plan::families::kimi::core_inventory(&checkpoint)?;
+        for inventory in [&CoreInventory::default(), &core] {
+            for ranks in [1, 2] {
+                for global in GlobalLayout::ranks_with_core(&cfg, inventory, ranks)? {
+                    assert_eq!(global.allocation_extents().iter().sum::<u64>(), global.bytes()? as u64);
+                }
+                let modes = if ranks == 1 { vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }] }
+                    else { vec![LayerMode::HeadSplit, LayerMode::ContextSplit,
+                        LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] };
+                for mode in modes {
+                    for layer in 0..cfg.layers {
+                        if ranks == 2 && cfg.attention[layer] == KimiAttention::Kda && mode != LayerMode::HeadSplit {
+                            assert!(LayerLayout::ranks_with_core(&cfg, layer, mode, inventory, ranks).is_err());
+                            continue;
+                        }
+                        for mut layout in LayerLayout::ranks_with_core(&cfg, layer, mode, inventory, ranks)? {
+                            // Both native storage variants use the same physical partition.
+                            for fp8 in [false, true] {
+                                layout.native.insert("mla.test", crate::formats::native_attention::NativeLayout {
+                                    stem: "test".into(), shape: [256, 512], fp8, rank: 0, ranks: 1,
+                                    split: crate::formats::trellis_core::CoreSplit::Whole,
+                                });
+                                let mut all = layout.allocation_extents(None)?;
+                                let mut attention = layout.allocation_extents(Some(true))?;
+                                assert_eq!(all.iter().sum::<u64>(), layout.bytes()? as u64);
+                                assert_eq!(attention.iter().sum::<u64>(), layout.attention_bytes()? as u64);
+                                attention.extend(layout.allocation_extents(Some(false))?);
+                                all.sort_unstable();
+                                attention.sort_unstable();
+                                assert_eq!(all, attention);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn one_rank_owns_full_attention_ffns_and_all_routed_frontends() -> Result<()> {

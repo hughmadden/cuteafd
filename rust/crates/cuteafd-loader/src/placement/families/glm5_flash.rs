@@ -509,10 +509,7 @@ pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: 
         layers, gpus == 2, &glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms)));
     let ranks = counts.iter().enumerate().map(|(rank, &count)| {
         let role = if gpus == 1 { 0 } else { rank + 1 };
-        let measured = glmf_graphs::measured_graph_bytes(count, role);
-        let margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
-            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
-        GraphRank { executables: count, bytes: measured + margin, margin }
+        glmf_graphs::estimated_graph_rank(count, role)
     }).collect();
     GraphSet { ranks, shapes: counts[0] / (layers + 1) as u64, lifetime: Lifetime::Startup }
 }
@@ -567,24 +564,19 @@ pub fn startup_graph_bound(cfg: &GlmNextConfig, layers: usize, context: usize, p
     let shapes = (geometries.len() * rows) as u64;
     let ranks = (0..gpus).map(|rank| {
         let executables = shapes * (layers + usize::from(rank == 0)) as u64;
-        let measured = glmf_graphs::measured_graph_bytes(executables, if gpus == 1 { 0 } else { rank + 1 });
-        let margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
-            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
-        GraphRank { executables, bytes: measured + margin, margin }
+        glmf_graphs::estimated_graph_rank(executables, if gpus == 1 { 0 } else { rank + 1 })
     }).collect();
     GraphSet { ranks, shapes, lifetime: Lifetime::Startup }
 }
 
-/// P6 staged capture after every expert capacity was primed, not legacy Spark-route graphs.
-/// Preserve the separate admission-growth margin; only the ready executable charge changes.
+/// Historical P6 local-route observation. Missing exact code/key provenance
+/// keeps this an estimate (#1463); live admission replaces it after capture.
 pub fn calibrate_local_tp2_graphs(graphs: &mut GraphSet) {
     if graphs.ranks.len() != 2 || graphs.lifetime != Lifetime::Startup { return; }
     for (rank, graph) in graphs.ranks.iter_mut().enumerate() {
         let (bytes, count) = [(2_074_083_328u64, 12_880u64), (2_004_877_312, 12_600)][rank];
-        let measured = (graph.executables as u128 * bytes as u128).div_ceil(count as u128) as u64;
-        graph.margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
-            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
-        graph.bytes = measured + graph.margin;
+        *graph = GraphRank::estimate(graph.executables, bytes, count)
+            .expect("GLMF local startup graph estimate fits u64");
     }
 }
 
@@ -626,7 +618,8 @@ pub(crate) mod tests {
         GlmfInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(262_144),
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
-                context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,
+                context_bytes: context + inventory::loaded_code_allowance("glmf", "exl3", ranks == 2,
+                    rank as u8, ArchContext::for_device("sm_120", capacity), None).bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; ranks], local_tp2_exl3: false, headroom_bytes: 1 << 30,
             spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262_144, sequences: 8, speculation: true, state_slots: 8, mark_slots: 16, pool_marks: false,
@@ -743,7 +736,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn contract_graph_exact_substitution_preserves_ready_and_growth_phases() {
+    fn contract_startup_graph_estimates_are_opaque_without_growth_margin() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         for local in [false, true] {
             let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
@@ -753,14 +746,16 @@ pub(crate) mod tests {
             let admitted = contract(&input).unwrap();
             assert!(admitted.working.spark_layers.is_empty());
             for gpu in 0..2 {
-                let ready = admitted.solved.facts.allocations.iter()
-                    .find(|owner| owner.id == format!("glmf.graphs.{gpu}.ready")).unwrap();
-                let growth = admitted.solved.facts.allocations.iter()
-                    .find(|owner| owner.id == format!("glmf.graphs.{gpu}.growth")).unwrap();
-                assert_eq!(ready.bytes + growth.bytes, admitted.graphs.bytes(gpu));
-                assert_eq!(growth.bytes, admitted.graphs.ranks[gpu].margin);
-                assert_eq!(ready.lifetime.first, planner::Phase::Warmup);
-                assert_eq!(growth.lifetime.first, planner::Phase::Growth);
+                let owner = admitted.solved.facts.allowances.iter()
+                    .find(|owner| owner.source == format!("startup graphs: glmf.graphs.{gpu}")).unwrap();
+                assert_eq!(owner.bytes, admitted.graphs.bytes(gpu));
+                assert!(owner.assumed);
+                assert_eq!(admitted.graphs.ranks[gpu].margin, 0);
+                assert_eq!(owner.lifetime.first, planner::Phase::Warmup);
+                assert_eq!(owner.lifetime.last, planner::Phase::Growth);
+                assert!(!admitted.solved.facts.allocations.iter()
+                    .any(|owner| owner.id.starts_with(&format!("glmf.graphs.{gpu}."))));
+                assert!(!admitted.declared_graphs[gpu].is_empty());
             }
             assert_eq!(admitted.solved.phases,
                 planner::evaluate(&admitted.solved.facts, &admitted.solved.budgets).unwrap());
@@ -854,8 +849,9 @@ pub(crate) mod tests {
                 .find(|allocation| allocation.id == format!("glmf.pool.{owner}")).unwrap();
             let units = marked.solved.pool_tokens / 256;
             let per_unit = pool.bytes / units;
-            let used = marked.solved.phases.iter().find(|phase| phase.phase == planner::Phase::Growth
-                && phase.budget == format!("rtx{owner}")).unwrap().owned;
+            let phase = marked.solved.phases.iter().find(|phase| phase.phase == planner::Phase::Growth
+                && phase.budget == format!("rtx{owner}")).unwrap();
+            let used = phase.owned + phase.opaque;
             let runtime = marked.solved.facts.allocations.iter()
                 .find(|allocation| allocation.id == format!("glmf.runtime.{owner}")).unwrap().bytes;
             let fixed = used - pool.bytes - runtime;
@@ -879,30 +875,33 @@ pub(crate) mod tests {
         let copy = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
         assert_eq!(copy.shapes, 280);
         assert_eq!(copy.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [12_880, 12_600]);
-        assert_eq!([copy.at_ready(0), copy.at_ready(1)], [2_082_618_720, 2_131_554_600]);
+        assert_eq!([copy.at_ready(0), copy.at_ready(1)], [
+            GraphRank::estimate(12_880, 2_231_369_728, 13_800).unwrap().bytes,
+            GraphRank::estimate(12_600, 2_283_798_528, 13_500).unwrap().bytes]);
+        assert!(copy.ranks.iter().all(|rank| rank.margin == 0 && rank.basis == Basis::Estimated));
         let plain = startup_graphs(&cfg, 45, 262_144, 262_144, 8, false, 2, 64, 188);
         assert_eq!(plain.shapes, 112);
         assert_eq!(plain.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [5_152, 5_040]);
     }
 
     #[test]
-    fn local_tp2_runtime_and_graphs_equal_staged_ready() {
+    fn local_tp2_code_no_longer_reuses_mixed_staged_runtime() {
         let mut config = crate::plan::testing::glm5_flash_config(45);
         config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
             if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
         let mut graphs = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
         calibrate_local_tp2_graphs(&mut graphs);
-        for (rank, (baseline, ready)) in [(1_027_511_116u64, 3_101_594_444u64),
-            (900_673_356, 2_905_550_668)].into_iter().enumerate() {
-            let items = inventory::glmf_local_tp2_runtime_items(rank);
-            assert_eq!(items.iter().map(|i| i.bytes).sum::<u64>(), baseline);
-            assert_eq!(baseline + graphs.at_ready(rank), ready);
-            let code = loaded_code("glmf", "exl3-tp2-local", true, rank as u8).unwrap();
-            assert_eq!(inventory::ArchContext::coordinator(inventory::PRO_TOTAL_BYTES, None).context_bytes + code.bytes, baseline);
-            let sampled = [598_999_040, 609_484_800][rank];
-            assert_eq!(sampled + code.pending(sampled, 586_416_128), baseline);
-            assert!(graphs.growth(rank) >= 64 << 20);
+        let programs = ProgramSet::from_names(&["glmf", "glmf2"], ["glmf_decode", "glmf2_decode"]);
+        for rank in 0..2 {
+            assert!(loaded_code("glmf", "exl3-tp2-local", true, rank).is_none());
+            let code = inventory::loaded_code_allowance("glmf", "exl3-tp2-local", true, rank,
+                ArchContext::for_device("sm_120", inventory::PRO_TOTAL_BYTES), Some(&programs));
+            assert_eq!(code.basis, Basis::Estimated);
+            assert_eq!(code.bytes, programs.module_bytes());
+            assert_eq!(code.pending(586_416_128 + 100, 586_416_128), code.bytes - 100);
+            assert_eq!(graphs.growth(rank as usize), 0);
+            assert_eq!(graphs.ranks[rank as usize].basis, Basis::Estimated);
         }
     }
 

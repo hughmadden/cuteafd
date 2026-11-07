@@ -12,13 +12,18 @@ pub struct NativeLayout {
     pub rank: usize, pub ranks: usize, pub split: CoreSplit,
 }
 impl NativeLayout {
-    pub fn bytes(&self) -> Result<u64> {
+    pub fn allocation_extents(&self) -> Result<Vec<u64>> {
         let [n, k] = self.shape;
         let values = n.checked_mul(k).and_then(|n| n.checked_mul(if self.fp8 { 1 } else { 2 }))
             .context("native attention projection extent overflow")?.max(256);
         let scales = if self.fp8 { n.div_ceil(128).checked_mul(k.div_ceil(128)).and_then(|n| n.checked_mul(4))
             .context("native attention scale extent overflow")?.max(256) } else { 0 };
-        Ok(values.checked_add(scales).context("native attention projection byte overflow")? as u64)
+        Ok(if self.fp8 { vec![values as u64, scales as u64] } else { vec![values as u64] })
+    }
+
+    pub fn bytes(&self) -> Result<u64> {
+        self.allocation_extents()?.into_iter().try_fold(0u64, |sum, bytes|
+            sum.checked_add(bytes).context("native attention projection byte overflow"))
     }
 }
 
@@ -54,6 +59,20 @@ mod tests {
     use super::*;
     use crate::{plan::checkpoint::{CheckpointTensor, ProjectionStorage, SelectedProjection}, SafetensorsTensorMetadata};
     use cuteafd_core::DType;
+
+    #[test]
+    fn physical_native_extents_keep_values_and_fp8_scales_separate() -> Result<()> {
+        for (shape, fp8, expected) in [([256, 512], false, vec![262144]),
+            ([256, 512], true, vec![131072, 256]), ([1, 1], true, vec![256, 256])] {
+            let layout = NativeLayout { stem: "projection".into(), shape, fp8, rank: 0, ranks: 1, split: CoreSplit::Whole };
+            assert_eq!(layout.allocation_extents()?, expected);
+            assert_eq!(layout.bytes()?, expected.iter().sum::<u64>());
+        }
+        let overflow = NativeLayout { stem: "overflow".into(), shape: [usize::MAX, 2], fp8: false,
+            rank: 0, ranks: 1, split: CoreSplit::Whole };
+        assert!(overflow.allocation_extents().is_err());
+        Ok(())
+    }
 
     #[test]
     fn selected_fp8_scales_preserve_both_names_and_refuse_missing_or_ambiguous() -> Result<()> {

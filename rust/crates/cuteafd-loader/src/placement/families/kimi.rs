@@ -9,7 +9,7 @@ use super::super::{
     Placement, PoolLimits, ResidentWeights, Tp2Range,
 };
 use crate::formats::dflash::MlaDraftRuntimeLayout;
-use cuteafd_core::memory_layout::Category;
+use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 
 /// One shared decode/prefill endpoint per lane, using the same finite probe
@@ -112,6 +112,7 @@ pub struct FixedOwner {
     pub bytes: u64,
     pub weights: u64,
     pub lifetime: Lifetime,
+    pub basis: Basis,
 }
 
 impl FixedOwner {
@@ -123,6 +124,7 @@ impl FixedOwner {
             bytes: demand.bytes,
             weights: demand.resident_weights.0,
             lifetime: Lifetime::RESIDENT,
+            basis: demand.basis,
         }
     }
 }
@@ -486,6 +488,79 @@ impl KimiRecipe {
         profiles[if self.gpus == 2 && self.placement == AttentionPlacement::Layers { middle.min(2) } else { 0 }].clone()
     }
 
+    /// Price actual weight cudaMalloc requests, not aggregate layer demands.
+    /// Every alternative profile has its own physical request inventory.
+    pub fn allocation_granularity(&mut self,
+        cfg: &crate::families::kimi_k3::config::KimiK3Config,
+        core: &crate::families::kimi_k3::core::CoreInventory) -> anyhow::Result<()> {
+        use crate::families::kimi_k3::weight_layout::{GlobalLayout, LayerLayout};
+        anyhow::ensure!(!self.owners.iter().any(|component|
+            matches!(component.kind, ComponentKind::AllocationGranularity(_))),
+            "Kimi physical allocation inventory already prepared");
+        let globals = GlobalLayout::ranks_with_core(cfg, core, self.gpus)?;
+        let profiled = self.gpus == 2 && self.placement == AttentionPlacement::Layers;
+        for (option, modes) in self.attention_profiles().iter().enumerate() {
+            let mut backings = globals.iter().map(|layout| vec![GranularityBacking {
+                backing: format!("Kimi global weights.{}", layout.rank), requests: layout.allocation_extents(),
+            }]).collect::<Vec<_>>();
+            for (layer, &mode) in modes.iter().enumerate() {
+                for (rank, layout) in LayerLayout::ranks_with_core(cfg, layer, mode, core, self.gpus)?.iter().enumerate() {
+                    let selected = if self.gpus == 1 { None } else { Some(true) };
+                    let requests = layout.allocation_extents(selected)?;
+                    if !requests.is_empty() {
+                        backings[rank].push(GranularityBacking {
+                            backing: format!("layers.{layer}.{}.{rank}", if profiled { option } else { 0 }), requests,
+                        });
+                    }
+                    if self.gpus == 2 {
+                        let requests = layout.allocation_extents(Some(false))?;
+                        if !requests.is_empty() {
+                            backings[rank].push(GranularityBacking {
+                                backing: format!("Kimi layer {layer} TP2 FFN/residual/router/latent.{rank}"), requests,
+                            });
+                        }
+                    }
+                }
+            }
+            for (rank, backings) in backings.into_iter().enumerate() {
+                let mut component = allocation_granularity_component(AllocationGranularity {
+                    id: format!("kimi.weights.{rank}"), location: Location::coordinator(rank as u8),
+                    lifetime: Lifetime::RESIDENT, backings, evidence: GranularityEvidence::Forecast,
+                }, self.maximum_pages)?;
+                if profiled { component.activation = Activation::choice(0, option); }
+                self.owners.push(component);
+            }
+        }
+        Ok(())
+    }
+
+    /// Native target IO creates one vocabulary head per lane only without K6.
+    /// The MLA drafter constructor retains its own head even for a K6 target.
+    pub fn blas_owners(&mut self, core_head: bool) -> Result<(), Refusal> {
+        use super::super::planner::serving::{blas_components, BlasOwners};
+        if !(1..=2).contains(&self.gpus) || self.lanes == 0 {
+            return Err(invalid("invalid BLAS physical rank or lane geometry"));
+        }
+        if self.owners.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allowance(owner) if owner.source.starts_with("cuBLAS handles: Kimi "))) {
+            return Err(invalid("BLAS owners already prepared"));
+        }
+        let location = Location::coordinator((self.gpus - 1) as u8);
+        let mut handles = Vec::new();
+        if !core_head {
+            handles.push(BlasOwners { name: "Kimi target vocabulary heads".into(), process: "coordinator".into(),
+                location, cublas_handles: self.lanes, lt_handles: self.lanes,
+                lifetime: Lifetime::TARGET, activation: Activation::always() });
+        }
+        if self.draft.is_some() {
+            handles.push(BlasOwners { name: "Kimi MLA DFlash vocabulary head".into(), process: "coordinator".into(),
+                location, cublas_handles: 1, lt_handles: 1,
+                lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, activation: Activation::always() });
+        }
+        self.owners.extend(blas_components("sm_120", &handles, self.maximum_pages, PhaseOrder::DRAFT_THEN_TARGET)?);
+        Ok(())
+    }
+
     /// Graph bytes follow the same finite boundary as weights and KV. Callers
     /// build the executable keys only after admission selects that boundary.
     pub fn balance_graphs(&mut self, cfg: &crate::families::kimi_k3::config::KimiK3Config,
@@ -645,6 +720,19 @@ impl Recipe for KimiRecipe {
                 ByteCurve::linear(bytes, bytes, self.maximum_pages), false, self.maximum_pages));
         }
         for fixed in &self.fixed {
+            if fixed.group == crate::families::kimi_k3::allocation::CODE_OWNER {
+                if fixed.weights != 0 || fixed.category != Category::Runtime || fixed.basis != Basis::Estimated
+                    || fixed.lifetime != Lifetime::RESIDENT {
+                    return Err(invalid("selected-program code must be an Estimated opaque resident owner"));
+                }
+                if fixed.bytes == 0 { continue; }
+                contract.components.push(Component { activation: Activation::always(),
+                    bytes: ByteCurve::fixed(fixed.bytes, self.maximum_pages),
+                    kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(fixed.rank),
+                        bytes: fixed.bytes, lifetime: fixed.lifetime, assumed: true,
+                        source: fixed.group.clone() }) });
+                continue;
+            }
             if fixed.bytes == 0 { continue; }
             let owner = Allocation::buffer(format!("{}.{}", fixed.group, fixed.rank),
                 Location::coordinator(fixed.rank),
@@ -760,8 +848,6 @@ impl Recipe for KimiRecipe {
                 ("experts", "routed experts (balanced H128, replicated 3584 rotations)", spark.experts, Category::Experts),
                 ("overhead", "Spark rank I/O and execution owners", spark.overhead, Category::Workspace),
                 ("startup", cuteafd_core::memory_layout::spark_runtime_reserve_group(), spark.runtime, Category::Runtime),
-                ("arena-growth", cuteafd_core::memory_layout::SPARK_ARENA_DRIVER_OVERHEAD_GROUP,
-                    cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(spark.experts), Category::Workspace),
             ] {
                 if bytes == 0 { continue; }
                 let owner = Allocation::buffer(format!("spark.{}.{owner_kind}.{}", spark.rank, spark.count),
@@ -771,6 +857,18 @@ impl Recipe for KimiRecipe {
                     ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages);
                 component.activation = activation.clone();
                 contract.components.push(component);
+            }
+            if spark.experts != 0 {
+                contract.components.push(Component {
+                    activation,
+                    bytes: ByteCurve::fixed(spark.experts, self.maximum_pages),
+                    kind: ComponentKind::DriverPageTables {
+                        model: DriverPageTableModel::Sm121Arena,
+                        location: Location { device: Device::Spark(spark.rank as u8), domain: Domain::Managed },
+                        lifetime: Lifetime::RESIDENT,
+                        backing: format!("spark.{}.experts.{}", spark.rank, spark.count),
+                    },
+                });
             }
         }
         if let Some(draft) = &self.draft {
@@ -975,7 +1073,78 @@ mod tests {
             draft: None,
             owners: vec![],
             fixed: vec![FixedOwner { rank: 0, category: Category::Prefix, group: "Kimi exact KDA marks".into(),
-                bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT }],
+                bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }],
+        }
+    }
+
+    #[test]
+    fn blas_owners_follow_actual_target_and_draft_constructors() {
+        let order = PhaseOrder::DRAFT_THEN_TARGET;
+        for gpus in [1, 2] {
+            for lanes in [1, 2] {
+                for core_head in [false, true] {
+                    for draft in [false, true] {
+                        let mut recipe = recipe();
+                        recipe.gpus = gpus;
+                        recipe.lanes = lanes;
+                        recipe.draft = draft.then(|| Draft { context_split: false, owners: vec![],
+                            staging_at_first: 0, staging_per_page: 0 });
+                        recipe.blas_owners(core_head).unwrap();
+                        let owners = recipe.owners.iter().map(|component| {
+                            let ComponentKind::Allowance(owner) = &component.kind else { panic!("BLAS is opaque") };
+                            assert!(!owner.assumed);
+                            assert_eq!(owner.location, Location::coordinator((gpus - 1) as u8));
+                            owner
+                        }).collect::<Vec<_>>();
+                        let handles = owners.iter().filter(|owner| owner.source.starts_with("cuBLAS handles:")).collect::<Vec<_>>();
+                        assert_eq!(handles.len(), usize::from(!core_head) + usize::from(draft));
+                        for &phase in order.phases() {
+                            let target = if !core_head && order.at_or_before(Phase::PostTargetKv, phase) { lanes } else { 0 };
+                            let draft = u64::from(draft && order.at_or_before(Phase::DraftLoad, phase));
+                            let active = owners.iter().filter(|owner|
+                                order.at_or_before(owner.lifetime.first, phase)
+                                    && order.at_or_before(phase, owner.lifetime.last)).collect::<Vec<_>>();
+                            assert_eq!(active.iter().filter(|owner| owner.source.starts_with("BLAS device initialization")).count(),
+                                usize::from(target + draft > 0));
+                            assert_eq!(active.iter().map(|owner| owner.bytes).sum::<u64>(),
+                                (target + draft) * (64 << 20) + if target + draft > 0 { 2 << 20 } else { 0 });
+                        }
+                        if !core_head || draft { assert!(recipe.blas_owners(core_head).is_err()); }
+                    }
+                }
+            }
+        }
+        for (gpus, lanes) in [(0, 1), (3, 1), (1, 0)] {
+            let mut recipe = recipe();
+            recipe.gpus = gpus;
+            recipe.lanes = lanes;
+            assert!(recipe.blas_owners(false).is_err());
+        }
+    }
+
+    #[test]
+    fn selected_program_code_remains_an_estimated_opaque_owner() {
+        use crate::families::kimi_k3::allocation;
+        let mut recipe = recipe();
+        let demand = allocation::code_demand(0, 12345, 1).unwrap();
+        let owner = FixedOwner::ready(&demand);
+        recipe.fixed.push(owner.clone());
+        let contract = recipe.prepare(&single()).unwrap();
+        let code = contract.components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::Allowance(value) if value.source == allocation::CODE_OWNER => Some(value),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(code.len(), 1);
+        assert_eq!((code[0].bytes, code[0].assumed, code[0].lifetime), (12345, true, Lifetime::RESIDENT));
+        assert!(!contract.components.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.group == allocation::CODE_OWNER)));
+        for invalid in [FixedOwner { weights: 1, ..owner.clone() },
+            FixedOwner { category: Category::Workspace, ..owner.clone() },
+            FixedOwner { basis: Basis::Exact, ..owner.clone() },
+            FixedOwner { lifetime: Lifetime::TARGET, ..owner.clone() },
+            FixedOwner { bytes: 0, basis: Basis::Exact, ..owner.clone() }] {
+            recipe.fixed = vec![invalid];
+            assert!(recipe.prepare(&single()).is_err());
         }
     }
 
@@ -1166,6 +1335,12 @@ mod tests {
         assert_eq!(admitted.onboard, 1);
         assert_eq!(admitted.placement.layers[1].experts, ExpertHome::RtxWhole { gpu: 0 });
         assert_eq!(admitted.placement.layers[2].experts, ExpertHome::Spark);
+        let row = admitted.solved.phases.iter().find(|row| row.budget == "spark0" && row.phase == Phase::Ready).unwrap();
+        assert_eq!((row.owned, row.opaque), (100, 48));
+        let driver = &admitted.solved.facts.driver_page_tables[0];
+        assert_eq!(driver.model, DriverPageTableModel::Sm121Arena);
+        assert_eq!(driver.backing, "spark.0.experts.1");
+        assert!(!admitted.solved.facts.allocations.iter().any(|owner| owner.id.contains("arena-growth")));
     }
 
     #[test]
@@ -1186,7 +1361,7 @@ mod tests {
         recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
         recipe.fixed = [96_382_880_182, 100_432_126_894].into_iter().enumerate().map(|(rank, bytes)|
             FixedOwner { rank: rank as u8, category: Category::Runtime, group: "replayed max owners".into(),
-                bytes: bytes - 12 * per_layer, weights: 0, lifetime: Lifetime::RESIDENT }).collect();
+                bytes: bytes - 12 * per_layer, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }).collect();
         let request = request(recipe.context, Some(recipe.context), crate::placement::Onboard::Auto,
             recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), SparkReplyFormats::default());
         let started = std::time::Instant::now();

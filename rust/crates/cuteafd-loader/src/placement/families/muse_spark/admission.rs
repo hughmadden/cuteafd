@@ -601,10 +601,17 @@ impl<'a> ProductionInput<'a> {
                         runtime, Lifetime::RESIDENT, Category::Runtime,
                         cuteafd_core::memory_layout::spark_runtime_reserve_group(), maximum_pages));
                     let resident = spark_budget.resident[rank][count..].iter().sum();
-                    components.extend(buffer(format!("muse.spark.arena-growth.{rank}.{count}"), location,
-                        cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(resident),
-                        Lifetime::RESIDENT, Category::Workspace,
-                        cuteafd_core::memory_layout::SPARK_ARENA_DRIVER_OVERHEAD_GROUP, maximum_pages));
+                    if resident != 0 {
+                        components.push(Component {
+                            activation: Activation::always(),
+                            bytes: ByteCurve::fixed(resident, maximum_pages),
+                            kind: ComponentKind::DriverPageTables {
+                                model: DriverPageTableModel::Sm121Arena, location,
+                                lifetime: Lifetime::RESIDENT,
+                                backing: format!("muse.spark.experts.{rank}.{count}"),
+                            },
+                        });
+                    }
                 }
             }
             let envelope = crate::push_load::PushHostEnvelope::new(validation.clone(), vec![dense_bound; gpus],

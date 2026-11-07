@@ -221,6 +221,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn bytes(&self) -> u64 { self.entries.len() as u64 * self.each() }
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn contains(&self, key: &K) -> bool { self.entries.contains_key(key) }
+    pub fn keys(&self) -> Vec<K> { self.entries.keys().cloned().collect() }
     pub fn count(&self, matches: impl Fn(&K) -> bool) -> usize {
         self.entries.keys().filter(|key| matches(key)).count()
     }

@@ -6,15 +6,8 @@ pub const UNIT_ROWS: usize = PAGE_ROWS * UNIT_PAGES;
 pub const DECODE_ROWS: usize = 64;
 pub const PLAIN_DECODE_BUCKETS: [usize; 6] = [1, 4, 8, 16, 32, 64];
 pub const SPEC_DECODE_BUCKETS: [usize; 6] = [2, 4, 8, 16, 32, 64];
-// SM120 measured bytes per executable, plus admission margins (WP9, 2026-10-06).
-pub const MEASURED_GRAPH_BYTES: u64 = 146_459;
-pub const GRAPH_MARGIN_PERCENT: u64 = 20;
-pub const GRAPH_RANK_MARGIN_BYTES: u64 = 64 << 20;
-// WP9 SM120 measurements; retained until a selected-program ledger separates cuBLAS ownership.
-pub const WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20;
-pub fn workspace_runtime_overhead(_waves: usize, drafter: bool) -> u64 {
-    WORKSPACE_RUNTIME_OVERHEAD_BYTES * (2 + usize::from(drafter)) as u64
-}
+use crate::placement::inventory::{CapturedGraphRank, DeclaredGraphSet, GraphRank};
+use serde::{Deserialize, Serialize};
 
 pub fn verify_budget(decode_rows: usize, sms: usize) -> usize {
     if decode_rows <= DECODE_ROWS { decode_rows } else { (3 * sms / 4).clamp(DECODE_ROWS, decode_rows) }
@@ -47,20 +40,16 @@ impl DecodeBuckets {
     }
 }
 
-/// Measured bytes per startup executable by role (v3-p2 ready ledgers, RTX PRO 6000 SM120, driver
-/// 595.91.07, EXL3 K3.25, 64 decode rows, 2026-10-10): one GPU 1,946,157,056 B / 13,800 graphs;
-/// head-split lead 2,231,369,728 B / 13,800; peer 2,283,798,528 B / 13,500 (the split graphs carry
-/// the peer exchange's waits and copies).
-pub use crate::placement::inventory::GLMF_GRAPH_BYTES_BY_ROLE as MEASURED_GRAPH_BYTES_BY_ROLE;
-
-/// Measured bytes of `graphs` startup executables on `role` (0: one GPU, 1: split lead, 2: peer).
-pub fn measured_graph_bytes(graphs: u64, role: usize) -> u64 {
-    graphs * MEASURED_GRAPH_BYTES_BY_ROLE[role.min(2)]
+/// Whole historical observations are fallback estimates, not qualified census
+/// rows: exact keys and code provenance were not retained (#1463). No margin.
+pub fn estimated_graph_rank(graphs: u64, role: usize) -> GraphRank {
+    let (bytes, count) = [(1_946_157_056, 13_800), (2_231_369_728, 13_800),
+        (2_283_798_528, 13_500)][role.min(2)];
+    GraphRank::estimate(graphs, bytes, count).expect("GLMF historical graph estimate fits u64")
 }
 
 pub fn graph_reserve_bytes(graphs: usize) -> u64 {
-    let measured = graphs as u64 * MEASURED_GRAPH_BYTES;
-    measured + (measured * GRAPH_MARGIN_PERCENT).div_ceil(100) + GRAPH_RANK_MARGIN_BYTES
+    estimated_graph_rank(graphs as u64, 0).bytes
 }
 
 /// The startup decode graph set's bytes per rank: `buckets` (the engine's sets) over every geometry.
@@ -71,7 +60,7 @@ pub fn serving_graph_reserve(context: usize, pool_tokens: usize, dense: usize,
         .inventory.ranks.iter().map(|rank| rank.bytes).collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GraphGeometry {
     pub pool_width: usize,
     pub page_stride: usize,
@@ -185,27 +174,61 @@ mod tests {
         let shapes = serving_graph_shapes(1_048_576, 2_097_152 / PAGE_ROWS, 2051, 16, true, &buckets);
         assert_eq!(shapes.len(), 300);
         let bytes = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, true, &buckets);
-        assert_eq!(bytes, vec![graph_reserve_bytes(13_800), graph_reserve_bytes(13_500)]);
+        assert_eq!(bytes, vec![estimated_graph_rank(13_800, 1).bytes, estimated_graph_rank(13_500, 2).bytes]);
         assert_eq!(verify_budget(128, 170), 127);
         assert_eq!(verify_budget(128, 132), 99);
     }
 }
 
-/// One immutable geometry list and per-rank ledger for both admission and
-/// capture. Retain the existing reserve and per-role rounding byte-for-byte.
+/// Stable launch geometry shared by admission and the executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GraphKey {
+    pub segment: usize,
+    pub rows: usize,
+    pub spec: bool,
+    pub long: bool,
+    pub pool_width: usize,
+    pub page_stride: usize,
+    pub pool_stride: usize,
+}
+
+impl GraphKey {
+    pub fn new(segment: usize, rows: usize, spec: bool, geometry: GraphGeometry) -> Self {
+        let geometry = GraphGeometry::keyed(geometry.pool_width, geometry.page_stride, geometry.pool_stride, geometry.long);
+        Self { segment, rows, spec, long: geometry.long, pool_width: geometry.pool_width,
+            page_stride: geometry.page_stride, pool_stride: geometry.pool_stride }
+    }
+}
+
+pub fn executable_keys(shapes: &[(usize, bool, GraphGeometry)], layers: usize, rank: usize) -> Vec<GraphKey> {
+    shapes.iter().flat_map(|&(rows, spec, geometry)| (0..layers + usize::from(rank == 0))
+        .map(move |segment| GraphKey::new(segment, rows, spec, geometry))).collect()
+}
+
+pub fn declared_fingerprints(shapes: &[(usize, bool, GraphGeometry)], layers: usize, ranks: usize)
+    -> Result<Vec<String>, String> {
+    (0..ranks).map(|rank| DeclaredGraphSet::new(&executable_keys(shapes, layers, rank))?
+        .fingerprint(rank as u8)).collect()
+}
+
+/// Capture bytes and exact retained executable identities; never a count-only proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupCapture {
+    pub ranks: Vec<CapturedGraphRank>,
+}
+
+/// One immutable geometry list and estimated per-rank ledger for both admission and capture.
 #[allow(clippy::too_many_arguments)]
 pub fn startup_set(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
     speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets)
     -> crate::placement::inventory::StartupGraphs<(usize, bool, GraphGeometry)> {
-    use crate::placement::inventory::{GraphRank, GraphSet, Lifetime};
+    use crate::placement::inventory::{GraphSet, Lifetime};
     let keys = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation, buckets);
     let shapes = keys.len() as u64;
     let ranks = std::iter::once(shapes * (layers + 1) as u64)
         .chain(peer.then_some(shapes * layers as u64)).enumerate().map(|(rank, executables)| {
             let role = if peer { 1 + rank } else { 0 };
-            let bytes = graph_reserve_bytes(executables as usize);
-            let measured = measured_graph_bytes(executables, role).min(bytes);
-            GraphRank { executables, bytes, margin: bytes - measured }
+            estimated_graph_rank(executables, role)
         }).collect();
     GraphSet { ranks, shapes, lifetime: Lifetime::Startup }.startup(keys)
         .expect("startup geometry list and ledger are constructed together")
