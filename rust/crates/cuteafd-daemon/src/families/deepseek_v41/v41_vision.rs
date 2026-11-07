@@ -120,12 +120,14 @@ impl<'a> VisionRuntime<'a> {
             "vision owner exceeds device budget"
         );
         let names = Self::names();
-        let weights = NativeRtxTensors::load(
-            lib,
-            catalog,
-            &names,
-            NativeRtxTensors::plan(catalog, &names)?,
-            16 << 20,
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("v41/vision",
+            names.iter().map(|name| Ok((name.clone(), usize::try_from(catalog.device_tensor_bytes(name, None)?)?)))
+                .collect::<Result<Vec<_>>>()?)?;
+        // VisionRuntime is constructed inside its owning encoder thread/device.
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            crate::shared::memory::device::Device { library: lib, id: lib.cuda_get_device()? }, layout)?;
+        let weights = NativeRtxTensors::load_in(
+            lib, catalog, &names, NativeRtxTensors::plan(catalog, &names)?, 16 << 20, Some(&arena),
         )?;
         let workspace = DeviceAllocation::new(lib, V41VisionOps::WORKSPACE_BYTES)?;
         let ops = unsafe { lib.v41_vision_ops(workspace.buffer)? };
