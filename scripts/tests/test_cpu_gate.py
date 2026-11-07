@@ -786,6 +786,6 @@ def test_missing_installed_programs_manifest_surfaces_in_receipt_error(tmp_path,
     assert reason in receipt
 
 
-def test_help_documents_systemd_docker_supplementary_group():
-    assert 'SupplementaryGroups=docker' in gate.__doc__
+def test_help_warns_against_systemd_supplementary_groups():
+    assert '216/GROUP' in gate.__doc__
     assert 'gate-requirements.txt' in gate.__doc__

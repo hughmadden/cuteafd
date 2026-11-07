@@ -20,9 +20,10 @@ When cargo or rustc is not on PATH (a systemd user unit), the gate prepends the
 existing standard Cargo bin directories ($CARGO_HOME/bin, ~/.cargo/bin, the
 persistent architecture Cargo home, Homebrew's bin, and the toolchain rustup
 resolves when /opt/rustup exists) for itself and every child before refusing.
-Launch systemd user units with -p SupplementaryGroups=docker (and ensure the
-user manager holds the docker group) so Docker-socket tests such as
-test_cleanup_foreign_root_refused can reach /var/run/docker.sock.
+Systemd user units inherit the user manager's groups, so Docker-socket tests
+such as test_cleanup_foreign_root_refused reach /var/run/docker.sock when the
+user is in the docker group. Don't pass -p SupplementaryGroups=docker: a user
+manager can't set supplementary groups and the unit fails with 216/GROUP.
 
 With none of --cargo, --scripts, --benches the first two run. --benches runs
 the release host-cost bounds (BENCHES: the draft policy's select median at the
