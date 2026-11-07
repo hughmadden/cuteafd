@@ -1153,15 +1153,16 @@ mod tests {
     }
 
     #[test]
-    fn native_limits_default_to_model_maximum_and_allow_smaller_launches() {
+    fn native_limits_default_to_automatic_context_and_allow_pins() {
         use clap::Parser;
         let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command else {
             panic!("expected native serving");
         };
-        assert_eq!(args.max_context_tokens, 1_048_576);
-        assert_eq!(args.reserve.limits(args.max_context_tokens as usize).unwrap().output(), 131_072);
+        assert_eq!(args.max_context_tokens, 0);
+        // HTTP limits are created after admission resolves the automatic extent.
+        assert_eq!(args.reserve.limits(1_048_576).unwrap().output(), 131_072);
         assert_eq!(args.concurrency, 16);
         assert_eq!(args.resolved_prefix_entries(), 20);
         assert_eq!(args.dspark_draft_limit, 5);
@@ -1214,7 +1215,7 @@ mod tests {
         // Sizes only: no percentage ceiling and no removed reservation key.
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--gpu-memory-cap", "87.5%"])).is_err());
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--memory-reservation", "87.5GiB"])).is_err());
-        for (context, output, valid) in [("256", "128", true), ("0", "128", false),
+        for (context, output, valid) in [("256", "128", true), ("0", "128", true),
             ("1048577", "128", false), ("256", "0", true), ("256", "-1", true), ("256", "393217", true),
             ("256", "12k", false)] {
             let command = base.into_iter().chain(["--max-context-tokens", context, "--max-output-tokens", output]);
@@ -1444,7 +1445,7 @@ pub(crate) struct NativeServeArgs {
     pub prefill_reserve_rows: u32,
 
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
-    #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=1048576))]
     pub max_context_tokens: u32,
 
     /// Output limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).

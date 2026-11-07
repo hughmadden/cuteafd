@@ -172,8 +172,7 @@ pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: 
     use cuteafd_core::memory_layout::DeviceKind as Layout;
     let policy = MemoryPolicy::current();
     let smallest = physical_card;
-    let spark_free = !layout.devices.iter().any(|device| device.kind == Layout::Spark);
-    let Ok(kv) = policy.kv(smallest, context, spark_free) else { return Vec::new() };
+    let Ok(kv) = policy.kv(smallest, context) else { return Vec::new() };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: layout.pool_tokens };
     layout.devices.iter().map(|device| {
         let (kind, named) = match device.kind {
@@ -198,8 +197,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
     let smallest = plan.budgets.iter().filter(|budget| budget.locations.iter()
         .any(|location| matches!(location.device, Device::Coordinator(_))))
         .map(|budget| budget.physical_bytes).min().unwrap_or(u64::MAX);
-    let spark_free = !plan.budgets.iter().any(|budget| budget.locations.iter().any(|location| matches!(location.device, Device::Spark(_))));
-    let Ok(kv) = policy.kv(smallest, plan.request.context, spark_free) else { return };
+    let Ok(kv) = policy.kv(smallest, plan.request.context.maximum) else { return };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: plan.pool_tokens };
     for budget in &plan.budgets {
         let (kind, location) = match budget.locations.first().map(|location| location.device) {
@@ -225,7 +223,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
 pub fn log_placement(placement: &super::Placement, request: &super::PlacementRequest) {
     let policy = MemoryPolicy::current();
     let smallest = request.inventory.gpus.iter().map(|gpu| gpu.capacity_bytes).min().unwrap_or(u64::MAX);
-    let Ok(kv) = policy.kv(smallest, request.pool.compiled_context, request.inventory.spark_ranks == 0) else { return };
+    let Ok(kv) = policy.kv(smallest, request.pool.compiled_context) else { return };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: placement.pool_tokens };
     for (gpu, (budget, items)) in request.inventory.gpus.iter().zip(&placement.items).enumerate() {
         let line = cuteafd_core::memory_policy::render_line(&breakdown(format!("rtx{gpu}"), DeviceKind::Gpu,
@@ -295,8 +293,8 @@ mod tests {
         // The GPU cap is the plan's cap, not the layout capacity already less the reserve.
         assert!(lines[0].starts_with("rtx0: cap 98304MiB; weights 40960MiB"), "{}", lines[0]);
         assert!(lines[0].contains("reserve 1624MiB [context+modules 600MiB, family reserve 1024MiB]"), "{}", lines[0]);
-        // With Sparks the default min is the serving context (no 256K agentic floor).
-        assert!(lines[0].contains("KV target 2097152 min 1048576 max 2097152, pool 1048576 tokens / 20480MiB"), "{}", lines[0]);
+        // The same shared default minimum applies with Sparks.
+        assert!(lines[0].contains("KV target 2097152 min 262144 max 2097152, pool 1048576 tokens / 20480MiB"), "{}", lines[0]);
         // A Spark's cap is its worker ceiling; its residual is a named component.
         assert!(lines[1].starts_with("spark0: cap 110592MiB; weights 92160MiB"), "{}", lines[1]);
         // Sparks carry no family reserve; the residual is their named component.

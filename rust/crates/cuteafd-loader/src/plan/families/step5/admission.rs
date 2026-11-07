@@ -182,6 +182,7 @@ pub struct RuntimeInputs {
     pub full_prefill_logits: bool,
     pub sequences: usize,
     pub context: u64,
+    pub serving_context: crate::placement::planner::Context,
     pub requested_pool: Option<u64>,
     pub marks: MarkRule,
     pub peer_diagnostics: bool,
@@ -373,9 +374,7 @@ impl RuntimeInputs {
             &self.inventory.gpus.iter().map(|g| g.capacity_bytes).collect::<Vec<_>>(),
             self.context,
             self.requested_pool,
-            64,
-            false,
-        )
+            64).with_context(self.serving_context)
         .validate_explicit()?;
         ensure!(
             self.pending_code.len() == ranks && self.marks.lanes == self.sequences,
@@ -575,7 +574,7 @@ mod tests {
             },
             rows: 64,
             sequences: 16,
-            context: FLOOR,
+            context: FLOOR, serving_context: crate::placement::planner::Context::pinned(FLOOR),
             requested_pool: Some(FLOOR),
             marks: MarkRule {
                 lanes: 16,

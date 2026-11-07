@@ -149,7 +149,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
                 reserve_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: 1_048_576,
+            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: 1_048_576, serving_context: crate::placement::planner::Context::pinned(1_048_576),
             requested_pool: Some(1_048_576),
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
@@ -740,7 +740,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         if let Some(tokens) = pool {
             assert_eq!(memory.pool_tokens, tokens);
         } else {
-            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64, false).target;
+            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64).target;
             assert!((context..=target).contains(&memory.pool_tokens));
             // More free capacity must grow the same default-format pool to its cap.
             let roomy = report_context(dir.path(), 1, 160, 4, None, context);
@@ -2078,7 +2078,7 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
                 reserve_bytes: 0,
             }; 2], spark_ranks: 6, peer_access: true },
             rows: 64, waves: 1, unit: 64, full_prefill_logits: false,
-            sequences: 1, context: 262_144, requested_pool: Some(262_144),
+            sequences: 1, context: 262_144, serving_context: crate::placement::planner::Context::pinned(262_144), requested_pool: Some(262_144),
             marks: MarkRule { lanes: 1, entries: 0, budget_bytes: 0, host: false },
             peer_diagnostics: false, pending_code: vec![0; 2], onboard: None,
         };

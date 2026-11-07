@@ -92,7 +92,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         mark_slots: options.mark_slots, context, maximum_pool_tokens,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
         local: options.local, drafter: options.drafter, fixed, media }.prepare()?;
-    let request = shared::production_request(context, options.pool_tokens, options.onboard,
+    let request = shared::production_request(cuteafd_loader::placement::planner::Context::resolve(context, options.max_context), options.pool_tokens, options.onboard,
         cuteafd_loader::placement::planner::PrefillShape { rows: options.prefill.unit_rows, waves: options.prefill.waves },
         if options.full_prefill_logits { cuteafd_loader::placement::planner::Operation::Scoring }
         else { cuteafd_loader::placement::planner::Operation::Serving },
@@ -100,7 +100,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
     let admitted = prepared.admit(request)?;
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "muse_spark");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
-    cuteafd_bench::context::ResolvedSettings::prefill(options.prefill).value("max-context", context).publish();
+    cuteafd_bench::context::ResolvedSettings::prefill(options.prefill).value("max-context", admitted.solved.request.context.served(admitted.solved.pool_tokens)).publish();
     Ok(admitted)
 }
 

@@ -517,7 +517,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     }
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 128 } else { 64 };
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(
-        &options.rtx_bytes[..gpus], context, options.pool_tokens, page_tokens, spark_ranks == 0).maximum_tokens();
+        &options.rtx_bytes[..gpus], context, options.pool_tokens, page_tokens).maximum_tokens();
     let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
     let prefill = PrefillShape { rows, waves: lanes };
     let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
@@ -583,7 +583,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
     let budgets = production_budgets(&options.rtx_bytes[..gpus].iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
-    let request = production_request(context, options.pool_tokens, onboard, prefill, operation,
+    let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let mut prepared = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
         attention, gpus, prefill, target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
@@ -699,7 +699,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     }).transpose()?;
     let page_tokens = if attention == crate::placement::AttentionPlacement::Context { 2 * glm::PAGE_ROWS } else { glm::PAGE_ROWS };
     let maximum_pool_tokens = crate::placement::PoolPolicy::resolve(
-        &options.rtx_bytes, context, options.pool_tokens, page_tokens, spark_ranks == 0).maximum_tokens();
+        &options.rtx_bytes, context, options.pool_tokens, page_tokens).maximum_tokens();
     let maximum_pages = maximum_pool_tokens.div_ceil(page_tokens);
     let (draft, mut additional, prefix_quota) = production_serving(options, checkpoint, &cfg,
         context, attention, gpu_count, maximum_pages)?;
@@ -723,7 +723,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let budgets = production_budgets(&options.rtx_bytes.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
         crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
-    let request = production_request(context, options.pool_tokens, onboard, prefill, operation,
+    let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let admitted = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
         attention, gpus: gpu_count, prefill, target, draft, scratch, context_scratch: context_programs,

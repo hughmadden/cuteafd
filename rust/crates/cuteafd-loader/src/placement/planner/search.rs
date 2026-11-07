@@ -759,8 +759,11 @@ pub fn solve(
         },
         &budgets,
     )?;
-    if request.context == 0 {
+    if request.context.maximum == 0 {
         return Err(Refusal::InvalidFact("zero context".into()));
+    }
+    if request.context.required() > request.context.maximum {
+        return Err(Refusal::InvalidFact("pinned context exceeds model/workspace maximum".into()));
     }
     let page = contract.page_rows;
     let multiple = contract.pool_page_multiple;
@@ -772,18 +775,16 @@ pub fn solve(
                 page_rows: pool_rows,
             });
         }
-        if tokens < request.context {
+        if tokens < request.context.required() {
             return Err(Refusal::PoolBelowContext {
                 tokens,
-                context: request.context,
+                context: request.context.required(),
             });
         }
     }
     if matches!(request.prefill, Pin::Exact(s) if s.rows == 0 || s.waves == 0) {
         return Err(Refusal::InvalidPin("zero prefill shape"));
     }
-    let minimum = request.context.div_ceil(pool_rows).checked_mul(multiple)
-        .ok_or(Refusal::Overflow("minimum pool pages"))?;
     // KV target, min and max (`cuteafd_core::memory_policy`). The layout is
     // searched at the target; an automatic pool then grows to the max.
     // The card class picks the default target (a capped PRO keeps the PRO
@@ -791,14 +792,15 @@ pub fn solve(
     let smallest = budgets.iter().filter(|b| b.locations.iter()
         .any(|l| matches!(l.device, Device::Coordinator(_))))
         .map(|b| b.physical_bytes).min().unwrap_or(u64::MAX);
-    let spark_free = !budgets.iter().any(|b| b.locations.iter().any(|l| matches!(l.device, Device::Spark(_))));
-    let kv = cuteafd_core::memory_policy::MemoryPolicy::current().kv(smallest, request.context, spark_free)
+    let kv = cuteafd_core::memory_policy::MemoryPolicy::current().kv(smallest, request.context.maximum)
         .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
     let aligned = |tokens: u64| tokens.div_ceil(page).div_ceil(multiple).checked_mul(multiple)
         .ok_or(Refusal::Overflow("target pool pages"));
+    let floor = request.context.required().max(if matches!(request.pool, Pin::Auto) { kv.min } else { 0 });
+    let minimum = aligned(floor)?;
     let compiled = contract.maximum_pages / multiple * multiple;
-    let target = aligned(kv.target.max(request.context))?;
-    let ceiling = aligned(kv.max.max(kv.target).max(request.context))?.min(compiled);
+    let target = aligned(kv.target.max(request.context.required()))?;
+    let ceiling = aligned(kv.max.max(kv.target).max(request.context.required()))?.min(compiled);
     let wanted = match request.pool {
         Pin::Auto => target.min(compiled),
         Pin::Exact(n) => n / page,
@@ -885,7 +887,7 @@ pub fn solve(
         if !matches!(search.last, Refusal::Capacity { .. }) {
             return Err(search.last);
         }
-        return Err(Refusal::FullContextShortfall { context: request.context,
+        return Err(Refusal::FullContextShortfall { context: floor,
             tokens: pages.checked_mul(page).ok_or(Refusal::Overflow("feasible pool tokens"))?,
             limiting: Box::new(search.last) });
     }
@@ -899,15 +901,6 @@ pub fn solve(
     let pages = if matches!(request.pool, Pin::Auto) && ceiling > pages {
         costs.limit(&budgets, &selected, pages, ceiling)?.unwrap_or(pages).max(pages)
     } else { pages };
-    // An explicit KV_MIN_TOKENS refuses a smaller automatic pool; unset, the
-    // family's own context floor (`minimum`, above) is the refusal.
-    let explicit_min = cuteafd_core::memory_policy::MemoryPolicy::current().kv_min;
-    if matches!(request.pool, Pin::Auto) && explicit_min.is_some()
-        && pages.saturating_mul(page) < kv.min.min(compiled.saturating_mul(page)) {
-        return Err(Refusal::FullContextShortfall { context: kv.min,
-            tokens: pages.checked_mul(page).ok_or(Refusal::Overflow("feasible pool tokens"))?,
-            limiting: Box::new(Refusal::InvalidFact(format!("KV_MIN_TOKENS {} is above the admitted pool", kv.min))) });
-    }
     let decisions = contract.decisions(&selected)?;
     let facts = contract.facts(&selected, pages)?;
     let phases = evaluate(&facts, &budgets)?;

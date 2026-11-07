@@ -1,6 +1,6 @@
 //! The one KV pool policy (`cuteafd_core::memory_policy`): the layout is
 //! sized for `KV_TARGET_TOKENS` (2M tokens on cards above 32 GiB, 1M at 32 GiB
-//! or less, never below the compiled context); the pool then grows into what
+//! or less by default); the pool then grows into what
 //! the fixed layout leaves, up to `KV_MAX_TOKENS`; below `KV_MIN_TOKENS` the
 //! launch is refused.
 use cuteafd_core::memory_policy::{MemoryPolicy, SMALL_CARD_BYTES};
@@ -28,20 +28,20 @@ impl CoordinatorCard {
 
     pub fn maximum_pool(cards: &[Self], context: u64, requested: Option<u64>, page_rows: u64) -> u64 {
         let physical = cards.iter().map(|card| card.physical_bytes).collect::<Vec<_>>();
-        PoolPolicy::resolve(&physical, context, requested, page_rows, false).maximum_tokens()
+        PoolPolicy::resolve(&physical, context, requested, page_rows).maximum_tokens()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolPolicy {
-    /// Fixed or operator-set context requirement; zero for automatic context.
-    /// Independent of the mutable fit floor and the selected pool.
+    pub context: super::planner::Context,
+    /// Immutable workspace extent, independent of the pool fit floor.
     pub compiled_context: u64,
     /// An explicit pool is strict: admission fails rather than shrink it.
     pub requested: Option<u64>,
     /// The layout (onboarding, buffers) is sized for this pool.
     pub target: u64,
-    /// Admission refuses below this (`KV_MIN_TOKENS`, never below the compiled context).
+    /// Admission refuses below this (`KV_MIN_TOKENS` and any pinned context).
     pub floor: u64,
     /// The largest pool the build can index; a fixed onboard fills up to it.
     pub ceiling: u64,
@@ -64,36 +64,30 @@ impl PoolPolicy {
     /// `card_bytes` are the coordinator GPUs' totals; `context` the compiled
     /// serving context; `requested` 0 or `None` means automatic. KV target,
     /// min and max come from the installed memory policy.
-    pub fn resolve(card_bytes: &[u64], context: u64, requested: Option<u64>, unit_rows: u64,
-        spark_free: bool) -> Self {
+    pub fn resolve(card_bytes: &[u64], context: u64, requested: Option<u64>, unit_rows: u64) -> Self {
         let requested = Self::normalize_request(requested);
         let smallest = card_bytes.iter().copied().min().unwrap_or(u64::MAX);
         let policy = MemoryPolicy::current();
         let target_default = if smallest <= SMALL_CARD_BYTES { cuteafd_core::memory_policy::SMALL_CARD_KV_TARGET_TOKENS }
             else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS };
-        let target = policy.kv_target.unwrap_or(target_default).max(context);
-        // Explicit pools must cover the compiled context. Automatic pools are
-        // refused below KV_MIN_TOKENS; unset, the serving context, and the
-        // 256K agentic floor on Spark-free layouts (Sparks may serve less,
-        // with the context clamped to the pool).
-        let minimum = policy.kv_min.unwrap_or(if spark_free { AGENTIC_FLOOR_TOKENS } else { 0 });
+        let target = policy.kv_target.unwrap_or(target_default.max(context));
+        let minimum = policy.kv_min.unwrap_or(context.min(AGENTIC_FLOOR_TOKENS).min(target));
         let floor = match requested {
             Some(n) => n.max(context),
             None => context.max(minimum),
         };
         let max = requested.unwrap_or_else(|| policy.kv_max.unwrap_or(target).max(target));
-        Self { compiled_context: context, requested, target, floor, ceiling: u64::MAX, max, unit_rows }
+        Self { context: context.into(), compiled_context: context, requested, target, floor, ceiling: u64::MAX, max, unit_rows }
     }
 
-    /// Automatic checkpoint context may be clamped by serving to an explicit
-    /// diagnostic pool. Fixed compiled extents must not use this mode.
-    pub fn with_automatic_context(mut self, automatic: bool) -> Self {
-        if automatic {
-            self.compiled_context = 0;
-            if let Some(requested) = self.requested {
-                self.floor = requested;
-            }
-        }
+    /// Apply the shared context requirement without changing workspace extents.
+    pub fn with_context(mut self, context: super::planner::Context) -> Self {
+        self.context = context;
+        self.compiled_context = context.maximum;
+        self.target = MemoryPolicy::current().kv_target.unwrap_or(self.target).max(context.required());
+        let minimum = MemoryPolicy::current().kv_min
+            .unwrap_or(context.maximum.min(AGENTIC_FLOOR_TOKENS).min(self.target));
+        self.floor = self.requested.unwrap_or(minimum).max(context.required());
         self
     }
 
@@ -106,9 +100,9 @@ impl PoolPolicy {
     }
 
     pub fn validate_explicit(&self) -> Result<(), super::PlacementError> {
-        if let Some(requested) = self.requested.filter(|&n| n > 0 && n < self.compiled_context) {
+        if let Some(requested) = self.requested.filter(|&n| n > 0 && n < self.context.required()) {
             return Err(super::PlacementError::RequestedBelowContext {
-                requested, floor: self.compiled_context,
+                requested, floor: self.context.required(),
             });
         }
         Ok(())
@@ -149,18 +143,18 @@ mod tests {
     #[test]
     fn targets_follow_the_smallest_card_and_the_context() {
         let gib = 1u64 << 30;
-        assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, None, 256, false).target, 2 << 20);
-        assert_eq!(PoolPolicy::resolve(&[96 * gib, 32 * gib], 131_072, None, 256, false).target, 1 << 20);
-        assert_eq!(PoolPolicy::resolve(&[32 * gib], 1 << 21, None, 256, false).target, 1 << 21);
-        let explicit = PoolPolicy::resolve(&[96 * gib], 131_072, Some(32_768), 256, true);
+        assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, None, 256).target, 2 << 20);
+        assert_eq!(PoolPolicy::resolve(&[96 * gib, 32 * gib], 131_072, None, 256).target, 1 << 20);
+        assert_eq!(PoolPolicy::resolve(&[32 * gib], 1 << 21, None, 256).target, 1 << 21);
+        let explicit = PoolPolicy::resolve(&[96 * gib], 131_072, Some(32_768), 256);
         assert_eq!((explicit.requested, explicit.floor), (Some(32_768), 131_072));
         assert_eq!(explicit.validate_explicit(), Err(super::super::PlacementError::RequestedBelowContext {
             requested: 32_768, floor: 131_072,
         }));
-        assert!(PoolPolicy::resolve(&[96 * gib], 32_768, Some(32_768), 256, true)
+        assert!(PoolPolicy::resolve(&[96 * gib], 32_768, Some(32_768), 256)
             .validate_explicit().is_ok());
-        assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256, true).floor, AGENTIC_FLOOR_TOKENS);
-        assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256, true).requested, None);
+        assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256).floor, 131_072);
+        assert_eq!(PoolPolicy::resolve(&[96 * gib], 131_072, Some(0), 256).requested, None);
 
     }
 }

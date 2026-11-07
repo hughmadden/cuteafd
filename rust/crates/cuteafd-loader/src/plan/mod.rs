@@ -196,13 +196,14 @@ pub struct RoleReadiness {
 /// The admitted phase totals, separate from Ready-resident layout items.
 #[derive(Debug, Clone, Serialize)]
 pub struct SolvedPhaseLedger {
+    pub served_context_tokens: u64,
     pub budgets: Vec<crate::placement::planner::Budget>,
     pub phases: Vec<crate::placement::planner::PhaseBudget>,
 }
 
 impl From<&crate::placement::planner::ResolvedPlan> for SolvedPhaseLedger {
     fn from(plan: &crate::placement::planner::ResolvedPlan) -> Self {
-        Self { budgets: plan.budgets.clone(), phases: plan.phases.clone() }
+        Self { served_context_tokens: plan.served_context(), budgets: plan.budgets.clone(), phases: plan.phases.clone() }
     }
 }
 
@@ -210,6 +211,7 @@ impl SolvedPhaseLedger {
     fn render(&self, out: &mut String) {
         use crate::placement::planner::{Baseline, Device, Domain};
         use std::fmt::Write;
+        let _ = writeln!(out, "served context: {} tokens", self.served_context_tokens);
         for budget in &self.budgets {
             let Some(peak) = self.phases.iter().filter(|row| row.budget == budget.id)
                 .reduce(|peak, row| if u128::from(row.owned) + u128::from(row.opaque)

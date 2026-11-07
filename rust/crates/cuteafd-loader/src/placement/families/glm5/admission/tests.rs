@@ -451,7 +451,7 @@ fn glm_draft_first_peak_excludes_target_kv_and_changes_tight_pool_admission() {
     let mut target_first = actual.clone();
     target_first.phase_order = PhaseOrder::TARGET_THEN_DRAFT;
     let selected = vec![0; actual.variables.len()];
-    let pages = req.context / recipe.page_tokens;
+    let pages = req.context.maximum / recipe.page_tokens;
     let facts = actual.facts(&selected, pages).unwrap();
     let target_bytes: u64 = facts
         .allocations
@@ -501,7 +501,7 @@ fn glm_draft_first_peak_excludes_target_kv_and_changes_tight_pool_admission() {
 
 fn request() -> Request {
     Request {
-        context: 4096,
+        context: (4096).into(),
         pool: Pin::Exact(4096),
         onboard: Pin::Auto,
         prefill: Pin::Auto,
@@ -1758,7 +1758,7 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
     let context = 131136;
     let recipe = owned_graph_recipe(&cfg, context);
     let mut request = request();
-    request.context = context;
+    request.context = context.into();
     request.pool = Pin::Auto;
     request.onboard = Pin::Exact(0);
     request.prefill = Pin::Exact(recipe.prefill[0]);
@@ -1779,7 +1779,7 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
     }
     let plan = planner::solve(request.clone(), limits.clone(), &recipe).unwrap();
     assert_eq!(plan.pool_tokens, wanted);
-    assert_eq!(plan.request.context, context);
+    assert_eq!(plan.request.context.maximum, context);
     assert_eq!(contract.maximum_pages, 32768);
     // A smaller context changes the declaration; it cannot make the full request fit.
     let smaller = StartupGraphs::new(context - 64, AttentionPlacement::Layers, 2,
@@ -1819,7 +1819,7 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
         planner::solve(request.clone(), limits, &recipe),
         Err(Refusal::FullContextShortfall { .. })
     ));
-    request.context -= 64;
+    request.context.maximum -= 64;
     assert!(matches!(
         recipe.prepare(&request),
         Err(Refusal::InvalidFact(_))
@@ -1926,7 +1926,7 @@ fn composition_refuses_mismatched_geometry_domains_and_non_target_experts() {
     ];
     refuses(bad);
     let mut beyond = request();
-    beyond.context = 8192;
+    beyond.context = 8192.into();
     assert!(matches!(
         base.prepare(&beyond),
         Err(Refusal::InvalidFact(_))

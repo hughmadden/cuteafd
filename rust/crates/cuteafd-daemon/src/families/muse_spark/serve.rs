@@ -230,7 +230,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
     let placement = &built.placement;
     cuteafd_bench::context::ResolvedSettings::placement(placement).publish();
-    cuteafd_bench::context::set_resolved("max-context", &args.max_context.unwrap_or(cfg.max_position as u64).to_string());
+    cuteafd_bench::context::set_resolved("max-context", &cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens).to_string());
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
@@ -243,7 +243,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let admission_plan = crate::shared::placement::SparkAdmission::plan_view(&view,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(),
         spark.model.clone(), None)?;
-    let context = args.max_context.unwrap_or(cfg.max_position as u64);
+    let context = cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens);
     // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over
     // peer access), filled in the background while the layers load.
     let name = "model.language_model.embed_tokens.weight";

@@ -709,7 +709,7 @@ mod tests {
                 chunk_bytes: geometry.chunk_bytes().min(quota) };
             assert_eq!(live.as_ref().map_or(0, |c| c.bytes), owner.quota_bytes);
             assert_eq!(live.as_ref().map_or(0, |c| c.chunk_bytes), owner.chunk_bytes);
-            let admitted = qwen3_5::admit(Request { context: cfg.max_context as u64,
+            let admitted = qwen3_5::admit(Request { context: (cfg.max_context as u64).into(),
                 pool: Pin::Exact(cfg.max_context as u64), onboard: Pin::Auto,
                 prefill: Pin::Exact(PrefillShape { rows: 4096, waves: 1 }), operation: Operation::Serving,
                 resident_weight_limit: None, spark_reply_formats: Default::default() },

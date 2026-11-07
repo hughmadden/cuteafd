@@ -583,7 +583,7 @@ impl Opened {
         } else { requested };
         cuteafd_loader::placement::families::QWEN4.check_attention(selected,
             1 + usize::from(args.split_device.is_some()), args.split_device.is_some())?;
-        let automatic_context = args.max_context == 0;
+        let requested_context = (args.max_context > 0).then_some(args.max_context as u64);
         let mut context_args = args.clone();
         let resolved = args.resolved_prefill()?;
         let prefill_shape = args.prefill_shape()?;
@@ -596,10 +596,10 @@ impl Opened {
             &args.snapshot, &args.manifest, "qwen4", args.max_context)?;
         let args = &context_args;
         cuteafd_loader::placement::PoolPolicy::resolve(&[], args.max_context as u64,
-            (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 256, false)
-            .with_automatic_context(automatic_context).validate_explicit()?;
+            (args.pool_tokens > 0).then_some(args.pool_tokens as u64), 256)
+            .with_context(cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context)).validate_explicit()?;
         if let Some(peer) = args.split_device {
-            return self.with_dual_engine(args, peer, automatic_context, media, body);
+            return self.with_dual_engine(args, peer, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), media, body);
         }
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
@@ -783,10 +783,10 @@ impl Opened {
                 self.checkpoint.spark_input_is_bf16(), ple.as_ref().map(|p| p.row_bytes as u64), window_push)?;
             let (pool, host) = admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
                 manifest_json.as_ref(), ple.as_ref().map(|p| (p.row_bytes as u64, p.fp8)),
-                future_expert_bytes)?, source, automatic_context, admitted_weights, host)?;
+                future_expert_bytes)?, source, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), admitted_weights, host)?;
             (pool, Some(host))
         } else { (args.pool_tokens, None) };
-        let max_context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool_tokens, 256)?;
+        let max_context = crate::shared::context::pool_context("qwen4", cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), pool_tokens)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;

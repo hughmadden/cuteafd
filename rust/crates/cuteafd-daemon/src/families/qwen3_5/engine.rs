@@ -132,7 +132,7 @@ impl<'a> DenseEngine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
+        mut cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
         prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool)>, verify_check: bool) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
@@ -160,7 +160,8 @@ impl<'a> DenseEngine<'a> {
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         let budgets = qwen3_5::sampled_budgets(free as u64, total as u64, None, host)?;
         let request = Request {
-            context: cfg.max_context as u64,
+            context: cuteafd_loader::placement::planner::Context::resolve(cfg.max_context as u64,
+                serving.is_none().then_some(cfg.max_context as u64)),
             pool: requested_pool.filter(|&n| n > 0).map(Pin::Exact).unwrap_or(Pin::Auto),
             onboard: Pin::Auto,
             prefill: Pin::Exact(PrefillShape { rows: ROWS as u64, waves: 1 }),
@@ -243,6 +244,7 @@ impl<'a> DenseEngine<'a> {
             == pool_tokens * cfg.full_kv_bytes_per_token(kv_format),
             "dense native planner KV differs from actual runtime allocations");
         tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
+        cfg.max_context = usize::try_from(admitted_plan.served_context())?;
         Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, admitted_host_config: host_config, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],

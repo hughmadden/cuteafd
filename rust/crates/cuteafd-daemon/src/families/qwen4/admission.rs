@@ -142,7 +142,7 @@ impl ExpertSource {
 /// the shared admission's fixed items and, with startup graphs, the largest pool whose own graph set
 /// fits beside them.
 pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>,
-    source: ExpertSource, automatic_context: bool, loaded_weights: ResidentWeights, host: qwen4::QwenHost)
+    source: ExpertSource, context: cuteafd_loader::placement::planner::Context, loaded_weights: ResidentWeights, host: qwen4::QwenHost)
     -> Result<(usize, qwen4::QwenHost)> {
     let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key(),
         &inputs.manifest.map(|m| cuteafd_loader::placement::ProgramSet::from_manifest(m, &["qwen4"]))
@@ -160,7 +160,7 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
         mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
     let mut inputs = placement_inputs(args, admission, source,
-        (available as u64, total as u64), pending, enabled, automatic_context, host);
+        (available as u64, total as u64), pending, enabled, context, host);
     inputs.loaded_weights = loaded_weights;
     let (placement, solved) = qwen4::admitted(&inputs)?;
     cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
@@ -172,11 +172,11 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
 }
 
 fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, source: ExpertSource,
-    (available, total): (u64, u64), pending: u64, graphs_enabled: bool, automatic_context: bool,
+    (available, total): (u64, u64), pending: u64, graphs_enabled: bool, context: cuteafd_loader::placement::planner::Context,
     host: qwen4::QwenHost) -> qwen4::QwenInputs<'a> {
     qwen4::QwenInputs {
         loaded_weights: Default::default(),
-        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), automatic_context: automatic_context, admission, capacity_bytes: total,
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), context, admission, capacity_bytes: total,
         baseline: Baseline::Measured { free_bytes: available }, pending_code_bytes: pending,
         max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         spark_ranks: source.spark_ranks(),
@@ -654,7 +654,7 @@ mod tests {
             let onboard = Onboard::Auto;
             {
                 let mut inputs = qwen4::QwenDualInputs {
-        resident_weight_limit: None, automatic_context: false,
+        resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072),
                     owner_manifests: [None; 2],
                     admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
@@ -894,7 +894,7 @@ mod tests {
             if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, args.prefill_rows as u64)?); }
             let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs {
-        resident_weight_limit: None, automatic_context: false, owner_manifests: manifests.each_ref().map(Some), admission,
+        resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072), owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
                     reserve_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
                         - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
@@ -977,7 +977,7 @@ mod tests {
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let planned = qwen4::QwenInputs {
                     loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
-                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
+                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: pool, spark_ranks: 0,
                     startup_graph_modes: args.planner_graph_modes,
@@ -1001,7 +1001,7 @@ mod tests {
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let mut invalid = qwen4::QwenInputs {
                     loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
-                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
+                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: Some(layout.pool_tokens), spark_ranks: 0,
                     startup_graph_modes: Some((65, true)), host: qwen4::QwenHost::ample(&cfg, 1, 4096)?, encoders: Default::default() };
@@ -1036,7 +1036,7 @@ mod tests {
         with_peers.peers = Some("127.0.0.1:1234,127.0.0.1:1235".into());
         let input = |args, source, pending| -> anyhow::Result<_> {
             Ok(placement_inputs(args, super::inputs(args, &cfg, 48, false, None, None, 0)?,
-                source, (96 << 30, 96 << 30), pending, false, false, qwen4::QwenHost::ample(&cfg, 1, 4096)?))
+                source, (96 << 30, 96 << 30), pending, false, cuteafd_loader::placement::planner::Context::pinned(args.max_context as u64), qwen4::QwenHost::ample(&cfg, 1, 4096)?))
         };
         for (source, key) in [(ExpertSource::LocalFp8, "fp8"), (ExpertSource::LocalExl3, "exl3")] {
             assert_eq!(source.code_key(), key);

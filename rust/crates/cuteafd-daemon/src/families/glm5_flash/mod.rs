@@ -1826,7 +1826,7 @@ impl Opened {
 
     #[allow(clippy::too_many_arguments)]
     fn admit_candidate(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
-        index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
+        index: engine::IndexCache, marks: usize, peer: Option<i32>, context: cuteafd_loader::placement::planner::Context,
         remote_draft: bool, attention: engine::GlmfAttention,
         native_admission: Option<&native::Admission>,
         inventory: &crate::shared::inventory::RuntimeInventory)
@@ -1974,7 +1974,7 @@ impl Opened {
         let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
         let onboard = runtime_onboard(args, self.native, routed, experts.len());
         let inputs = admission::GlmfInputs {
-            resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
+            resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes })).collect(),
             pending_code, headroom_bytes: cuteafd_loader::placement::reserve::gpu("glm5_flash"), spark_ranks,
@@ -2082,7 +2082,7 @@ impl Opened {
         native::publish_resolved(&resolved);
         cuteafd_bench::context::set_resolved("split-device", &resolved.split_device.map_or_else(|| "none".into(), |device| device.to_string()));
         let args = &resolved;
-        let automatic_context = args.max_context == 0;
+        let requested_context = (args.max_context > 0).then_some(args.max_context as u64);
         let mut context_args = args.clone();
         resolve_prefill(&mut context_args, args.layers.is_none_or(|n| n == self.cfg.layers))?;
         context_args.max_context = crate::shared::context::checkpoint_context_config(
@@ -2254,10 +2254,10 @@ impl Opened {
         let admitted = if args.tp2_dflash_auto {
             draft_args.tp2_dflash = false;
             let whole = self.admit_candidate(&draft_args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, false, attention, native_admission.as_ref(), &inventory);
+                split_device, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), false, attention, native_admission.as_ref(), &inventory);
             draft_args.tp2_dflash = true;
             let split = self.admit_candidate(&draft_args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, false, attention, native_admission.as_ref(), &inventory);
+                split_device, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), false, attention, native_admission.as_ref(), &inventory);
             let whole_pool = whole.as_ref().ok().map(|a| a.0.pool_tokens);
             let split_pool = split.as_ref().ok().map(|a| a.0.pool_tokens);
             draft_args.tp2_dflash = cuteafd_loader::placement::families::glm5_flash::prefer_tp2_dflash(whole_pool, split_pool);
@@ -2265,7 +2265,7 @@ impl Opened {
             if draft_args.tp2_dflash { split } else { whole }
         } else {
             self.admit_candidate(args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, remote_draft, attention, native_admission.as_ref(), &inventory)
+                split_device, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), remote_draft, attention, native_admission.as_ref(), &inventory)
         }?;
         let args = &draft_args;
         let remote_draft = false;
@@ -2691,7 +2691,7 @@ impl Opened {
             tracing::info!(allowance_bytes = LAZY_GRAPH_ALLOWANCE_BYTES,
                 "GLM Flash decode graphs captured lazily within the graph allowance, not at startup");
         }
-        let max_context = crate::shared::context::pool_context("glm5_flash", args.max_context, automatic_context, pool_tokens, 256)?;
+        let max_context = crate::shared::context::pool_context("glm5_flash", cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), pool_tokens)?;
         let step_experts = admitted_step_experts(&self.cfg, &placement, args.skip_experts, self.fp8().is_some())?;
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
             let mut settings = step_settings(args, index_cache);

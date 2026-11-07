@@ -519,7 +519,7 @@ impl Recipe for KimiRecipe {
     fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
         if !(1..=2).contains(&self.gpus)
             || self.context == 0
-            || request.context != self.context
+            || request.context.maximum != self.context
             || self.attention.is_empty()
             || self.layer_attention.len() != self.attention.len()
             || self.records_per_page.len() != self.gpus
@@ -878,11 +878,11 @@ pub fn host_prefix_owner(bytes: u64, maximum: u64) -> Component {
 }
 
 /// Zero and omission normalize identically; an explicit pin stays exact.
-pub fn request(context: u64, pool: Option<u64>, onboard: crate::placement::Onboard,
+pub fn request(context: impl Into<crate::placement::planner::Context>, pool: Option<u64>, onboard: crate::placement::Onboard,
     prefill: PrefillShape, operation: Operation, weight_limit: ResidentWeights,
     spark_reply_formats: SparkReplyFormats) -> Request {
     Request {
-        context,
+        context: context.into(),
         pool: crate::placement::PoolPolicy::normalize_request(pool).map_or(Pin::Auto, Pin::Exact),
         onboard: match onboard {
             crate::placement::Onboard::Auto => Pin::Auto,
@@ -1092,7 +1092,7 @@ mod tests {
             assert_eq!(owners.len(), 1);
             assert_eq!(owners[0].bytes, 128);
         }
-        let request = |pool| Request { context: 128, ..request_with(Some(pool)) };
+        let request = |pool| Request { context: (128).into(), ..request_with(Some(pool)) };
         recipe.context = 128;
         assert!(recipe.admit(request(192), budget.clone()).is_err());
         assert_eq!(recipe.admit(request(128), budget).unwrap().solved.pool_tokens, 128);
@@ -1205,6 +1205,6 @@ mod tests {
     fn a_missing_physical_budget_is_refused_before_any_fit() {
         let recipe = recipe();
         assert!(recipe.admit(single(), Vec::new()).is_err());
-        assert!(recipe.prepare(&Request { context: 512, ..single() }).is_err());
+        assert!(recipe.prepare(&Request { context: (512).into(), ..single() }).is_err());
     }
 }

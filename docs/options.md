@@ -141,7 +141,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
 | `KV_TARGET_TOKENS` | 2M; 1M on cards of 32 GB or less | positive count | KV the layout is sized for: layer placement, onboarding, buffers. |
-| `KV_MIN_TOKENS` | the serving context; at least 256K on Spark-free layouts | positive count | Refuse the launch below this; missing the target is fine down to it. With Sparks an automatic context may be clamped to the pool. |
+| `KV_MIN_TOKENS` | min(256K, model max context, KV target), on every layout | positive count | Refuse automatic pools below this; missing the target is fine down to it. Automatic context serves min(model max context, admitted pool); an explicit context still requires the pool to cover it. |
 | `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
 | `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark engine ceiling, including worker process residency and routed weights; the outside-cap gap leaves room for OS/services. |
@@ -160,7 +160,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `ATTENTION_MODE` | `hqa` | `hqa`, `compact`, `fp8-compact` | Per qualified checkpoint family in `scripts/lib/attention-variants.json` (shared by launcher, launch-key registry and daemon; no separate per-family key gate): default native HQA bundle, parent compact bundle, or deterministic load/push FP8 conversion of native BF16. Already-FP8 HQA cannot be converted again. Step-5 converts native O only, including private MTP O, and retains F32 TP2 partials. Selected for the model lifetime. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
-| `MAX_CONTEXT_TOKENS` | `1048576` | 1–1048576 | Context cap. |
+| `MAX_CONTEXT_TOKENS` | automatic | 1–1048576 | Omitted: serve min(model maximum context, admitted pool). Explicit: pin context and require the pool to cover it. |
 | `MAX_OUTPUT_TOKENS` | `131072` | integer | Generation cap. |
 | `KV_CACHE` | family default | `bf16`, `fp8`; MiMo also `int8` | See the precision table below. |
 | `SWA_KV_CACHE` | `int8` | `bf16`, `int8`, `fp8` | MiMo sliding/MTP rings. |

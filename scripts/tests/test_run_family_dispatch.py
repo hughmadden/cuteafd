@@ -1905,7 +1905,7 @@ def test_mimo_full_context_profile_respects_physical_and_logical_memory(tmp_path
     result = _family_launch_result(tmp_path, config, "test/mimo", keys, gpu_total_mib=total)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert "--max-context 0" in launch
+    assert "--max-context " not in launch
     assert f"--max-sequences {8 if embedding == 'host' else 16}" in launch
     assert f"--embedding-placement {embedding}" in launch
     assert "--pool-tokens 0" in launch
@@ -4776,7 +4776,10 @@ def test_generic_family_checkpoint_context_default_and_override(tmp_path, family
     result = _family_launch_result(tmp_path, config, "test/model", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert f"--max-context {context or 0}" in launch
+    if context is None:
+        assert "--max-context " not in launch
+    else:
+        assert f"--max-context {context}" in launch
 
 
 def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):

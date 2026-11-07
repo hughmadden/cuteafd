@@ -11,8 +11,8 @@ use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, Targ
 use std::rc::Rc;
 use crate::families::deepseek_v41::v41_projection_tp2::Kind;
 
-pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
+pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
+    ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
     let startup_prototype = super::graph_startup_prototype(&args)?;
     // `all` becomes the expert inventory's exact count inside admission; this
@@ -62,6 +62,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     })?;
     memory_checkpoint("after native preload")?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    args.max_context_tokens = pool.served_context;
+    cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
     cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
     let usage = super::expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
@@ -574,7 +576,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;
     memory_checkpoint("ready")?;
-    ready.take().context("startup readiness missing")?.send(Ok(vision.health_handle()))
+    ready.take().context("startup readiness missing")?.send(Ok((vision.health_handle(), args.max_context_tokens)))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
         &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)

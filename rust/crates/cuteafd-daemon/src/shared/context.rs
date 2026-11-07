@@ -30,11 +30,11 @@ pub(crate) fn checkpoint_context_config(config: &serde_json::Value, manifest: &P
     }
 }
 
-pub(crate) fn pool_context(family: &str, context: usize, automatic: bool, pool: usize, unit: usize) -> Result<usize> {
-    let supported = cuteafd_loader::serving_capacity::pool_context(context, automatic, pool, unit)
+pub(crate) fn pool_context(family: &str, context: cuteafd_loader::placement::planner::Context, pool: usize) -> Result<usize> {
+    let supported = cuteafd_loader::serving_capacity::pool_context(context, pool)
         .map_err(|error| anyhow::anyhow!("{family}: {error}"))?;
-    if supported != context {
-        tracing::info!(family, checkpoint_context = context, admitted_pool = pool, max_context = supported,
+    if supported as u64 != context.maximum {
+        tracing::info!(family, checkpoint_context = context.maximum, admitted_pool = pool, max_context = supported,
             "checkpoint context exceeds admitted pool; serving reduced max_context; set POOL_TOKENS/MAX_CONTEXT_TOKENS to change");
     }
     cuteafd_bench::context::set_resolved("max-context", &supported.to_string());
@@ -96,7 +96,7 @@ mod tests {
             let path = dir.path().join("PROGRAMS.json");
             std::fs::write(&path, value.to_string()).unwrap();
             let full = checkpoint_context(dir.path(), &path, "deepseek_v4", 0).unwrap();
-            assert_eq!(pool_context("deepseek_v4", full, true, 32768, 256).unwrap(), 32512);
+            assert_eq!(pool_context("deepseek_v4", cuteafd_loader::placement::planner::Context::automatic(full as u64), 32768).unwrap(), 32768);
             assert_eq!(checkpoint_context(dir.path(), &path, "deepseek_v4", 16384).unwrap(), 16384);
             assert_eq!(cuteafd_loader::serving_capacity::compiled_c128_width(&value, family).unwrap(), 1024);
             let mut bad = value.clone();
@@ -127,16 +127,16 @@ mod tests {
     }
 
     #[test]
-    fn defaults_clamp_to_compiled_support_and_pool_with_margin_but_explicit_fails() {
+    fn defaults_clamp_exactly_to_compiled_support_and_pool_but_explicit_fails() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), r#"{"text_config":{"max_position_embeddings":1048576}}"#).unwrap();
         let manifest = dir.path().join("PROGRAMS.json");
         std::fs::write(&manifest, r#"{"capacities":{"max_context":131072}}"#).unwrap();
         assert_eq!(checkpoint_context(dir.path(), &manifest, "qwen4", 0).unwrap(), 131072);
         assert!(checkpoint_context(dir.path(), &manifest, "qwen4", 131073).is_err());
-        assert_eq!(pool_context("mimo_v2", 1048576, true, 962560, 64).unwrap(), 962496);
-        assert!(pool_context("mimo_v2", 1048576, false, 962560, 64).is_err());
-        assert_eq!(pool_context("glm5", 32768, false, 65536, 256).unwrap(), 32768);
-        assert!(pool_context("glm5", 131072, true, 64, 256).is_err());
+        assert_eq!(pool_context("mimo_v2", cuteafd_loader::placement::planner::Context::automatic(1048576 as u64), 962560).unwrap(), 962560);
+        assert!(pool_context("mimo_v2", cuteafd_loader::placement::planner::Context::pinned(1048576 as u64), 962560).is_err());
+        assert_eq!(pool_context("glm5", cuteafd_loader::placement::planner::Context::pinned(32768 as u64), 65536).unwrap(), 32768);
+        assert_eq!(pool_context("glm5", cuteafd_loader::placement::planner::Context::automatic(131072 as u64), 64).unwrap(), 64);
     }
 }

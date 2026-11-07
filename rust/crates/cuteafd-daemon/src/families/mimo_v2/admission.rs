@@ -100,10 +100,9 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
     Ok((costs, workspace, tp2_workspace, Some(directory)))
 }
 
-fn resolve_pool_context(capacity: &mut cuteafd_core::serving_capacity::ResolvedCapacity, automatic: bool, unit_rows: u64) -> Result<()> {
+fn resolve_pool_context(capacity: &mut cuteafd_core::serving_capacity::ResolvedCapacity, context: cuteafd_loader::placement::planner::Context, unit_rows: u64) -> Result<()> {
     capacity.effective_max_context_tokens = crate::shared::context::pool_context("mimo_v2",
-        usize::try_from(capacity.effective_max_context_tokens)?, automatic,
-        usize::try_from(capacity.allocated_gpu_kv_tokens)?, super::engine::PAGE_ROWS)? as u64;
+        context, usize::try_from(capacity.allocated_gpu_kv_tokens)?)? as u64;
     let sequence_units = capacity.effective_max_context_tokens.div_ceil(unit_rows);
     capacity.active_max_context_sequences = (capacity.allocated_gpu_kv_tokens / unit_rows / sequence_units)
         .min(u64::from(capacity.concurrency)) as u32;
@@ -217,10 +216,10 @@ pub(super) fn preflight(
     serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
     prefill_output: MimoPrefillOutput,
     prefix_draft: bool,
-    automatic_context: bool,
+    serving_context: cuteafd_loader::placement::planner::Context,
 ) -> Result<Preflight> {
     preflight_shape(opened, args, programs, split_device, serving,
-        prefill_output, prefix_draft, automatic_context)
+        prefill_output, prefix_draft, serving_context)
 }
 
 fn preflight_shape(
@@ -231,7 +230,7 @@ fn preflight_shape(
     serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
     prefill_output: MimoPrefillOutput,
     prefix_draft: bool,
-    automatic_context: bool,
+    serving_context: cuteafd_loader::placement::planner::Context,
 ) -> Result<Preflight> {
     use cuteafd_core::serving_capacity::{CapacityPolicy, DeviceMemory};
     use cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE;
@@ -502,7 +501,7 @@ fn preflight_shape(
     let maximum_pool_tokens = contract::maximum_pool_tokens(
         &memory.iter().map(|sample| sample.total_bytes).collect::<Vec<_>>(),
         args.max_context as u64, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-        spark_profiles.steady.pool_unit_rows, spark_ranks == 0);
+        spark_profiles.steady.pool_unit_rows);
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
         target_pool_tokens: maximum_pool_tokens,
@@ -535,7 +534,7 @@ fn preflight_shape(
         cuteafd_loader::formats::mapped_preload::host_memory_before_process()?,
         cuteafd_loader::placement::reserve::spark_cap(), spark_ranks)?;
     let request = contract::production_request(
-        args.max_context as u64, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
+        serving_context, (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         args.onboard.resolve(routed_layers), prefill, operation,
         crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
     let prepared = ProductionInput {
@@ -571,7 +570,7 @@ fn preflight_shape(
     let shortfall_tokens = (args.max_context as u64).saturating_sub(pool_tokens);
     tracing::info!(pool_tokens, context_tokens=args.max_context, full_context_sequences=pool_tokens / args.max_context as u64,
         slots=concurrency, shortfall_tokens, "MiMo full-context pool admission before allocation");
-    resolve_pool_context(&mut capacity, automatic_context, profiles.steady.pool_unit_rows)?;
+    resolve_pool_context(&mut capacity, serving_context, profiles.steady.pool_unit_rows)?;
     let local_expert_budget = capacity.devices[0]
         .reservations
         .iter()
@@ -925,9 +924,9 @@ mod tests {
         let memory = [DeviceMemory { device: 0, total_bytes: 2000000, baseline_free_bytes: 2000000 }];
         let mut capacity = resolve_capacity(policy, &profile, &memory).unwrap();
         assert_eq!(capacity.active_max_context_sequences, 0);
-        assert!(resolve_pool_context(&mut capacity.clone(), false, 64).is_err());
-        resolve_pool_context(&mut capacity, true, 64).unwrap();
-        assert_eq!(capacity.effective_max_context_tokens, 962496);
+        assert!(resolve_pool_context(&mut capacity.clone(), cuteafd_loader::placement::planner::Context::pinned(1 << 20), 64).is_err());
+        resolve_pool_context(&mut capacity, cuteafd_loader::placement::planner::Context::automatic(1 << 20), 64).unwrap();
+        assert_eq!(capacity.effective_max_context_tokens, 962560);
         assert_eq!(capacity.active_max_context_sequences, 1);
     }
 

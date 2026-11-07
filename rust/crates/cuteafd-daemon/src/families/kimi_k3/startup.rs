@@ -29,6 +29,7 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub slots: usize,
     pub marks: usize,
     pub max_context: usize,
+    pub context: cuteafd_loader::placement::planner::Context,
     pub pool_tokens: Option<u64>,
     pub graphs: bool,
     pub full_prefill_logits: bool,
@@ -228,12 +229,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         core.attention_receive_bytes(unit.min(64), RANKS)?];
     let mut admitted = admission::admit(admission::Inputs { expert_usage: options.expert_usage_reader.configure(options.expert_usage, false).map_err(anyhow::Error::msg)?, cfg, core,
         resident_weight_limit: crate::shared::memory::budget::resident_weight_limit(), cache_format: options.cache_format, gpus, devices: options.devices,
-        peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, requested_pool: options.pool_tokens,
+        peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
         unit_rows: options.prefill_rows, full_prefill_logits: options.full_prefill_logits, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
             (0..RANKS).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
         spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
+    options.max_context = usize::try_from(options.context.served(admitted.placement.pool_tokens))?;
     let graph_set = admitted.graph_set.take();
     let spark_layers = admitted.working_set().spark_layers;
     let inactive_seeded_layers = options.hosted_layers.as_ref().map(|expected|
@@ -282,7 +284,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             peer.as_ref().map(|peer| ([streams[0].clone(), streams[1].clone()], peer.clone())))).transpose()?;
     let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
     let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
-        options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?;
+        options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules)?
+        .with_served_context(options.max_context)?;
     if let Some(set) = graph_set {
         let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
         let capture_started = std::time::Instant::now();

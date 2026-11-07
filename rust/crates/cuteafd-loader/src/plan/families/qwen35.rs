@@ -200,7 +200,8 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         Onboard::Layers(layers) => Pin::Exact(layers as u64),
     };
     let request = Request {
-        context: cfg.max_context as u64,
+        context: crate::placement::planner::Context::resolve(cfg.max_context as u64,
+            (options.context_tokens > 0).then_some(options.context_tokens)),
         pool: options.pool_tokens.filter(|&n| n > 0).map(Pin::Exact).unwrap_or(Pin::Auto),
         onboard,
         prefill: Pin::Exact(PrefillShape { rows: prefill.unit_rows, waves: prefill.waves }),

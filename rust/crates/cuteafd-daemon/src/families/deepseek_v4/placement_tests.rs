@@ -164,8 +164,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
         exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
     let facts = admission::inputs(&cli.engine, &inputs)?;
     let (placement, _, _) = admission::admit(&facts)?;
-    crate::shared::context::pool_context("deepseek_v4", inputs.max_context,
-        cli.engine.max_context == 0, usize::try_from(placement.pool_tokens)?, 256)?;
+    crate::shared::context::pool_context("deepseek_v4", facts.serving_context, usize::try_from(placement.pool_tokens)?)?;
     assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
         "V4 final residual must live on the rank0 head, not on both ranks");
     assert!(placement.hops.iter().all(|hop| hop.row_bytes == 4 * cfg.dim as u64 * 2),

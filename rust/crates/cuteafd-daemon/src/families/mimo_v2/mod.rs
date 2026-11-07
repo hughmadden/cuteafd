@@ -991,7 +991,7 @@ impl Opened {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, media: crate::shared::experts::rtx::dense::Records,
         prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
-        let automatic_context = args.max_context == 0;
+        let requested_context = (args.max_context > 0).then_some(args.max_context as u64);
         let shape = admission::resolved_prefill_shape(usize::from(args.peers.is_some()),
             args.prefill_rows, args.prefill_waves)?;
         let depth = shape.waves as usize;
@@ -1071,7 +1071,7 @@ impl Opened {
                 Ok(())
             })?;
         }
-        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
+        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, cuteafd_loader::placement::planner::Context::resolve(resolved.max_context as u64, requested_context))?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
         cuteafd_bench::context::set_rtx_expert_layers(preflight.placement.onboard_layers);
         resolved.prefill_rows = preflight.prefill_rows;

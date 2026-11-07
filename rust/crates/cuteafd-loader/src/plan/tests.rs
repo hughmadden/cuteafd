@@ -68,7 +68,7 @@ fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
             physical_bytes: 8192, logical_bytes: 4096, headroom: 64,
             baseline: Baseline::Forecast { occupied: 128, source: "host baseline".into(), assumed: true } },
     ];
-    let solved = planner::solve(Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+    let solved = planner::solve(Request { context: (64).into(), pool: Pin::Exact(64), onboard: Pin::Auto,
         prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
         spark_reply_formats: Default::default() }, budgets, &Fixed(facts)).unwrap();
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
@@ -3526,7 +3526,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {
-        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
@@ -3819,7 +3819,7 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                             served_index, 4, rows).unwrap();
                         let unit = geometry.logical_unit_rows;
                         let mut served_pool = crate::placement::PoolPolicy::resolve(&vec![24 << 30; gpus],
-                            131_072, None, 256, false).target;
+                            131_072, None, 256).target;
                         for (device, rank) in memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
                             .zip(&geometry.ranks) {
                             let records = device.items.iter().find(|i| i.category == Category::Kv && i.group == "KV pool")

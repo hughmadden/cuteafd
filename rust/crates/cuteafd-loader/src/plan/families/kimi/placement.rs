@@ -546,10 +546,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     report.host_ledger = cuteafd_core::memory_layout::HostLayout::new(host_total, host_available,
         (8 << 30).max(host_total / 10), host_quota, host_items);
-    let resolved = recipe.admit(kimi::request(context, requested_pool, onboard, prefill,
+    let resolved = recipe.admit(kimi::request(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)), requested_pool, onboard, prefill,
         crate::placement::planner::Operation::Serving, ResidentWeights(opts.weight_budget_bytes), opts.spark_reply_formats), budgets);
     let onboarded = match resolved {
         Ok(selection) => {
+            let served = selection.solved.request.context.served(selection.solved.pool_tokens);
+            memory.notes.retain(|note| !note.starts_with("Kimi API max context:"));
+            memory.notes.push(format!("Kimi API max context: {served} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
             let placed = &selection.placement;
             memory.notes.push(format!("Kimi retained prefix marks are a fixed charge: {legacy_marks} slots per rank"));
             memory.notes.push(format!("Kimi selected RTX expert layers: {}; retained marks: {}", placed.onboard_layers, legacy_marks));

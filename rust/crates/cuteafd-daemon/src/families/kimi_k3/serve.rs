@@ -68,7 +68,7 @@ pub(crate) struct ServeArgs {
 
 impl ServeArgs {
     /// `admitted` is the engine's resolved context extent (the explicit
-    /// --max-context, else the checkpoint core's default).
+    /// --max-context, else the admitted automatic extent).
     fn api_limits(&self, admitted: usize) -> Result<NativeLimits> {
         self.prefix.reserve.limits(self.max_context.unwrap_or(admitted).min(admitted))
     }
@@ -121,6 +121,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
         max_context: args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?),
+        context: cuteafd_loader::placement::planner::Context::resolve(args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?) as u64, args.max_context.map(|n| n as u64)),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
         full_prefill_logits: args.full_prefill_logits,
         ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0, prefix: Some(&args.prefix),
@@ -415,7 +416,7 @@ mod tests {
         assert_eq!(defaults.max_sequences, 16);
         assert!(args(&["--peers", peers, "--native-k6"]).is_err());
         assert_eq!(defaults.pool_tokens, None);
-        assert_eq!(defaults.api_limits(DEFAULT_CONTEXT)?.context(), DEFAULT_CONTEXT as u32);
+        assert_eq!(defaults.api_limits(524_288)?.context(), 524_288);
         assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), COMPILED_CONTEXT as u32);
         args(&["--peers", peers, "--max-context", "1048576"])?.validate()?;
         let limited = args(&["--peers", peers, "--max-context", "262144"])?;
