@@ -339,6 +339,7 @@ pub struct PreparedGlmf<'a> {
 pub struct AdmittedGlmf {
     pub placement: Placement,
     pub graphs: GraphSet,
+    pub declared_graphs: Vec<String>,
     pub working: GlmfWorkingSet,
     pub solved: p::ResolvedPlan,
     /// Unused estimate-minus-selected bytes; selection is never rerun to reclaim them.
@@ -801,31 +802,27 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         }
         arena.push(peak);
     }
-    let mut graph = if i.graphs.lifetime == Lifetime::Startup {
+    let graph = if i.graphs.lifetime == Lifetime::Startup {
         startup_graph_bound(i.cfg, i.layers, i.max_context as usize, (maximum * 256) as usize,
             i.sequences as usize, i.speculation, gpus, i.decode_rows as usize, sms)
     } else { i.graphs.clone() };
-    if i.local_tp2_exl3 {
-        // Both runtime routes remain below this per-rank maximum.
-        let mut local = graph.clone();
-        calibrate_local_tp2_graphs(&mut local);
-        for (bound, calibrated) in graph.ranks.iter_mut().zip(local.ranks) {
-            let ready = (bound.bytes - bound.margin).max(calibrated.bytes - calibrated.margin);
-            bound.margin = bound.margin.max(calibrated.margin);
-            bound.bytes = ready.checked_add(bound.margin)
-                .ok_or(p::Refusal::Overflow("Flash graph bound"))?;
+    for (option, &count) in counts.iter().enumerate() {
+        let mut selected = graph.clone();
+        if i.local_tp2_exl3 && GlmfWorkingSet::candidate(i, count).map_err(invalid)?.spark_ranks == 0 {
+            calibrate_local_tp2_graphs(&mut selected);
         }
-    }
-    for gpu in 0..gpus {
-        let startup = graph.lifetime == Lifetime::Startup;
-        let measured = if startup { graph.bytes(gpu) - graph.ranks[gpu].margin } else { 0 };
-        for (suffix, group, bytes, first) in [
-            ("ready", "graphs", measured, p::Phase::Warmup),
-            ("growth", "graph growth", graph.bytes(gpu) - measured, p::Phase::Growth),
-        ] {
-            contract.components.push(component(format!("glmf.graphs.{gpu}.{suffix}"), gpu as u8,
-                Category::Runtime, group, p::ByteCurve::fixed(bytes, maximum),
-                p::Lifetime { first, last: p::Phase::Growth }, maximum)?);
+        for (gpu, &rank) in selected.ranks.iter().enumerate() {
+            let mut owner = if selected.lifetime == Lifetime::Startup {
+                p::serving::startup_graph_component(&format!("glmf.graphs.{gpu}"),
+                    p::Location::coordinator(gpu as u8), rank, maximum)?
+            } else {
+                component(format!("glmf.graphs.{gpu}.growth"), gpu as u8,
+                    Category::Runtime, "graph growth", p::ByteCurve::fixed(rank.bytes, maximum),
+                    p::Lifetime { first: p::Phase::Growth, last: p::Phase::Growth }, maximum)?
+            };
+            owner.activation = if routed.is_empty() { p::Activation::always() }
+                else { p::Activation::choice(onboard_variable, option) };
+            contract.components.push(owner);
         }
     }
     contract.components.extend(p::serving::blas_components("sm_120", &blas, maximum, contract.phase_order)?);
@@ -863,17 +860,35 @@ impl PreparedGlmf<'_> {
                 i.sequences as usize, i.speculation, i.gpus.len(), i.decode_rows as usize, self.sms)
         } else { i.graphs.clone() };
         if i.local_tp2_exl3 && working.spark_ranks == 0 { calibrate_local_tp2_graphs(&mut graphs); }
+        let declared_graphs = if graphs.lifetime == Lifetime::Startup {
+            let context = glmf_graphs::admitted_graph_context(i.max_context as usize,
+                solved.pool_tokens as usize, i.automatic_context);
+            let buckets = glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(i.decode_rows as usize, self.sms));
+            let shapes = glmf_graphs::serving_graph_shapes(context,
+                (solved.pool_tokens as usize).div_ceil(glmf_graphs::PAGE_ROWS), i.cfg.dense_context(),
+                (i.sequences as usize).min(i.decode_rows as usize), i.speculation, &buckets);
+            glmf_graphs::declared_fingerprints(&shapes, i.layers, i.gpus.len()).map_err(invalid)?
+        } else { Vec::new() };
         let mut graph_slack = vec![0; i.gpus.len()];
         for gpu in 0..i.gpus.len() {
-            let ready = if graphs.lifetime == Lifetime::Startup { graphs.bytes(gpu) - graphs.ranks[gpu].margin } else { 0 };
-            for (suffix, bytes) in [("ready", ready), ("growth", graphs.bytes(gpu) - ready)] {
-                let owner = solved.facts.allocations.iter_mut().find(|owner| owner.id == format!("glmf.graphs.{gpu}.{suffix}"));
+            let bytes = graphs.bytes(gpu);
+            if graphs.lifetime == Lifetime::Startup {
+                let source = format!("startup graphs: glmf.graphs.{gpu}");
+                let owner = solved.facts.allowances.iter_mut().find(|owner| owner.source == source)
+                    .ok_or_else(|| invalid("missing admitted startup graph owner"))?;
+                if bytes > owner.bytes { return Err(invalid("selected graphs exceed prepared estimate")); }
+                graph_slack[gpu] = owner.bytes - bytes;
+                owner.bytes = bytes;
+                owner.assumed = graphs.ranks[gpu].basis != Basis::Calibrated;
+            } else {
+                let owner = solved.facts.allocations.iter_mut()
+                    .find(|owner| owner.id == format!("glmf.graphs.{gpu}.growth"));
                 let Some(owner) = owner else {
                     if bytes == 0 { continue; }
-                    return Err(invalid("missing admitted graph owner"));
+                    return Err(invalid("missing admitted graph budget"));
                 };
-                if bytes > owner.bytes { return Err(invalid("exact graphs exceed prepared estimate")); }
-                graph_slack[gpu] += owner.bytes - bytes;
+                if bytes > owner.bytes { return Err(invalid("selected graph budget exceeds prepared budget")); }
+                graph_slack[gpu] = owner.bytes - bytes;
                 owner.bytes = bytes;
                 owner.shape = vec![bytes];
             }
@@ -909,7 +924,8 @@ impl PreparedGlmf<'_> {
         let encoder = solved.decisions.encoder.map(|index| self.encoders[index].clone());
         tracing::debug!(target: "cuteafd::planner", complete_solve_us = self.started.elapsed().as_micros() as u64,
             graph_slack = ?graph_slack, "Flash recipe preparation, search and exact reconciliation completed");
-        Ok(AdmittedGlmf { placement, graphs, working, solved, graph_slack, native_load: self.native_load, mount_load: self.mount_load, push_host: self.push_host, encoder })
+        Ok(AdmittedGlmf { placement, graphs, declared_graphs, working, solved, graph_slack,
+            native_load: self.native_load, mount_load: self.mount_load, push_host: self.push_host, encoder })
     }
 }
 

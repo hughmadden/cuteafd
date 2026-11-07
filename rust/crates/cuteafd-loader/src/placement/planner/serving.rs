@@ -2,6 +2,48 @@
 //! placement are resolved inputs; this module never chooses admission policy.
 use super::*;
 
+fn startup_graph_source(id: &str) -> String { format!("startup graphs: {id}") }
+
+/// Executable residency is opaque driver storage, not a ledger allocation.
+/// Estimates have no variance margin and are replaced after startup capture.
+pub fn startup_graph_component(id: &str, location: Location, rank: crate::placement::GraphRank,
+    maximum: u64) -> Result<Component, Refusal> {
+    if id.is_empty() || maximum == 0 || rank.margin != 0 {
+        return Err(Refusal::InvalidFact("invalid startup graph owner".into()));
+    }
+    Ok(Component { activation: Activation::always(), bytes: ByteCurve::fixed(rank.bytes, maximum),
+        kind: ComponentKind::Allowance(Allowance { location, bytes: rank.bytes,
+            lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+            source: startup_graph_source(id), assumed: rank.basis != Basis::Calibrated }) })
+}
+
+/// Reevaluate the selected facts, never select a different pool or placement.
+/// A capture may exceed its estimate if physical capacity still admits it.
+/// On refusal the original receipt stays intact.
+pub fn reconcile_startup_graphs(plan: &mut ResolvedPlan, prefix: &str,
+    estimated: &crate::placement::GraphSet, declared: &[String],
+    captured: &[crate::placement::inventory::CapturedGraphRank])
+    -> Result<crate::placement::GraphSet, Refusal> {
+    let measured = estimated.captured(declared, captured).map_err(Refusal::InvalidFact)?;
+    let mut facts = plan.facts.clone();
+    for (rank, graph) in measured.ranks.iter().enumerate() {
+        let source = startup_graph_source(&format!("{prefix}.{rank}"));
+        let matches: Vec<_> = facts.allowances.iter_mut().filter(|owner| owner.source == source).collect();
+        let [owner] = matches.try_into().map_err(|_: Vec<_>|
+            Refusal::InvalidFact("missing or duplicate startup graph owner".into()))?;
+        if owner.location != Location::coordinator(rank as u8)
+            || owner.lifetime != (Lifetime { first: Phase::Warmup, last: Phase::Growth }) {
+            return Err(Refusal::InvalidFact("startup graph owner location or lifetime differs".into()));
+        }
+        owner.bytes = graph.bytes;
+        owner.assumed = false;
+    }
+    let phases = evaluate(&facts, &plan.budgets)?;
+    plan.facts = facts;
+    plan.phases = phases;
+    Ok(measured)
+}
+
 /// A retained native handle group. Caller-owned Lt workspaces stay allocations.
 #[derive(Debug, Clone)]
 pub struct BlasOwners {

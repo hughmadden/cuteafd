@@ -248,12 +248,6 @@ pub const LOADED_CODE: &[LoadedCode] = &[
         source: "v4-flash TP2 tagged ready rtx1 (b367a34f, 2026-10-11): untracked 1,389,470,672 - context 586,416,128" },
 ];
 
-/// GLM Flash startup executable means (SM120 RTX PRO 6000, CUDA driver
-/// 595.91.07, EXL3 K3.25, 64 decode rows, v3-p2 ready ledgers, 2026-10-10).
-/// One GPU: 1,946,157,056 / 13,800; split lead: 2,231,369,728 / 13,800;
-/// split peer: 2,283,798,528 / 13,500. Values retain P2's rounded arithmetic.
-pub const GLMF_GRAPH_BYTES_BY_ROLE: [u64; 3] = [141_027, 161_694, 169_171];
-
 /// The table's family key of a program family (`dsv4f`, `mimop2`, ...).
 pub fn loaded_code_family(program_family: &str) -> &str {
     let base = program_family.trim_end_matches('2');
@@ -518,19 +512,129 @@ pub enum Lifetime {
     Growth,
 }
 
-/// One rank's graph executables.
+/// Compatibility of one rank's exact startup executable census. A graph count
+/// is not an identity: all launch keys and the code/device provenance must match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphCensusIdentity {
+    pub declared_graphs: String,
+    pub programs_sha256: String,
+    pub native_sha256: String,
+    pub toolchain: String,
+    pub gpu_class: String,
+    pub driver: String,
+    pub layout: String,
+}
+
+impl GraphCensusIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        if [&self.declared_graphs, &self.programs_sha256, &self.native_sha256,
+            &self.toolchain, &self.gpu_class, &self.driver, &self.layout]
+            .iter().any(|value| value.trim().is_empty()) {
+            return Err("incomplete startup graph census identity".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphCensus {
+    pub identity: GraphCensusIdentity,
+    pub executables: u64,
+    pub bytes: u64,
+    pub evidence: String,
+    pub producing_commit: String,
+}
+
+/// A synchronized capture boundary. Tracked allocations are separate owners;
+/// their change must never be absorbed into executable residency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphMemorySample {
+    pub total: u64,
+    pub free: u64,
+    pub tracked_device: u64,
+    pub tracked_pinned: u64,
+    pub tracked_managed: u64,
+}
+
+impl GraphMemorySample {
+    pub fn retained_since(self, before: Self) -> Result<u64, String> {
+        if self.total != before.total || self.free > self.total || before.free > before.total {
+            return Err("incompatible startup graph memory samples".into());
+        }
+        if self.tracked_pinned != before.tracked_pinned || self.tracked_managed != before.tracked_managed {
+            return Err("mapped or managed storage changed during graph capture; prepare it before sampling".into());
+        }
+        let bytes = i128::from(before.free) - i128::from(self.free)
+            - (i128::from(self.tracked_device) - i128::from(before.tracked_device));
+        u64::try_from(bytes).map_err(|_| "negative startup graph residency after excluding tracked allocations".into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedGraphRank {
+    pub declared_graphs: String,
+    pub executables: u64,
+    pub bytes: u64,
+}
+
+impl CapturedGraphRank {
+    pub fn measure<K>(rank: u8, declared: &DeclaredGraphSet<K>, actual: &[K],
+        before: GraphMemorySample, after: GraphMemorySample) -> Result<Self, String>
+        where K: std::hash::Hash + Eq + Clone + std::fmt::Debug + Serialize {
+        declared.verify(actual.iter())?;
+        Ok(Self { declared_graphs: declared.fingerprint(rank)?, executables: actual.len() as u64,
+            bytes: after.retained_since(before)? })
+    }
+}
+
+fn estimated_graph_basis() -> Basis { Basis::Estimated }
+
+/// One rank's graph executables. Unqualified historical arithmetic remains an
+/// estimate until an exact compatible census or this process's capture replaces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphRank {
     pub executables: u64,
-    /// Reserved: the captured estimate plus the driver margin.
     pub bytes: u64,
-    /// Of `bytes`, the margin (driver variance, late captures); growth.
+    /// Legacy startup consumers still split a margin into growth; migrated
+    /// startup owners have zero margin. Lazy budgets retain their own lifetime.
     pub margin: u64,
+    #[serde(default = "estimated_graph_basis")]
+    pub basis: Basis,
 }
 
-/// The decode graph set a family captures, per rank (lead first). The
-/// runtime's warm-up and the planner build it from the same function; bytes
-/// are executables x the arch's bytes per executable, plus a margin.
+impl GraphRank {
+    pub fn estimated(executables: u64, bytes: u64) -> Self {
+        Self { executables, bytes, margin: 0, basis: Basis::Estimated }
+    }
+
+    /// Historical whole-capture arithmetic is only a fallback estimate. It
+    /// carries no percentage, minimum or maximum-of-samples adjustment.
+    pub fn estimate(executables: u64, observed_bytes: u64, observed_executables: u64) -> Result<Self, String> {
+        if observed_executables == 0 { return Err("empty startup graph observation".into()); }
+        let bytes = (u128::from(executables) * u128::from(observed_bytes))
+            .div_ceil(u128::from(observed_executables));
+        Ok(Self::estimated(executables, bytes.try_into().map_err(|_| "startup graph estimate overflow")?))
+    }
+
+    /// A stale or absent row never becomes calibrated merely because counts
+    /// agree. The fallback is explicit estimate-then-exact, without padding.
+    pub fn from_census(identity: &GraphCensusIdentity, executables: u64,
+        census: &[GraphCensus], estimated_bytes: u64) -> Result<Self, String> {
+        identity.validate()?;
+        let matches: Vec<_> = census.iter().filter(|row|
+            row.identity == *identity && row.executables == executables).collect();
+        match matches.as_slice() {
+            [] => Ok(Self::estimated(executables, estimated_bytes)),
+            [row] if !row.evidence.trim().is_empty() && !row.producing_commit.trim().is_empty() =>
+                Ok(Self { bytes: row.bytes, basis: Basis::Calibrated, ..Self::estimated(executables, 0) }),
+            _ => Err("duplicate or unattributed startup graph census".into()),
+        }
+    }
+}
+
+/// The decode graph set a family captures, per rank (lead first). Exact census
+/// rows or explicit estimates forecast residency; synchronized capture supplies
+/// the live owner. Legacy consumers still retain margins until migrated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSet {
     pub ranks: Vec<GraphRank>,
@@ -615,6 +719,23 @@ pub struct V41GraphShape {
 }
 
 impl GraphSet {
+    /// Replace planning estimates with this process's synchronized capture. No
+    /// reserve or count-only match can stand in for the selected executable keys.
+    pub fn captured(&self, declared: &[String], captured: &[CapturedGraphRank]) -> Result<Self, String> {
+        if self.lifetime != Lifetime::Startup || declared.len() != self.ranks.len()
+            || captured.len() != self.ranks.len() {
+            return Err("startup graph capture rank inventory differs from admission".into());
+        }
+        let ranks = self.ranks.iter().zip(declared).zip(captured).map(|((rank, expected), actual)| {
+            if expected.is_empty() || actual.declared_graphs != *expected || actual.executables != rank.executables {
+                return Err("startup graph capture keys differ from admission".into());
+            }
+            Ok(GraphRank { executables: actual.executables, bytes: actual.bytes,
+                margin: 0, basis: Basis::Calibrated })
+        }).collect::<Result<_, String>>()?;
+        Ok(Self { ranks, lifetime: Lifetime::Startup, shapes: self.shapes })
+    }
+
     /// Couple a family's exact warm keys to the very ledger charged by its
     /// planner. Refuse a growth ledger or a shape-count mismatch at startup.
     pub fn startup<K>(self, keys: Vec<K>) -> Result<StartupGraphs<K>, String> {
@@ -656,14 +777,14 @@ impl GraphSet {
         let ranks = executables.iter().map(|&count| {
             let measured = count.saturating_mul(per_executable);
             let margin = measured.saturating_mul(margin_percent).div_ceil(100).max(minimum_margin);
-            GraphRank { executables: count, bytes: measured.saturating_add(margin), margin }
+            GraphRank { executables: count, bytes: measured.saturating_add(margin), margin, basis: Basis::Estimated }
         }).collect();
         Self { ranks, lifetime, shapes }
     }
 
     /// A lazily captured set bounded by a byte budget per rank.
     pub fn budget(per_rank: &[u64]) -> Self {
-        Self { ranks: per_rank.iter().map(|&bytes| GraphRank { executables: 0, bytes, margin: bytes }).collect(),
+        Self { ranks: per_rank.iter().map(|&bytes| GraphRank { executables: 0, bytes, margin: bytes, basis: Basis::Exact }).collect(),
             lifetime: Lifetime::Growth, shapes: 0 }
     }
 
@@ -692,7 +813,8 @@ impl GraphSet {
     pub fn demand(&self, rank: usize) -> super::Demand {
         use cuteafd_core::memory_layout::ItemLifetime;
         let group = match self.lifetime { Lifetime::Startup => "graphs", Lifetime::Growth => "graph growth" };
-        super::Demand::new(rank as u8, Category::Runtime, group, self.bytes(rank), Basis::Formula)
+        super::Demand::new(rank as u8, Category::Runtime, group, self.bytes(rank),
+            self.ranks.get(rank).map_or(Basis::Estimated, |rank| rank.basis))
             .with_lifetime(match self.lifetime {
                 Lifetime::Startup => ItemLifetime::ReadyResident,
                 Lifetime::Growth => ItemLifetime::PostReadyReserve,
@@ -707,7 +829,7 @@ impl GraphSet {
         [("graphs", self.at_ready(rank), ItemLifetime::ReadyResident),
             (GRAPH_GROWTH, self.growth(rank), ItemLifetime::PostReadyReserve)]
             .into_iter().filter(|(_, bytes, _)| *bytes > 0)
-            .map(|(group, bytes, lifetime)| Item::new(Category::Runtime, group, "", bytes, Basis::Formula)
+            .map(|(group, bytes, lifetime)| Item::new(Category::Runtime, group, "", bytes, self.ranks[rank].basis)
                 .with_lifetime(lifetime)).collect()
     }
 }
@@ -766,6 +888,76 @@ pub fn exl3_capacities(rows: u64) -> Vec<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn startup_graph_census_requires_exact_attributed_identity() {
+        let identity = GraphCensusIdentity { declared_graphs: "keys".into(), programs_sha256: "programs".into(),
+            native_sha256: "native".into(), toolchain: "compiler".into(), gpu_class: "sm120/188/96G".into(),
+            driver: "13020".into(), layout: "layout".into() };
+        let census = GraphCensus { identity: identity.clone(), executables: 2, bytes: 101,
+            evidence: "synthetic capture".into(), producing_commit: "producer-A".into() };
+        let used = GraphRank::from_census(&identity, 2, &[census.clone()], 200).unwrap();
+        assert_eq!((used.bytes, used.margin, used.basis), (101, 0, Basis::Calibrated));
+        for field in 0..7 {
+            let mut stale = identity.clone();
+            match field {
+                0 => stale.declared_graphs.push('x'),
+                1 => stale.programs_sha256.push('x'),
+                2 => stale.native_sha256.push('x'),
+                3 => stale.toolchain.push('x'),
+                4 => stale.gpu_class.push('x'),
+                5 => stale.driver.push('x'),
+                _ => stale.layout.push('x'),
+            }
+            assert_eq!(GraphRank::from_census(&stale, 2, &[census.clone()], 200).unwrap(),
+                GraphRank::estimated(2, 200));
+        }
+        assert_eq!(GraphRank::from_census(&identity, 3, &[census.clone()], 200).unwrap(),
+            GraphRank::estimated(3, 200));
+        assert!(GraphRank::from_census(&identity, 2, &[census.clone(), census.clone()], 200).is_err());
+        let mut unattributed = census.clone();
+        unattributed.evidence.clear();
+        assert!(GraphRank::from_census(&identity, 2, &[unattributed], 200).is_err());
+        let mut unattributed = census.clone();
+        unattributed.producing_commit.clear();
+        assert!(GraphRank::from_census(&identity, 2, &[unattributed], 200).is_err());
+        let mut incomplete = identity.clone();
+        incomplete.native_sha256.clear();
+        assert!(GraphRank::from_census(&incomplete, 2, &[], 200).is_err());
+        assert_eq!(serde_json::from_slice::<GraphCensus>(&serde_json::to_vec(&census).unwrap()).unwrap(), census);
+        assert_eq!(GraphRank::estimate(3, 10, 2).unwrap(), GraphRank::estimated(3, 15));
+        assert!(GraphRank::estimate(3, 10, 0).is_err());
+        assert!(GraphRank::estimate(u64::MAX, u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn startup_capture_excludes_tracked_storage_and_checks_actual_keys() {
+        let before = GraphMemorySample { total: 1000, free: 900, tracked_device: 100,
+            tracked_pinned: 10, tracked_managed: 0 };
+        let after = GraphMemorySample { free: 600, tracked_device: 300, ..before };
+        assert_eq!(after.retained_since(before).unwrap(), 100);
+        assert_eq!(GraphMemorySample { free: 950, tracked_device: 0, ..before }
+            .retained_since(before).unwrap(), 50);
+        for bad in [GraphMemorySample { total: 1001, ..after },
+            GraphMemorySample { free: 1001, ..after }, GraphMemorySample { tracked_pinned: 11, ..after },
+            GraphMemorySample { tracked_managed: 1, ..after }, GraphMemorySample { free: 950, ..before }] {
+            assert!(bad.retained_since(before).is_err());
+        }
+        let keys = [1u32, 2];
+        let declared = DeclaredGraphSet::new(&keys).unwrap();
+        let captured = CapturedGraphRank::measure(0, &declared, &[2, 1], before, after).unwrap();
+        assert_eq!(captured.bytes, 100);
+        for actual in [vec![1], vec![1, 3], vec![1, 1]] {
+            assert!(CapturedGraphRank::measure(0, &declared, &actual, before, after).is_err());
+        }
+        let estimated = GraphSet { ranks: vec![GraphRank::estimated(2, 10)], shapes: 1, lifetime: Lifetime::Startup };
+        let fingerprints = [declared.fingerprint(0).unwrap()];
+        let measured = estimated.captured(&fingerprints, &[captured.clone()]).unwrap();
+        assert_eq!(measured.ranks[0], GraphRank { executables: 2, bytes: 100, margin: 0, basis: Basis::Calibrated });
+        assert!(estimated.captured(&["other keys".into()], &[captured.clone()]).is_err());
+        assert!(estimated.captured(&fingerprints, &[]).is_err());
+        assert!(GraphSet::budget(&[10]).captured(&fingerprints, &[captured]).is_err());
+    }
 
     fn measured_figure() -> MemoryFigure {
         MemoryFigure { bytes: 101, attribution: FigureAttribution::Measured,

@@ -114,6 +114,54 @@ fn coordinator_devices_preserve_logical_rank_for_reversed_and_sparse_ordinals() 
     assert_eq!(CoordinatorDevices::new(&[1]).unwrap().location(1).unwrap(), Location::coordinator(0));
 }
 
+#[test]
+fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
+    use crate::placement::inventory::{CapturedGraphRank, GraphRank, GraphSet, Lifetime as GraphLifetime};
+    let rank = GraphRank::estimated(2, 10);
+    let owner = serving::startup_graph_component("test.0", Location::coordinator(0), rank, 1).unwrap();
+    let ComponentKind::Allowance(owner) = owner.kind else { panic!("graph is not an opaque allowance") };
+    let mut physical = facts(vec![allocation("kv", 100)]);
+    physical.allowances.push(owner);
+    let budgets = vec![budget(1000)];
+    let mut plan = ResolvedPlan { encoder_diagnostics: vec![], request: request(), decisions: decisions(1),
+        pool_tokens: 64, phases: evaluate(&physical, &budgets).unwrap(), facts: physical, budgets };
+    let original = plan.clone();
+    let graphs = GraphSet { ranks: vec![rank], shapes: 1, lifetime: GraphLifetime::Startup };
+    let declared = vec!["exact keys".into()];
+    let capture = CapturedGraphRank { declared_graphs: declared[0].clone(), executables: 2, bytes: 200 };
+    let measured = serving::reconcile_startup_graphs(&mut plan, "test", &graphs, &declared, &[capture.clone()]).unwrap();
+    assert_eq!(measured.ranks[0].bytes, 200);
+    assert_eq!(measured.ranks[0].basis, Basis::Calibrated);
+    assert_eq!(plan.request, original.request);
+    assert_eq!(plan.decisions, original.decisions);
+    assert_eq!(plan.pool_tokens, original.pool_tokens);
+    assert_eq!(plan.budgets, original.budgets);
+    assert_eq!(plan.facts.allocations, original.facts.allocations);
+    assert_eq!(plan.facts.allowances[0].bytes, 200);
+    assert!(!plan.facts.allowances[0].assumed);
+    for phase in plan.phases.iter().filter(|phase| matches!(phase.phase, Phase::Warmup | Phase::Ready | Phase::Growth)) {
+        assert_eq!((phase.owned, phase.opaque), (100, 200));
+    }
+    let good = plan.clone();
+    for bad in [CapturedGraphRank { bytes: 1000, ..capture.clone() },
+        CapturedGraphRank { declared_graphs: "wrong keys".into(), ..capture.clone() },
+        CapturedGraphRank { executables: 3, ..capture.clone() }] {
+        assert!(serving::reconcile_startup_graphs(&mut plan, "test", &graphs, &declared, &[bad]).is_err());
+        assert_eq!(plan, good);
+    }
+    let mut duplicate = good.clone();
+    duplicate.facts.allowances.push(duplicate.facts.allowances[0].clone());
+    let unchanged = duplicate.clone();
+    assert!(serving::reconcile_startup_graphs(&mut duplicate, "test", &graphs, &declared, &[capture.clone()]).is_err());
+    assert_eq!(duplicate, unchanged);
+    let mut missing = good.clone();
+    missing.facts.allowances.clear();
+    assert!(serving::reconcile_startup_graphs(&mut missing, "test", &graphs, &declared, &[capture]).is_err());
+    assert!(serving::startup_graph_component("", Location::coordinator(0), rank, 1).is_err());
+    assert!(serving::startup_graph_component("test", Location::coordinator(0), rank, 0).is_err());
+    assert!(serving::startup_graph_component("test", Location::coordinator(0), GraphRank { margin: 1, ..rank }, 1).is_err());
+}
+
 fn budget(bytes: u64) -> Budget {
     Budget {
         id: "gpu".into(),

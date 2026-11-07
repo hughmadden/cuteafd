@@ -509,10 +509,7 @@ pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: 
         layers, gpus == 2, &glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms)));
     let ranks = counts.iter().enumerate().map(|(rank, &count)| {
         let role = if gpus == 1 { 0 } else { rank + 1 };
-        let measured = glmf_graphs::measured_graph_bytes(count, role);
-        let margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
-            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
-        GraphRank { executables: count, bytes: measured + margin, margin }
+        glmf_graphs::estimated_graph_rank(count, role)
     }).collect();
     GraphSet { ranks, shapes: counts[0] / (layers + 1) as u64, lifetime: Lifetime::Startup }
 }
@@ -567,24 +564,19 @@ pub fn startup_graph_bound(cfg: &GlmNextConfig, layers: usize, context: usize, p
     let shapes = (geometries.len() * rows) as u64;
     let ranks = (0..gpus).map(|rank| {
         let executables = shapes * (layers + usize::from(rank == 0)) as u64;
-        let measured = glmf_graphs::measured_graph_bytes(executables, if gpus == 1 { 0 } else { rank + 1 });
-        let margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
-            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
-        GraphRank { executables, bytes: measured + margin, margin }
+        glmf_graphs::estimated_graph_rank(executables, if gpus == 1 { 0 } else { rank + 1 })
     }).collect();
     GraphSet { ranks, shapes, lifetime: Lifetime::Startup }
 }
 
-/// P6 staged capture after every expert capacity was primed, not legacy Spark-route graphs.
-/// Preserve the separate admission-growth margin; only the ready executable charge changes.
+/// Historical P6 local-route observation. Missing exact code/key provenance
+/// keeps this an estimate (#1463); live admission replaces it after capture.
 pub fn calibrate_local_tp2_graphs(graphs: &mut GraphSet) {
     if graphs.ranks.len() != 2 || graphs.lifetime != Lifetime::Startup { return; }
     for (rank, graph) in graphs.ranks.iter_mut().enumerate() {
         let (bytes, count) = [(2_074_083_328u64, 12_880u64), (2_004_877_312, 12_600)][rank];
-        let measured = (graph.executables as u128 * bytes as u128).div_ceil(count as u128) as u64;
-        graph.margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
-            .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
-        graph.bytes = measured + graph.margin;
+        *graph = GraphRank::estimate(graph.executables, bytes, count)
+            .expect("GLMF local startup graph estimate fits u64");
     }
 }
 
@@ -744,7 +736,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn contract_graph_exact_substitution_preserves_ready_and_growth_phases() {
+    fn contract_startup_graph_estimates_are_opaque_without_growth_margin() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
         for local in [false, true] {
             let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
@@ -754,14 +746,16 @@ pub(crate) mod tests {
             let admitted = contract(&input).unwrap();
             assert!(admitted.working.spark_layers.is_empty());
             for gpu in 0..2 {
-                let ready = admitted.solved.facts.allocations.iter()
-                    .find(|owner| owner.id == format!("glmf.graphs.{gpu}.ready")).unwrap();
-                let growth = admitted.solved.facts.allocations.iter()
-                    .find(|owner| owner.id == format!("glmf.graphs.{gpu}.growth")).unwrap();
-                assert_eq!(ready.bytes + growth.bytes, admitted.graphs.bytes(gpu));
-                assert_eq!(growth.bytes, admitted.graphs.ranks[gpu].margin);
-                assert_eq!(ready.lifetime.first, planner::Phase::Warmup);
-                assert_eq!(growth.lifetime.first, planner::Phase::Growth);
+                let owner = admitted.solved.facts.allowances.iter()
+                    .find(|owner| owner.source == format!("startup graphs: glmf.graphs.{gpu}")).unwrap();
+                assert_eq!(owner.bytes, admitted.graphs.bytes(gpu));
+                assert!(owner.assumed);
+                assert_eq!(admitted.graphs.ranks[gpu].margin, 0);
+                assert_eq!(owner.lifetime.first, planner::Phase::Warmup);
+                assert_eq!(owner.lifetime.last, planner::Phase::Growth);
+                assert!(!admitted.solved.facts.allocations.iter()
+                    .any(|owner| owner.id.starts_with(&format!("glmf.graphs.{gpu}."))));
+                assert!(!admitted.declared_graphs[gpu].is_empty());
             }
             assert_eq!(admitted.solved.phases,
                 planner::evaluate(&admitted.solved.facts, &admitted.solved.budgets).unwrap());
@@ -880,7 +874,10 @@ pub(crate) mod tests {
         let copy = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
         assert_eq!(copy.shapes, 280);
         assert_eq!(copy.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [12_880, 12_600]);
-        assert_eq!([copy.at_ready(0), copy.at_ready(1)], [2_082_618_720, 2_131_554_600]);
+        assert_eq!([copy.at_ready(0), copy.at_ready(1)], [
+            GraphRank::estimate(12_880, 2_231_369_728, 13_800).unwrap().bytes,
+            GraphRank::estimate(12_600, 2_283_798_528, 13_500).unwrap().bytes]);
+        assert!(copy.ranks.iter().all(|rank| rank.margin == 0 && rank.basis == Basis::Estimated));
         let plain = startup_graphs(&cfg, 45, 262_144, 262_144, 8, false, 2, 64, 188);
         assert_eq!(plain.shapes, 112);
         assert_eq!(plain.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [5_152, 5_040]);
@@ -902,7 +899,8 @@ pub(crate) mod tests {
             assert_eq!(code.basis, Basis::Estimated);
             assert_eq!(code.bytes, programs.module_bytes());
             assert_eq!(code.pending(586_416_128 + 100, 586_416_128), code.bytes - 100);
-            assert!(graphs.growth(rank as usize) >= 64 << 20);
+            assert_eq!(graphs.growth(rank as usize), 0);
+            assert_eq!(graphs.ranks[rank as usize].basis, Basis::Estimated);
         }
     }
 
