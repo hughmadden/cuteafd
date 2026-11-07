@@ -855,8 +855,9 @@ pub(crate) mod tests {
                 .find(|allocation| allocation.id == format!("glmf.pool.{owner}")).unwrap();
             let units = marked.solved.pool_tokens / 256;
             let per_unit = pool.bytes / units;
-            let used = marked.solved.phases.iter().find(|phase| phase.phase == planner::Phase::Growth
-                && phase.budget == format!("rtx{owner}")).unwrap().owned;
+            let phase = marked.solved.phases.iter().find(|phase| phase.phase == planner::Phase::Growth
+                && phase.budget == format!("rtx{owner}")).unwrap();
+            let used = phase.owned + phase.opaque;
             let runtime = marked.solved.facts.allocations.iter()
                 .find(|allocation| allocation.id == format!("glmf.runtime.{owner}")).unwrap().bytes;
             let fixed = used - pool.bytes - runtime;
