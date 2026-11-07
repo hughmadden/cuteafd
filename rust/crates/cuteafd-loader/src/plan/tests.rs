@@ -3911,6 +3911,23 @@ fn glm5_flash_layout_moves_shared_replay_records_into_the_prefill_scratch() {
         assert_eq!(item(&path, false, fixed, Category::Workspace, "steps"), item(&path, true, fixed, Category::Workspace, "steps"));
     }
     assert_eq!(report(&path, true, None).memory_layout.unwrap().pool_tokens, 1_048_576);
+    assert_eq!(report(&path, true, None).replay_records, Some("shared"));
+    assert_eq!(report(&path, false, None).replay_records, Some("own"));
+    let auto_report = |placement: ExpertPlacement, pool: Option<u64>, onboard: Option<crate::placement::OnboardSetting>| {
+        let options = PlanOptions { placement, layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            drafter_bytes: 256 << 20, rtx_bytes: vec![96 << 30], context_tokens: 131_072,
+            workspace_manifest: Some(path.clone()), glmf_auto_replay: true, pool_tokens: pool,
+            onboard, ..Default::default() }), ..Default::default() };
+        plan(dir.path(), &options).unwrap()
+    };
+    let auto_spark = auto_report(ExpertPlacement::Sparks { ranks: 4 }, None, None);
+    assert_eq!(auto_spark.replay_records, Some("shared"));
+    let auto_fixed = auto_report(ExpertPlacement::Sparks { ranks: 4 }, Some(131_072), None);
+    assert_eq!(auto_fixed.replay_records, Some("own"));
+    let auto_local = auto_report(ExpertPlacement::Local, None, None);
+    assert_eq!(auto_local.replay_records, Some("own"));
+    let auto_onboard_all = auto_report(ExpertPlacement::Sparks { ranks: 4 }, None, Some(crate::placement::OnboardSetting::All));
+    assert_eq!(auto_onboard_all.replay_records, Some("own"));
 }
 
 #[test]
