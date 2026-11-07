@@ -649,7 +649,7 @@ pub fn live_budgets(
 }
 
 pub fn production_request(
-    context: u64,
+    context: impl Into<crate::placement::planner::Context>,
     pool: Option<u64>,
     onboard: crate::placement::Onboard,
     prefill: PrefillShape,
@@ -658,7 +658,7 @@ pub fn production_request(
     spark_reply_formats: SparkReplyFormats,
 ) -> Request {
     Request {
-        context,
+        context: context.into(),
         pool: crate::placement::PoolPolicy::normalize_request(pool).map_or(Pin::Auto, Pin::Exact),
         onboard: match onboard {
             crate::placement::Onboard::Auto => Pin::Auto,
@@ -1206,7 +1206,7 @@ impl Recipe for V41Recipe<'_> {
     fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
         if !(1..=2).contains(&self.gpus)
             || self.context == 0
-            || request.context != self.context
+            || request.context.maximum != self.context
             || self.maximum_pages == 0
             || self.maximum_pages == u64::MAX
             || self.page_tokens != 512

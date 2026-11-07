@@ -1525,14 +1525,15 @@ mod draft_tests {
         std::fs::write(&manifest, r#"{"capacities":{"max_context":1048576}}"#)?;
         let mut census = Vec::new();
         for context in [0usize, 1_048_576] {
+            let context_arg = if context == 0 { "auto".into() } else { context.to_string() };
             let mut args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
-                "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16",
+                "--max-context-tokens", &context_arg, "--dspark", "--max-sequences", "16",
                 "--host-cache-bytes", "auto"])?.args;
             args.prefix.resolve_entries(args.max_sequences.unwrap());
             let mut resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;
             assert_eq!(resolved.args.max_context, 1_048_576);
-            assert_eq!(resolved.automatic_context, context == 0);
+            assert_eq!(matches!(resolved.context.pin, cuteafd_loader::placement::planner::Pin::Auto), context == 0);
             assert_eq!(args.engine.max_context, context, "CLI auto policy must remain intact");
             // Removing the manifest after resolution proves sizing does not resolve it again.
             std::fs::remove_file(&manifest)?;
@@ -1551,9 +1552,8 @@ mod draft_tests {
                 cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?));
             assert!(resolved.args.draft_window_marks > census.last().unwrap().1);
 
-            let pool_context = crate::shared::context::pool_context("glm5", resolved.args.max_context,
-                resolved.automatic_context, 524_288, 256);
-            if context == 0 { assert_eq!(pool_context?, 524_032); }
+            let pool_context = crate::shared::context::pool_context("glm5", resolved.context, 524_288);
+            if context == 0 { assert_eq!(pool_context?, 524_288); }
             else { assert!(pool_context.is_err()); }
             std::fs::write(&manifest, r#"{"capacities":{"max_context":1048576}}"#)?;
         }

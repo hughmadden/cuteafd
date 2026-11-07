@@ -167,8 +167,8 @@ pub fn context_buffers(cfg: &GlmNextConfig, extent: u64, rows: u64, lanes: u64,
 pub struct GlmfInputs<'a> {
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
-    /// True only when the operator left context automatic.
-    pub automatic_context: bool,
+    /// Shared model extent and optional operator context pin.
+    pub context: crate::placement::planner::Context,
     pub attention: GlmfAttention,
     pub cfg: &'a GlmNextConfig,
     pub layers: usize,
@@ -615,7 +615,7 @@ pub(crate) mod tests {
 
     pub(crate) fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
         let context = ArchContext::coordinator(capacity, None).context_bytes;
-        GlmfInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+        GlmfInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(262_144),
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + inventory::loaded_code_allowance("glmf", "exl3", ranks == 2,
@@ -645,7 +645,7 @@ pub(crate) mod tests {
         rtx_experts: bool, alternate: Option<&[GlmfResidentRank]>)
         -> Result<(Placement, GraphSet, GlmfWorkingSet), planner::Refusal> {
         let mut input = input.clone();
-        input.automatic_context = automatic_context;
+        input.context = crate::placement::planner::Context::resolve(input.max_context, (!automatic_context).then_some(input.max_context));
         let mut process = admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
         process.alternate_resident = alternate.map(<[GlmfResidentRank]>::to_vec);
         let selected = admission::prepare(&input, sms, rtx_experts, process)?.admit()?;
@@ -842,7 +842,7 @@ pub(crate) mod tests {
             input.drafter_bytes = 0;
             input.resident.iter_mut().for_each(|rank| rank.embedding = 0);
             input.graphs = GraphSet::budget(&[64 << 20; 2]);
-            input.automatic_context = true;
+            input.context = crate::placement::planner::Context::automatic(input.max_context);
             let owner = (1 - first) as usize;
             let marked = contract(&input).unwrap();
             let pool = marked.solved.facts.allocations.iter()
@@ -857,7 +857,8 @@ pub(crate) mod tests {
             let fixed = used - pool.bytes - runtime;
             input.gpus[owner].1 = Baseline::Measured {
                 free_bytes: fixed + 64 * per_unit + input.headroom_bytes };
-            let bounded = contract(&input).unwrap();
+            let bounded = cuteafd_core::memory_policy::MemoryPolicy { kv_min: Some(256), ..Default::default() }
+                .scoped(|| contract(&input)).unwrap();
             assert_eq!(bounded.placement.pool_tokens, 64 * 256);
             input.pool_marks = false;
             assert!(contract(&input).unwrap().placement.pool_tokens > bounded.placement.pool_tokens);
@@ -909,7 +910,7 @@ pub(crate) mod tests {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         for (ranks, capacity) in [(1, 32 << 30), (1, inventory::PRO_TOTAL_BYTES), (2, inventory::PRO_TOTAL_BYTES)] {
             let mut planned = inputs(&cfg, ranks, capacity);
-            planned.automatic_context = true;
+            planned.context = crate::placement::planner::Context::automatic(planned.max_context);
             let p = contract(&planned).unwrap();
             let r = contract(&sampled(&planned)).unwrap();
             assert_eq!(p.solved.pool_tokens, r.solved.pool_tokens);
@@ -1184,6 +1185,7 @@ pub(crate) mod tests {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let mut input = inputs(&cfg, 1, 32 << 30);
         input.max_context = 4 << 20;
+        input.context = crate::placement::planner::Context::pinned(input.max_context);
         input.graphs = GraphSet::budget(&[64 << 20]);
         let (placed, _, working) = admitted_case(&input, true, 170, true, None).unwrap();
         assert!(placed.pool_tokens < input.max_context);
@@ -1554,7 +1556,7 @@ pub(crate) mod tests {
         let input = inputs(&cfg, 1, 32 << 30);
         let (placed, graphs) = admitted_case(&input, true, 170, true, None).map(|(placed, graphs, _)| (placed, graphs)).unwrap();
         assert!(placed.pool_tokens < 1 << 20);
-        let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
+        let context = crate::placement::planner::Context::automatic(input.max_context).served(placed.pool_tokens) as usize;
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
             input.sequences as usize, true, 1, 64, 170);
         assert_eq!(graphs.ranks, expected.ranks);
@@ -1569,7 +1571,7 @@ pub(crate) mod tests {
             input.speculation = speculation;
             input.sequences = 128;
             let (placed, graphs) = admitted_case(&input, true, 188, true, None).map(|(placed, graphs, _)| (placed, graphs)).unwrap();
-            let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
+            let context = crate::placement::planner::Context::automatic(input.max_context).served(placed.pool_tokens) as usize;
             let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
                 64, speculation, 1, 64, 188);
             assert_eq!(graphs.ranks, expected.ranks);
@@ -1583,7 +1585,7 @@ pub(crate) mod tests {
         input.onboard = Onboard::Layers(1);
         let (placed, graphs) = admitted_case(&input, true, 188, true, None).map(|(placed, graphs, _)| (placed, graphs)).unwrap();
         assert_eq!(placed.onboard_layers, 1);
-        let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
+        let context = crate::placement::planner::Context::automatic(input.max_context).served(placed.pool_tokens) as usize;
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
             input.sequences as usize, true, 1, 64, 188);
         assert_eq!(graphs.ranks, expected.ranks);

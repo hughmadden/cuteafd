@@ -186,6 +186,12 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             full_prefill_logits: false, prefill: (rows, 1), depth: None, packed_row_cap: None, admitted_host: None })
     }
 
+    pub(super) fn with_served_context(mut self, context: usize) -> Result<Self> {
+        ensure!(context > 0 && context <= self.context, "served context exceeds compiled Step-5 cache extent");
+        self.context = context;
+        Ok(self)
+    }
+
     pub(super) fn with_admitted_host(mut self, bytes: u64,
         geometry: cuteafd_core::prefix::HostCacheGeometry) -> Self {
         self.admitted_host = Some((bytes, geometry));

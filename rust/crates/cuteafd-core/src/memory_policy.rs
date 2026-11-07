@@ -153,17 +153,15 @@ impl MemoryPolicy {
         }
     }
 
-    /// KV target, min and max for the smallest physical coordinator card and
-    /// the serving context. Unset, the min is the context, and at least the
-    /// 256K agentic floor on Spark-free layouts (Sparks may serve less, the
-    /// context clamped to the pool); never above the target.
-    pub fn kv(&self, smallest_card: u64, context: u64, spark_free: bool) -> Result<KvBounds, PolicyError> {
+    /// KV target, min and max for the smallest physical coordinator card.
+    /// The default minimum is the smaller of the model context and the
+    /// agentic floor, bounded by the target, independent of Spark placement.
+    pub fn kv(&self, smallest_card: u64, context: u64) -> Result<KvBounds, PolicyError> {
         let default_target = if smallest_card <= SMALL_CARD_BYTES { SMALL_CARD_KV_TARGET_TOKENS }
             else { DEFAULT_GPU_KV_TOKENS };
-        // The target is never below the serving context (a full sequence fits).
-        let target = self.kv_target.unwrap_or(default_target).max(context);
-        let min = self.kv_min.unwrap_or(if spark_free { context.max(AGENTIC_FLOOR_TOKENS) } else { context }
-            .min(target));
+        // An explicit target can be below the model maximum for automatic context.
+        let target = self.kv_target.unwrap_or(default_target.max(context));
+        let min = self.kv_min.unwrap_or(context.min(AGENTIC_FLOOR_TOKENS).min(target));
         let max = self.kv_max.unwrap_or(target).max(if self.kv_max.is_some() { 0 } else { target });
         if target == 0 || min > target || target > max {
             return Err(PolicyError::KvOrder { min, target, max });
@@ -180,7 +178,7 @@ impl MemoryPolicy {
                 if reserve >= cap { return Err(PolicyError::ReserveFillsCap { device: name, reserve, cap }); }
             }
         }
-        self.kv(u64::MAX, 0, false).map(|_| ())
+        self.kv(u64::MAX, 0).map(|_| ())
     }
 }
 
@@ -290,13 +288,16 @@ mod tests {
     #[test]
     fn kv_defaults_follow_card_and_context() {
         let policy = MemoryPolicy::default();
-        assert_eq!(policy.kv(96 * GIB, 1 << 20, false).unwrap(), KvBounds { target: 2 << 20, min: 1 << 20, max: 2 << 20 });
-        assert_eq!(policy.kv(96 * GIB, 65_536, true).unwrap(), KvBounds { target: 2 << 20, min: AGENTIC_FLOOR_TOKENS, max: 2 << 20 });
-        assert_eq!(policy.kv(32 * GIB, 65_536, false).unwrap(), KvBounds { target: 1 << 20, min: 65_536, max: 1 << 20 });
+        assert_eq!(policy.kv(96 * GIB, 1 << 20).unwrap(), KvBounds { target: 2 << 20, min: AGENTIC_FLOOR_TOKENS, max: 2 << 20 });
+        assert_eq!(policy.kv(96 * GIB, 65_536).unwrap(), KvBounds { target: 2 << 20, min: 65_536, max: 2 << 20 });
+        assert_eq!(policy.kv(32 * GIB, 65_536).unwrap(), KvBounds { target: 1 << 20, min: 65_536, max: 1 << 20 });
+        let short_target = MemoryPolicy { kv_target: Some(131_072), ..policy };
+        assert_eq!(short_target.kv(96 * GIB, 1 << 20).unwrap(),
+            KvBounds { target: 131_072, min: 131_072, max: 131_072 });
         let grow = MemoryPolicy { kv_max: Some(4 << 20), ..policy };
-        assert_eq!(grow.kv(96 * GIB, 1 << 20, false).unwrap().max, 4 << 20);
-        assert!(MemoryPolicy { kv_max: Some(1 << 20), ..policy }.kv(96 * GIB, 0, false).is_err());
-        assert!(MemoryPolicy { kv_min: Some(3 << 20), ..policy }.kv(96 * GIB, 0, false).is_err());
+        assert_eq!(grow.kv(96 * GIB, 1 << 20).unwrap().max, 4 << 20);
+        assert!(MemoryPolicy { kv_max: Some(1 << 20), ..policy }.kv(96 * GIB, 0).is_err());
+        assert!(MemoryPolicy { kv_min: Some(3 << 20), ..policy }.kv(96 * GIB, 0).is_err());
     }
 
     #[test]

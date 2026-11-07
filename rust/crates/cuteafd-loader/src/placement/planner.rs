@@ -167,9 +167,30 @@ pub struct PrefillShape {
     pub rows: u64,
     pub waves: u64,
 }
+/// Compiled model extent and the user's context requirement are independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Context {
+    pub maximum: u64,
+    pub pin: Pin<u64>,
+}
+impl Context {
+    pub fn resolve(maximum: u64, requested: Option<u64>) -> Self {
+        Self { maximum, pin: requested.filter(|&tokens| tokens > 0).map_or(Pin::Auto, Pin::Exact) }
+    }
+    pub fn automatic(maximum: u64) -> Self { Self { maximum, pin: Pin::Auto } }
+    pub fn pinned(tokens: u64) -> Self { Self { maximum: tokens, pin: Pin::Exact(tokens) } }
+    pub fn required(self) -> u64 { match self.pin { Pin::Auto => 0, Pin::Exact(tokens) => tokens } }
+    pub fn served(self, pool: u64) -> u64 {
+        match self.pin { Pin::Auto => self.maximum.min(pool), Pin::Exact(tokens) => tokens }
+    }
+}
+impl From<u64> for Context {
+    fn from(tokens: u64) -> Self { Self::pinned(tokens) }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
-    pub context: u64,
+    pub context: Context,
     pub pool: Pin<u64>,
     pub onboard: Pin<u64>,
     pub prefill: Pin<PrefillShape>,
@@ -480,6 +501,8 @@ pub struct ResolvedPlan {
     pub phases: Vec<PhaseBudget>,
 }
 impl ResolvedPlan {
+    pub fn served_context(&self) -> u64 { self.request.context.served(self.pool_tokens) }
+
     pub fn items(&self, location: Location) -> Result<Vec<Item>, Refusal> {
         let mut groups = BTreeMap::new();
         for allocation in &self.facts.allocations {

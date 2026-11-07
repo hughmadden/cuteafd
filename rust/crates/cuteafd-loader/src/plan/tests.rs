@@ -68,7 +68,7 @@ fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
             physical_bytes: 8192, logical_bytes: 4096, headroom: 64,
             baseline: Baseline::Forecast { occupied: 128, source: "host baseline".into(), assumed: true } },
     ];
-    let solved = planner::solve(Request { context: 64, pool: Pin::Exact(64), onboard: Pin::Auto,
+    let solved = planner::solve(Request { context: (64).into(), pool: Pin::Exact(64), onboard: Pin::Auto,
         prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
         spark_reply_formats: Default::default() }, budgets, &Fixed(facts)).unwrap();
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
@@ -3526,7 +3526,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {
-        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(opts.context_tokens), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().map(|&total| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes,
                 loaded_bytes: 0 })).collect(),
@@ -3823,7 +3823,7 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                             served_index, 4, rows).unwrap();
                         let unit = geometry.logical_unit_rows;
                         let mut served_pool = crate::placement::PoolPolicy::resolve(&vec![24 << 30; gpus],
-                            131_072, None, 256, false).target;
+                            131_072, None, 256).target;
                         for (device, rank) in memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
                             .zip(&geometry.ranks) {
                             let records = device.items.iter().find(|i| i.category == Category::Kv && i.group == "KV pool")
@@ -5979,10 +5979,14 @@ fn qwen_auto_pool_normalization_keeps_one_admission_and_its_refusal() {
     assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
     assert_eq!(automatic.prefill_waves, unset.prefill_waves);
     zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let small = plan(dir.path(), &zero).unwrap();
+    assert!(small.wip_launchable(), "{}", render(&small));
+    assert_eq!(small.phase_ledger.as_ref().unwrap().served_context_tokens, 64);
+    zero.layout.as_mut().unwrap().context_tokens = 262144;
     let refused = plan(dir.path(), &zero).unwrap();
     assert!(!refused.wip_launchable());
-    // The shared Recipe's typed refusal survives instead of a second solve with
-    // a smaller prefill reserve.
+    // An explicit context pin preserves the typed refusal instead of a second
+    // solve with a smaller prefill reserve.
     assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")
             && hint.what.contains("cannot hold selected context")), "{}", render(&refused));
     assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));

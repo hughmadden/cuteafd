@@ -84,6 +84,12 @@ class Gpu:
         return min(self.total_mib, self.free_mib + self.reclaim_mib)
 
 
+def context_setting(value: str) -> str:
+    if value == "auto" or (re.fullmatch(r"[1-9][0-9]{0,6}", value) and int(value) <= 1048576):
+        return value
+    raise argparse.ArgumentTypeError("context must be auto or a positive integer in 1..1048576")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--nvidia-smi", default="nvidia-smi")
@@ -98,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     select.add_argument("--selectors", default="", help="COORDINATOR_GPUS")
     select.add_argument("--mode", choices=("auto", "1", "2"), required=True)
     select.add_argument("--concurrency", type=int, required=True)
-    select.add_argument("--max-context-tokens", type=int, required=True)
+    select.add_argument("--max-context-tokens", type=context_setting, required=True, help="auto or a positive context pin")
     select.add_argument("--retained-turns", type=int, required=True)
     select.add_argument("--kv-pool-size", default="")
     select.add_argument("--gpu-memory-cap", default="", help="GPU_MEMORY_CAP: per-GPU total ceiling (a size)")
@@ -249,9 +255,12 @@ def desired_groups(args: argparse.Namespace) -> int:
         return groups
     if args.gpu_memory_cap:
         return minimum
-    groups = math.ceil(args.max_context_tokens / 512) * args.concurrency
+    if args.max_context_tokens == "auto":
+        return minimum
+    context = int(args.max_context_tokens)
+    groups = math.ceil(context / 512) * args.concurrency
     return max(min(groups, DEFAULT_POOL_TOKENS // 512) + args.concurrency + 2 * args.retained_turns,
-               math.ceil(args.max_context_tokens / 512) + minimum)
+               math.ceil(context / 512) + minimum)
 
 
 def required_mib(role: int, groups: int, minimum_expert_layers: int = 20,

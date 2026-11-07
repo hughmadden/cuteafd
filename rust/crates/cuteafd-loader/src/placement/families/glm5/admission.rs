@@ -728,10 +728,10 @@ pub fn production_links(cfg: &GlmDsaConfig, ranks: usize, prefill: PrefillShape,
         Some(endpoint("glm.prefill", prefill, true, replies.prefill(geometry.partial_replies()))?)))
 }
 
-pub fn production_request(context: u64, pool: Option<u64>, onboard: crate::placement::Onboard,
+pub fn production_request(context: impl Into<crate::placement::planner::Context>, pool: Option<u64>, onboard: crate::placement::Onboard,
     prefill: PrefillShape, operation: Operation, resident_weight_limit: crate::placement::ResidentWeights,
     spark_reply_formats: SparkReplyFormats) -> Request {
-    Request { context, pool: crate::placement::PoolPolicy::normalize_request(pool).map_or(Pin::Auto, Pin::Exact),
+    Request { context: context.into(), pool: crate::placement::PoolPolicy::normalize_request(pool).map_or(Pin::Auto, Pin::Exact),
         onboard: match onboard { crate::placement::Onboard::Auto => Pin::Auto,
             crate::placement::Onboard::Layers(n) => Pin::Exact(n as u64) },
         prefill: Pin::Exact(prefill), operation, resident_weight_limit: Some(resident_weight_limit), spark_reply_formats }
@@ -1464,8 +1464,8 @@ impl Recipe for GlmRecipe<'_> {
             || self.attention.is_empty()
             || self.attention.len() > self.cfg.layers
             || self.context == 0
-            || request.context == 0
-            || request.context != self.context
+            || request.context.maximum == 0
+            || request.context.maximum != self.context
             || self.maximum_pages == 0
             || self.maximum_pages == u64::MAX
             || self.page_tokens == 0

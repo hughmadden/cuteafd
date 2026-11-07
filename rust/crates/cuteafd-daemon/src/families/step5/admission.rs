@@ -298,7 +298,7 @@ mod tests {
                 waves,
                 unit,
                 sequences: 16,
-                context,
+                context, serving_context: cuteafd_loader::placement::planner::Context::pinned(context),
                 requested_pool: pool,
                 marks: prefix_marks(&<PrefixCli as clap::Parser>::parse_from([
                     "step5", "--host-cache-bytes", &host.map_or_else(|| "auto".into(), |n| n.to_string()),

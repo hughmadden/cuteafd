@@ -301,12 +301,12 @@ fn pool_policy(inputs: &V4Inputs) -> crate::placement::PoolPolicy {
     // targets the same pool offline and live.
     let cards = inputs.gpus.iter().map(|&(bytes, _)| bytes).collect::<Vec<_>>();
     crate::placement::PoolPolicy::resolve(&cards, inputs.max_context, inputs.requested_pool,
-        V4_PAGE_ROWS, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context)
+        V4_PAGE_ROWS).with_context(inputs.serving_context)
 }
 
 /// The smallest pool the request admits.
 fn context_floor(inputs: &V4Inputs) -> u64 {
-    pool_policy(inputs).floor
+    inputs.max_context
 }
 
 /// Prepare V4's immutable contract terms from one admission input.
@@ -399,7 +399,7 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
 /// The request `plan --layout` and serve-dsv4 both admit.
 pub fn production_request(inputs: &V4Inputs) -> Request {
     Request {
-        context: context_floor(inputs),
+        context: inputs.serving_context,
         pool: inputs
             .requested_pool
             .filter(|&tokens| tokens > 0)
@@ -853,10 +853,10 @@ impl<'a> PreparedV4<'a> {
 impl Recipe for PreparedV4<'_> {
     fn prepare(&self, request: &Request) -> Result<Contract, Refusal> {
         let inputs = self.inputs;
-        if request.context != self.context {
+        if request.context.maximum != self.context {
             return Err(invalid(format!(
                 "V4 request context {} differs from prepared {}",
-                request.context, self.context
+                request.context.maximum, self.context
             )));
         }
         if let Pin::Exact(shape) = request.prefill {

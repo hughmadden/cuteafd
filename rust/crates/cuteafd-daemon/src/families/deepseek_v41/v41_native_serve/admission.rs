@@ -460,6 +460,7 @@ mod startup_tests {
 /// One shared decision before cache or conditional routed weights are allocated.
 /// `memory` is the context/module inventory less subsequent live owners.
 pub(super) struct Admitted {
+    pub served_context: u32,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub pages: [usize; 4],
     pub cache_bytes: Vec<usize>,
@@ -531,7 +532,7 @@ pub(super) fn resolve_with_owners(
         "invalid V4.1 admission inventory"
     );
     ensure!(
-        (1..=1_048_576).contains(&args.max_context_tokens),
+        (0..=1_048_576).contains(&args.max_context_tokens),
         "invalid V4.1 context limit"
     );
     let onboard = args.rtx_expert_layers.onboard(experts.len());
@@ -550,15 +551,21 @@ pub(super) fn resolve_with_owners(
         ceilings.push(total);
         cards.push((total as u64, total as u64, free as u64));
     }
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
+    let maximum = cuteafd_loader::serving_capacity::checkpoint_context_limit(&config)?
+        .context("V4.1 checkpoint lacks context capability")?;
+    ensure!(u64::from(args.max_context_tokens) <= maximum, "V4.1 context exceeds checkpoint capability");
+    let serving_context = cuteafd_loader::placement::planner::Context::resolve(
+        if args.max_context_tokens == 0 { maximum } else { u64::from(args.max_context_tokens) },
+        Some(u64::from(args.max_context_tokens)));
+    let context = serving_context.maximum;
     let totals = memory.iter().map(|&(_, total)| total as u64).collect::<Vec<_>>();
     let tails = args.concurrency as u64 + 2 * args.resolved_prefix_entries() as u64;
     let mut pool = PoolPolicy::resolve(
         &totals,
-        args.max_context_tokens as u64,
+        context,
         args.pool_tokens,
-        512,
-        args.peers.is_empty(),
-    );
+        512);
     if let Some(bytes) = args.kv_pool_size.filter(|_| args.pool_tokens.is_none()) {
         let groups = bytes.0 as u64 / (5 * 256 * 356);
         ensure!(
@@ -567,22 +574,14 @@ pub(super) fn resolve_with_owners(
         );
         pool = PoolPolicy::resolve(
             &totals,
-            args.max_context_tokens as u64,
+            context,
             Some((groups - tails) * 512),
-            512,
-            args.peers.is_empty(),
-        );
+            512);
     }
-    // An explicit pool below the compiled context is the first typed refusal;
+    pool = pool.with_context(serving_context);
+    // An explicit pool below the pinned context is the first typed refusal;
     // zero and an omitted pool both selected automatic admission above.
     pool.validate_explicit()?;
-    // The compiled context is the pool minimum. Only an automatic Spark-free
-    // pool keeps the shared agentic floor; nothing else is clamped.
-    let context = if pool.requested.is_none() {
-        pool.floor.max(args.max_context_tokens as u64)
-    } else {
-        args.max_context_tokens as u64
-    };
     // The family executor's shape: the live capacity the chunk rounds to and
     // the configured units in flight.
     let prefill = PrefillShape {
@@ -620,7 +619,7 @@ pub(super) fn resolve_with_owners(
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     let mut host = admission::HostFacts::prepare(&config,
         &catalog.tensors().iter().map(|tensor| &tensor.metadata).collect::<Vec<_>>(),
-        prefill, ranks, args.peers.len(), args.max_context_tokens as u64, args.concurrency as u64,
+        prefill, ranks, args.peers.len(), context, args.concurrency as u64,
         args.dspark, match args.host_cache_bytes { crate::shared::prefix::HostBudget::Auto => None,
             crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes) },
         args.host_cache_bytes.enabled() && args.resolved_prefix_entries() > 0, args.host_cache_chunk_bytes,
@@ -681,7 +680,7 @@ pub(super) fn resolve_with_owners(
         budgets,
     };
     let request = production_request(
-        context,
+        serving_context,
         pool.requested,
         onboard,
         prefill,
@@ -715,6 +714,7 @@ pub(super) fn resolve_with_owners(
     }
     cuteafd_bench::context::set_resolved("kv-pool-size", &(groups * (5 * 256 * 356)).to_string());
     Ok(Admitted {
+        served_context: u32::try_from(admitted.solved.served_context())?,
         expert_usage: admitted.expert_usage,
         host, host_ledger,
         pages: [groups, groups, groups, 2 * groups],
@@ -1282,7 +1282,7 @@ mod admission_tests {
         assert_eq!(admitted.placement.onboard_layers, 3);
         assert!(resolve(&args, &memory, vec![expert; 2], 600 << 20, &[0], 0, None).is_err());
         args.rtx_expert_layers = LocalLayers::Count(0);
-        for context in [0, 1_048_577, u32::MAX] {
+        for context in [1_048_577, u32::MAX] {
             args.max_context_tokens = context;
             assert!(resolve(&args, &memory, no_experts(), 0, &[0], 0, None).is_err());
         }

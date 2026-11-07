@@ -6,7 +6,7 @@ use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxExpertLay
 use cuteafd_loader::placement::{families::qwen4, GpuBudget, LayerMode, Onboard};
 
 impl Opened {
-    pub(super) fn with_dual_engine<T>(&self, args: &EngineArgs, peer: i32, automatic_context: bool,
+    pub(super) fn with_dual_engine<T>(&self, args: &EngineArgs, peer: i32, context: cuteafd_loader::placement::planner::Context,
         media: crate::shared::experts::rtx::dense::Records,
         body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>) -> Result<T> {
         ensure!(args.local_experts && args.peers.is_none() && !args.shared_only && args.expert_window.is_none(),
@@ -88,7 +88,7 @@ impl Opened {
             ple_info.map(|(row_bytes, _)| row_bytes),
             dense_envelope.iter().map(|envelope| ("qwen.host.push.dual", envelope.clone())).collect())?;
         let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs {
-        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), automatic_context: automatic_context,
+        resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), context,
             owner_manifests: manifests.each_ref().map(Some),
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,
             gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: baselines[rank].0,
@@ -182,7 +182,7 @@ impl Opened {
         for rank in 0..2 { ensure!(pair[rank].workspace_bytes() as u64 == experts.workspace[rank],
             "Qwen allocated TP2 workspace disagrees with admission"); }
         let pool = usize::try_from(placement.pool_tokens)?;
-        let context = crate::shared::context::pool_context("qwen4", args.max_context, automatic_context, pool, 256)?;
+        let context = crate::shared::context::pool_context("qwen4", context, pool)?;
         let engine_ranks = [(devices[0], &programs[0], streams[0].raw), (devices[1], &programs[1], streams[1].raw)];
         let mut engine = engine::Qwen4Engine::new_placed(&self.library, self.cfg.clone(), model, ple, &owners,
             &engine_ranks, context, args.prefill_rows, pool.div_ceil(engine::PAGE_ROWS), args.slots, args.kv_format, embedding)?;

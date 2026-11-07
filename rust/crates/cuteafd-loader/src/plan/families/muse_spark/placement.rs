@@ -45,7 +45,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let context = if opts.context_tokens == 0 { cfg.max_position as u64 } else { opts.context_tokens };
     if context > cfg.max_position as u64 {
         report.refuse_placement(format!("Muse Spark context {context} exceeds the checkpoint's {}", cfg.max_position),
-            "Lower --context-tokens to at most 1M.");
+            "Lower --max-context-tokens to at most 1M.");
         return memory;
     }
     if !model.complete {
@@ -190,7 +190,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.encoder = Some(vision.clone());
         report.audio_encoder = Some(audio.clone());
     }
-    let request = shared::production_request(context, opts.pool_tokens, onboard,
+    let request = shared::production_request(crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)), opts.pool_tokens, onboard,
         PrefillShape { rows: prefill.unit_rows, waves: prefill.waves },
         if opts.full_prefill_logits { Operation::Scoring } else { Operation::Serving },
         Some(ResidentWeights(opts.weight_budget_bytes)), opts.spark_reply_formats);

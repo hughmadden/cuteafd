@@ -16,7 +16,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
             gpus: vec![GpuBudget { capacity_bytes: 96 * GIB, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: free } }; gpus],
             spark_ranks: sparks, peer_access: gpus == 2 },
-        pool: PoolPolicy::resolve(&vec![96 * GIB; gpus], 131_072, None, 256, sparks == 0),
+        pool: PoolPolicy::resolve(&vec![96 * GIB; gpus], 131_072, None, 256),
         layers: (0..layers).map(|_| LayerDemand { kind: AttentionClass::Csa, weights: ModeBytes::default(),
             kv_unit: ModeBytes::default().into(), colocate: None,
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false,
@@ -240,20 +240,20 @@ fn explicit_pool_requires_compiled_context_in_live_and_frozen_solves() {
     }
     req.pool.requested = Some(131072);
     assert_eq!(solve(&req).unwrap().pool_tokens, 131072);
-    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 32768, Some(32768), 256, false);
+    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 32768, Some(32768), 256);
     assert_eq!(solve(&req).unwrap().pool_tokens, 32768);
 }
 
 #[test]
 fn explicit_diagnostic_pool_clamps_only_automatic_context() {
     let mut req = request(1, GIB, 2, 4, Onboard::Auto);
-    req.pool = PoolPolicy::resolve(&[96 * GIB], 131072, Some(32768), 256, false)
-        .with_automatic_context(true);
+    req.pool = PoolPolicy::resolve(&[96 * GIB], 131072, Some(32768), 256)
+        .with_context(crate::placement::planner::Context::automatic(131072));
     let placed = solve(&req).unwrap();
     assert_eq!(placed.pool_tokens, 32768);
-    assert_eq!(crate::serving_capacity::pool_context(131072, true,
-        placed.pool_tokens as usize, 256).unwrap(), 32512);
-    req.pool = PoolPolicy::resolve(&[96 * GIB], 131072, Some(32768), 256, false);
+    assert_eq!(crate::serving_capacity::pool_context(crate::placement::planner::Context::automatic(131072),
+        placed.pool_tokens as usize).unwrap(), 32768);
+    req.pool = PoolPolicy::resolve(&[96 * GIB], 131072, Some(32768), 256);
     assert_eq!(solve(&req), Err(PlacementError::RequestedBelowContext {
         requested: 32768, floor: 131072,
     }));
@@ -335,14 +335,14 @@ fn absent_counterfactual_is_omitted_from_placement_summary_and_json() {
 }
 
 #[test]
-fn spark_free_layouts_need_every_layer_and_the_agentic_floor() {
+fn spark_free_layouts_need_every_layer_and_the_model_bounded_floor() {
     let placement = solve(&request(2, 44 * GIB, 30, 0, Onboard::Auto)).unwrap();
     assert_eq!(placement.onboard_layers, 30);
     assert!(placement.pool_tokens >= pool::AGENTIC_FLOOR_TOKENS);
     assert!(matches!(solve(&request(2, 44 * GIB, 100, 0, Onboard::Auto)), Err(PlacementError::SparkFree { .. })));
     assert!(matches!(solve(&request(2, 44 * GIB, 30, 0, Onboard::Layers(10))), Err(PlacementError::SparkFree { .. })));
     // All routed layers with no pool room left is below the floor.
-    assert!(matches!(solve(&request(2, 18 * GIB, 30, 0, Onboard::Auto)), Err(PlacementError::BelowFloor { .. })
+    assert!(matches!(solve(&request(2, 17 * GIB, 30, 0, Onboard::Auto)), Err(PlacementError::BelowFloor { .. })
         | Err(PlacementError::Mandatory { .. })));
 }
 
@@ -1033,6 +1033,7 @@ fn context_pool_rounding_never_crosses_floor_and_explicit_units_are_even() {
     req.pool_overhead = vec![0; 2];
     req.pool.unit_rows = 1;
     req.pool.compiled_context = 3;
+    req.pool.context = crate::placement::planner::Context::pinned(3);
     req.pool.floor = 3;
     req.pool.target = 3;
     req.pool.ceiling = 3;
@@ -1620,7 +1621,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
     for fixed in [false, true] {
         for (free, expected) in [(65, 3), (75, 4), (85, 5), (100, 7)] {
             let mut req = request(1, free, 0, 4, if fixed { Onboard::Layers(0) } else { Onboard::Auto });
-            req.pool = PoolPolicy { compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
+            req.pool = PoolPolicy { context: (1).into(), compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
             req.pool_overhead = vec![10];
             req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv,
                 group: "bounded table".into(), bytes_per_unit: 5, offset_units: 2, cap_units: 6, basis: Basis::Formula }];
@@ -1632,7 +1633,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
         }
     }
     let mut req = request(1, 200, 1, 4, Onboard::Auto);
-    req.pool = PoolPolicy { compiled_context: 5, requested: Some(5), target: 5, floor: 5, ceiling: 5, max: 5, unit_rows: 1 };
+    req.pool = PoolPolicy { context: (5).into(), compiled_context: 5, requested: Some(5), target: 5, floor: 5, ceiling: 5, max: 5, unit_rows: 1 };
     req.pool_overhead = vec![10];
     req.expert_workspace = 0;
     req.layers[0].experts.as_mut().unwrap().whole = Bytes2 { resident: 121, staging: 0 };
@@ -1647,7 +1648,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
 fn pool_failures_name_rank_demands_and_retain_selected_expert_arena() {
     for onboard in [Onboard::Auto, Onboard::Layers(0)] {
         let mut req = request(2, 100, 0, 4, onboard);
-        req.pool = PoolPolicy { compiled_context: 1, requested: Some(6), target: 6, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
+        req.pool = PoolPolicy { context: (1).into(), compiled_context: 1, requested: Some(6), target: 6, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
         req.pool_overhead = vec![1, 2];
         req.pool_bounded = vec![BoundedDemand { gpu: 1, category: Category::Prefix,
             group: "recurrent marks".into(), bytes_per_unit: 20, offset_units: 1,
@@ -1700,7 +1701,7 @@ fn successful_pool_limits_retain_auto_onboarded_arenas() {
 #[test]
 fn bounded_only_pool_and_invalid_demands_are_checked() {
     let mut req = request(1, 49, 0, 4, Onboard::Auto);
-    req.pool = PoolPolicy { compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
+    req.pool = PoolPolicy { context: (1).into(), compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
     req.pool_overhead = vec![0];
     req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv, group: "table".into(),
         bytes_per_unit: 10, offset_units: 0, cap_units: 5, basis: Basis::Formula }];
@@ -1747,7 +1748,7 @@ fn compulsory_prefix_reserves_exact_costs_before_an_automatic_pool() {
 #[test]
 fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
     let mut req = request(2, 8 * GIB, 4, 6, Onboard::Auto);
-    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 1 << 20, Some(1 << 20), 64, false);
+    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 1 << 20, Some(1 << 20), 64);
     req.pool_overhead = vec![128 * 1024; 2]; // 2 GiB per GPU at the fixed 1M extent.
     for layer in &mut req.layers {
         let cost = layer.experts.as_mut().unwrap();
@@ -1760,7 +1761,18 @@ fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
     req.fixed = marks.iter().cloned().map(|mut demand| { demand.bytes *= 4; demand }).collect();
     let budget = SparkBudgetInventory { layers: vec![0, 1, 2, 3],
         resident: vec![vec![GIB; 4], vec![GIB, GIB, 2 * GIB, GIB]],
-        overhead: vec![GIB; 2], budget: 4 * GIB };
+        overhead: vec![GIB; 2], budget: 4 * GIB
+            + cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(3 * GIB) };
+    assert_eq!(budget.rank_bytes(1, 2).unwrap(), budget.budget);
+    for reserve in [0, 7] {
+        cuteafd_core::memory_policy::MemoryPolicy { spark_reserve: Some(reserve), ..Default::default() }.scoped(|| {
+            // The inventory's overhead already contains the selected reserve;
+            // changing policy must never discard the separate arena metadata.
+            assert_eq!(budget.rank_bytes(1, 2).unwrap(), budget.budget);
+        });
+    }
+    assert_eq!(budget.rank_bytes(1, 3).unwrap(), 2 * GIB
+        + cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(GIB));
     assert_eq!(budget.minimum_rtx_layers().unwrap(), 2); // The asymmetric rank is binding.
     budget.constrain(&mut req).unwrap();
     assert_eq!(req.minimum_expert_layers, 2);
@@ -1817,6 +1829,7 @@ fn pool_ceiling_is_strict_for_automatic_and_explicit_pools() {
     let mut req = request(1, 32 * GIB, 0, 4, Onboard::Auto);
     req.pool.floor = 0;
     req.pool.compiled_context = 512;
+    req.pool.context = crate::placement::planner::Context::pinned(512);
     req.pool.ceiling = 512;
     req.pool.target = 1024;
     assert_eq!(solve(&req).unwrap().pool_tokens,512);

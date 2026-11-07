@@ -41,11 +41,12 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     // Identify the checkpoint before loading it: an unidentifiable directory fails in seconds.
     let mut profile = served_profile(args.model_id.clone(), &args.snapshot)?;
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
-    let Http { api, listen, snapshot, limits, http_queue_wait, console_hub, expert_usage } = http.expect("serving start loads the API");
-    let vision_health = readiness
+    let Http { api, listen, snapshot, reserve, http_queue_wait, console_hub, expert_usage } = http.expect("serving start loads the API");
+    let (vision_health, served_context) = readiness
         .await
         .context("native target startup stopped")?
         .map_err(anyhow::Error::msg)?;
+    let limits = reserve.limits(served_context as usize)?;
     cuteafd_bench::context::phase("engine loaded");
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     cuteafd_bench::ready(&listener);
@@ -104,7 +105,7 @@ fn expert_usage<'a>(library: &'a NativeLibrary, args: &crate::cli::NativeServeAr
     }).transpose()
 }
 
-type Readiness = std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>;
+type Readiness = std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), String>;
 type Stats = std::sync::Arc<std::sync::Mutex<serde_json::Value>>;
 
 /// What the HTTP API needs, loaded in the launch's original order.
@@ -113,7 +114,7 @@ struct Http {
     listen: String,
     /// Tokenizer snapshot for the gateway's exact `count_tokens`.
     snapshot: std::path::PathBuf,
-    limits: cuteafd_api::openai::NativeLimits,
+    reserve: crate::shared::kv_reserve::ReserveArgs,
     http_queue_wait: Duration,
     console_hub: std::sync::Arc<cuteafd_api::openai::ConsoleHub>,
     expert_usage: cuteafd_core::expert_usage::Reader,
@@ -183,7 +184,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     let api = if http { Some(args.api.load()?) } else { None };
     let listen = args.listen.clone();
     let snapshot = args.snapshot.clone();
-    let limits = args.reserve.limits(args.max_context_tokens as usize)?;
+    let reserve = args.reserve.clone();
     let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency) as usize);
     let http_queue_wait = Duration::from_millis(args.http_queue_wait_ms);
     let (ready, readiness) = oneshot::channel();
@@ -193,7 +194,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         Some(api) => {
             let console_hub = cuteafd_api::openai::ConsoleHub::new(args.console_text);
             console::install(console_hub.clone(), console::layout(&args))?;
-            Some(Http { api, listen, snapshot, limits, http_queue_wait, console_hub, expert_usage: args.expert_usage_reader.clone() })
+            Some(Http { api, listen, snapshot, reserve, http_queue_wait, console_hub, expert_usage: args.expert_usage_reader.clone() })
         }
         None => None,
     };
@@ -384,9 +385,9 @@ mod graph_startup_tests {
     }
 }
 fn worker(
-    args: crate::cli::NativeServeArgs,
+    mut args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
-    ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
+    ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
     graph_startup_prototype(&args)?;
@@ -453,6 +454,8 @@ fn worker(
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
     let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    args.max_context_tokens = pool.served_context;
+    cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
     cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
     let usage = expert_usage(&lib, &args, pool.expert_usage.as_ref())?;
@@ -779,7 +782,7 @@ fn worker(
     ready
         .take()
         .context("startup readiness missing")?
-        .send(Ok(vision.health_handle()))
+        .send(Ok((vision.health_handle(), args.max_context_tokens)))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second,
         &mut requests, &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut(), &mut vision, stats, prefixes)

@@ -133,7 +133,7 @@
       "--prefix-cache-entries",
       "20",
       "--max-context-tokens",
-      "1048576",
+      "auto",
       "--max-output-tokens",
       "131072",
       "--console-secret-file",

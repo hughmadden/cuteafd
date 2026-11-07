@@ -197,7 +197,7 @@ pub(super) fn layout(
         unit: checked_rows,
         full_prefill_logits: opts.full_prefill_logits,
         sequences,
-        context,
+        context, serving_context: crate::placement::planner::Context::resolve(context, (opts.context_tokens > 0).then_some(opts.context_tokens)),
         requested_pool: opts.pool_tokens,
         marks: MarkRule {
             lanes: sequences,
@@ -249,7 +249,7 @@ pub(super) fn layout(
             "Offline CUDA/code baseline is estimated; serving must re-admit against pre-weight live samples and native export ABIs".into(),
             format!("{}; {sequences} sequences, request context {}, compiled extent {}",
                 if coordinators == 2 { "SWA head split, complete-cost contiguous CSA owners" } else { "Single-device SWA and CSA ownership" },
-                admitted.cache.context, model.cfg.max_context)] };
+                admitted.solved.served_context(), model.cfg.max_context)] };
     let csa_owners = (0..coordinators).map(|rank| admitted.placement.layers.iter().enumerate()
         .filter(|(layer, item)| model.cfg.full[*layer]
             && matches!(item.mode, LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank)).count())
@@ -335,7 +335,7 @@ pub(super) fn layout(
                     assignment.resident_bytes,
                     Basis::Exact,
                 ),
-                cuteafd_core::memory_layout::spark_runtime_residual(),
+                cuteafd_core::memory_layout::spark_worker_process_resident_item(),
             ],
         };
         for (group, bytes) in [

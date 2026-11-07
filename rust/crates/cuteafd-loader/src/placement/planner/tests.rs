@@ -197,7 +197,7 @@ fn facts(allocations: Vec<Allocation>) -> Facts {
 }
 fn request() -> Request {
     Request {
-        context: 64,
+        context: (64).into(),
         pool: Pin::Auto,
         onboard: Pin::Auto,
         prefill: Pin::Auto,
@@ -390,7 +390,7 @@ fn pool_page_multiple_aligns_automatic_pool_floor_extent_and_explicit_pins() {
     assert!(matches!(solve(pinned, vec![budget(1024)], &Prepared(contract.clone())),
         Err(Refusal::MisalignedPool { tokens: 448, page_rows: 128 })));
     let mut floor = request();
-    floor.context = 64 * 3;
+    floor.context = (64 * 3).into();
     assert_eq!(solve(floor.clone(), vec![budget(64 * 5)], &Prepared(contract.clone())).unwrap().pool_tokens, 64 * 4);
     assert!(matches!(solve(floor, vec![budget(64 * 3)], &Prepared(contract.clone())),
         Err(Refusal::FullContextShortfall { tokens: 128, .. })));
@@ -1292,7 +1292,7 @@ fn step_exact_fifteen_inventory_replay_preserves_feasible_two_million_target() {
         }
     }
     let recipe = Prepared(contract);
-    let req = Request { context: 1 << 20, onboard: Pin::Exact(15), ..request() };
+    let req = Request { context: (1 << 20).into(), onboard: Pin::Exact(15), ..request() };
     let pinned = solve(req.clone(), budgets.clone(), &recipe).unwrap();
     let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() },
         budgets.clone(), &recipe).unwrap();
@@ -1350,7 +1350,7 @@ fn flash_spark_free_auto_all_inventory_replay_stops_at_target_and_retains_slack(
     assert!(matches!(evaluate(&contract.facts(&selected, LEGACY_POOL / 256 + 1).unwrap(), &budgets),
         Err(Refusal::Capacity { .. })));
     let recipe = Prepared(contract);
-    let req = Request { context: 1 << 20, ..request() };
+    let req = Request { context: (1 << 20).into(), ..request() };
     let automatic = solve(req.clone(), budgets.clone(), &recipe).unwrap();
     let pinned = solve(Request { onboard: Pin::Exact(42), ..req.clone() }, budgets.clone(), &recipe).unwrap();
     let explicit = solve(Request { pool: Pin::Exact(TARGET), ..req.clone() }, budgets.clone(), &recipe).unwrap();
@@ -1723,7 +1723,7 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
     ));
     let automatic = solve(
         Request {
-            context: 129,
+            context: (129).into(),
             ..request()
         },
         vec![budget(192)],
@@ -1731,11 +1731,11 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
     )
     .unwrap();
     assert_eq!(
-        (automatic.request.context, automatic.pool_tokens),
+        (automatic.request.context.maximum, automatic.pool_tokens),
         (129, 192)
     );
     for (available, context, tokens) in [(192, 193, 192), (192, 2 << 20, 192), (63, 64, 0)] {
-        let refusal = solve(Request { context, ..request() }, vec![budget(available)], &recipe).unwrap_err();
+        let refusal = solve(Request { context: context.into(), ..request() }, vec![budget(available)], &recipe).unwrap_err();
         let text = refusal.to_string();
         assert!(text.contains(&format!("maximum feasible pool is {tokens} tokens")), "{text}");
         assert!(text.contains("lower explicit context"), "{text}");
@@ -1745,6 +1745,33 @@ fn pool_pins_are_exact_and_context_is_never_clamped() {
         assert_eq!((actual, maximum), (context, tokens));
         assert!(matches!(*limiting, Refusal::Capacity { phase: Phase::PostTargetKv, .. }));
     }
+}
+
+#[test]
+fn full_context_refusal_prices_best_feasible_assignment_not_pruned_alternative() {
+    let mut contract = Linear::new().prepare(&request()).unwrap();
+    let variable = add_profile(&mut contract, vec![0], vec![0], vec![0, 1], &[0, 64]);
+    let mut remote = allocation("remote.experts", 1000);
+    remote.location = Location { device: Device::Spark(0), domain: Domain::Device };
+    let mut component = Component::allocation(remote, ByteCurve::fixed(1000, contract.maximum_pages),
+        false, contract.maximum_pages);
+    component.activation = Activation::choice(variable, 0);
+    contract.components.push(component);
+    let mut spark = budget(100);
+    spark.id = "spark0".into();
+    spark.locations = vec![Location { device: Device::Spark(0), domain: Domain::Device }];
+    let refusal = solve(Request { context: (256).into(), ..request() }, vec![budget(192), spark],
+        &Prepared(contract)).unwrap_err();
+    let Refusal::FullContextShortfall { tokens, limiting, .. } = refusal else {
+        panic!("expected full-context refusal");
+    };
+    assert_eq!(tokens, 128);
+    let Refusal::Capacity { budget, required, available, owners, .. } = *limiting else {
+        panic!("expected capacity witness");
+    };
+    assert_eq!((budget.as_str(), required, available), ("gpu", 256, 192));
+    assert!(!owners.is_empty(), "refusal must retain evaluated owner names");
+    assert!(!owners.iter().any(|owner| owner.contains("remote.experts")));
 }
 
 #[test]
@@ -1770,7 +1797,7 @@ fn automatic_target_uses_physical_card_not_logical_cap() {
     assert_eq!(
         solve(
             Request {
-                context,
+                context: context.into(),
                 ..request()
             },
             vec![budget(32 << 30)],
@@ -2841,4 +2868,48 @@ fn kv_min_refuses_and_kv_max_grows_an_automatic_pool_past_the_target() {
     let minimum = MemoryPolicy { kv_min: Some(64 * 64), ..target };
     assert!(solve_with(minimum, 64 * 32).is_err());
     assert_eq!(solve_with(minimum, 64 * 64).unwrap().pool_tokens, 64 * 64);
+}
+
+#[test]
+fn automatic_context_uses_shared_floor_and_exact_admitted_extent() {
+    let maximum = 1 << 20;
+    let recipe = Linear { maximum: 2 << 20, ..Linear::new() };
+    let automatic = Request { context: Context::automatic(maximum), ..request() };
+    for pool in [262_144, 760_768, maximum, 2 << 20] {
+        let mut available = budget(pool);
+        available.physical_bytes = 96 << 30;
+        let solved = solve(automatic.clone(), vec![available], &recipe).unwrap();
+        assert_eq!(solved.pool_tokens, pool);
+        assert_eq!(solved.served_context(), maximum.min(pool));
+        assert_eq!(solved.request.context.maximum, maximum);
+    }
+    assert!(solve(automatic.clone(), vec![budget(262_144 - 64)], &recipe).is_err());
+    let pinned = Request { context: Context::pinned(maximum), ..automatic.clone() };
+    assert!(solve(pinned, vec![budget(760_768)], &recipe).is_err());
+    let small_pool = Request { pool: Pin::Exact(64), ..automatic };
+    let solved = solve(small_pool, vec![budget(64)], &recipe).unwrap();
+    assert_eq!(solved.served_context(), 64);
+    let short = solve(Request { context: Context::automatic(128), ..request() },
+        vec![budget(128)], &recipe).unwrap();
+    assert_eq!(short.served_context(), 128);
+    assert!(solve(Request { context: Context::resolve(128, Some(256)), ..request() },
+        vec![budget(512)], &recipe).is_err());
+}
+
+#[test]
+fn pinned_context_keeps_the_operator_limit_with_a_larger_pool() {
+    let solved = solve(Request { context: Context::resolve(1 << 20, Some(131_072)), ..request() },
+        vec![budget(2 << 20)], &Linear::new()).unwrap();
+    assert_eq!(solved.served_context(), 131_072);
+    assert_eq!(solved.request.context.maximum, 1 << 20);
+}
+
+#[test]
+fn automatic_floor_is_bounded_by_an_explicit_target() {
+    cuteafd_core::memory_policy::MemoryPolicy { kv_target: Some(131_072), ..Default::default() }
+        .scoped(|| {
+            let solved = solve(Request { context: Context::automatic(1 << 20), ..request() },
+                vec![budget(2 << 20)], &Linear::new()).unwrap();
+            assert_eq!((solved.pool_tokens, solved.served_context()), (131_072, 131_072));
+        });
 }

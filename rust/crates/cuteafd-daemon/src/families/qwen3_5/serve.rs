@@ -510,6 +510,9 @@ pub(crate) struct ServeArgs {
     pub device: i32,
     #[arg(long)]
     pub pool_tokens: Option<u64>,
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<u64>)]
+    pub max_context: Option<u64>,
     /// Full-attention KV storage only; GDN recurrence remains FP32.
     #[arg(long, default_value = "fp8")]
     pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -595,7 +598,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
                 Some((&engine_args.prefix, lanes,
-                    engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device)), false)?);
+                    engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false)?);
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
             let drafts = if let Some(snapshot) = &engine_args.draft {
@@ -692,11 +695,12 @@ mod tests {
         let weights = NativeWeights { layers: vec![256; 2], norm: 256, head: 256, embedding: 256 };
         let geometry = qwen3_5::host_prefix_geometry(&cfg, 4096, buffers.mark_bytes as u64);
         let memory = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
-        for value in ["auto", "0", "1GiB"] {
+        for (value, context) in ["auto", "0", "1GiB"].into_iter()
+            .flat_map(|value| ["auto", "131072"].map(|context| (value, context))) {
             let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/model", "--host-cache-bytes", value])?;
             let crate::cli::Commands::Plan(plan) = cli.command else { unreachable!() };
             let serve = Cli::try_parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib.so",
-                "--host-cache-bytes", value])?.serve;
+                "--host-cache-bytes", value, "--max-context-tokens", context])?.serve;
             assert_eq!(plan.host_cache_bytes, serve.prefix.host_cache_bytes);
             let live = serve.prefix.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
                 page_rows: 64, pages: 4096, page_bytes: geometry.page_bytes as usize,
@@ -709,7 +713,9 @@ mod tests {
                 chunk_bytes: geometry.chunk_bytes().min(quota) };
             assert_eq!(live.as_ref().map_or(0, |c| c.bytes), owner.quota_bytes);
             assert_eq!(live.as_ref().map_or(0, |c| c.chunk_bytes), owner.chunk_bytes);
-            let admitted = qwen3_5::admit(Request { context: cfg.max_context as u64,
+            let requested_context = planner::Context::resolve(cfg.max_context as u64, serve.max_context);
+            assert_eq!(requested_context.pin, if context == "auto" { Pin::Auto } else { Pin::Exact(131072) });
+            let admitted = qwen3_5::admit(Request { context: requested_context,
                 pool: Pin::Exact(cfg.max_context as u64), onboard: Pin::Auto,
                 prefill: Pin::Exact(PrefillShape { rows: 4096, waves: 1 }), operation: Operation::Serving,
                 resident_weight_limit: None, spark_reply_formats: Default::default() },
@@ -717,6 +723,8 @@ mod tests {
                     96 << 30, 0, (128 << 30, 128 << 30))?,
                 DenseFacts { cfg: &cfg, weights: &weights, buffers: &buffers, slots: 4,
                     record_bytes: 4096, drafter: None, serving: None, host_prefix: owner, verify_check: false })?;
+            assert_eq!(admitted.request.context, requested_context);
+            assert_eq!(admitted.served_context(), if context == "auto" { cfg.max_context as u64 } else { 131072 });
             let pinned: u64 = admitted.facts.allocations.iter().filter(|a| a.id.starts_with("host.prefix."))
                 .map(|a| a.bytes).sum();
             assert_eq!(pinned, if quota == 0 { 0 } else { quota / owner.chunk_bytes * owner.chunk_bytes });
@@ -859,7 +867,7 @@ mod tests {
     fn dense_defaults_to_compact_kv_without_full_prefill_arena() {
         let mut parsed = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"])
             .unwrap().serve;
-        crate::commands::bench::assert_resolved_family_seam("qwen3_5", &["pool-tokens"], || {
+        crate::commands::bench::assert_resolved_family_seam("qwen3_5", &["max-context-tokens", "pool-tokens"], || {
             parsed.prefix.resolve_entries(parsed.max_sequences as usize);
             Ok(())
         }).unwrap();
