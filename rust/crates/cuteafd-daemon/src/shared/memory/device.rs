@@ -126,6 +126,7 @@ impl<F: Future> Drop for DeviceFuture<'_, F> {
 pub(crate) struct Allocation<'a> {
     pub device: Device<'a>,
     pub buffer: CuteafdDeviceBuffer,
+    backing: Option<std::rc::Rc<Allocation<'a>>>,
 }
 impl<'a> Allocation<'a> {
     pub fn attention_plane(device: Device<'a>, rows: usize, stride: usize, name: &str) -> Result<Self> {
@@ -139,11 +140,23 @@ impl<'a> Allocation<'a> {
 
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
         let buffer = device.run(|| device.library.alloc_device_buffer(bytes))?;
-        Ok(Self { device, buffer })
+        Ok(Self { device, buffer, backing: None })
+    }
+
+    /// A view retains the physical owner, including on partial-load failures.
+    pub fn view(owner: &std::rc::Rc<Self>, offset: usize, bytes: usize) -> Result<Self> {
+        ensure!(bytes > 0 && offset.checked_add(bytes).is_some_and(|end| end <= owner.buffer.bytes),
+            "device allocation view outside backing");
+        let address = (owner.buffer.ptr as usize).checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("device allocation view address overflow"))?;
+        ensure!(address % 256 == 0, "weight arena view requires 256-byte alignment");
+        Ok(Self { device: owner.device, buffer: CuteafdDeviceBuffer {
+            ptr: address as *mut std::ffi::c_void, bytes, ..owner.buffer }, backing: Some(owner.clone()) })
     }
 }
 impl Drop for Allocation<'_> {
     fn drop(&mut self) {
+        if self.backing.is_some() { return; }
         if self.device.library.is_quarantined_after_failed_drain() {
             // Match legacy allocations: cudaFree may wait on unproved work.
             return;

@@ -547,13 +547,14 @@ pub(crate) struct RawScales<'a> {
 impl<'a> RawScales<'a> {
     fn none() -> Self { Self { library: None, buffer: std::cell::Cell::new(None) } }
     fn owned(allocation: DeviceAllocation<'a>) -> Self {
+        assert!(allocation.backing.is_none(), "temporary raw scales must own their allocation");
         let allocation = std::mem::ManuallyDrop::new(allocation);
         Self { library: Some(allocation.library), buffer: std::cell::Cell::new(Some(allocation.buffer)) }
     }
     /// Frees the images (their packs ran).
     pub(crate) fn release(&self) {
         if let (Some(library), Some(buffer)) = (self.library, self.buffer.take()) {
-            drop(DeviceAllocation { library, buffer });
+            drop(DeviceAllocation { library, buffer, backing: None });
         }
     }
 }

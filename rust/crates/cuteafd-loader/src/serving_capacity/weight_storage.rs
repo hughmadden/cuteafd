@@ -1,6 +1,34 @@
 //! Exact aligned regions used by the coordinator's physical weight arenas.
-use anyhow::{Context, Result};
-use std::ops::Range;
+use anyhow::{ensure, Context, Result};
+use std::{collections::BTreeMap, ops::Range};
+
+/// One physical CUDA request and its immutable tensor views. IDs survive
+/// planning/loading so granularity owners charge backings, not views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightArenaLayout {
+    pub id: String,
+    pub bytes: usize,
+    pub views: BTreeMap<String, WeightArenaView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeightArenaView { pub offset: usize, pub bytes: usize }
+
+impl WeightArenaLayout {
+    /// Preserve cudaMalloc's 256-byte alignment for every consumer (including
+    /// the native K6 dispatcher and TMA's 16-byte tensor-map bases).
+    pub fn new(id: impl Into<String>, tensors: impl IntoIterator<Item = (String, usize)>) -> Result<Self> {
+        let tensors = tensors.into_iter().collect::<Vec<_>>();
+        ensure!(tensors.iter().all(|(_, bytes)| *bytes > 0), "empty weight arena tensor");
+        let packed = PackedWeightRegions::new(tensors.iter().map(|(_, bytes)| *bytes))?;
+        let mut views = BTreeMap::new();
+        for ((name, bytes), region) in tensors.into_iter().zip(packed.regions) {
+            ensure!(views.insert(name, WeightArenaView { offset: region.start, bytes }).is_none(),
+                "duplicate weight arena tensor");
+        }
+        Ok(Self { id: id.into(), bytes: packed.bytes, views })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PackedWeightRegions {
@@ -33,5 +61,16 @@ mod tests {
         assert_eq!(PackedWeightRegions::new([]).unwrap().bytes, 0);
         assert!(PackedWeightRegions::new([usize::MAX, 1]).is_err());
         assert!(PackedWeightRegions::new([256, usize::MAX]).is_err());
+    }
+
+    #[test]
+    fn named_arena_views_match_the_single_physical_request() -> Result<()> {
+        let layout = WeightArenaLayout::new("core/gpu0", [("payload".into(), 257), ("scale".into(), 2)])?;
+        assert_eq!(layout.bytes, 514);
+        assert_eq!(layout.views["scale"], WeightArenaView { offset: 512, bytes: 2 });
+        assert!(WeightArenaLayout::new("x", [("same".into(), 1), ("same".into(), 2)]).is_err());
+        assert!(WeightArenaLayout::new("x", [("empty".into(), 0)]).is_err());
+        assert!(WeightArenaLayout::new("x", [("a".into(), usize::MAX), ("b".into(), 1)]).is_err());
+        Ok(())
     }
 }
