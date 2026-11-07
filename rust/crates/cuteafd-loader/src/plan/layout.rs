@@ -807,8 +807,12 @@ mod draft_prefix_tests {
                 onboard: Some(crate::placement::OnboardSetting::Layers(5)), ..Default::default() };
             let mut report = plan::plan(target.path(), &PlanOptions {
                 placement: ExpertPlacement::Sparks { ranks: 6 }, layout: Some(options.clone()),
+                // This record-geometry fixture does not require Context's native programs.
+                attention_placement: Some(crate::placement::AttentionPlacement::Layers),
                 ..Default::default()
             })?;
+            assert!(report.fits && report.placement_supported, "{:?}", report.hints);
+            assert!(report.memory_layout.as_ref().unwrap().pool_tokens > 0);
             let (base, context, concurrency) = selected_host_geometry(&mut report, &options, checkpoint, model, &input)?;
             assert_eq!(context, (crate::families::kimi_k3::COMPILED_CONTEXT as u64).min(report.memory_layout.as_ref().unwrap().pool_tokens));
             assert_eq!(concurrency, 2);
