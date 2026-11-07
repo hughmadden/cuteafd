@@ -274,6 +274,12 @@ mod tests {
             .context("missing GDN norm")?.meta.dtype.clone();
         let mut layouts = vec![target_arena(&checkpoint, &cfg, norm, format)?];
         if cfg.mtp_layers == 1 { layouts.push(mtp_arena(&checkpoint, &cfg, format)?); }
+        if let Ok(draft) = std::env::var("CUTEAFD_QWEN_DENSE_ARENA_DRAFT") {
+            use crate::shared::speculation::block_dspark::DsparkDrafter;
+            let mut requests = DsparkDrafter::arena_requests(std::path::Path::new(&draft),
+                cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only, 0)?;
+            layouts.push(WeightArenaLayout::new("qwen3_5/dspark/gpu0", requests.remove(&0).context("dSpark device")?)?);
+        }
         for layout in layouts {
             check_layout(&layout);
             let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
