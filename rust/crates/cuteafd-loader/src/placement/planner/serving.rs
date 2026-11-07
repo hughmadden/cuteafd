@@ -176,10 +176,11 @@ mod tests {
             sequential: vec![], reservations: vec![], allowances: vec![],
             resident_weights: vec![], driver_page_tables: vec![] };
         let mut contract = Contract::fixed(64, 1, 2, empty);
-        contract.variables = vec![Variable::Encoder(vec![0, 1])];
+        contract.variables = vec![Variable::Encoder(vec![0, 1]),
+            Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
         contract.components = blas_components("sm_120", &owners, 1, order).unwrap();
         for selected in [0, 1] {
-            let facts = contract.facts(&[selected], 1).unwrap();
+            let facts = contract.facts(&[selected, 0, 0], 1).unwrap();
             for &phase in order.phases() {
                 let bytes = |rank| facts.allowances.iter().filter(|owner|
                     owner.location == Location::coordinator(rank) && owner.lifetime.contains(phase, order))
