@@ -1,0 +1,168 @@
+"""WIP builds export only what their scope's cards run: V4.1 and vision follow the scope (CPU only)."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'scripts/lib'))
+import wip_aot_scopes as aot  # noqa: E402
+
+V41_COORDINATOR = ('V41_LOCAL_EXPERT', 'V41_TP2_EXPERT', 'V41_FP8', 'V41_ATTENTION', 'V41_HC_LAGGED', 'V41_NARROW')
+SCOPE_KEYS = ('V41_AOT', 'VISION_ATTENTION_AOT', 'KIMIK3_AOT', 'GLMF_AOT', 'MUSE_AOT')
+
+
+def scopes(family, model, count, **extra):
+    _, derived = aot.config_scopes(dict(FAMILY=family, MODEL_ID='test/' + model, SPARK_COUNT=str(count),
+                                        RTX_GPUS='1', **extra))
+    return derived
+
+
+def test_kimi_scope_requests_no_v41_or_vision_exports():
+    derived = scopes('kimi_k3', 'Kimi-K3-EXL3-K2', 6)
+    assert derived['CUTEAFD_WIP_KIMIK3_AOT'] == 'ON'
+    assert 'CUTEAFD_WIP_V41_AOT' not in derived
+    assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in derived
+    assert derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'kimik3:exl3-k23'
+
+
+@pytest.mark.parametrize('count,roles', [(4, ''), (6, 'tp6'), (0, '')])
+def test_v41_scope_requests_v41_exports_only(count, roles):
+    derived = scopes('deepseek_v41', 'DeepSeek-V4.1-Flash', count)
+    assert derived['CUTEAFD_WIP_V41_AOT'] == 'ON'
+    assert derived['CUTEAFD_WIP_SPARK_TP_ROLES'] == roles
+    # V4.1 serves its tower through its own kernels, not the shared vision exports.
+    assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in derived
+
+
+@pytest.mark.parametrize('family,model', [('glm5_flash', 'GLM-5.3-Flash-NVFP4'), ('qwen4', 'Qwen3.8-Flash-Next-EXL3'),
+                                          ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6'),
+                                          ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6')])
+def test_vision_families_request_vision_unless_off(family, model):
+    assert scopes(family, model, 4)['CUTEAFD_WIP_VISION_ATTENTION_AOT'] == 'ON'
+    assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in scopes(family, model, 4, VISION='off')
+    assert 'CUTEAFD_WIP_V41_AOT' not in scopes(family, model, 4)
+
+
+@pytest.mark.parametrize('family,model', [('mimo_v2', 'MiMo-V2.6-Pro'), ('glm5', 'GLM-5.3-EXL3-K4'),
+                                          ('step5', 'Step-5-Preview'), ('deepseek_v4', 'DeepSeek-V4-Flash')])
+def test_towers_without_shared_vision_attention_request_none(family, model):
+    derived = scopes(family, model, 4)
+    assert 'CUTEAFD_WIP_VISION_ATTENTION_AOT' not in derived and 'CUTEAFD_WIP_V41_AOT' not in derived
+
+
+def test_card_union_carries_each_cards_switches():
+    cards = [dict(family='kimi_k3', name='kimi', config='k'), dict(family='deepseek_v41', name='v41', config='v'),
+             dict(family='glm5_flash', name='glmf', config='g')]
+    configs = dict(k=dict(MODEL_ID='test/Kimi-K3-EXL3-K2', SPARK_COUNT='6'),
+                   v=dict(MODEL_ID='test/DeepSeek-V4.1-Flash', SPARK_COUNT='6'),
+                   g=dict(MODEL_ID='test/GLM-5.3-Flash-NVFP4', SPARK_COUNT='4'))
+    derived = aot.family_scopes(cards, configs.__getitem__)
+    assert {key: derived.get('CUTEAFD_WIP_' + key) for key in SCOPE_KEYS} == dict(
+        V41_AOT='ON', VISION_ATTENTION_AOT='ON', KIMIK3_AOT='ON', GLMF_AOT='ON', MUSE_AOT=None)
+
+
+def test_release_all_scope_is_unchanged_by_wip_only_switches():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('release_scope_wip_only', ROOT / 'scripts/build/release-scope.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    derived, _ = module.derive(ROOT, ROOT / module.DEFAULT_MATRIX, 'all', {})
+    assert not any(key.endswith(('_V41_AOT', '_VISION_ATTENTION_AOT')) for key in derived)
+    # The release builder keeps both always on.
+    release = (ROOT / 'scripts/build/build-release-artifacts.sh').read_text()
+    assert '-DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \\' in release
+    assert '-DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_RELEASE_VISION_ATTENTION_AOT:-ON}"' in release
+    for flag in V41_COORDINATOR:
+        assert f'-DCUTEAFD_ENABLE_{flag}_AOT="$coordinator_aot"' in release
+
+
+def cmake_flags(role, env):
+    """The CMake -D flags build-wip-artifacts.sh passes for ROLE under ENV (no build)."""
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    roles = script[script.index('case "$role" in'):script.index('[[ "$cuda_arch" =~')]
+    cmake = 'cmake \\\n' + script.split('\ncmake \\\n', 1)[1].split('\n# One process budget', 1)[0]
+    command = ('set -euo pipefail\nrole=$1; cuda_arch=$2; source_dir=fixture; build_dir=fixture\n'
+               'spark_tp_roles="${CUTEAFD_WIP_SPARK_TP_ROLES:-}"; compiler_cache_cmake_args=()\n'
+               'cmake() { printf "%s\\n" "$@"; }\n'
+               + roles[roles.index('esac') + len('esac'):] + '\n' + cmake)
+    clean = {key: value for key, value in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
+    result = subprocess.run(['bash', '-c', command, 'test', role, '120' if role == 'coordinator' else '121'],
+                            env={**clean, **env, 'coordinator_aot': 'ON' if role == 'coordinator' else 'OFF',
+                                 'xgrammar': 'OFF'},
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return dict(line[2:].split('=', 1) for line in result.stdout.splitlines() if line.startswith('-D'))
+
+
+def flags_for(family, model, count, role='coordinator'):
+    derived = scopes(family, model, count)
+    env = {key: value for key, value in derived.items()}
+    if role == 'expert':
+        env['CUTEAFD_WIP_EXPERT_FAMILIES'] = derived['CUTEAFD_WIP_EXPERT_FAMILIES']
+    else:
+        env['CUTEAFD_WIP_EXPERT_FAMILIES'] = derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES']
+        env.pop('CUTEAFD_WIP_SPARK_TP_ROLES', None)
+    return cmake_flags(role, env)
+
+
+def test_kimi_coordinator_flags_turn_v41_and_vision_off():
+    flags = flags_for('kimi_k3', 'Kimi-K3-EXL3-K2', 6)
+    for flag in V41_COORDINATOR + ('V41_EXPERT', 'V41_NVFP4', 'VISION_ATTENTION'):
+        assert flags[f'CUTEAFD_ENABLE_{flag}_AOT'] == 'OFF', flag
+    assert flags['CUTEAFD_ENABLE_KIMIK3_AOT'] == 'ON'
+    assert flags['CUTEAFD_EXPERT_FAMILIES'] == 'kimik3:exl3-k23'
+
+
+@pytest.mark.parametrize('role', ['coordinator', 'expert'])
+def test_v41_flags_keep_todays_artifact_set(role):
+    flags = flags_for('deepseek_v41', 'DeepSeek-V4.1-Flash', 6, role)
+    on = 'ON' if role == 'coordinator' else 'OFF'
+    for flag in V41_COORDINATOR:
+        assert flags[f'CUTEAFD_ENABLE_{flag}_AOT'] == on, flag
+    assert flags['CUTEAFD_ENABLE_V41_EXPERT_AOT'] == 'ON'
+    assert flags['CUTEAFD_ENABLE_V41_NVFP4_AOT'] == 'ON'
+    # V4.1 never needed the shared vision exports; it now omits them.
+    assert flags['CUTEAFD_ENABLE_VISION_ATTENTION_AOT'] == 'OFF'
+
+
+@pytest.mark.parametrize('families,roles', [('dsv4f:rtx_backbone;dsv4f:spark_tp2', ''), ('', 'tp6')])
+def test_native_expert_base_stays_on_for_v4_native_families_and_spark_roles(families, roles):
+    flags = cmake_flags('expert', {'CUTEAFD_WIP_EXPERT_FAMILIES': families, 'CUTEAFD_WIP_SPARK_TP_ROLES': roles})
+    assert flags['CUTEAFD_ENABLE_V41_EXPERT_AOT'] == 'ON'
+    assert flags['CUTEAFD_ENABLE_V41_NVFP4_AOT'] == 'OFF'
+
+
+def test_vision_family_flags_enable_vision_only():
+    flags = flags_for('glm5_flash', 'GLM-5.3-Flash-NVFP4', 4)
+    assert flags['CUTEAFD_ENABLE_VISION_ATTENTION_AOT'] == 'ON'
+    assert all(flags[f'CUTEAFD_ENABLE_{flag}_AOT'] == 'OFF' for flag in V41_COORDINATOR + ('V41_EXPERT',))
+
+
+@pytest.mark.parametrize('key', ['CUTEAFD_WIP_V41_AOT', 'CUTEAFD_WIP_VISION_ATTENTION_AOT'])
+def test_invalid_switch_values_are_refused(tmp_path, key):
+    result = subprocess.run(['bash', str(ROOT / 'scripts/build/build-wip-artifacts.sh'), str(ROOT), 'expert', '121',
+                             str(tmp_path / 'b'), str(tmp_path / 'o'), 'rust'],
+                            env={'PATH': '/usr/bin:/bin', key: 'yes', 'TMPDIR': str(tmp_path),
+                                 'CARGO_HOME': str(tmp_path / 'cargo')},
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2 and f'{key} must be ON or OFF' in result.stderr
+
+
+def test_out_of_scope_v41_manifests_are_explicit_and_empty():
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    assert '"enabled":false,"variants":[]' in script and 'V41_EXPERT_AOT.json' in script
+    assert '{"schema":1,"role":"%s","enabled":false}' in script
+
+
+def test_wip_forwards_both_switches_to_both_legs_and_the_build_key():
+    wip = (ROOT / 'wip.sh').read_text()
+    coordinator = wip.split('local -a coordinator_build=(docker exec', 1)[1].split('"$coordinator_container"', 1)[0]
+    expert = wip.split('build_command="docker exec', 1)[1].split('\n', 1)[0]
+    for key in ('V41_AOT', 'VISION_ATTENTION_AOT'):
+        assert f'CUTEAFD_WIP_{key}=' in coordinator and f'CUTEAFD_WIP_{key}=' in expert
+    assert 'VISION_ATTENTION_AOT V41_AOT CARGO_FEATURES; do' in wip
