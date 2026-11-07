@@ -375,10 +375,15 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         catalog.exl3().context("Muse draft pricing needs EXL3 headers")?, &onboarded, gpus, engine.link.world_size()?,
         engine.link.installed_grouping()?)).transpose()?;
     tracing::info!(drafter = ?args.draft, onboarded = onboarded.len(), "Muse Spark drafter");
+    let draft_receipts = if crate::shared::inventory::startup_probe_enabled() {
+        draft.as_ref().map(|draft| draft.drafter.allocation_receipts(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&device_ids)?, "muse.drafter"))
+            .transpose()?.unwrap_or_default()
+    } else { Vec::new() };
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
         served_context, pages, local, draft, pricing, super::media::Binding::from_view(&view, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
-    let target_census = if crate::shared::inventory::startup_probe_enabled() {
+    let weight_census = if crate::shared::inventory::startup_probe_enabled() {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
         use crate::shared::memory::receipts::{Census, Inventory};
         let devices = CoordinatorDevices::new(&device_ids)?;
@@ -396,12 +401,13 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         let mut census = Census::default();
         census.owners(owners.receipts);
         census.owners(embedding.allocation_receipts(devices, "muse.target.embedding")?);
+        census.owners(draft_receipts);
         census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
-        tracing::info!("Muse startup named census covers target weights only; other owners remain in native-live records");
+        tracing::info!("Muse startup named census covers target weights and drafter; other owners remain in native-live records");
         Some(census)
     } else { None };
     crate::shared::inventory::startup_probe(&library, &device_ids, "muse-backend-ready",
-        crate::shared::inventory::StartupEvidence { census: target_census.as_ref(), ..Default::default() })?;
+        crate::shared::inventory::StartupEvidence { census: weight_census.as_ref(), ..Default::default() })?;
     // Engine teardown may block while joining exchange workers; preserve the
     // original scheduler error before any backend or native owners unwind.
     // Scheduler-owned selection, cache copies and timing live beside the target head.

@@ -17,6 +17,7 @@
 //!   admission refuses a drafter with others).
 use super::engine::RankResources;
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::weight_arena::{weight_allocation, DeviceWeightArena};
 use crate::shared::speculation::dflash::{ContextRow, DflashDrafter, Draft, DraftSeq, TargetHead, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::Scalar, CuteafdDeviceBuffer as Buffer};
@@ -37,6 +38,18 @@ pub(crate) struct MuseDraft<'a> {
     rows: usize,
 }
 
+fn drafter_arenas<'a>(device: Device<'a>, snapshot: &Path, devices: &[i32], head_rank: usize)
+    -> Result<std::collections::BTreeMap<i32, DeviceWeightArena<'a>>> {
+    use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only;
+    DflashDrafter::arena_requests(snapshot, Bf16Only, devices, head_rank)?.into_iter()
+        .map(|(id, requests)| {
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                format!("muse/drafter/{id}"), requests)?;
+            DeviceWeightArena::new(Device { library: device.library, id }, layout)
+                .map(|arena| (id, arena))
+        }).collect()
+}
+
 impl<'a> MuseDraft<'a> {
     /// Loads `snapshot` on the head rank's device and stream. `sequences`
     /// bounds a draft batch and the context slots (the admitted charge).
@@ -55,18 +68,28 @@ impl<'a> MuseDraft<'a> {
         let mask = table.host_rows(&[config.mask_token])?;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         ensure!(exchange.is_some() == !admitted.tp2.is_empty(), "Muse draft split differs from admission");
+        use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only;
+        let (devices, head_rank) = if let Some(exchange) = exchange.as_ref() {
+            ensure!(exchange.device(1) == device.id && exchange.stream(1) == stream,
+                "Muse drafter lead differs from the target head rank");
+            (vec![exchange.device(0), exchange.device(1)], 1)
+        } else {
+            (vec![device.id], 0)
+        };
+        let arenas = drafter_arenas(device, snapshot, &devices, head_rank)?;
+        let allocate = |id, name: &str, bytes| {
+            let arena = arenas.get(&id).context("Muse drafter requested an unplanned physical device")?;
+            weight_allocation(Device { library: device.library, id }, Some(arena), name, bytes)
+        };
         let drafter = device.run(|| {
-            use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only;
             use crate::shared::fp8_linear::{Fp8Scales, Fp8Rows};
             if let Some(exchange) = exchange {
-                ensure!(exchange.device(1) == device.id && exchange.stream(1) == stream,
-                    "Muse drafter lead differs from the target head rank");
-                DflashDrafter::load_tp2_on(device.library, programs, snapshot, file, admitted.context_slots,
+                DflashDrafter::load_tp2_on_with(device.library, programs, snapshot, file, admitted.context_slots,
                     admitted.sequences, mask, true, Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
-                    kv_cache, exchange, 1)
+                    kv_cache, exchange, head_rank, allocate)
             } else {
-                DflashDrafter::load(device.library, programs, snapshot, file, stream, admitted.context_slots,
-                    admitted.sequences, mask, true, Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16, kv_cache)
+                DflashDrafter::load_with(device.library, programs, snapshot, file, stream, admitted.context_slots,
+                    admitted.sequences, mask, true, Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16, kv_cache, allocate)
             }
         })?;
         let stored_width = head.globals.head.as_ref().context("Muse drafter on a rank without the head")?.shape[0];
@@ -139,5 +162,70 @@ impl<'a> MuseDraft<'a> {
             }
         };
         self.device.run(|| self.drafter.draft_device_with(sequences, &input, TargetHead::Launch(Box::new(launch))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::memory::receipts::{Census, Inventory};
+    use cuteafd_core::memory_layout::Category;
+    use cuteafd_loader::{families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
+        placement::planner::{CoordinatorDevices, Lifetime, Phase, PhaseOrder}};
+
+    #[test]
+    fn installed_muse_drafter_arenas_follow_physical_devices_and_retain_views() -> Result<()> {
+        let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/huggingface"));
+        let model = home.join("hub/models--nvidia--Muse-Spark-Open-816B-A42B-DFlash2");
+        let revision = std::fs::read_to_string(model.join("refs/main"))?;
+        let snapshot = model.join("snapshots").join(revision.trim());
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.extent_only(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        for id in 0..2 { fixture.configure_memory(&library, id, 96usize << 30)?; }
+        for devices in [vec![1], vec![0, 1], vec![1, 0]] {
+            let head_rank = devices.len() - 1;
+            let head = Device { library: &library, id: devices[head_rank] };
+            let requests = DflashDrafter::arena_requests(&snapshot, Bf16Only, &devices, head_rank)?;
+            let arenas = drafter_arenas(head, &snapshot, &devices, head_rank)?;
+            let mut views = Vec::new();
+            let mut census = Census::default();
+            let topology = CoordinatorDevices::new(&devices)?;
+            for (&id, requests) in &requests {
+                let arena = arenas.get(&id).context("missing Muse drafter arena")?;
+                let device = Device { library: &library, id };
+                let mut inventory = Inventory::new(topology, &format!("muse.draft.{id}"),
+                    Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "Muse drafter");
+                for (name, bytes) in requests {
+                    let view = weight_allocation(device, Some(arena), name, *bytes)?;
+                    assert_eq!(view.buffer.device_id, id);
+                    assert_eq!(view.buffer.bytes, *bytes);
+                    assert_eq!(view.buffer.ptr as usize % 256, 0);
+                    view.inventory(&mut inventory, name)?;
+                    views.push(view);
+                }
+                assert!(weight_allocation(Device { library: &library, id: 1 - id },
+                    Some(arena), &requests[0].0, requests[0].1).is_err());
+                let payload = requests.iter().map(|(_, bytes)| bytes).sum::<usize>();
+                let large = requests.iter().filter(|(_, bytes)| *bytes > 1 << 20).collect::<Vec<_>>();
+                let old_tail = large.iter().map(|(_, bytes)| bytes.div_ceil(2 << 20) * (2 << 20) - bytes).sum::<usize>();
+                let bytes = arena.layout().bytes();
+                println!("Muse drafter TP{} GPU{id}: N={} payload={payload} large_N={} large_bytes={} old_tail={old_tail} arena={bytes} padding={} tail={}",
+                    devices.len(), requests.len(), large.len(), large.iter().map(|(_, bytes)| bytes).sum::<usize>(),
+                    arena.layout().padding_bytes(), bytes.div_ceil(2 << 20) * (2 << 20) - bytes);
+                census.owners(inventory.receipts);
+            }
+            drop(arenas);
+            assert!(views.iter().all(|view| view.weight_backing().is_some()));
+            census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+            assert_eq!(census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count(), devices.len());
+            library.cuda_set_device(0)?;
+            drop(views);
+            assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        }
+        Ok(())
     }
 }
