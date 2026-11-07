@@ -35,6 +35,7 @@ fn draft_homes(ownership: &ExecutionOwnership, catalog: &cuteafd_loader::Officia
 pub(super) struct NativePlan {
     pub(super) contract: Rc<CoordinatorContract>,
     pub(super) layouts: Vec<RankWeightLayout>,
+    pub(super) native_selection: Option<Rc<cuteafd_loader::plan::families::step5::native::NativeSelection>>,
 }
 impl NativePlan {
     pub(super) fn new(checkpoint: &Checkpoint, ownership: &ExecutionOwnership,
@@ -43,7 +44,16 @@ impl NativePlan {
         let layouts = (0..ownership.ranks()).map(|rank|
             RankWeightLayout::from_contract(&contract, &cfg, rank, ownership.ranks(), Some(ownership)))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { contract, layouts })
+        Ok(Self { contract, layouts, native_selection: None })
+    }
+
+    pub(super) fn with_selection(mut self, checkpoint: &Checkpoint, depth: usize, rows: usize,
+        selection: Rc<cuteafd_loader::plan::families::step5::native::NativeSelection>) -> Result<Self> {
+        for layout in &self.layouts { selection.validate_layout(layout, rows)?; }
+        let mtp = RankWeightLayout::mtp_from_contract(checkpoint, &self.contract, depth)?;
+        selection.validate_layout(&mtp, rows)?;
+        self.native_selection = Some(selection);
+        Ok(self)
     }
 
     fn layer(&self, rank: usize, layer: usize) -> Result<(&CoordinatorContract, &RankWeightLayout)> {
@@ -133,7 +143,8 @@ impl<'a> NativeOwners<'a> {
                     cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
             }
         }
-        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)).transpose()?;
+        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog_view(
+            checkpoint.view.as_ref().context("Step-5 execution requires its selected checkpoint view")?)).transpose()?;
         admit_native(&admission, available, reservations, || {
             let contract = &plan.contract;
             let mut ranks: Vec<Vec<Option<Layer<'a>>>> = (0..ownership.ranks()).map(|_| Vec::new()).collect();
@@ -241,6 +252,7 @@ pub(super) struct Execution<'e, 'a> {
 }
 
 struct MainExecution<'e, 'a> {
+    checkpoint: &'a Checkpoint,
     ownership: ExecutionOwnership,
     native: NativeOwners<'a>,
     caches: Vec<&'e RefCell<CacheRank<'a>>>,
@@ -668,7 +680,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 Some(onboard)
             }
         };
-        let execution = Self { ownership, native, caches, stages, exchange,
+        let execution = Self { checkpoint, ownership, native, caches, stages, exchange,
             sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), routed_reply, tp2, rows, inventory, requests: Cell::new(0), placement_version,
             terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
             diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
@@ -849,10 +861,11 @@ impl<'e, 'a> Execution<'e, 'a> {
         })?;
         Ok(packed_route_cap(rows, &reports, &inputs))
     }
-    pub(super) fn draft_geometry(&self, snapshot: &std::path::Path, width: usize, rows: usize)
+    pub(super) fn draft_geometry(&self, width: usize, rows: usize)
         -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::{draft::resource, experts::rtx::RtxExpertLayer};
-        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+        let catalog = cuteafd_loader::read_expert_catalog_view(self.main.checkpoint.view.as_ref()
+            .context("Step-5 draft geometry requires its selected checkpoint view")?)?;
         let transport = self.main.transport.borrow();
         let reports = transport.as_ref().context("Step-5 main transport missing")?.installed_grouping()?;
         let homes = draft_homes(&self.main.ownership, &catalog, &reports, |layer| {

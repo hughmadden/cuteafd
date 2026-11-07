@@ -1845,3 +1845,440 @@ fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
     assert!(matches!(crate::plan::experts::spark_recipe("step5:nvfp4",1536,5),
         Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
 }
+
+/// Leave parent shards untouched: only the selected index replaces O buffers.
+fn hqa_snapshot() -> tempfile::TempDir {
+    let dir = exl3_snapshot();
+    let root = dir.path();
+    let config = std::fs::read_to_string(root.join("config.json")).unwrap();
+    std::fs::write(root.join("config.compact-attention.json"),
+        config.replace("quantize_config.json", "quantize_config.compact-attention.json")).unwrap();
+    std::fs::copy(root.join("model.safetensors.index.json"),
+        root.join("model.compact-attention.safetensors.index.json")).unwrap();
+    let compact_quant = std::fs::read_to_string(root.join("quantize_config.json")).unwrap()
+        .replace("quantize_config.json", "quantize_config.compact-attention.json");
+    std::fs::write(root.join("quantize_config.compact-attention.json"), compact_quant).unwrap();
+    let mut index: Value = serde_json::from_slice(&std::fs::read(root.join("model.safetensors.index.json")).unwrap()).unwrap();
+    let mut quant: Value = serde_json::from_slice(&std::fs::read(root.join("quantize_config.json")).unwrap()).unwrap();
+    let mut native = Vec::new();
+    let mut declarations = serde_json::Map::new();
+    for layer in 0..95 {
+        let stem = format!("model.layers.{layer}.self_attn.o_proj");
+        for suffix in ["trellis", "suh", "svh", "mcg"] {
+            index["weight_map"].as_object_mut().unwrap().remove(&format!("{stem}.{suffix}"));
+        }
+        quant["tensor_storage"].as_object_mut().unwrap().remove(&stem);
+        let name = format!("{stem}.weight");
+        index["weight_map"][&name] = Value::from("hqa-attention.safetensors");
+        native.push(testing::t(&name, "BF16", &[4096, 12288]));
+        declarations.insert(stem, serde_json::json!({"format":"bf16", "shard":"hqa-attention.safetensors",
+            "compact_attention_bits":if layer < 92 { 6 } else { 4 },
+            "tensors":{name:{"dtype":"BF16", "shape":[4096,12288]}}}));
+    }
+    let declaration = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
+        "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
+            "compact-attention":{"config":"config.compact-attention.json",
+                "index":"model.compact-attention.safetensors.index.json", "quantize":"quantize_config.compact-attention.json"}},
+        "native_modules":"quantize_config.json:native_attention"});
+    let mut config: Value = serde_json::from_str(&config).unwrap();
+    config["quantization_config"]["attention_view"] = declaration.clone();
+    quant["attention_view"] = declaration;
+    quant["native_attention"] = Value::Object(declarations);
+    std::fs::write(root.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    testing::write_safetensors(&root.join("hqa-attention.safetensors"), &native);
+    std::fs::write(root.join("model.safetensors.index.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+    std::fs::write(root.join("quantize_config.json"), serde_json::to_vec(&quant).unwrap()).unwrap();
+    dir
+}
+
+#[test]
+fn hqa_published_bundle_refuses_mixed_metadata_and_missing_private_outputs() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    let root = fixture.path();
+    let config = std::fs::read(root.join("config.json"))?;
+    let quant = std::fs::read(root.join("quantize_config.json"))?;
+    let index = std::fs::read(root.join("model.safetensors.index.json"))?;
+    for mode in [AttentionMode::Hqa, AttentionMode::Compact] {
+        Checkpoint::open_view(&CheckpointView::select(root, mode)?)?;
+    }
+    let native: Value = serde_json::from_slice(&quant)?;
+    assert_eq!(native["native_attention"].as_object().unwrap().len(), 95);
+    for layer in 92..95 {
+        assert_eq!(native["native_attention"][format!("model.layers.{layer}.self_attn.o_proj")]
+            ["compact_attention_bits"], 4);
+    }
+    for change in 0..4 {
+        let mut bad_config: Value = serde_json::from_slice(&config)?;
+        let mut bad_quant: Value = serde_json::from_slice(&quant)?;
+        let mut bad_index: Value = serde_json::from_slice(&index)?;
+        match change {
+            0 => bad_config["quantization_config"]["attention_view"]["mode"] = Value::from("compact-attention"),
+            1 => { bad_quant.as_object_mut().unwrap().remove("native_attention"); }
+            2 => { bad_index["weight_map"].as_object_mut().unwrap().remove("model.layers.94.self_attn.o_proj.weight"); }
+            _ => { bad_index["weight_map"]["model.layers.0.self_attn.o_proj.trellis"] = Value::from("parent.safetensors"); }
+        }
+        std::fs::write(root.join("config.json"), serde_json::to_vec(&bad_config)?)?;
+        std::fs::write(root.join("quantize_config.json"), serde_json::to_vec(&bad_quant)?)?;
+        std::fs::write(root.join("model.safetensors.index.json"), serde_json::to_vec(&bad_index)?)?;
+        assert!(CheckpointView::select(root, AttentionMode::Hqa).is_err(), "mixed bundle variant {change}");
+    }
+    std::fs::write(root.join("config.json"), config)?;
+    std::fs::write(root.join("quantize_config.json"), quant)?;
+    std::fs::write(root.join("model.safetensors.index.json"), index)?;
+    for filename in ["config.compact-attention.json", "model.compact-attention.safetensors.index.json",
+        "quantize_config.compact-attention.json"] {
+        let bytes = std::fs::read(root.join(filename))?;
+        std::fs::remove_file(root.join(filename))?;
+        assert!(CheckpointView::select(root, AttentionMode::Compact).is_err(), "missing {filename}");
+        std::fs::write(root.join(filename), bytes)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn hqa_o_dispatch_and_exact_rank_charges_include_all_predictors() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    let hqa = CheckpointView::select(fixture.path(), AttentionMode::Hqa)?;
+    let compact = CheckpointView::select(fixture.path(), AttentionMode::Compact)?;
+    let native = Checkpoint::open_view(&hqa)?;
+    let parent = Checkpoint::open_view(&compact)?;
+    let cfg = Config::parse(&native)?;
+    for ranks in [1, 2] {
+        for rank in 0..ranks {
+            let hqa = coordinator::RankWeightLayout::from_checkpoint(&native, rank, ranks)?;
+            let compact = coordinator::RankWeightLayout::from_checkpoint(&parent, rank, ranks)?;
+            let mut delta = 0;
+            for layer in 0..cfg.layers {
+                let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+                let native = hqa.operands.iter().find(|w| w.name == name).unwrap();
+                assert_eq!(native.shape, [4096, 12288 / ranks]);
+                assert_eq!(native.dtype, DType::Bf16);
+                assert!(!hqa.core.contains_key(&name));
+                delta += native.allocation_bytes - compact.core[&name].bytes as u64;
+            }
+            assert_eq!(hqa.resident_bytes, compact.resident_bytes + delta);
+            assert_eq!(hqa.resident_bytes, hqa.operands.iter().map(|w| w.allocation_bytes)
+                .chain(hqa.core.values().map(|w| w.bytes as u64)).sum::<u64>());
+        }
+    }
+    // Serving head-splits SWA but keeps each CSA whole on one contiguous owner.
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let modes: Vec<_> = (0..cfg.layers).map(|layer| if cfg.full[layer] {
+        LayerMode::Whole { gpu: u8::from(layer >= 44), ffn: FfnMode::Owner }
+    } else { LayerMode::HeadSplit }).collect();
+    let owners = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0))?;
+    for rank in 0..2 {
+        let hqa = coordinator::RankWeightLayout::for_execution(&native, rank, &owners)?;
+        let compact = coordinator::RankWeightLayout::for_execution(&parent, rank, &owners)?;
+        let mut delta = 0;
+        for layer in 0..cfg.layers {
+            let local = owners.layer(layer, rank)?;
+            let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+            let output = hqa.operands.iter().find(|w| w.name == name);
+            assert!(!hqa.core.contains_key(&name));
+            if local.query_heads == 0 {
+                assert!(output.is_none());
+                assert!(!compact.core.contains_key(&name));
+            } else {
+                let output = output.unwrap();
+                assert_eq!(output.dtype, DType::Bf16);
+                assert_eq!(output.shape, [4096, local.query_heads * cfg.dim]);
+                delta += output.allocation_bytes - compact.core[&name].bytes as u64;
+            }
+        }
+        assert_eq!(hqa.resident_bytes, compact.resident_bytes + delta);
+    }
+    for stage in 0..cfg.mtp {
+        let hqa = coordinator::RankWeightLayout::for_mtp_stage(&native, stage)?;
+        let compact = coordinator::RankWeightLayout::for_mtp_stage(&parent, stage)?;
+        let name = format!("model.layers.{}.self_attn.o_proj.weight", cfg.layers + stage);
+        let output = hqa.operands.iter().find(|w| w.name == name).unwrap();
+        assert_eq!(output.shape, [4096, 12288]);
+        assert_eq!(hqa.resident_bytes, compact.resident_bytes + output.allocation_bytes - compact.core[&name].bytes as u64);
+    }
+    Ok(())
+}
+
+#[test]
+fn hqa_push_envelope_covers_native_headers_and_preserves_compact_parent() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    let parent = exl3_snapshot();
+    let hqa_view = CheckpointView::select(fixture.path(), AttentionMode::Hqa)?;
+    let compact_view = CheckpointView::select(fixture.path(), AttentionMode::Compact)?;
+    let hqa = Checkpoint::coordinator_view(&hqa_view, false, true)?;
+    let compact = Checkpoint::coordinator_view(&compact_view, false, true)?;
+    let parent = Checkpoint::coordinator(parent.path(), false, true)?;
+    let cfg = Config::parse(&hqa)?;
+    let hqa_contract = coordinator::CoordinatorContract::from_checkpoint(&hqa)?;
+    let compact_contract = coordinator::CoordinatorContract::from_checkpoint(&compact)?;
+    let parent_contract = coordinator::CoordinatorContract::from_checkpoint(&parent)?;
+    let output_bytes = 4096 * 12288 * 2u64;
+    let native_outputs = hqa_contract.weights.tensors.iter()
+        .filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight")).collect::<Vec<_>>();
+    assert_eq!(native_outputs.len(), cfg.layers);
+    assert!(native_outputs.iter().all(|tensor| tensor.meta.byte_length == output_bytes
+        && tensor.meta.dtype == DType::Bf16 && tensor.shard == "hqa-attention.safetensors"));
+    assert!(!compact_contract.weights.tensors.iter()
+        .any(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight")));
+    let (target, draft) = compact_contract.core.bytes(cfg.layers);
+    let unchanged_compact_dense = 2 * (compact_contract.weights.resident_bytes + target + draft) + (64 << 20);
+    for ranks in [1, 2] {
+        let native = super::admission::push_host_envelope(&hqa_contract, &cfg, ranks)?;
+        let compact_envelope = super::admission::push_host_envelope(&compact_contract, &cfg, ranks)?;
+        let parent_envelope = super::admission::push_host_envelope(&parent_contract, &cfg, ranks)?;
+        assert_eq!(compact_envelope, parent_envelope, "compact parent envelope changed");
+        assert_eq!(compact_envelope.dense_bytes, vec![unchanged_compact_dense; ranks]);
+        let mtp = coordinator::RankWeightLayout::mtp_from_contract(&hqa, &hqa_contract, cfg.mtp)?;
+        for rank in 0..ranks {
+            let layout = coordinator::RankWeightLayout::from_contract(&hqa_contract, &cfg, rank, ranks, None)?;
+            let native_dense = layout.operands.iter().map(|operand| operand.allocation_bytes).sum::<u64>();
+            let native_mtp = mtp.operands.iter().map(|operand| operand.allocation_bytes).sum::<u64>();
+            assert!(native.dense_bytes[rank] >= native_dense + native_mtp,
+                "HQA push undersizes native dense headers at rank {rank}/{ranks}");
+            assert!(native.dense_bytes[rank] > compact_envelope.dense_bytes[rank],
+                "native HQA envelope did not grow beyond compact at rank {rank}/{ranks}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Result<()> {
+    use crate::placement::{inventory, Baseline, GpuBudget, Inventory};
+    use super::admission::{self, MarkRule, RuntimeInputs};
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    for mode in [AttentionMode::Hqa, AttentionMode::Compact, AttentionMode::Fp8Compact] {
+        let view = CheckpointView::select(fixture.path(), mode)?;
+        let checkpoint = Checkpoint::open_view(&view)?;
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let inputs = RuntimeInputs {
+            host: Default::default(), resident_weight_limit: None,
+            spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
+            inventory: Inventory { gpus: vec![GpuBudget {
+                capacity_bytes: inventory::PRO_TOTAL_BYTES,
+                baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
+                headroom_bytes: 0,
+            }; 2], spark_ranks: 6, peer_access: true },
+            rows: 64, waves: 1, unit: 64, full_prefill_logits: false,
+            sequences: 1, context: 262_144, requested_pool: Some(262_144),
+            marks: MarkRule { lanes: 1, entries: 0, budget_bytes: 0, host: false },
+            peer_diagnostics: false, pending_code: vec![0; 2], onboard: None,
+        };
+        for depth in [0, 3] {
+            let admitted = admission::forecast_mtp(&checkpoint, &inputs, depth)?;
+            let mtp = coordinator::RankWeightLayout::mtp_from_contract(&checkpoint, &contract, depth)?;
+            for rank in 0..2 {
+                let layout = coordinator::RankWeightLayout::for_execution(&checkpoint, rank, &admitted.ownership)?;
+                let resident = layout.operands.iter().filter(|w| w.name != "model.embed_tokens.weight")
+                    .map(|w| w.allocation_bytes).chain(layout.core.values().map(|w| w.bytes as u64)).sum::<u64>();
+                let target = native::rank_admission(&checkpoint, &admitted.ownership, rank, 64, 64, 64)?;
+                assert_eq!(target.resident_weights.0, resident);
+                let head = rank == usize::from(admitted.ownership.execution().spec().head_gpu);
+                let expected_resident = resident + if head { mtp.resident_bytes } else { 0 };
+                let predictor = if head { mtp.resident_bytes
+                    + native::mtp_native_scratch_from_contract(&checkpoint, &contract, depth, 64)? } else { 0 };
+                let owner = admitted.fixed.iter().find(|owner| owner.gpu == rank as u8
+                    && owner.group == "Step-5 native target and head").expect("named weight owner");
+                assert_eq!(owner.resident_weights.0, expected_resident, "{mode:?} depth {depth} rank {rank}");
+                assert_eq!(owner.bytes, target.immutable + predictor);
+                let id = format!("step5.owner.{rank}.Step-5.native.target.and.head");
+                let fact = admitted.solved.facts.allocations.iter().find(|owner| owner.id == id
+                    && owner.bytes == target.immutable + predictor);
+                assert!(fact.is_some(), "missing exact selected-mode allocation");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn hqa_modes_bind_distinct_identities_and_compact_needs_no_native_shard() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{identity::CheckpointIdentity, AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    let mut identities = std::collections::BTreeSet::new();
+    for mode in [AttentionMode::Hqa, AttentionMode::Compact, AttentionMode::Fp8Compact] {
+        let view = CheckpointView::select(fixture.path(), mode)?;
+        identities.insert(CheckpointIdentity::from_view(&view, None)?.fingerprint);
+        let checkpoint = Checkpoint::coordinator_view(&view, false, true)?;
+        Model::open(&checkpoint)?;
+    }
+    assert_eq!(identities.len(), 3);
+    std::fs::remove_file(fixture.path().join("hqa-attention.safetensors"))?;
+    let compact = CheckpointView::select(fixture.path(), AttentionMode::Compact)?;
+    let checkpoint = Checkpoint::open_view(&compact)?;
+    assert!(checkpoint.missing_shards.is_empty());
+    assert_eq!(Model::open(&checkpoint)?.core.projections.len(), 672);
+    std::fs::remove_file(fixture.path().join("quantize_config.compact-attention.json"))?;
+    assert!(CheckpointView::select(fixture.path(), AttentionMode::Compact).is_err());
+    Ok(())
+}
+
+#[test]
+fn hqa_preweight_selection_is_exact_and_refuses_changed_native_owners() -> anyhow::Result<()> {
+    use crate::{placement::inventory::{ProgramsManifest, ProgramSet}, plan::checkpoint::{AttentionMode, CheckpointView}};
+    use cuteafd_ffi::draft_projection::ProjectionOutput;
+    let fixture = hqa_snapshot();
+    let checkpoint = Checkpoint::open_view(&CheckpointView::select(fixture.path(), AttentionMode::Hqa)?)?;
+    let cfg = Config::parse(&checkpoint)?;
+    let contract = coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+    let entry = |k: usize, output: ProjectionOutput| serde_json::json!({
+        "name":output.program_name(k, 4096), "capacity_rows":4096,
+        "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
+        "scalars":[{"type":"int32"}], "scratch_bytes_at_capacity":{},
+        "geometry":{"width":k,"outputs":4096,"output_dtype":output.torch_dtype(),
+            "reduction":"ordered_k16","tiles_by_rows":[[1,16,32,2]]}});
+    let manifest = serde_json::json!({"programs":[entry(12288, ProjectionOutput::Bf16),
+        entry(6144, ProjectionOutput::F32), {"name":"step5_hidden_norm"}]});
+    let typed = ProgramsManifest::from_manifest(&manifest)?;
+    let selection = native::NativeSelection::resolve(&contract, &cfg, 2, 3, 2048, Some(&typed))?;
+    assert_eq!(selection.requirements.len(), 95);
+    assert_eq!(selection.resolved.programs, ["draft_bf16_k12288_n4096", "draft_bf16_k6144_n4096_f32"]);
+    assert_eq!(selection.resolved.fp8_scratch_bytes, 0);
+    assert!(native::NativeSelection::resolve(&contract, &cfg, 2, 3, 2048,
+        Some(&ProgramsManifest::default())).is_err());
+    let mut programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
+    selection.augment_programs(&mut programs);
+    assert_eq!(programs.names.len(), 3);
+    let modes = (0..cfg.layers).map(|layer| if cfg.full[layer] {
+        crate::placement::LayerMode::Whole { gpu: u8::from(layer >= 44), ffn: crate::placement::FfnMode::Owner }
+    } else { crate::placement::LayerMode::HeadSplit }).collect::<Vec<_>>();
+    let owners = ownership::ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0))?;
+    for rank in 0..2 {
+        let layout = coordinator::RankWeightLayout::from_contract(&contract, &cfg, rank, 2, Some(&owners))?;
+        selection.validate_layout(&layout, 2048)?;
+        let name = "model.layers.0.self_attn.o_proj.weight";
+        for change in 0..5 {
+            let mut bad = layout.clone();
+            let at = bad.operands.iter().position(|operand| operand.name == name).unwrap();
+            match change {
+                0 => bad.operands[at].shape[1] += 128,
+                1 => bad.operands[at].dtype = DType::F32,
+                2 => bad.operands[at].slice = coordinator::WeightSlice::Replicated,
+                3 => bad.operands[at].allocation_bytes += 256,
+                _ => { bad.operands.remove(at); }
+            }
+            let error = selection.validate_layout(&bad, 2048).unwrap_err();
+            assert!(error.downcast_ref::<native::NativeOwnerMismatch>().is_some(), "{error:#}");
+        }
+        assert!(selection.validate_layout(&layout, 2049).unwrap_err()
+            .downcast_ref::<native::NativeOwnerMismatch>().is_some());
+    }
+    let mtp = coordinator::RankWeightLayout::mtp_from_contract(&checkpoint, &contract, 3)?;
+    selection.validate_layout(&mtp, 2048)?;
+    let tp1 = native::NativeSelection::resolve(&contract, &cfg, 1, 0, 64, Some(&typed))?;
+    assert_eq!(tp1.requirements.len(), 92);
+    assert_eq!(tp1.resolved.programs, ["draft_bf16_k12288_n4096"]);
+    Ok(())
+}
+
+#[test]
+fn hqa_compact_and_legacy_code_allowance_matches_old_formula_on_same_manifest() -> anyhow::Result<()> {
+    use crate::{placement::inventory::{self, ArchContext, ProgramSet}, plan::checkpoint::{AttentionMode, CheckpointView}};
+    let hqa = hqa_snapshot();
+    let legacy = snapshot("fp8");
+    let checkpoints = [Checkpoint::open_view(&CheckpointView::select(hqa.path(), AttentionMode::Compact)?)?,
+        Checkpoint::open(legacy.path())?];
+    for checkpoint in checkpoints {
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+        for ranks in [1, 2] {
+            let selection = native::NativeSelection::resolve(&contract, &cfg, ranks, 3, 2048, None)?;
+            assert!(selection.requirements.is_empty());
+            assert!(selection.resolved.programs.is_empty());
+            for count in [15, 16, 17, 31, 32, 33] {
+                let mut entries = (0..count).map(|n| serde_json::json!({"name":format!("step5_op{n}")}))
+                    .collect::<Vec<_>>();
+                entries.extend((0..17).map(|n| serde_json::json!({"name":format!("step52_op{n}")})));
+                entries.extend((0..65).map(|n| serde_json::json!({"name":format!("draft_bf16_unselected_{n}")})));
+                let manifest = serde_json::json!({"programs":entries});
+                let prefixes = native::program_prefixes(ranks == 2);
+                let old = ProgramSet::from_manifest(&manifest, prefixes);
+                let mut selected = old.clone();
+                selection.augment_programs(&mut selected);
+                assert_eq!(selected.names, old.names);
+                for rank in 0..ranks {
+                    let arch = ArchContext::coordinator(inventory::PRO_TOTAL_BYTES, None);
+                    let before = inventory::loaded_code_allowance("step5", "exl3-step5-k46", ranks == 2,
+                        rank as u8, &arch, Some(&old));
+                    let after = inventory::loaded_code_allowance("step5", "exl3-step5-k46", ranks == 2,
+                        rank as u8, &arch, Some(&selected));
+                    assert_eq!(after.bytes, before.bytes);
+                    assert_eq!(after.pending(arch.context_bytes, arch.context_bytes),
+                        before.pending(arch.context_bytes, arch.context_bytes));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn fp8_compact_step_outputs_and_mtp_have_exact_final_storage() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
+    let fixture = hqa_snapshot();
+    let fp8 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), AttentionMode::Fp8Compact)?)?;
+    let bf16 = Checkpoint::open_view(&CheckpointView::select(fixture.path(), AttentionMode::Hqa)?)?;
+    let cfg = Config::parse(&fp8)?;
+    let contract = coordinator::CoordinatorContract::from_checkpoint(&fp8)?;
+    let selection = native::NativeSelection::resolve(&contract, &cfg, 2, 3, 2048, None)?;
+    assert_eq!(selection.requirements.len(), 95);
+    assert_eq!(selection.resolved.programs, ["native_attention_n4096_k12288_m4096", "native_attention_n4096_k6144_m4096_f32"]);
+    assert_eq!(selection.resolved.fp8_scratch_bytes, 256);
+    for ranks in [1,2] {
+        for rank in 0..ranks {
+            let a = coordinator::RankWeightLayout::from_checkpoint(&fp8, rank, ranks)?;
+            let b = coordinator::RankWeightLayout::from_checkpoint(&bf16, rank, ranks)?;
+            assert_eq!(a.core, b.core);
+            assert_eq!(a.operands.len(), b.operands.len());
+            for (a,b) in a.operands.iter().zip(&b.operands) {
+                assert_eq!(a.name, b.name);
+                if a.name.ends_with(".self_attn.o_proj.weight") {
+                    assert_eq!(a.dtype, DType::F8E4M3);
+                    let layout = a.native_layout(rank,ranks)?;
+                    assert_eq!(a.allocation_bytes, layout.bytes()?);
+                    assert_eq!(a.allocation_bytes, b.allocation_bytes / 2 + (a.shape[0]/128*a.shape[1]/128*4) as u64);
+                } else {
+                    assert_eq!(a.dtype, b.dtype);
+                    assert_eq!(a.allocation_bytes, b.allocation_bytes);
+                }
+            }
+        }
+    }
+    let mtp = coordinator::RankWeightLayout::mtp_from_contract(&fp8, &contract, 3)?;
+    selection.validate_layout(&mtp, 2048)?;
+    assert_eq!(mtp.operands.iter().filter(|w| w.dtype == DType::F8E4M3).count(), 3);
+    // Final storage admission also proves the dead trellis plane covers the selected ABI.
+    for rows in [1, 64, 65, 2048, 4096] {
+        use crate::placement::inventory::ProgramsManifest;
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let stage = if rows <= 64 { 64 } else { 4096 };
+        let entry = |k: usize, output: ProjectionOutput, scratch: u64| {
+            let suffix = if output == ProjectionOutput::F32 { "_f32" } else { "" };
+            serde_json::json!({"name":format!("native_attention_n4096_k{k}_m{stage}{suffix}"),
+                "capacity_rows":stage,"pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                "scalars":[{"type":"int32"}],"scratch_bytes_at_capacity":{"scratch":scratch},
+                "geometry":{"input_features":k,"output_features":4096,"output_dtype":output.torch_dtype(),
+                    "max_rows":stage,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                    "reduction":"canonical_fp8_gemv64_w8a16"}})
+        };
+        let manifest = |scratch| ProgramsManifest::from_manifest(&serde_json::json!({"programs":[
+            entry(12288, ProjectionOutput::Bf16, scratch), entry(6144, ProjectionOutput::F32, scratch)]}));
+        let exact = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(256)?))?;
+        exact.validate_layout(&mtp, rows)?;
+        let oversized = native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&manifest(1 << 30)?))?;
+        assert!(oversized.validate_layout(&mtp, rows).unwrap_err().is::<native::NativeOwnerMismatch>());
+        let mut stale = entry(6144, ProjectionOutput::F32, 256);
+        stale["geometry"]["output_dtype"] = serde_json::json!("torch.bfloat16");
+        let bad = ProgramsManifest::from_manifest(&serde_json::json!({"programs":[
+            entry(12288, ProjectionOutput::Bf16, 256), stale]}))?;
+        assert!(native::NativeSelection::resolve(&contract, &cfg, 2, 3, rows, Some(&bad)).is_err());
+    }
+    Ok(())
+}

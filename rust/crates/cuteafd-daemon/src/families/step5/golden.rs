@@ -35,6 +35,7 @@ const FP8_REVISION: &str = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc";
 const NVFP4_REVISION: &str = "bc246cc2848e17b37f377eda8fd825c5b3018d1f";
 /// wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6, immutable published revision.
 const EXL3_REVISION: &str = "83d47a384eabc07ea6fcfaac4779b0e5f013ce89";
+const HQA_REVISION: &str = "61f9275e7f604cb11a5ae9a64a07ff1c600174b7";
 const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
@@ -138,7 +139,8 @@ fn write_f32(path: PathBuf, values: &[f32], rows: usize, width: usize) -> Result
 
 #[allow(clippy::too_many_arguments)]
 fn save_diagnostics(
-    args: &GoldenArgs, tokens: &[u32], positions: &[usize], vocab: usize,
+    args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    tokens: &[u32], positions: &[usize], vocab: usize,
     logits: &[f32], normalized: Option<&[f32]>,
     mut residual: impl FnMut(usize) -> Result<Vec<f32>>,
 ) -> Result<()> {
@@ -147,11 +149,23 @@ fn save_diagnostics(
     ensure!(!tokens.is_empty() && tokens.iter().all(|&t| (t as usize) < vocab)
         && !positions.is_empty() && positions.iter().all(|&p| p > 0 && p < tokens.len())
         && positions.windows(2).all(|p| p[0] < p[1]), "diagnostic token/scored positions mismatch");
+    let identity = serde_json::json!({
+        "attention_mode": view.mode(), "view_fingerprint": view.fingerprint(),
+    });
     let token_bytes = tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
     if let Some(dir) = &args.save_logits {
         std::fs::create_dir_all(dir)?;
+        let meta = dir.join("logits.meta.json");
+        if meta.exists() { std::fs::remove_file(&meta)?; }
         write_f32(dir.join("logits.bin"), logits, tokens.len(), vocab)?;
         std::fs::write(dir.join("tokens.bin"), &token_bytes)?;
+        std::fs::write(meta, serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "cuteafd.step5.logits/1", "checkpoint": identity,
+            "window": args.window, "kv_cache": args.kv_cache,
+            "rows": tokens.len(), "width": vocab, "dtype": "F32", "byte_order": "little",
+            "logits": "logits.bin", "tokens": "tokens.bin", "token_dtype": "U32",
+            "scored_target_positions": positions, "logits_row_target_offset": 1, "complete": true
+        }))?)?;
     }
     if let Some(dir) = &args.dump_residuals {
         let normalized = normalized.context("residual dump requires final normalized head input")?;
@@ -167,7 +181,8 @@ fn save_diagnostics(
         std::fs::write(dir.join("positions.bin"), (0..tokens.len() as u32)
             .flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
         std::fs::write(meta, serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": "cuteafd.step5.residuals/1", "window": args.window, "kv_cache": args.kv_cache,
+            "schema": "cuteafd.step5.residuals/1", "checkpoint": identity,
+            "window": args.window, "kv_cache": args.kv_cache,
             "rows": tokens.len(), "width": H, "dtype": "F32", "byte_order": "little",
             "positions": "positions.bin", "position_dtype": "U32", "tokens": "tokens.bin",
             "layers": args.dump_layers, "layer_pattern": "layerNN.bin",
@@ -456,11 +471,12 @@ pub(super) fn request(
     Ok(request)
 }
 
-fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
+fn expert_admission(args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    rows: usize, layers: &[usize])
     -> Result<(SparkWorld, TcpTransportConfig, super::experts::StepExperts)> {
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
     let metadata: Value = serde_json::from_slice(&std::fs::read(
         format.package_manifest(&packages.join("lib"))?)?)?;
@@ -483,7 +499,7 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
     let unit = args.prefill_units.unwrap_or(rows);
     let config = TcpTransportConfig::default();
     SparkAdmission::plan_view(
-        &args.attention.selected_view.clone().map(Ok).unwrap_or_else(|| args.attention.select(&args.snapshot))?,
+        view,
         ExpertGeometry::STEP5,
         Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet {
@@ -496,7 +512,8 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
         None,
         super::serve::spark_model(&exports,
             SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: format.ingress(), partial_reply_bytes: None },
-            u64::from(args.prefill_waves), 1, config.max_frame_bytes)?, None,
+            u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
+        None,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
@@ -504,8 +521,9 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize])
     Ok((world, config, format))
 }
 
-fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
-    let (world, config, format) = expert_admission(args, rows, layers)?;
+fn link<'a>(device: Device<'a>, args: &GoldenArgs,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
+    let (world, config, format) = expert_admission(args, view, rows, layers)?;
     let warm = super::execution::bootstrap_shape(rows, &format)?;
     // The widest wave sizes every rank's rings and the exchange staging.
     let mut link = SparkLink::new_waves(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2, 1, u32::try_from(rows)?)?;
@@ -778,6 +796,23 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
     Ok(())
 }
 
+fn selected_programs(programs: &cuteafd_ffi::programs::Programs<'_>, checkpoint: &Checkpoint,
+    cfg: &Config, ranks: usize, rows: usize, ownership: Option<&cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership>)
+    -> Result<(cuteafd_loader::placement::ProgramSet, cuteafd_loader::plan::families::step5::native::NativeSelection)> {
+    use cuteafd_loader::plan::families::step5::{coordinator::{CoordinatorContract, RankWeightLayout}, native};
+    let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+    let specs = programs.names().map(|name| programs.spec(name)).collect::<Result<Vec<_>>>()?;
+    let manifest = cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?;
+    let selection = native::NativeSelection::resolve(&contract, cfg, ranks, 0, rows, Some(&manifest))?;
+    for rank in 0..ranks {
+        let layout = RankWeightLayout::from_contract(&contract, cfg, rank, ranks, ownership)?;
+        selection.validate_layout(&layout, rows)?;
+    }
+    let mut selected = cuteafd_loader::placement::ProgramSet::from_names(native::program_prefixes(ranks == 2), programs.names());
+    selection.augment_programs(&mut selected);
+    Ok((selected, selection))
+}
+
 fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     reference: Reference, layers: &[usize], format: &super::experts::StepExperts) -> Result<()> {
     use super::execution::Execution;
@@ -815,7 +850,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     library.cuda_set_device(args.device)?;
     let devices = [args.device, peer_device].map(|id| Device { library: &library, id });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5", "step52"], programs.names());
+    let (selected, _native_selection) = selected_programs(&programs, checkpoint, cfg, 2, unit, Some(&ownership))?;
+    for device in &devices {
+        device.run(|| { programs.load_matching(|name| selected.names.iter().any(|selected| selected == name))?; Ok(()) })?;
+    }
     let head_rank = ownership.execution().spec().head_gpu as usize;
     let pages = (rows as u64).div_ceil(64) + 1;
     let mut available = [0u64; 2];
@@ -853,7 +891,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
     let stages = [Staging::new_for_units(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize, 1, unit)?,
         Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
-    let (world, config, format) = expert_admission(args, rows, layers)?;
+    let (world, config, format) = expert_admission(args,
+        checkpoint.view.as_ref().context("Step-5 golden requires its selected checkpoint view")?, rows, layers)?;
     let transport = devices[0].own(|| {
         let mut link = SparkLink::new_waves(&library, world, &args.peers, unit as u32,
             config, H * 2, waves, unit as u32)?;
@@ -901,7 +940,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         let actual = head.logits(output)?;
         let normalized = (args.dump_residuals.is_some() || reference.final_norm.is_some())
             .then(|| head.normalized()).transpose()?;
-        save_diagnostics(args, &reference.tokens, &reference.positions, cfg.vocab,
+        save_diagnostics(args, checkpoint.view.as_ref().context("Step-5 golden requires its selected checkpoint view")?,
+            &reference.tokens, &reference.positions, cfg.vocab,
             &actual, normalized.as_deref(), |layer| execution.diagnostic_output(layer))?;
         if let Some(expected) = &reference.final_norm {
             let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
@@ -929,7 +969,8 @@ fn checkpoint_identity(revision: Option<&str>, format: &super::experts::StepExpe
     let pinned = match format {
         StepExperts::Native(ExpertFormat::Fp8Block128) => revision == Some(FP8_REVISION),
         StepExperts::Native(ExpertFormat::Nvfp4) => revision == Some(NVFP4_REVISION),
-        StepExperts::Exl3(tiers) => tiers == &[4, 6] && revision == Some(EXL3_REVISION),
+        StepExperts::Exl3(tiers) => tiers == &[4, 6]
+            && matches!(revision, Some(EXL3_REVISION | HQA_REVISION)),
         StepExperts::Native(_) => false,
     };
     ensure!(pinned, "Step-5 golden requires a matching pinned FP8, NVFP4 or EXL3 K4/K6 revision and expert headers");
@@ -948,18 +989,21 @@ async fn on_engine_thread(work: impl FnOnce() -> Result<()> + Send + 'static) ->
 }
 
 fn run(args: GoldenArgs) -> Result<()> {
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
     diagnostic_selection(&args)?;
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
     if args.dump_layer0.is_none() {
         selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
         // The world comes from the planner's fit for this checkpoint, not a fixed list.
-        cuteafd_loader::plan::families::step5::spark_world_admitted(&args.snapshot, &args.manifest, args.peers.len())?;
+        cuteafd_loader::plan::families::step5::spark_world_admitted_view(&view, &args.manifest, args.peers.len())?;
     }
-    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
     checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), &format,
         args.fp8_diagnostic_reference)?;
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
     let reference = reference(&args, cfg.vocab)?;
     if args.dump_layer0.is_some() { return layer0_run(&args, &checkpoint, &cfg, reference); }
@@ -988,7 +1032,8 @@ fn run(args: GoldenArgs) -> Result<()> {
         id: args.device,
     };
     let programs = library.programs()?.with_manifest(&args.manifest)?;
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["step5"], programs.names());
+    let (selected, _native_selection) = selected_programs(&programs, &checkpoint, &cfg, 1, rows, None)?;
+    programs.load_matching(|name| selected.names.iter().any(|selected| selected == name))?;
     let pending = crate::shared::inventory::pending_code(
         &library,
         args.device,
@@ -1046,7 +1091,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         "Step-5 cold prefix admission"
     );
     let started = std::time::Instant::now();
-    let link = device.run(|| link(device, &args, rows, &layers))?;
+    let link = device.run(|| link(device, &args, &view, rows, &layers))?;
     let (remaining, _) = library.cuda_memory_info()?;
     let owners = chain_bytes + head_bytes + cache_bytes + staging_bytes + input_bytes + pending + (2u64 << 30);
     ensure!(
@@ -1122,7 +1167,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         let actual = head.logits(chain.output(91)?)?;
         let normalized = (args.dump_residuals.is_some() || final_norm.is_some())
             .then(|| head.normalized()).transpose()?;
-        save_diagnostics(&args, &tokens, &positions, cfg.vocab, &actual,
+        save_diagnostics(&args, &view, &tokens, &positions, cfg.vocab, &actual,
             normalized.as_deref(), |layer| {
                 Ok(read_buffer(device, chain.output(layer)?)?.chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
@@ -1165,6 +1210,18 @@ mod tests {
         ].into_iter().chain(flags.iter().copied()))?;
         let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
         Ok(args)
+    }
+
+    #[test]
+    fn golden_retains_selected_view_through_fit_and_spark_admission() {
+        let source = include_str!("golden.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("Checkpoint::coordinator_view(&view"));
+        assert!(source.contains("spark_world_admitted_view(&view"));
+        assert!(source.contains("read_expert_catalog_view(&view)"));
+        assert!(source.contains("SparkAdmission::plan_view("));
+        assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
+        assert!(!source.contains("read_expert_catalog(&args.snapshot"));
+        assert!(!source.contains("spark_world_admitted(&args.snapshot"));
     }
 
     #[test]
@@ -1253,13 +1310,31 @@ mod tests {
         Ok(())
     }
 
+    fn diagnostic_view(root: &std::path::Path, mode: cuteafd_loader::plan::checkpoint::AttentionMode)
+        -> Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
+        std::fs::write(root.join("config.json"), b"{}")?;
+        std::fs::write(root.join("config.compact-attention.json"), b"{}")?;
+        std::fs::write(root.join("model.compact-attention.safetensors.index.json"), br#"{"weight_map":{}}"#)?;
+        std::fs::write(root.join("quantize_config.compact-attention.json"), b"{}")?;
+        cuteafd_loader::plan::checkpoint::CheckpointView::select(root, mode)
+    }
+
     #[test]
     fn diagnostic_files_preserve_full_rows_bits_positions_and_head_input() -> Result<()> {
-        for format in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
-            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+        use cuteafd_loader::plan::checkpoint::AttentionMode;
+        for (mode, format) in [AttentionMode::Hqa, AttentionMode::Compact].into_iter().flat_map(|mode|
+            [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8].map(|format| (mode, format))) {
             let root = tempfile::tempdir()?;
             let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
             args.kv_cache = format;
+            let view = diagnostic_view(root.path(), mode)?;
+            let other_mode = if mode == AttentionMode::Hqa { AttentionMode::Compact } else { AttentionMode::Hqa };
+            let other = diagnostic_view(root.path(), other_mode)?;
+            assert_ne!(view.fingerprint(), other.fingerprint());
+            // Diagnostics bind the frozen selection, not metadata reopened at write time.
+            std::fs::remove_file(root.path().join("config.json"))?;
+            std::fs::remove_file(root.path().join("config.compact-attention.json"))?;
             let logits_dir = root.path().join("logits");
             let residual_dir = root.path().join("residuals");
             args.save_logits = Some(logits_dir.clone());
@@ -1269,7 +1344,7 @@ mod tests {
             let logits = [-0.0f32, 1., -2., 3., 4., 5., 6., 7., 8.];
             let norm = vec![0.5f32; tokens.len() * H];
             let mut requested = vec![];
-            save_diagnostics(&args, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
+            save_diagnostics(&args, &view, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
                 requested.push(layer);
                 Ok(vec![layer as f32; tokens.len() * H])
             })?;
@@ -1284,9 +1359,18 @@ mod tests {
                 assert_eq!(std::fs::read(residual_dir.join(file))?,
                     vec![value; tokens.len() * H].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
             }
+            let identity = serde_json::json!({"attention_mode":mode, "view_fingerprint":view.fingerprint()});
+            let logits_meta: Value = serde_json::from_slice(&std::fs::read(logits_dir.join("logits.meta.json"))?)?;
+            assert_eq!(logits_meta, serde_json::json!({
+                "schema":"cuteafd.step5.logits/1", "checkpoint":identity,
+                "window":"code-1", "kv_cache":format.to_string(), "rows":3, "width":3,
+                "dtype":"F32", "byte_order":"little", "tokens":"tokens.bin", "token_dtype":"U32",
+                "logits":"logits.bin", "scored_target_positions":[1,2], "logits_row_target_offset":1, "complete":true
+            }));
             let meta: Value = serde_json::from_slice(&std::fs::read(residual_dir.join("meta.json"))?)?;
             assert_eq!(meta, serde_json::json!({
-                "schema":"cuteafd.step5.residuals/1", "window":"code-1", "kv_cache":format.to_string(), "rows":3, "width":H,
+                "schema":"cuteafd.step5.residuals/1", "checkpoint":identity,
+                "window":"code-1", "kv_cache":format.to_string(), "rows":3, "width":H,
                 "dtype":"F32", "byte_order":"little", "positions":"positions.bin", "position_dtype":"U32",
                 "tokens":"tokens.bin", "layers":[0,91], "layer_pattern":"layerNN.bin",
                 "final_norm":"final_norm.bin", "final_norm_source_dtype":"BF16",
@@ -1307,24 +1391,25 @@ mod tests {
         let root = tempfile::tempdir()?;
         let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0"])?;
         args.dump_residuals = Some(root.path().into());
+        let view = diagnostic_view(root.path(), cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
         let norm = vec![1f32; 2 * H];
         for bad in [vec![1.; H], vec![f32::NAN; 2 * H], vec![f32::INFINITY; 2 * H]] {
             std::fs::write(root.path().join("meta.json"), b"stale")?;
-            assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &[0.; 4], Some(&norm),
+            assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &[0.; 4], Some(&norm),
                 |_| Ok(bad.clone())).is_err());
             assert!(!root.path().join("meta.json").exists());
         }
-        assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &[0.; 4], None,
+        assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &[0.; 4], None,
             |_| Ok(norm.clone())).is_err());
         for positions in [vec![], vec![0], vec![2], vec![1, 1]] {
-            assert!(save_diagnostics(&args, &[0, 1], &positions, 2, &[0.; 4], Some(&norm),
+            assert!(save_diagnostics(&args, &view, &[0, 1], &positions, 2, &[0.; 4], Some(&norm),
                 |_| Ok(norm.clone())).is_err());
         }
         args.dump_residuals = None;
         args.dump_layers.clear();
         args.save_logits = Some(root.path().join("logits"));
         for bad in [vec![0.; 3], vec![f32::NAN; 4]] {
-            assert!(save_diagnostics(&args, &[0, 1], &[1], 2, &bad, None,
+            assert!(save_diagnostics(&args, &view, &[0, 1], &[1], 2, &bad, None,
                 |_| unreachable!()).is_err());
         }
         Ok(())
@@ -1591,6 +1676,7 @@ mod tests {
         checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), true)?;
         checkpoint_identity(Some(NVFP4_REVISION), &native(ExpertFormat::Nvfp4), false)?;
         checkpoint_identity(Some(EXL3_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
+        checkpoint_identity(Some(HQA_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
         for (revision, format, diagnostic) in [
             (Some(FP8_REVISION), native(ExpertFormat::Nvfp4), false),
             (Some(NVFP4_REVISION), native(ExpertFormat::Fp8Block128), false),
@@ -1601,6 +1687,8 @@ mod tests {
             // Only the published revision and matching expert tiers qualify.
             (Some("0123456789abcdef0123456789abcdef01234567"), StepExperts::Exl3(vec![4, 6]), false),
             (Some(EXL3_REVISION), StepExperts::Exl3(vec![4, 6]), true),
+            (Some(HQA_REVISION), StepExperts::Exl3(vec![4, 6]), true),
+            (Some(HQA_REVISION), StepExperts::Exl3(vec![3, 4]), false),
             (Some(EXL3_REVISION), StepExperts::Exl3(vec![3, 4]), false),
             (None, StepExperts::Exl3(vec![4, 6]), false),
         ] {

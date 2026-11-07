@@ -98,12 +98,44 @@ pub(super) fn load_operand<'a>(
     cuteafd_ffi::memory_ledger::tensor(&operand.name);
     let _format = cuteafd_ffi::memory_ledger::format(if operand.dtype == DType::Bf16 {
         "bf16"
-    } else {
+    } else if operand.dtype == DType::F8E4M3 { "fp8-block128" } else {
         "f32"
     });
     let allocation = Allocation::new(device, usize::try_from(operand.allocation_bytes)?)?;
-    load_records(device, checkpoint, layout, operand, allocation.buffer)?;
+    if operand.dtype == DType::F8E4M3 {
+        use crate::shared::{native_attention::{attention_records, AttentionRecord}, experts::rtx::dense::DenseLoad};
+        let native = operand.native_layout(layout.rank, layout.ranks)?;
+        ensure!(native.bytes()? == operand.allocation_bytes, "Step-5 FP8 owner extent");
+        let selected = checkpoint.projection(&native.stem)?;
+        let (values, scales) = fp8_buffers(allocation.buffer, &operand.shape)?;
+        let records = attention_records(&checkpoint.snapshot, &selected, checkpoint.attention_mode(), &native,
+            crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales))?;
+        let dense = DenseLoad::mount(device.library);
+        dense.admit_mount(cuteafd_loader::shared::dense_read::MountLoad::from_headers(
+            selected.tensors.iter().map(|tensor| &tensor.meta), layout.ranks)?)?;
+        for record in records {
+            device.run(|| match record {
+                AttentionRecord::Operand(record) => dense.operand(record),
+                AttentionRecord::Step(record) => dense.step(record, std::ptr::null_mut()),
+            })?;
+        }
+    } else {
+        load_records(device, checkpoint, layout, operand, allocation.buffer)?;
+    }
     Ok(allocation)
+}
+
+/// One admitted allocation holds final E4M3 values followed by aligned F32 block scales.
+pub(super) fn fp8_buffers(buffer: CuteafdDeviceBuffer, shape: &[usize])
+    -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
+    ensure!(shape.len() == 2 && shape.iter().all(|n| *n > 0 && n % 128 == 0), "Step-5 FP8 matrix geometry");
+    let values = shape[0].checked_mul(shape[1]).context("Step-5 FP8 values overflow")?.max(256);
+    let scales = (shape[0] / 128).checked_mul(shape[1] / 128).and_then(|n| n.checked_mul(4))
+        .context("Step-5 FP8 scales overflow")?.max(256);
+    ensure!(buffer.bytes == values.checked_add(scales).context("Step-5 FP8 owner overflow")?,
+        "Step-5 FP8 actual owner extent");
+    Ok((CuteafdDeviceBuffer { bytes: values, ..buffer }, CuteafdDeviceBuffer {
+        ptr: buffer.ptr.wrapping_byte_add(values), bytes: scales, ..buffer }))
 }
 
 /// `operand`'s bytes as shared dense records into `buffer` (allocated as the
@@ -271,6 +303,65 @@ mod tests {
             core: Default::default(),
             resident_bytes: 0,
         }
+    }
+
+    #[test]
+    fn fp8_final_owner_has_disjoint_exact_values_and_scales() -> Result<()> {
+        for shape in [[4096, 12288], [4096, 6144], [128, 128]] {
+            let values = shape[0] * shape[1];
+            let scales = (shape[0] / 128 * (shape[1] / 128) * 4).max(256);
+            let owner = CuteafdDeviceBuffer { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                bytes: values + scales, device_id: 1, ..Default::default() };
+            let (q, grid) = fp8_buffers(owner, &shape)?;
+            assert_eq!((q.ptr, q.bytes, q.device_id), (owner.ptr, values, 1));
+            assert_eq!((grid.ptr, grid.bytes, grid.device_id), (owner.ptr.wrapping_byte_add(values), scales, 1));
+            for bytes in [owner.bytes - 1, owner.bytes + 1] {
+                assert!(fp8_buffers(CuteafdDeviceBuffer { bytes, ..owner }, &shape).is_err());
+            }
+        }
+        assert!(fp8_buffers(CuteafdDeviceBuffer::default(), &[4096, 6143]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_conversion_records_keep_selected_tp_and_mtp_source_rectangles() -> Result<()> {
+        use crate::shared::{experts::rtx::dense::Job, native_attention::{attention_records, AttentionRecord}};
+        use cuteafd_loader::plan::checkpoint::{AttentionMode, ProjectionStorage, SelectedProjection};
+        for (layer, ranks, rank) in [(0, 1, 0), (0, 2, 0), (0, 2, 1), (92, 1, 0)] {
+            let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+            let src = source(&name, DType::Bf16, vec![4096, 12288]);
+            let selected = SelectedProjection { storage: ProjectionStorage::Native {
+                dtype: DType::Bf16, shape: src.meta.shape.clone() },
+                source_bytes: src.meta.byte_length, tensors: vec![src.clone()] };
+            let operand = WeightOperand { name, sources: vec![src], dtype: DType::F8E4M3,
+                shape: vec![4096, 12288 / ranks],
+                slice: if ranks == 1 { WeightSlice::Replicated } else { WeightSlice::Cols }, allocation_bytes: 0 };
+            let layout = operand.native_layout(rank, ranks)?;
+            let owner = CuteafdDeviceBuffer { bytes: layout.bytes()? as usize, ..Default::default() };
+            let (q, scales) = fp8_buffers(owner, &operand.shape)?;
+            let records = attention_records(std::path::Path::new("/selected"), &selected,
+                AttentionMode::Fp8Compact, &layout, crate::shared::fp8_linear::Fp8Scales::Amax, q, Some(scales))?;
+            let mut rows = 0;
+            for record in records {
+                let AttentionRecord::Step(step) = record else { panic!("BF16 conversion must be staged, not resident"); };
+                assert_eq!(step.rects.len(), 1);
+                let rect = &step.rects[0];
+                assert_eq!(rect.name, operand.name);
+                assert_eq!(rect.row_bytes, 12288 * 2);
+                assert_eq!(rect.cols, rank * 12288 / ranks * 2..(rank + 1) * 12288 / ranks * 2);
+                assert_eq!(rect.rows.start, rows);
+                assert_eq!(rect.rows.len() % 128, 0);
+                let Job::Quant { rows: window, pitch, cols, target, .. } = &step.jobs[0]
+                    else { panic!("FP8-compact must quantize once"); };
+                assert_eq!(*window, 0..rect.rows.len());
+                assert_eq!((*pitch, *cols, target.q_stride), (12288 / ranks, 12288 / ranks, 12288 / ranks));
+                assert_eq!(target.q.bytes, rect.rows.len() * 12288 / ranks);
+                assert_eq!(target.scales.bytes, rect.rows.len() / 128 * (12288 / ranks / 128) * 4);
+                rows += rect.rows.len();
+            }
+            assert_eq!(rows, 4096);
+        }
+        Ok(())
     }
 
     #[test]

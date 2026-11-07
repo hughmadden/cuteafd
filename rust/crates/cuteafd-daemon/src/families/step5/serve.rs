@@ -265,10 +265,13 @@ fn with_backend<T>(args: &ServeArgs,
     let args = &resolved;
     args.validate()?;
     let startup = std::time::Instant::now();
-    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, args.mtp > 0)?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    let checkpoint = Checkpoint::coordinator_view(&view, false, args.mtp > 0)?;
     let cfg = Config::parse(&checkpoint)?;
     cuteafd_bench::context::set_family(cfg.family_id());
-    let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    let mut catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     catalog.select_draft(DraftOwnership::None)?;
     ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "Step-5 routed geometry mismatch");
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
@@ -286,8 +289,14 @@ fn with_backend<T>(args: &ServeArgs,
         args.prefill_packing, args.prefill_rows as usize)?;
     let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
         family: "step5", split_family: args.split_device.map(|_| "step52") };
+    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
+    let specs = programs.names().map(|name| programs.spec(name)).collect::<Result<Vec<_>>>()?;
+    let manifest = cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?;
+    let native_selection = std::rc::Rc::new(cuteafd_loader::plan::families::step5::native::NativeSelection::resolve(
+        &contract, &cfg, ids.len(), usize::from(args.mtp), args.prefill_rows as usize, Some(&manifest))?);
     let measured = RuntimeInventory::measure(&library, &ids, InventoryPhase::PreWeight, |id| {
-        programs.load_matching(|name| selected.contains(name))?;
+        programs.load_matching(|name| selected.contains(name)
+            || native_selection.resolved.programs.iter().any(|selected| selected == name))?;
         if let Some(other) = ids.iter().copied().find(|&other| other != id) {
             library.cuda_enable_peer(other)?;
             library.tp2_native_initialize()?;
@@ -299,8 +308,9 @@ fn with_backend<T>(args: &ServeArgs,
         }
         Ok(())
     })?;
-    let selected_programs = ProgramSet::from_names(
+    let mut selected_programs = ProgramSet::from_names(
         cuteafd_loader::plan::families::step5::native::program_prefixes(ids.len() == 2), programs.names());
+    native_selection.augment_programs(&mut selected_programs);
     let pending_code = ids.iter().enumerate().map(|(rank, &id)| crate::shared::inventory::pending_code(
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
@@ -317,7 +327,6 @@ fn with_backend<T>(args: &ServeArgs,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
-    let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?);
     inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs {
         memory: cuteafd_loader::formats::mapped_preload::host_memory()?,
         cache_bytes: match args.prefix.host_cache_bytes {
@@ -326,13 +335,14 @@ fn with_backend<T>(args: &ServeArgs,
         },
         headroom: args.prefix.host_cache_headroom_bytes,
         retained_sync_h2d_bytes: contract.retained_sync_h2d_bytes()?,
+        attention_mount_load: contract.attention_mount_load(ids.len())?,
         push: Some(cuteafd_loader::plan::families::step5::admission::push_host_envelope(&contract, &cfg, ids.len())?),
     };
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
     let planning = std::time::Instant::now();
     // One admission: the contract prices every retained owner, and native ABIs
     // are validated against the ownership it selected.
-    let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract)?;
+    let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract, native_selection)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
     cuteafd_bench::context::set_resolved("max-context", &args.max_context.to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
@@ -349,7 +359,7 @@ fn with_backend<T>(args: &ServeArgs,
         spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 };
     let bootstrap = super::execution::bootstrap_shape(inputs.unit_rows(), &format)?;
-    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(checkpoint.view.as_ref().context("Step-5 Spark admission requires selected checkpoint view")?, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
+    let spark_admission = if !opens_expert_sessions(&spark_working) { None } else { Some(SparkAdmission::plan_view(&view, ExpertGeometry::STEP5, Some(&catalog), &spark_working, args.peers.len(), None,
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?, None)?) };
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
@@ -427,9 +437,9 @@ fn with_backend<T>(args: &ServeArgs,
         };
         let envelope = inputs.host.push.clone().context("Step-5 admitted push host envelope")?;
         let prepared = if expert_world == 0 {
-            (CoordinatorPush::prepare_alone_admitted(&args.snapshot, Some(&catalog), devices.len(), experts, envelope)?, None)
+            (CoordinatorPush::prepare_alone_view_admitted(&view, Some(&catalog), devices.len(), experts, envelope)?, None)
         } else {
-            let (push, streams, ranks) = CoordinatorPush::prepare_admitted(&args.snapshot, Some(&catalog), devices.len(), experts, envelope)?;
+            let (push, streams, ranks) = CoordinatorPush::prepare_view_admitted(&view, Some(&catalog), devices.len(), experts, envelope)?;
             (push, Some((streams, ranks)))
         };
         Ok((prepared, loaded, records, dense))
@@ -531,6 +541,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
+    let view = args.attention.selected_view.clone().map(Ok)
+        .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+    args.attention.validate_view(&view)?;
+    args.attention.selected_view = Some(view);
     args.prefix.resolve_entries(usize::from(args.max_sequences));
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
@@ -586,6 +600,21 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn serve_retains_selected_view_through_checkpoint_catalog_admission_and_push() {
+        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("args.attention.selected_view = Some(view)"));
+        assert!(source.contains("Checkpoint::coordinator_view(&view"));
+        assert!(source.contains("read_expert_catalog_view(&view)"));
+        assert!(source.contains("SparkAdmission::plan_view(&view"));
+        assert!(source.contains("CoordinatorPush::prepare_alone_view_admitted(&view"));
+        assert!(source.contains("CoordinatorPush::prepare_view_admitted(&view"));
+        assert!(!source.contains("Checkpoint::coordinator(&args.snapshot"));
+        assert!(!source.contains("read_expert_catalog(&args.snapshot"));
+        assert!(!source.contains("CoordinatorPush::prepare_alone_admitted("));
+        assert!(!source.contains("CoordinatorPush::prepare_admitted("));
     }
 
     #[test]

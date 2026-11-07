@@ -24,16 +24,23 @@ pub(super) fn admit_mtp<'a>(
     inputs: &RuntimeInputs, depth: usize,
 ) -> Result<admission::Admission> {
     let contract = std::rc::Rc::new(cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(checkpoint)?);
-    Ok(admit_mtp_with_contract(programs, checkpoint, inputs, depth, contract)?.0)
+    let cfg = cuteafd_loader::plan::families::step5::Config::parse(checkpoint)?;
+    let specs = programs.names().map(|name| programs.spec(name)).collect::<Result<Vec<_>>>()?;
+    let manifest = cuteafd_loader::placement::inventory::ProgramsManifest::from_specs(specs.into_iter())?;
+    let selection = std::rc::Rc::new(cuteafd_loader::plan::families::step5::native::NativeSelection::resolve(
+        &contract, &cfg, inputs.inventory.gpus.len(), depth, inputs.unit_rows(), Some(&manifest))?);
+    Ok(admit_mtp_with_contract(programs, checkpoint, inputs, depth, contract, selection)?.0)
 }
 
 pub(super) fn admit_mtp_with_contract<'a>(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
     inputs: &RuntimeInputs, depth: usize,
     contract: std::rc::Rc<cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract>,
+    selection: std::rc::Rc<cuteafd_loader::plan::families::step5::native::NativeSelection>,
 ) -> Result<(admission::Admission, super::execution::NativePlan)> {
     measured(inputs)?;
     let admitted = admission::admit_mtp_with_contract(checkpoint, inputs, depth, &contract)?;
-    let plan = super::execution::NativePlan::new(checkpoint, &admitted.ownership, contract)?;
+    let plan = super::execution::NativePlan::new(checkpoint, &admitted.ownership, contract)?
+        .with_selection(checkpoint, depth, inputs.unit_rows(), selection)?;
     if depth > 0 {
         for stage in 0..depth {
             super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.unit_rows(), &plan.contract)?;

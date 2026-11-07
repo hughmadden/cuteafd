@@ -24,6 +24,110 @@ pub fn program_prefixes(split: bool) -> &'static [&'static str] {
     if split { &["step5", "step52"] } else { &["step5"] }
 }
 
+/// Concrete mixed-attention requirements survive export resolution and placement.
+#[derive(Debug, Clone)]
+pub struct NativeRequirement {
+    pub layout: crate::formats::native_attention::NativeLayout,
+    pub output: cuteafd_ffi::draft_projection::ProjectionOutput,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeSelection {
+    pub requirements: Vec<NativeRequirement>,
+    pub rows: usize,
+    pub resolved: crate::placement::planner::native_attention::NativePrograms,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Step-5 native owner {operand} differs from preweight selection: {detail}")]
+pub struct NativeOwnerMismatch {
+    pub operand: String,
+    pub detail: String,
+}
+
+impl NativeSelection {
+    pub fn resolve(contract: &CoordinatorContract, cfg: &Config, ranks: usize, depth: usize,
+        rows: usize, manifest: Option<&crate::placement::inventory::ProgramsManifest>) -> Result<Self> {
+        use crate::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
+            placement::planner::native_attention::{NativeProgram, NativePrograms}};
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        ensure!(matches!(ranks, 1 | 2) && depth <= cfg.mtp && (1..=4096).contains(&rows),
+            "Step-5 native program geometry");
+        let mut requirements = Vec::new();
+        for layer in 0..cfg.layers + depth {
+            let stem = format!("model.layers.{layer}.self_attn.o_proj");
+            let qkv_compressed = ["q", "k", "v"].iter().all(|leaf| contract.core.projections
+                .contains_key(&format!("model.layers.{layer}.self_attn.{leaf}_proj")));
+            if !qkv_compressed || contract.core.projections.contains_key(&stem) { continue; }
+            let name = format!("{stem}.weight");
+            let declared = if layer < cfg.layers {
+                contract.weights.tensors.iter().any(|tensor| tensor.meta.name == name
+                    && tensor.meta.dtype == cuteafd_core::DType::Bf16
+                    && tensor.meta.shape == [cfg.hidden, cfg.heads * cfg.dim])
+            } else {
+                contract.mtp_declarations.iter().any(|(key, shape, dtype)| key == &name
+                    && *dtype == cuteafd_core::DType::Bf16 && *shape == [cfg.hidden, cfg.heads * cfg.dim])
+            };
+            ensure!(declared, NativeOwnerMismatch { operand: name,
+                detail: "mixed attention lacks its declared BF16 output matrix".into() });
+            let split = layer < cfg.layers && !cfg.full[layer] && ranks == 2;
+            requirements.push(NativeRequirement { layout: NativeLayout {
+                stem, shape: [cfg.hidden, cfg.heads * cfg.dim / if split { 2 } else { 1 }],
+                fp8: contract.attention_mode == crate::plan::checkpoint::AttentionMode::Fp8Compact, rank: 0, ranks: if split { 2 } else { 1 },
+                split: if split { CoreSplit::Input } else { CoreSplit::Whole },
+            }, output: if split { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 } });
+        }
+        let requests = requirements.iter().map(|request| NativeProgram {
+            layout: &request.layout, output: request.output }).collect::<Vec<_>>();
+        let resolved = NativePrograms::resolve(&requests, rows, manifest)?;
+        Ok(Self { requirements, rows, resolved })
+    }
+
+    pub fn augment_programs(&self, programs: &mut crate::placement::inventory::ProgramSet) {
+        if self.resolved.programs.is_empty() { return; }
+        programs.names.extend(self.resolved.programs.iter().cloned());
+        programs.names.sort();
+        programs.names.dedup();
+    }
+
+    /// Compare actual storage and launch ABI with the retained requests, never re-resolve.
+    pub fn validate_layout(&self, layout: &RankWeightLayout, rows: usize) -> Result<()> {
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let mismatch = |operand: &str, detail: &str| NativeOwnerMismatch {
+            operand: operand.into(), detail: detail.into() };
+        ensure!(rows > 0 && rows <= self.rows, mismatch("rows", "row ceiling exceeded"));
+        for operand in &layout.operands {
+            let Some(stem) = operand.name.strip_suffix(".weight") else { continue; };
+            let mixed = stem.strip_suffix(".o_proj").is_some_and(|prefix| ["q", "k", "v"].iter()
+                .all(|leaf| layout.core.contains_key(&format!("{prefix}.{leaf}_proj.weight"))));
+            if !mixed { continue; }
+            let output = if operand.slice == super::coordinator::WeightSlice::Cols && layout.ranks == 2 {
+                ProjectionOutput::F32
+            } else { ProjectionOutput::Bf16 };
+            let request = self.requirements.iter().find(|request| request.layout.stem == stem)
+                .ok_or_else(|| mismatch(&operand.name, "owner was not selected before inventory"))?;
+            ensure!(operand.dtype == if request.layout.fp8 { cuteafd_core::DType::F8E4M3 } else { cuteafd_core::DType::Bf16 }
+                && operand.shape == request.layout.shape && output == request.output
+                && operand.allocation_bytes == request.layout.bytes()?,
+                mismatch(&operand.name, "shape, storage, output precision or capacity changed"));
+            if request.layout.fp8 {
+                let prefix = stem.strip_suffix("o_proj").expect("output requirement");
+                let borrowed = layout.core.iter().filter(|(name, _)| name.starts_with(prefix))
+                    .map(|(_, core)| (self.rows * core.shape[1] * 2).max(256) as u64).max().unwrap_or(0);
+                ensure!(self.resolved.fp8_scratch_bytes <= borrowed,
+                    mismatch(&operand.name, "manifest FP8 scratch exceeds serialized trellis rotated plane"));
+            }
+        }
+        for request in &self.requirements {
+            let prefix = request.layout.stem.strip_suffix("o_proj").expect("output requirement");
+            if !layout.core.contains_key(&format!("{prefix}q_proj.weight")) { continue; }
+            ensure!(layout.operands.iter().any(|operand| operand.name == format!("{}.weight", request.layout.stem)),
+                mismatch(&request.layout.stem, "owned QKV lacks its selected native output"));
+        }
+        Ok(())
+    }
+}
+
 pub fn validate_span_rows(rows: usize) -> Result<()> {
     let limit = crate::serving_capacity::prefill_waves::PrefillLimits::default().max_span_rows;
     ensure!(rows > 0 && rows as u64 <= limit, "Step-5 allocation span must be 1..={limit} rows");

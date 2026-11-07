@@ -86,7 +86,8 @@ impl<'a> TargetChain<'a> {
         let mut bytes = weights
             .checked_add(contract.rope_tables.allocation_bytes)
             .context("chain rope overflow")?;
-        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)).transpose()?;
+        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog_view(
+            checkpoint.view.as_ref().context("Step-5 target chain requires its selected checkpoint view")?)).transpose()?;
         let mut routed = Vec::new();
         for layer in &contract.layers[..count] {
             let workspace = if layer.sliding.is_some() {

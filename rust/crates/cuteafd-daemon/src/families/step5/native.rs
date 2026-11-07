@@ -122,45 +122,94 @@ impl<'a> NativeScratch<'a> {
 
 /// Native q/k/v/o for one attention owner; `o` is input-split on head-split ranks.
 pub(super) struct NativeAttention<'a> {
-    pub(super) q: NativeLinear<'a>,
-    pub(super) k: NativeLinear<'a>,
-    pub(super) v: NativeLinear<'a>,
-    pub(super) o: NativeLinear<'a>,
+    pub(super) qkv: Option<[NativeLinear<'a>; 3]>,
+    pub(super) o: Option<NativeLinear<'a>>,
 }
 
 /// Operand slots (input norm, q, k, v, q_norm, k_norm, g, o) the native core replaces.
 pub(super) const ATTENTION_SLOTS: [usize; 4] = [1, 2, 3, 7];
 
 impl<'a> NativeAttention<'a> {
-    /// `None` for a BF16 layer; mixed native/BF16 attention is refused.
+    /// Q/K/V share one route; the output projection may retain native BF16.
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &Checkpoint,
         layout: &RankWeightLayout, layer: usize, rows: usize, q: usize, kv: usize, hidden: usize)
         -> Result<Option<Self>> {
         let names = ["q", "k", "v", "o"].map(|p| format!("model.layers.{layer}.self_attn.{p}_proj.weight"));
         let present = names.iter().filter(|name| layout.core.contains_key(*name)).count();
         if present == 0 { return Ok(None); }
-        ensure!(present == 4, "Step-5 layer {layer} attention mixes native and BF16 operands");
+        let qkv = names[..3].iter().filter(|name| layout.core.contains_key(*name)).count();
+        ensure!(matches!(qkv, 0 | 3), "Step-5 layer {layer} attention requires complete EXL3 q/k/v");
         let mut core = NativeLayer::load(device, programs, checkpoint, layout, rows, |name| names.iter().any(|n| n == name))?;
         let mut take = |name: &str| -> Result<NativeLinear<'a>> {
             Rc::try_unwrap(core.linears.remove(name).context("native attention operand")?)
                 .map_err(|_| anyhow::anyhow!("native attention operand aliased"))
         };
-        let attention = Self { q: take(&names[0])?, k: take(&names[1])?, v: take(&names[2])?, o: take(&names[3])? };
-        let split = attention.o.side() == TrellisSide::Input;
-        ensure!(attention.q.shape() == [q, hidden] && attention.k.shape() == [kv, hidden]
-            && attention.v.shape() == [kv, hidden] && attention.o.shape() == [hidden, q]
-            && [&attention.q, &attention.k, &attention.v].iter().all(|l| l.side() == TrellisSide::Output),
+        let has_o = layout.core.contains_key(&names[3]);
+        let attention = Self { qkv: if qkv == 3 { Some([take(&names[0])?, take(&names[1])?, take(&names[2])?]) } else { None },
+            o: if has_o { Some(take(&names[3])?) } else { None } };
+        let split = attention.o.as_ref().is_some_and(|o| o.side() == TrellisSide::Input);
+        ensure!(attention.qkv.as_ref().is_none_or(|linears| linears.iter().zip([q, kv, kv])
+                .all(|(linear, n)| linear.shape() == [n, hidden] && linear.side() == TrellisSide::Output))
+            && attention.o.as_ref().is_none_or(|o| o.shape() == [hidden, q]),
             "Step-5 layer {layer} native attention geometry (split o={split})");
         Ok(Some(attention))
     }
 
     pub(super) fn scratch_layout(&self, rows: usize) -> Result<ProjectionScratchLayout> {
         let mut merged = None::<ProjectionScratchLayout>;
-        for linear in [&self.q, &self.k, &self.v, &self.o] {
+        for linear in self.qkv.iter().flatten().chain(self.o.iter()) {
             let [n, k] = linear.shape();
             let next = ProjectionScratchLayout::new(k, n, rows)?;
             match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
         }
         merged.context("native attention scratch")
+    }
+}
+
+/// Mixed-attention O keeps the selected storage and typed output together.
+pub(super) enum OutputProjection<'a> {
+    Bf16(cuteafd_ffi::draft_projection::DraftProjections<'a>),
+    Fp8 { program: cuteafd_ffi::native_attention::Fp8Projections<'a>,
+        output: cuteafd_ffi::draft_projection::ProjectionOutput },
+}
+impl<'a> OutputProjection<'a> {
+    pub(super) fn load(programs: &'a Programs<'a>, layout: &RankWeightLayout, layer: usize,
+        rows: usize, k: usize, n: usize, output: cuteafd_ffi::draft_projection::ProjectionOutput) -> Result<Self> {
+        let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+        let operand = layout.operands.iter().find(|w| w.name == name).context("selected native O")?;
+        if operand.dtype != cuteafd_core::DType::F8E4M3 {
+            return Ok(Self::Bf16(cuteafd_ffi::draft_projection::DraftProjections::load_with_output(
+                programs, &[(k, n)], rows, output)?));
+        }
+        let program = cuteafd_ffi::native_attention::Fp8Projections::load(programs, &[(k,n)], rows, output)?;
+        let prefix = format!("model.layers.{layer}.self_attn.");
+        let borrowed = layout.core.iter().filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(_, core)| rows * core.shape[1] * 2).max().context("FP8 O requires serialized trellis scratch")?.max(256);
+        ensure!(program.scratch_bytes(k,n)? <= borrowed, "FP8 O manifest scratch exceeds borrowed rotated plane");
+        Ok(Self::Fp8 { program, output })
+    }
+
+    pub(super) fn output(&self) -> cuteafd_ffi::draft_projection::ProjectionOutput {
+        match self { Self::Bf16(program) => program.output(), Self::Fp8 { output, .. } => *output }
+    }
+
+    pub(super) fn launch(&self, input: *const c_void, weight: Buffer, out: Buffer,
+        scratch: Option<&NativeScratch<'_>>, rows: usize, k: usize, n: usize, stream: *mut c_void) -> Result<()> {
+        match self {
+            Self::Bf16(program) => {
+                // SAFETY: caller retains admitted BF16 input, weight and typed output until stream drain.
+                unsafe { program.launch_checked(input, weight.ptr, out, rows, k, n, stream)?; }
+            }
+            Self::Fp8 { program, .. } => {
+                let (values, scales) = super::weights::fp8_buffers(weight, &[n,k])?;
+                // QKV trellis egress precedes O on this same stream. Its rotated plane is
+                // dead until the next serialized projection; sibling lanes own sibling scratch.
+                let scratch = scratch.context("FP8 O borrowed scratch missing")?.scratch.buffers["rotated"];
+                // SAFETY: disjoint admitted input/output/final weights and borrowed dead scratch,
+                // retained by the lane through stream drainage; no hot-path allocation.
+                unsafe { program.launch(input, values.ptr, scales.ptr, out, scratch, rows, k, n, stream)?; }
+            }
+        }
+        Ok(())
     }
 }
