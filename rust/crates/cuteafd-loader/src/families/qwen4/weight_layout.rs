@@ -148,7 +148,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = qwen4_config(2);
         config["text_config"]["layer_types"] = serde_json::json!(["linear_attention", "full_attention"]);
-        config["text_config"]["ple_layer_ids"] = serde_json::json!([0]);
+        config["text_config"]["ple_layer_ids"] = serde_json::json!([1]);
+        config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
         let cfg = Qwen4Config::from_hf(&config).unwrap();
         let mut tensors = vec![t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden])];
         let mut hc = |p: &str, inject: bool| {

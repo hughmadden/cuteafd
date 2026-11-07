@@ -726,6 +726,7 @@ impl Opened {
                 engine::DECODE_ROWS)?),
             _ => None,
         };
+        weights::arena::probe(&self.library, &[device.id], &model, &embedding, ple.as_ref())?;
         use cuteafd_loader::placement::ResidentWeights;
         let mut loaded_weights = ResidentWeights(resident as u64)
             .checked_add(ResidentWeights(embedding.device_bytes() as u64))?

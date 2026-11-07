@@ -22,7 +22,7 @@ use std::ffi::c_void;
 use crate::shared::qwen::weights::WeightReader;
 
 #[path = "weights_arena.rs"]
-mod arena;
+pub(super) mod arena;
 
 pub(crate) const PREFIX: &str = "model.language_model.";
 /// Rows of the shared expert's packed gate/up/gate-logit operand.
@@ -550,6 +550,21 @@ mod tests {
             let loader = Qwen4Loader { library: &library, checkpoint: &checkpoint, fp8_decode: false,
                 fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
                 dense: std::rc::Rc::new(DenseLoad::mount(&library)), arenas: None };
+            let fp8_loader = Qwen4Loader { fp8_decode: true, ..loader.clone() };
+            let layouts = cuteafd_loader::families::qwen4::weight_layout::coordinator_arenas(
+                &checkpoint, &cfg, &[0], 1, false,
+                resident::Qwen4Representation { fp8_projections: true, fp8_head: false }, 0)?;
+            let payload = layouts.iter().map(|(_, layout)| layout.payload_bytes()).sum::<usize>();
+            fixture.configure_memory(&library, 0, payload)?;
+            let before = library.cuda_memory_info()?.0;
+            let error = match fp8_loader.with_arenas(&cfg, &[0], &[(Device { library: &library, id: 0 },
+                std::ptr::null_mut())], false, false, false) {
+                Ok(_) => anyhow::bail!("startup admitted payload without live staging"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("startup arenas and dense workspace"), "{error:#}");
+            assert_eq!(library.cuda_memory_info()?.0, before, "refusal allocated a backing");
+            fixture.configure_memory(&library, 0, 1 << 30)?;
             let mounted = loader.model(&cfg, 1, false, false)?;
             let admitted = resident::checkpoint_resident_bytes(&checkpoint, &cfg, 1, false,
                 resident::Qwen4Representation::default())?;
@@ -562,6 +577,26 @@ mod tests {
             let _committed = crate::shared::experts::rtx::push::tests::receive_pushed(
                 Device { library: &library, id: 0 }, None, &checkpoint.snapshot, sockets.path(), &records, None, 0, 0)?;
             assert_eq!(pushed.bytes(), mounted.bytes());
+            let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&[0])?;
+            for model in [&mounted, &pushed] {
+                let receipts = model.allocation_receipts(devices)?;
+                let backings = receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+                assert_eq!(backings.len(), 1);
+                assert!(backings[0].allocation.id.contains("qwen4/target/"));
+                assert!(receipts.iter().filter(|r| r.allocation.view.is_some()).count() > 10);
+                assert_eq!(backings[0].allocation.bytes, model.bytes() as u64);
+            }
+            for (name, allocation) in mounted.layers[0].operands() {
+                let other = &pushed.layers[0].operands[name];
+                // Only logical widened rows are initialized below the native min-256 extent.
+                let bytes = if ["a_log", "dt_bias"].contains(&name) { 48 * 4 } else { allocation.buffer.bytes };
+                let read = |a: &Allocation<'_>| -> Result<Vec<u8>> {
+                    let mut out = vec![0; bytes];
+                    library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..a.buffer })?;
+                    Ok(out)
+                };
+                assert_eq!(read(allocation)?, read(other)?, "{name}");
+            }
             for key in ["a_log", "dt_bias"] {
                 let mounted = &mounted.layers[0].operands[key];
                 let pushed = &pushed.layers[0].operands[key];

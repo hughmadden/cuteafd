@@ -28,6 +28,16 @@ fn i64s(bytes: &[u8]) -> Vec<i64> {
 }
 
 impl<'a> PleTable<'a> {
+    pub(crate) fn allocation_receipts(&self,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "qwen4.ple",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "mapped PLE table");
+        self.scale.inventory(&mut inventory, "scale")?;
+        Ok(inventory.receipts)
+    }
+
     pub fn mapped(&self) -> &MappedTableDevice<'a> {
         &self.mapped
     }
