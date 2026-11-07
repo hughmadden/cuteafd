@@ -3337,3 +3337,19 @@ def test_release_preflight_verifies_exact_packages_without_gpu(entry, tmp_path, 
     with pytest.raises(ValueError, match='missing Spark package tp5-compact-rank4/m1'):
         cards.preflight_job(job, dict(release='v4.1.2'))
     assert len(commands) == 1
+
+
+@pytest.mark.parametrize('attested,refused', [([], True), (['tp3', 'tp6'], True), (['tp7'], False)])
+def test_unequal_v41_world_needs_its_own_attested_role(attested, refused):
+    """A V4.1 TP7 card (adjacent-width packages) is refused before enqueue unless
+    every rank's slot attests tp7 itself; another world's role never stands in."""
+    card = dict(name='v', family='deepseek_v41', config='', set={'SPARK_COUNT': '7'}, sparks=[])
+    assert cards.v41_tp_role(card, {'SPARK_COUNT': '7'})['tp_role'] == 'tp7'
+    problems = cards.tp_role_problems('kiwi', 's', 'tp7', False,
+        dict(tp_roles=dict(roles=attested, verified=True, nvfp4=[], error=None)))
+    assert bool(problems) == refused, problems
+    if refused:
+        assert 'not tp7' in problems[0] and 'CUTEAFD_WIP_SPARK_TP_ROLES=tp7' in problems[0]
+    # A slot with no role manifest at all is refused too (the #1105 shape).
+    missing = cards.tp_role_problems('kiwi', 's', 'tp7', False, dict(tp_roles=None))
+    assert missing and 'has no V41_EXPERT_TP_AOT.json' in missing[0]

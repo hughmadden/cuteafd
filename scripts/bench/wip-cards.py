@@ -2006,7 +2006,7 @@ def tp_roles(p,art):
         assert hashlib.sha256(data).hexdigest()==meta.get('v41_expert_tp_manifest_sha256'),'TP manifest hash mismatch'
         manifest=json.loads(data)
         roles=manifest.get('spark_tp_roles')
-        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp6') for r in roles),'invalid TP roles'
+        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp5','tp6','tp7','tp8') for r in roles),'invalid TP roles'
         assert roles==meta.get('spark_tp_roles'),'slot and artifact roles differ'
         lib=hashlib.sha256((art/'libcuteafd_native.so').read_bytes()).hexdigest()
         assert lib==manifest.get('native_library_sha256'),'native library hash mismatch'

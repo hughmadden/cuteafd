@@ -27,6 +27,7 @@ cannot pass silently.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -333,3 +334,55 @@ def test_ml4_adjacent_width_roles_do_not_claim_v41_degree_objects(tmp_path: Path
     assert document["spark_tp_roles"] == []
     assert document["manifests"] == {}
     assert document["symbols_verified"] is False
+
+
+def _write_width_package(directory: Path, artifact) -> None:
+    import hashlib
+
+    directory.mkdir(parents=True, exist_ok=True)
+    variants, hashes = [], {}
+    for capacity in CAPACITIES:
+        obj = directory / f"v41_{artifact.name}_m{capacity}.o"
+        obj.write_bytes(f"{artifact.name}-{capacity}\n".encode())
+        variants.append({"name": obj.stem, "capacity_rows": capacity})
+        hashes[obj.name] = hashlib.sha256(obj.read_bytes()).hexdigest()
+    (directory / "v41_experts.json").write_text(json.dumps({
+        "schema": 1, "capability": [12, 1], "role": artifact.name, "family": "v41",
+        "geometry": {"experts": 384, "hidden": 5120, "intermediate": artifact.logical,
+                     "kernel_intermediate": artifact.stored, "topk": 6},
+        "variants": variants, "artifact_sha256": hashes, "decode_capacities": [1, 16, 64]}))
+
+
+def _width_artifacts(world: int):
+    spec = importlib.util.spec_from_file_location("width_spark_packages", REPO / "python/tools/lib/spark_packages.py")
+    packages = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packages)
+    return packages.native_spark_artifacts("v41")[world]
+
+
+@pytest.mark.parametrize("world", [5, 7])
+def test_unequal_v41_worlds_are_attested_only_by_their_complete_width_packages(tmp_path: Path, world: int) -> None:
+    """A V4.1 TP5/TP7 image advertises its role exactly when every adjacent-width
+    package the world loads is present and valid; a partial set fails the build,
+    so preflight can never pass a world that would fail at worker startup."""
+    library = tmp_path / "libcuteafd_native.so"
+    library.write_bytes(b"stub")
+    output = tmp_path / "V41_EXPERT_TP_AOT.json"
+    command = [sys.executable, str(MANIFEST), "--role", "expert", "--requested", f"tp{world}",
+               "--native-build-dir", str(tmp_path), "--native-library", str(library), "--output", str(output)]
+    artifacts = _width_artifacts(world)
+    assert len(artifacts) == 2 and all(a.name.startswith("spark_w") for a in artifacts)
+    _write_width_package(tmp_path / f"v41_{artifacts[0].name}_experts", artifacts[0])
+    partial = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert partial.returncode == 2 and "needs width packages" in partial.stderr, partial.stderr
+    _write_width_package(tmp_path / f"v41_{artifacts[1].name}_experts", artifacts[1])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    document = json.loads(output.read_text())
+    assert document["spark_tp_roles"] == [f"tp{world}"]
+    assert sorted(document["manifests"][f"tp{world}"]["width_packages"]) == sorted(a.name for a in artifacts)
+    # A corrupted width object is refused, not advertised.
+    victim = next((tmp_path / f"v41_{artifacts[1].name}_experts").glob("*.o"))
+    victim.write_bytes(b"corrupt")
+    corrupt = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert corrupt.returncode == 2 and "does not match its hash" in corrupt.stderr
