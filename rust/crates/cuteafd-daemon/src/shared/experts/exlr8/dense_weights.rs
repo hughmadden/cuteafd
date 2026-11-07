@@ -588,7 +588,12 @@ pub(crate) mod tests {
         let config = serde_json::from_slice(&std::fs::read(root.join("config.json"))?)?;
         let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&config)?;
         let selection = DenseSelection::from_hf(&config)?;
-        let records = DenseRecord::inventory(&root)?;
+        let records = DenseRecord::inventory(&root)?.into_iter().filter_map(|record|
+            match selection.role(&record.tensor, cfg.layers) {
+                Ok(cuteafd_loader::plan::exlr8::dense::DenseRole::Excluded) => None,
+                Ok(_) => Some(Ok(record)),
+                Err(error) => Some(Err(error)),
+            }).collect::<Result<Vec<_>>>()?;
         let metadata = MetadataInput::open(&root, "up1")?;
         for world in [1, 2] {
             let plans = (0..world).map(|rank| DensePlan::for_rank(&records, world, rank))
@@ -629,8 +634,10 @@ pub(crate) mod tests {
                     let layers = cfg.first_moe_layer..cfg.first_moe_layer + onboard;
                     let loaded_experts = layers.clone().map(|layer| metadata.plan(layer, world, rank, ExpertSet::Routed))
                         .collect::<std::result::Result<Vec<_>, _>>()?.iter().map(|p| p.resident_bytes).sum::<usize>();
-                    let admitted_experts = layers.map(|layer| metadata.resident_bytes(layer, world, rank, ExpertSet::Routed))
-                        .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().sum::<usize>();
+                    let admitted_experts = cuteafd_loader::plan::exlr8::routed_expert_costs(
+                        &metadata, &layers.collect::<Vec<_>>())?.iter().map(|cost|
+                            if world == 1 { cost.whole.resident } else { cost.half[rank].resident })
+                        .sum::<u64>() as usize;
                     assert_eq!(actual + loaded_experts, expected + admitted_experts);
                     eprintln!("TP{world} rank{rank} onboard={onboard}: expert owners={loaded_experts}");
                 }

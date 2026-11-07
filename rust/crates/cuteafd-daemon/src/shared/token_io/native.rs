@@ -795,7 +795,8 @@ mod tests {
                     // Fresh loader residency and the planner's cached census must agree
                     // for zero, one and two resident Whole layers (or TP2 halves).
                     let loaded_layer = metadata.plan(3, world, rank, ExpertSet::Routed)?;
-                    let admitted_layer = metadata.resident_bytes(3, world, rank, ExpertSet::Routed)?;
+                    let cost = cuteafd_loader::plan::exlr8::routed_expert_costs(&metadata, &[3])?[0];
+                    let admitted_layer = if world == 1 { cost.whole.resident } else { cost.half[rank].resident } as usize;
                     for onboard in 0..=2 {
                         assert_eq!(embedding_bytes + head_bytes + onboard * loaded_layer.resident_bytes,
                             admitted_target + onboard * admitted_layer,
