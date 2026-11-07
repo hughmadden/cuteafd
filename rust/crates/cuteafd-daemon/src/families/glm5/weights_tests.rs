@@ -177,6 +177,19 @@ fn digests(library: &NativeLibrary, layers: &[Vec<GlmLayer<'_>>], norm: &DeviceA
     Ok(out)
 }
 
+fn golden_arenas<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+    cfg: &GlmDsaConfig) -> Result<std::rc::Rc<std::collections::BTreeMap<i32,
+        crate::shared::memory::weight_arena::DeviceWeightArena<'a>>>> {
+    use cuteafd_loader::placement::{families::glm5::weights::WeightInventory, planner::EmbeddingHome};
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(catalog.snapshot())?;
+    let layouts = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None, false, false,
+        EmbeddingHome::Device(0))?.coordinator_arenas()?;
+    Ok(std::rc::Rc::new(layouts.into_iter().enumerate().map(|(rank, layout)| {
+        Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            Device { library, id: rank as i32 }, layout)?))
+    }).collect::<Result<_>>()?))
+}
+
 /// Set CUTEAFD_WRITE_GLM5_OPERAND_GOLDEN=1 to regenerate (only from a loader
 /// already known to be correct).
 #[test]
@@ -195,7 +208,7 @@ fn head_split_operands_match_the_mount_golden() -> Result<()> {
     let cfg = GlmDsaConfig::read(root.path())?;
     let stream = std::ptr::null_mut();
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: None };
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], arenas: Some(golden_arenas(&library, &catalog, &cfg)?), allocation_prefix: String::new(), push: None };
     let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
     let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
     let actual = digests(&library, &layers, &model.norm, model.head.bf16()?)?;
@@ -231,7 +244,7 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
     let stream = std::ptr::null_mut();
     let sink = std::rc::Rc::new(super::landing::PushSink::default());
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: Some(sink.clone()) };
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], arenas: Some(golden_arenas(&library, &catalog, &cfg)?), allocation_prefix: String::new(), push: Some(sink.clone()) };
     let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
     let (records, deferred) = sink.take();
     let (sparks, world) = (6usize, 8usize);

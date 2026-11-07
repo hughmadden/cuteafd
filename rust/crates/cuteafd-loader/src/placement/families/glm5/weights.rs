@@ -159,6 +159,20 @@ pub struct WeightInventory {
 }
 
 impl WeightInventory {
+    /// Final target operands only, excluding independently owned shared experts
+    /// and host-pinned embeddings. Call before appending peer router replicas;
+    /// those belong to the separately admitted onboarding scope.
+    pub fn coordinator_arenas(&self) -> Result<Vec<crate::serving_capacity::WeightArenaLayout>> {
+        (0..self.ranks).map(|rank| {
+            let location = Location::coordinator(u8::try_from(rank)?);
+            let tensors = self.owners.iter().filter(|owner| owner.allocation.location == location
+                && !owner.allocation.id.contains(".shared.layer."))
+                .map(|owner| Ok((owner.allocation.id.clone(), usize::try_from(owner.allocation.bytes)?)))
+                .collect::<Result<Vec<_>>>()?;
+            crate::serving_capacity::WeightArenaLayout::new(format!("glm/coordinator/{rank}"), tensors)
+        }).collect()
+    }
+
     /// These target operations serialize, so their heap peaks do not add.
     /// Concurrent draft prefetch and embedding filler join as separate charges.
     pub fn loading_components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {

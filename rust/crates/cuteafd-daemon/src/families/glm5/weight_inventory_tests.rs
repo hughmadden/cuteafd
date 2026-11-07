@@ -152,6 +152,71 @@ fn installed_variant_weight_inventory_equals_production_requests() -> Result<()>
     Ok(())
 }
 
+fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
+    for (rank, arena) in inventory.coordinator_arenas()?.iter().enumerate() {
+        let sizes = inventory.owners.iter().filter(|owner|
+            owner.allocation.location == cuteafd_loader::placement::planner::Location::coordinator(rank as u8)
+                && !owner.allocation.id.contains(".shared.layer."))
+            .map(|owner| owner.allocation.bytes).collect::<Vec<_>>();
+        let large = sizes.iter().copied().filter(|&n| n > 1 << 20).collect::<Vec<_>>();
+        let rounding = |n: u64| n.div_ceil(2 << 20) * (2 << 20) - n;
+        let old_slack: u64 = large.iter().copied().map(rounding).sum();
+        let tail = if arena.bytes() > 1 << 20 { rounding(arena.bytes() as u64) } else { 0 };
+        eprintln!("ARENA {label} rank={rank} N={} payload={} large_N={} large_bytes={} old_slack={} arena={} padding={} tail={tail}",
+            sizes.len(), sizes.iter().sum::<u64>(), large.len(), large.iter().sum::<u64>(), old_slack,
+            arena.bytes(), arena.padding_bytes());
+        assert_eq!(arena.payload_bytes() as u64, sizes.iter().sum::<u64>());
+        let mut regions = arena.views().values().copied().collect::<Vec<_>>();
+        regions.sort_by_key(|v| v.offset());
+        let mut end = 0;
+        for view in regions {
+            assert_eq!(view.offset() % 256, 0);
+            assert!(view.offset() >= end);
+            end = view.offset() + view.bytes();
+        }
+        assert_eq!(end, arena.bytes());
+    }
+    Ok(())
+}
+
+#[test]
+fn installed_arena_cpu_inventory() -> Result<()> {
+    for (model, revision) in [
+        ("wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6", "5a4e83a09a11f3145332ed632d28a9894ea88225"),
+        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6", "03c80aebaa483d55760703ae5bc0c9734c9d67d6"),
+    ] {
+        let root = installed(model, revision)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
+        let cfg = GlmDsaConfig::read(&root)?;
+        for ranks in [1, 2] {
+            let owners = cuteafd_loader::placement::families::glm5::attention_owners(&cfg, cfg.layers)?;
+            for whole in [false, true] {
+                if whole && ranks == 1 { continue; }
+                let inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
+                    whole.then_some(owners.as_slice()), bf16_programs(), false, EmbeddingHome::Device(0))?;
+                arena_inventory(&format!("{model} tp{ranks} whole={whole}"), &inventory)?;
+            }
+        }
+    }
+    let root = installed("kindlingai--glm-5.3-exlr8-k2-k3-k4", "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80")?;
+    let cfg = GlmDsaConfig::read(&root)?;
+    let config = serde_json::from_slice(&std::fs::read(root.join("config.json"))?)?;
+    let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
+    for ranks in [1, 2] {
+        let records = (0..ranks).map(|rank|
+            crate::shared::experts::exlr8::dense_weights::NativeDenseRecords::new(&root, cfg.layers, ranks, rank, &BTreeMap::new()))
+            .collect::<Result<Vec<_>>>()?;
+        let plans = records.iter().map(|r| r.plan.clone()).collect::<Vec<_>>();
+        let mut inventory = WeightInventory::from_native(&selection, cfg.layers, &plans)?;
+        let all = cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(&root)?;
+        let vocabulary = (0..ranks).map(|rank| crate::shared::token_io::native::VocabularyPlan::new(
+            &all, &selection, ranks, rank, cfg.hidden, cfg.vocab_size)).collect::<Result<Vec<_>>>()?;
+        inventory.extend_native(&selection, cfg.layers, &vocabulary.iter().map(|p| p.dense_plan()).collect::<Vec<_>>())?;
+        arena_inventory(&format!("GLM-EXLR8 tp{ranks} context-or-heads"), &inventory)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn installed_k6_max_streaming_staging_covers_measured_pools() -> Result<()> {
     use crate::shared::experts::rtx::dense::{HostStaging, Rect};
@@ -317,6 +382,13 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     let cfg = GlmDsaConfig::read(root.path())?;
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    let layout_inventory = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, owners,
+        bf16_programs(), false, if placement == EmbedPlacement::Host { EmbeddingHome::HostPinned }
+            else { EmbeddingHome::Device(0) })?;
+    let arenas = layout_inventory.coordinator_arenas()?.into_iter().enumerate().map(|(rank, layout)| {
+        Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            Device { library: &library, id: rank as i32 }, layout)?))
+    }).collect::<Result<BTreeMap<_, _>>>()?;
     let loader = GlmLoader {
         library: &library,
         catalog: &catalog,
@@ -326,13 +398,14 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
             device: 1,
             stream: std::ptr::null_mut(),
         }],
-        push: None,
+        arenas: None, allocation_prefix: String::new(), push: None,
     };
+    let loader = GlmLoader { arenas: Some(std::rc::Rc::new(arenas)), ..loader };
     let source = catalog.tensor(cfg.embedding())?;
     let source = EmbedSource::new(root.path(), &source.shard, &source.metadata, cfg.hidden)?;
-    let (embedding, (weights, peers)) = TokenEmbedding::load(&library, source, placement, || {
+    let (embedding, (weights, peers)) = TokenEmbedding::load_with(&library, source, placement, || {
         loader.model(&cfg, cfg.layers, owners, false)
-    })?;
+    }, |_, bytes| loader.allocate_owner("embedding", bytes))?;
     let devices = CoordinatorDevices::new(&[0, 1])?;
     let mut inventory = crate::shared::memory::receipts::Inventory::new(
         devices,
@@ -365,6 +438,31 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
         }
         _ => anyhow::bail!("unexpected native vocabulary"),
     }
+    let mut physical = crate::shared::memory::receipts::Inventory::new(
+        devices, "glm.target", Lifetime::RESIDENT, Category::Weights, "target arena fixture");
+    for (rank, layers) in std::iter::once(&weights.layers).chain(peers.iter()).enumerate() {
+        for (layer, weights) in layers.iter().enumerate() {
+            weights.allocation_receipts(&mut physical, &format!("rank.{rank}.layer.{layer}"))?;
+        }
+    }
+    weights.norm.inventory(&mut physical, "norm")?;
+    match &weights.head {
+        GlmHead::Bf16(head) => head.inventory(&mut physical, "head")?,
+        GlmHead::K6(head) => {
+            head.payload.inventory(&mut physical, "head.payload")?;
+            head.suh.inventory(&mut physical, "head.suh")?;
+            head.svh.inventory(&mut physical, "head.svh")?;
+        }
+        _ => anyhow::bail!("unexpected native vocabulary"),
+    }
+    let backings = physical.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+    assert_eq!(backings.len(), 2);
+    for arena in layout_inventory.coordinator_arenas()? {
+        let backing = backings.iter().find(|r| r.allocation.id == arena.id()).context("missing target arena")?;
+        assert_eq!(backing.allocation.bytes, arena.bytes() as u64);
+    }
+    assert!(physical.receipts.iter().filter(|r| r.allocation.view.is_some()).all(|r|
+        r.allocation.view.as_ref().unwrap().offset % 256 == 0));
     let mut actual = inventory
         .receipts
         .into_iter()
@@ -437,7 +535,7 @@ fn glm_and_ml4_k6_min_max_push_plans_preserve_packed_bytes() -> Result<()> {
             let sink = std::rc::Rc::new(super::landing::PushSink::default());
             let loader = GlmLoader { library: &library, catalog: &catalog, device: 0,
                 stream: std::ptr::null_mut(), peers: (1..ranks).map(|rank| crate::shared::peer_split::RankDevice {
-                    device: rank as i32, stream: std::ptr::null_mut() }).collect(), push: Some(sink.clone()) };
+                    device: rank as i32, stream: std::ptr::null_mut() }).collect(), arenas: None, allocation_prefix: String::new(), push: Some(sink.clone()) };
             let mut layouts = Vec::new();
             for layer in 0..cfg.layers {
                 for (rank, weights) in core.layer_weights(&cfg, layer, ranks, None)?.into_iter().enumerate() {
@@ -451,7 +549,7 @@ fn glm_and_ml4_k6_min_max_push_plans_preserve_packed_bytes() -> Result<()> {
                 let packed = CoreWeightLayout::from_shared(layout.clone()).read(|name|
                     crate::shared::checkpoint_read::read_tensor(&checkpoint, name))?;
                 expected.push(packed.shard);
-                weights.push(loader.core_weights(layout.clone(), &checkpoint, *rank)?);
+                weights.push(loader.core_weights(layout.clone(), &checkpoint, *rank, &layout.stem)?);
             }
             let (records, deferred) = sink.take();
             assert!(deferred.is_empty());
@@ -714,9 +812,8 @@ fn compact_ml4_query_vectors_and_native_index_equal_real_layer_requests() -> Res
             device: 1,
             stream: std::ptr::null_mut(),
         }],
-        push: None,
+        arenas: None, allocation_prefix: String::new(), push: None,
     };
-    let layers = loader.layer(&cfg, 0, &checkpoint, &core, None, false)?;
     let mut requests = Vec::new();
     routes::layer_routes(
         &catalog,
@@ -733,6 +830,17 @@ fn compact_ml4_query_vectors_and_native_index_equal_real_layer_requests() -> Res
             Ok(())
         },
     )?;
+    let arenas = (0..2).map(|rank| {
+        let tensors = requests.iter().filter(|request| request.location ==
+            cuteafd_loader::placement::planner::Location::coordinator(rank as u8))
+            .map(|request| (request.id.clone(), request.bytes as usize));
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+            format!("glm/coordinator/{rank}"), tensors)?;
+        Ok((rank, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            Device { library: &library, id: rank }, layout)?))
+    }).collect::<Result<BTreeMap<_, _>>>()?;
+    let loader = GlmLoader { arenas: Some(std::rc::Rc::new(arenas)), ..loader };
+    let layers = loader.layer(&cfg, 0, &checkpoint, &core, None, false)?;
     let mut actual = crate::shared::memory::receipts::Inventory::new(
         CoordinatorDevices::new(&[0, 1])?,
         "glm.weights",
