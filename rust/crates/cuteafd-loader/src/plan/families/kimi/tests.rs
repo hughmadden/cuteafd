@@ -124,12 +124,57 @@ fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
     let report = input.plan(&options).unwrap();
     let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
     assert_eq!(placed.items.len(), 1);
+    assert!(placed.items[0].iter().any(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP
+        && item.bytes > 0 && item.basis == cuteafd_core::memory_layout::Basis::Estimated));
     assert!(placed.layers.iter().all(|layer| layer.mode == LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }));
     assert!(placed.layers.iter().all(|layer| matches!(layer.experts,
         ExpertHome::Dense | ExpertHome::Spark | ExpertHome::RtxWhole { gpu: 0 })));
     assert!(placed.tp2.is_none());
     assert_eq!(report.memory_layout.as_ref().unwrap().devices.iter()
         .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count(), 1);
+}
+
+#[test]
+fn header_and_installed_min_plans_share_the_physical_weight_granularity_forecast() -> Result<()> {
+    use crate::{families::kimi_k3::weight_layout::{GlobalLayout, LayerLayout},
+        placement::{planner::{allocation_granularity_forecast, ALLOCATION_GRANULARITY_GROUP},
+            FfnMode, LayerMode, OnboardSetting}};
+    use cuteafd_core::memory_layout::Basis;
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path())?;
+    let model = Model::open(&Checkpoint::open(dir.path())?)?;
+    let mut requests = GlobalLayout::ranks_with_core(model.cfg(), &model.core, 1)?[0].allocation_extents();
+    for layer in 0..model.cfg().layers {
+        requests.extend(LayerLayout::ranks_with_core(model.cfg(), layer,
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, &model.core, 1)?[0].allocation_extents(None)?);
+    }
+    let expected = allocation_granularity_forecast(&requests)?;
+    assert!(expected > 0);
+    let package = tempfile::tempdir()?;
+    let manifest = installed_inventory(package.path(), false);
+    let mut options = with_layout(6, Some(192 << 30));
+    options.attention_placement = None;
+    options.coordinator_budget_bytes = 192 << 30;
+    let layout = options.layout.as_mut().unwrap();
+    layout.rtx_bytes = vec![192 << 30];
+    layout.head_split = false;
+    layout.context_tokens = 262_144;
+    layout.pool_tokens = Some(262_144);
+    layout.prefix_slots = Some(1);
+    layout.onboard = Some(OnboardSetting::Layers(0));
+    let mut charges = Vec::new();
+    for installed in [false, true] {
+        options.layout.as_mut().unwrap().workspace_manifest = installed.then(|| manifest.clone());
+        let report = input.plan(&options)?;
+        let placed = report.solver_placement.as_ref().unwrap_or_else(|| panic!("installed={installed}: {:?}", report.hints));
+        let owners = placed.items[0].iter().filter(|item| item.group == ALLOCATION_GRANULARITY_GROUP).collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].basis, Basis::Estimated);
+        assert_eq!(owners[0].bytes, expected);
+        charges.push(owners[0].bytes);
+    }
+    assert_eq!(charges[0], charges[1], "the same request inventory must not depend on PROGRAMS.json");
+    Ok(())
 }
 
 #[test]

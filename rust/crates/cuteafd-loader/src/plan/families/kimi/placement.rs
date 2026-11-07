@@ -132,26 +132,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         demand.bytes = bytes;
         fixed.push(demand);
     }
-    let packed = manifest.as_ref().map(|_| &model.core);
-    let globals = packed.map(|core| crate::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, core, gpus)).transpose();
-    let globals = match globals { Ok(value) => value, Err(error) => {
-        report.refuse_placement(format!("Kimi packed global inventory refused: {error:#}"), "Check checkpoint global geometry."); return memory;
-    }};
-    for gpu in 0..gpus as u8 {
-        if let Some(globals) = &globals {
-            fixed.push(globals[usize::from(gpu)].demand().expect("validated global extent"));
-        } else {
-        let split = residency.split / gpus as u64;
-        fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", split, Basis::Exact)
-            .with_resident_weights(ResidentWeights(split)));
-        let replicated = residency.replicated - if gpus == 2 { model.frontends[1 - gpu as usize] } else { 0 };
-        fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (KDA low-rank A, routers, latent proj, norms)",
-            replicated, Basis::Exact).with_resident_weights(ResidentWeights(replicated)));
-        if gpu == 0 { fixed.push(Demand::new(gpu, Category::Embedding, "token embedding", embedding, Basis::Exact)
-            .with_resident_weights(ResidentWeights(embedding))); }
-        if usize::from(gpu) == head_rank { fixed.push(Demand::new(gpu, Category::Weights, "lm head", head, Basis::Exact)
-            .with_resident_weights(ResidentWeights(head))); }
+    // Weight upload extents come from checkpoint geometry, not executable
+    // workspace metadata. Header-only forecasts retain the same physical owners.
+    let globals = match crate::families::kimi_k3::weight_layout::GlobalLayout::ranks_with_core(cfg, &model.core, gpus) {
+        Ok(value) => value, Err(error) => {
+            report.refuse_placement(format!("Kimi packed global inventory refused: {error:#}"), "Check checkpoint global geometry."); return memory;
         }
+    };
+    for gpu in 0..gpus as u8 {
+        fixed.push(globals[usize::from(gpu)].demand().expect("validated global extent"));
         fixed.push(Demand::new(gpu, Category::Kv, format!("KDA FP32 state + BF16 conv, {slots} slots, {} heads", cfg.kda_heads / gpus), state, Basis::Formula));
     }
     let mut baseline = vec![Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }; gpus];
@@ -307,27 +296,23 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let mut records = vec![0u64; gpus];
         for layer in 0..cfg.layers {
             let mla = cfg.attention[layer] == KimiAttention::Mla;
-            let mut weights = ModeBytes { whole: model.mla[layer].split + model.mla[layer].replicated,
-                split: [model.mla[layer].split / 2 + model.mla[layer].replicated; 2] };
-            if let Some(core) = packed {
-                if gpus == 1 {
-                    weights = ModeBytes { whole: LayerLayout::ranks_with_core(cfg, layer, WHOLE, core, 1)?[0].bytes()? as u64,
-                        split: [0; 2] };
-                } else {
-                    let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, core)?;
-                    let mut halves = [0; 2];
-                    for rank in 0..gpus {
-                        halves[rank] = split[rank].attention_bytes()? as u64;
-                        let fixed_weights = split[rank].bytes()? as u64 - halves[rank];
-                        fixed.push(Demand::new(rank as u8, Category::Weights,
-                            format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
-                            fixed_weights, Basis::Exact).with_resident_weights(ResidentWeights(fixed_weights)));
-                    }
-                    weights = ModeBytes { split: halves, whole: if mla {
-                        LayerLayout::pair_with_core(cfg, layer, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, core)?[0].attention_bytes()? as u64
-                    } else { 0 } };
+            let weights = if gpus == 1 {
+                ModeBytes { whole: LayerLayout::ranks_with_core(cfg, layer, WHOLE, &model.core, 1)?[0].bytes()? as u64,
+                    split: [0; 2] }
+            } else {
+                let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, &model.core)?;
+                let mut halves = [0; 2];
+                for rank in 0..gpus {
+                    halves[rank] = split[rank].attention_bytes()? as u64;
+                    let fixed_weights = split[rank].bytes()? as u64 - halves[rank];
+                    fixed.push(Demand::new(rank as u8, Category::Weights,
+                        format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
+                        fixed_weights, Basis::Exact).with_resident_weights(ResidentWeights(fixed_weights)));
                 }
-            }
+                ModeBytes { split: halves, whole: if mla {
+                    LayerLayout::pair_with_core(cfg, layer, LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, &model.core)?[0].attention_bytes()? as u64
+                } else { 0 } }
+            };
             // Resolved once here; the recipe never flips a layer to fit.
             let mode = if gpus == 1 { WHOLE } else if mla {
                 match attention {
