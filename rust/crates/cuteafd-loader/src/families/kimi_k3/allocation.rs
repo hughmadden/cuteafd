@@ -179,7 +179,8 @@ impl NativeLaneLayout {
     /// previous reader has completed on the same lane stream. Peer meet outputs
     /// remain separate allocations because the exchange stream reads them.
     pub fn with_core_stages(mut self, stages: BTreeMap<&'static str, usize>) -> Result<Self> {
-        let mut transient = stages.iter().filter(|(name, _)| !CORE_MEET_PLANES.contains(name))
+        let mut transient = stages.iter().filter(|(name, _)| !CORE_MEET_PLANES.contains(name)
+            && !matches!(**name, "native attention F32 partial" | "native attention FP8 scratch"))
             .map(|(&name, &bytes)| (name, bytes)).collect::<Vec<_>>();
         transient.sort_by_key(|&(name, bytes)| (std::cmp::Reverse(bytes), name));
         ensure!(stages.keys().all(|name| !self.operands.contains_key(name)), "duplicate Kimi core arena operand");
@@ -491,7 +492,12 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
             io_extents_for_ranks(cfg.vocab_size, rank, rows, core.get_weight("language_model.lm_head").is_some(), physical_ranks)?
                 .into_iter().sum::<usize>() as u64, Basis::Exact));
         demands.push(graph_demand(&graphs, rank));
-        if physical_ranks == 2 { demands.push(exchange_demand(unit, rank as u8, 0)?); }
+        if physical_ranks == 2 {
+            demands.push(exchange_demand(unit, rank as u8, 0)?);
+            if core.native_attention_split(physical_ranks) {
+                demands.push(core.native_attention_receive_demand(unit, rank as u8, physical_ranks)?);
+            }
+        }
         // Active state and retained marks are charged by the caller's mark policy.
         demands.extend(kda_demands_for_heads(cfg.kda_layers(), slots, 1, 1, rank as u8,
             cfg.kda_heads / physical_ranks)?.into_iter()

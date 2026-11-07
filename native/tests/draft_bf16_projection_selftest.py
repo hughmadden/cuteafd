@@ -59,11 +59,16 @@ def main():
     parser.add_argument("library")
     parser.add_argument("--out-dtype", choices=("bf16", "f32"), default="bf16")
     parser.add_argument("--shape", action="append", help="restrict to K,N; repeatable")
+    parser.add_argument("--rows", action="append", type=int, default=[],
+                        help="additional live row count (1..2048); repeatable")
     parser.add_argument("--support-library", help="load native dependencies for isolated translation-unit iteration")
     parser.add_argument("--screen", action="store_true", help="compare fixed-Lt, padding and existing row-local TMA")
     parser.add_argument("--skinny-screen", action="store_true",
                         help="compare canonical TMA with row-retiled M16 tensor-core arms")
     args = parser.parse_args()
+    if any(rows < 1 or rows > 2048 for rows in args.rows):
+        parser.error("--rows must be between 1 and 2048")
+    row_counts = tuple(sorted({1, 4, 8, 16, 17, 32, 64, 128, 140, 2048, *args.rows}))
     assert not (args.screen and args.skinny_screen), "select one screen"
     assert args.out_dtype == "bf16" or not (args.screen or args.skinny_screen), "screens require BF16 output"
     output_dtype = torch.bfloat16 if args.out_dtype == "bf16" else torch.float32
@@ -197,7 +202,6 @@ def main():
 
             results = {}
             canonical_outputs = {}
-            row_counts = (1, 4, 8, 16, 17, 32, 64, 128, 140, 2048)
             for arm, operation in arms.items():
                 outputs, timing = {}, {}
                 graph_exact = True
@@ -235,9 +239,9 @@ def main():
                     end.synchronize()
                     timing[f"n{rows}_us"] = start.elapsed_time(end) * 1000 / 30
                 mismatches = []
-                if not torch.equal(outputs[140].view(bits_dtype), outputs[2048][:140].view(bits_dtype)):
-                    mismatches.append("n140/n2048")
                 for rows, out in outputs.items():
+                    if not torch.equal(out.view(bits_dtype), outputs[2048][:rows].view(bits_dtype)):
+                        mismatches.append(f"n{rows}/n2048")
                     for offset in offsets:
                         if offset < rows and not torch.equal(outputs[1][0].view(bits_dtype), out[offset].view(bits_dtype)):
                             mismatches.append(f"n{rows}/offset{offset}")

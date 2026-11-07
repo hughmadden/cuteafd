@@ -97,11 +97,132 @@ pub fn exchange_recv_bytes(rows: usize) -> Result<usize> {
     Ok((rows * 7168 * 2).max(256))
 }
 
+impl CoreInventory {
+    /// All native projection routes that placement may select, resolved before allocation.
+    /// Tuple fields are (K, N, FP8 storage, F32 TP2 partial output).
+    pub fn native_geometries(&self, ranks: usize) -> Result<Vec<(usize, usize, bool, bool)>> {
+        Ok(self.native_layouts(ranks)?.iter().map(|layout| (layout.shape[1], layout.shape[0], layout.fp8,
+            layout.ranks == 2 && layout.split == CoreSplit::Input))
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect())
+    }
+
+    pub fn native_layouts(&self, ranks: usize)
+        -> Result<Vec<crate::formats::native_attention::NativeLayout>> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi native attention physical rank count");
+        let mut layouts = Vec::new();
+        for (stem, projection) in &self.native {
+            let mla = stem.ends_with(".q_b_proj") || (stem.ends_with(".o_proj")
+                && self.projections.contains_key(&format!("{}.q_a_proj", stem.rsplit_once('.').unwrap().0)));
+            let worlds: &[usize] = if ranks == 1 || projection.split == CoreSplit::Whole { &[1] }
+                else if mla { &[1, 2] } else { &[2] };
+            for &world in worlds {
+                let [mut n, mut k] = projection.shape;
+                match projection.split {
+                    CoreSplit::Input => k /= world,
+                    CoreSplit::Output => n /= world,
+                    CoreSplit::Whole => {},
+                }
+                layouts.push(crate::formats::native_attention::NativeLayout {
+                    stem: stem.clone(), shape: [n, k], fp8: projection.fp8,
+                    rank: 0, ranks: world, split: projection.split });
+            }
+        }
+        Ok(layouts)
+    }
+
+    /// Serialized native records reuse one mapped BF16 source and quant table.
+    /// Partial input-column reads also retain a full-width host row window.
+    pub fn native_mount_load(&self, ranks: usize) -> Result<crate::shared::dense_read::MountLoad> {
+        use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
+        ensure!(matches!(ranks, 1 | 2), "Kimi native mount physical rank count");
+        let mut owner = MountLoad::default();
+        for projection in self.native.values() {
+            for world in [1, ranks] {
+                let [n, k] = projection.shape;
+                let (rows, cols) = match projection.split {
+                    CoreSplit::Output => (n / world, k),
+                    CoreSplit::Input => (n, k / world),
+                    CoreSplit::Whole => (n, k),
+                };
+                let row_bytes = k.checked_mul(2).context("Kimi native source row overflow")?;
+                let width = cols.checked_mul(2).context("Kimi native source slice overflow")?;
+                if projection.fp8 {
+                    let per = (cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES / width / 128).max(1) * 128;
+                    let batch_rows = rows.min(per);
+                    let mut load = MountLoad::read(ReadBatch::new(batch_rows, row_bytes, width, usize::MAX)?);
+                    load.pinned_tables = cuteafd_ffi::programs::fp8_load_table_bytes(batch_rows, 128)? as u64;
+                    owner.merge(load);
+                } else {
+                    owner.merge(MountLoad::read(ReadBatch::new(rows, row_bytes, width, STEP_BYTES)?));
+                }
+            }
+        }
+        Ok(owner)
+    }
+
+    pub fn native_attention_split(&self, ranks: usize) -> bool {
+        ranks == 2 && self.native.values().any(|p| p.split == CoreSplit::Input)
+    }
+
+    /// Native output projections retain unrotated F32 until the TP meet.
+    /// Compact K6 keeps its original BF16 transformed-basis planes unchanged.
+    pub fn native_attention_stages(&self, rows: usize, ranks: usize)
+        -> Result<BTreeMap<&'static str, usize>> {
+        ensure!(matches!(ranks, 1 | 2), "Kimi native attention physical rank count");
+        if !self.native_attention_split(ranks) { return Ok(BTreeMap::new()); }
+        let bytes = rows.checked_mul(7168 * 4).context("Kimi native attention partial overflow")?;
+        Ok(BTreeMap::from([("native attention F32 partial", bytes)]))
+    }
+
+    pub fn native_programs(&self, unit: usize, ranks: usize,
+        manifest: Option<&crate::placement::inventory::ProgramsManifest>)
+        -> Result<crate::placement::planner::native_attention::NativePrograms> {
+        use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        let layouts = self.native_layouts(ranks)?;
+        let requests = layouts.iter().map(|layout| NativeProgram { layout,
+            output: if layout.ranks == 2 && layout.split == CoreSplit::Input {
+                ProjectionOutput::F32
+            } else { ProjectionOutput::Bf16 } }).collect::<Vec<_>>();
+        Ok(NativePrograms::resolve(&requests, unit.max(64), manifest)?)
+    }
+
+    pub fn native_package_stages(&self, manifest: &serde_json::Value, rows: usize, unit: usize,
+        ranks: usize) -> Result<BTreeMap<&'static str, usize>> {
+        let manifest = crate::placement::inventory::ProgramsManifest::from_manifest(manifest)?;
+        self.native_stages_from_manifest(&manifest, rows, unit, ranks)
+    }
+
+    pub fn native_stages_from_manifest(&self, manifest: &crate::placement::inventory::ProgramsManifest,
+        rows: usize, unit: usize, ranks: usize) -> Result<BTreeMap<&'static str, usize>> {
+        let mut stages = self.native_attention_stages(rows, ranks)?;
+        let native = self.native_programs(unit, ranks, Some(manifest))?;
+        if native.fp8_scratch_bytes != 0 {
+            stages.insert("native attention FP8 scratch", usize::try_from(native.fp8_scratch_bytes)?);
+        }
+        Ok(stages)
+    }
+
+    pub fn attention_receive_bytes(&self, rows: usize, ranks: usize) -> Result<usize> {
+        let base = exchange_recv_bytes(rows)?;
+        Ok(if self.native_attention_split(ranks) { base * 2 } else { base })
+    }
+
+    pub fn native_attention_receive_demand(&self, rows: usize, rank: u8, ranks: usize)
+        -> Result<crate::placement::Demand> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        let bytes = self.attention_receive_bytes(rows, ranks)? - exchange_recv_bytes(rows)?;
+        Ok(crate::placement::Demand::new(rank, Category::Workspace,
+            "Kimi native attention F32 peer receive", bytes as u64, Basis::Exact))
+    }
+}
+
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct CoreCharges {
     pub projection: Vec<Option<ProjectionScratchLayout>>,
     pub stages: BTreeMap<&'static str,usize>,
     pub stage_bytes: usize,
+    pub native_stage_bytes: usize,
     pub receive: usize,
 }
 impl CoreCharges {
@@ -114,9 +235,19 @@ impl CoreCharges {
 
     pub fn from_package_for_ranks(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
         manifest: &serde_json::Value, ranks: usize) -> Result<Self> {
+        let native = crate::placement::inventory::ProgramsManifest::from_manifest(manifest)?;
+        Self::from_package_with_native(cfg, core, rows, unit, manifest, &native, ranks)
+    }
+
+    pub fn from_package_with_native(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
+        manifest: &serde_json::Value, native: &crate::placement::inventory::ProgramsManifest,
+        ranks: usize) -> Result<Self> {
         ensure!(matches!(ranks, 1 | 2), "Kimi K6 charge physical rank count");
-        let stages = if core.projections.is_empty() { BTreeMap::new() }
+        let mut stages = if core.projections.is_empty() { BTreeMap::new() }
             else { package_lane_extents_for_ranks(manifest,rows,unit,ranks)? };
+        let native_stages = core.native_stages_from_manifest(native, rows, unit, ranks)?;
+        let native_stage_bytes = native_stages.values().sum::<usize>();
+        stages.extend(native_stages);
         let stage_bytes = if stages.is_empty() { 0 } else {
             let base = super::allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, super::COMPILED_CONTEXT,
                 super::allocation::NativeScratch::from_manifest_for_ranks(manifest, ranks)?, ranks)?;
@@ -125,7 +256,7 @@ impl CoreCharges {
         };
         Ok(Self {
             projection: projection_scratch_for_ranks(cfg,core,unit,&manifest["families"]["dense_trellis_k6"],ranks)?,
-            stages, stage_bytes,
+            stages, stage_bytes, native_stage_bytes,
             receive: if ranks == 2 { exchange_recv_bytes(unit)? } else { 0 },
         })
     }
@@ -136,7 +267,13 @@ impl CoreCharges {
             demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
                 "Kimi K6 projection scratch",projection.as_ref().map_or(Ok(0),|layout|layout.bytes())? as u64,Basis::Exact));
             demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
-                "Kimi K6 split-stage operands",self.stage_bytes as u64,Basis::Exact));
+                "Kimi K6 split-stage operands",(self.stage_bytes - self.native_stage_bytes) as u64,Basis::Exact));
+            for (name, bytes) in &self.stages {
+                if name.starts_with("native attention ") {
+                    demands.push(crate::placement::Demand::new(gpu as u8, Category::Workspace,
+                        format!("Kimi {name}"), *bytes as u64, Basis::Exact));
+                }
+            }
             if self.receive != 0 {
                 demands.push(crate::placement::Demand::new(gpu as u8,Category::Workspace,
                     "Kimi K6 peer receive",self.receive as u64,Basis::Exact));
@@ -235,6 +372,8 @@ pub fn draft_head_demand(core: &CoreInventory, rows: usize, metadata: &serde_jso
 #[derive(Debug, Default, Clone)]
 pub struct CoreInventory {
     pub projections: BTreeMap<String, CoreProjection>,
+    pub native: BTreeMap<String, crate::formats::native_attention::NativeProjection>,
+    pub largest_selected_dense_bytes: Option<u64>,
 }
 
 impl CoreInventory {
@@ -250,13 +389,36 @@ impl CoreInventory {
                     && expected.get(&format!("{stem}.weight")).is_some_and(|shape|
                         shape.first() == Some(&(cfg.kv_lora_rank + cfg.qk_rope_dim))),
             }))?;
-        Ok(Self { projections })
+        let mut native = BTreeMap::new();
+        for (name, shape) in expected {
+            let Some(stem) = name.strip_suffix(".weight") else { continue; };
+            if !stem.contains(".self_attn.") || split(stem).is_none()
+                || projections.contains_key(stem) || !checkpoint.contains_tensor(name) { continue; }
+            let group = stem.rsplit_once('.').context("Kimi attention group")?.0;
+            if !projections.keys().any(|s| s.rsplit_once('.').is_some_and(|(parent, _)| parent == group)) {
+                continue;
+            }
+            let selected = checkpoint.projection(stem)?;
+            let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape: actual } = selected.storage else { continue; };
+            ensure!(stem.ends_with(".o_proj") || stem.ends_with(".q_b_proj"),
+                "{stem}: Kimi native mixed attention only supports q_b_proj/o_proj; grouped inputs require K6");
+            ensure!(actual == *shape && shape.len() == 2 && dtype == cuteafd_core::DType::Bf16,
+                "{stem}: Kimi native attention requires BF16 {shape:?}, found {dtype:?} {actual:?}");
+            native.insert(stem.into(), crate::formats::native_attention::NativeProjection {
+                shape: [shape[0], shape[1]], split: split(stem).unwrap(),
+                fp8: checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact });
+        }
+        let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.tensors.iter()
+            .filter(|tensor| checkpoint.contains_tensor(&tensor.meta.name)
+                && !tensor.meta.name.contains(".experts."))
+            .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0));
+        let inventory = Self { projections, native, largest_selected_dense_bytes };
+        inventory.validate_runtime_groups(cfg)?;
+        Ok(inventory)
     }
 
-    /// The current projected engine admits complete operator groups only. The
-    /// quantizer's KDA fallback keeps all five projections BF16, preserving the
-    /// original fused path; partial groups require independently exported BF16
-    /// partner projections and are deliberately not admitted.
+    /// Attention dispatches each validated projection independently. Shared
+    /// FFNs and latent projections retain their existing whole-group contract.
     pub fn validate_runtime_groups(&self,cfg:&KimiK3Config)->Result<()> {
         for layer in 0..cfg.layers {
             let root=format!("language_model.model.layers.{layer}");
@@ -264,7 +426,10 @@ impl CoreInventory {
                 super::config::KimiAttention::Kda=>&["q_proj","k_proj","v_proj","g_proj","o_proj"],
                 super::config::KimiAttention::Mla=>&["q_a_proj","kv_a_proj_with_mqa","q_b_proj","g_proj","o_proj"],
             };
-            self.complete_group("attention",attention.iter().map(|leaf|format!("{root}.self_attn.{leaf}")))?;
+            let stems = attention.iter().map(|leaf| format!("{root}.self_attn.{leaf}")).collect::<Vec<_>>();
+            let staged = stems.iter().any(|stem| self.projections.contains_key(stem) || self.native.contains_key(stem));
+            ensure!(!staged || stems.iter().all(|stem| self.projections.contains_key(stem) || self.native.contains_key(stem)),
+                "Kimi attention group lacks a validated per-projection K6/BF16 operand: {root}.self_attn");
             if !cfg.dense[layer] {
                 self.complete_group("shared FFN",["gate_proj","up_proj","down_proj"].iter()
                     .map(|leaf|format!("{root}.block_sparse_moe.shared_experts.{leaf}")))?;
@@ -305,6 +470,92 @@ mod tests {
     }
 
     #[test]
+    fn native_layouts_cover_mla_ownership_and_only_physical_kda_shards() -> Result<()> {
+        use crate::formats::native_attention::NativeProjection;
+        let mla = "language_model.model.layers.3.self_attn";
+        let kda = "language_model.model.layers.0.self_attn";
+        let qa = format!("{mla}.q_a_proj");
+        let core = CoreInventory { projections: BTreeMap::from([(qa.clone(), CoreProjection {
+            stem: qa, shape: [1536, 7168], stored_outputs: 1536, bits: 6,
+            codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
+            split: CoreSplit::Whole, source_bytes: 0 })]),
+            native: BTreeMap::from([
+                (format!("{mla}.q_b_proj"), NativeProjection { shape: [18432, 1536], fp8: false, split: CoreSplit::Output }),
+                (format!("{mla}.o_proj"), NativeProjection { shape: [7168, 12288], fp8: false, split: CoreSplit::Input }),
+                (format!("{kda}.o_proj"), NativeProjection { shape: [7168, 12288], fp8: false, split: CoreSplit::Input }),
+            ]), ..Default::default() };
+        for ranks in [1, 2] {
+            let layouts = core.native_layouts(ranks)?;
+            assert_eq!(layouts.len(), if ranks == 1 { 3 } else { 5 });
+            for layout in &layouts {
+                assert_eq!(layout.rank, 0);
+                assert!(!layout.fp8);
+                let whole = layout.ranks == 1;
+                let qb = layout.stem.ends_with(".q_b_proj");
+                assert_eq!(layout.shape, if qb {
+                    [if whole { 18432 } else { 9216 }, 1536]
+                } else { [7168, if whole { 12288 } else { 6144 }] });
+                if layout.stem.starts_with(kda) { assert_eq!(layout.ranks, ranks); }
+            }
+            let shapes = core.native_geometries(ranks)?;
+            assert_eq!(shapes.len(), if ranks == 1 { 2 } else { 4 });
+            assert!(shapes.iter().all(|(_, _, fp8, _)| !fp8));
+            assert_eq!(shapes.iter().filter(|(_, _, _, partial)| *partial).count(), usize::from(ranks == 2));
+        }
+        assert!(core.native_layouts(3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_stages_validate_selected_capacity_precision_and_exact_scratch() -> Result<()> {
+        use crate::formats::native_attention::NativeProjection;
+        use cuteafd_ffi::draft_projection::ProjectionOutput;
+        for fp8 in [false, true] { for ranks in [1, 2] { for unit in [64, 2752] {
+            let core = CoreInventory { native: BTreeMap::from([
+                ("language_model.model.layers.0.self_attn.o_proj".into(),
+                    NativeProjection { shape: [7168, 12288], fp8, split: CoreSplit::Input }),
+                ("language_model.model.layers.3.self_attn.q_b_proj".into(),
+                    NativeProjection { shape: [18432, 1536], fp8, split: CoreSplit::Output }),
+            ]), ..Default::default() };
+            let entries = core.native_geometries(ranks)?.into_iter().map(|(k, n, _, partial)| {
+                let output = if partial { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 };
+                if fp8 {
+                    let capacity = if unit <= 64 { 64 } else { 4096 };
+                    let suffix = if partial { "_f32" } else { "" };
+                    serde_json::json!({"name":format!("native_attention_n{n}_k{k}_m{capacity}{suffix}"),
+                        "capacity_rows":capacity, "pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                        "scalars":[{"type":"int32"}], "scratch_bytes_at_capacity":{"scratch":8192},
+                        "geometry":{"input_features":k,"output_features":n,"output_dtype":output.torch_dtype(),
+                            "max_rows":capacity,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                            "reduction":"canonical_fp8_gemv64_w8a16"}})
+                } else {
+                    serde_json::json!({"name":output.program_name(k,n),"capacity_rows":4096,
+                        "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],"scalars":[{"type":"int32"}],
+                        "scratch_bytes_at_capacity":{},"geometry":{"width":k,"outputs":n,
+                            "output_dtype":output.torch_dtype(),"reduction":"ordered_k16",
+                            "tiles_by_rows":[[4096,1,4,16,64,6]]}})
+                }
+            }).collect::<Vec<_>>();
+            let manifest = serde_json::json!({"programs":entries});
+            let stages = core.native_package_stages(&manifest, 8256, unit, ranks)?;
+            assert_eq!(stages.get("native attention FP8 scratch").copied().unwrap_or(0), if fp8 { 8192 } else { 0 });
+            assert_eq!(stages.get("native attention F32 partial").copied().unwrap_or(0),
+                if ranks == 2 { 8256 * 7168 * 4 } else { 0 });
+            let mut missing = manifest.clone();
+            missing["programs"].as_array_mut().unwrap().pop();
+            assert!(core.native_package_stages(&missing, 8256, unit, ranks).is_err());
+            let mut wrong = manifest.clone();
+            wrong["programs"][0]["geometry"]["output_dtype"] = serde_json::json!("torch.float16");
+            assert!(core.native_package_stages(&wrong, 8256, unit, ranks).is_err());
+            if fp8 {
+                let other = if unit <= 64 { 2752 } else { 64 };
+                assert!(core.native_package_stages(&manifest, 8256, other, ranks).is_err());
+            }
+        } } }
+        Ok(())
+    }
+
+    #[test]
     fn runtime_groups_allow_bf16_kda_fallback_but_name_partial_groups() -> Result<()> {
         let cfg=KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config())?;
         let mut core=CoreInventory::default();
@@ -328,8 +579,225 @@ mod tests {
                 codebook:crate::formats::exl3_storage::Exl3Codebook::Mcg,shape:[128,128],stored_outputs:128,
                 split:split(&stem).unwrap(),source_bytes:0});
             let error=partial.validate_runtime_groups(&cfg).unwrap_err().to_string();
-            assert!(error.contains("only whole-group fallback") && error.contains(&stem)
-                && error.contains("BF16:"),"{error}");
+            assert!(if leaves[0].starts_with("self_attn.") {
+                error.contains("validated per-projection")
+            } else {
+                error.contains("only whole-group fallback") && error.contains(&stem) && error.contains("BF16:")
+            }, "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hqa_attention_inventory_and_mode_charges_follow_selected_projections() -> Result<()> {
+        use crate::plan::{checkpoint::{AttentionMode, CheckpointView}, testing};
+        use crate::placement::{LayerMode, FfnMode};
+        let dir = tempfile::tempdir()?;
+        testing::write_kimi_core_snapshot(dir.path(), false);
+        let compact_checkpoint = Checkpoint::open(dir.path())?;
+        let compact_cfg = KimiK3Config::from_hf(&compact_checkpoint.config)?;
+        let compact_core = crate::plan::families::kimi::core_inventory(&compact_checkpoint)?;
+        let compact_layouts = (0..compact_cfg.layers).map(|layer|
+            super::super::weight_layout::LayerLayout::pair_with_core(&compact_cfg, layer, LayerMode::HeadSplit, &compact_core))
+            .collect::<Result<Vec<_>>>()?;
+        let mut policies = BTreeMap::new();
+        for projection in compact_core.projections.values() {
+            for world in [1, 2] {
+                let (mut n, mut k) = (projection.stored_outputs, projection.shape[1]);
+                let side = if world == 1 || projection.split != CoreSplit::Input { 1 } else { 2 };
+                if world == 2 && projection.split != CoreSplit::Whole {
+                    if side == 1 { n /= 2; } else { k /= 2; }
+                }
+                let book = projection.codebook.marker();
+                policies.insert((k, n, side, book), serde_json::json!({"input_features":k,
+                    "output_features":n,"sharded_side":side,"codebook":book}));
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for capacity in [64, 4096] {
+            for prefix in ["kimik3_kda", "kda_fused_h96", "kda_core_h48", "kda_core_h96"] {
+                names.insert(format!("{prefix}_m{capacity}"));
+            }
+            for heads in [48, 96] {
+                let suffix = if heads == 48 { "" } else { "_h96" };
+                for prefix in ["kimik3_mla_producer", "kimik3_mla_output"] {
+                    names.insert(format!("{prefix}{suffix}_m{capacity}"));
+                }
+                for mode in ["decode", "verify", "extend"] {
+                    names.insert(format!("kimik3_dense_mla_{mode}{suffix}_m{capacity}"));
+                }
+                for stride in [576, 640] { for cache in ["", "_fp8"] {
+                    names.insert(format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"));
+                } }
+            }
+        }
+        let compact_manifest = serde_json::json!({"families":{"dense_trellis_k6":{"abi_version":1,
+            "row_policies":policies.into_values().collect::<Vec<_>>()}},
+            "programs":names.into_iter().map(|name| serde_json::json!({"name":name,
+                "scratch_bytes_at_capacity":{"scratch":256}})).collect::<Vec<_>>()});
+        let compact_index = std::fs::read(dir.path().join("model.safetensors.index.json"))?;
+        std::fs::write(dir.path().join("quantize_config.json"), "{}")?;
+        for (source, target) in [("config.json", "config.compact-attention.json"),
+            ("model.safetensors.index.json", "model.compact-attention.safetensors.index.json"),
+            ("quantize_config.json", "quantize_config.compact-attention.json")] {
+            std::fs::copy(dir.path().join(source), dir.path().join(target))?;
+        }
+        let mut index: serde_json::Value = serde_json::from_slice(&compact_index)?;
+        let mut restored = Vec::new();
+        for (name, dtype, shape) in testing::kimi_k3_tensors(false) {
+            if !name.contains(".self_attn.") || !(name.ends_with(".o_proj.weight") || name.ends_with(".q_b_proj.weight")) {
+                continue;
+            }
+            let stem = name.strip_suffix(".weight").unwrap();
+            for suffix in ["trellis", "suh", "svh", "mcg"] {
+                index["weight_map"].as_object_mut().unwrap().remove(&format!("{stem}.{suffix}"));
+            }
+            index["weight_map"][&name] = serde_json::json!("hqa.safetensors");
+            restored.push((name, dtype, shape));
+        }
+        testing::write_safetensors(&dir.path().join("hqa.safetensors"), &restored);
+        std::fs::write(dir.path().join("model.safetensors.index.json"), serde_json::to_vec(&index)?)?;
+        let declaration = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
+            "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
+                "compact-attention":{"config":"config.compact-attention.json",
+                    "index":"model.compact-attention.safetensors.index.json", "quantize":"quantize_config.compact-attention.json"}},
+            "native_modules":"quantize_config.json:native_attention"});
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("config.json"))?)?;
+        config["quantization_config"]["attention_view"] = declaration.clone();
+        let declarations = restored.iter().map(|(name, dtype, shape)| (name.strip_suffix(".weight").unwrap().to_owned(),
+            serde_json::json!({"format":"bf16", "shard":"hqa.safetensors", "compact_attention_bits":6,
+                "tensors":{name:{"dtype":dtype,"shape":shape}}}))).collect::<serde_json::Map<_, _>>();
+        let quant = serde_json::json!({"attention_view":declaration, "native_attention":declarations});
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
+        std::fs::write(dir.path().join("quantize_config.json"), serde_json::to_vec(&quant)?)?;
+        let expected = testing::kimi_k3_tensors(false).into_iter().map(|(n, _, s)| (n, s)).collect();
+        let mut charges = Vec::new();
+        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
+            let view = CheckpointView::select(dir.path(), mode)?;
+            let checkpoint = Checkpoint::open_view(&view)?;
+            let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+            let core = CoreInventory::from_checkpoint(&cfg, &checkpoint, &expected)?;
+            // Worker role selection opens the mixed core before ordinary headers
+            // load; declared native headers must coexist with K6 discovery.
+            let inventory = Checkpoint::inventory_view(&view)?;
+            let eager = CoreInventory::from_checkpoint(&cfg, &inventory, &expected)?;
+            assert!(!eager.projections.is_empty());
+            assert_eq!(eager.projections.keys().collect::<Vec<_>>(), core.projections.keys().collect::<Vec<_>>());
+            assert_eq!(eager.native, core.native);
+            for role in [crate::plan::files::ReadRole::Coordinator { local_experts: false, speculator: false },
+                crate::plan::files::ReadRole::Spark { rank: 0, world: 6 }] {
+                let selected = crate::plan::files::required_tensors(&inventory, role)?;
+                let opened = crate::plan::files::open_role_view(&view, role)?;
+                assert_eq!(crate::plan::files::required_tensors(&opened, role)?, selected,
+                    "role-filtered checkpoint must remain classifiable for Spark admission");
+                assert!(!selected.is_empty());
+                if matches!(role, crate::plan::files::ReadRole::Spark { .. }) {
+                    assert_eq!(crate::plan::experts::checkpoint_spark_recipe(&opened, 6, &[1])?,
+                        crate::plan::experts::checkpoint_spark_recipe(&checkpoint, 6, &[1])?);
+                }
+                for (name, _, _) in &restored {
+                    assert!(inventory.has_header(name));
+                    assert_eq!(selected.contains(name), matches!(role,
+                        crate::plan::files::ReadRole::Coordinator { .. }));
+                    if selected.contains(name) {
+                        let stem = name.strip_suffix(".weight").unwrap();
+                        assert_eq!(inventory.projection(stem)?.storage, opened.projection(stem)?.storage);
+                    }
+                }
+            }
+            assert_eq!(core.native.len(), restored.len());
+            assert!(core.native.values().all(|p| p.fp8 == (mode == AttentionMode::Fp8Compact)));
+            let largest = checkpoint.tensors.iter().filter(|tensor| checkpoint.contains_tensor(&tensor.meta.name)
+                && !tensor.meta.name.contains(".experts.")).map(|tensor| tensor.meta.byte_length).max().unwrap();
+            assert_eq!(core.largest_selected_dense_bytes, Some(largest));
+            for ranks in [1, 2] {
+                let envelope = crate::placement::families::kimi::selected_push_host_envelope(&cfg, &core, ranks)?;
+                assert_eq!(envelope.dense_bytes, vec![crate::push_load::admitted_push_envelope(largest, 128, 1 << 20)?; ranks]);
+                let mount = core.native_mount_load(ranks)?;
+                assert!(mount.pinned_source > 0);
+                assert_eq!(mount.pinned_tables > 0, mode == AttentionMode::Fp8Compact);
+                assert!(mount.allocations("kimi.test.native").iter().all(|owner|
+                    owner.lifetime == crate::placement::planner::Lifetime {
+                        first: crate::placement::planner::Phase::Load, last: crate::placement::planner::Phase::Load }));
+                assert_eq!(core.attention_receive_bytes(64, ranks)?, 64 * 7168 * if ranks == 2 { 4 } else { 2 });
+                assert_eq!(core.native_attention_stages(8192, ranks)?.values().sum::<usize>(),
+                    if ranks == 2 { 8192 * 7168 * 4 } else { 0 });
+            }
+            let mut bytes = 0;
+            for layer in 0..cfg.layers {
+                let pair = super::super::weight_layout::LayerLayout::pair_with_core(&cfg, layer, LayerMode::HeadSplit, &core)?;
+                for layout in pair {
+                    for (name, native) in &layout.native {
+                        assert!(!layout.operands.contains_key(name) && !layout.core.contains_key(name));
+                        assert_eq!(native.ranks, 2);
+                        assert_eq!(native.shape, if *name == "mla.q_b" { [9216, 1536] } else { [7168, 6144] });
+                        bytes += native.bytes()?;
+                    }
+                }
+                if cfg.attention[layer] == super::super::config::KimiAttention::Mla {
+                    let whole = super::super::weight_layout::LayerLayout::pair_with_core(&cfg, layer,
+                        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }, &core)?;
+                    assert!(whole[0].native.is_empty());
+                    assert!(whole[1].native.values().all(|p| p.rank == 0 && p.ranks == 1));
+                }
+            }
+            charges.push(bytes);
+        }
+        assert!(charges[1] < charges[0]);
+        for mutation in 0..4 {
+            let mut bad_config = config.clone();
+            let mut bad_quant = quant.clone();
+            let mut bad_index = index.clone();
+            let stem = restored[0].0.strip_suffix(".weight").unwrap();
+            match mutation {
+                0 => bad_config["quantization_config"]["attention_view"]["mode"] = serde_json::json!("compact-attention"),
+                1 => { bad_quant.as_object_mut().unwrap().remove("native_attention"); }
+                2 => { bad_index["weight_map"].as_object_mut().unwrap().remove(&restored[0].0); }
+                _ => bad_index["weight_map"][format!("{stem}.trellis")] = serde_json::json!("parent.safetensors"),
+            }
+            for (name, value) in [("config.json", &bad_config), ("quantize_config.json", &bad_quant),
+                ("model.safetensors.index.json", &bad_index)] {
+                std::fs::write(dir.path().join(name), serde_json::to_vec(value)?)?;
+            }
+            assert!(CheckpointView::select(dir.path(), AttentionMode::Hqa).is_err(), "mixed bundle {mutation}");
+        }
+        for (name, value) in [("config.json", &config), ("quantize_config.json", &quant),
+            ("model.safetensors.index.json", &index)] {
+            std::fs::write(dir.path().join(name), serde_json::to_vec(value)?)?;
+        }
+        for name in ["config.compact-attention.json", "quantize_config.compact-attention.json",
+            "model.compact-attention.safetensors.index.json"] {
+            let bytes = std::fs::read(dir.path().join(name))?;
+            std::fs::remove_file(dir.path().join(name))?;
+            assert!(CheckpointView::select(dir.path(), AttentionMode::Compact).is_err(), "missing {name}");
+            std::fs::write(dir.path().join(name), bytes)?;
+        }
+        let compact_view = CheckpointView::select(dir.path(), AttentionMode::Compact)?;
+        std::fs::remove_file(dir.path().join("hqa.safetensors"))?;
+        let checkpoint = Checkpoint::open_view(&compact_view)?;
+        let core = CoreInventory::from_checkpoint(&compact_cfg, &checkpoint, &expected)?;
+        assert!(core.native.is_empty());
+        assert!(core.largest_selected_dense_bytes.is_none());
+        for ranks in [1, 2] {
+            assert_eq!(core.native_mount_load(ranks)?, crate::shared::dense_read::MountLoad::default());
+            assert!(crate::placement::families::kimi::native_load_owners(&core, ranks, 16384)?.is_empty());
+            assert_eq!(crate::placement::families::kimi::selected_push_host_envelope(&compact_cfg, &core, ranks)?,
+                crate::placement::families::kimi::push_host_envelope(&compact_cfg, ranks)?);
+            for (rows, unit) in [(64, 64), (8256, 2752)] {
+                let before = CoreCharges::from_package_for_ranks(&compact_cfg, &compact_core,
+                    rows, unit, &compact_manifest, ranks)?;
+                let after = CoreCharges::from_package_for_ranks(&compact_cfg, &core,
+                    rows, unit, &compact_manifest, ranks)?;
+                assert_eq!(before, after, "compact mode changed parent core charges");
+                assert_eq!(before.demands()?, after.demands()?, "compact mode changed named owners");
+                assert_eq!(after.native_stage_bytes, 0);
+            }
+        }
+        assert!(core.native_attention_stages(8192, 2)?.is_empty());
+        assert_eq!(core.attention_receive_bytes(64, 2)?, exchange_recv_bytes(64)?);
+        for (layer, before) in compact_layouts.iter().enumerate() {
+            let after = super::super::weight_layout::LayerLayout::pair_with_core(&compact_cfg, layer, LayerMode::HeadSplit, &core)?;
+            assert_eq!(before, &after, "compact mode changed the parent layer {layer} allocation");
         }
         Ok(())
     }

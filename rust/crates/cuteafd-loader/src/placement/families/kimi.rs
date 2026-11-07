@@ -44,6 +44,25 @@ pub fn push_host_envelope(cfg: &crate::families::kimi_k3::config::KimiK3Config, 
         vec![PUSH_DENSE_BYTES_PER_RANK; gpus], 128, 1 << 20)
 }
 
+pub fn selected_push_host_envelope(cfg: &crate::families::kimi_k3::config::KimiK3Config,
+    core: &crate::families::kimi_k3::core::CoreInventory, gpus: usize)
+    -> Result<crate::push_load::PushHostEnvelope, Refusal> {
+    let mut envelope = push_host_envelope(cfg, gpus)?;
+    if let Some(largest) = core.largest_selected_dense_bytes {
+        let dense = crate::push_load::admitted_push_envelope(largest, envelope.slots as usize,
+            envelope.slot_bytes)?;
+        envelope.dense_bytes.fill(dense);
+    }
+    Ok(envelope)
+}
+
+pub fn native_load_owners(core: &crate::families::kimi_k3::core::CoreInventory,
+    gpus: usize, maximum: u64) -> anyhow::Result<Vec<Component>> {
+    Ok(core.native_mount_load(gpus)?.allocations("kimi.native_attention.load").into_iter()
+        .map(|owner| Component::allocation(owner.clone(), ByteCurve::fixed(owner.bytes, maximum),
+            false, maximum)).collect())
+}
+
 pub fn push_host_owners(envelope: &crate::push_load::PushHostEnvelope, maximum: u64)
     -> Result<Vec<Component>, Refusal> {
     Ok(envelope.allocations("kimi.push")?.into_iter().map(|owner| {
@@ -51,7 +70,11 @@ pub fn push_host_owners(envelope: &crate::push_load::PushHostEnvelope, maximum: 
             Component { activation: Activation::always(), bytes: ByteCurve::fixed(owner.bytes, maximum),
                 kind: ComponentKind::Allowance(Allowance { location: owner.location, bytes: owner.bytes,
                     lifetime: owner.lifetime, assumed: true,
-                    source: format!("{} estimated: #1329 K6 max smoke 2026-11-06 complete push 9,606,907,904 B; per-rank split unknown", owner.id) }) }
+                    source: if envelope.dense_bytes.iter().all(|&bytes| bytes == PUSH_DENSE_BYTES_PER_RANK) {
+                        format!("{} estimated: #1329 K6 max smoke 2026-11-06 complete push 9,606,907,904 B; per-rank split unknown", owner.id)
+                    } else {
+                        format!("{} estimated: selected dense headers and bounded shared push windows; actual records validate before load", owner.id)
+                    } }) }
         } else {
             Component::allocation(owner.clone(), ByteCurve::fixed(owner.bytes, maximum), false, maximum)
         }

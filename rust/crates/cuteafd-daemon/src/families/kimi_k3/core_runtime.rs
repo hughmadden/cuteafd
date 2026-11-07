@@ -80,6 +80,11 @@ pub(crate) struct CorePrograms<'a> {
     /// Diagnostic only: false forces the four standalone launches (bitwise A/B).
     grouped_enabled:std::cell::Cell<bool>,
     pub layouts:Vec<Option<ProjectionLayout>>,
+    pub native_inventory:cuteafd_loader::families::kimi_k3::core::CoreInventory,
+    native_bf16:[cuteafd_ffi::draft_projection::DraftProjections<'a>;2],
+    native_fp8:[cuteafd_ffi::native_attention::Fp8Projections<'a>;2],
+    pub native_scratch:usize,
+    pub native_add:cuteafd_ffi::F32Add<'a>,
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
     pub norm:cuteafd_ffi::KimiRmsNorm<'a>,pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,
@@ -149,6 +154,18 @@ impl<'a> CorePrograms<'a> {
                 ==planned[rank].as_ref().map(|p|(&p.extents,p.rows)),
                 "K6 runtime/planner rank {rank} scratch differs");
         }
+        use cuteafd_ffi::draft_projection::{DraftProjections, ProjectionOutput};
+        let geometries = inventory.native_geometries(ranks)?;
+        let shapes = |fp8, partial| geometries.iter().filter(|g| g.2 == fp8 && g.3 == partial)
+            .map(|g| (g.0, g.1)).collect::<Vec<_>>();
+        let native_bf16 = [DraftProjections::load_with_output(programs, &shapes(false, false), rows.max(64), ProjectionOutput::Bf16)?,
+            DraftProjections::load_with_output(programs, &shapes(false, true), rows.max(64), ProjectionOutput::F32)?];
+        let native_fp8 = [cuteafd_ffi::native_attention::Fp8Projections::load(programs, &shapes(true, false), rows.max(64), ProjectionOutput::Bf16)?,
+            cuteafd_ffi::native_attention::Fp8Projections::load(programs, &shapes(true, true), rows.max(64), ProjectionOutput::F32)?];
+        let mut native_scratch = 0;
+        for (k, n, fp8, partial) in geometries {
+            if fp8 { native_scratch = native_scratch.max(native_fp8[usize::from(partial)].scratch_bytes(k, n)?); }
+        }
         let heads=cfg.kda_heads/ranks;
         let kda=[KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m64"),64,true)?,
             KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m4096"),4096,false)?];
@@ -159,10 +176,33 @@ impl<'a> CorePrograms<'a> {
             mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
-        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,6144/ranks)?,
+        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,native_inventory:inventory.clone(),native_bf16,native_fp8,native_scratch,native_add:programs.library().f32_add()?,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,6144/ranks)?,
             copy:programs.library().v41_peer_copy()?,narrow:programs.library().f32_bf16_narrow()?,
             core_add:programs.library().bf16_f32_add()?}))
     }
+    pub(crate) fn native_projection(&self, weight:&crate::shared::native_attention::NativeAttentionWeights<'_>,
+        rows:usize, input:Buffer, output:Buffer, scratch:Option<Buffer>, stream:*mut c_void)->Result<()> {
+        use cuteafd_loader::families::kimi_k3::core::CoreSplit;
+        let layout = &weight.layout;
+        let [n,k] = layout.shape;
+        let partial = layout.ranks == 2 && layout.split == CoreSplit::Input;
+        ensure!(input.device_id == weight.values.buffer.device_id && output.device_id == input.device_id
+            && input.bytes >= rows*k*2, "Kimi native projection input/device differs from retained owner");
+        // SAFETY: admitted lane and weight owners survive queued work and graph replay;
+        // the selected registry checks output precision, capacity and alignment.
+        unsafe {
+            if layout.fp8 {
+                self.native_fp8[usize::from(partial)].launch(input.ptr, weight.values.buffer.ptr,
+                    weight.scales.as_ref().context("Kimi native FP8 scales absent")?.buffer.ptr, output,
+                    scratch.context("Kimi native FP8 scratch not admitted")?, rows,k,n,stream)?;
+            } else {
+                self.native_bf16[usize::from(partial)].launch_checked(input.ptr, weight.values.buffer.ptr,
+                    output,rows,k,n,stream)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn projection(&self,weights:&CoreWeights<'_>)->Result<&Projection<'a>> {
         self.projections.get(&projection_key(weights.shape,weights.side,weights.codebook))
             .ok_or_else(||anyhow::anyhow!("Kimi K6 weight geometry not resolved before admission"))
