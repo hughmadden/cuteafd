@@ -196,7 +196,8 @@ mod tests {
             placement::{AttentionPlacement, FfnMode},
             families::glm5_flash::{core, resident::{resident_weights_placed, GlmfRepresentation}}};
         let root = tempfile::tempdir()?;
-        let config = glm5_flash_config(4);
+        let mut config = glm5_flash_config(4);
+        config["text_config"]["vocab_size"] = serde_json::json!(256);
         let cfg = GlmNextConfig::from_hf(&config)?;
         let expected = core::expected(&cfg);
         let mut tensors = glm5_flash_tensors(&config);
