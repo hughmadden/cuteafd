@@ -1611,5 +1611,91 @@ pub fn verify_matrix(pack: &Kx7Pack, w: &[u16]) -> Result<()> {
     verify(pack, &Kx7Source::matrix(w, pack.header.n, pack.header.k)?)
 }
 
+// ---------------------------------------------------------------- device image
+
+/// The device buffers an engine holds for one pack, in bytes: the decode tables
+/// ([`Kx7Pack::device_tables`], u32 words), the stream offsets (`offsets.bin`), the stream
+/// lengths (`lengths.bin`) and the streams followed by [`READ_AHEAD_BYTES`] zeros. The code
+/// table and rare table stay on the host (the device tables hold what a lane reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kx7DeviceBytes {
+    pub tables: u64,
+    pub offsets: u64,
+    pub lengths: u64,
+    pub streams: u64,
+}
+
+/// Words of the decode tables of a `kind` code: exact for the two-class code (2^pbits primary
+/// entries and 2^rare_bits u16 ranks), the most a Huffman code's sub-tables can take.
+pub fn device_table_words(kind: CodeKind) -> u64 {
+    match kind {
+        CodeKind::TwoClass { pbits, rare_bits } => (1u64 << pbits) + (1u64 << rare_bits).div_ceil(2),
+        CodeKind::Huffman => PATTERNS as u64 + (1 << (MAXLEN - DEVICE_PBITS)),
+    }
+}
+
+impl Kx7DeviceBytes {
+    /// The buffers of `pack`.
+    pub fn of(pack: &Kx7Pack) -> Result<Self> {
+        Ok(Self {
+            tables: 4 * pack.device_tables()?.len() as u64,
+            offsets: 4 * pack.offsets.len() as u64,
+            lengths: 2 * pack.lengths.len() as u64,
+            streams: (pack.streams.len() + READ_AHEAD_BYTES) as u64,
+        })
+    }
+
+    /// The admission bound of an [n, k] pack in `layout` and `kind`, known before any weight is
+    /// read: streams (with their padding) of at most 8 bits a weight (FP8-born BF16 takes about
+    /// 7.5 in v1.1), the exact offsets and lengths and the largest decode tables. A pack above
+    /// it is refused ([`Self::within`]).
+    pub fn bound(n: usize, k: usize, layout: Kx7Layout, kind: CodeKind) -> Result<Self> {
+        layout.check(n, k)?;
+        let streams = layout.streams(n, k) as u64;
+        Ok(Self {
+            tables: 4 * device_table_words(kind),
+            offsets: 4 * (streams + 1),
+            lengths: 2 * streams,
+            streams: n as u64 * k as u64 + READ_AHEAD_BYTES as u64,
+        })
+    }
+
+    /// Whether every buffer fits the matching one of `bound`.
+    pub fn within(&self, bound: &Self) -> bool {
+        self.tables <= bound.tables
+            && self.offsets <= bound.offsets
+            && self.lengths <= bound.lengths
+            && self.streams <= bound.streams
+    }
+
+    /// The buffers' bytes, each at least `floor` (an allocator's minimum).
+    pub fn total(&self, floor: u64) -> u64 {
+        [self.tables, self.offsets, self.lengths, self.streams].iter().map(|&b| b.max(floor)).sum()
+    }
+}
+
+/// Bytes of a decoded [n, k] BF16 matrix in a decode workspace, rounded up to 256.
+pub fn decoded_bytes(n: usize, k: usize) -> u64 {
+    (n as u64 * k as u64 * 2).next_multiple_of(256)
+}
+
+/// Packs one row-major [n, k] BF16 matrix and proves the pack against it bit for bit with the
+/// reference decoder (the device tables and lane walk the kernels use): a pack an engine may
+/// upload.
+pub fn encode_verified(w: &[u16], n: usize, k: usize, layout: Kx7Layout, kind: CodeKind) -> Result<Kx7Pack> {
+    let pack = encode_matrix(w, n, k, layout, kind)?;
+    verify_matrix(&pack, w)?;
+    Ok(pack)
+}
+
+/// [`encode_verified`] of every (matrix, n, k) in parallel, in order; the first error wins.
+pub fn encode_verified_all(
+    matrices: &[(&[u16], usize, usize)],
+    layout: Kx7Layout,
+    kind: CodeKind,
+) -> Result<Vec<Kx7Pack>> {
+    matrices.par_iter().map(|&(w, n, k)| encode_verified(w, n, k, layout, kind)).collect()
+}
+
 #[cfg(test)]
 mod tests;

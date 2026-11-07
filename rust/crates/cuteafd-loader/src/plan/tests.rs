@@ -1393,7 +1393,7 @@ fn declared_numerics_report_preserves_optimizations_and_names_pending_kernel() {
     assert!(defaults.iter().any(|text| text.contains("head:")));
     let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
-            kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false },
+            kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false, kda_kx7: false },
         glmf_drafter_disabled: true, ..Default::default() }), ..Default::default() };
     let overridden = precision_optimizations("glm5_flash", &options);
     assert!(!overridden.iter().any(|text| text.contains("KDA") || text.contains("head:") || text.contains("drafter:")));
@@ -3555,7 +3555,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(setting),
             prefill_rows: 4096, prefill_lanes: lanes, state_slots: Some(8), prefix_slots: Some(8),
             glmf_drafter_disabled: true, glmf_prefill_expanded: false, host_cache_bytes: Some(0),
-            glmf_representation: resident::GlmfRepresentation { kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false },
+            glmf_representation: resident::GlmfRepresentation { kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false, kda_kx7: false },
             workspace_manifest: Some(path.clone()), ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
         let report = plan(dir.path(), &options).unwrap();
@@ -4020,7 +4020,7 @@ fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
         // The fixture manifest is the plain program set: no W8 KDA, no expanded prefill, no
         // sharded output.
         glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
-            kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false }, glmf_prefill_expanded: false,
+            kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false, kda_kx7: false }, glmf_prefill_expanded: false,
         ..Default::default() }),
         attention_placement: attention, ..sparks(4) };
     let heads = plan(dir.path(), &options(Some(AttentionPlacement::Heads))).unwrap();

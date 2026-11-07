@@ -1,5 +1,7 @@
-//! Exact native K6 storage beside the Flash execution slots.
-use super::{core::CoreInventory, GlmNextConfig};
+//! Exact native K6 storage beside the Flash execution slots, and the staged KDA of KX7 layers
+//! (exact Huffman-packed BF16 q/k/v/o, `--kda-exact kx7`), which runs the same stage programs.
+use super::{core::CoreInventory, GlmNextAttention, GlmNextConfig};
+use crate::serving_capacity::GlmfKdaState;
 use crate::formats::{dense_trellis::TrellisSide, trellis_core::{CoreWeightLayout, ProjectionScratchLayout}};
 use anyhow::{ensure, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +23,15 @@ impl CoreStageLayout {
             ("scratch", scratch.max(256)),
         ]) })
     }
+    /// The stages of KX7 KDA layers alone: their q, k and v projections, the core's values and its
+    /// program scratch (no MLA or FFN stage runs staged beside them).
+    pub fn kda(cfg: &GlmNextConfig, rows: usize, scratch: usize) -> Result<Self> {
+        ensure!((1..=4096).contains(&rows), "Flash KX7 stage geometry");
+        let d = cfg.kda_heads * cfg.kda_head_dim;
+        let bf16 = || rows.checked_mul(d).and_then(|n| n.checked_mul(2)).context("Flash KX7 stage overflow");
+        Ok(Self { extents: BTreeMap::from([("q", bf16()?), ("k", bf16()?), ("v", bf16()?), ("values", bf16()?),
+            ("scratch", scratch.max(256))]) })
+    }
     pub fn bytes(&self) -> Result<usize> {
         self.extents.values().try_fold(0usize, |n, &v| n.checked_add(v).context("Flash K6 stage sum overflow"))
     }
@@ -36,10 +47,13 @@ pub struct CoreRankLayout {
     pub draft_head: Option<ProjectionScratchLayout>,
     pub retained_rows: usize,
     pub receive_suffix: usize,
+    /// KX7 layers' one decode workspace (the largest decoded projection), reused in order on the
+    /// rank's stream by every KX7 linear; 0 without KX7 layers.
+    pub kx7_workspace: usize,
 }
 impl CoreRankLayout {
     pub fn bytes(&self, hidden: usize) -> Result<u64> {
-        let mut bytes = self.receive_suffix;
+        let mut bytes = self.receive_suffix.checked_add(self.kx7_workspace).context("Flash KX7 workspace overflow")?;
         for layout in self.decode.iter().chain(&self.prefill).chain(&self.target_head).chain(&self.draft_head) {
             bytes = bytes.checked_add(layout.bytes()?).context("Flash K6 scratch sum overflow")?;
         }
@@ -157,7 +171,7 @@ impl CoreCharges {
                 target_head: if rank == 0 { head_scratch(decode_rows)? } else { None },
                 draft_head: if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None },
                 retained_rows: if body.is_empty() { 0 } else { retained_rows },
-                receive_suffix: if split { receive } else { 0 }, body,
+                receive_suffix: if split { receive } else { 0 }, body, kx7_workspace: 0,
             });
         }
         let result = Self { ranks: layouts, programs: programs.into_iter().collect() };
@@ -165,6 +179,68 @@ impl CoreCharges {
         Ok(result)
     }
     pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.bytes(hidden)).collect() }
+
+    /// The staged KDA of KX7 layers (`--kda-exact kx7`) on one GPU, `None` without a KDA layer
+    /// in the first `layers`: no trellis owner, the KDA stages of `decode_rows` and `unit` rows
+    /// with the largest scratch of their core programs (`scratch(name)`, the manifest's
+    /// `scratch_bytes_at_capacity`), and one decode workspace of the largest KDA projection.
+    pub fn kx7_kda(cfg: &GlmNextConfig, layers: usize, ranks: usize, unit: usize, decode_rows: usize,
+        state: GlmfKdaState, scratch: impl Fn(&str) -> Result<usize>) -> Result<Option<Self>> {
+        ensure!(ranks == 1, "--kda-exact kx7 serves one coordinator GPU (the two-GPU head split is not supported yet)");
+        ensure!(layers > 0 && layers <= cfg.layers && (1..=4096).contains(&unit) && matches!(decode_rows, 64 | 128),
+            "Flash KX7 admission geometry");
+        if !cfg.attention[..layers].contains(&GlmNextAttention::Kda) { return Ok(None); }
+        let mut stages = Vec::new();
+        let mut programs = Vec::new();
+        for (decode, rows) in [(true, decode_rows), (false, unit)] {
+            let mut bytes = 0;
+            for name in kx7_stage_names(state, decode, decode_rows) {
+                bytes = bytes.max(scratch(&name)?);
+                programs.push(name);
+            }
+            stages.push(CoreStageLayout::kda(cfg, rows, bytes)?);
+        }
+        let d = cfg.kda_heads * cfg.kda_head_dim;
+        let workspace = cuteafd_core::kx7::decoded_bytes(d, cfg.hidden).max(cuteafd_core::kx7::decoded_bytes(cfg.hidden, d));
+        let stages: [CoreStageLayout; 2] = stages.try_into().map_err(|_| anyhow::anyhow!("Flash KX7 stages"))?;
+        programs.sort(); programs.dedup();
+        let result = Self { ranks: vec![CoreRankLayout { body: vec![], stages: Some(stages), decode: None, prefill: None,
+            target_head: None, draft_head: None, retained_rows: 0, receive_suffix: 0,
+            kx7_workspace: usize::try_from(workspace)? }], programs };
+        result.bytes(cfg.hidden)?;
+        Ok(Some(result))
+    }
+
+    /// Whether these charges stage KX7 KDA layers (no trellis owner).
+    pub fn kx7(&self) -> bool { self.ranks.iter().any(|r| r.kx7_workspace > 0) }
+}
+
+/// The staged KDA core program, without its `glmf_stage_` prefix, for a KX7 layer's recurrent
+/// state at capacity `cap` (`m64`, `m128`, `m4096`): the F32 state's `kda_core`, or the BF16
+/// state's `kda_core_s16` (`kda_core_s16t_m4096` for the tile-rounded prefill), as the fused
+/// `kda` programs are named (`GlmfKdaState::program`).
+pub fn kx7_kda_core(state: GlmfKdaState, cap: &str) -> String {
+    match (state, cap) {
+        (GlmfKdaState::F32, _) => format!("kda_core_{cap}"),
+        (GlmfKdaState::Bf16Tile, "m4096") => format!("kda_core_s16t_{cap}"),
+        _ => format!("kda_core_s16_{cap}"),
+    }
+}
+
+/// Every staged KDA core a KX7 decode (`m64`, and `m128` past 64 rows) or prefill (`m4096`)
+/// step can launch, with its `glmf_stage_` prefix.
+pub fn kx7_stage_names(state: GlmfKdaState, decode: bool, decode_rows: usize) -> Vec<String> {
+    let caps: &[&str] = if !decode { &["m4096"] } else if decode_rows > 64 { &["m64", "m128"] } else { &["m64"] };
+    caps.iter().map(|cap| format!("glmf_stage_{}", kx7_kda_core(state, cap))).collect()
+}
+
+/// `scratch_bytes_at_capacity.scratch` of the one manifest program `name`, for KX7 charges.
+pub fn kx7_manifest_scratch(manifest: &serde_json::Value, name: &str) -> Result<usize> {
+    let entries = manifest["programs"].as_array().context("PROGRAMS.json has no program list")?;
+    let matches = entries.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
+    ensure!(matches.len() == 1, "--kda-exact kx7 runs the staged KDA core {name}, which this build does not export \
+        (a build exporting the glmf_stage programs does)");
+    Ok(matches[0]["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0).try_into()?)
 }
 
 pub fn fp8_projection_name(prefix: &str, [n, k]: [usize; 2], cap: usize) -> String {
@@ -221,11 +297,50 @@ mod tests {
         let stage = CoreStageLayout::new(&cfg, 64, 2, false, 4096)?;
         let rank = CoreRankLayout { body: vec![], stages: Some([stage.clone(), stage.clone()]),
             decode: Some(p.clone()), prefill: Some(p.clone()), target_head: Some(p.clone()), draft_head: Some(p.clone()),
-            retained_rows: 64 + 3 * 4096, receive_suffix: 4 * 3 * 4096 * 4096 * 2 };
+            retained_rows: 64 + 3 * 4096, receive_suffix: 4 * 3 * 4096 * 4096 * 2, kx7_workspace: 0 };
         assert_eq!(rank.bytes(4096)?, (4 * p.bytes()? + 2 * stage.bytes()? + rank.receive_suffix
             + rank.retained_rows * 4096 * 8) as u64);
         let mut overflow = rank; overflow.retained_rows = usize::MAX;
         assert!(overflow.bytes(4096).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn kx7_charges_stage_kda_alone_with_one_decode_workspace() -> Result<()> {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45))?;
+        let scratch = |name: &str| Ok(if name.ends_with("_m4096") { 9000 } else if name.ends_with("_m128") { 700 } else { 500 });
+        for (state, decode_rows, decode, prefill) in [
+            (GlmfKdaState::F32, 64, vec!["glmf_stage_kda_core_m64"], vec!["glmf_stage_kda_core_m4096"]),
+            (GlmfKdaState::F32, 128, vec!["glmf_stage_kda_core_m128", "glmf_stage_kda_core_m64"], vec!["glmf_stage_kda_core_m4096"]),
+            (GlmfKdaState::Bf16, 64, vec!["glmf_stage_kda_core_s16_m64"], vec!["glmf_stage_kda_core_s16_m4096"]),
+            (GlmfKdaState::Bf16Tile, 64, vec!["glmf_stage_kda_core_s16_m64"], vec!["glmf_stage_kda_core_s16t_m4096"])] {
+            let charges = CoreCharges::kx7_kda(&cfg, cfg.layers, 1, 4096, decode_rows, state, scratch)?.unwrap();
+            assert!(charges.kx7());
+            let mut names: Vec<_> = decode.iter().chain(&prefill).map(|n| n.to_string()).collect();
+            names.sort();
+            assert_eq!(charges.programs, names);
+            let rank = &charges.ranks[0];
+            let [d, p] = rank.stages.clone().unwrap();
+            let width = cfg.kda_heads * cfg.kda_head_dim;
+            assert_eq!(d.extents.keys().copied().collect::<Vec<_>>(), ["k", "q", "scratch", "v", "values"]);
+            assert_eq!((d.extents["q"], d.extents["values"]), (decode_rows * width * 2, decode_rows * width * 2));
+            assert_eq!((p.extents["v"], p.extents["scratch"]), (4096 * width * 2, 9000));
+            assert_eq!(d.extents["scratch"], if decode_rows > 64 { 700 } else { 500 });
+            assert_eq!(rank.kx7_workspace, 64 << 20);
+            assert!(rank.body.is_empty() && rank.retained_rows == 0 && rank.decode.is_none() && rank.prefill.is_none());
+            assert_eq!(rank.bytes(cfg.hidden)?, (d.bytes()? + p.bytes()? + (64 << 20)) as u64);
+        }
+        assert!(CoreCharges::kx7_kda(&cfg, cfg.layers, 2, 4096, 64, GlmfKdaState::F32, scratch).unwrap_err()
+            .to_string().contains("one coordinator GPU"));
+        let missing = CoreCharges::kx7_kda(&cfg, cfg.layers, 1, 4096, 64, GlmfKdaState::Bf16,
+            |name| kx7_manifest_scratch(&serde_json::json!({"programs": [{"name": "glmf_stage_kda_core_m64"}]}), name));
+        assert!(missing.unwrap_err().to_string().contains("glmf_stage_kda_core_s16_m64"));
+        if cfg.attention[0] == GlmNextAttention::Mla {
+            assert!(CoreCharges::kx7_kda(&cfg, 1, 1, 4096, 64, GlmfKdaState::F32, scratch)?.is_none());
+        }
+        let manifest = serde_json::json!({"programs": [
+            {"name": "glmf_stage_kda_core_m64", "scratch_bytes_at_capacity": {"scratch": 1234}}]});
+        assert_eq!(kx7_manifest_scratch(&manifest, "glmf_stage_kda_core_m64")?, 1234);
         Ok(())
     }
 }

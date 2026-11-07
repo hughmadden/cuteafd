@@ -500,6 +500,10 @@ pub(crate) struct PlanArgs {
     /// GLM Flash KDA projection residency (default: launcher's row128).
     #[arg(long, value_enum, default_value = "row128")]
     pub(crate) kda_fp8: crate::families::glm5_flash::fp8::KdaFp8,
+    /// GLM Flash KDA projections held exactly: `off`, or `kx7` (exact KX7 packs of the BF16,
+    /// admitted at 8 bits a weight; needs --kda-fp8 off and one GPU).
+    #[arg(long, value_enum, default_value = "off")]
+    pub(crate) kda_exact: crate::families::glm5_flash::kx7::KdaExact,
     /// GLM Flash recurrent state storage for --layout.
     #[arg(long, value_enum, default_value = "f32")]
     pub(crate) kda_state: crate::families::glm5_flash::engine::KdaState,

@@ -3074,6 +3074,48 @@ def test_glmf_kda_state_is_forwarded_with_either_kda_storage(tmp_path, keys, for
         assert f"--kda-state {forwarded}" in launch and launch.count("--kda-state") == 1
 
 
+@pytest.mark.parametrize("keys,kda", [("GLM5_FLASH_KDA_EXACT=kx7\n", "off"),
+                                      ("GLM5_FLASH_KDA_EXACT=kx7\nGLM5_FLASH_KDA_FP8=auto\n", "off"),
+                                      ("GLM5_FLASH_KDA_EXACT=kx7\nGLM5_FLASH_KDA_FP8=off\n", "off")])
+@pytest.mark.parametrize("state", ["", "GLM5_FLASH_KDA_STATE=bf16\n"])
+def test_glmf_kda_exact_reaches_serve_and_plan_on_one_gpu(tmp_path, keys, kda, state):
+    """GLM5_FLASH_KDA_EXACT=kx7 forwards --kda-exact kx7 to serve-glmf and its plan, once, with
+    the BF16 projections it packs (an auto GLM5_FLASH_KDA_FP8 resolves to off) and any KDA state."""
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "RTX_GPUS=1\n" + keys + state)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--split-device" not in launch
+    assert "--kda-exact kx7" in launch and launch.count("--kda-exact") == 1, launch
+    assert f"--kda-fp8 {kda}" in launch and launch.count("--kda-fp8") == 1, launch
+    assert ("--kda-state bf16" in launch) == bool(state), launch
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans and all("--kda-exact kx7" in plan and plan.count("--kda-exact") == 1
+                         and "--kda-fp8 off" in plan for plan in plans), plans
+
+
+@pytest.mark.parametrize("keys", ["", "GLM5_FLASH_KDA_EXACT=off\n"])
+def test_glmf_kda_exact_off_forwards_nothing(tmp_path, keys):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf", "RTX_GPUS=1\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--kda-exact" not in launch and "--kda-fp8 row128" in launch, launch
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans and not any("--kda-exact" in plan for plan in plans), plans
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_EXACT=kx7\nGLM5_FLASH_KDA_FP8=row128\n", "set GLM5_FLASH_KDA_FP8=off"),
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_EXACT=kx7\nGLMF_KDA_FP8=channel\n", "set GLM5_FLASH_KDA_FP8=off"),
+    ("RTX_GPUS=2\nGLM5_FLASH_KDA_EXACT=kx7\n", "head split"),
+    ("RTX_GPUS=1\nGLM5_FLASH_KDA_EXACT=huffman\n", "GLM5_FLASH_KDA_EXACT must be off or kx7"),
+])
+def test_glmf_kda_exact_refuses_lossy_or_split_layouts_before_launch(tmp_path, keys, message):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf", keys)
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,message", [
     ("RTX_GPUS=2\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=bf16\n", "without a head split"),
     ("RTX_GPUS=1\nGLM5_FLASH_KDA_FP8=off\nGLM5_FLASH_KDA_STATE=fp16\n", "GLM5_FLASH_KDA_STATE must be"),

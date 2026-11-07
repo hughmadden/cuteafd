@@ -331,6 +331,45 @@ fn kx7_fused_source_round_trips_under_one_code() {
 }
 
 #[test]
+fn kx7_device_bytes_fit_their_bound() {
+    // FP8-born over 4 exponents: about 7.2 bits a weight, as GLM 5.3 Flash's KDA tensors.
+    let w = fp8_born_over(64, 4096, 31, 4);
+    let pack = encode_verified(&w, 64, 4096, V11_LAYOUT, V11_CODE).unwrap();
+    let bytes = Kx7DeviceBytes::of(&pack).unwrap();
+    let bound = Kx7DeviceBytes::bound(64, 4096, V11_LAYOUT, V11_CODE).unwrap();
+    assert_eq!(bytes.tables, 4 * pack.device_tables().unwrap().len() as u64);
+    assert_eq!(bytes.tables, bound.tables);
+    assert_eq!((bytes.offsets, bytes.lengths), (4 * (64 * 16 + 1), 2 * 64 * 16));
+    assert_eq!((bound.offsets, bound.lengths), (bytes.offsets, bytes.lengths));
+    assert_eq!(bytes.streams, pack.streams().len() as u64 + READ_AHEAD_BYTES as u64);
+    assert!(bytes.within(&bound) && bytes.total(256) <= bound.total(256));
+    // The GLM 5.3 Flash KDA shapes: q/k/v [8192, 4096], o [4096, 8192].
+    let q = Kx7DeviceBytes::bound(8192, 4096, V11_LAYOUT, V11_CODE).unwrap();
+    let o = Kx7DeviceBytes::bound(4096, 8192, V11_LAYOUT, V11_CODE).unwrap();
+    assert_eq!((q.streams, q.offsets, q.lengths, q.tables), (33_554_448, 524_292, 262_144, 16_384));
+    assert_eq!((o.streams, o.offsets, o.lengths, o.tables), (33_554_448, 262_148, 131_072, 16_384));
+    assert_eq!(device_table_words(V11_CODE), 4096);
+    assert_eq!(decoded_bytes(8192, 4096), 64 << 20);
+    // 16 exponents spread the 15% ordinary values over 4,096 patterns: above 8 bits a weight,
+    // past the bound; random 16-bit patterns do not even take a two-class code.
+    let wide = encode_verified(&fp8_born(64, 1024, 9), 64, 1024, V11_LAYOUT, V11_CODE).unwrap();
+    assert!(!Kx7DeviceBytes::of(&wide).unwrap().within(&Kx7DeviceBytes::bound(64, 1024, V11_LAYOUT, V11_CODE).unwrap()));
+    let mut r = Mix(9);
+    let noise: Vec<u16> = (0..64 * 1024).map(|_| r.next() as u16).collect();
+    assert!(encode_verified(&noise, 64, 1024, V11_LAYOUT, V11_CODE).is_err());
+    assert!(Kx7DeviceBytes::bound(4, 1024, V11_LAYOUT, V11_CODE).is_err());
+    // In parallel, in order, each verified.
+    let v = fp8_born_over(16, 1024, 5, 4);
+    let packs = encode_verified_all(&[(&w, 64, 4096), (&v, 16, 1024)], V11_LAYOUT, V11_CODE).unwrap();
+    assert_eq!(packs.iter().map(|p| (p.header().n, p.header().k)).collect::<Vec<_>>(), [(64, 4096), (16, 1024)]);
+    assert_eq!(packs[0], pack);
+    let mut other = v.clone();
+    other[37] ^= 1;
+    let stale = encode_verified(&v, 16, 1024, V11_LAYOUT, V11_CODE).unwrap();
+    assert!(matches!(verify_matrix(&stale, &other), Err(Kx7Error::Mismatch { row: 0, col: 37, .. })));
+}
+
+#[test]
 fn kx7_encoding_is_deterministic() {
     let w = fp8_born(64, 4096, 5);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
