@@ -127,6 +127,61 @@ impl NativeLibrary {
         let code = unsafe { f(x, pack, out, i32::try_from(rows)?, workspace, workspace_bytes, stream) };
         self.status_to_result("KX7 linear", code)
     }
+
+    /// Decode and verify rows (1..=64) of up to three packs of one shape and code in one GEMV
+    /// launch: pack i's outputs land at `out[r * ldo + col0[i] + c]`, each element bit for bit
+    /// [`Self::kx7_linear`]'s for that pack. Errs (cudaErrorInvalidValue) when the packs cannot
+    /// share a launch; the caller then runs [`Self::kx7_linear_ld`] per pack. Asynchronous on
+    /// `stream`, graph capturable.
+    ///
+    /// # Safety
+    /// Every pack names live device buffers; `x` is live device memory of `rows * k` BF16 and `out`
+    /// of `rows * ldo` BF16, on the stream's device.
+    pub unsafe fn kx7_gemv_group(&self, x: P, packs: &[&Kx7DevicePack], col0: &[usize], out: M, ldo: usize,
+        rows: usize, stream: M) -> Result<()> {
+        ensure!(packs.len() == col0.len() && (1..=3).contains(&packs.len()), "KX7 GEMV group of {} packs", packs.len());
+        type F = unsafe extern "C" fn(P, *const *const Kx7DevicePack, i32, *const i32, M, i32, i32, M) -> i32;
+        // SAFETY: the symbol has this signature in kx7.cu.
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_kx7_gemv_group") }?;
+        let headers: Vec<*const Kx7DevicePack> = packs.iter().map(|p| *p as *const Kx7DevicePack).collect();
+        let cols = col0.iter().map(|&c| i32::try_from(c)).collect::<std::result::Result<Vec<_>, _>>()?;
+        // SAFETY: the caller's contract; the native call reads the headers and columns before it returns.
+        let code = unsafe { f(x, headers.as_ptr(), i32::try_from(packs.len())?, cols.as_ptr(), out,
+            i32::try_from(ldo)?, i32::try_from(rows)?, stream) };
+        self.status_to_result("KX7 GEMV group", code)
+    }
+
+    /// [`Self::kx7_linear`]'s GEMV rows (1..=64) with output rows `ldo` (>= n) elements apart.
+    ///
+    /// # Safety
+    /// As [`Self::kx7_gemv_group`] for the one pack.
+    pub unsafe fn kx7_linear_ld(&self, x: P, pack: &Kx7DevicePack, out: M, ldo: usize, rows: usize, stream: M)
+        -> Result<()> {
+        type F = unsafe extern "C" fn(P, *const Kx7DevicePack, M, i32, i32, M) -> i32;
+        // SAFETY: the symbol has this signature in kx7.cu.
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_kx7_linear_ld") }?;
+        // SAFETY: the caller's contract; the native call reads `pack` before it returns.
+        let code = unsafe { f(x, pack, out, i32::try_from(ldo)?, i32::try_from(rows)?, stream) };
+        self.status_to_result("KX7 strided linear", code)
+    }
+
+    /// `out[r * ldo + c]` = (`x` [rows, k] @ `w`^T)[r, c] for row-major BF16 `w` [n, k], rows 1..=64
+    /// (n % 8 == 0, k % 512 == 0): the decode-row GEMV for BF16 rows beside KX7 ones, FP32
+    /// accumulation, row-count invariant. Asynchronous on `stream`, graph capturable.
+    ///
+    /// # Safety
+    /// `x`, `w` and `out` are live device buffers of those shapes (16-byte aligned `x` and `w`).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn bf16_gemv_ld(&self, x: P, w: P, out: M, ldo: usize, rows: usize, n: usize, k: usize, stream: M)
+        -> Result<()> {
+        type F = unsafe extern "C" fn(P, P, M, i32, i32, i32, i32, M) -> i32;
+        // SAFETY: the symbol has this signature in kx7.cu.
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_bf16_gemv_ld") }?;
+        // SAFETY: the caller's contract.
+        let code = unsafe { f(x, w, out, i32::try_from(ldo)?, i32::try_from(rows)?, i32::try_from(n)?,
+            i32::try_from(k)?, stream) };
+        self.status_to_result("BF16 strided GEMV", code)
+    }
 }
 
 #[cfg(test)]

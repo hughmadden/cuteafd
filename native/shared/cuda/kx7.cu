@@ -133,39 +133,79 @@ bool gemv_applies(int32_t rows, int32_t n, int32_t slices) {
   return rows >= 1 && rows <= kGemvRows && slices == kGemvSlices && n % kGemvCols == 0;
 }
 
-// One GEMV configuration <KS, RG, G, MT> launched over `pack`.
+// A grouped launch's packs as the kernel reads them; `col0[i]` is pack i's first output column.
+kx7gemv::Kx7GemvGroup group_of(const cuteafd_kx7_pack_t* const* packs, int32_t count, const int32_t* col0) {
+  kx7gemv::Kx7GemvGroup g{};
+  g.packs = count;
+  g.streams_per_row = packs[0]->streams_per_row;
+  g.stride = packs[0]->quad_stride;
+  g.ragged = int(packs[0]->ragged);
+  for (int i = 0; i < count; ++i) {
+    const cuteafd_kx7_pack_t* p = packs[i];
+    g.pack[i] = kx7gemv::Kx7GemvPack{static_cast<const uint8_t*>(p->streams), static_cast<const uint32_t*>(p->offsets),
+                                     static_cast<const uint16_t*>(p->lengths), static_cast<const uint32_t*>(p->tables),
+                                     int(p->table_words), p->esc_shift, p->esc_mask, p->n, col0[i]};
+  }
+  return g;
+}
+
+// One GEMV configuration <KS, RG, G, MT> launched over a group of packs of one shape and code.
 template <int RG, int G, int MT, bool TWOCLASS>
-int32_t launch_gemv(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32_t rows, cudaStream_t s) {
+int32_t launch_gemv(const cuteafd_kx7_pack_t* const* packs, int32_t count, const int32_t* col0, const void* x,
+                    void* out, int32_t ldo, int32_t rows, cudaStream_t s) {
   using Geo = kx7gemv::Geometry<kGemvSlices, RG, G, MT>;
   static_assert(Geo::kx7_smem(int(kV11TableWords)) <= int(kDefaultSmem), "two-class GEMVs need no opt-in");
   static_assert(Geo::COLS == kGemvCols, "every GEMV configuration owns kGemvCols weight rows per CTA");
-  if (p->n % Geo::COLS != 0) return cudaErrorInvalidValue;
-  const size_t smem = size_t(Geo::kx7_smem(int(p->table_words)));
+  int ctas = 0;
+  uint32_t lut_words = 0;
+  for (int i = 0; i < count; ++i) {
+    if (packs[i]->n % Geo::COLS != 0) return cudaErrorInvalidValue;
+    ctas += packs[i]->n / Geo::COLS;
+    lut_words = packs[i]->table_words > lut_words ? packs[i]->table_words : lut_words;
+  }
+  const size_t smem = size_t(Geo::kx7_smem(int(lut_words)));
   static size_t granted = kDefaultSmem;
   const cudaError_t allowed = allow_smem(kx7gemv::kx7_gemv_kernel<kGemvSlices, RG, G, MT, TWOCLASS>, smem, granted);
   if (allowed != cudaSuccess) return allowed;
-  kx7gemv::kx7_gemv_kernel<kGemvSlices, RG, G, MT, TWOCLASS><<<p->n / Geo::COLS, Geo::THREADS, smem, s>>>(
-      static_cast<const uint16_t*>(x), rows, p->n, p->k, static_cast<const uint8_t*>(p->streams),
-      static_cast<const uint32_t*>(p->offsets), static_cast<const uint16_t*>(p->lengths), p->streams_per_row,
-      p->quad_stride, int(p->ragged), static_cast<const uint32_t*>(p->tables), int(p->table_words), p->esc_shift,
-      p->esc_mask, static_cast<__nv_bfloat16*>(out));
+  kx7gemv::kx7_gemv_kernel<kGemvSlices, RG, G, MT, TWOCLASS><<<ctas, Geo::THREADS, smem, s>>>(
+      static_cast<const uint16_t*>(x), rows, packs[0]->k, ldo, group_of(packs, count, col0),
+      static_cast<__nv_bfloat16*>(out));
   return cudaGetLastError();
 }
 
 // The GEMV for `rows` <= kGemvRows: one, two or four activation tiles, the configurations measured
 // best on an RTX 5090 for GLM 5.3 Flash's [8192, 4096] q/k/v and [4096, 8192] o_proj. Every
 // configuration has K split 4 and the same per-element K order and fold, so a row's bits do not
-// depend on the row count.
+// depend on the row count or on which packs share the launch.
 template <bool TWOCLASS>
-int32_t gemv_code(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32_t rows, cudaStream_t s) {
-  if (rows <= 16) return launch_gemv<4, 1, 1, TWOCLASS>(p, x, out, rows, s);
-  if (rows <= 32) return launch_gemv<4, 1, 2, TWOCLASS>(p, x, out, rows, s);
-  if (p->n >= 8192) return launch_gemv<4, 1, 4, TWOCLASS>(p, x, out, rows, s);
-  return launch_gemv<2, 2, 4, TWOCLASS>(p, x, out, rows, s);
+int32_t gemv_code(const cuteafd_kx7_pack_t* const* packs, int32_t count, const int32_t* col0, const void* x,
+                  void* out, int32_t ldo, int32_t rows, cudaStream_t s) {
+  if (rows <= 16) return launch_gemv<4, 1, 1, TWOCLASS>(packs, count, col0, x, out, ldo, rows, s);
+  if (rows <= 32) return launch_gemv<4, 1, 2, TWOCLASS>(packs, count, col0, x, out, ldo, rows, s);
+  if (packs[0]->n >= 8192) return launch_gemv<4, 1, 4, TWOCLASS>(packs, count, col0, x, out, ldo, rows, s);
+  return launch_gemv<2, 2, 4, TWOCLASS>(packs, count, col0, x, out, ldo, rows, s);
 }
 
-int32_t gemv(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32_t rows, cudaStream_t s) {
-  return huffman(p) ? gemv_code<false>(p, x, out, rows, s) : gemv_code<true>(p, x, out, rows, s);
+int32_t gemv(const cuteafd_kx7_pack_t* const* packs, int32_t count, const int32_t* col0, const void* x, void* out,
+             int32_t ldo, int32_t rows, cudaStream_t s) {
+  return huffman(packs[0]) ? gemv_code<false>(packs, count, col0, x, out, ldo, rows, s)
+                           : gemv_code<true>(packs, count, col0, x, out, ldo, rows, s);
+}
+
+// Whether `count` packs can share one GEMV launch writing [rows, ldo] rows: valid v1.1 packs of one
+// shape, K split, layout and code, each a GEMV width, their columns inside a row of `ldo`.
+bool groupable(const cuteafd_kx7_pack_t* const* packs, int32_t count, const int32_t* col0, int32_t ldo,
+               int32_t rows) {
+  if (!packs || !col0 || count < 1 || count > kx7gemv::kMaxGroup) return false;
+  for (int i = 0; i < count; ++i) {
+    const cuteafd_kx7_pack_t* p = packs[i];
+    if (!valid_v11(p) || !gemv_applies(rows, p->n, p->slices) || col0[i] < 0 || col0[i] % 2 != 0 ||
+        int64_t(col0[i]) + p->n > ldo || p->k != packs[0]->k || p->format != packs[0]->format ||
+        p->streams_per_row != packs[0]->streams_per_row || p->ragged != packs[0]->ragged) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -217,7 +257,10 @@ extern "C" int32_t cuteafd_kx7_linear(const void* x, const cuteafd_kx7_pack_t* p
   if (workspace_bytes < cuteafd_kx7_workspace(rows, n, k)) return cudaErrorInvalidValue;
   // Decode and verify steps: the fused GEMV, each lane decoding its stream straight into MMA
   // fragments (no workspace pass). Wider steps and prefill: decode once, then the BF16 GEMM.
-  if (gemv_applies(rows, pack->n, pack->slices)) return gemv(pack, x, out, rows, static_cast<cudaStream_t>(stream));
+  if (gemv_applies(rows, pack->n, pack->slices)) {
+    const int32_t col0 = 0;
+    return gemv(&pack, 1, &col0, x, out, n, rows, static_cast<cudaStream_t>(stream));
+  }
   const int32_t decoded = cuteafd_kx7_decode(pack, workspace, stream);
   if (decoded != 0) return decoded;
   const cuteafd_status_t gemm = cuteafd_cuda_linear_bf16_cublas_async(
@@ -239,7 +282,7 @@ extern "C" int32_t cuteafd_kx7_reference_gemv(const void* x, const void* w, void
     using Geo = decltype(geo);
     if (n % Geo::COLS != 0) return cudaErrorInvalidValue;
     kernel<<<n / Geo::COLS, Geo::THREADS, Geo::bf16_smem(), s>>>(static_cast<const uint16_t*>(x), rows, n, k,
-                                                                 static_cast<const uint16_t*>(w),
+                                                                 static_cast<const uint16_t*>(w), n,
                                                                  static_cast<__nv_bfloat16*>(out));
     return cudaGetLastError();
   };
@@ -249,4 +292,50 @@ extern "C" int32_t cuteafd_kx7_reference_gemv(const void* x, const void* w, void
   if (rows <= 32) return run(Geometry<kGemvSlices, 4, 1, 2>{}, bf16_gemv_kernel<kGemvSlices, 4, 1, 2>);
   if (n >= 8192) return run(Geometry<kGemvSlices, 4, 1, 4>{}, bf16_gemv_kernel<kGemvSlices, 4, 1, 4>);
   return run(Geometry<kGemvSlices, 2, 2, 4>{}, bf16_gemv_kernel<kGemvSlices, 2, 2, 4>);
+}
+
+// Decode and verify steps of several packs of one shape and code at once (GLM Flash's q, k and v):
+// out[r * ldo + col0[i] + c] = (x [rows, k] @ W_i^T)[r, c] for pack i, rows 1..64, as one GEMV
+// launch whose packs' CTAs run side by side. Each output element is bit for bit what
+// cuteafd_kx7_linear gives for its pack alone. Returns cudaErrorInvalidValue when the packs cannot
+// share a launch (the caller then runs cuteafd_kx7_linear_ld per pack); otherwise a cudaError_t.
+extern "C" int32_t cuteafd_kx7_gemv_group(const void* x, const cuteafd_kx7_pack_t* const* packs, int32_t count,
+                                          const int32_t* col0, void* out, int32_t ldo, int32_t rows, void* stream) {
+  if (!x || !out || !groupable(packs, count, col0, ldo, rows)) return cudaErrorInvalidValue;
+  return gemv(packs, count, col0, x, out, ldo, rows, static_cast<cudaStream_t>(stream));
+}
+
+// cuteafd_kx7_linear with the output rows `ldo` elements apart (ldo >= n): the GEMV's rows only
+// (1..64); a wider call returns cudaErrorInvalidValue.
+extern "C" int32_t cuteafd_kx7_linear_ld(const void* x, const cuteafd_kx7_pack_t* pack, void* out, int32_t ldo,
+                                         int32_t rows, void* stream) {
+  const int32_t col0 = 0;
+  if (!x || !out || !groupable(&pack, 1, &col0, ldo, rows)) return cudaErrorInvalidValue;
+  return gemv(&pack, 1, &col0, x, out, ldo, rows, static_cast<cudaStream_t>(stream));
+}
+
+// A BF16 matrix's decode-row GEMV beside KX7 ones: out[r * ldo + c] = (x [rows, k] @ w^T)[r, c] for
+// row-major BF16 w [n, k], rows 1..64, FP32 accumulation, every row's bits independent of the row
+// count (K split 8 over one 8-column group per CTA: a short matrix still spreads over n / 8 CTAs).
+// Returns a cudaError_t (cudaErrorInvalidValue outside n % 8 == 0, k % 512 == 0, 1..64 rows).
+extern "C" int32_t cuteafd_bf16_gemv_ld(const void* x, const void* w, void* out, int32_t ldo, int32_t rows,
+                                        int32_t n, int32_t k, void* stream) {
+  constexpr int kSlices = 8;
+  if (!x || !w || !out || rows < 1 || rows > kGemvRows || n < 8 || n % 8 != 0 || k % (64 * kSlices) != 0 ||
+      ldo < n || !aligned(x, 16) || !aligned(w, 16)) {
+    return cudaErrorInvalidValue;
+  }
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  auto run = [&](auto geo, auto kernel) -> int32_t {
+    using Geo = decltype(geo);
+    kernel<<<n / Geo::COLS, Geo::THREADS, Geo::bf16_smem(), s>>>(static_cast<const uint16_t*>(x), rows, n, k,
+                                                                 static_cast<const uint16_t*>(w), ldo,
+                                                                 static_cast<__nv_bfloat16*>(out));
+    return cudaGetLastError();
+  };
+  using kx7gemv::Geometry;
+  using kx7gemv::bf16_gemv_kernel;
+  if (rows <= 16) return run(Geometry<kSlices, 1, 1, 1>{}, bf16_gemv_kernel<kSlices, 1, 1, 1>);
+  if (rows <= 32) return run(Geometry<kSlices, 1, 1, 2>{}, bf16_gemv_kernel<kSlices, 1, 1, 2>);
+  return run(Geometry<kSlices, 1, 1, 4>{}, bf16_gemv_kernel<kSlices, 1, 1, 4>);
 }

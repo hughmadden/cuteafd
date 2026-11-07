@@ -103,7 +103,8 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     caps = decode_caps | {prefill_rows}
     states = [f"kda_core_{tag}_m{rows}" for rows in sorted(caps)
               for tag in (("s16",) if rows in decode_caps else ("s16", "s16t"))]
-    assert len(calls) == len(programs) == 17 * len(caps) + len(states)
+    projected = [f"kda_core_projected_m{rows}" for rows in sorted(decode_caps) if rows <= 64]
+    assert len(calls) == len(programs) == 17 * len(caps) + len(states) + len(projected)
     existing = []
     for rows in sorted(caps):
         existing.extend([f"kda_core_m{rows}", *[f"{stage}_m{rows}" for stage in ("rank_norm", "absorb", "values")],
@@ -115,7 +116,12 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     shapes = sorted({(1536, 16384), (16384, 4096), (4096, 8192), (8192, 4096),
                      (4096, 1536), (4096, 512)})
     added = [f"fp8_linear_k{k}_n{n}_m{rows}" for rows in sorted(caps) for k, n in shapes]
-    assert list(calls) == existing + added + states
+    assert list(calls) == existing + added + states + projected
+    for name in projected:
+        op, params, (module, compiler, args, kwargs) = calls[name]
+        rows = int(name.rsplit("_m", 1)[1])
+        assert (op, module, compiler, args) == ("kda_core", "glmf_split", "compile_glmf_kda_core_projected_aot", (geometry,))
+        assert params == kwargs == {"max_rows": rows, "decode": True}
     for name in states:
         op, params, (module, compiler, args, kwargs) = calls[name]
         rows = int(name.rsplit("_m", 1)[1])
@@ -219,8 +225,9 @@ def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
     wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
     describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
     narrow, wide = describe(narrow), describe(wide)
-    # 17 per capacity, then the BF16-state staged KDA cores (s16 per capacity, s16t at prefill).
-    assert len(narrow) == 34 + 3 and len(wide) == 51 + 4
+    # 17 per capacity, then the BF16-state staged KDA cores (s16 per capacity, s16t at prefill),
+    # then the KX7 projected KDA core at the 64-row decode capacity.
+    assert len(narrow) == 34 + 3 + 1 and len(wide) == 51 + 4 + 1
     assert {name: wide[name] for name in narrow} == narrow
     assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
     assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()

@@ -27,6 +27,12 @@ pub(super) fn stage_attention(layer: &GlmfLayer<'_>) -> bool {
 }
 /// A KDA layer whose q/k/v/o are KX7 packs (`--kda-exact kx7`).
 pub(super) fn kx7_attention(layer: &GlmfLayer<'_>) -> bool { !layer.kx7.is_empty() }
+/// KX7 decode steps run the projected KDA core ([`GlmfEngine::kx7_kda_projected`]) unless
+/// `CUTEAFD_GLMF_KX7_PROJECTED=off` keeps the staged core with its own aux projection.
+pub(super) fn kx7_projected_core() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CUTEAFD_GLMF_KX7_PROJECTED").map_or(true, |v| v != "off"))
+}
 /// The staged KDA core a KX7 layer's prefill runs (without the `glmf_` prefix), as [`GlmfEngine::core_kda`]
 /// names it.
 pub(super) fn kx7_prefill_program(state: KdaState) -> String { format!("stage_{}", kx7_kda_core(state.into(), PREFILL_CAP)) }
@@ -360,6 +366,9 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn core_kda(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, count: Scalar,
         first: usize, cap: &str, spec: bool, [conv, state, replay]: [*mut c_void; 3]) -> Result<()> {
+        if kx7_attention(layer) && cap == "m64" && matches!(self.kda_state, KdaState::F32) && kx7_projected_core() {
+            return self.kx7_kda_projected(rank, w, layer, count, first, cap, spec, [conv, state, replay]);
+        }
         let rows = rows(count)?;
         let s = &w.core.as_ref().context("Flash K6 KDA slot")?.scratch;
         let (q,k,v,out,scratch) = (s.stage("q")?,s.stage("k")?,s.stage("v")?,s.stage("values")?,s.stage("scratch")?);
@@ -379,6 +388,69 @@ impl<'a> GlmfEngine<'a> {
         let destination = Self::core_buffer(w.delta.buffer.ptr.wrapping_byte_add(first*self.cfg.hidden*2),
             rows*self.cfg.hidden*2,w.x.buffer.device_id);
         self.timed("kda staged o_proj", || self.core_linear(rank,w,layer,"self_attn.o_proj",out,destination,rows,0,cap))
+    }
+
+    /// A KX7 KDA layer's decode step (1..=64 rows, FP32 state) without the staged core's own aux
+    /// projection and q/k/v copy: one KX7 GEMV launch writes q, k and v (and a BF16 GEMV the f_a,
+    /// g_a and b rows) straight into the in-projection rows `[rows, 3 d + aux]` the KDA body reads at
+    /// the base of its scratch, the `kda_core_projected` program runs only that body (conv,
+    /// recurrence, gates, norm), and the o_proj GEMV follows. Every projection is exact (KX7 GEMV
+    /// bit for bit its BF16 twin; FP32 accumulation everywhere), so outputs differ from the staged
+    /// path only by accumulation order in the aux rows.
+    #[allow(clippy::too_many_arguments)]
+    fn kx7_kda_projected(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, count: Scalar, first: usize,
+        cap: &str, spec: bool, [conv, state, replay]: [*mut c_void; 3]) -> Result<()> {
+        let rows = rows(count)?;
+        let hidden = self.cfg.hidden;
+        let s = &w.core.as_ref().context("Flash K6 KDA slot")?.scratch;
+        let (unused, out, scratch) = (s.stage("q")?, s.stage("values")?, s.stage("scratch")?);
+        let input = Self::core_buffer(row_at(&w.x, first, hidden * 2), rows * hidden * 2, w.x.buffer.device_id);
+        let projection = |name: &str| layer.kx7.get(name).with_context(|| format!("KX7 layer without {name}"));
+        let (wq, wk, wv) = (projection("self_attn.q_proj")?, projection("self_attn.k_proj")?,
+            projection("self_attn.v_proj")?);
+        let aux = layer.buffer("w_aux")?;
+        let aux_rows = aux.bytes / (hidden * 2);
+        let width = wq.n + wk.n + wv.n + aux_rows;
+        ensure!(wq.k == hidden && wk.k == hidden && wv.k == hidden && aux.bytes == aux_rows * hidden * 2,
+            "Flash KX7 projected KDA: q/k/v/aux over the hidden width");
+        ensure!(scratch.bytes >= rows * width * 2, "Flash KX7 projected KDA: scratch holds {rows} in-projection rows");
+        let packs = [wq.device_pack()?, wk.device_pack()?, wv.device_pack()?];
+        let cols = [0, wq.n, wq.n + wk.n];
+        let stream = self.stream_of(rank);
+        self.timed("kda kx7 q/k/v", || self.on(rank, || {
+            let refs = [&packs[0], &packs[1], &packs[2]];
+            // One launch when the three packs share a code (a Huffman-fallback q runs on its own).
+            if packs.iter().all(|p| p.format == packs[0].format) {
+                // SAFETY: the packs name their layer's live allocations, `input` holds `rows`
+                // hidden rows and `scratch` the `rows * width` in-projection rows (checked above),
+                // all on this rank's stream.
+                return unsafe { self.library.kx7_gemv_group(input.ptr.cast_const(), &refs, &cols, scratch.ptr, width,
+                    rows, stream) };
+            }
+            for (pack, col) in refs.into_iter().zip(cols) {
+                // SAFETY: as above, one pack at a time into its columns.
+                unsafe { self.library.kx7_linear_ld(input.ptr.cast_const(), pack,
+                    scratch.ptr.wrapping_byte_add(col * 2), width, rows, stream)? };
+            }
+            Ok(())
+        }))?;
+        let aux_col = wq.n + wk.n + wv.n;
+        self.timed("kda kx7 aux (bf16)", || self.on(rank, ||
+            // SAFETY: `aux` is the layer's live [aux_rows, hidden] BF16 operand; output columns
+            // aux_col.. of the `rows * width` in-projection rows checked above.
+            unsafe { self.library.bf16_gemv_ld(input.ptr.cast_const(), aux.ptr.cast_const(),
+                scratch.ptr.wrapping_byte_add(aux_col * 2), width, rows, aux_rows, hidden, stream) }))?;
+        let program = format!("kda_core_projected_{cap}");
+        self.timed(&format!("kda kx7 {program}"), || self.core_stage(rank, false, &program, &[
+            ("x",input.ptr),("q",unused.ptr),("k",unused.ptr),("v",unused.ptr),("gate",unused.ptr),
+            ("w_fab",layer.ptr("w_aux")?),("w_f",layer.ptr("w_fg")?),("conv_w",layer.ptr("conv_w")?),
+            ("a_log",layer.ptr("a_log")?),("dt_bias",layer.ptr("dt_bias")?),("o_norm",layer.ptr("o_norm")?),
+            ("conv_state",conv),("state",state),("slots",row_at(&w.kda_slots,first,4)),
+            ("seq_first",row_at(&w.seq_first,first,4)),("out",out.ptr),("replay",replay),("scratch",scratch.ptr)],
+            &[count,Scalar::I32(i32::from(spec))]))?;
+        let destination = Self::core_buffer(w.delta.buffer.ptr.wrapping_byte_add(first*hidden*2),
+            rows*hidden*2,w.x.buffer.device_id);
+        self.timed("kda kx7 o_proj", || self.core_linear(rank,w,layer,"self_attn.o_proj",out,destination,rows,0,cap))
     }
     pub(super) fn core_mla_producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, count: Scalar,
         cap: &str, cache: *mut c_void) -> Result<()> {

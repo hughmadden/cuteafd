@@ -54,6 +54,19 @@ int32_t cuteafd_kx7_decode(const cuteafd_kx7_pack_t* pack, void* out_bf16, void*
 int32_t cuteafd_kx7_linear(const void* x, const cuteafd_kx7_pack_t* pack, void* out, int32_t rows,
                            void* workspace, size_t workspace_bytes, void* stream);
 
+// Decode and verify steps (rows 1..64) of `count` (1..3) packs of one shape and code in one launch:
+// out[r * ldo + col0[i] + c] = (x @ W_i^T)[r, c], each element bit for bit cuteafd_kx7_linear's for
+// its pack. cudaErrorInvalidValue when the packs cannot share a launch; otherwise a cudaError_t.
+int32_t cuteafd_kx7_gemv_group(const void* x, const cuteafd_kx7_pack_t* const* packs, int32_t count,
+                               const int32_t* col0, void* out, int32_t ldo, int32_t rows, void* stream);
+// cuteafd_kx7_linear's GEMV rows (1..64) with output rows ldo (>= n) elements apart.
+int32_t cuteafd_kx7_linear_ld(const void* x, const cuteafd_kx7_pack_t* pack, void* out, int32_t ldo, int32_t rows,
+                              void* stream);
+// out[r * ldo + c] = (x [rows, k] @ w^T)[r, c] for row-major BF16 w [n, k], rows 1..64 (n % 8 == 0,
+// k % 512 == 0), FP32 accumulation, row-count invariant. Returns a cudaError_t.
+int32_t cuteafd_bf16_gemv_ld(const void* x, const void* w, void* out, int32_t ldo, int32_t rows, int32_t n,
+                             int32_t k, void* stream);
+
 // Test support: the KX7 GEMV's BF16 twin over row-major BF16 w [n, k], for rows 1..64 (the
 // GEMV's range): bit for bit what cuteafd_kx7_linear gives for a pack of w at those rows.
 int32_t cuteafd_kx7_reference_gemv(const void* x, const void* w, void* out, int32_t rows, int32_t n, int32_t k,
