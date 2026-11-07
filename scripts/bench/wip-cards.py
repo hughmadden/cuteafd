@@ -484,8 +484,16 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                                  finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
-    if expected_pool is not None or 'image' in probes:
+    if expected_pool is not None or 'image' in probes or ('memory' in probes and hosts):
         entry['precheck'] = dict(argv=hook + ['--precheck', str(dest / 'job.json')], timeout_s=180, required=True)
+    if 'memory' in probes and hosts and (entry.get('levels') or entry.get('prefill_lengths')):
+        sample = dict(argv=hook + ['--spark-memory-boundary', str(dest / 'job.json')], timeout_s=20, required=True)
+        window = entry.setdefault('window', dict(open=dict(argv=['true'], timeout_s=10, required=True)))
+        previous = window.get('close')
+        if previous:
+            sample['argv'] = window_argv([previous['argv'], sample['argv']])
+            sample['timeout_s'] += previous.get('timeout_s', 0)
+        window['close'] = sample
     # Re-checked at grant: smoke runs prelaunch once it holds this card's locks.
     entry['prelaunch'] = dict(argv=hook + ['--preflight-job', str(dest / 'job.json')], timeout_s=300, required=True)
     save(dest / 'job.json', {**job, 'probes': sorted(probes)})
@@ -1031,7 +1039,9 @@ def precheck(job):
     dest = Path(job['state'])
     result = {}
     try:
-        text = ready_log(job)
+        if 'memory' in job['probes'] and job['entry'].get('sparks'):
+            spark_memory_boundary(job, 'ready')
+        text = ready_log(job) if job['expected_pool'] is not None or 'image' in job['probes'] else ''
         if job['expected_pool'] is not None:
             result['pool'] = admitted_pool(text)
             if result['pool'] != job['expected_pool']:
@@ -1096,10 +1106,11 @@ fields = {'MemAvailable', 'MemFree', 'Cached', 'SReclaimable', 'AnonPages',
 started = heartbeat = time.monotonic()
 phase = 'loading'
 pending = ''
+once = len(sys.argv) > 4 and sys.argv[4] == 'once'
 while time.monotonic() - started < lifetime:
     began = time.monotonic()
     readable, _, _ = select.select([sys.stdin], [], [], 0)
-    if readable:
+    if readable and not once:
         control = os.read(sys.stdin.fileno(), 65536)
         if not control:
             break
@@ -1116,7 +1127,7 @@ while time.monotonic() - started < lifetime:
         if key in fields:
             parts = value.split()
             if parts[1:] != ['kB']:
-                raise RuntimeError('unexpected meminfo unit: ' + line)
+                raise RuntimeError(key + ': unexpected meminfo unit: ' + line)
             mem[key] = int(parts[0]) * 1024
     missing = fields - mem.keys()
     # SecPageTables is not present on older kernels; retain that fact as null.
@@ -1124,6 +1135,8 @@ while time.monotonic() - started < lifetime:
         raise RuntimeError('missing meminfo fields: ' + str(sorted(missing)))
     mem.setdefault('SecPageTables', None)
     print(json.dumps(dict(time=time.time(), rank=rank, host=host, phase=phase, mem=mem)), flush=True)
+    if once:
+        break
     time.sleep(max(0, .05 - (time.monotonic() - began)))
 '''
 
@@ -1185,6 +1198,34 @@ def spark_memory_phase(url):
         return 'decode'
     active = http(url, '/v1/bench/status', timeout=.5).get('active')
     return 'panel:' + str(active['panel']) if active else 'ready-idle'
+
+
+def spark_memory_boundary(job, boundary):
+    """Capture real host state at readiness/sweep completion, even for subsecond sweeps."""
+    phase = spark_memory_phase(os.environ['CUTEAFD_SMOKE_URL'])
+    # Both hooks run after smoke has confirmed health; an older starting
+    # snapshot cannot make this known-ready boundary a loading sample.
+    if phase == 'loading':
+        phase = 'ready-idle'
+    hosts = job['entry'].get('sparks', [])
+    def sample(item):
+        rank, host = item
+        command = spark_memory_command(rank, host, 5)
+        command[-1] += ' once'
+        result = run(command, timeout=8)
+        row = json.loads(result.stdout)
+        if row['rank'] != rank or row['host'] != host:
+            raise ValueError('Spark boundary sampler identity mismatch')
+        row.update(phase=phase, boundary=boundary)
+        path = Path(job['state']) / f'memory-spark-rank{rank}-{boundary}.jsonl'
+        with path.open('w') as output:
+            output.write(json.dumps(row) + '\n')
+        if job.get('memory_guard_bytes', 0) and row['mem']['MemAvailable'] < job['memory_guard_bytes']:
+            stop_memory_worker(job, host)
+            raise RuntimeError(f'{host}: memory guard stopped this card worker at {boundary}')
+    if hosts:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+            list(pool.map(sample, enumerate(hosts)))
 
 
 def spark_memory_report(dest):
@@ -1334,7 +1375,7 @@ def observe(job):
                 # After the baseline's warm-up (the first part of the run), the
                 # trace must have records. Diagnostic only: the row decides.
                 try:
-                    active = (http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status').get('active') or {})
+                    active = (http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/bench/status', timeout=.5).get('active') or {})
                     # Past the first warm-up: 5% into the run, or (a run that skips
                     # the baseline starts its first panel at once) 60 s into it.
                     if active and (active.get('fraction', 0) >= .05 or active.get('elapsed_s', 0) >= 60):
@@ -1347,11 +1388,11 @@ def observe(job):
                                                      'ok': bool(size) or not speculating(job['entry']['set'])})
             if 'console' in job['probes']:
                 try:
-                    snapshot = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/console/snapshot')
+                    snapshot = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/console/snapshot', timeout=.5)
                     console.write(json.dumps({'time': time.time(), 'snapshot': snapshot}) + '\n')
                     console.flush()
                     if time.monotonic() >= policy_sample_at:
-                        stats = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/stats')
+                        stats = http(os.environ['CUTEAFD_SMOKE_URL'], '/v1/stats', timeout=.5)
                         policy.write(json.dumps({'time': time.time(), 'stats': stats}) + '\n')
                         policy.flush()
                         policy_sample_at = time.monotonic() + 1.
@@ -1389,17 +1430,26 @@ def observe(job):
                     sampler.kill()
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     sampler.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
+        # Give EOF a brief shared grace, then kill remaining SSH clients together
+        # before reaping, all against the same overall deadline.
+        eof_deadline = min(deadline, time.monotonic() + .15)
+        for child, _, _, _ in spark_samplers:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                child.wait(timeout=max(0, eof_deadline - time.monotonic()))
+        killed_sparks = set()
+        for child, _, _, _ in spark_samplers:
+            if child.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    child.kill()
+                    killed_sparks.add(child.pid)
         for child, spark_reader, output, error in spark_samplers:
             try:
-                child.wait(timeout=max(0, deadline - time.monotonic()) / max(1, len(spark_samplers)))
+                child.wait(timeout=max(0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                child.kill()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    child.wait(timeout=min(.05, max(0, deadline - time.monotonic())))
                 spark_errors.append('Spark memory sampler teardown timed out')
-            if child.returncode not in (None, 0):
+            if child.returncode not in (None, 0) and child.pid not in killed_sparks:
                 spark_errors.append(f'Spark memory sampler exit {child.returncode}; see {error.name}')
-            spark_reader.join(timeout=max(0, deadline - time.monotonic()) / max(1, len(spark_samplers)))
+            spark_reader.join(timeout=max(0, deadline - time.monotonic()))
             if spark_reader.is_alive():
                 spark_errors.append('Spark memory reader teardown timed out')
             else:
@@ -1850,7 +1900,8 @@ def summarize_job(job, exit_code):
     row['spark_memory'] = spark_memory_report(dest)
     row['memory_probe'] = dict(cadence_s=.05, spark_phase_refresh_s=1,
                                spark_guard_bytes=job.get('memory_guard_bytes', 0),
-                               spark_context='none; host /proc/meminfo, bytes')
+                               spark_context='none; host /proc/meminfo, bytes',
+                               spark_phase_note='sampled labels; 1 s polling and up to 2 s console snapshot age; explicit ready/post-sweep samples')
     row['ledger'] = ledger(dest)
     coordinator = {k: v for k, v in row['ledger']['device_used_peak_bytes'].items() if '.coordinator.log:' in k}
     row['memory_crosscheck'] = {'ledger_device_used_peak_bytes': coordinator, 'cuda_corrected_peak_bytes': {k: v['corrected_bytes'] for k, v in row['peaks'].items()}, 'note': 'ledger point-in-time samples vs CUDA 50ms high-water; differences are retained, not treated as identical samples'}
@@ -2094,6 +2145,15 @@ def write_summary(state, rows, arms):
                     text += '| ' + ' | '.join(map(cell, values)) + ' |\n'
         pauses = [p.get('health', {}).get('pause_counters', {}) for r in rows for phase in r.get('fabric', []) for p in phase.get('ports', []) if p.get('health')]
         text += '\nPFC pause: ' + ('per-priority deltas retained in JSON' if any(pauses) else 'unavailable in this report') + '. Retransmits cost goodput; no data is lost and results remain valid.\n\n'
+    if any(r.get('spark_memory') for r in rows):
+        text += '## Spark Host Memory\n\nHost /proc/meminfo; no Spark CUDA context. Sampled phase labels, not exact wave boundaries. Minima are bytes.\n\n'
+        text += '| Card | Arm | Repeat | Rank | Host | Phase | Samples | Minimum MemAvailable bytes |\n| --- | --- | ---: | ---: | --- | --- | ---: | ---: |\n'
+        for r in rows:
+            for rank, memory in r.get('spark_memory', {}).items():
+                for phase, values in [('all', memory), *memory['phases'].items()]:
+                    text += '| ' + ' | '.join(map(cell, [r['card'], r['arm'], r['repeat'], rank, memory['host'], phase,
+                                                       values['samples'], values['min_mem_available_bytes']])) + ' |\n'
+        text += '\n'
     text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Per-layer timing | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:
         trace = r.get('trace') or {}
@@ -2774,7 +2834,11 @@ def main():
     parser.add_argument('--precheck', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--preflight-job', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--census-final-sample', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--spark-memory-boundary', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.spark_memory_boundary:
+        spark_memory_boundary(json.loads(args.spark_memory_boundary.read_text()), 'post-sweep')
+        return 0
     if args.census_final_sample:
         census_final_sample(json.loads(args.census_final_sample.read_text()))
         return 0

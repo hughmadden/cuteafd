@@ -66,7 +66,7 @@ def test_console_observer_records_policy_stats(entry, tmp_path, monkeypatch):
     monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
     calls = []
 
-    def http(url, path):
+    def http(url, path, **kwargs):
         calls.append(path)
         if path == '/v1/stats':
             stop.touch()
@@ -3145,7 +3145,7 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
             time.sleep(0.01)
         time.sleep(2.0)
 
-    def http(url, path):
+    def http(url, path, **kwargs):
         if path == '/v1/stats':
             stop.touch()
             return {'dspark_policy': {}}
@@ -3462,3 +3462,197 @@ def test_spark_guard_checks_exact_owned_worker_mount(entry, tmp_path, monkeypatc
                 exec(program, {})
             assert not stopped
     monkeypatch.setattr(subprocess, 'run', real_run)
+
+
+@pytest.mark.parametrize('hosts', [[], ['moa', 'dodo']])
+def test_memory_observer_samples_selected_hosts_and_closes_streams(entry, tmp_path, monkeypatch, hosts):
+    import shlex
+    entry.update(sparks=hosts, set={'SPARK_COUNT': str(len(hosts))})
+    job = cards.generate(entry, 'candidate', dict(instance='streams-test', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'memory'}, None, 1)
+    stop = tmp_path / 'observer.stop'
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    real_popen = subprocess.Popen
+    selected, children = [], []
+
+    class Coordinator:
+        returncode = None
+        stderr = SimpleNamespace(read=lambda: '')
+        def poll(self):
+            return None
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    def popen(cmd, **kwargs):
+        if cmd[0] == 'docker':
+            kwargs['stdout'].write('{"devices":[{"gpu":0,"raw_bytes":3,"sampler_bytes":1,"corrected_bytes":2}]}\n')
+            kwargs['stdout'].flush()
+            if not hosts:
+                stop.touch()
+            return Coordinator()
+        assert cmd[0] == 'ssh' and cmd[-2] in hosts
+        args = shlex.split(cmd[-1])
+        selected.append((int(args[-3]), cmd[-2]))
+        child = real_popen([sys.executable, *args[1:]], **kwargs)
+        children.append(child)
+        return child
+
+    def phase(url):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if all((Path(job['state']) / f'memory-spark-rank{r}.jsonl').stat().st_size for r in range(len(hosts))):
+                stop.touch()
+                return 'ready-idle'
+            time.sleep(.01)
+        pytest.fail('selected Spark streams did not produce samples')
+
+    monkeypatch.setattr(cards.subprocess, 'Popen', popen)
+    monkeypatch.setattr(cards, 'run', lambda *args, **kwargs: None)
+    monkeypatch.setattr(cards, 'spark_memory_phase', phase)
+    cards.observe(job)
+    assert selected == list(enumerate(hosts))
+    assert all(child.returncode == 0 and child.stdin.closed for child in children)
+    summary = cards.spark_memory_report(Path(job['state']))
+    assert [summary[str(r)]['host'] for r in range(len(hosts))] == hosts
+    assert all(rank['samples'] > 0 and rank['min_mem_available_bytes'] > 0 for rank in summary.values())
+    assert cards.peaks(Path(job['state'])) == {'0': dict(raw_bytes=3, sampler_bytes=1, corrected_bytes=2)}
+
+
+def test_spark_memory_minima_are_in_text_summary(tmp_path):
+    row = dict(card='test', arm='probe', repeat=1, status='pass', simulated=False, spark_memory={
+        '2': dict(host='moa', samples=10, min_mem_available_bytes=2**30,
+                  phases={'decode': dict(samples=8, min_mem_available_bytes=2**30)})})
+    cards.write_summary(tmp_path, [row], {'probe': {}})
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'Spark Host Memory' in text and 'moa' in text and 'decode' in text
+    assert '1073741824' in text
+
+
+@pytest.mark.parametrize('ending', ['lifetime', 'lost-heartbeat'])
+def test_spark_memory_sampler_bounds_remote_lifetime(ending):
+    lifetime = '.15' if ending == 'lifetime' else '30'
+    source = cards.SPARK_MEMORY_SAMPLER
+    if ending == 'lost-heartbeat':
+        # Exercise the watchdog path without waiting five seconds in the suite.
+        source = source.replace('began - heartbeat > 5', 'began - heartbeat > .15')
+    child = subprocess.Popen([sys.executable, '-I', '-u', '-c', source, '0', 'ostrich', lifetime],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert child.wait(timeout=2) == 0, child.stderr.read()
+        assert json.loads(child.stdout.readline())['host'] == 'ostrich'
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+        child.stdin.close()
+
+
+def test_spark_memory_unit_error_identifies_field():
+    from unittest.mock import patch
+    from pathlib import Path as HostPath
+    from io import StringIO
+    with patch.object(HostPath, 'read_text', return_value='MemAvailable: 123 MB\n'), \
+         patch.object(sys, 'argv', ['sampler', '0', 'ostrich', '1']):
+        # The control channel is idle; the fixture reaches meminfo validation.
+        with patch('select.select', return_value=([], [], [])):
+            with pytest.raises(RuntimeError, match='MemAvailable.*unit'):
+                exec(cards.SPARK_MEMORY_SAMPLER, {})
+
+
+def test_observer_telemetry_calls_have_short_timeouts(entry, tmp_path, monkeypatch):
+    job = cards.generate(entry, 'candidate', dict(instance='http-test', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'console'}, None, 1, trace=True)
+    stop = tmp_path / 'observer.stop'
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    calls = []
+    def http(url, path, **kwargs):
+        calls.append((path, kwargs.get('timeout')))
+        if path == '/v1/stats':
+            stop.touch()
+        return {'active': None}
+    monkeypatch.setattr(cards, 'http', http)
+    monkeypatch.setattr(cards, 'console_frames', lambda *args: None)
+    cards.observe(job)
+    assert calls == [('/v1/bench/status', .5), ('/v1/console/snapshot', .5), ('/v1/stats', .5)]
+
+
+def test_spark_memory_boundaries_are_wired_and_merged(entry, tmp_path, monkeypatch):
+    entry.update(levels=[1], window=dict(open=dict(argv=['true'], timeout_s=10),
+                                       close=dict(argv=['echo', 'existing'], timeout_s=12)))
+    job = cards.generate(entry, 'probe', dict(instance='boundary', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, {'memory'}, None, 1)
+    assert '--precheck' in job['entry']['precheck']['argv']
+    close = job['entry']['window']['close']
+    assert 'existing' in str(close['argv']) and '--spark-memory-boundary' in str(close['argv'])
+    assert close['timeout_s'] == 32
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
+    phases = iter(['loading', 'ready-idle'])
+    monkeypatch.setattr(cards, 'spark_memory_phase', lambda url: next(phases))
+    real_run = subprocess.run
+    commands = []
+    def run(command, **kwargs):
+        import shlex
+        commands.append(command)
+        args = shlex.split(command[-1])
+        return real_run([sys.executable, *args[1:]], capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=kwargs['timeout'], check=True)
+    monkeypatch.setattr(cards, 'run', run)
+    cards.precheck(job)
+    cards.spark_memory_boundary(job, 'post-sweep')
+    assert len(commands) == 6
+    report = cards.spark_memory_report(Path(job['state']))
+    assert len(report) == 3
+    for rank in report.values():
+        assert rank['samples'] == 2 and rank['phases']['ready-idle']['samples'] == 2
+    for boundary in ['ready', 'post-sweep']:
+        sample = json.loads((Path(job['state']) / f'memory-spark-rank0-{boundary}.jsonl').read_text())
+        assert sample['boundary'] == boundary and sample['phase'] == 'ready-idle'
+
+
+def test_spark_teardown_kills_all_before_reaping(entry, tmp_path, monkeypatch):
+    from io import StringIO
+    entry.update(sparks=['moa', 'dodo'], set={'SPARK_COUNT': '2'})
+    job = cards.generate(entry, 'probe', dict(instance='teardown', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, {'memory'}, None, 1)
+    stop = tmp_path / 'observer.stop'
+    stop.touch()
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    events = []
+    class Child:
+        def __init__(self, pid):
+            self.pid, self.returncode = pid, None
+            self.stdin = StringIO()
+            self.stdout = StringIO(json.dumps(dict(rank=pid, host=entry['sparks'][pid],
+                phase='loading', mem={'MemAvailable': 1024})) + '\n')
+        def poll(self):
+            return self.returncode
+        def kill(self):
+            events.append(('kill', self.pid))
+            self.returncode = -9
+        def wait(self, timeout):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired('ssh', timeout)
+            events.append(('reap', self.pid, timeout))
+            return self.returncode
+    children = []
+    class Coordinator:
+        def wait(self, timeout):
+            return 0
+    def popen(cmd, **kwargs):
+        if cmd[0] == 'docker':
+            kwargs['stdout'].write('{"devices":[]}\n')
+            kwargs['stdout'].flush()
+            return Coordinator()
+        child = Child(len(children))
+        children.append(child)
+        return child
+    monkeypatch.setattr(cards.subprocess, 'Popen', popen)
+    monkeypatch.setattr(cards, 'run', lambda *args, **kwargs: None)
+    cards.observe(job)
+    assert events[:2] == [('kill', 0), ('kill', 1)]
+    assert [e[:2] for e in events[2:]] == [('reap', 0), ('reap', 1)]
+    assert all(e[2] > 2 for e in events[2:])
+    assert all(child.stdin.closed for child in children)

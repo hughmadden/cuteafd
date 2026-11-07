@@ -41,8 +41,12 @@ raw/corrected CUDA 50ms peaks (NVML sampler-context subtraction). The memory pro
 ledger peaks and authenticated console stage events. Spark memory is sampled
 from host `/proc/meminfo` at the same 50 ms cadence, without a CUDA context:
 `memory-spark-rankN.jsonl` retains byte-valued fields and sampled phase labels
-(refreshed once per second), and each result's `spark_memory` reports per-rank
-and per-phase minimum MemAvailable and field peaks. Streams end with the card,
+(refreshed once per second; console snapshots can be up to two seconds old,
+so these are not exact wave boundaries). Additional host samples at readiness
+and after each sweep go to `memory-spark-rankN-ready.jsonl` and
+`memory-spark-rankN-post-sweep.jsonl`, retaining their boundary provenance.
+Each result's `spark_memory` reports per-rank and per-phase minimum MemAvailable
+and field peaks; the text summary also lists minima. Streams end with the card,
 on observer EOF, or after a lost heartbeat. Optional `--spark-memory-guard`
 stops only this card's mount-verified WIP worker below 512 MiB MemAvailable;
 it never stops a foreign container. Explicit probes fail
