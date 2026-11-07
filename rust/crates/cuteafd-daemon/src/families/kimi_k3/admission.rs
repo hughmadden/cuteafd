@@ -1809,7 +1809,7 @@ pub(super) mod tests {
                 code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1, 1)?];
             i.startup = vec![super::super::graphs::demand(
                 &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
-            i.gpus[0] = GpuBudget { capacity_bytes: capacity, reserve_bytes: 2 << 30,
+            i.gpus[0] = GpuBudget { capacity_bytes: capacity, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
             Ok(i)
         };
@@ -1827,7 +1827,8 @@ pub(super) mod tests {
         let planned = devices[0];
         assert_eq!(planned.index, 0);
         let runtime_bytes = admitted.placement.items[0].iter().map(|item| item.bytes).sum::<u64>();
-        assert_eq!(planned.used_bytes(), runtime_bytes + (2 << 30));
+        // The plan's named-reserve item (absent at the default 0) is the runtime's kept-free bytes.
+        assert_eq!(planned.used_bytes(), runtime_bytes + cuteafd_loader::placement::reserve::gpu("kimi_k3"));
         let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
         assert_eq!(planned.items.iter().filter(|item| item.category == Category::Prefix)
             .map(|item| item.bytes).sum::<u64>(), mark_bytes * marks as u64);
@@ -2007,7 +2008,7 @@ pub(super) mod tests {
                 // Model an identical post-module sample: context + resident code are
                 // already allocated, while BLAS and private head handles are future.
                 let resident = code.bytes - arch.cublas_bytes;
-                i.gpus[rank] = GpuBudget { capacity_bytes: capacity, reserve_bytes: 2 << 30,
+                i.gpus[rank] = GpuBudget { capacity_bytes: capacity, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
                     baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
                 i.fixed.push(super::super::startup::code_demand(rank,
                     code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1)?);
@@ -2052,7 +2053,7 @@ pub(super) mod tests {
                 assert_eq!(planned_marks, mark_bytes as u64 / 2 * marks,
                     "rank {rank}, concurrency {slots}, {format}: planner must charge runtime staging marks");
                 let runtime_bytes = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
-                assert_eq!(planned.used_bytes(), runtime_bytes + (2 << 30),
+                assert_eq!(planned.used_bytes(), runtime_bytes + cuteafd_loader::placement::reserve::gpu("kimi_k3"),
                     "rank {rank}, {format}: installed planner and runtime must charge identical owners");
             }
             assert!(admitted.placement.pool_tokens >= context as u64);
