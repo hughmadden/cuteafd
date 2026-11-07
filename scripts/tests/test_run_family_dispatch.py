@@ -1381,6 +1381,10 @@ def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary:
 def capture_muse_real_planner_launch(snapshot: Path, example: Path, binary: Path,
                                      programs: Path, hf_home: Path, temporary: Path) -> None:
     """Muse's shipped min/max configs through the real launcher and contract."""
+    drafter = "models--nvidia--Muse-Spark-Open-816B-A42B-DFlash2"
+    hub = temporary / "hf" / "hub"
+    hub.mkdir(parents=True, exist_ok=True)
+    (hub / drafter).symlink_to((hf_home / "hub" / drafter).resolve(), target_is_directory=True)
     _, deployment = _capture_real_planner_launch(snapshot, example, binary, programs, hf_home,
         temporary, "test/muse-real-plan", "muse_spark")
     assert deployment["prefill_waves"] == 3, deployment
