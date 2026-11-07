@@ -151,6 +151,15 @@ pub struct RingRun {
     pub rows: u64,
 }
 
+/// The one sliding-window ring size: the window plus the rows a kernel reads
+/// at once (one decode/verify step, or one staged prefill unit), page aligned.
+/// Caches, planners and exporters size every append ring through this rule.
+/// A ring sized by a whole multi-wave prefill reserve is oversized: the
+/// kernel stages or reads one step at a time, never the reserve.
+pub fn swa_ring(window: u64, step: u64, page: u64) -> Option<AppendRing> {
+    AppendRing::new(window, step, page)
+}
+
 impl AppendRing {
     pub fn new(window: u64, step: u64, alignment: u64) -> Option<Self> {
         if window == 0 || step == 0 || alignment == 0 { return None; }
@@ -185,6 +194,18 @@ impl AppendRing {
 #[cfg(test)]
 mod append_ring_tests {
     use super::*;
+
+    #[test]
+    fn swa_ring_sizes_the_window_plus_one_step_and_fails_closed() {
+        let ring = swa_ring(512, 2752, 64).unwrap();
+        assert_eq!((ring.window, ring.step, ring.rows), (512, 2752, 3264));
+        assert!(ring.proposal(0, 2752).is_some());
+        assert!(ring.proposal(0, 2753).is_none());
+        // A whole three-wave reserve is never the step.
+        assert!(swa_ring(512, 3 * 2752, 64).unwrap().rows > ring.rows);
+        assert!(swa_ring(0, 1, 64).is_none() && swa_ring(512, 0, 64).is_none()
+            && swa_ring(512, 1, 0).is_none());
+    }
 
     #[test]
     fn proposal_never_overwrites_visible_rows_including_wraps() {

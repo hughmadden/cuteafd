@@ -71,22 +71,31 @@ pub struct Step5CacheLayout {
     pub mtp_hidden_rows: u64,
     /// Target SWA rings: [`swa_ring`] of one prefill unit.
     pub ring: cuteafd_core::prefix::AppendRing,
-    /// Predictor SWA rings: a predictor appends a whole step in one call.
+    /// Predictor SWA rings: [`swa_ring`] of one prefill unit too. A predictor
+    /// appends at most one unit per call (`catch_up` chunks by unit capacity,
+    /// the draft appends `depth + 1` rows), never the whole wave.
     pub mtp_ring: cuteafd_core::prefix::AppendRing,
+    /// Predictor hidden history: `window + stages + 1` (the teacher shift
+    /// through every stage) plus one whole step, page aligned. Target hidden
+    /// rows are published for a complete prefill step at once, so this ring
+    /// keeps the step rows; `None` without MTP.
+    pub mtp_history: Option<cuteafd_core::prefix::AppendRing>,
     /// Rows one step may carry (the prefill reserve): staging and step admission.
     pub step_rows: u64,
     window: u64,
 }
 
-/// The target SWA ring: `window + unit_rows`, page aligned. A unit's K/V are
-/// staged into the ring before its attention reads them (`Step::stage`, then
-/// `Step::attend`, in order on one lane stream), so the ring holds the window
-/// plus the rows of one unit. Units of a sequence stage, attend and commit in
-/// order on that stream, so a whole multi-unit step never occupies the ring at
-/// once: sizing by the prefill reserve only wastes memory. The cache layout,
-/// staging, step metadata (ring page tables) and the planner all read this.
+/// The SWA ring: `window + rows a kernel reads in one call`, page aligned.
+/// A target unit's K/V are staged into the ring before its attention reads
+/// them (`Step::stage`, then `Step::attend`, in order on one lane stream), so
+/// the ring holds the window plus the rows of one unit. Units of a sequence
+/// stage, attend and commit in order on that stream, so a whole multi-unit
+/// step never occupies the ring at once: sizing by the prefill reserve only
+/// wastes memory. Predictors run one unit per call for the same reason. The
+/// cache layout, staging, step metadata (ring page tables) and the planner
+/// all read [`cuteafd_core::prefix::swa_ring`].
 pub fn swa_ring(window: u64, unit_rows: u64) -> Option<cuteafd_core::prefix::AppendRing> {
-    cuteafd_core::prefix::AppendRing::new(window, unit_rows, PAGE_ROWS)
+    cuteafd_core::prefix::swa_ring(window, unit_rows, PAGE_ROWS)
 }
 
 fn invalid(what: &'static str) -> CacheGeometryError {
@@ -117,8 +126,9 @@ impl RankState {
 
 impl Step5CacheLayout {
     /// Selected K/V, BF16 pending K/Z, E4M3 dense summaries; recurrence stays F32.
-    /// `unit_rows` sizes the target SWA rings ([`swa_ring`]); `step_rows` (at
-    /// least one unit) sizes staging, predictor rings and the hidden history.
+    /// `unit_rows` sizes every SWA ring ([`swa_ring`]: target and predictor);
+    /// `step_rows` (at least one unit) sizes staging and the target hidden
+    /// history, which one step publishes for later steps.
     pub fn new(cfg: &Config, ranks: usize, context: u64, mtp: usize, unit_rows: u64, step_rows: u64,
         kv_format: Qwen4KvCache) -> Result<Self, CacheGeometryError> {
         Self::build(cfg, ranks, context, mtp, unit_rows, step_rows, kv_format, None)
@@ -152,16 +162,21 @@ impl Step5CacheLayout {
         let mtp_owner = ownership.map_or(0, |o| usize::from(o.execution().spec().head_gpu));
         let window = cfg.window as u64;
         let ring = swa_ring(window, unit_rows).ok_or_else(|| invalid("append-only ring step or extent"))?;
-        let mtp_ring = cuteafd_core::prefix::AppendRing::new(window, step_rows, PAGE_ROWS)
+        // A predictor appends at most one unit (a catch-up chunk or the
+        // triangular draft), so its rings follow the target's: window + unit.
+        let mtp_ring = swa_ring(window, unit_rows)
             .ok_or_else(|| invalid("predictor ring step or extent"))?;
         // Preserve the old frontier while appending a complete uncommitted wave,
-        // including the teacher shift through all predictor stages.
-        let mtp_hidden_rows = if mtp == 0 { 0 } else {
+        // including the teacher shift through all predictor stages. Target
+        // hidden rows are published for a whole step at once, so this ring
+        // keeps `step_rows`, unlike the predictor K/V rings above.
+        let mtp_history = if mtp == 0 { None } else {
             let history_window = window.checked_add(mtp as u64 + 1)
                 .ok_or(CacheGeometryError::Overflow("Step-5 MTP history window"))?;
-            cuteafd_core::prefix::AppendRing::new(history_window, step_rows, PAGE_ROWS)
-                .ok_or_else(|| invalid("MTP append-only history extent"))?.rows
+            Some(cuteafd_core::prefix::swa_ring(history_window, step_rows, PAGE_ROWS)
+                .ok_or_else(|| invalid("MTP append-only history extent"))?)
         };
+        let mtp_hidden_rows = mtp_history.map_or(0, |ring| ring.rows);
         let mut states = Vec::with_capacity(ranks);
         let mut costs = Vec::with_capacity(ranks);
         for rank in 0..ranks {
@@ -228,7 +243,7 @@ impl Step5CacheLayout {
                     else { KvPlacement::PartitionedHeads },
                 ranks: costs,
             },
-            context, kv_format, mtp_hidden_rows, ring, mtp_ring, step_rows, window,
+            context, kv_format, mtp_hidden_rows, ring, mtp_ring, mtp_history, step_rows, window,
         })
     }
 
@@ -294,10 +309,7 @@ impl Step5CacheLayout {
             parts.push((component, 0, 0, component.bytes));
         }
         if let Some(target) = state.mtp_hidden {
-            let history = cuteafd_core::prefix::AppendRing {
-                window: self.window + stages.len() as u64 + 1,
-                step: self.step_rows, rows: self.mtp_hidden_rows,
-            };
+            let history = self.mtp_history.ok_or_else(|| invalid("MTP hidden history ring"))?;
             for (component, end) in std::iter::once((target, frontier))
                 .chain(state.mtp_stage_hidden.iter().copied().zip(stages.iter().copied())) {
                 let row = component.bytes / history.rows;
