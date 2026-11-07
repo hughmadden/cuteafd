@@ -191,6 +191,55 @@ mod tests {
     }
 
     #[test]
+    fn whole_mla_and_k6_keep_rank_local_views() -> Result<()> {
+        use cuteafd_loader::{plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot, t},
+            placement::{AttentionPlacement, FfnMode},
+            families::glm5_flash::{core, resident::{resident_weights_placed, GlmfRepresentation}}};
+        let root = tempfile::tempdir()?;
+        let config = glm5_flash_config(4);
+        let cfg = GlmNextConfig::from_hf(&config)?;
+        let expected = core::expected(&cfg);
+        let mut tensors = glm5_flash_tensors(&config);
+        tensors.retain(|tensor| !expected.keys().any(|name| {
+            let stem = name.strip_suffix(".weight").unwrap();
+            tensor.name == *name || tensor.name == format!("{name}_scale_inv") || tensor.name.starts_with(&format!("{stem}.trellis"))
+        }));
+        for (name, shape) in expected {
+            let stem = name.strip_suffix(".weight").unwrap();
+            let (n, k) = (shape[0], shape[1]);
+            tensors.extend([t(format!("{stem}.trellis"), "I16", &[k/16, n/16, 96]),
+                t(format!("{stem}.suh"), "F16", &[k]), t(format!("{stem}.svh"), "F16", &[n]),
+                t(format!("{stem}.mcg"), "I32", &[1])]);
+        }
+        write_snapshot(root.path(), &config, &tensors, None);
+        let checkpoint = Checkpoint::open(root.path())?;
+        for ranks in [1, 2] { for first_owner in 0..ranks {
+            let attention = if ranks == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads };
+            let mut owner = first_owner;
+            let modes = cfg.attention.iter().map(|&kind| {
+                if ranks == 2 && kind == GlmNextAttention::Mla {
+                    let mode = LayerMode::Whole { gpu: owner as u8, ffn: FfnMode::Split };
+                    owner ^= 1;
+                    mode
+                } else { LayerMode::HeadSplit }
+            }).collect::<Vec<_>>();
+            let old = resident_weights_placed(&checkpoint, &cfg, cfg.layers, ranks,
+                GlmfRepresentation::default(), attention, first_owner).map_err(anyhow::Error::msg)?;
+            let layouts = target(&checkpoint, &cfg, &modes, ranks, KdaFp8::Row128, false, true, None)?;
+            for (rank, layout) in layouts.iter().enumerate() {
+                check(layout);
+                assert_eq!(layout.payload_bytes() as u64, old[rank].weights, "native rank {rank}/{ranks}");
+                for (layer, mode) in modes.iter().enumerate() {
+                    if matches!(mode, LayerMode::Whole { gpu, .. } if usize::from(*gpu) != rank) {
+                        assert!(!layout.views().keys().any(|name| name.starts_with(&format!("{PREFIX}layers.{layer}.self_attn."))));
+                    }
+                }
+            }
+        }}
+        Ok(())
+    }
+
+    #[test]
     fn installed_cpu_inventory() -> Result<()> {
         let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_GLMF") else { return Ok(()) };
         let checkpoint = Checkpoint::coordinator(std::path::Path::new(&snapshot), false, false)?;
