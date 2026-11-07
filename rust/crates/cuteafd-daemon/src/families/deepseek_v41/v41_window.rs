@@ -242,7 +242,7 @@ pub(crate) struct WindowWeights<'a> {
     scales: DeviceAllocation<'a>,
 }
 impl<'a> WindowWeights<'a> {
-    fn names(layer: usize) -> Result<[String; 3]> {
+    pub(super) fn names(layer: usize) -> Result<[String; 3]> {
         ensure!(layer < 40, "invalid backbone window layer");
         Ok([
             format!("layers.{layer}.attn.wkv.weight"),

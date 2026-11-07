@@ -22,7 +22,7 @@ pub(crate) struct AttentionOutputWeights<'a> {
     scales: Option<DeviceAllocation<'a>>,
 }
 impl<'a> AttentionOutputWeights<'a> {
-    fn names(layer: usize) -> Result<[String; 4]> {
+    pub(super) fn names(layer: usize) -> Result<[String; 4]> {
         ensure!(layer < 40, "invalid backbone output layer");
         Ok([
             format!("layers.{layer}.attn.wo_a.weight"),

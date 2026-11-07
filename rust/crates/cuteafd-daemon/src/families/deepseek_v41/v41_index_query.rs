@@ -23,7 +23,7 @@ pub(crate) struct IndexQueryWeights<'a> {
     scales: DeviceAllocation<'a>,
 }
 impl<'a> IndexQueryWeights<'a> {
-    fn names(layer: usize) -> Result<[String; 3]> {
+    pub(super) fn names(layer: usize) -> Result<[String; 3]> {
         ensure!(
             [2, 8, 14, 20, 24, 28, 32, 36].contains(&layer),
             "layer has no learned index query producer"

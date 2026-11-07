@@ -64,7 +64,7 @@ pub(crate) struct BackboneSharedWeights<'a> {
     scales: Vec<DeviceAllocation<'a>>,
 }
 impl<'a> BackboneSharedWeights<'a> {
-    fn names(layer: usize) -> Result<Vec<String>> {
+    pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         ensure!(layer < 40, "invalid backbone shared FFN layer");
         Ok(["w1", "w3", "w2"]
             .into_iter()

@@ -25,7 +25,7 @@ impl<'a> BackboneHcWeights<'a> {
             ffn.prepare_binding(&self.tensors, Self::names(self.layer, false)?)?,
         ])
     }
-    fn names(layer: usize, attention: bool) -> Result<[String; 4]> {
+    pub(super) fn names(layer: usize, attention: bool) -> Result<[String; 4]> {
         ensure!(layer < 40, "invalid backbone mHC layer");
         let kind = if attention { "attn" } else { "ffn" };
         Ok([

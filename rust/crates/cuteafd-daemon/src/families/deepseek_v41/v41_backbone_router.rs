@@ -78,7 +78,7 @@ fn request_hidden_format(nvfp4: bool) -> (cuteafd_transport::ExpertV2Dtype, usiz
     }
 }
 impl<'a> BackboneRouterWeights<'a> {
-    fn names(layer: usize) -> Result<Vec<String>> {
+    pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         ensure!(layer < 40, "invalid backbone router layer");
         Ok(["weight", "bias", "bias_vl"]
             .map(|n| format!("layers.{layer}.ffn.gate.{n}"))

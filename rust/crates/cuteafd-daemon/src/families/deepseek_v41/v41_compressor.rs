@@ -289,7 +289,7 @@ pub(crate) struct CompressorWeights<'a> {
     names: Vec<String>,
 }
 impl<'a> CompressorWeights<'a> {
-    fn names(layer: usize) -> Result<Vec<String>> {
+    pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         let suffixes = if ratio(layer)? == 2 {
             vec!["wkv", "norm", "wgate"]
         } else {
