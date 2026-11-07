@@ -19,8 +19,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "examples" / "configs"
 STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|nvfp4)-reply)?\.config$")
-TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
-         "tp3ep2-native.config", "tp4ep1-explicit-native.config", "tp6ep1-native.config"}
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
@@ -102,7 +100,7 @@ POOL_EXCEPTIONS = {("deepseek_v41", "POOL_TOKENS"): "auto"}
 
 
 def starting_configs() -> list[Path]:
-    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in TP_EP | QUALIFICATION | V4_PREP)
+    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in QUALIFICATION | V4_PREP)
 
 
 def keys(path: Path) -> dict[str, str]:
@@ -637,10 +635,6 @@ def test_ml4_smoke_entries_use_published_examples_and_minimum_sparks() -> None:
         assert len(entry["sparks"]) == sparks and entry["set"]["SPARK_COUNT"] == str(sparks)
         assert not any(k.startswith(f"SPARK_{sparks}_") for k in entry["set"])
         assert keys(ROOT / entry["config"])["SPECULATOR"] == "dspark"
-
-
-def test_tp_ep_examples_are_left_alone() -> None:
-    assert TP_EP <= {p.name for p in EXAMPLES.glob("*.config")}
 
 
 def test_qualification_configs_exist_and_are_listed() -> None:

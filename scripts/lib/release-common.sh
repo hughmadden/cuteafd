@@ -295,10 +295,9 @@ release_need() {
 #   ./run.sh                          preflight, launch, readiness, EXIT teardown
 #   ./stop.sh, release_stop_*         container teardown
 #   ./push-containers.sh              publishing the Spark image from SPARK_0_HOST
-# The standalone NOT-LAUNCH-READY harnesses - scripts/launch/run-tp-ep-native-candidate.sh
-# and wip.sh - are deliberately outside this contract. They keep
-# their own ssh forms (per-host bind addresses, argv rendered into a command string)
-# and are not release-pipeline-verified; they join when integrated, not before.
+# The standalone NOT-LAUNCH-READY harness wip.sh is deliberately outside this
+# contract. It keeps its own ssh forms (per-host bind addresses, argv rendered
+# into a command string) and is not release-pipeline-verified.
 #
 # These are declarations only: nothing here changes behavior until a script calls
 # release_configure_ssh_transport or release_ssh, so a script that keeps its own

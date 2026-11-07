@@ -254,8 +254,8 @@ import pytest  # noqa: E402
 
 
 def _load_width_fixture():
-    path = Path(__file__).with_name("tp_ep_width_cmake_fixture.py")
-    spec = importlib.util.spec_from_file_location("tp_ep_width_cmake_fixture", path)
+    path = Path(__file__).with_name("spark_tp_width_cmake_fixture.py")
+    spec = importlib.util.spec_from_file_location("spark_tp_width_cmake_fixture", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

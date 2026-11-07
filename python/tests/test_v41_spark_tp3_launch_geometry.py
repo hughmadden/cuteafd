@@ -19,7 +19,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "python" / "tools"
 GEOMETRY = TOOLS / "lib" / "v41_spark_tp3_launch_geometry.py"
-QUALIFIER = TOOLS / "qualify" / "deepseek_v41" / "qualify_v41_replicated_native.py"
+QUALIFIER = TOOLS / "qualify" / "deepseek_v41" / "qualify_v41_spark_tp_native.py"
 SLICES = TOOLS / "aot" / "export_b12x_slices_aot.py"
 CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
 

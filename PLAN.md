@@ -1673,9 +1673,7 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    deterministic) cuts the GPU-only 8K prefill 2.89 -> 2.57 s, but 8K with
    Sparks stays 2.95 s (GPU wait 2.11 -> 1.45 s, Spark wait up): the GB10
    wave is the bound. Lanes 2 or 4 lose to 3.
-   Verify layouts (busiest-rank expert reads, uniform routes): TP6 beats
-   TP2xEP3 up to 16 rows (1.50 vs 2.02 expert-equivalents at 1 row, 10.8 vs
-   11.2 at 8) and loses by 1-8% only at 32-64 rows; keep TP6. DFlash2 at max
+   DFlash2 at max
    (TP6 + split, code C1): adaptive 66-68 tok/s vs fixed 7/5/3 at 65/62/61;
    offline trace scoring with the measured TP6 table: adaptive 72.9 vs best
    fixed 62.7 (oracle 83.3) — the policy is not the limit.

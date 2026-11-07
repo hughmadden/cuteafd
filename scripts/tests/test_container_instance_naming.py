@@ -22,7 +22,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 COMMON = ROOT / "scripts" / "lib" / "release-common.sh"
 STOP = ROOT / "stop.sh"
-CANDIDATE = ROOT / "scripts" / "launch" / "run-tp-ep-native-candidate.sh"
 
 DOCKER_STUB = """#!/usr/bin/env bash
 set -euo pipefail
@@ -135,43 +134,6 @@ def test_stop_targets_only_the_instances_coordinator(tmp_path, instance, expecte
     # satisfied by, the shared name.
     assert f"stop -t 30 {other}" not in lines
     assert f"rm -f {other}" not in lines
-
-
-def test_candidate_launcher_refuses_every_namespaced_production_name():
-    """The candidate launcher may not start or stop any production name, and a
-    namespaced launch is a production name: `cuteafd-coordinator-*` joins the
-    list, so an INSTANCE launcher cannot be hijacked either."""
-    text = CANDIDATE.read_text(encoding="utf-8")
-    line = next(
-        line for line in text.splitlines()
-        if line.strip().startswith("cuteafd-coordinator|") and "spark-expert" in line
-    )
-    pattern = line.strip().rstrip(")")
-    assert "cuteafd-coordinator-*" in pattern
-    harness = (
-        "set -euo pipefail\n"
-        "for name in \"$@\"; do\n"
-        "  case \"$name\" in\n"
-        f"    {pattern}) printf 'refused %s\\n' \"$name\" ;;\n"
-        "    *) printf 'allowed %s\\n' \"$name\" ;;\n"
-        "  esac\n"
-        "done\n"
-    )
-    result = subprocess.run(
-        ["bash", "-c", harness, "_", "cuteafd-coordinator", "cuteafd-coordinator-wip",
-         "cuteafd-coordinator-own", "cuteafd-spark-expert",
-         "cuteafd-spark-expert-ostrich-19441", "cuteafd-tpep-dev"],
-        capture_output=True, text=True, timeout=60, check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "refused cuteafd-coordinator",
-        "refused cuteafd-coordinator-wip",
-        "refused cuteafd-coordinator-own",
-        "refused cuteafd-spark-expert",
-        "refused cuteafd-spark-expert-ostrich-19441",
-        "allowed cuteafd-tpep-dev",
-    ]
 
 
 @pytest.mark.parametrize("instance", ["", "plat-robust", "agent.2_ab-cd"])

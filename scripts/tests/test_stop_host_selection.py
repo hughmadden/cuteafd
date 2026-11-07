@@ -171,13 +171,6 @@ class StopHostScopeTest(StopHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(set(self.hosts(lines))), sorted(SIX_HOSTS))
 
-    def test_explicit_example_six_host_config_stops_all_six(self):
-        """The reported --config example configuration must clean every rank."""
-        result, lines, _ = self.run_stop(
-            "--config", str(EXAMPLES / "tp3ep2-native.config"))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sorted(set(self.hosts(lines))), sorted(SIX_HOSTS))
-
     def test_six_host_config_without_spark_count_stops_all_six(self):
         """A six-host file that omits SPARK_COUNT still cleans all six hosts."""
         config = write_config(self.root / "six-hosts-no-count.config", SIX_HOSTS)

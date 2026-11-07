@@ -3914,8 +3914,7 @@ def test_memory_keys_are_accepted_for_cleanup_and_native_launchers(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout.split() == ["--gpu-memory-cap", "32GiB", "--spark-reserve", "3GiB",
                                      "--kv-max-tokens", "4194304"]
-    for file in ("scripts/launch/run-family.sh", "scripts/launch/run-tp-ep-native-candidate.sh"):
-        assert "release_memory_args" in (ROOT / file).read_text()
+    assert "release_memory_args" in (ROOT / "scripts/launch/run-family.sh").read_text()
 
 
 @pytest.mark.parametrize("keys,expected", [
