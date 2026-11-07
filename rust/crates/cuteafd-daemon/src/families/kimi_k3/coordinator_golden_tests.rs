@@ -121,7 +121,40 @@ pub(crate) fn installed(snapshot: &std::path::Path) -> Result<Installed> {
     Ok(Installed { checkpoint, cfg, core })
 }
 
-/// Every golden operand through the coordinator loader, each owner on its GPU.
+// The standalone path is a test-only before-packing byte oracle, not a loader.
+fn baseline_operands<'a>(device: Device<'a>, operands: BTreeMap<&'static str, Vec<u8>>)
+    -> Result<BTreeMap<&'static str, Allocation<'a>>> {
+    operands.into_iter().map(|(name, bytes)| {
+        let owner = Allocation::new(device, bytes.len())?;
+        device.run(|| device.library.copy_h2d(owner.buffer, &bytes))?;
+        Ok((name, owner))
+    }).collect()
+}
+
+fn baseline_global<'a>(device: Device<'a>, layout: &GlobalLayout, packed: PackedGlobal)
+    -> Result<GlobalWeights<'a>> {
+    layout.check(&packed)?;
+    let operands = baseline_operands(device, packed.operands)?;
+    let core_head = packed.core_head.map(|head| layout.core_head.as_ref().unwrap().upload(device, head)).transpose()?;
+    Ok(GlobalWeights { operands, core_head })
+}
+
+fn baseline_layer<'a>(device: Device<'a>, layout: &LayerLayout, packed: PackedLayer)
+    -> Result<LayerWeights<'a>> {
+    layout.check(&packed)?;
+    let operands = baseline_operands(device, packed.operands)?;
+    let core = packed.core.into_iter().map(|(name, loaded)|
+        Ok((name, layout.core[name].upload(device, loaded)?))).collect::<Result<_>>()?;
+    let native = packed.native.into_iter().map(|(name, bytes)| device.run(|| {
+        let values = crate::shared::memory::DeviceAllocation::new(device.library, bytes.len())?;
+        device.library.copy_h2d(values.buffer, &bytes)?;
+        Ok((name, crate::shared::native_attention::NativeAttentionWeights {
+            layout: layout.native[name].clone(), values, scales: None }))
+    })).collect::<Result<_>>()?;
+    Ok(LayerWeights { operands, attention: packed.attention, core, native })
+}
+
+/// Every golden operand through the independent host packer, on its own GPU.
 pub(crate) fn mount(library: &NativeLibrary, model: &Installed, out: &mut Digests) -> Result<()> {
     mount_for_ranks(library, model, 2, out)
 }
@@ -138,14 +171,14 @@ fn mount_for_ranks(library: &NativeLibrary, model: &Installed, ranks: usize, out
     let read = |name: &str| read_tensor(&model.checkpoint, name);
     let globals = GlobalLayout::ranks_with_core(&model.cfg, &model.core, ranks)?;
     for (rank, layout) in globals.iter().enumerate() {
-        let weights = layout.upload(devices[rank], layout.pack(&model.cfg, read)?)?;
+        let weights = baseline_global(devices[rank], layout, layout.pack(&model.cfg, read)?)?;
         global_digests(library, rank, &weights, out)?;
     }
     for (layer, mode) in fixture_layers(&model.cfg, ranks)? {
         let layouts = LayerLayout::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks)?;
         let packed = PackedLayer::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks, read)?;
         for ((rank, packed), layout) in packed.into_iter().enumerate().zip(&layouts) {
-            let weights = LayerWeights::upload(devices[rank], packed, layout, layout.bytes()?)?;
+            let weights = baseline_layer(devices[rank], layout, packed)?;
             layer_digests(library, &format!("layers.{layer}.{}.{rank}", mode_tag(mode)), &weights, out)?;
         }
     }

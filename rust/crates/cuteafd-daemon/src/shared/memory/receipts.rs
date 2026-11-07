@@ -273,9 +273,14 @@ impl<'a> Inventory<'a> {
         use cuteafd_loader::placement::planner::{Device, Domain};
         let mut uploads = Vec::new();
         let mut observed = std::collections::BTreeSet::new();
+        let backings = self.receipts.iter().filter_map(|receipt|
+            receipt.allocation.view.as_ref().map(|view| view.backing.as_str())).collect::<std::collections::BTreeSet<_>>();
         for receipt in &self.receipts {
             let allocation = &receipt.allocation;
             if allocation.location.domain != Domain::Device { continue; }
+            // A physical root is not an upload destination. Its offset-zero
+            // alias can share its address, but owns the logical staging key.
+            if allocation.view.is_none() && backings.contains(allocation.id.as_str()) { continue; }
             let Device::Coordinator(rank) = allocation.location.device else {
                 anyhow::bail!("ordered upload destination is not coordinator-owned");
             };

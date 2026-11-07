@@ -296,7 +296,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
                 let [n, k] = layout.shape;
                 let (values, scales) = device.run(|| Ok((
                     DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.values"), (n * k * if layout.fp8 { 1 } else { 2 }).max(256))?),
-                    if layout.fp8 { Some(DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.scales"), (n / 128 * (k / 128) * 4).max(256))?)) } else { None },
+                    if layout.fp8 { Some(DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.scales"), (n.div_ceil(128) * k.div_ceil(128) * 4).max(256))?)) } else { None },
                 )))?;
                 let records = attention_records(&scoped.checkpoint.snapshot, &selected, scoped.checkpoint.attention_mode(),
                     layout, crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,

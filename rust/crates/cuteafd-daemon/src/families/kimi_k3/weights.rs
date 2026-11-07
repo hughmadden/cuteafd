@@ -64,6 +64,7 @@ impl GlobalLayout {
             .with_resident_weights(cuteafd_loader::placement::ResidentWeights(bytes)))
     }
 
+    #[cfg(test)]
     pub(crate) fn pack(&self, cfg: &KimiK3Config, mut read: impl FnMut(&str) -> Result<LoadedTensor>) -> Result<PackedGlobal> {
         ensure!(self.rank < 2, "Kimi global rank outside admission");
         let whole = self.rank == 0 && self.operands.contains_key("output.norm");
@@ -102,6 +103,7 @@ impl GlobalLayout {
         Ok(packed)
     }
 
+    #[cfg(test)]
     fn check(&self, packed: &PackedGlobal) -> Result<()> {
         ensure!(packed.rank == self.rank && packed.operands.len() == self.operands.len()
             && self.operands.iter().all(|(name, bytes)| packed.operands.get(name).is_some_and(|data| data.len() == *bytes)),
@@ -110,22 +112,9 @@ impl GlobalLayout {
         if let (Some(layout),Some(head))=(&self.core_head,&packed.core_head) {layout.check(head)?;}
         Ok(())
     }
-
-    pub(super) fn upload<'a>(&self, device: Device<'a>, packed: PackedGlobal) -> Result<GlobalWeights<'a>> {
-        self.check(&packed)?;
-        let operands = packed.operands.into_iter().map(|(name, bytes)| {
-            let _scope = cuteafd_ffi::memory_ledger::scope("weights/kimi global weights");
-            let allocation = Allocation::new(device, bytes.len())?;
-            ensure!(allocation.buffer.bytes == bytes.len() && allocation.buffer.device_id == device.id,
-                "Kimi global allocation differs from admitted extent/device");
-            device.run(|| device.library.copy_h2d(allocation.buffer, &bytes))?;
-            Ok((name, allocation))
-        }).collect::<Result<_>>()?;
-        let core_head=packed.core_head.map(|head|self.core_head.as_ref().unwrap().upload(device,head)).transpose()?;
-        Ok(GlobalWeights { operands, core_head })
-    }
 }
 
+#[cfg(test)]
 pub(crate) struct PackedGlobal {
     rank: usize,
     operands: BTreeMap<&'static str, Vec<u8>>,
@@ -459,31 +448,6 @@ impl<'a> LayerWeights<'a> {
             && weight.scales.as_ref().is_none_or(|scales| scales.buffer.device_id == device.id)),
             "Kimi native attention owner differs from lane device");
         Ok(())
-    }
-
-    /// `charged_bytes` is the exact weight demand accepted by shared startup
-    /// admission, not available CUDA bytes or an independent family budget.
-    /// Uploads are synchronous; no queued work can outlive error cleanup here.
-    pub(crate) fn upload(device: Device<'a>, packed: PackedLayer, layout: &LayerLayout,
-        charged_bytes: usize) -> Result<Self> {
-        layout.check(&packed)?;
-        ensure!(layout.bytes()? == charged_bytes, "Kimi layer layout differs from admitted weight bytes");
-        let operands = packed.operands.into_iter().map(|(name, bytes)| {
-            ensure!(!bytes.is_empty(), "Kimi operand {name} is empty");
-            let _scope = cuteafd_ffi::memory_ledger::scope("weights/kimi layer weights");
-            let allocation = Allocation::new(device, bytes.len())?;
-            device.run(|| device.library.copy_h2d(allocation.buffer, &bytes))?;
-            Ok((name, allocation))
-        }).collect::<Result<_>>()?;
-        let core = packed.core.into_iter().map(|(name, loaded)|
-            Ok((name, layout.core[name].upload(device, loaded)?))).collect::<Result<_>>()?;
-        let native = packed.native.into_iter().map(|(name, bytes)| device.run(|| {
-            let values = crate::shared::memory::DeviceAllocation::new(device.library, bytes.len())?;
-            device.library.copy_h2d(values.buffer, &bytes)?;
-            Ok((name, crate::shared::native_attention::NativeAttentionWeights {
-                layout: layout.native[name].clone(), values, scales: None }))
-        })).collect::<Result<_>>()?;
-        Ok(Self { operands, attention: packed.attention, core, native })
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {

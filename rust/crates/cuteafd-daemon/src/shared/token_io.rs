@@ -141,7 +141,7 @@ impl<'a> TokenEmbedding<'a> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::Lifetime;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
-            Lifetime::TARGET, Category::Weights, "embedding owners");
+            Lifetime::RESIDENT, Category::Weights, "embedding owners");
         match &self.table {
             ResidentWeight::Device(owner) => owner.inventory(&mut inventory, "table")?,
             ResidentWeight::Host { storage, .. } => inventory.pinned("table", storage.buffer)?,
@@ -1324,6 +1324,8 @@ mod tests {
         let receipts = packed.allocation_receipts(
             cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?, "embedding")?;
         assert_eq!(receipts.len(), 2);
+        assert!(receipts.iter().all(|receipt| receipt.allocation.lifetime
+            == cuteafd_loader::placement::planner::Lifetime::RESIDENT));
         assert_eq!(receipts[0].allocation.id, "test/embedding");
         assert_eq!(receipts[1].allocation.view.as_ref().context("embedding view")?.backing, "test/embedding");
         let error = packed.table_receipt(

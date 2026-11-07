@@ -16,6 +16,78 @@ fn installed_snapshot(repo: &str) -> Result<PathBuf> {
 }
 
 #[test]
+fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
+    use crate::shared::memory::{device::{Device, Stream}, weight_arena::DeviceWeightArena};
+    use cuteafd_loader::{plan::testing::{t, write_safetensors}, serving_capacity::WeightArenaLayout};
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.extent_only(&library)?;
+    fixture.configure_memory(&library, 1, 1usize << 30)?;
+    let device = Device { library: &library, id: 1 };
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let snapshot = root.path();
+    std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&serde_json::json!({
+        "hidden_size":128, "intermediate_size":128, "num_hidden_layers":1,
+        "num_attention_heads":1, "num_key_value_heads":1, "head_dim":128,
+        "rms_norm_eps":1e-6, "rope_theta":10000., "sliding_window":2048, "vocab_size":16,
+        "dflash_config":{"block_size":8, "conv_group_size":16, "conv_kernel_size":2,
+            "mask_token_id":0, "selector_rank":256, "selector_top_k":16, "target_layer_ids":[0]}
+    }))?)?;
+    let cfg = DflashConfig::read(snapshot)?;
+    write_safetensors(&snapshot.join("model.safetensors"), &cfg.tensor_shapes().iter()
+        .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
+    let shapes = [(cfg.hidden, 2 * cfg.intermediate), (cfg.intermediate, cfg.hidden),
+        (cfg.hidden * cfg.taps.len(), cfg.hidden), (cfg.hidden, cfg.conv_width()),
+        (cfg.hidden, cfg.rank), (cfg.hidden, cfg.qkv_width()), (cfg.hidden, 2 * cfg.kv_width()),
+        (cfg.heads * cfg.head_dim, cfg.hidden)].into_iter().collect::<std::collections::BTreeSet<_>>();
+    let entries = shapes.into_iter().enumerate().map(|(index, (k, n))| {
+        fixture.draft_projection(&library, index.try_into()?, k.try_into()?, n.try_into()?)?;
+        Ok(serde_json::json!({"name":format!("draft_bf16_k{k}_n{n}"),
+            "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}], "capacity_rows":TAP_ROWS,
+            "geometry":{"width":k,"outputs":n,"output_dtype":"torch.bfloat16",
+                "reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]}}))
+    }).collect::<Result<Vec<_>>>()?;
+    let manifest = snapshot.join("programs.json");
+    std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+    let programs = library.programs()?.with_manifest(&manifest)?;
+    let representation = GlmDraftRepresentation::Bf16Only;
+    let requests = DflashDrafter::arena_requests(snapshot, representation, &[1], 0)?;
+    // Deliberately outside the logical receipt prefix, as shared arena IDs are.
+    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("physical/draft/1", requests[&1].clone())?)?;
+    let first = arena.view(&requests[&1][0].0, requests[&1][0].1)?.buffer;
+    let stream = Stream::new(device)?;
+    let (drafter, records) = device.run(|| crate::shared::experts::rtx::dense::recording(||
+        DflashDrafter::load_with(&library, &programs, snapshot, Vec::new(), stream.raw, 2, 1,
+            vec![0; cfg.hidden * 2], false, representation, fp8_linear::Fp8Scales::Amax,
+            fp8_linear::Fp8Rows::W8a16, Qwen4KvCache::Bf16, |physical, name, bytes| {
+                assert_eq!(physical, 1);
+                arena.view(name, bytes)
+            })))?;
+    assert!(!records.operands.is_empty());
+    drop(arena);
+    let devices = CoordinatorDevices::new(&[1])?;
+    let before = drafter.allocation_receipts(devices, "draft")?;
+    let alias = before.iter().find(|receipt| receipt.address == first.ptr as u64
+        && receipt.allocation.view.as_ref().is_some_and(|view| view.offset == 0))
+        .context("offset-zero draft weight alias missing")?;
+    let expected = format!("{}.upload", alias.allocation.id);
+    fixture.reserve_ordered_upload(&library, first, stream.raw as usize)?;
+    let after = drafter.allocation_receipts(devices, "draft")?;
+    let uploads = after.iter().filter(|receipt| receipt.allocation.id.ends_with(".upload"))
+        .collect::<Vec<_>>();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].allocation.id, expected);
+    assert_eq!(uploads[0].allocation.location, Location::PINNED);
+    assert_eq!(uploads[0].allocation.bytes, first.bytes as u64);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(after.iter().filter(|receipt| receipt.allocation.id == "physical/draft/1").count(), 1);
+    drop(drafter);
+    stream.drain()?;
+    fixture.finish_ordered_uploads(&library)?;
+    Ok(())
+}
+
+#[test]
 fn installed_standard_dflash_physical_layout_equals_serving_receipts() -> Result<()> {
     // Isolate the RSS contract from other CPU gate tests running in parallel.
     const CHILD: &str = "CUTEAFD_DFLASH_PHYSICAL_CHILD";
