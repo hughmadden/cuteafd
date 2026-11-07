@@ -242,6 +242,10 @@ pub(crate) struct WindowWeights<'a> {
     scales: DeviceAllocation<'a>,
 }
 impl<'a> WindowWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        self.scales.inventory(inventory, &super::weight_layout::packed_scale_name(&self.names[0]))
+    }
     pub(super) fn names(layer: usize) -> Result<[String; 3]> {
         ensure!(layer < 40, "invalid backbone window layer");
         Ok([

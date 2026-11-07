@@ -10,6 +10,9 @@ pub(crate) struct BackboneHcWeights<'a> {
     tensors: NativeRtxTensors<'a>,
 }
 impl<'a> BackboneHcWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)
+    }
     pub fn layer(&self) -> usize { self.layer }
     /// The buffers one sublayer's mHC reads (L2 prefetch): function, scale, base, norm.
     pub(crate) fn decode_reads(&self, attention: bool) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {

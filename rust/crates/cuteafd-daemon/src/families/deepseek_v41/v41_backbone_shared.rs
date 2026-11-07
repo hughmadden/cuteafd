@@ -64,6 +64,14 @@ pub(crate) struct BackboneSharedWeights<'a> {
     scales: Vec<DeviceAllocation<'a>>,
 }
 impl<'a> BackboneSharedWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        let names = Self::names(self.layer)?;
+        for (index, scales) in self.scales.iter().enumerate() {
+            scales.inventory(inventory, &super::weight_layout::packed_scale_name(&names[index * 2]))?;
+        }
+        Ok(())
+    }
     pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         ensure!(layer < 40, "invalid backbone shared FFN layer");
         Ok(["w1", "w3", "w2"]

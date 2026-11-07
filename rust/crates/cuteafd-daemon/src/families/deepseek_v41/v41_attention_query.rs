@@ -29,6 +29,13 @@ pub(crate) struct AttentionQueryWeights<'a> {
     split_query_b: bool,
 }
 impl<'a> AttentionQueryWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        for (index, scales) in self.scales.iter().enumerate() {
+            scales.inventory(inventory, &super::weight_layout::packed_scale_name(&self.names[index * 2]))?;
+        }
+        Ok(())
+    }
     pub(super) fn names(layer: usize) -> Result<[String; 5]> {
         ensure!(layer < 40, "invalid backbone query layer");
         Ok([

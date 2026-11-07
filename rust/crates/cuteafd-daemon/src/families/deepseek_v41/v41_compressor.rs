@@ -289,6 +289,9 @@ pub(crate) struct CompressorWeights<'a> {
     names: Vec<String>,
 }
 impl<'a> CompressorWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)
+    }
     pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         let suffixes = if ratio(layer)? == 2 {
             vec!["wkv", "norm", "wgate"]

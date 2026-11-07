@@ -78,6 +78,9 @@ fn request_hidden_format(nvfp4: bool) -> (cuteafd_transport::ExpertV2Dtype, usiz
     }
 }
 impl<'a> BackboneRouterWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)
+    }
     pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         ensure!(layer < 40, "invalid backbone router layer");
         Ok(["weight", "bias", "bias_vl"]

@@ -22,6 +22,14 @@ pub(crate) struct AttentionOutputWeights<'a> {
     scales: Option<DeviceAllocation<'a>>,
 }
 impl<'a> AttentionOutputWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        self.grouped_scales.inventory(inventory, &super::weight_layout::packed_scale_name(&self.names[0]))?;
+        if let Some(scales) = &self.scales {
+            scales.inventory(inventory, &super::weight_layout::packed_scale_name(&self.names[2]))?;
+        }
+        Ok(())
+    }
     pub(super) fn names(layer: usize) -> Result<[String; 4]> {
         ensure!(layer < 40, "invalid backbone output layer");
         Ok([
