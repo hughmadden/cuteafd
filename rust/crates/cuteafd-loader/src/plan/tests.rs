@@ -4195,8 +4195,12 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
     let disabled = plan(dir.path(), &options(true)).unwrap().memory_layout.unwrap();
     assert!(enabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
     assert!(!disabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
-    let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
-        .find(|i| i.group == "graphs").unwrap().bytes;
+    let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| {
+        let owner = layout.devices[0].items.iter()
+            .find(|i| i.group == "startup graphs: glmf.graphs.0").unwrap();
+        assert_eq!(owner.basis, cuteafd_core::memory_layout::Basis::Estimated);
+        owner.bytes
+    };
     assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
     assert!(crate::placement::loaded_code("glmf", "*", false, 0).is_none());
     for (layout, handles) in [(&enabled, 3), (&disabled, 2)] {
