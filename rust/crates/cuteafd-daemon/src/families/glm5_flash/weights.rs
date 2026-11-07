@@ -136,6 +136,23 @@ pub(crate) struct Residency {
 }
 
 impl GlmfWeights<'_> {
+    pub(super) fn allocation_receipts(&self,
+        peers: &[Vec<GlmfLayer<'_>>], devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::Lifetime;
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices,
+            "glm5_flash.target", Lifetime::TARGET, Category::Weights, "target weights");
+        self.norm.inventory(&mut inventory, "norm")?;
+        self.head.inventory(&mut inventory)?;
+        for (rank, layers) in std::iter::once(self.layers.as_slice()).chain(peers.iter().map(Vec::as_slice)).enumerate() {
+            for (layer, owner) in layers.iter().enumerate() {
+                owner.inventory(&mut inventory, &format!("rank{rank}.layer{layer}"))?;
+            }
+        }
+        Ok(inventory.receipts)
+    }
+
     pub fn residency(&self) -> Residency {
         let mut r = Residency::default();
         for layer in self.layers.iter().filter(|l| l.attention == GlmNextAttention::Kda) {

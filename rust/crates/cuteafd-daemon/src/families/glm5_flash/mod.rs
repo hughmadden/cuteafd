@@ -2670,6 +2670,15 @@ impl Opened {
             .map(|item| item.bytes).sum::<u64>()).context("GLM Flash embedding admission")?;
         tracing::info!(rank = embedding_rank, device = embedding_device.id, bytes = embedding.device_bytes(),
             "GLM Flash embedding matches admission (peer-readable single residency)");
+        let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
+        let receipt_devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+        let mut weight_census = crate::shared::memory::receipts::Census::default();
+        weight_census.owners(model.allocation_receipts(&shares, receipt_devices)?);
+        weight_census.owners(embedding.allocation_receipts(receipt_devices, "glm5_flash.embedding")?);
+        weight_census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        tracing::info!(owners = weight_census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),
+            aliases = weight_census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),
+            "GLM Flash retained weight arena census");
         probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
