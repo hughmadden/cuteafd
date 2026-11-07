@@ -626,7 +626,8 @@ pub(crate) mod tests {
         GlmfInputs { resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
-                context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,
+                context_bytes: context + inventory::loaded_code_allowance("glmf", "exl3", ranks == 2,
+                    rank as u8, ArchContext::for_device("sm_120", capacity), None).bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; ranks], local_tp2_exl3: false, headroom_bytes: 1 << 30,
             spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262_144, sequences: 8, speculation: true, state_slots: 8, mark_slots: 16, pool_marks: false,
@@ -885,23 +886,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn local_tp2_runtime_and_graphs_equal_staged_ready() {
+    fn local_tp2_code_no_longer_reuses_mixed_staged_runtime() {
         let mut config = crate::plan::testing::glm5_flash_config(45);
         config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
             if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
         let mut graphs = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
         calibrate_local_tp2_graphs(&mut graphs);
-        for (rank, (baseline, ready)) in [(1_027_511_116u64, 3_101_594_444u64),
-            (900_673_356, 2_905_550_668)].into_iter().enumerate() {
-            let items = inventory::glmf_local_tp2_runtime_items(rank);
-            assert_eq!(items.iter().map(|i| i.bytes).sum::<u64>(), baseline);
-            assert_eq!(baseline + graphs.at_ready(rank), ready);
-            let code = loaded_code("glmf", "exl3-tp2-local", true, rank as u8).unwrap();
-            assert_eq!(inventory::ArchContext::coordinator(inventory::PRO_TOTAL_BYTES, None).context_bytes + code.bytes, baseline);
-            let sampled = [598_999_040, 609_484_800][rank];
-            assert_eq!(sampled + code.pending(sampled, 586_416_128), baseline);
-            assert!(graphs.growth(rank) >= 64 << 20);
+        let programs = ProgramSet::from_names(&["glmf", "glmf2"], ["glmf_decode", "glmf2_decode"]);
+        for rank in 0..2 {
+            assert!(loaded_code("glmf", "exl3-tp2-local", true, rank).is_none());
+            let code = inventory::loaded_code_allowance("glmf", "exl3-tp2-local", true, rank,
+                ArchContext::for_device("sm_120", inventory::PRO_TOTAL_BYTES), Some(&programs));
+            assert_eq!(code.basis, Basis::Estimated);
+            assert_eq!(code.bytes, programs.module_bytes());
+            assert_eq!(code.pending(586_416_128 + 100, 586_416_128), code.bytes - 100);
+            assert!(graphs.growth(rank as usize) >= 64 << 20);
         }
     }
 

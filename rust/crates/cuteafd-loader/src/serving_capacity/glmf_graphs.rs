@@ -10,11 +10,6 @@ pub const SPEC_DECODE_BUCKETS: [usize; 6] = [2, 4, 8, 16, 32, 64];
 pub const MEASURED_GRAPH_BYTES: u64 = 146_459;
 pub const GRAPH_MARGIN_PERCENT: u64 = 20;
 pub const GRAPH_RANK_MARGIN_BYTES: u64 = 64 << 20;
-// WP9 SM120 measurements; retained until a selected-program ledger separates cuBLAS ownership.
-pub const WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20;
-pub fn workspace_runtime_overhead(_waves: usize, drafter: bool) -> u64 {
-    WORKSPACE_RUNTIME_OVERHEAD_BYTES * (2 + usize::from(drafter)) as u64
-}
 
 pub fn verify_budget(decode_rows: usize, sms: usize) -> usize {
     if decode_rows <= DECODE_ROWS { decode_rows } else { (3 * sms / 4).clamp(DECODE_ROWS, decode_rows) }

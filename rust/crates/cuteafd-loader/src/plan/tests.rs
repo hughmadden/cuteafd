@@ -3529,7 +3529,9 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
-                    + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
+                    + placement::inventory::loaded_code_allowance("glmf", "fp8", true, rank as u8,
+                        placement::ArchContext::for_device("sm_120", total),
+                        Some(&placement::ProgramSet::from_manifest(&manifest, &["glmf", "glmf2"]))).bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: crate::placement::reserve::gpu("glm5_flash"),
             spark_ranks: peers, prefill_lanes: lanes, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262144, sequences: 8, speculation: false, state_slots: 8, mark_slots: 8,
@@ -4194,14 +4196,19 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
     let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
         .find(|i| i.group == "graphs").unwrap().bytes;
     assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
-    // The measured loaded code (`placement::inventory::LOADED_CODE`) replaces the per-workspace
-    // runtime allowance: it already holds the workspaces' and the drafter's untracked memory.
-    let code = crate::placement::loaded_code("glmf", "*", false, 0).unwrap().bytes;
-    for layout in [&enabled, &disabled] {
-        assert!(!layout.devices[0].items.iter().any(|i| i.group == "workspace runtime overhead"));
-        let context = layout.devices[0].items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
+    assert!(crate::placement::loaded_code("glmf", "*", false, 0).is_none());
+    for (layout, handles) in [(&enabled, 3), (&disabled, 2)] {
+        let items = &layout.devices[0].items;
+        assert!(!items.iter().any(|i| i.group == "workspace runtime overhead"));
+        let context = items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
         assert_eq!(context, crate::placement::ArchContext::coordinator(crate::placement::inventory::PRO_TOTAL_BYTES,
-            None).context_bytes + code);
+            None).context_bytes);
+        let code = items.iter().find(|i| i.group.starts_with("selected-program loaded code estimate")).unwrap();
+        assert_eq!(code.basis, cuteafd_core::memory_layout::Basis::Estimated);
+        assert_eq!(items.iter().filter(|i| i.group.starts_with("cuBLAS handles:"))
+            .map(|i| i.bytes).sum::<u64>(), handles * (64 << 20));
+        assert_eq!(items.iter().filter(|i| i.group.starts_with("BLAS device initialization"))
+            .map(|i| i.bytes).sum::<u64>(), 2 << 20);
     }
 }
 

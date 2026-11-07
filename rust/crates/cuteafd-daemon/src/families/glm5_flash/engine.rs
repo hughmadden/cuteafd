@@ -1554,32 +1554,6 @@ fn check_decode_thresholds(buckets: &DecodeBuckets, sequences: usize, speculatio
     if speculation { check_bucket_thresholds(&buckets.spec, &thresholds)?; }
     Ok(())
 }
-// WP9 2026-10-07, RTX PRO 6000 SM120, runtime99c: each new LM lane
-// adds 71,942,144 B beyond tracked buffers; drafter adds 68,269,888 B. This
-// measured/calibrated allowance is not exact cuBLAS allocator ownership.
-#[allow(unused_imports)]
-use cuteafd_loader::serving_capacity::glmf_graphs::WORKSPACE_RUNTIME_OVERHEAD_BYTES;
-
-/// Per rank, the device bytes its step workspaces take before the KV pool, for an admission that
-/// sizes the pool before they exist: the decode workspace and `lanes` prefill lanes of `prefill_rows`
-/// rows over their one set of shared temporaries (`plan`'s arithmetic, which the engine allocates),
-/// plus the measured untracked runtime memory per workspace, the drafter's included. A plan with
-/// all-row prefill logits (`--full-prefill-logits`) gives the exact union scoring runs in: a serial
-/// prefill runs in lane 0, and the logits live once, in the lanes' shared temporaries.
-pub(crate) fn workspace_reserve(plan: &StepPlan<'_, '_>, prefill_rows: usize, lanes: usize, peer: bool,
-    drafter: bool) -> Result<Vec<u64>> {
-    (0..if peer { 2 } else { 1 }).map(|rank| {
-        // The planner separately admits drafter storage. Its runtime overhead is additional.
-        Ok(workspace_reserve_bytes(plan.workspace_bytes(rank, prefill_rows, lanes)?, lanes, rank == 0 && drafter))
-    }).collect()
-}
-
-/// A rank's `tracked` workspace bytes with the untracked runtime memory of its decode workspace,
-/// `lanes` prefill lanes and (`drafter`) the drafter's.
-fn workspace_reserve_bytes(tracked: u64, lanes: usize, drafter: bool) -> u64 {
-    tracked + cuteafd_loader::serving_capacity::glmf_graphs::workspace_runtime_overhead(lanes, drafter)
-}
-
 fn startup_graph_policy(graphs: Option<&str>, startup: Option<&str>) -> bool {
     graphs != Some("0") && startup != Some("0")
 }
@@ -5840,15 +5814,7 @@ mod prefill_lane_tests {
         assert_eq!(super::partial_exchange_reserve(2, 4096, 4096, 4), 268_435_456);
         assert_eq!(super::partial_exchange_reserve(2, 4096, 4096, 2), 0);
         assert_eq!(super::partial_exchange_reserve(4, 2048, 4096, 4), super::partial_exchange_reserve(2, 4096, 4096, 4));
-        // Whole workspaces kept a serial one beside the lanes (1 + lanes past one lane); shared lanes
-        // run a serial prefill in lane 0, so scoring's union is the configured lanes' (with all-row
-        // logits in their temporaries: `step_workspaces_reproduce_...`), one allowance per workspace.
-        for lanes in 1..=MAX_PREFILL_WAVES {
-            for drafter in [false, true] {
-                assert_eq!(super::workspace_reserve_bytes(10_000, lanes, drafter),
-                    10_000 + super::WORKSPACE_RUNTIME_OVERHEAD_BYTES * (2 + usize::from(drafter)) as u64);
-            }
-        }
+
     }
 
     /// The startup set's fallback, against an admission modelled on a 5090 at 131,072 tokens and 16
@@ -5990,9 +5956,6 @@ mod prefill_lane_tests {
         assert_eq!(shared, 2_950_470_912);
         let spark = GlmfStepShape { local_experts: false, spark: true, ..shape };
         assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &spark, decode, prefill).device_bytes(), 2_882_837_760);
-        let reserve = super::workspace_reserve_bytes(shared, 2, true);
-        assert_eq!(reserve, shared + 3 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
-        assert!(reserve >= shared + 2 * 71_942_144 + 68_269_888);
         // The programs' scratch keeps its capacity whatever a lane's rows.
         for rows in [1, 64, 512, 4096] {
             let temps = glmf_temporary_bytes(&cfg, rows, false, &shape, prefill);
@@ -6015,7 +5978,6 @@ mod prefill_lane_tests {
         // times (a serial workspace and two lanes). Runtime now owns decode and one arena.
         let scoring = glmf_step_workspaces(&cfg, 2, 4096, 64, &full, decode, prefill).device_bytes();
         assert_eq!(scoring - shared, (4096 - 64) * 154_880 * 4);
-        assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 2 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
     }
 
     #[test]

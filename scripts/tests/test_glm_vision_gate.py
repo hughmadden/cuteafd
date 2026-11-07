@@ -167,8 +167,7 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch)" in temporaries
     lane = source.split("fn lane(", 1)[1].split("/// ModelOpt NVFP4 dense MLPs", 1)[0]
     assert "glmf_lane_bytes(" in lane and "streams: [alloc(bytes.streams)?" in lane
-    reserve = source.split("pub(crate) fn workspace_reserve(", 1)[1].split("/// The prefill lanes a serving engine", 1)[0]
-    assert "plan.workspace_bytes(" in reserve and "workspace_reserve_bytes(" in reserve
+    assert "fn workspace_reserve(" not in source
     prepare = source.split("pub fn prepare_serving_workspaces(", 1)[1].split("/// Capture the complete", 1)[0]
     for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_waves",
                      "self.prefill_slots_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
@@ -176,11 +175,12 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
     scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("fn step_plan(", 1)[0]
     assert "self.prefill_slots_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
-    # The per-workspace runtime allowance is the loader's shared definition; where the measured
-    # loaded code covers it (`placement::inventory::LOADED_CODE`) the reserve charges that instead.
+    # Retained handles are named owners, not a mixed per-workspace residual.
     graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_graphs.rs").read_text()
-    assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20" in graphs
-    assert "measured/calibrated allowance is not exact cuBLAS allocator ownership" in source
+    assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES" not in graphs
+    admission = (ROOT / "rust/crates/cuteafd-loader/src/placement/families/glm5_flash/admission.rs").read_text()
+    assert 'p::serving::blas_components("sm_120"' in admission
+    assert 'contract.add_driver_page_tables()' in admission
     assert "kda.in[24896|12576,4096]" in source
     module = (root / "glm5_flash/mod.rs").read_text()
     opening = module.split("pub fn with_engine", 1)[1]
