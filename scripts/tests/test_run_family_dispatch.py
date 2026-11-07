@@ -3974,15 +3974,10 @@ def test_qwen_auto_mtp_follows_admitted_world(tmp_path, method, inventory, world
         keys += f"SPECULATOR={override}\n"
     result = _family_launch_result(tmp_path, config, "test/model", keys,
         extra_args=("--wip", "qwen-auto-policy"),
-        encoder_plan={"placement_supported": not tower, "fits": not tower,
-            "spark_expert_world": world, "spark_roles": roles, "encoder": placement if tower else None,
-            "hints": ["vision-only Spark workers are not supported"] if tower else []})
+        encoder_plan={"placement_supported": True, "fits": True,
+            "spark_expert_world": world, "spark_roles": roles, "encoder": placement if tower else None})
     plan = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan " in line)
     assert plan[plan.index("--speculator") + 1] == (override or "auto")
-    if tower:
-        assert result.returncode != 0 and "vision-only Spark workers are not supported" in result.stderr
-        assert "cuteafd serve-qwen4 --snapshot" not in result.stderr
-        return
     assert result.returncode == 0, result.stderr
     serve = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-qwen4 --snapshot" in line)
     expected = override == "mtp" or override in (None, "auto") and world == 0
