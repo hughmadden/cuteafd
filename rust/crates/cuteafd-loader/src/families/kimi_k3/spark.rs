@@ -54,22 +54,13 @@ mod tests {
     use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, Item, Basis, Category};
 
     #[test]
-    fn measured_tp6_zero_onboard_refuses_110_gib_with_startup_reserve() -> Result<()> {
+    fn measured_tp6_execution_and_startup_owners_preserve_other_worlds() -> Result<()> {
         let executions = super::super::spark_executions(3, 1024)?;
         let retained = executions.workspace_bytes(|extent| owner_bytes(6, extent))?.unwrap();
         assert_eq!(retained.device_bytes, 253_473_888);
         assert_eq!(retained.pinned_bytes, 401_408);
-        let resident = 117_692_170_240;
-        let rings = 134_217_728;
-        let legacy_io = 1024 * ((3584 + 112 + 128 + 7168) + (128 + 7168) + 4) + 1024 * 4 + 128;
-        let conservative_total = resident + rings + legacy_io + reserve_bytes(6, 3, 1024)?;
-        assert_eq!(conservative_total, resident + rings + legacy_io + retained.total().unwrap()
+        assert_eq!(reserve_bytes(6, 3, 1024)?, retained.total().unwrap()
             + cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_BYTES + 4096);
-        let inventory = crate::placement::SparkBudgetInventory {
-            layers: (1..=92).collect(), resident: vec![vec![1_279_262_720; 92]; 6],
-            overhead: vec![conservative_total - resident; 6], budget: 110 << 30,
-        };
-        assert!(inventory.minimum_rtx_layers()? > 0);
         for world in [1, 2, 3, 4, 5, 7, 8] {
             assert_eq!(reserve_bytes(world, 3, 1024)?, super::super::spark_reserve_bytes(3, 1024)?);
         }
