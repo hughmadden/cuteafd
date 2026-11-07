@@ -1627,7 +1627,9 @@ def capture_qwen4_real_spark_launch(snapshot: Path, example: Path, binary: Path,
     assert deployment["speculator"] == "off", deployment
     serve = next(shlex.split(line) for line in result.stderr.splitlines() if "serve-qwen4 --snapshot" in line)
     assert "--local-experts" not in serve and "--mtp" not in serve, serve
-    workers = [shlex.split(line) for line in result.stderr.splitlines() if "cuteafd expertd-native --snapshot" in line]
+    # SSH traces echo the remote shell payload as well as its Docker command.
+    workers = [shlex.split(line) for line in result.stderr.splitlines()
+               if line.startswith("docker run -d ") and "cuteafd expertd-native --snapshot" in line]
     assert len(workers) == 4, result.stderr
     assert all(role["experts"] and role["layers"] for role in deployment["spark_roles"]), deployment
 
