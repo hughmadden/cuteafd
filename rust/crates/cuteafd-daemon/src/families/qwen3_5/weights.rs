@@ -194,8 +194,17 @@ mod tests {
                     assert_eq!(target_arena(&checkpoint, &cfg, DType::Bf16, format)?, target);
                     assert_eq!(mtp_arena(&checkpoint, &cfg, format)?, mtp);
                 }
-                checkpoint.tensors.retain(|t| !t.meta.name.ends_with("linear_attn.A_log"));
+                for tensor in &mut checkpoint.tensors {
+                    if tensor.meta.name.ends_with("linear_attn.norm.weight") {
+                        tensor.meta.dtype = DType::F32;
+                        tensor.meta.byte_length *= 2;
+                    }
+                }
+                let fp32_norm = target_arena(&checkpoint, &cfg, DType::F32, format)?;
+                assert_eq!(fp32_norm.view(&format!("{p}/norm_w")).unwrap().bytes(), 512);
                 assert!(target_arena(&checkpoint, &cfg, DType::Bf16, format).is_err());
+                checkpoint.tensors.retain(|t| !t.meta.name.ends_with("linear_attn.A_log"));
+                assert!(target_arena(&checkpoint, &cfg, DType::F32, format).is_err());
             }
         }
         Ok(())
