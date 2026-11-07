@@ -550,7 +550,7 @@ mod tests {
                 "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}],
                 "pointers":pointers(&[("ids","int32","[rows]","in"),("payload","uint8","[256,128]","in"),
                     ("scales","float32","[256]","in"),("output","bfloat16","[rows,128]","out")])}),
-            json!({"name":"exlr8_dense_fp8_row_k128_n256_s1", "capacity_rows":4096, "scratch":{"partial":0},
+            json!({"name":"exlr8_dense_fp8_row_k128_n256_s1", "capacity_rows":4096, "scratch_bytes_at_capacity":{"partial":0},
                 "geometry":{"abi_version":1,"input_features":128,"output_features":256,"sharded_side":1,
                     "max_rows":4096,"ctas_per_sm":4,"splits":1,"split_k":128,"segments":1,"encoding":"fp8_row","core":"tile"},
                 "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}],
