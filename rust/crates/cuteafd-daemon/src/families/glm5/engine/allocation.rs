@@ -396,7 +396,7 @@ impl GlmEngine<'_> {
         let physical = self.census_physical_devices()?;
         let devices = CoordinatorDevices::new(&physical)?;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "glm.weight",
-            Lifetime::TARGET, Category::Weights, "target checkpoint owners");
+            Lifetime::RESIDENT, Category::Weights, "target checkpoint owners");
         for rank in 0..self.ranks() {
             let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
             for (layer, weights) in layers.iter().enumerate() {
