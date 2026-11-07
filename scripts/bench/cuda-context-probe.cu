@@ -1,13 +1,15 @@
 // Named CUDA owners. Run in the matching toolchain image on idle, locked GPUs.
-// nvcc -O2 -o probe cuda-context-probe.cu -lcublas -lcublasLt -arch=sm_120
+// nvcc -O2 -o probe cuda-context-probe.cu -lcublas -lcublasLt -lcuda -arch=sm_120
 // probe handles|lt|lt-with-blas [device=0] [count=4] [prewarm]
 // probe mappings [device0=0] [device1=1]
+// probe allocations [device=0] [retained_count=32]
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <vector>
 #include <sys/mman.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -253,12 +255,105 @@ static void mappings(int device0, int device1) {
     }
   }
 }
+static void driver_check(CUresult status, const char* call) {
+  if (status != CUDA_SUCCESS) {
+    const char* message = nullptr;
+    cuGetErrorString(status, &message);
+    std::fprintf(stderr, "%s: %s\n", call, message ? message : "driver error");
+    std::exit(1);
+  }
+}
+#define DRIVER(call) driver_check((call), #call)
+
+static void allocation_pool(const char* stage, int device) {
+  cudaMemPool_t pool = nullptr;
+  CUDA(cudaDeviceGetMemPool(&pool, device));
+  uint64_t reserved = 0, allocated = 0;
+  CUDA(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved));
+  CUDA(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &allocated));
+  std::printf("{\"mode\":\"allocation_pool\",\"stage\":\"%s\",\"reserved_bytes\":%llu,"
+      "\"used_bytes\":%llu}\n", stage, (unsigned long long)reserved, (unsigned long long)allocated);
+}
+
+static void allocation_batch(int device, const char* name, const std::vector<size_t>& sizes, int count) {
+  constexpr size_t limit = size_t(8) << 30;
+  size_t per = 0;
+  for (size_t size : sizes) {
+    if (size == 0 || size > limit - per) { std::fprintf(stderr, "invalid allocation batch\n"); std::exit(2); }
+    per += size;
+  }
+  if (size_t(count) > limit / per) { std::fprintf(stderr, "allocation batch exceeds 8 GiB\n"); std::exit(2); }
+  const auto baseline = used(device);
+  std::vector<void*> owners;
+  owners.reserve(sizes.size() * count);
+  size_t requested = 0;
+  auto previous = baseline;
+  for (int i = 0; i < count; ++i) {
+    for (size_t size : sizes) {
+      void* p = nullptr;
+      CUDA(cudaMalloc(&p, size));
+      owners.push_back(p);
+      requested += size;
+    }
+    if (i < 3 || i + 1 == count || (i + 1) % (count > 64 ? 128 : 1) == 0) {
+      const auto after = used(device);
+      CUdeviceptr base = 0;
+      size_t range = 0;
+      DRIVER(cuMemGetAddressRange(&base, &range, (CUdeviceptr)owners.back()));
+      std::printf("{\"mode\":\"allocation_batch\",\"case\":\"%s\",\"groups\":%d,"
+          "\"allocations\":%zu,\"requested_bytes\":%zu,\"raw_delta_bytes\":%lld,"
+          "\"raw_since_sample_bytes\":%lld,\"unclassified_bytes\":%lld,"
+          "\"last_address\":%llu,\"last_address_range_bytes\":%zu}\n",
+          name, i + 1, owners.size(), requested, (long long)after - baseline,
+          (long long)after - previous, (long long)after - baseline - (long long)requested,
+          (unsigned long long)base, range);
+      previous = after;
+      std::fflush(stdout);
+    }
+  }
+  for (auto owner : owners) CUDA(cudaFree(owner));
+  const auto after = used(device);
+  std::printf("{\"mode\":\"allocation_released\",\"case\":\"%s\",\"retained_bytes\":%lld}\n",
+      name, (long long)after - baseline);
+}
+
+static void allocations(int device, int count) {
+  CUDA(cudaSetDevice(device));
+  CUDA(cudaFree(nullptr));
+  CUmemAllocationProp prop{};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device;
+  size_t minimum = 0, recommended = 0;
+  DRIVER(cuMemGetAllocationGranularity(&minimum, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  DRIVER(cuMemGetAllocationGranularity(&recommended, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+  int driver = 0, runtime = 0;
+  CUDA(cudaDriverGetVersion(&driver));
+  CUDA(cudaRuntimeGetVersion(&runtime));
+  std::printf("{\"mode\":\"allocation_granularity\",\"device\":%d,\"driver\":%d,\"runtime\":%d,"
+      "\"vmm_minimum_bytes\":%zu,\"vmm_recommended_bytes\":%zu,\"batch_limit_bytes\":%zu}\n",
+      device, driver, runtime, minimum, recommended, size_t(8) << 30);
+  allocation_pool("before", device);
+  constexpr size_t kib = 1024, mib = 1024 * kib;
+  for (size_t size : {size_t(384), 14 * kib, 24 * kib, 64 * kib - 1, 64 * kib,
+      64 * kib + 1, 576 * kib, mib - 1, mib, mib + 1, 2 * mib - 1, 2 * mib,
+      2 * mib + 1, 3 * mib, 3136 * kib, 63 * mib, 64 * mib}) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "size_%zu", size);
+    allocation_batch(device, name, {size}, size < mib ? count * 32 : count);
+  }
+  allocation_batch(device, "k6_payload_suh_svh", {63 * mib, 14 * kib, 24 * kib}, count);
+  allocation_batch(device, "small_large_interleaved", {14 * kib, 63 * mib, 24 * kib, 3 * mib, 384}, count);
+  allocation_pool("after", device);
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "handles";
   const int device = argc > 2 ? std::atoi(argv[2]) : 0;
   identity(device);
   if (std::strcmp(mode, "mappings") == 0) identity(argc > 3 ? std::atoi(argv[3]) : 1);
-  const int last = argc > 3 ? std::atoi(argv[3]) : (std::strcmp(mode, "mappings") == 0 ? 1 : 4);
+  const int last = argc > 3 ? std::atoi(argv[3]) :
+      (std::strcmp(mode, "mappings") == 0 ? 1 : std::strcmp(mode, "allocations") == 0 ? 32 : 4);
   const bool prewarm = argc == 5 && std::strcmp(argv[4], "prewarm") == 0;
   if (argc > 5 || (argc == 5 && (!prewarm || std::strcmp(mode, "mappings") == 0))) {
     std::fprintf(stderr, "invalid prewarm argument\n");
@@ -268,5 +363,6 @@ int main(int argc, char** argv) {
   else if ((std::strcmp(mode, "lt") == 0 || std::strcmp(mode, "lt-with-blas") == 0)
       && last > 0 && last <= 64) lt_handles(device, last, std::strcmp(mode, "lt-with-blas") == 0, prewarm);
   else if (std::strcmp(mode, "mappings") == 0) mappings(device, last);
-  else { std::fprintf(stderr, "usage: probe handles|lt|lt-with-blas [device] [count] [prewarm] | mappings [device0] [device1]\n"); return 2; }
+  else if (std::strcmp(mode, "allocations") == 0 && !prewarm && last > 0 && last <= 64) allocations(device, last);
+  else { std::fprintf(stderr, "usage: probe handles|lt|lt-with-blas [device] [count] [prewarm] | mappings [device0] [device1] | allocations [device] [retained_count]\n"); return 2; }
 }
