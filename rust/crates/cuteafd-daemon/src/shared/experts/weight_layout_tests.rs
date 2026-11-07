@@ -147,6 +147,11 @@ fn native_plane_receipts_charge_each_rank_backing_once() -> Result<()> {
             }
         }
         assert_receipts(&inventory.receipts, &layouts)?;
+        assert_eq!(backing_bytes(&inventory.receipts)?, layouts.iter().map(|l| l.bytes() as u64).sum());
+        if nvfp4 {
+            assert!(layouts.iter().all(|l| l.padding_bytes() > 0));
+            assert!(backing_bytes(&inventory.receipts)? > layouts.iter().map(|l| l.payload_bytes() as u64).sum());
+        }
         inventory.receipts.retain(|r| r.allocation.id != layouts[0].id());
         assert!(assert_receipts(&inventory.receipts, &layouts).is_err(), "missing physical root must fail");
         drop(owners);

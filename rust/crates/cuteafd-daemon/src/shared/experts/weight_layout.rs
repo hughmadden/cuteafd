@@ -56,3 +56,10 @@ pub(crate) fn fits(layout: &WeightArenaLayout, staging: usize, workspace: usize,
         .context("expert arena startup peak overflow")?;
     Ok(peak <= available)
 }
+
+pub(crate) fn backing_bytes(receipts: &[cuteafd_loader::placement::planner::Receipt]) -> Result<u64> {
+    use cuteafd_loader::placement::planner::Domain;
+    receipts.iter().filter(|r| r.allocation.view.is_none()
+        && r.allocation.location.domain == Domain::Device).try_fold(0u64, |sum, r|
+            sum.checked_add(r.allocation.bytes).context("expert physical residency overflow"))
+}

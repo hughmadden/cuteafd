@@ -118,8 +118,33 @@ impl<'a> Weights<'a> {
                 }
             }
         }
+        // Payload views omit alignment gaps. Report the retained physical roots
+        // once, for both mount arenas and unchanged ReadyArena push owners.
+        let physical = [library.cuda_get_device()?];
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?, "spark",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Experts, "expert weights");
+        match self {
+            Self::Full(weights) => for (index, weight) in weights.iter().enumerate() {
+                weight.allocation_receipts(&mut inventory, &format!("layer.{index}"))?;
+            },
+            Self::Exl3(weights) => for (index, weight) in weights.iter().enumerate() {
+                weight.allocation_receipts(&mut inventory, &format!("layer.{index}"))?;
+            },
+            Self::Exlr8(weights) => for (index, weight) in weights.iter().enumerate() {
+                weight.allocation_receipts(&mut inventory, &format!("layer.{index}"))?;
+            },
+            Self::Fp8(groups) => for group in groups {
+                for weight in &group.layers {
+                    weight.allocation_receipts(&mut inventory, &format!("layer.{}", weight.layer))?;
+                }
+            },
+        }
+        let physical = super::super::weight_layout::backing_bytes(&inventory.receipts)?;
+        ensure!(physical >= resident, "Spark physical roots undercount expert payload");
         slices.sort_unstable_by_key(|slice| slice.layer);
-        Ok((resident, slices))
+        Ok((physical, slices))
     }
 
     pub(super) fn validate_ingress(&self, library: &NativeLibrary,
