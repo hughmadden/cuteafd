@@ -66,7 +66,7 @@ mod tests {
             ([256, 512], true, vec![131072, 256]), ([1, 1], true, vec![256, 256])] {
             let layout = NativeLayout { stem: "projection".into(), shape, fp8, rank: 0, ranks: 1, split: CoreSplit::Whole };
             assert_eq!(layout.allocation_extents()?, expected);
-            assert_eq!(layout.bytes()?, expected.iter().sum());
+            assert_eq!(layout.bytes()?, expected.iter().sum::<u64>());
         }
         let overflow = NativeLayout { stem: "overflow".into(), shape: [usize::MAX, 2], fp8: false,
             rank: 0, ranks: 1, split: CoreSplit::Whole };
