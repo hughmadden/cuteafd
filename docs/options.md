@@ -327,7 +327,9 @@ Every key the launcher knows, checked against each launch path's real
 accept/refuse behaviour. `✓` means the family's config validation accepts it;
 `✗` means the launch stops with `unused configuration key: KEY` (exit 2).
 `SPARK_<rank>_*` covers ranks 0–7. In the combined GLM 5.3 / ML4 column,
-`ATTENTION_MODE` is accepted for GLM 5.3 only; ML4 remains gated.
+`ATTENTION_MODE` is accepted for both families. ML4 HQA keeps its native E4M3
+weights and F32 block-128 scales; `compact` selects parent K6 attention, while
+`fp8-compact` returns `UnsupportedFp8Conversion` because its HQA is already FP8.
 
 | Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
