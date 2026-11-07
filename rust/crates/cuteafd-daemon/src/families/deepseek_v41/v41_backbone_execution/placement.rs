@@ -500,6 +500,7 @@ impl<'a> CacheProducerWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load_distributed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -517,6 +518,7 @@ impl<'a> CacheProducerWeights<'a> {
         );
         Self::load_placed(library, catalog, staging, Some(placement))
     }
+    #[cfg(test)]
     pub(super) fn load_placed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

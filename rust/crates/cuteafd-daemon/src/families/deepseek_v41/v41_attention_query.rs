@@ -64,6 +64,7 @@ impl<'a> AttentionQueryWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -73,6 +74,7 @@ impl<'a> AttentionQueryWeights<'a> {
     ) -> Result<Self> {
         Self::load_with_split(library,catalog,layer,budget,staging,false)
     }
+    #[cfg(test)]
     pub fn load_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,layer:usize,
         budget:usize,staging:usize,split_query_b:bool)->Result<Self> {
         Self::load_in(library, catalog, layer, budget, staging, split_query_b, None)

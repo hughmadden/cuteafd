@@ -75,6 +75,7 @@ impl<'a> BackboneLaneWeights<'a> {
                 })
         })
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

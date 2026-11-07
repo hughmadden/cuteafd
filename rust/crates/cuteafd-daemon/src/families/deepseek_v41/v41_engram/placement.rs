@@ -28,6 +28,7 @@ impl<'a> PlacedEngramWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

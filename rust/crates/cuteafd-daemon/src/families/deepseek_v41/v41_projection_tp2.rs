@@ -36,6 +36,7 @@ impl<'a> Weights<'a> {
     pub fn load_peak_device_bytes(kind: Kind) -> usize {
         let (k,n)=kind.geometry(); Self::device_bytes(kind) + k*(n/2)/1024
     }
+    #[cfg(test)]
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize,
         kind: Kind, rank: usize, budget: usize) -> Result<Self> {
         Self::load_in(device, catalog, layer, kind, rank, budget, None)

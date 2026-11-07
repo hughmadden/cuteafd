@@ -55,6 +55,7 @@ impl<'a> VocabularyShard<'a> {
 
     /// The caller scopes construction/destruction to the owning GPU. Admission
     /// precedes allocation and payload reads. No full-head GPU staging is used.
+    #[cfg(test)]
     pub fn load(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         tokens: Range<usize>, budget: usize, staging_bytes: usize) -> Result<Self> {
         Self::load_in(library, catalog, tokens, budget, staging_bytes, None)

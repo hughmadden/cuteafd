@@ -44,6 +44,7 @@ impl<'a> BackboneHcWeights<'a> {
         ensure!(bytes == 3_952_856, "unexpected backbone mHC tensor sizes");
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

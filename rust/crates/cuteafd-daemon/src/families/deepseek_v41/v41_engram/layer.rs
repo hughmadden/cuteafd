@@ -32,6 +32,7 @@ impl<'a> EngramLayerWeights<'a> {
         NativeRtxTensors::plan(catalog,&names)?.checked_add(library.v41_fp8_kernel(16)?.info().packed_weight_scale_bytes as usize)
             .context("engram resident budget overflow")
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

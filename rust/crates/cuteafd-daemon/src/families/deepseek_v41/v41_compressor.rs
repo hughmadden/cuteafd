@@ -311,6 +311,7 @@ impl<'a> CompressorWeights<'a> {
     pub fn device_bytes(catalog: &OfficialV41Catalog, layer: usize) -> Result<usize> {
         NativeRtxTensors::plan(catalog, &Self::names(layer)?)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

@@ -124,7 +124,8 @@ def test_v41_native_census_probes_cover_all_card_sizes():
     assert 'crate::shared::inventory::startup_probe(&lib, &[0, 1],' in checkpoint
     assert dual.index('memory_checkpoint("before native preload")') < dual.index('RuntimeInventory::measure(')
     assert dual.index('RuntimeInventory::measure(') < dual.index('memory_checkpoint("after native preload")')
-    assert dual.index('memory_checkpoint("after native preload")') < dual.index('BackboneLaneWeights::load_distributed')
+    assert dual.index('memory_checkpoint("after native preload")') < dual.index('TargetArenas::new(')
+    assert dual.index('TargetArenas::new(') < dual.index('BackboneLaneWeights::load_in(')
     assert dual.index('memory_checkpoint("ready")') < dual.index('.send(Ok((vision.health_handle(), args.max_context_tokens)))')
 
 

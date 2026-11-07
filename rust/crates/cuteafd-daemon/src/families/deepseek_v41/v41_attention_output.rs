@@ -54,6 +54,7 @@ impl<'a> AttentionOutputWeights<'a> {
             + library.v41_fp8_matrix_info(1,32768,8192)?.packed_weight_scale_bytes as usize
             + if split_output_b {0} else {library.v41_fp8_matrix_info(1,8192,5120)?.packed_weight_scale_bytes as usize})
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -63,6 +64,7 @@ impl<'a> AttentionOutputWeights<'a> {
     ) -> Result<Self> {
         Self::load_with_split(library,catalog,layer,budget,staging,false)
     }
+    #[cfg(test)]
     pub fn load_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,layer:usize,
         budget:usize,staging:usize,split_output_b:bool)->Result<Self> {
         Self::load_in(library, catalog, layer, budget, staging, split_output_b, None)

@@ -24,6 +24,7 @@ impl<'a> BackboneLaneWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load_distributed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -33,6 +34,7 @@ impl<'a> BackboneLaneWeights<'a> {
     ) -> Result<Self> {
         Self::load_distributed_with_split(library,catalog,placement,budgets,staging,false,false)
     }
+    #[cfg(test)]
     pub fn load_distributed_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,
         placement:CachePlacement,budgets:[usize;2],staging:usize,split_query_b:bool,split_output_b:bool)->Result<Self> {
         ensure!(
@@ -44,6 +46,7 @@ impl<'a> BackboneLaneWeights<'a> {
         );
         Self::load_placed_with_split(library, catalog, staging, Some(placement),split_query_b,split_output_b)
     }
+    #[cfg(test)]
     pub(super) fn load_placed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -52,6 +55,7 @@ impl<'a> BackboneLaneWeights<'a> {
     ) -> Result<Self> {
         Self::load_placed_with_split(library,catalog,staging,placement,false,false)
     }
+    #[cfg(test)]
     fn load_placed_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,staging:usize,
         placement:Option<CachePlacement>,split_query_b:bool,split_output_b:bool)->Result<Self> {
         Self::load_in(library, catalog, staging, placement, split_query_b, split_output_b, None)

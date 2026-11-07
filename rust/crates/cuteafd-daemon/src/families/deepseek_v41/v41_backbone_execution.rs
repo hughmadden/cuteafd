@@ -252,6 +252,7 @@ impl<'a> CacheProducerWeights<'a> {
         }
         Ok(total)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

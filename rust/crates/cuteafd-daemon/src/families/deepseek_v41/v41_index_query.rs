@@ -53,6 +53,7 @@ impl<'a> IndexQueryWeights<'a> {
                 .v41_fp8_matrix_info(1, 1280, 4096)?
                 .packed_weight_scale_bytes as usize)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

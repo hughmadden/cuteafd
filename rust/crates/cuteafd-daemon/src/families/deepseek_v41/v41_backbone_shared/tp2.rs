@@ -195,6 +195,7 @@ impl<'a> Weights<'a> {
     pub fn device_bytes() -> usize { 3 * (5120 * 1152 + 5120 * 1152 / 32) }
     /// Including every matrix's raw scales (resident until their pack ran).
     pub fn load_peak_device_bytes() -> usize { Self::device_bytes() + 3 * (5120 * 1152 / 1024) }
+    #[cfg(test)]
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize, budget: usize) -> Result<Self> {
         Self::load_in(device, catalog, layer, budget, None)
     }

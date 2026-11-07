@@ -29,6 +29,7 @@ impl<'a> IndexLaneWeights<'a> {
                 .context("index weight budget overflow")
         })
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

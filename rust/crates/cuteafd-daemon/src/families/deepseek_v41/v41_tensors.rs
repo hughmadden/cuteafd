@@ -55,6 +55,7 @@ pub(crate) struct NativeRtxTensors<'a> {
 }
 impl<'a> NativeRtxTensors<'a> {
     /// Target and dSpark borrow the same immutable table on both CED devices.
+    #[cfg(test)]
     pub fn load_embedding(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         placement: crate::shared::memory::EmbedPlacement) -> Result<Self> {
         Self::load_embedding_in(library, catalog, placement, None)
@@ -94,6 +95,7 @@ impl<'a> NativeRtxTensors<'a> {
     }
     /// Admission precedes allocation and payload reads; bounded pinned staging is
     /// released after synchronous uploads. Engram tables cannot enter this path.
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -207,10 +209,6 @@ pub(crate) struct HeadScratch<'a> {
 
 /// Packs a resident BF16 head, draining before releasing the source. Failed
 /// drains quarantine both formats and the native module until process teardown.
-fn pack_fp8<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize)
-    -> Result<(Option<DeviceAllocation<'a>>, crate::shared::fp8_linear::Fp8Weight<'a>)> {
-    pack_fp8_in(library, weight, rows, None)
-}
 fn pack_fp8_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize,
     arena: Option<&DeviceWeightArena<'a>>)
     -> Result<(Option<DeviceAllocation<'a>>, crate::shared::fp8_linear::Fp8Weight<'a>)> {
@@ -237,10 +235,6 @@ fn pack_fp8_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, row
 /// Packs a resident BF16 head into the exact 12-bit copy, which verifies itself
 /// bit for bit, then releases the BF16 source. A failed drain quarantines the
 /// destination, the source and the native module until process teardown.
-fn pack_packed<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize)
-    -> Result<crate::shared::packed_head::PackedHead<'a>> {
-    pack_packed_in(library, weight, rows, None)
-}
 fn pack_packed_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize,
     arena: Option<&DeviceWeightArena<'a>>) -> Result<crate::shared::packed_head::PackedHead<'a>> {
     ensure!(weight.buffer.bytes == rows * 10240, "packed head geometry differs from BF16");
@@ -360,6 +354,7 @@ impl<'library> VocabularyHead<'library> {
         let source = VocabularyShard::device_bytes(catalog, 0..129280)?;
         Ok(usize::try_from(fp8_head().resident(source as u64).0)?)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'library NativeLibrary,
         catalog: &OfficialV41Catalog,
