@@ -40,7 +40,7 @@ pub(crate) fn decode_peer_bytes(hidden: usize, expert: usize, topk: usize, onboa
 
 /// The pair's exchange (both ends); each rank uses it through [`RankEnd`].
 pub(crate) struct MusePeer<'a> {
-    exchange: PeerExchange<'a>,
+    exchange: std::rc::Rc<PeerExchange<'a>>,
     sizes: Vec<usize>,
     /// Per rank and channel: pushes sent and events received (round-robin ordinals).
     sent: [[Cell<u64>; 5]; 2],
@@ -51,13 +51,15 @@ impl<'a> MusePeer<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, ranks: [RankDevice; 2], sizes: Vec<usize>, decode_bytes: usize) -> Result<Self> {
         ensure!(sizes.len() == Channel::ALL.iter().map(|&c| receive_slots(c)).sum::<usize>(),
             "Muse TP2 needs every channel's slots");
-        let exchange = PeerExchange::new_abortable_sized(library, ranks, &sizes, decode_bytes)?;
+        let exchange = std::rc::Rc::new(PeerExchange::new_abortable_sized(library, ranks, &sizes, decode_bytes)?);
         Ok(Self { exchange, sizes, sent: Default::default(), received: Default::default() })
     }
 
     pub(crate) fn rank(&self, rank: usize) -> RankEnd<'_, 'a> { RankEnd { peer: self, rank } }
 
     pub(crate) fn exchange(&self) -> &PeerExchange<'a> { &self.exchange }
+
+    pub(crate) fn shared(&self) -> std::rc::Rc<PeerExchange<'a>> { self.exchange.clone() }
 
     /// The next slot of `channel` for `rank`'s `counter`, advancing it.
     fn next(counter: &[[Cell<u64>; 5]; 2], rank: usize, channel: Channel) -> usize {
