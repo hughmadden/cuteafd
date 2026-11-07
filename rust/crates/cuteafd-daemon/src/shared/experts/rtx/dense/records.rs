@@ -882,8 +882,9 @@ pub(crate) struct Mount<'a> {
     staging: Option<HostAllocation<'a>>,
     /// The whole rows of the last partial-width read (column shares of one tensor).
     rows: Option<(Rect, Vec<u8>)>,
-    /// Per-GPU device scratch of gathering jobs.
-    scratch: std::collections::HashMap<i32, Option<crate::shared::memory::DeviceAllocation<'a>>>,
+    /// Gathering scratch must retire on its owning GPU, even if the mount
+    /// runner is released or unwound with another device current.
+    scratch: std::collections::HashMap<i32, crate::shared::memory::device::DeviceOwner<'a, Option<crate::shared::memory::DeviceAllocation<'a>>>>,
 }
 
 impl<'a> Mount<'a> {
@@ -935,8 +936,13 @@ impl<'a> Mount<'a> {
         }
         if self.kernels.is_none() { self.kernels = Some(LoadKernels::new(self.library)?); }
         let kernels = self.kernels.as_mut().context("load kernels")?;
-        let scratch = self.scratch.entry(step.device).or_default();
-        step.run(kernels, self.library, &staging.bytes()[..bytes], stream, scratch)
+        let scratch = match self.scratch.entry(step.device) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Device { library: self.library, id: step.device }.own(|| Ok(None))?)
+            }
+        };
+        step.run(kernels, self.library, &staging.bytes()[..bytes], stream, scratch.get_mut())
     }
 }
 
@@ -965,6 +971,68 @@ pub(crate) fn fill_records_by_mount(library: &NativeLibrary, records: &Records,
 
 #[cfg(test)]
 mod window_tests {
+    #[test]
+    fn mount_scratch_drops_on_each_owning_device() -> anyhow::Result<()> {
+        use super::*;
+        use crate::shared::memory::device::Allocation;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let capacity = STEP_BYTES * 2;
+        for id in 0..2 { fixture.configure_memory(&library, id, capacity)?; }
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let path = dir.path().join("tiles.bin");
+        let bytes = (0..1024).map(|i| (i * 29 % 251) as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &bytes)?;
+        // No arenas: reproduce the shared mount lifetime on two physical devices.
+        let outputs = (0..2).map(|id| Allocation::new(Device { library: &library, id }, bytes.len()))
+            .collect::<Result<Vec<_>>>()?;
+        let steps = outputs.iter().map(|output| Step {
+            device: output.device.id,
+            rects: vec![Rect { name: "tiles".into(), path: path.clone(), base: 0,
+                row_bytes: 128, rows: 0..8, cols: 0..128 }],
+            jobs: vec![Job::TrellisTiles { rows: 8, k0: 0, tiles: 8, tile_bytes: 16,
+                k16: 8, input: false, dst: output.buffer }],
+        }).collect::<Vec<_>>();
+        for ambient in 0..2 {
+            for cleanup in ["drop", "release", "error", "fallback"] {
+                library.cuda_set_device(ambient)?;
+                if cleanup == "fallback" {
+                    fill_by_mount(&library, &[], &steps, |_| std::ptr::null_mut())?;
+                } else {
+                    let result = (|| -> Result<()> {
+                        let dense = DenseLoad::mount(&library);
+                        for step in &steps { dense.step(step.clone(), std::ptr::null_mut())?; }
+                        if cleanup == "release" { dense.release(); }
+                        if cleanup == "error" {
+                            let mut invalid = steps[1].clone();
+                            invalid.rects[0].path = dir.path().join("missing.bin");
+                            dense.step(invalid, std::ptr::null_mut())?;
+                        }
+                        Ok(())
+                    })();
+                    assert_eq!(result.is_err(), cleanup == "error");
+                }
+                assert_eq!(library.cuda_get_device()?, ambient, "{cleanup} restores caller device");
+                assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1),
+                    "{cleanup} with ambient GPU{ambient}");
+                for output in &outputs {
+                    let free = output.device.run(|| library.cuda_physical_memory_info())?.0;
+                    assert_eq!(free, capacity - bytes.len(), "{cleanup} releases all scratch");
+                    let mut actual = vec![0; bytes.len()];
+                    output.device.run(|| library.copy_d2h(&mut actual, output.buffer))?;
+                    assert_eq!(actual, bytes, "{cleanup} keeps gathered contents");
+                }
+            }
+        }
+        drop(outputs);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
+        for id in 0..2 {
+            assert_eq!(Device { library: &library, id }.run(|| library.cuda_physical_memory_info())?.0, capacity);
+        }
+        Ok(())
+    }
     #[test]
     fn mount_load_records_charge_partial_rows_and_quant_tables() -> anyhow::Result<()> {
         use super::*;
