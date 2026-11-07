@@ -74,7 +74,7 @@ VERSION = str(
 # exporter imports this module before compiling, so the default HostTarget is
 # pinned here once. Coordinator stubs (launch wrappers, not hot code) use
 # x86-64-v3 (AVX2). Every Spark is a GB10 (Cortex-X925 + Cortex-A725, one
-# feature set), so Spark exports are tuned for its fast core: CuTe DSL 4.6.2's
+# feature set), so Spark exports are tuned for its fast core: CuTe DSL 4.8.1's
 # LLVM accepts cortex-x925, and on a GB10 "native" already resolved to it
 # (identical objects), so the pin keeps today's code and makes it reproducible.
 # An explicit per-call --host-target still wins; CUTEAFD_CUTE_HOST_TARGET
@@ -115,7 +115,7 @@ def _pin_cute_host_target() -> None:
     # and the string parser assigns "" for an absent --host-target. The object
     # export reads only .triple/.cpu/.features, so an empty spec resolves to the
     # pinned target there; a non-empty explicit spec is used as given.
-    pinned = compiler._parse_host_target(target)
+    pinned = cls._parse_target(target)
 
     def resolved(self) -> tuple[str, str, str]:
         return (self._triple, self._cpu, self._features) if self._triple else pinned

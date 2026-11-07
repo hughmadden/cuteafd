@@ -846,6 +846,7 @@ pub(crate) struct DflashDrafter<'a> {
 struct GqaHeadSplit<'a> {
     peer: DeviceOwner<'a, Box<DflashDrafter<'a>>>,
     exchange: Rc<PeerExchange<'a>>,
+    lead: usize,
     reduced: Dev<'a>,
     peer_reduced: DeviceOwner<'a, Dev<'a>>,
 }
@@ -1071,16 +1072,28 @@ impl<'a> DflashDrafter<'a> {
         row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         exchange: Rc<PeerExchange<'a>>) -> Result<Self> {
+        Self::load_tp2_on(library, programs, snapshot, file, slots, max_sequences, mask_row,
+            row_window, representation, scales, fp8_rows, kv_cache, exchange, 0)
+    }
+
+    /// The target head may live on either exchange rank; keep its selector local.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_tp2_on(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        snapshot: &Path, file: Vec<u8>, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
+        row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
+        fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        exchange: Rc<PeerExchange<'a>>, head_rank: usize) -> Result<Self> {
+        ensure!(head_rank < 2, "invalid DFlash head rank");
         let file = Rc::new(file);
-        let mut lead = Self::load_rank(library, programs, snapshot, Some(file.clone()), exchange.stream(0), slots,
+        let mut lead = Self::load_rank(library, programs, snapshot, Some(file.clone()), exchange.stream(head_rank), slots,
             max_sequences, mask_row.clone(), row_window, representation, scales, fp8_rows, kv_cache, 0, 2)?;
-        let device = Device { library, id: exchange.device(1) };
-        let peer = device.own(|| Self::load_rank(library, programs, snapshot, Some(file), exchange.stream(1), slots,
+        let device = Device { library, id: exchange.device(1 - head_rank) };
+        let peer = device.own(|| Self::load_rank(library, programs, snapshot, Some(file), exchange.stream(1 - head_rank), slots,
             max_sequences, mask_row, row_window, representation, scales, fp8_rows, kv_cache, 1, 2).map(Box::new))?;
         let bytes = max_sequences * lead.cfg.block * lead.cfg.hidden * 2;
         let reduced = DeviceAllocation::new(library, bytes)?;
         let peer_reduced = device.own(|| DeviceAllocation::new(library, bytes))?;
-        lead.head_split = Some(GqaHeadSplit { peer, exchange, reduced, peer_reduced });
+        lead.head_split = Some(GqaHeadSplit { peer, exchange, lead: head_rank, reduced, peer_reduced });
         Ok(lead)
     }
 
@@ -1598,13 +1611,13 @@ impl<'a> DflashDrafter<'a> {
         ensure!(last < TAP_ROWS, "draft tap span exceeds admitted rows");
         let bytes = self.cfg.taps.len() * self.cfg.hidden * 2;
         split.peer.device.run(|| split.peer.update_with(rows, || {
-            split.exchange.push_to(0, DIRECT, at(&self.taps, first * bytes),
+            split.exchange.push_to(split.lead, DIRECT, at(&self.taps, first * bytes),
                 at(&split.peer.taps, first * bytes), (last - first + 1) * bytes)?;
-            split.exchange.wait(1, DIRECT)
+            split.exchange.wait(1 - split.lead, DIRECT)
         }))?;
-        split.exchange.signal(1, DIRECT)?;
+        split.exchange.signal(1 - split.lead, DIRECT)?;
         self.update_with(rows, || Ok(()))?;
-        split.exchange.wait(0, DIRECT)
+        split.exchange.wait(split.lead, DIRECT)
     }
 
     /// Upload metadata before a remote tap wait is enqueued. `ready` orders
@@ -2138,8 +2151,8 @@ impl<'a> DflashDrafter<'a> {
             split.peer.put(&pw.positions, bytes_of(positions))?;
             split.peer.put(&pw.attention.gqa()?.tables, bytes_of(tables))
         })?;
-        split.exchange.push_to(0, DIRECT, w.h.buffer.ptr, pw.h.buffer.ptr, rows * h * 2)?;
-        split.exchange.wait(1, DIRECT)?;
+        split.exchange.push_to(split.lead, DIRECT, w.h.buffer.ptr, pw.h.buffer.ptr, rows * h * 2)?;
+        split.exchange.wait(1 - split.lead, DIRECT)?;
         split.peer.device.run(|| {
             // SAFETY: peer residual and normalized arenas cover this admitted block.
             unsafe { self.library.glm_dflash_rmsnorm(pw.h.buffer.ptr, split.peer.layers[0].input_norm.buffer.ptr,
@@ -2155,8 +2168,8 @@ impl<'a> DflashDrafter<'a> {
             self.gqa_finish_layer(w, index, rows, split.reduced.buffer.ptr)?;
             split.peer.device.run(|| split.peer.gqa_finish_layer(pw, index, rows, split.peer_reduced.buffer.ptr))?;
         }
-        split.exchange.signal(1, DIRECT)?;
-        split.exchange.wait(0, DIRECT)
+        split.exchange.signal(1 - split.lead, DIRECT)?;
+        split.exchange.wait(split.lead, DIRECT)
     }
 
     fn gqa_attention_partial(&self, w: &Workspace<'_>, index: usize, sequences: usize, max_keys: usize) -> Result<()> {
@@ -2227,15 +2240,15 @@ impl<'a> DflashDrafter<'a> {
         for first in (0..elements).step_by(window) {
             let count = window.min(elements - first);
             for (rank, w) in work.iter().enumerate() {
-                exchange.push(rank, 0, at(&w.delta, first * 2), count * 2)?;
+                exchange.push(rank ^ split.lead, 0, at(&w.delta, first * 2), count * 2)?;
             }
             for (rank, w) in work.iter().enumerate() {
                 let reduced = if rank == 0 { &split.reduced } else { &*split.peer_reduced };
-                exchange.wait(rank, 0)?;
-                exchange.add(rank, at(&w.delta, first * 2), exchange.recv(rank, 0)?, at(reduced, first * 2), count)?;
+                exchange.wait(rank ^ split.lead, 0)?;
+                exchange.add(rank ^ split.lead, at(&w.delta, first * 2), exchange.recv(rank ^ split.lead, 0)?, at(reduced, first * 2), count)?;
             }
-            for rank in 0..2 { exchange.signal(rank, DIRECT)?; }
-            for rank in 0..2 { exchange.wait(rank, DIRECT)?; }
+            for rank in 0..2 { exchange.signal(rank ^ split.lead, DIRECT)?; }
+            for rank in 0..2 { exchange.wait(rank ^ split.lead, DIRECT)?; }
         }
         Ok(())
     }
@@ -2276,7 +2289,7 @@ impl<'a> DflashDrafter<'a> {
                     let workspace = owner.workspace.borrow();
                     let work = workspace.as_ref().context("TP2 startup workspace missing")?;
                     let reduced = if rank == 0 { &split.reduced } else { &*split.peer_reduced };
-                    split.exchange.add(rank, work.delta.buffer.ptr, work.h.buffer.ptr, reduced.buffer.ptr, 128)?;
+                    split.exchange.add(rank ^ split.lead, work.delta.buffer.ptr, work.h.buffer.ptr, reduced.buffer.ptr, 128)?;
                 }
                 self.drain_mla()?;
             }

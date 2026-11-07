@@ -100,8 +100,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let head = model.core.get_weight(crate::families::muse_spark::core::HEAD)
             .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
         let sms = opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", cards[gpus - 1].physical_bytes).sms);
-        crate::placement::families::muse_spark::drafter_inventory(cfg, &config, usize::try_from(slots)?,
-            usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)
+        let drafter = shared::drafter_inventory(cfg, &config, usize::try_from(slots)?,
+            usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)?;
+        if opts.tp2_dflash { drafter.with_tp2(snapshot, &vec![u64::from(sms); gpus], opts.draft_kv_cache) }
+        else { Ok(drafter) }
     }).transpose() {
         Ok(drafter) => drafter,
         Err(error) => {

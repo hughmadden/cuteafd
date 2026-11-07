@@ -172,15 +172,25 @@ mod tests {
             }
         }
         let mut host_rings = std::collections::BTreeSet::new();
-        for (cutoff_rows, formats, drafter, draft_kv) in cases {
-            let label = format!("cutoff {cutoff_rows} {formats:?} drafter {drafter:?} {draft_kv:?}");
+        let cases = cases.into_iter().flat_map(|(cutoff, formats, draft, kv)| {
+            let mut cases = vec![(cutoff, formats, draft, kv, false)];
+            if draft.is_some() { cases.push((cutoff, formats, draft, kv, true)); }
+            cases
+        });
+        for (cutoff_rows, formats, drafter, draft_kv, tp2) in cases {
+            let label = format!("cutoff {cutoff_rows} {formats:?} drafter {drafter:?} {draft_kv:?} TP2={tp2}");
             let snapshot = drafter.map(|name| -> Result<_> {
                 let dir = tempfile::tempdir()?;
-                std::fs::copy(drafters.join(name), dir.path().join("config.json"))?;
+                let config: serde_json::Value = serde_json::from_slice(&std::fs::read(drafters.join(name))?)?;
+                std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
+                let geometry = crate::shared::speculation::dflash::DflashConfig::read(dir.path())?;
+                let tensors = geometry.tensor_shapes().into_iter().map(|(name, shape)|
+                    testing::t(name, "BF16", &shape)).collect::<Vec<_>>();
+                testing::write_safetensors(&dir.path().join("model.safetensors"), &tensors);
                 Ok(dir)
             }).transpose()?;
             let opts = LayoutOptions { context_tokens: 786432, host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
-                head_split: true, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
+                head_split: true, tp2_dflash: tp2, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
                 muse_partial_bf16_max_rows: cutoff_rows, spark_reply_formats: formats, draft_kv_cache: draft_kv,
                 muse_drafter_snapshot: snapshot.as_ref().map(|d| d.path().to_path_buf()), ..Default::default() };
             let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
@@ -193,7 +203,9 @@ mod tests {
             let served_drafter = snapshot.as_ref().map(|d| -> Result<_> {
                 let config: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("config.json"))?)?;
                 let sms = cuteafd_loader::placement::ArchContext::for_device("sm_120", total).sms;
-                shared::drafter_inventory(&cfg, &config, 16, 16, 202_112, u64::from(sms), draft_kv)
+                let draft = shared::drafter_inventory(&cfg, &config, 16, 16, 202_112, u64::from(sms), draft_kv)?;
+                if tp2 { draft.with_tp2(d.path(), &[u64::from(sms); 2], draft_kv) }
+                else { Ok(draft) }
             }).transpose()?;
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
             let live = crate::commands::bench::assert_resolved_family_seam("muse_spark", &[], || {

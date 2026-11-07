@@ -868,10 +868,33 @@ impl Recipe for MuseRecipe<'_> {
             let home = u8::try_from(self.gpus - 1).map_err(|_| Refusal::Overflow("Muse GPUs"))?;
             let variable = contract.variables.len();
             contract.variables.push(Variable::DraftHome(vec![home]));
-            let bytes = [drafter.owned, drafter.scratch, drafter.head_scratch, drafter.runtime].into_iter()
+            if !drafter.tp2.is_empty() {
+                if self.gpus != 2 || drafter.tp2.len() != 2 {
+                    return Err(invalid("Muse TP2 drafter needs two rank-local layouts"));
+                }
+                for (rank, layout) in drafter.tp2.iter().enumerate() {
+                    let location = Location::coordinator((1 - rank) as u8);
+                    let prefix = format!("muse.drafter.rank{rank}");
+                    for owner in layout.allocations(&prefix, location) {
+                        let bytes = ByteCurve::fixed(owner.bytes, self.maximum_pages);
+                        contract.components.push(Component::allocation(owner, bytes, false, self.maximum_pages));
+                    }
+                    for owner in layout.weight_owners() {
+                        contract.components.push(Component::resident_weight(ResidentWeight {
+                            id: format!("{prefix}.{}", owner.id), location,
+                            weights: ResidentWeights(owner.bytes),
+                        }, ByteCurve::fixed(owner.bytes, self.maximum_pages)));
+                    }
+                }
+            }
+            let owned = if drafter.tp2.is_empty() {
+                drafter.owned.checked_add(drafter.scratch).ok_or(Refusal::Overflow("Muse drafter"))?
+            } else { 0 };
+            let resident = if drafter.tp2.is_empty() { drafter.weights.0 } else { 0 };
+            let bytes = [owned, drafter.head_scratch, drafter.runtime].into_iter()
                 .try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).ok_or(Refusal::Overflow("Muse drafter"))?;
             for mut component in weights("muse.drafter".into(), Location::coordinator(home), bytes,
-                drafter.weights.0, Category::Drafter, "Drafter", self.maximum_pages)? {
+                resident, Category::Drafter, "Drafter", self.maximum_pages)? {
                 component.activation = Activation::choice(variable, 0);
                 contract.components.push(component);
             }

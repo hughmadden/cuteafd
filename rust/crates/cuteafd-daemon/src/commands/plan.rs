@@ -189,8 +189,8 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
     };
     let enabled = args.tp2_dflash.unwrap_or(configured);
     anyhow::ensure!(!enabled || (args.layout && args.rtx == 2 && args.speculator == "dflash2"
-        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash")),
-        "TP2_DFLASH requires MiMo/Kimi/GLM Flash, --layout, --rtx 2 and DFlash2");
+        && matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark")),
+        "TP2_DFLASH requires MiMo/Kimi/GLM Flash/Muse, --layout, --rtx 2 and DFlash2");
     Ok(enabled)
 }
 
@@ -1120,7 +1120,7 @@ mod tests {
             let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(
                 argv.into_iter().chain(["--tp2-dflash", explicit])).unwrap().command
                 else { panic!("expected plan") };
-            for family in ["mimo_v2", "kimi_k3", "glm5_flash"] {
+            for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
                 assert_eq!(tp2_dflash(&request, family, &cfg).unwrap(), expected);
             }
             assert_eq!(options(&request).unwrap().layout.unwrap().tp2_dflash, expected);
@@ -1132,8 +1132,10 @@ mod tests {
             assert!(!tp2_dflash(&request, family, &[("TP2_DFLASH".into(), "off".into())].into()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).unwrap());
         }
+        assert!(!tp2_dflash(&request, "muse_spark", &Default::default()).unwrap());
+        assert!(tp2_dflash(&request, "muse_spark", &cfg).unwrap());
         request.rtx = 1;
-        for family in ["mimo_v2", "kimi_k3", "glm5_flash"] {
+        for family in ["mimo_v2", "kimi_k3", "glm5_flash", "muse_spark"] {
             assert!(!tp2_dflash(&request, family, &Default::default()).unwrap());
             assert!(tp2_dflash(&request, family, &cfg).is_err());
         }
