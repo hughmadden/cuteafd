@@ -43,6 +43,17 @@ static size_t used(int device) {
   CUDA(cudaMemGetInfo(&free, &total));
   return total - free;
 }
+static void identity(int device) {
+  CUDA(cudaSetDevice(device));
+  cudaDeviceProp prop{};
+  CUDA(cudaGetDeviceProperties(&prop, device));
+  std::printf("{\"mode\":\"identity\",\"device\":%d,\"name\":\"%s\",\"uuid\":\"GPU-", device, prop.name);
+  for (int i = 0; i < 16; ++i) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) std::putchar('-');
+    std::printf("%02x", (unsigned char)prop.uuid.bytes[i]);
+  }
+  std::printf("\"}\n");
+}
 static void handles(int device, int count) {
   CUDA(cudaSetDevice(device));
   CUDA(cudaFree(nullptr));
@@ -132,6 +143,8 @@ static void mappings(int device0, int device1) {
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "handles";
   const int device = argc > 2 ? std::atoi(argv[2]) : 0;
+  identity(device);
+  if (std::strcmp(mode, "mappings") == 0) identity(argc > 3 ? std::atoi(argv[3]) : 1);
   const int last = argc > 3 ? std::atoi(argv[3]) : (std::strcmp(mode, "mappings") == 0 ? 1 : 4);
   if (std::strcmp(mode, "handles") == 0 && last > 0 && last <= 64) handles(device, last);
   else if (std::strcmp(mode, "mappings") == 0) mappings(device, last);
