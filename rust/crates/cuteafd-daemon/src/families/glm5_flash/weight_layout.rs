@@ -202,7 +202,7 @@ mod tests {
         let mut tensors = glm5_flash_tensors(&config);
         tensors.retain(|tensor| !expected.keys().any(|name| {
             let stem = name.strip_suffix(".weight").unwrap();
-            tensor.name == *name || tensor.name == format!("{name}_scale_inv") || tensor.name.starts_with(&format!("{stem}.trellis"))
+            tensor.0 == *name || tensor.0 == format!("{name}_scale_inv") || tensor.0.starts_with(&format!("{stem}.trellis"))
         }));
         for (name, shape) in expected {
             let stem = name.strip_suffix(".weight").unwrap();
