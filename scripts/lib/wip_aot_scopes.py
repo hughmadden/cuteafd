@@ -133,6 +133,15 @@ def dense_switch(values):
     return switches[geometry]
 
 
+def exl3_spark_layouts(scope, tp):
+    if not 1 <= tp <= 8:
+        raise ValueError(f'invalid Spark TP {tp}')
+    family, _ = scope.split(':', 1)
+    intermediate = spark_packages.package_entry(family, 'exl3')['intermediate']
+    compact = '-compact' if intermediate // 128 % tp else ''
+    return [f'tp{tp}{compact}-rank{rank}/m1' for rank in range(tp)]
+
+
 def family_scopes(cards, config_reader):
     # Derived per card: a card with no Sparks (local experts) contributes only
     # coordinator scopes, and a Spark card's TP count is keyed to its own family
@@ -142,7 +151,7 @@ def family_scopes(cards, config_reader):
     for card in cards:
         family = card.get('family')
         require_mapping(family)
-        values = {**config_reader(card['config']), **card.get('set', {})}
+        values = card['resolved_values'] if 'resolved_values' in card else {**config_reader(card['config']), **card.get('set', {})}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
         if family == 'qwen3_5':
             if count or values.get('SPARK_HOSTS') or values.get('EXPERT_BACKEND') == 'spark':

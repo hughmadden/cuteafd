@@ -86,7 +86,7 @@ fn fp8_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::pat
 }
 
 /// The installed `exl3-<family>-k<tiers>/rtx-tp<tp>` arena at `rows`, plus the
-/// routed output (F32 partials for TP2, BF16 for one GPU).
+/// routed output (F32 for both whole and TP2 execution).
 fn exl3_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
     tp: usize) -> Result<u64> {
     let exl3 = catalog.exl3().context("EXL3 onboarding needs EXL3 expert headers")?;
@@ -111,5 +111,5 @@ fn exl3_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::pa
         Ok(value)
     }).collect::<Result<Vec<_>>>()?;
     Ok(crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
-        + rows.max(1) * shape.hidden as u64 * if tp == 2 { 4 } else { 2 })
+        + crate::serving_capacity::exl3_rtx_output_bytes(rows, shape.hidden as u64)?)
 }

@@ -258,8 +258,8 @@ impl<'a> Exl3Tp2<'a> {
             Exl3ReductionPlan::new(&paths)?;
         }
         Ok([Exl3Workspace::plan(&paths, Self::INPUT_FORMAT, Exl3Epilogue::Sum)?,
-            max_rows.checked_mul(hidden).and_then(|n| n.checked_mul(4))
-                .context("EXL3 TP2 output overflow")?])
+            usize::try_from(cuteafd_loader::serving_capacity::exl3_rtx_output_bytes(
+                max_rows as u64, hidden as u64)?)?])
     }
 
     /// Loads each layer's two slices concurrently before advancing to the next
