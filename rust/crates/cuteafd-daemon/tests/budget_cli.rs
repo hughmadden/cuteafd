@@ -582,7 +582,9 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
     assert!(output.status.success(), "MiMo min installed native plan: {}", String::from_utf8_lossy(&output.stderr));
     let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(deployment["report"]["fits"], true, "{deployment}");
-    assert_eq!(deployment["report"]["onboard_layers"], 15, "measured min-card local prefix must not drift");
+    // 15 layers under the retired 97% ceiling; the one-cap policy (#1440) admits a 16th
+    // with the measured 575 MiB baseline and 570 MiB runtime allowance still charged.
+    assert_eq!(deployment["report"]["onboard_layers"], 16, "measured min-card local prefix must not drift");
     assert_eq!(deployment["memory_layout"]["pool_tokens"], 2_097_152);
     assert_eq!(deployment["prefill_unit_rows"], 2752);
     assert_eq!(deployment["prefill_waves"], 3);
