@@ -623,7 +623,8 @@ mod tests {
                     let owners = if recorded {
                         let (owners, records) = dense::recording(|| run(device, &snapshot, &cfg, rank, ranks, representation, &expected, Some(&arena)))?;
                         assert!(!records.operands.is_empty());
-                        let sockets = tempfile::tempdir_in(fixture.directory())?;
+                        // The nested DSO fixture path exceeds Unix socket path limits.
+                        let sockets = tempfile::tempdir()?;
                         crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
                             &records, None, 6, 1)?;
                         owners
