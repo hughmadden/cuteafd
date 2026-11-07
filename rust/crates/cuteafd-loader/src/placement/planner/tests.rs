@@ -2,6 +2,147 @@ use super::*;
 use cuteafd_core::SparkReplyFormat;
 use crate::placement::FfnMode;
 
+fn granular_owner(id: &str, backing: &str, requests: Vec<u64>, lifetime: Lifetime) -> AllocationGranularity {
+    AllocationGranularity { id: id.into(), location: Location::coordinator(0), lifetime,
+        backings: vec![GranularityBacking { backing: backing.into(), requests }], evidence: GranularityEvidence::Forecast }
+}
+
+#[test]
+fn allocation_granularity_preserves_activation_lifetimes_serde_search_and_fixed_replay() {
+    let maximum = 8;
+    let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+    let lifetime = Lifetime { first: Phase::Ready, last: Phase::Growth };
+    let owner = granular_owner("weights", "payload", vec![3 << 20, 24 << 10], lifetime);
+    let payload = owner.requests().iter().sum();
+    let option = contract.variables.len();
+    contract.variables.push(Variable::Encoder(vec![0, 1]));
+    let mut allocation = Component::allocation(Allocation::buffer("payload", owner.location,
+        payload, lifetime, Category::Weights, "weights"), ByteCurve::fixed(payload, maximum), false, maximum);
+    allocation.activation = Activation::choice(option, 0);
+    contract.components.push(allocation);
+    let mut component = allocation_granularity_component(owner.clone(), maximum).unwrap();
+    component.activation = Activation::choice(option, 0);
+    contract.components.push(component);
+    // An exact multiple still retains its typed inventory when the slack is zero.
+    let zero = granular_owner("zero", "aligned", vec![2 << 20], Lifetime::RESIDENT);
+    contract.components.push(Component::allocation(Allocation::buffer("aligned", zero.location,
+        2 << 20, zero.lifetime, Category::Weights, "aligned"), ByteCurve::fixed(2 << 20, maximum), false, maximum));
+    contract.components.push(allocation_granularity_component(zero, maximum).unwrap());
+    let budgets = vec![budget(16 << 20)];
+    let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+    for selected in [&[0, 0, 0, 0][..], &[0, 0, 0, 1][..]] {
+        for pages in 1..=maximum {
+            let owners = contract.facts(selected, pages).unwrap();
+            let phases = evaluate(&owners, &budgets).unwrap();
+            assert_eq!(compiled.phases(&budgets, selected, pages).unwrap(), phases);
+            assert_eq!(owners.allocation_granularity.len(), if selected[option] == 0 { 2 } else { 1 });
+            for row in phases {
+                assert_eq!(row.opaque, if selected[option] == 0 && lifetime.contains(row.phase, owners.phase_order) {
+                    owner.bytes().unwrap()
+                } else { 0 });
+            }
+            let encoded = serde_json::to_vec(&owners).unwrap();
+            let restored: Facts = serde_json::from_slice(&encoded).unwrap();
+            let mut replay = Contract::fixed(64, 1, 1, restored);
+            replay.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+            assert_eq!(replay.facts(&[0, 0], 1).unwrap(), owners);
+        }
+    }
+    cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+        let mut overridden = contract.clone();
+        let mut budgets = budgets.clone();
+        search::apply_reserve_override(&mut overridden, &mut budgets);
+        assert_eq!(overridden.components.iter().filter(|c| matches!(c.kind, ComponentKind::AllocationGranularity(_))).count(), 2);
+    });
+}
+
+#[test]
+fn allocation_granularity_refuses_duplicate_alias_stale_and_wrong_domain_backings() {
+    let owner = granular_owner("weights", "payload", vec![3 << 20], Lifetime::TARGET);
+    let mut owners = facts(vec![Allocation::buffer("payload", owner.location, 3 << 20,
+        owner.lifetime, Category::Weights, "weights")]);
+    owners.allocation_granularity.push(owner);
+    let budgets = vec![budget(16 << 20)];
+    evaluate(&owners, &budgets).unwrap();
+    let mut invalid = Vec::new();
+    let mut duplicate = owners.clone();
+    duplicate.allocation_granularity.push(duplicate.allocation_granularity[0].clone());
+    invalid.push(duplicate);
+    let mut duplicate_backing = owners.clone();
+    let mut other = duplicate_backing.allocation_granularity[0].clone();
+    other.id = "other".into();
+    duplicate_backing.allocation_granularity.push(other);
+    invalid.push(duplicate_backing);
+    let mut alias = owners.clone();
+    let mut view = alias.allocations[0].clone();
+    view.id = "alias".into();
+    view.view = Some(View { backing: "payload".into(), offset: 0 });
+    alias.allocations.push(view);
+    alias.allocation_granularity[0].backings[0].backing = "alias".into();
+    invalid.push(alias);
+    let mut stale = owners.clone();
+    stale.allocation_granularity[0].backings[0].requests[0] += 1;
+    invalid.push(stale);
+    let mut missing = owners.clone();
+    missing.allocation_granularity[0].backings[0].backing = "missing".into();
+    invalid.push(missing);
+    let mut wrong_domain = owners.clone();
+    wrong_domain.allocation_granularity[0].location = Location { device: Device::Spark(0), domain: Domain::Managed };
+    invalid.push(wrong_domain);
+    let mut wrong_lifetime = owners.clone();
+    wrong_lifetime.allocation_granularity[0].lifetime = Lifetime::RESIDENT;
+    invalid.push(wrong_lifetime);
+    let mut overflow = owners.clone();
+    overflow.allocation_granularity[0].backings[0].requests = vec![u64::MAX];
+    invalid.push(overflow);
+    for owners in invalid {
+        assert!(evaluate(&owners, &budgets).is_err());
+        let mut replay = Contract::fixed(64, 1, 1, owners);
+        replay.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+        assert!(solve(request(), budgets.clone(), &Prepared(replay)).is_err());
+    }
+}
+
+#[test]
+fn allocation_granularity_reconciles_transactionally_without_reselection_or_baseline_recharge() {
+    let page = 2 << 20;
+    let maximum = 8;
+    let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+    let owner = granular_owner("weights", "payload", vec![3 << 20, 24 << 10], Lifetime::RESIDENT);
+    let payload = owner.requests().iter().sum();
+    contract.components.push(Component::allocation(Allocation::buffer("payload", owner.location,
+        payload, owner.lifetime, Category::Weights, "weights"), ByteCurve::fixed(payload, maximum), false, maximum));
+    contract.components.push(allocation_granularity_component(owner, maximum).unwrap());
+    let mut physical = budget(9 << 20);
+    physical.baseline = Baseline::Forecast { occupied: page, source: "earlier live small-allocation block".into(), assumed: false };
+    let mut plan = solve(request(), vec![physical], &Prepared(contract)).unwrap();
+    let original = plan.clone();
+    let before = vec![DeviceExtent { address: 4 * page, bytes: 14 << 10 }];
+    let mut after = before.clone();
+    after.extend([DeviceExtent { address: 4 * page + (16 << 10), bytes: 24 << 10 },
+        DeviceExtent { address: 8 * page, bytes: 3 << 20 }]);
+    reconcile_allocation_granularity(&mut plan, "weights", before.clone(), after).unwrap();
+    assert_eq!((plan.pool_tokens, &plan.decisions, &plan.budgets), (original.pool_tokens, &original.decisions, &original.budgets));
+    assert_eq!(plan.facts.allocations, original.facts.allocations);
+    assert_eq!(plan.facts.allocation_granularity[0].bytes().unwrap(), (1 << 20) - (24 << 10));
+    assert!(plan.items(Location::coordinator(0)).unwrap().iter().any(|item|
+        item.group == ALLOCATION_GRANULARITY_GROUP && item.basis == Basis::Calibrated));
+    for (old, new) in original.phases.iter().zip(&plan.phases) {
+        assert_eq!((old.owned, old.available), (new.owned, new.available));
+        assert_eq!(old.opaque - new.opaque, page);
+    }
+    let measured = plan.clone();
+    assert!(reconcile_allocation_granularity(&mut plan, "weights", before.clone(), before.clone()).is_err());
+    assert_eq!(plan, measured);
+    assert!(reconcile_allocation_granularity(&mut plan, "absent", before.clone(), before.clone()).is_err());
+    assert_eq!(plan, measured);
+    // Same requested sizes, but an allocation straddles three backing pages.
+    let after = vec![before[0], DeviceExtent { address: 8 * page - 512, bytes: 3 << 20 },
+        DeviceExtent { address: 16 * page, bytes: 24 << 10 }];
+    assert!(matches!(reconcile_allocation_granularity(&mut plan, "weights", before, after), Err(Refusal::Capacity { .. })));
+    assert_eq!(plan, measured);
+}
+
 #[test]
 fn driver_page_tables_preserve_backings_aliases_activation_and_lifetimes() {
     let maximum = 32;
@@ -301,7 +442,7 @@ fn allocation(id: &str, bytes: u64) -> Allocation {
     )
 }
 fn facts(allocations: Vec<Allocation>) -> Facts {
-    Facts { driver_page_tables: vec![], resident_weights: vec![],
+    Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
         phase_order: crate::placement::planner::PhaseOrder::TARGET_THEN_DRAFT,
         allocations,
         deferred: vec![],

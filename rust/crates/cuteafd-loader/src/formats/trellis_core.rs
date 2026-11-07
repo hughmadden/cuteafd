@@ -61,6 +61,12 @@ pub struct CoreWeightLayout {
     pub codebook: crate::formats::exl3_storage::Exl3Codebook,
 }
 impl CoreWeightLayout {
+    /// Separate cudaMalloc owners used by the shared recorded loader.
+    pub fn allocation_extents(&self) -> [u64; 3] {
+        let [n, k] = self.shape;
+        [(self.bytes - 2 * (n + k)) as u64, (2 * k) as u64, (2 * n) as u64]
+    }
+
     pub fn new(projection: &CoreProjection,
         side: crate::formats::dense_trellis::TrellisSide, rank: usize, ranks: usize) -> Result<Self> {
         ensure!(matches!(ranks,1|2) && rank<ranks,"dense trellis native rank geometry");

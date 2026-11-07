@@ -822,7 +822,7 @@ pub fn solve(
     contract.validate_home_budgets(&budgets)?;
     // Validate physical budgets independently of conditional allocation choices.
     validate(
-        &Facts { driver_page_tables: vec![], resident_weights: vec![],
+        &Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
             phase_order: contract.phase_order,
             allocations: vec![],
             deferred: vec![],

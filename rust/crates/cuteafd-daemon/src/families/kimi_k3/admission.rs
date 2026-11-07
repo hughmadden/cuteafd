@@ -116,6 +116,7 @@ pub(crate) struct Admission<'a> {
     pub host_prefix: Option<cuteafd_hostcache::config::Config>,
     pub mark_selection: MarkSelection,
     pub graph_set: Option<cuteafd_loader::placement::inventory::StartupGraphs<super::graphs::Key>>,
+    receipt: cuteafd_loader::placement::planner::ResolvedPlan,
     cfg: KimiK3Config,
     core: cuteafd_loader::families::kimi_k3::core::CoreInventory,
     rtx: Option<RtxInventory>,
@@ -443,12 +444,17 @@ impl<'a> Admission<'a> {
 
     /// Every global and layer owner through the shared records on `load`.
     #[allow(clippy::type_complexity)]
-    fn record(&self, devices: &[Device<'a>], checkpoint: &cuteafd_loader::plan::Checkpoint,
+    fn record(&mut self, devices: &[Device<'a>], checkpoint: &cuteafd_loader::plan::Checkpoint,
         load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, streams: &[(i32, *mut std::ffi::c_void)],
         memory: &mut crate::shared::inventory::StartupMemoryPhases<'_>)
         -> Result<(Vec<GlobalWeights<'a>>, Vec<Vec<LayerWeights<'a>>>)> {
         ensure!(devices.len() == self.devices.len() && streams.len() == devices.len(),
             "Kimi dense records physical inventory differs from admission");
+        // Push recording allocates only retained weights; mount loading can also
+        // allocate transient transform workspaces and is not this measured window.
+        let before = if load.pushing() {
+            crate::shared::inventory::cuda_malloc_extents(devices[0].library, &self.devices)?
+        } else { None };
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
         let records = super::weights::records::KimiRecords { checkpoint, cfg: &self.cfg, core: &self.core,
             dense: load, streams: streams.to_vec() };
@@ -461,6 +467,26 @@ impl<'a> Admission<'a> {
             memory.sample_layer(layer, self.cfg.layers)?;
         }
         memory.sample("weights-core-layers-recorded")?;
+        if let Some(before) = before {
+            let after = crate::shared::inventory::cuda_malloc_extents(devices[0].library, &self.devices)?
+                .context("Kimi cudaMalloc qualification changed during weight recording")?;
+            // Publish all ranks together, preserving the selected pool and layout.
+            let mut receipt = self.receipt.clone();
+            for (rank, (before, after)) in before.into_iter().zip(after).enumerate() {
+                cuteafd_loader::placement::planner::reconcile_allocation_granularity(
+                    &mut receipt, &format!("kimi.weights.{rank}"), before, after)?;
+            }
+            let items = (0..devices.len()).map(|rank| receipt.items(
+                cuteafd_loader::placement::planner::Location::coordinator(rank as u8)))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            self.receipt = receipt;
+            self.placement.items = items;
+            cuteafd_bench::context::ResolvedSettings::placement(&self.placement).publish();
+            let bytes = self.receipt.facts.allocation_granularity.iter().map(|owner| owner.bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            tracing::info!(phases = ?self.receipt.phases, ?bytes,
+                "Kimi weight allocation granularity reconciled without reselection");
+        }
         Ok((global, layers))
     }
 
@@ -776,6 +802,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         draft: draft.as_ref().map(|layout| kimi::draft_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
         fixed, owners: Vec::new(),
     };
+    recipe.allocation_granularity(cfg, &core)?;
     let modes = recipe.resolved_attention();
     let prepared_graph_set = (graph_reserve && (RANKS != 2 || placement_mode != AttentionPlacement::Layers)).then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
         graph_slots, graph_verify, RANKS,
@@ -877,7 +904,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let lane_readers = vec![vec![Weak::new(); devices.len()]; lane_layouts.len()];
     let mla_layouts = (0..devices.len()).map(|rank| CacheLayout::for_ranks(cfg, &placement, rank, cache_format, devices.len()))
         .collect::<Result<Vec<_>>>()?;
-    let admission = Admission { expert_usage: recipe.expert_usage.clone(), placement, host_prefix, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
+    let admission = Admission { receipt: admitted.solved, expert_usage: recipe.expert_usage.clone(), placement, host_prefix, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, context, context_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
         devices: devices.to_vec(), lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: vec![false; devices.len()], kda_owners: vec![Weak::new(); devices.len()],
         mla_layouts, mla_allocated: vec![false; devices.len()], mla_owners: vec![Weak::new(); devices.len()],

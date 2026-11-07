@@ -200,6 +200,7 @@ pub enum ComponentKind {
     DriverPageTables { model: DriverPageTableModel, location: Location, lifetime: Lifetime, backing: String },
     /// Weight residency can outlive or precede the future allocation ledger.
     ResidentWeight(ResidentWeight),
+    AllocationGranularity(AllocationGranularity),
 }
 #[derive(Debug, Clone)]
 pub struct Component {
@@ -273,6 +274,7 @@ impl Component {
             ComponentKind::Allowance(a) => Some((a.location, a.lifetime, true)),
             ComponentKind::DriverPageTables { location, lifetime, .. } => Some((*location, *lifetime, true)),
             ComponentKind::ResidentWeight(_) => None,
+            ComponentKind::AllocationGranularity(owner) => Some((owner.location, owner.lifetime, true)),
         }
     }
 }
@@ -339,6 +341,11 @@ impl Contract {
                 model: mapping.model, location: mapping.location, lifetime: mapping.lifetime, backing: mapping.backing,
             },
         }));
+        components.extend(facts.allocation_granularity.into_iter().map(|owner| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(owner.bytes().unwrap_or(0), maximum_pages),
+            kind: ComponentKind::AllocationGranularity(owner),
+        }));
         components.extend(facts.resident_weights.into_iter().map(|owner| {
             let bytes = ByteCurve::fixed(owner.weights.0, maximum_pages);
             Component::resident_weight(owner, bytes)
@@ -401,7 +408,7 @@ impl Contract {
     }
     pub fn facts(&self, selected: &[usize], pages: u64) -> Result<Facts, Refusal> {
         self.decisions(selected)?;
-        let mut result = Facts { driver_page_tables: vec![], resident_weights: vec![],
+        let mut result = Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![],
             phase_order: self.phase_order,
             allocations: vec![],
             deferred: vec![],
@@ -413,7 +420,7 @@ impl Contract {
                 continue;
             }
             let bytes = component.bytes.at(pages)?;
-            if bytes == 0 && !matches!(component.kind, ComponentKind::ResidentWeight(_)) {
+            if bytes == 0 && !matches!(component.kind, ComponentKind::ResidentWeight(_) | ComponentKind::AllocationGranularity(_)) {
                 continue;
             }
             match &component.kind {
@@ -460,6 +467,12 @@ impl Contract {
                     result.driver_page_tables.push(DriverPageTable {
                         model: *model, location: *location, lifetime: *lifetime, backing: backing.clone(), mapped_bytes: bytes,
                     });
+                }
+                ComponentKind::AllocationGranularity(owner) => {
+                    if bytes != owner.bytes()? {
+                        return Err(Refusal::InvalidFact("cudaMalloc granularity curve differs from physical inventory".into()));
+                    }
+                    result.allocation_granularity.push(owner.clone());
                 }
                 ComponentKind::ResidentWeight(template) => {
                     let mut owner = template.clone();
@@ -776,8 +789,13 @@ impl Contract {
                     return Err(Refusal::InvalidFact(format!("invalid resident weight {}", owner.id)));
                 }
             }
+            if let ComponentKind::AllocationGranularity(owner) = &component.kind {
+                if component.bytes != ByteCurve::fixed(owner.bytes()?, self.maximum_pages) {
+                    return Err(Refusal::InvalidFact("variable cudaMalloc granularity inventory".into()));
+                }
+            }
             if let ComponentKind::Reservation(reservation) = &component.kind {
-                let facts = Facts { driver_page_tables: vec![], resident_weights: vec![], phase_order: self.phase_order, allocations: vec![], deferred: vec![],
+                let facts = Facts { allocation_granularity: vec![], driver_page_tables: vec![], resident_weights: vec![], phase_order: self.phase_order, allocations: vec![], deferred: vec![],
                     sequential: vec![], reservations: vec![reservation.clone()], allowances: vec![] };
                 validate_owners(&facts)?;
             }

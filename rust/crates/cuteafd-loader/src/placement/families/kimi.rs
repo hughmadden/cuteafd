@@ -486,6 +486,52 @@ impl KimiRecipe {
         profiles[if self.gpus == 2 && self.placement == AttentionPlacement::Layers { middle.min(2) } else { 0 }].clone()
     }
 
+    /// Price actual weight cudaMalloc requests, not aggregate layer demands.
+    /// Every alternative profile has its own physical request inventory.
+    pub fn allocation_granularity(&mut self,
+        cfg: &crate::families::kimi_k3::config::KimiK3Config,
+        core: &crate::families::kimi_k3::core::CoreInventory) -> anyhow::Result<()> {
+        use crate::families::kimi_k3::weight_layout::{GlobalLayout, LayerLayout};
+        anyhow::ensure!(!self.owners.iter().any(|component|
+            matches!(component.kind, ComponentKind::AllocationGranularity(_))),
+            "Kimi physical allocation inventory already prepared");
+        let globals = GlobalLayout::ranks_with_core(cfg, core, self.gpus)?;
+        let profiled = self.gpus == 2 && self.placement == AttentionPlacement::Layers;
+        for (option, modes) in self.attention_profiles().iter().enumerate() {
+            let mut backings = globals.iter().map(|layout| vec![GranularityBacking {
+                backing: format!("Kimi global weights.{}", layout.rank), requests: layout.allocation_extents(),
+            }]).collect::<Vec<_>>();
+            for (layer, &mode) in modes.iter().enumerate() {
+                for (rank, layout) in LayerLayout::ranks_with_core(cfg, layer, mode, core, self.gpus)?.iter().enumerate() {
+                    let selected = if self.gpus == 1 { None } else { Some(true) };
+                    let requests = layout.allocation_extents(selected)?;
+                    if !requests.is_empty() {
+                        backings[rank].push(GranularityBacking {
+                            backing: format!("layers.{layer}.{}.{rank}", if profiled { option } else { 0 }), requests,
+                        });
+                    }
+                    if self.gpus == 2 {
+                        let requests = layout.allocation_extents(Some(false))?;
+                        if !requests.is_empty() {
+                            backings[rank].push(GranularityBacking {
+                                backing: format!("Kimi layer {layer} TP2 FFN/residual/router/latent.{rank}"), requests,
+                            });
+                        }
+                    }
+                }
+            }
+            for (rank, backings) in backings.into_iter().enumerate() {
+                let mut component = allocation_granularity_component(AllocationGranularity {
+                    id: format!("kimi.weights.{rank}"), location: Location::coordinator(rank as u8),
+                    lifetime: Lifetime::RESIDENT, backings, evidence: GranularityEvidence::Forecast,
+                }, self.maximum_pages)?;
+                if profiled { component.activation = Activation::choice(0, option); }
+                self.owners.push(component);
+            }
+        }
+        Ok(())
+    }
+
     /// Graph bytes follow the same finite boundary as weights and KV. Callers
     /// build the executable keys only after admission selects that boundary.
     pub fn balance_graphs(&mut self, cfg: &crate::families::kimi_k3::config::KimiK3Config,

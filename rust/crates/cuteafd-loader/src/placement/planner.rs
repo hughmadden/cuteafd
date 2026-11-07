@@ -442,6 +442,8 @@ pub struct Facts {
     /// Keep derivation identity when a solved ledger is used to prepare again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub driver_page_tables: Vec<DriverPageTable>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allocation_granularity: Vec<AllocationGranularity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +472,10 @@ pub fn driver_page_table_bytes(mapped_bytes: u64) -> u64 {
 
 mod contract;
 mod search;
+mod granularity;
+pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence, DeviceExtent,
+    ALLOCATION_GRANULARITY_GROUP, allocation_granularity_forecast, allocation_granularity_component,
+    reconcile_allocation_granularity};
 pub mod native_attention;
 pub mod serving;
 pub use contract::{
@@ -535,6 +541,11 @@ impl ResolvedPlan {
         items.extend(self.facts.driver_page_tables.iter().filter(|mapping|
             mapping.location == location && mapping.lifetime.contains(Phase::Ready, self.facts.phase_order))
             .map(|mapping| Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, mapping.source(), mapping.bytes(), Basis::Calibrated)));
+        for owner in self.facts.allocation_granularity.iter().filter(|owner|
+            owner.location == location && owner.lifetime.contains(Phase::Ready, self.facts.phase_order)) {
+            items.push(Item::new(Category::Runtime, ALLOCATION_GRANULARITY_GROUP,
+                owner.source(), owner.bytes()?, owner.basis()));
+        }
         Ok(items)
     }
     pub fn remaining(&self, budget: &str, phase: Phase) -> Option<u64> {
@@ -627,6 +638,7 @@ fn validate(facts: &Facts, budgets: &[Budget]) -> Result<(), Refusal> {
         || facts.resident_weights.iter().any(|w| !locations.contains(&w.location))
         || facts.reservations.iter().any(|r| !locations.contains(&r.location))
         || facts.driver_page_tables.iter().any(|mapping| !locations.contains(&mapping.location))
+        || facts.allocation_granularity.iter().any(|owner| !locations.contains(&owner.location))
     {
         return Err(Refusal::InvalidFact(
             "allocation outside memory budgets".into(),
@@ -745,6 +757,14 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
             return Err(Refusal::InvalidFact(format!("invalid driver page-table backing {}", mapping.backing)));
         }
     }
+    let mut granular_backings = BTreeSet::new();
+    let mut granular_ids = BTreeSet::new();
+    for owner in &facts.allocation_granularity {
+        if !granular_ids.insert(&owner.id) {
+            return Err(Refusal::InvalidFact("duplicate cudaMalloc granularity owner".into()));
+        }
+        owner.validate_backings(facts, &mut granular_backings)?;
+    }
     Ok(())
 }
 
@@ -810,6 +830,11 @@ pub fn evaluate(facts: &Facts, budgets: &[Budget]) -> Result<Vec<PhaseBudget>, R
                     && budget.locations.contains(&mapping.location))
                 .try_fold(opaque, |n, mapping| n.checked_add(mapping.bytes())
                     .ok_or(Refusal::Overflow("driver page tables")))?;
+            let opaque = facts.allocation_granularity.iter()
+                .filter(|owner| owner.lifetime.contains(phase, facts.phase_order)
+                    && budget.locations.contains(&owner.location))
+                .try_fold(opaque, |sum, owner| sum.checked_add(owner.bytes()?)
+                    .ok_or(Refusal::Overflow("allocation granularity")))?;
             let required = owned
                 .checked_add(opaque)
                 .ok_or(Refusal::Overflow("phase peak"))?;
@@ -932,7 +957,8 @@ pub fn reconcile_legacy_mla_events(
     events: &[OwnerEvent],
 ) -> Result<(), Refusal> {
     if !facts.phase_order.at_or_before(phase, Phase::Warmup) || !facts.deferred.is_empty()
-        || !facts.allowances.is_empty() || !facts.reservations.is_empty() || !facts.driver_page_tables.is_empty() {
+        || !facts.allowances.is_empty() || !facts.reservations.is_empty() || !facts.driver_page_tables.is_empty()
+        || !facts.allocation_granularity.is_empty() {
         return Err(Refusal::InvalidFact(
             "legacy MLA bridge only checks startup owners".into(),
         ));

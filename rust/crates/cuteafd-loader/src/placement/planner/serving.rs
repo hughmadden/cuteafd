@@ -237,7 +237,7 @@ mod tests {
         let owners = [target.clone(), draft, lt];
         let empty = Facts { phase_order: order, allocations: vec![], deferred: vec![],
             sequential: vec![], reservations: vec![], allowances: vec![],
-            resident_weights: vec![], driver_page_tables: vec![] };
+            resident_weights: vec![], allocation_granularity: vec![], driver_page_tables: vec![] };
         let mut contract = Contract::fixed(64, 1, 2, empty);
         contract.variables = vec![Variable::Encoder(vec![0, 1]),
             Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
@@ -279,7 +279,7 @@ mod tests {
         let owners = [media.clone(), target.clone(), draft];
         let empty = Facts { phase_order: order, allocations: vec![], deferred: vec![],
             sequential: vec![], reservations: vec![], allowances: vec![],
-            resident_weights: vec![], driver_page_tables: vec![] };
+            resident_weights: vec![], allocation_granularity: vec![], driver_page_tables: vec![] };
         let mut contract = Contract::fixed(64, 1, 1, empty);
         contract.variables = vec![Variable::Encoder(vec![0, 1]),
             Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
