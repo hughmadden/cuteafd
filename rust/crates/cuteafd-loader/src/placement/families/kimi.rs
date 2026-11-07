@@ -9,7 +9,7 @@ use super::super::{
     Placement, PoolLimits, ResidentWeights, Tp2Range,
 };
 use crate::formats::dflash::MlaDraftRuntimeLayout;
-use cuteafd_core::memory_layout::Category;
+use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 
 /// One shared decode/prefill endpoint per lane, using the same finite probe
@@ -112,6 +112,7 @@ pub struct FixedOwner {
     pub bytes: u64,
     pub weights: u64,
     pub lifetime: Lifetime,
+    pub basis: Basis,
 }
 
 impl FixedOwner {
@@ -123,6 +124,7 @@ impl FixedOwner {
             bytes: demand.bytes,
             weights: demand.resident_weights.0,
             lifetime: Lifetime::RESIDENT,
+            basis: demand.basis,
         }
     }
 }
@@ -532,6 +534,33 @@ impl KimiRecipe {
         Ok(())
     }
 
+    /// Native target IO creates one vocabulary head per lane only without K6.
+    /// The MLA drafter constructor retains its own head even for a K6 target.
+    pub fn blas_owners(&mut self, core_head: bool) -> Result<(), Refusal> {
+        use super::super::planner::serving::{blas_components, BlasOwners};
+        if !(1..=2).contains(&self.gpus) || self.lanes == 0 {
+            return Err(invalid("invalid BLAS physical rank or lane geometry"));
+        }
+        if self.owners.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allowance(owner) if owner.source.starts_with("cuBLAS handles: Kimi "))) {
+            return Err(invalid("BLAS owners already prepared"));
+        }
+        let location = Location::coordinator((self.gpus - 1) as u8);
+        let mut handles = Vec::new();
+        if !core_head {
+            handles.push(BlasOwners { name: "Kimi target vocabulary heads".into(), process: "coordinator".into(),
+                location, cublas_handles: self.lanes, lt_handles: self.lanes,
+                lifetime: Lifetime::TARGET, activation: Activation::always() });
+        }
+        if self.draft.is_some() {
+            handles.push(BlasOwners { name: "Kimi MLA DFlash vocabulary head".into(), process: "coordinator".into(),
+                location, cublas_handles: 1, lt_handles: 1,
+                lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, activation: Activation::always() });
+        }
+        self.owners.extend(blas_components("sm_120", &handles, self.maximum_pages, PhaseOrder::DRAFT_THEN_TARGET)?);
+        Ok(())
+    }
+
     /// Graph bytes follow the same finite boundary as weights and KV. Callers
     /// build the executable keys only after admission selects that boundary.
     pub fn balance_graphs(&mut self, cfg: &crate::families::kimi_k3::config::KimiK3Config,
@@ -691,6 +720,19 @@ impl Recipe for KimiRecipe {
                 ByteCurve::linear(bytes, bytes, self.maximum_pages), false, self.maximum_pages));
         }
         for fixed in &self.fixed {
+            if fixed.group == crate::families::kimi_k3::allocation::CODE_OWNER {
+                if fixed.weights != 0 || fixed.category != Category::Runtime || fixed.basis != Basis::Estimated
+                    || fixed.lifetime != Lifetime::RESIDENT {
+                    return Err(invalid("selected-program code must be an Estimated opaque resident owner"));
+                }
+                if fixed.bytes == 0 { continue; }
+                contract.components.push(Component { activation: Activation::always(),
+                    bytes: ByteCurve::fixed(fixed.bytes, self.maximum_pages),
+                    kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(fixed.rank),
+                        bytes: fixed.bytes, lifetime: fixed.lifetime, assumed: true,
+                        source: fixed.group.clone() }) });
+                continue;
+            }
             if fixed.bytes == 0 { continue; }
             let owner = Allocation::buffer(format!("{}.{}", fixed.group, fixed.rank),
                 Location::coordinator(fixed.rank),
@@ -1031,7 +1073,78 @@ mod tests {
             draft: None,
             owners: vec![],
             fixed: vec![FixedOwner { rank: 0, category: Category::Prefix, group: "Kimi exact KDA marks".into(),
-                bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT }],
+                bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }],
+        }
+    }
+
+    #[test]
+    fn blas_owners_follow_actual_target_and_draft_constructors() {
+        let order = PhaseOrder::DRAFT_THEN_TARGET;
+        for gpus in [1, 2] {
+            for lanes in [1, 2] {
+                for core_head in [false, true] {
+                    for draft in [false, true] {
+                        let mut recipe = recipe();
+                        recipe.gpus = gpus;
+                        recipe.lanes = lanes;
+                        recipe.draft = draft.then(|| Draft { context_split: false, owners: vec![],
+                            staging_at_first: 0, staging_per_page: 0 });
+                        recipe.blas_owners(core_head).unwrap();
+                        let owners = recipe.owners.iter().map(|component| {
+                            let ComponentKind::Allowance(owner) = &component.kind else { panic!("BLAS is opaque") };
+                            assert!(!owner.assumed);
+                            assert_eq!(owner.location, Location::coordinator((gpus - 1) as u8));
+                            owner
+                        }).collect::<Vec<_>>();
+                        let handles = owners.iter().filter(|owner| owner.source.starts_with("cuBLAS handles:")).collect::<Vec<_>>();
+                        assert_eq!(handles.len(), usize::from(!core_head) + usize::from(draft));
+                        for &phase in order.phases() {
+                            let target = if !core_head && order.at_or_before(Phase::PostTargetKv, phase) { lanes } else { 0 };
+                            let draft = u64::from(draft && order.at_or_before(Phase::DraftLoad, phase));
+                            let active = owners.iter().filter(|owner|
+                                order.at_or_before(owner.lifetime.first, phase)
+                                    && order.at_or_before(phase, owner.lifetime.last)).collect::<Vec<_>>();
+                            assert_eq!(active.iter().filter(|owner| owner.source.starts_with("BLAS device initialization")).count(),
+                                usize::from(target + draft > 0));
+                            assert_eq!(active.iter().map(|owner| owner.bytes).sum::<u64>(),
+                                (target + draft) * (64 << 20) + if target + draft > 0 { 2 << 20 } else { 0 });
+                        }
+                        if !core_head || draft { assert!(recipe.blas_owners(core_head).is_err()); }
+                    }
+                }
+            }
+        }
+        for (gpus, lanes) in [(0, 1), (3, 1), (1, 0)] {
+            let mut recipe = recipe();
+            recipe.gpus = gpus;
+            recipe.lanes = lanes;
+            assert!(recipe.blas_owners(false).is_err());
+        }
+    }
+
+    #[test]
+    fn selected_program_code_remains_an_estimated_opaque_owner() {
+        use crate::families::kimi_k3::allocation;
+        let mut recipe = recipe();
+        let demand = allocation::code_demand(0, 12345, 1).unwrap();
+        let owner = FixedOwner::ready(&demand);
+        recipe.fixed.push(owner.clone());
+        let contract = recipe.prepare(&single()).unwrap();
+        let code = contract.components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::Allowance(value) if value.source == allocation::CODE_OWNER => Some(value),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(code.len(), 1);
+        assert_eq!((code[0].bytes, code[0].assumed, code[0].lifetime), (12345, true, Lifetime::RESIDENT));
+        assert!(!contract.components.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.group == allocation::CODE_OWNER)));
+        for invalid in [FixedOwner { weights: 1, ..owner.clone() },
+            FixedOwner { category: Category::Workspace, ..owner.clone() },
+            FixedOwner { basis: Basis::Exact, ..owner.clone() },
+            FixedOwner { lifetime: Lifetime::TARGET, ..owner.clone() },
+            FixedOwner { bytes: 0, basis: Basis::Exact, ..owner.clone() }] {
+            recipe.fixed = vec![invalid];
+            assert!(recipe.prepare(&single()).is_err());
         }
     }
 
@@ -1248,7 +1361,7 @@ mod tests {
         recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
         recipe.fixed = [96_382_880_182, 100_432_126_894].into_iter().enumerate().map(|(rank, bytes)|
             FixedOwner { rank: rank as u8, category: Category::Runtime, group: "replayed max owners".into(),
-                bytes: bytes - 12 * per_layer, weights: 0, lifetime: Lifetime::RESIDENT }).collect();
+                bytes: bytes - 12 * per_layer, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }).collect();
         let request = request(recipe.context, Some(recipe.context), crate::placement::Onboard::Auto,
             recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), SparkReplyFormats::default());
         let started = std::time::Instant::now();

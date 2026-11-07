@@ -246,9 +246,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     for (rank, sample) in inventory.gpus.iter().enumerate() {
         let pending = crate::shared::inventory::pending_code(library, sample.device, rank, RANKS == 2,
             "kimik3", "exl3", &selected)?;
-        let arch = cuteafd_loader::placement::ArchContext::for_device(&sample.arch, sample.total_bytes);
-        fixed.push(cuteafd_loader::families::kimi_k3::allocation::code_demand_for_ranks(
-            rank, pending, arch.cublas_bytes, 1, RANKS)?);
+        fixed.push(cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, RANKS)?);
     }
     let gpus = inventory.gpus.iter().map(|sample| {
         GpuBudget { capacity_bytes: sample.total_bytes, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
@@ -347,8 +345,8 @@ fn check_attention(attention: Option<cuteafd_loader::placement::AttentionPlaceme
     Ok(())
 }
 
-pub(super) fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
-    cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, cublas_bytes, lanes)
+pub(super) fn code_demand(rank: usize, pending: u64) -> Result<Demand> {
+    cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, 2)
 }
 
 use cuteafd_loader::families::kimi_k3::core::exchange_recv_bytes;

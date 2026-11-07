@@ -1128,7 +1128,7 @@ mod tests {
         for rank in 0..2 {
             let code = cuteafd_loader::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
                 rank as u8, arch, Some(&selected));
-            fixed.push(code_demand(rank, code.bytes, arch.cublas_bytes, 1)?);
+            fixed.push(code_demand(rank, code.bytes)?);
         }
         // No CUDA baseline is claimed: conservatively reserve context plus a
         // separate 2 GiB module allowance in this CPU-only forecast.
@@ -1190,22 +1190,20 @@ mod tests {
     }
 
     #[test]
-    fn shared_code_allowance_and_each_private_head_are_reserved() -> Result<()> {
+    fn selected_code_allowance_excludes_private_head_and_peer_storage() -> Result<()> {
         use cuteafd_loader::placement::{ArchContext, ProgramSet, inventory::loaded_code_allowance};
         let arch = ArchContext::for_device("sm_120", 96 << 30);
         let programs = ProgramSet::from_names(&["kimik3"], ["kimik3_kda_m64", "other_m64"]);
         for rank in 0..2 {
             let code = loaded_code_allowance("kimik3", "exl3", true, rank as u8, arch, Some(&programs));
-            assert_eq!(code.basis, Basis::Formula);
-            assert_eq!(code.bytes, arch.cublas_bytes + programs.module_bytes() + arch.peer_context_bytes);
-            for lanes in [1, 2] {
-                let demand = code_demand(rank, code.bytes, arch.cublas_bytes, lanes)?;
-                assert_eq!(demand.basis, Basis::Formula);
-                assert_eq!(demand.bytes, code.bytes + if rank == 1 { lanes as u64 * arch.cublas_bytes } else { 0 });
-            }
+            assert_eq!(code.basis, Basis::Estimated);
+            assert_eq!(code.bytes, programs.module_bytes());
+            let demand = code_demand(rank, code.bytes)?;
+            assert_eq!(demand.basis, Basis::Estimated);
+            assert_eq!(demand.bytes, code.bytes);
+            assert_eq!(code.pending(arch.context_bytes + code.bytes, arch.context_bytes), 0);
         }
-        assert!(code_demand(2, 0, 0, 1).is_err());
-        assert!(code_demand(1, u64::MAX, 1, 1).is_err());
+        assert!(code_demand(2, 0).is_err());
         Ok(())
     }
 

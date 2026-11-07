@@ -754,7 +754,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
             group: "CUDA context and loaded modules".into(),
             bytes: request.inventory.gpus[rank].capacity_bytes.saturating_sub(free_bytes), weights: 0,
-            lifetime: contract::Lifetime::RESIDENT });
+            lifetime: contract::Lifetime::RESIDENT, basis: Basis::Exact });
     }
     let mut recipe = KimiRecipe { expert_usage: kimi::usage_geometry(cfg, expert_usage), context: request.pool.compiled_context, gpus: RANKS,
         placement: placement_mode, attention,
@@ -778,6 +778,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         fixed, owners: Vec::new(),
     };
     recipe.allocation_granularity(cfg, &core)?;
+    recipe.blas_owners(core.get_weight("language_model.lm_head").is_some())?;
     let modes = recipe.resolved_attention();
     let prepared_graph_set = (graph_reserve && (RANKS != 2 || placement_mode != AttentionPlacement::Layers)).then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
         graph_slots, graph_verify, RANKS,
@@ -926,14 +927,17 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
         && cfg.mla_record_values() * 2 == MLA_RECORD_BYTES, "Kimi native state/cache geometry");
     ensure!(i.gpus.iter().all(|gpu| matches!(gpu.baseline, Baseline::Measured { .. })),
         "Kimi runtime admission needs post-module CUDA samples");
-    // Only startup graphs carry a temporary estimate pending the first serving
-    // census. No weight, workspace, fixed or pool charge inherits this exception.
-    ensure!(i.fixed.iter().all(|d| (d.gpu as usize) < RANKS && d.basis != Basis::Estimated)
+    // Only selected-program code and startup graphs may be explicitly Estimated.
+    // Neither exception permits guessed weight/workspace payloads.
+    ensure!(i.fixed.iter().all(|d| (d.gpu as usize) < RANKS && (d.basis != Basis::Estimated
+            || (d.group == cuteafd_loader::families::kimi_k3::allocation::CODE_OWNER
+                && d.category == Category::Runtime
+                && d.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident)))
         && i.startup.iter().all(|d| (d.gpu as usize) < RANKS && (d.basis != Basis::Estimated
             || (d.group == super::graphs::RESERVE && d.category == Category::Runtime
                 && d.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident)))
         && i.pool_bounded.iter().all(|d| (d.gpu as usize) < RANKS && d.basis != Basis::Estimated),
-        "Kimi runtime admission allows estimates only for its named startup graph reserve");
+        "Kimi runtime admission allows estimates only for selected-program code and startup graphs");
     ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten()
         .all(|layout| layout.rows() == i.rows && layout.unit == unit),
         "Kimi lane operand layouts differ from executor geometry");
@@ -1128,7 +1132,7 @@ pub(super) mod tests {
                 i.state_slots = 8; i.prefix_marks = 1; i.lanes = 1; i.requested_pool = Some(1 << 20);
                 i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, 4096, 4096, context, scratch).unwrap())];
                 i.fixed = startup::exchange_demands(4096, false)?;
-                for rank in 0..2 { i.fixed.push(startup::code_demand(rank, 71_303_168, 71_303_168, 1)?); }
+                for rank in 0..2 { i.fixed.push(startup::code_demand(rank, 71_303_168)?); }
                 if enabled {
                     i.fixed.extend(super::super::draft::bridge_demands(&draft, i.rows)?);
                     i.fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
@@ -1826,7 +1830,7 @@ pub(super) mod tests {
         let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
         let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
             "kimik3", "exl3", false, 0, arch, Some(&programs));
-        let resident = code.bytes - arch.cublas_bytes;
+        let resident = code.bytes;
         let runtime_inputs = || -> Result<_> {
             let mut i = inputs_for_ranks::<1>(&cfg);
             i.resident_weight_limit = ResidentWeights(options.coordinator_budget_bytes);
@@ -1835,8 +1839,8 @@ pub(super) mod tests {
             i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
             i.lane_layouts = vec![[LaneLayout::for_ranks(&cfg, rows, unit, context,
                 allocation::NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?]];
-            i.fixed = vec![allocation::code_demand_for_ranks(0,
-                code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1, 1)?];
+            i.fixed = vec![allocation::code_demand(0,
+                code.pending(arch.context_bytes + resident, arch.context_bytes), 1)?];
             i.startup = vec![super::super::graphs::demand(
                 &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
             i.gpus[0] = GpuBudget { capacity_bytes: capacity, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
@@ -2037,12 +2041,12 @@ pub(super) mod tests {
                 let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
                     "kimik3", "exl3", true, rank as u8, arch, Some(&programs));
                 // Model an identical post-module sample: context + resident code are
-                // already allocated, while BLAS and private head handles are future.
-                let resident = code.bytes - arch.cublas_bytes;
+                // already allocated; actual native head handles are separate future owners.
+                let resident = code.bytes;
                 i.gpus[rank] = GpuBudget { capacity_bytes: capacity, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
                     baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
                 i.fixed.push(super::super::startup::code_demand(rank,
-                    code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1)?);
+                    code.pending(arch.context_bytes + resident, arch.context_bytes))?);
             }
             i.rtx = Some(rtx); i.spark_budget = Some(spark);
             let admitted = match admit(i) {

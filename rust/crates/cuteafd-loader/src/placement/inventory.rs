@@ -294,10 +294,10 @@ impl CodeAllowance {
 /// and peer context. Live admission subtracts bytes already in its sample.
 pub fn loaded_code_allowance(program_family: &str, experts: &str, split: bool, rank: u8,
     arch: &ArchContext, programs: Option<&ProgramSet>) -> CodeAllowance {
-    // Historical Flash rows mix modules, handles, transport mappings and stream
-    // state without recorded handle counts/backing extents. They cannot donate
-    // a calibrated code-only remainder (#1463).
-    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6") {
+    // Retired mixed rows and generic library/peer formulas lack recorded handle
+    // counts/backing extents. These families use selected-program code only;
+    // BLAS and driver storage are disjoint typed owners (#1463).
+    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3") {
         return CodeAllowance { bytes: programs.map_or(32 * MIB, ProgramSet::module_bytes),
             basis: Basis::Estimated, future_library_bytes: 0 };
     }

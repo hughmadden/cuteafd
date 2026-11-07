@@ -185,7 +185,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 let code = crate::placement::inventory::loaded_code_allowance("kimik3", "exl3", gpus == 2,
                     rank as u8, arch, Some(&programs));
                 baseline[rank] = Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 };
-                demands.push(allocation::code_demand_for_ranks(rank, code.bytes, arch.cublas_bytes, 1, gpus)?);
+                demands.push(allocation::code_demand(rank, code.bytes, gpus)?);
             }
             if !model.core.projections.is_empty() {
                 // The baseline already includes the full peer receive allocation.
@@ -462,6 +462,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Provide complete selected native weight extents.");
         return memory;
     }
+    if let Err(error) = recipe.blas_owners(model.core.get_weight("language_model.lm_head").is_some()) {
+        report.refuse_placement(format!("Kimi BLAS owners refused: {error}"), "Supply supported native head geometry.");
+        return memory;
+    }
     if manifest.is_some() {
         let graph_result = (|| -> anyhow::Result<()> {
             let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
@@ -479,7 +483,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if let crate::placement::Baseline::Planned { context_bytes, loaded_bytes } = baseline {
             recipe.fixed.push(FixedOwner { rank: rank as u8, category: Category::Runtime,
                 group: "CUDA context (estimated)".into(), bytes: context_bytes.saturating_add(*loaded_bytes),
-                weights: 0, lifetime: crate::placement::planner::Lifetime::RESIDENT });
+                weights: 0, lifetime: crate::placement::planner::Lifetime::RESIDENT, basis: Basis::Estimated });
         }
     }
     let sparks = vec![spark_budget.budget; ranks];

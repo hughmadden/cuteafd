@@ -412,17 +412,11 @@ pub fn exchange_demand(rows: usize, rank: u8, progress: usize) -> Result<Demand>
     Ok(Demand::new(rank, Category::Workspace, "Kimi peer/abort/hop controls", bytes as u64, Basis::Exact))
 }
 
-pub fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
-    code_demand_for_ranks(rank, pending, cublas_bytes, lanes, 2)
-}
+pub const CODE_OWNER: &str = "Kimi selected-program loaded code";
 
-pub fn code_demand_for_ranks(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize,
-    ranks: usize) -> Result<Demand> {
-    ensure!(matches!(ranks, 1 | 2) && rank < ranks && (1..=2).contains(&lanes),
-        "Kimi code allowance physical rank/lane geometry");
-    let bytes = pending.checked_add(if rank == ranks - 1 { lanes as u64 * cublas_bytes } else { 0 })
-        .context("Kimi future code/handle allowance overflow")?;
-    Ok(Demand::new(rank as u8, Category::Workspace, "Kimi future loaded code and private head handles", bytes, Basis::Formula))
+pub fn code_demand(rank: usize, pending: u64, ranks: usize) -> Result<Demand> {
+    ensure!(matches!(ranks, 1 | 2) && rank < ranks, "Kimi code physical rank geometry");
+    Ok(Demand::new(rank as u8, Category::Runtime, CODE_OWNER, pending, Basis::Estimated))
 }
 
 /// Exact FirstCapacity owner, using the shared EXL3 capacity arenas.
@@ -591,10 +585,10 @@ mod tests {
         let lane = NativeLaneLayout::for_ranks(&cfg, 8256, 2752, 262144,
             NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?;
         assert_eq!(bytes(&single, "Kimi lane 0 native operands"), lane.bytes()? as u64);
-        assert_eq!(code_demand_for_ranks(0, 100, 200, 2, 1)?.bytes, 500);
-        assert_eq!(code_demand(0, 100, 200, 2)?.bytes, 100);
-        assert_eq!(code_demand(1, 100, 200, 2)?.bytes, 500);
-        assert!(code_demand_for_ranks(1, 0, 0, 1, 1).is_err());
+        assert_eq!(code_demand(0, 100, 1)?.bytes, 100);
+        assert_eq!(code_demand(0, 100, 2)?.basis, Basis::Estimated);
+        assert_eq!(code_demand(1, 100, 2)?.bytes, 100);
+        assert!(code_demand(1, 0, 1).is_err());
         assert!(baseline_demands_for_ranks(&cfg, &manifest, 8256, shape, 262144, 16, 8,
             &core, false, 6, 0, cuteafd_core::SparkReplyFormat::Bf16).is_err());
         Ok(())
