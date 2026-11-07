@@ -4145,6 +4145,22 @@ def test_glmf_tp2_dflash_auto_passes_planner_choice_to_server(tmp_path, selected
     assert f"--tp2-dflash {str(selected).lower()}" in server
 
 
+@pytest.mark.parametrize("precision,mode", [("off", "w8a16"), ("on", "wide"), ("auto", "w8a8")])
+def test_glmf_plan_uses_served_drafter_precision_and_rows(tmp_path, precision, mode):
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "tp2_dflash": True}
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/tp2-dflash",
+        "RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/tp2-dflash\nVISION=off\nAUDIO=off\n"
+        f"SPECULATOR_FP8={precision}\nGLM5_FLASH_DRAFT_LINEAR={mode}\n", encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    planner = shlex.split(next(line for line in lines if "cuteafd plan" in line and "--deployment" in line))
+    server = shlex.split(next(line for line in lines if "cuteafd serve-glmf" in line))
+    for flag in ["--draft-fp8", "--draft-linear"]:
+        assert (flag in planner) == (flag in server)
+        if flag in server:
+            assert planner[planner.index(flag) + 1] == server[server.index(flag) + 1]
+
+
 @pytest.mark.parametrize("vision", [None, "auto"])
 def test_glmf_auto_vision_serves_text_when_the_plan_turns_vision_off(tmp_path, vision):
     """VISION=auto (the default) follows the encoder plan: when `cuteafd plan` resolves automatic

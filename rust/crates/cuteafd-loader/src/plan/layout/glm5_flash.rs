@@ -23,6 +23,9 @@ pub(crate) fn native_layout(report: &mut PlanReport, model: &dyn super::super::F
 fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions,
     exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
+    if options.glmf_tp2_dflash_auto {
+        options.tp2_dflash = options.rtx_bytes.len() == 2 && options.drafter_bytes == 0;
+    }
     if options.glmf_tp2_dflash_auto && options.head_split && options.rtx_bytes.len() == 2
         && !options.glmf_drafter_disabled && options.drafter_bytes == 0 {
         let mut whole_report = report.clone();
@@ -248,12 +251,12 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             if options.tp2_dflash {
                 let (_, _, path) = draft_config.as_ref().context("TP2 drafter snapshot")?;
                 draft_tp2 = glmf::drafter_tp2_inventory(path, *capacity, &draft_sms,
-                    crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
-                    2, options.draft_kv_cache)?;
+                    options.glmf_draft_representation,
+                    options.glmf_draft_fp8_mode, options.draft_kv_cache)?;
                 (0, placement::ResidentWeights::default(), vec![0; ranks], None)
             } else {
             let (bytes, scratch) = glmf::drafter_inventory(config, slots, batch,
-                &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
+                &draft_sms, options.glmf_draft_representation, options.glmf_draft_fp8_mode, options.draft_kv_cache)?;
             // GPU1-whole remains unqualified; only GPU0-whole competes with TP2.
             let bridge = None;
             anyhow::ensure!(options.drafter_bytes == 0 || options.drafter_bytes == bytes.resident_weights.0,
@@ -389,7 +392,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         process.draft_tp2 = draft_tp2;
         process.draft_push = draft_config.as_ref().filter(|_| draft > 0 || !process.draft_tp2.is_empty()).map(|(config, _, path)|
             glmf::admission::DraftPush::for_snapshot(path, config,
-                crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only))
+                options.glmf_draft_representation))
             .transpose()?.flatten().map(|push| push.for_tp(if options.tp2_dflash { 2 } else { 1 })).transpose()?;
         if exlr8.is_none() && process.push_host.is_none() {
             process.mount_load = Some(glmf::admission::mount_load(checkpoint, ranks)?);

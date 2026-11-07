@@ -2411,6 +2411,9 @@ audio_encoder_hash=""
   for ((i=0; i<${#family_args[@]}; i++)); do
     [[ "${family_args[i]}" != --host-cache-bytes ]] || plan_host_cache="${family_args[i+1]}"
     [[ "${family_args[i]}" != --media-cache-bytes ]] || plan_draft_args+=(--media-cache-bytes "${family_args[i+1]}")
+    if [[ "$family" == glm5_flash && ( "${family_args[i]}" == --draft-fp8 || "${family_args[i]}" == --draft-linear ) ]]; then
+      plan_draft_args+=("${family_args[i]}" "${family_args[i+1]}")
+    fi
   done
   plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
   [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)

@@ -27,10 +27,6 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
     let (enabled, family, split, draft) = match command {
         Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
-        Commands::ServeGlmf(args) => (&mut args.engine.tp2_dflash, "glm5_flash", args.engine.split_device.is_some(),
-            args.engine.draft.as_ref().is_some_and(|path| crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|plain| !plain))),
-        Commands::GlmfGolden(args) => (&mut args.engine.tp2_dflash, "glm5_flash", args.engine.split_device.is_some(),
-            args.engine.draft.as_ref().is_some_and(|path| crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|plain| !plain))),
         Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
         _ => return,
     };
@@ -421,9 +417,12 @@ pub(crate) struct PlanArgs {
     /// Separately configured drafter checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) drafter_snapshot: Option<PathBuf>,
-    /// Charge native MLA DFlash FP8 residency instead of BF16.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    pub(crate) draft_fp8: bool,
+    /// Charge DFlash FP8 residency (GLM Flash defaults to FP8); explicit false uses BF16.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub(crate) draft_fp8: Option<bool>,
+    /// GLM Flash FP8 drafter GEMM row mode.
+    #[arg(long, default_value = "w8a16")]
+    pub(crate) draft_linear: crate::shared::fp8_linear::Fp8Rows,
     /// Separately configured vision checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) vision_snapshot: Option<PathBuf>,

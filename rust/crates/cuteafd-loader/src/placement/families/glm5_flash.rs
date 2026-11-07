@@ -264,8 +264,8 @@ pub fn drafter_tp2_inventory(snapshot: &std::path::Path,
     mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache)
     -> anyhow::Result<Vec<crate::families::glm5::draft_physical::GlmDflashPhysicalLayout>> {
     anyhow::ensure!(sms.len() == 2, "TP2 DFlash requires two coordinator GPUs");
-    sms.iter().map(|&sm| crate::families::glm5::draft_physical::GlmDflashPhysicalLayout::read_tp(
-        snapshot, representation, capacity, usize::try_from(sm)?, mode, kv_cache, 2)).collect()
+    sms.iter().enumerate().map(|(rank, &sm)| crate::families::glm5::draft_physical::GlmDflashPhysicalLayout::read_tp(
+        snapshot, representation, capacity, usize::try_from(sm)?, mode, kv_cache, rank, 2)).collect()
 }
 
 /// GPU1 DFlash bridge inventory, conditional on installing its executor.

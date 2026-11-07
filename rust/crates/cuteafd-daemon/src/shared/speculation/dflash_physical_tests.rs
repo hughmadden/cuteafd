@@ -174,6 +174,12 @@ fn installed_tp2_dflash_physical_layout_equals_both_rank_receipts() -> Result<()
                 layout.allocations(if rank == 0 { "draft" } else { "draft.peer" }, Location::coordinator(rank as u8)))
                 .map(|allocation| (allocation.id.clone(), allocation)).collect();
             assert_eq!(actual, expected, "{representation:?}, {kv}");
+            assert!(matches!(peer.head_ops, DraftHeadOps::Peer));
+            assert!(peer.workspace.borrow().as_ref().unwrap().head.is_none());
+            assert!(layouts[1].owners().iter().all(|owner| !owner.id.starts_with("head.")));
+            assert!(layouts[0].resident_weights().0 > layouts[1].resident_weights().0);
+            assert!(layouts[1].owner_bytes("workspace.logits").is_err());
+            assert!(layouts[1].owner_bytes("workspace.head").is_err());
             let full = GlmDflashPhysicalLayout::read(&snapshot, representation, capacity,
                 library.sm_count()?, fp8_linear::Fp8Rows::Wide.code() as u8, kv)?;
             assert!(layouts[0].resident_weights().0 < full.resident_weights().0);

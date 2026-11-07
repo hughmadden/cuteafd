@@ -20,6 +20,7 @@ impl DflashDrafter<'_> {
         }
         inventory.host("mask_row", &self.mask_row)?;
         match &self.head_ops {
+            DraftHeadOps::Peer => {}
             DraftHeadOps::Selector { projection, predecessor, successor } => {
                 projection.allocation_receipts(&mut inventory, "head.projection")?;
                 inventory.device("head.predecessor", predecessor.buffer)?;
@@ -80,17 +81,22 @@ impl DflashDrafter<'_> {
         }
         if let Some(workspace) = self.workspace.try_borrow()?.as_ref() {
             for (name, owner) in [("h", &workspace.h), ("n", &workspace.n), ("delta", &workspace.delta),
-                ("gate_up", &workspace.gate_up), ("act", &workspace.act), ("logits", &workspace.logits),
-                ("anchors", &workspace.anchors), ("ids", &workspace.ids), ("tokens", &workspace.tokens),
-                ("positions", &workspace.positions), ("head", &workspace._head_workspace)] {
+                ("gate_up", &workspace.gate_up), ("act", &workspace.act), ("positions", &workspace.positions)] {
                 inventory.device(&format!("workspace.{name}"), owner.buffer)?;
             }
-            inventory.pinned("workspace.landing", workspace.landing.buffer)?;
+            if let Some(head) = &workspace.head {
+                for (name, owner) in [("logits", &head.logits), ("anchors", &head.anchors), ("ids", &head.ids),
+                    ("tokens", &head.tokens), ("head", &head._head_workspace)] {
+                    inventory.device(&format!("workspace.{name}"), owner.buffer)?;
+                }
+                inventory.pinned("workspace.landing", head.landing.buffer)?;
+                for (name, owner) in [("unary", &head.unary), ("candidates", &head.candidates),
+                    ("projected", &head.projected), ("features", &head.features), ("topk", &head.topk_workspace)] {
+                    if let Some(owner) = owner { inventory.device(&format!("workspace.dflash.{name}"), owner.buffer)?; }
+                }
+            }
             if let Some(workspace) = &workspace.dflash {
-                for (name, owner) in [("conv", &workspace.conv), ("dynamic", &workspace.dynamic),
-                    ("unary", &workspace.unary), ("candidates", &workspace.candidates),
-                    ("projected", &workspace.projected), ("features", &workspace.features),
-                    ("topk", &workspace.topk_workspace)] {
+                for (name, owner) in [("conv", &workspace.conv), ("dynamic", &workspace.dynamic)] {
                     inventory.device(&format!("workspace.dflash.{name}"), owner.buffer)?;
                 }
             }

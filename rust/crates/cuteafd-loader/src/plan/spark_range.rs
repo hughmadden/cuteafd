@@ -221,6 +221,7 @@ impl PlanInput {
             let layout = options.layout.get_or_insert_with(Default::default);
             let budget = layout.rtx_bytes.first().copied().unwrap_or(crate::placement::inventory::PRO_TOTAL_BYTES);
             layout.rtx_bytes = vec![budget; rtx_gpus];
+            if rtx_gpus == 1 { layout.tp2_dflash = false; }
             let reports = (0..=MAX_SPARKS).map(|sparks| {
                 options.placement = ExpertPlacement::from_spark_ranks(sparks);
                 super::plan_unrestricted(self, &options)

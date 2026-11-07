@@ -126,7 +126,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 muse_drafter_snapshot: None,
                 muse_partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
                 dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
-                kimi_draft_fp8: args.draft_fp8,
+                kimi_draft_fp8: args.draft_fp8.unwrap_or(false),
+                glmf_draft_representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(
+                    args.draft_fp8),
+                glmf_draft_fp8_mode: args.draft_linear.code() as u8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
@@ -177,7 +180,8 @@ fn tp2_dspark_experts(args: &PlanArgs, family: &str,
 
 fn tp2_dflash(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
-    let default_on = crate::cli::tp2_dflash_default(family, args.layout && args.rtx == 2,
+    let default_on = crate::cli::tp2_dflash_default(family, args.layout && args.rtx == 2
+            && (family != "glm5_flash" || args.drafter_gib == 0.0),
         args.speculator == "dflash2");
     let configured = match cfg.get("TP2_DFLASH").map(String::as_str) {
         None | Some("") => default_on,
@@ -194,7 +198,7 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
 
 fn glmf_tp2_dflash_auto(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> bool {
-    family == "glm5_flash" && args.layout && args.rtx == 2 && args.speculator == "dflash2"
+    family == "glm5_flash" && args.layout && args.rtx == 2 && args.drafter_gib == 0.0 && args.speculator == "dflash2"
         && args.tp2_dflash.is_none() && cfg.get("TP2_DFLASH").is_none_or(String::is_empty)
 }
 
@@ -928,6 +932,43 @@ mod tests {
     }
 
     #[test]
+    fn glmf_tp2_auto_requires_two_gpus_and_checkpoint_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for rtx in [1, 2] {
+            for drafter_gib in [0.0, 12.0] {
+                let mut request = args(dir.path(), 0, false);
+                request.rtx = rtx;
+                request.drafter_gib = drafter_gib;
+                request.speculator = "dflash2".into();
+                let cfg = Default::default();
+                let expected = rtx == 2 && drafter_gib == 0.0;
+                assert_eq!(tp2_dflash(&request, "glm5_flash", &cfg).unwrap(), expected);
+                assert_eq!(glmf_tp2_dflash_auto(&request, "glm5_flash", &cfg), expected);
+                let cfg = [("TP2_DFLASH".into(), "off".into())].into_iter().collect();
+                assert!(!tp2_dflash(&request, "glm5_flash", &cfg).unwrap());
+                assert!(!glmf_tp2_dflash_auto(&request, "glm5_flash", &cfg));
+            }
+        }
+    }
+
+    #[test]
+    fn glmf_plan_preserves_explicit_drafter_representation_and_rows() {
+        use clap::Parser;
+        use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
+        for (flags, representation, mode) in [
+            (vec![], GlmDraftRepresentation::Fp8Only, 0),
+            (vec!["--draft-fp8", "false", "--draft-linear", "wide"], GlmDraftRepresentation::Bf16Only, 1),
+            (vec!["--draft-fp8", "true", "--draft-linear", "w8a8"], GlmDraftRepresentation::Fp8Only, 2),
+        ] {
+            let argv = [vec!["cuteafd", "plan", "model", "--layout"], flags].concat();
+            let crate::cli::Commands::Plan(request) = crate::cli::Cli::try_parse_from(argv).unwrap().command else { panic!("plan") };
+            let layout = options(&request).unwrap().layout.unwrap();
+            assert_eq!(layout.glmf_draft_representation, representation);
+            assert_eq!(layout.glmf_draft_fp8_mode, mode);
+        }
+    }
+
+    #[test]
     fn exlr8_prefill_activations_flag_defaults_to_a16_and_takes_only_a16_or_a8() {
         use clap::Parser;
         use cuteafd_loader::plan::exlr8::PrefillActivations;
@@ -1180,7 +1221,7 @@ mod tests {
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,
-            drafter_snapshot: None, draft_fp8: false, vision_snapshot: None, audio_snapshot: None,
+            drafter_snapshot: None, draft_fp8: None, draft_linear: Default::default(), vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,

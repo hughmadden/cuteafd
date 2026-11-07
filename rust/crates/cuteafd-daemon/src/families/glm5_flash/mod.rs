@@ -1818,11 +1818,33 @@ impl Opened {
             args.prefill_rows, args.prefill_waves, args.decode_rows, draft_rows, args.kda_output_shard, &manifest)?))
     }
 
+    fn admission_inventory(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>,
+        layers: usize, peer: Option<i32>, attention: engine::GlmfAttention,
+        native_admission: Option<&native::Admission>) -> Result<crate::shared::inventory::RuntimeInventory> {
+        let devices: Vec<_> = std::iter::once(args.device).chain(peer).collect();
+        let split = devices.len() == 2;
+        let core_charge = self.core_admission(args, layers, devices.len(), attention)?;
+        let mut native_code = native_admission.map(|c| c.charges.programs.clone()).unwrap_or_default();
+        if self.native {
+            native_code.extend(cuteafd_loader::plan::exlr8::dense::programs::vocabulary(
+                programs, self.cfg.hidden, self.cfg.vocab_size)?);
+        }
+        crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices,
+            crate::shared::inventory::InventoryPhase::PreWeight, |_| {
+                programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS)
+                    || core_charge.as_ref().is_some_and(|c| c.programs.iter().any(|n| n == name))
+                    || native_code.contains(name)
+                    || (self.native && name.starts_with("exlr8_glmf_")))?;
+                Ok(())
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
+    fn admit_candidate(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
         remote_draft: bool, attention: engine::GlmfAttention,
-        native_admission: Option<&native::Admission>)
+        native_admission: Option<&native::Admission>,
+        inventory: &crate::shared::inventory::RuntimeInventory)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet,
             Option<cuteafd_hostcache::config::Config>,
@@ -1842,13 +1864,6 @@ impl Opened {
             native_code.extend(cuteafd_loader::plan::exlr8::dense::programs::vocabulary(
                 programs, self.cfg.hidden, self.cfg.vocab_size)?);
         }
-        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
-            programs.load_matching(|name| glmf_startup_program(name, split, args.decode_rows > engine::DECODE_ROWS)
-                || core_charge.as_ref().is_some_and(|c| c.programs.iter().any(|n| n == name))
-                || native_code.contains(name)
-                || (self.native && name.starts_with("exlr8_glmf_")))?;
-            Ok(())
-        })?;
         let local_tp2_exl3 = split && args.peers.is_none() && !args.skip_experts
             && self.experts.as_ref().is_some_and(|c| c.exl3().is_some());
         let code_package = if self.native { "glmf:exlr8" } else if local_tp2_exl3 { "exl3-tp2-local" } else { "*" };
@@ -2245,22 +2260,24 @@ impl Opened {
             cuteafd_loader::plan::families::glm::GLM5_FLASH.exlr8_execution()
                 .check(1 + usize::from(split_device.is_some()), false)?;
         }
+        let inventory = self.admission_inventory(args, &programs, layers, split_device, attention,
+            native_admission.as_ref())?;
         let mut draft_args = args.clone();
         let admitted = if args.tp2_dflash_auto {
             draft_args.tp2_dflash = false;
-            let whole = self.admit(&draft_args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, false, attention, native_admission.as_ref());
+            let whole = self.admit_candidate(&draft_args, &programs, layers, index_cache, mark_slots,
+                split_device, automatic_context, false, attention, native_admission.as_ref(), &inventory);
             draft_args.tp2_dflash = true;
-            let split = self.admit(&draft_args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, false, attention, native_admission.as_ref());
+            let split = self.admit_candidate(&draft_args, &programs, layers, index_cache, mark_slots,
+                split_device, automatic_context, false, attention, native_admission.as_ref(), &inventory);
             let whole_pool = whole.as_ref().ok().map(|a| a.0.pool_tokens);
             let split_pool = split.as_ref().ok().map(|a| a.0.pool_tokens);
             draft_args.tp2_dflash = cuteafd_loader::placement::families::glm5_flash::prefer_tp2_dflash(whole_pool, split_pool);
             tracing::info!(whole_pool, split_pool, split = draft_args.tp2_dflash, "TP2_DFLASH auto selection");
             if draft_args.tp2_dflash { split } else { whole }
         } else {
-            self.admit(args, &programs, layers, index_cache, mark_slots,
-                split_device, automatic_context, remote_draft, attention, native_admission.as_ref())
+            self.admit_candidate(args, &programs, layers, index_cache, mark_slots,
+                split_device, automatic_context, remote_draft, attention, native_admission.as_ref(), &inventory)
         }?;
         let args = &draft_args;
         let remote_draft = false;
