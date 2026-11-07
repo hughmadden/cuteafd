@@ -53,8 +53,6 @@ pub(crate) struct GoldenArgs {
     #[arg(long)] check_headers: bool,
     /// Routed layers on coordinator GPUs: auto (startup planner), all or N.
     #[arg(long, default_value = "auto")] rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
-    /// Complete per-rank allocation ceiling; still an offline estimate.
-    #[arg(long)] spark_budget_gib: Option<f64>,
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
     #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
     compensated_ffn: bool,
@@ -610,7 +608,6 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         native_lib: args.native_lib.as_deref().context("--native-lib required")?,
         peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
-        spark_budget_gib: args.spark_budget_gib,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
         slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
@@ -1156,7 +1153,7 @@ mod tests {
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots, 0)?;
         let admitted = admission::admit(admission::Inputs { expert_usage: false, cfg: &cfg, core: Default::default(),
             resident_weight_limit: cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
-            capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
+            capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None, context: None,
             requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None, full_prefill_logits: false,

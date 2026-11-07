@@ -68,7 +68,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let ranks = if split { 2 } else { 1 };
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes.saturating_sub(options.headroom_bytes), worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 }).collect();
+            capacity_bytes: bytes.saturating_sub(crate::placement::reserve::gpu("glm5")), worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 }).collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         format!("attention placement {}", report.attention_placement)];
@@ -582,7 +582,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         options.spark_reply_formats)?;
     let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
     let budgets = production_budgets(&options.rtx_bytes[..gpus].iter().map(|&n| (n, n)).collect::<Vec<_>>(),
-        options.headroom_bytes, host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
+        crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let request = production_request(context, options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let mut prepared = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
@@ -721,7 +721,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         cuteafd_core::SparkIngress::Fp8K32, rings, options.spark_reply_formats)?;
     let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
     let budgets = production_budgets(&options.rtx_bytes.iter().map(|&n| (n, n)).collect::<Vec<_>>(),
-        options.headroom_bytes, host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
+        crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &vec![options.spark_bytes; spark_ranks])?;
     let operation = if options.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
     let request = production_request(context, options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
@@ -741,7 +741,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     notes.push(format!("EXLR8 native {gpu_count} shared owners; {attention} attention; context {context}; {}", placement.summary()));
     let devices = placement.items.iter().enumerate().map(|(rank, items)| DeviceLayout {
         kind: DeviceKind::Rtx, index: rank as u32,
-        capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes),
+        capacity_bytes: options.rtx_bytes[rank].saturating_sub(crate::placement::reserve::gpu("glm5")),
         worker_budget_bytes: 0, items: items.clone(), kv_tokens: placement.pool_tokens,
     }).collect();
     Ok((MemoryLayout { devices, pool_tokens: placement.pool_tokens, waste: vec![],

@@ -464,12 +464,28 @@ the coordinator to fit an endpoint
     compared with what was allocated (`compare`, `:327`). The ready report
     logs it (`memory_report::log("ready")`).
   - Weight and workspace admission happen before any allocation.
+- **One memory policy.** `MemoryPolicy` ([core/memory_policy.rs](../../rust/crates/cuteafd-core/src/memory_policy.rs))
+  is installed once per process from the global flags (`GPU_MEMORY_CAP`,
+  `SPARK_MEMORY_CAP`, `GPU_RESERVE`, `SPARK_RESERVE`, `FAMILY_RESERVE`,
+  `KV_TARGET_TOKENS`, `KV_MIN_TOKENS`, `KV_MAX_TOKENS`; [docs/options.md](../options.md)).
+  - Each device has one cap: weights, KV, workspaces and the reserve all
+    live inside it.
+  - The reserve is the sum of named, measured components (CUDA context and
+    cuBLAS, loaded code, graphs, runtime growth, the Spark runtime residual)
+    plus the family's `FAMILY_RESERVE` constant (default 0; constants and the
+    shared breakdown/log helpers live in [loader/placement/reserve.rs](../../rust/crates/cuteafd-loader/src/placement/reserve.rs)). `GPU_RESERVE` /
+    `SPARK_RESERVE` set the whole reserve and zero every built-in component.
+    No family keeps a private headroom, occupancy percentage or graph-budget key.
+  - Startup and `cuteafd plan` print one line per device: cap, weights,
+    workspaces, every reserve component, and the KV target, min, max and pool.
 - **Pool first.** `PoolPolicy` ([loader/placement/pool.rs:11](../../rust/crates/cuteafd-loader/src/placement/pool.rs#L11))
-  targets a 2M-token KV pool on cards above 32 GiB and 1M at 32 GiB or less.
-  The solver's order (`mod.rs:7-10`) is:
+  takes the KV target (2M tokens on cards above 32 GiB, 1M at 32 GiB or less),
+  min and max from the policy. The solver's order (`mod.rs:7-10`) is:
   1. fixed demands (graphs, workspaces) and mandatory movables;
   2. the pool target;
-  3. RTX expert layers in what is left.
+  3. RTX expert layers in what is left;
+  4. with the layout fixed, the pool grows into what is left, up to the KV
+     max; below the KV min the launch is refused.
 - **Onboarding.** `Onboard::Auto` (`mod.rs:425`) is the default:
   - onboarding is on in every shipped config;
   - explicit `all` (every routed-expert layer of the target model) and `N` are

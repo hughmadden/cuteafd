@@ -61,9 +61,18 @@ def copy_launcher_shared_inputs(source_root, destination_root):
             copy_input(source, target)
 
 
-def fake_deployment_memory_layout(rtx, ranks, spark_budget_gib=108):
-    """Typed device records shared by process-boundary planner stubs."""
-    budget = int(float(spark_budget_gib) * 2**30)
+def fake_deployment_memory_layout(rtx, ranks, spark_memory_cap=None):
+    """Typed device records shared by process-boundary planner stubs.
+
+    Self-contained: stubs inline it with inspect.getsource. The Spark cap is a
+    launcher memory size (B, MB, GB, MiB or GiB; bare bytes)."""
+    import re
+    from decimal import Decimal
+    budget = 108 << 30
+    if spark_memory_cap:
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)?", str(spark_memory_cap))
+        scale = {None: 1, "B": 1, "MB": 10**6, "GB": 10**9, "MiB": 2**20, "GiB": 2**30}[match.group(2)]
+        budget = int(Decimal(match.group(1)) * scale)
     return {"devices": [
         {"kind": "rtx", "index": i, "capacity_bytes": 96 << 30,
          "worker_budget_bytes": 0, "items": [{"category": "weights", "bytes": 8 << 30}],

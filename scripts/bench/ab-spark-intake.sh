@@ -132,7 +132,7 @@ model_config() { # model_config glmf|pro ARM FILE
   local hosts=(ostrich dodo emu kiwi rhea moa)
   {
     echo "EXPERT_PORT=$port"; echo "SPARK_COUNT=$count"
-    echo "SPARK_DEVICE_BUDGET_BYTES=110000000000"; echo "CONCURRENCY=4"
+    echo "SPARK_MEMORY_CAP=110000000000"; echo "CONCURRENCY=4"
     echo "MAX_CONTEXT_TOKENS=32768"; echo "MAX_OUTPUT_TOKENS=4096"; echo "SPARK_INTAKE=$intake"
     for ((r = 0; r < count; r++)); do echo "SPARK_${r}_HOST=${hosts[$r]}"; echo "SPARK_${r}_LANE_A=10.55.0.$((r + 1))"; done
     echo "COORDINATOR_DOCKER_INFERENCE=$image"; echo "SPARK_EXPERT_DOCKER_INFERENCE=$SPARK_IMAGE"

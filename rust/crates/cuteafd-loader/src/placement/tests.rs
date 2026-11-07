@@ -13,7 +13,7 @@ fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboar
         context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0,
         inventory: Inventory {
-            gpus: vec![GpuBudget { capacity_bytes: 96 * GIB, headroom_bytes: 0,
+            gpus: vec![GpuBudget { capacity_bytes: 96 * GIB, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: free } }; gpus],
             spark_ranks: sparks, peer_access: gpus == 2 },
         pool: PoolPolicy::resolve(&vec![96 * GIB; gpus], 131_072, None, 256, sparks == 0),
@@ -277,6 +277,8 @@ fn fixed_onboard_makes_the_pool_the_output() {
     assert_eq!(placement.onboard_layers, 10);
     // The split that leaves the most pool: 5 + 5 (each GPU 0.25 + 5 + 0.25 GiB).
     assert_eq!(placement.expert_ranges.iter().map(|r| r.layers).collect::<Vec<_>>(), [5, 5]);
+    // A pinned onboard is a fixed layout chosen by the operator: the pool is
+    // the output and fills what is left (up to the index limit, not KV max).
     assert_eq!(placement.pool_tokens, (44 * GIB - (5 * GIB + GIB / 2)) / UNIT * 256);
     assert!(placement.pool_tokens > 2 << 20);
     let none = solve(&request(2, 44 * GIB, 60, 4, Onboard::Layers(0))).unwrap();
@@ -399,7 +401,7 @@ fn v4_dense_startup_retains_weights_beside_step_scratch() {
 fn startup_phases_are_independent_and_not_retained_with_the_pool() {
     use cuteafd_core::memory_layout::{Basis, Category};
     let mut req = request(1, 12 * GIB, 40, 4, Onboard::Layers(0));
-    req.inventory.gpus[0].headroom_bytes = GIB;
+    req.inventory.gpus[0].reserve_bytes = GIB;
     let before = solve(&req).unwrap();
     req.startup = vec![
         Demand::new(0, Category::Staging, "vocabulary packing", 12 * GIB, Basis::Formula),
@@ -1095,6 +1097,7 @@ fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
     req.layers[1].modes = vec![LayerMode::HeadSplit, S0, S1];
     req.layers[2] = req.layers[1].clone();
     req.pool.target = 1024;
+    req.pool.max = 1024;
     req.pool.floor = 1;
     for layer in &mut req.layers { layer.experts = None; }
     let mixed = solve(&req).unwrap();
@@ -1105,6 +1108,7 @@ fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
     // If the Dsa flip alone reaches an odd-unit target, pruning the Mla
     // context stepping stone recovers the unit and removes its peer traffic.
     req.pool.target = 768;
+    req.pool.max = 768;
     let pruned = solve(&req).unwrap();
     assert_eq!(pruned.pool_tokens, 768);
     assert_eq!(pruned.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Heads), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
@@ -1115,6 +1119,7 @@ fn mixed_memory_flips_are_explicit_in_plan_and_summary() {
         gpu.baseline = Baseline::Measured { free_bytes: 5 * UNIT };
     }
     req.pool.target = 1280;
+    req.pool.ceiling = req.pool.target;
     let pruned = solve(&req).unwrap();
     assert_eq!(pruned.pool_tokens, 1024);
     assert_eq!(pruned.attention_by_kind, [(AttentionClass::Mla, AttentionPlacement::Heads), (AttentionClass::Dsa, AttentionPlacement::Layers)]);
@@ -1161,6 +1166,7 @@ fn measured_kind_does_not_flip_even_when_context_would_grow_the_pool() {
     req.executor = CONTEXT;
     req.pool_overhead = vec![0; 2];
     req.pool.target = 2 << 20;
+    req.pool.ceiling = req.pool.target;
     req.pool.floor = 256;
     req.layers[0].experts = None;
     req.layers[0].kind = AttentionClass::Mla;
@@ -1439,6 +1445,7 @@ fn layer_extra_rows_follow_the_cutover_and_reduce_available_pool() {
     assert!(split.items.iter().all(|rank| rank.iter().any(|i| i.group == "side table" && i.bytes == GIB)));
     req.inventory.gpus.iter_mut().for_each(|gpu| gpu.baseline = Baseline::Measured { free_bytes: 2 * GIB });
     req.pool.target = 2 << 20;
+    req.pool.ceiling = req.pool.target;
     req.pool.floor = 1;
     let limited = solve(&req).unwrap();
     assert_eq!(limited.pool_tokens, GIB / (UNIT / 4) * 256);
@@ -1478,6 +1485,7 @@ fn layer_switch_balances_mandatory_unequal_tp2_not_optional_residency() {
             tp2: true, whole_supported: true, spark_ok: true });
     }
     req.pool.target = 128 << 20;
+    req.pool.ceiling = req.pool.target;
     // No optional expert fits after this large automatic pool.
     assert_eq!(owner_cut(&req), 2);
     req.onboard = Onboard::Layers(4);
@@ -1612,7 +1620,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
     for fixed in [false, true] {
         for (free, expected) in [(65, 3), (75, 4), (85, 5), (100, 7)] {
             let mut req = request(1, free, 0, 4, if fixed { Onboard::Layers(0) } else { Onboard::Auto });
-            req.pool = PoolPolicy { compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, unit_rows: 1 };
+            req.pool = PoolPolicy { compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
             req.pool_overhead = vec![10];
             req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv,
                 group: "bounded table".into(), bytes_per_unit: 5, offset_units: 2, cap_units: 6, basis: Basis::Formula }];
@@ -1624,7 +1632,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
         }
     }
     let mut req = request(1, 200, 1, 4, Onboard::Auto);
-    req.pool = PoolPolicy { compiled_context: 5, requested: Some(5), target: 5, floor: 5, ceiling: 5, unit_rows: 1 };
+    req.pool = PoolPolicy { compiled_context: 5, requested: Some(5), target: 5, floor: 5, ceiling: 5, max: 5, unit_rows: 1 };
     req.pool_overhead = vec![10];
     req.expert_workspace = 0;
     req.layers[0].experts.as_mut().unwrap().whole = Bytes2 { resident: 121, staging: 0 };
@@ -1639,7 +1647,7 @@ fn bounded_pool_demands_grow_then_saturate_and_reserve_before_experts() {
 fn pool_failures_name_rank_demands_and_retain_selected_expert_arena() {
     for onboard in [Onboard::Auto, Onboard::Layers(0)] {
         let mut req = request(2, 100, 0, 4, onboard);
-        req.pool = PoolPolicy { compiled_context: 1, requested: Some(6), target: 6, floor: 1, ceiling: 100, unit_rows: 1 };
+        req.pool = PoolPolicy { compiled_context: 1, requested: Some(6), target: 6, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
         req.pool_overhead = vec![1, 2];
         req.pool_bounded = vec![BoundedDemand { gpu: 1, category: Category::Prefix,
             group: "recurrent marks".into(), bytes_per_unit: 20, offset_units: 1,
@@ -1692,7 +1700,7 @@ fn successful_pool_limits_retain_auto_onboarded_arenas() {
 #[test]
 fn bounded_only_pool_and_invalid_demands_are_checked() {
     let mut req = request(1, 49, 0, 4, Onboard::Auto);
-    req.pool = PoolPolicy { compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, unit_rows: 1 };
+    req.pool = PoolPolicy { compiled_context: 1, requested: None, target: 100, floor: 1, ceiling: 100, max: 100, unit_rows: 1 };
     req.pool_overhead = vec![0];
     req.pool_bounded = vec![BoundedDemand { gpu: 0, category: Category::Kv, group: "table".into(),
         bytes_per_unit: 10, offset_units: 0, cap_units: 5, basis: Basis::Formula }];
@@ -1774,7 +1782,7 @@ fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
     req.resident_weight_limit = None;
     req.onboard = Onboard::Layers(1);
     let error = budget.constrain(&mut req).unwrap_err().to_string();
-    assert!(error.contains("--rtx-expert-layers 1") && error.contains("--spark-budget-gib"));
+    assert!(error.contains("--rtx-expert-layers 1") && error.contains("--spark-memory-cap"));
     req.onboard = Onboard::Layers(2);
     budget.constrain(&mut req).unwrap();
     let all = SparkBudgetInventory { budget: 1, ..budget.clone() };
@@ -1908,6 +1916,7 @@ fn kimi_c8_marks_reduce_only_after_context_and_fixed_floors() {
     req.pool.requested = Some(1 << 20);
     req.pool.floor = 1 << 20;
     req.pool.target = 1 << 20;
+    req.pool.ceiling = req.pool.target;
     // This fixture's KV rate is 16 GiB/rank at 1M tokens. All other
     // operands are fixed: 8 active states plus weights and workspaces.
     let mark = 224_686_080;
@@ -2149,4 +2158,25 @@ fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
     }).map(|p| attention::owner_score(&p)).max().unwrap();
     assert_eq!(attention::owner_score(&accepted), best);
     assert_eq!(solve_frozen(&req, &accepted).unwrap(), accepted);
+}
+
+#[test]
+fn kv_max_grows_the_automatic_pool_after_the_onboarded_layout_is_fixed() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    // 40 GiB: the 2M target (32 GiB) first, then both 1 GiB layers in what is left.
+    let target = solve(&request(1, 40 * GIB, 2, 4, Onboard::Auto)).unwrap();
+    assert_eq!((target.pool_tokens, target.onboard_layers), (2 << 20, 2));
+    let grown = MemoryPolicy { kv_max: Some(4 << 20), ..Default::default() }
+        .scoped(|| solve(&request(1, 40 * GIB, 2, 4, Onboard::Auto))).unwrap();
+    // Same layout (onboarding fixed at the target), larger pool from the remainder.
+    assert_eq!(grown.onboard_layers, target.onboard_layers);
+    assert!(grown.pool_tokens > target.pool_tokens && grown.pool_tokens < 4 << 20, "{}", grown.pool_tokens);
+    // The growth uses exactly the free whole units after the arena peak: two
+    // layers' residency, one staging buffer at a time, and the expert workspace.
+    let fixed = 2 * GIB + GIB / 4 + GIB / 4;
+    assert_eq!(grown.pool_tokens / 256, (40 * GIB - fixed) / UNIT);
+    // GPU_RESERVE is kept free inside the cap.
+    let reserved = MemoryPolicy { gpu_reserve: Some(GIB), kv_max: Some(4 << 20), ..Default::default() }
+        .scoped(|| solve(&request(1, 40 * GIB, 2, 4, Onboard::Auto))).unwrap();
+    assert_eq!(reserved.pool_tokens / 256, (40 * GIB - GIB - fixed) / UNIT);
 }

@@ -196,12 +196,12 @@ def test_six_wrapper_rejects_bad_fixture_inputs(tmp_path) -> None:
     bin_dir, log = _fake_bin(tmp_path), tmp_path / "calls.log"
     base = (FIX / "site-2rtx6-tp3ep2.config").read_text()
     cases = {
-        "budget-over": (base.replace(f"SPARK_DEVICE_BUDGET_BYTES={BUDGET}", "SPARK_DEVICE_BUDGET_BYTES=109119320065"),
+        "budget-over": (base.replace(f"SPARK_MEMORY_CAP={BUDGET}", "SPARK_MEMORY_CAP=109119320065"),
                         "exceeds the global minimum-of-six"),
-        "budget-2pow64": (base.replace(f"SPARK_DEVICE_BUDGET_BYTES={BUDGET}",
-                                       "SPARK_DEVICE_BUDGET_BYTES=18446744073709551616"),
+        "budget-2pow64": (base.replace(f"SPARK_MEMORY_CAP={BUDGET}",
+                                       "SPARK_MEMORY_CAP=18446744073709551616"),
                           "exceeds the global minimum-of-six"),
-        "budget-zero": (base.replace(f"SPARK_DEVICE_BUDGET_BYTES={BUDGET}", "SPARK_DEVICE_BUDGET_BYTES=0"),
+        "budget-zero": (base.replace(f"SPARK_MEMORY_CAP={BUDGET}", "SPARK_MEMORY_CAP=0"),
                         "must be positive"),
         "arm-1rtx-tp2ep3": (base.replace("SPARK_TP=3", "SPARK_TP=2").replace("SPARK_EP=2", "SPARK_EP=3")
                             .replace("RTX_GPUS=2", "RTX_GPUS=1").replace("RTX_EXPERT_LAYERS=20", "RTX_EXPERT_LAYERS=0"),

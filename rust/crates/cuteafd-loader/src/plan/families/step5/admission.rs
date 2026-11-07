@@ -563,7 +563,7 @@ mod tests {
                 gpus: vec![
                     GpuBudget {
                         capacity_bytes: 96 << 30,
-                        headroom_bytes: 1 << 30,
+                        reserve_bytes: 1 << 30,
                         baseline: Baseline::Measured {
                             free_bytes: 96 << 30
                         }

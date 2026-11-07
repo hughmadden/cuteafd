@@ -201,8 +201,11 @@ pub struct Budget {
     /// in the same budget. A location must belong to exactly one budget.
     pub locations: Vec<Location>,
     pub physical_bytes: u64,
+    /// The device cap (`GPU_MEMORY_CAP` / `SPARK_MEMORY_CAP`); never above physical.
     pub logical_bytes: u64,
     pub baseline: Baseline,
+    /// The named reserve kept free inside the cap (devices: `placement::reserve`;
+    /// host RAM: the host headroom).
     pub headroom: u64,
 }
 impl Budget {

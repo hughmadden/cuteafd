@@ -585,14 +585,15 @@ mod tests {
         let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
         let programs = library.programs()?.with_manifest(&manifest)?;
         let cache_format = cuteafd_core::MlaCacheFormat::Fp8;
-        let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
+        let spark_cap = cuteafd_core::memory_policy::MemoryPolicy { spark_cap: Some(110 << 30), ..Default::default() };
+        let loaded = spark_cap.scoped(|| startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
             cache_format, attention: None, devices: [0], native_lib: &native, peers,
             rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
-            spark_budget_gib: Some(110.), rows: 2048, waves: 2, prefill_rows: Some(1024),
+            rows: 2048, waves: 2, prefill_rows: Some(1024),
             slots: 2, marks: 0, max_context: 8192, pool_tokens: Some(16384), graphs: false, full_prefill_logits: false,
             ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: Some(hosted_layers),
             draft: Some(Options { snapshot: drafter, fp8: true, tp2_dflash: false, cache_format }), verify_rows: 0, prefix: None,
-        })?;
+        }))?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;
         let family = engine.prefix_family()?;
@@ -675,7 +676,7 @@ mod tests {
         let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options { expert_usage: false, expert_usage_reader: Default::default(),
             cache_format,
             attention: None, devices: [0, 1], native_lib: &native, peers,
-            rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers), spark_budget_gib: None,
+            rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Layers(local_layers),
             rows: TARGET_TAP_ROWS, waves: 2, prefill_rows: None, slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, full_prefill_logits: false, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),

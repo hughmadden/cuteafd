@@ -66,6 +66,9 @@ PYCAPACITY
 }
 
 # Resolve total capacity in bytes, never free memory. Rust owns the default rule.
+# release_coordinator_profile PHYSICAL_BYTES [GPU_MEMORY_CAP]: prints the
+# logical per-GPU cap in bytes (the smaller of the device and the cap) and the
+# default concurrency for it.
 release_coordinator_profile() {
   local registry="${repo_root:?}/rust/crates/cuteafd-core/src/serving_capacity.rs"
   python3 - "$registry" "$1" "${2:-}" <<'PYPROFILE'
@@ -87,15 +90,79 @@ try:
     if not (0 < threshold < 2**64 and 0 < small <= large <= 0xffffffff):
         raise ValueError('invalid capacity registry geometry')
     physical = Decimal(sys.argv[2].strip())
-    budget = Decimal(sys.argv[3]) * 2**30 if sys.argv[3] else physical
-    if not all(value.is_finite() and 1 <= value < 2**64 for value in (physical, budget)):
+    def size(text):
+        match = re.fullmatch(r'([0-9]+(?:\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)?', text.strip())
+        if match is None:
+            raise ValueError(f'invalid GPU_MEMORY_CAP {text!r}: use B, MB, GB, MiB or GiB')
+        return Decimal(match.group(1)) * {None: 1, 'B': 1, 'MB': 10**6, 'GB': 10**9,
+            'MiB': 2**20, 'GiB': 2**30}[match.group(2)]
+    cap = size(sys.argv[3]) if sys.argv[3] else physical
+    if not all(value.is_finite() and 1 <= value < 2**64 for value in (physical, cap)):
         raise ValueError('GPU capacity must be finite, positive and representable in bytes')
-    logical = min(physical, budget)
-    print(logical / 2**30, small if int(logical) <= threshold else large)
+    logical = int(min(physical, cap))
+    print(logical, small if logical <= threshold else large)
 except (OSError, ValueError, ArithmeticError) as error:
     sys.exit(f'coordinator capacity registry: {error}')
 PYPROFILE
 }
+
+# The one device memory policy (rust/crates/cuteafd-core/src/memory_policy.rs):
+# launch keys and the global cuteafd flags they become, in one order.
+RELEASE_MEMORY_KEYS=(GPU_MEMORY_CAP SPARK_MEMORY_CAP GPU_RESERVE SPARK_RESERVE FAMILY_RESERVE
+  KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS)
+release_memory_flag() {
+  case "$1" in
+    GPU_MEMORY_CAP) printf -- --gpu-memory-cap ;; SPARK_MEMORY_CAP) printf -- --spark-memory-cap ;;
+    GPU_RESERVE) printf -- --gpu-reserve ;; SPARK_RESERVE) printf -- --spark-reserve ;;
+    FAMILY_RESERVE) printf -- --family-reserve ;; KV_TARGET_TOKENS) printf -- --kv-target-tokens ;;
+    KV_MIN_TOKENS) printf -- --kv-min-tokens ;; KV_MAX_TOKENS) printf -- --kv-max-tokens ;;
+    *) return 1 ;;
+  esac
+}
+# release_validate_memory_value KEY VALUE: sizes take B, MB, GB, MiB or GiB (a
+# bare number is bytes, no percentages); token counts are positive integers.
+release_validate_memory_value() {
+  local key="$1" value="$2"
+  [[ -z "$value" ]] && return 0
+  case "$key" in
+    KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS)
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || release_die "$key must be a positive token count" ;;
+    GPU_MEMORY_CAP|SPARK_MEMORY_CAP)
+      [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ && "$value" =~ [1-9] ]] ||
+        release_die "$key must be a positive size in B, MB, GB, MiB or GiB" ;;
+    GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE)
+      [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] ||
+        release_die "$key must be a size in B, MB, GB, MiB or GiB" ;;
+    *) release_die "unknown memory policy key: $key" ;;
+  esac
+}
+# release_size_bytes SIZE: the byte count of a validated size.
+release_size_bytes() {
+  python3 -c '
+import re, sys
+from decimal import Decimal
+match = re.fullmatch(r"([0-9]+(?:\.[0-9]{1,6})?)(B|MB|GB|MiB|GiB)?", sys.argv[1])
+if match is None: sys.exit(f"invalid size {sys.argv[1]!r}: use B, MB, GB, MiB or GiB")
+print(int(Decimal(match.group(1)) * {None: 1, "B": 1, "MB": 10**6, "GB": 10**9, "MiB": 2**20, "GiB": 2**30}[match.group(2)]))
+' "$1"
+}
+# release_memory_args NAME GETTER [SKIP_KEY...]: fill array NAME with the global
+# flags for every memory policy key GETTER KEY prints non-empty, minus SKIP_KEYs.
+release_memory_args() {
+  local -n release_memory_out="$1"
+  local getter="$2" key value skip
+  shift 2
+  release_memory_out=()
+  for key in "${RELEASE_MEMORY_KEYS[@]}"; do
+    for skip in "$@"; do [[ "$key" != "$skip" ]] || continue 2; done
+    value="$("$getter" "$key")"
+    release_validate_memory_value "$key" "$value"
+    [[ -z "$value" ]] || release_memory_out+=("$(release_memory_flag "$key")" "$value")
+  done
+}
+release_memory_variable() { printf '%s' "${!1:-}"; }
+# release_gib BYTES: the same value in GiB, for GiB-valued flags.
+release_gib() { python3 -c 'import sys; print(int(sys.argv[1]) / 2**30)' "$1"; }
 
 # The worker and coordinator must admit the same live rows, including decoder
 # replay. Fail closed if the Rust registry stops being literal declarations.
@@ -890,10 +957,11 @@ release_known_key() {
     DRAFT_SURVIVAL_LENGTHS|DRAFT_POLICY|DRAFT_ROW_COST) return 0 ;;
     CUDA_MODULE_LOADING) return 0 ;; # V4.1 coordinator CUDA module loading (LAZY or EAGER).
     MAPPED_SCALE_PRELOAD_GIB|ENGRAM_WARM|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|EXPERT_USAGE|GATEWAY) return 0 ;;
-    GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
+    GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
+    GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS) return 0 ;; # One device memory policy (docs/options.md).
     EXPERT_PARTIAL_BF16_MAX_ROWS|SPARK_PREFILL_REPLY_FORMAT|SPARK_DECODE_REPLY_FORMAT) return 0 ;; # Partial-reply cutoff and shared Spark reply format.
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS|TP2_DFLASH) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
@@ -912,7 +980,7 @@ release_known_key() {
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -960,16 +1028,6 @@ release_spark_host_rows() {
     printf '%s %s 10.55.0.%s 10.55.1.%s\n' "$rank" "$host" "$index" "$index"
     rank=$((rank + 1))
   done
-}
-
-# Optional logical per-GPU ceiling. Validate identically in both launchers
-# before any worker/service changes; an empty key keeps physical admission.
-release_validate_coordinator_gpu_budget() {
-  local value="$1"
-  [[ -z "$value" ]] && return 0
-  [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
-    python3 -c 'import math,sys; n=float(sys.argv[1])*2**30; sys.exit(not (math.isfinite(n) and 1 <= n < 2**64))' "$value" ||
-    release_die "COORDINATOR_GPU_BUDGET_GIB must be finite, positive GiB representable in bytes"
 }
 
 # Load and validate a configuration file.
@@ -1112,8 +1170,6 @@ release_load_config() {
   RTX_EXPERT_LAYERS=auto
   RTX_GPUS=auto
   COORDINATOR_GPUS=
-  COORDINATOR_GPU_HEADROOM_GIB=8
-  COORDINATOR_GPU_BUDGET_GIB=
   POOL_TOKENS=
   EMBEDDING=gpu
   KV_POOL_TOKENS=
@@ -1121,7 +1177,6 @@ release_load_config() {
   HOST_CACHE_BYTES=auto
   API_KEY_FILE="${API_KEY_FILE:-}"
   ENABLE_BENCH=off
-  MEMORY_RESERVATION=
   MAX_CONTEXT_TOKENS=1048576
   MAX_OUTPUT_TOKENS=131072
   KV_DECODE_RESERVE_CHUNK=
@@ -1138,7 +1193,7 @@ release_load_config() {
   PREFIX_CACHE_ENTRIES=auto
   PREFILL_BATCH_TOKENS=2048
   RELEASE_PREFILL_EXPLICIT=0
-  SPARK_DEVICE_BUDGET_BYTES=107374182400
+  for release_memory_key in "${RELEASE_MEMORY_KEYS[@]}"; do printf -v "$release_memory_key" '%s' ""; done
   SPARK_REDUCTION_MIN_ROWS=16
   SPARKINFER_EXL3=disable
   if [[ -z "${_release_count_env_saved:-}" ]]; then
@@ -1302,8 +1357,9 @@ release_load_config() {
     ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) ||
       release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
   fi
-  [[ "$SPARK_DEVICE_BUDGET_BYTES" =~ ^[1-9][0-9]*$ ]] ||
-    release_die "SPARK_DEVICE_BUDGET_BYTES must be a positive integer"
+  for release_memory_key in "${RELEASE_MEMORY_KEYS[@]}"; do
+    release_validate_memory_value "$release_memory_key" "${!release_memory_key}"
+  done
   [[ "$SPARK_REDUCTION_MIN_ROWS" =~ ^[1-9][0-9]*$ ]] ||
     release_die "SPARK_REDUCTION_MIN_ROWS must be a positive integer"
   [[ "$EXPERT_PORT" =~ ^[0-9]+$ ]] && ((EXPERT_PORT >= 1 && EXPERT_PORT <= 65535)) || release_die "EXPERT_PORT must be in 1..65535"
@@ -1311,8 +1367,6 @@ release_load_config() {
   # container name in the family launcher and the production launcher alike.
   [[ -z "$INSTANCE" || "$INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] ||
     release_die "INSTANCE must be [A-Za-z0-9_.-]"
-  [[ "$COORDINATOR_GPU_HEADROOM_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || release_die "COORDINATOR_GPU_HEADROOM_GIB must be non-negative"
-  release_validate_coordinator_gpu_budget "$COORDINATOR_GPU_BUDGET_GIB"
   [[ -z "$POOL_TOKENS" || "$POOL_TOKENS" == auto || "$POOL_TOKENS" =~ ^[0-9]+$ ]] || release_die "POOL_TOKENS must be auto or a non-negative integer"
   [[ -z "$POOL_TOKENS" || -z "$KV_POOL_SIZE" ]] || release_die "POOL_TOKENS conflicts with KV_POOL_SIZE"
   for release_integer_name in KV_POOL_TOKENS MAX_CONTEXT_TOKENS KV_DECODE_RESERVE_CHUNK; do
@@ -1336,8 +1390,6 @@ release_load_config() {
     release_die "KV_POOL_SIZE must use B, MB, GB, MiB or GiB"
   [[ "$HOST_CACHE_BYTES" == auto || "$HOST_CACHE_BYTES" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] ||
     release_die "HOST_CACHE_BYTES must be auto, 0, or a byte size"
-  [[ -z "$MEMORY_RESERVATION" || "$MEMORY_RESERVATION" =~ ^[0-9]+([.][0-9]{1,6})?((B|MB|GB|MiB|GiB)|%)$ ]] ||
-    release_die "MEMORY_RESERVATION must be a byte size or percentage"
   [[ "$ADDR" == *:* ]] || release_die "ADDR must be HOST:PORT"
   [[ -n "$MODEL_ID" && "$MODEL_ID" == */* && "$MODEL_ID" != *[[:space:]]* ]] ||
     release_die "MODEL_ID must be a Hugging Face repository ID"

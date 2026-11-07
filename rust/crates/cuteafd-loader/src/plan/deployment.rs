@@ -15,13 +15,13 @@ pub struct DeploymentOptions {
     pub admission: AdmissionArgs,
 }
 
-/// Preserve the requested spelling for the resolved-config fingerprint. Parsed
-/// byte values are supplementary; percentages still need the live device total.
+/// Preserve the requested spelling for the resolved-config fingerprint, plus
+/// the one memory policy (caps, reserves, KV target/min/max) the plan used.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AdmissionArgs {
     pub kv_pool_size: Option<String>,
-    pub memory_reservation: Option<String>,
     pub pool_tokens: Option<u64>,
+    pub memory_policy: cuteafd_core::memory_policy::MemoryPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -457,8 +457,8 @@ mod tests {
             });
             let options = DeploymentOptions { rtx_gpus: 1,
                 speculator: "off".into(),
-                admission: AdmissionArgs { kv_pool_size: Some("1.50GiB".into()),
-                    memory_reservation: Some("7.5%".into()), pool_tokens: Some(0) },
+                admission: AdmissionArgs { kv_pool_size: Some("1.50GiB".into()), pool_tokens: Some(0),
+                    memory_policy: cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(1 << 30), ..Default::default() } },
                 ..Default::default() };
             let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
             assert_eq!(deployment.launch.unwrap(), report.launch.as_ref().unwrap());
@@ -468,7 +468,7 @@ mod tests {
             assert!(deployment.artifact_requirements.spark_tp_manifest.is_none());
             assert!(deployment.estimated_placement.is_some());
             assert_eq!(deployment.admission.kv_pool_size.as_deref(), Some("1.50GiB"));
-            assert_eq!(deployment.admission.memory_reservation.as_deref(), Some("7.5%"));
+            assert_eq!(deployment.admission.memory_policy.gpu_reserve, Some(1 << 30));
         }
     }
 

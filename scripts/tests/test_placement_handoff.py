@@ -61,7 +61,8 @@ HTTP_QUEUE_WAIT_MS=25000
 RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
 KV_POOL_SIZE=
-MEMORY_RESERVATION=
+memory_policy_args=()
+spark_memory_args=()
 SPECULATOR=dspark
 EMBEDDING=gpu
 VISION=off
@@ -91,7 +92,6 @@ site_hub=0
 namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
-SPARK_DEVICE_BUDGET_BYTES=1000000
 spark_prefix=worker
 hosts=(a b c d)
 EXPERT_PORT=19441
@@ -119,7 +119,7 @@ resolved_decode_lanes=2
             # release_spark_ep to 1 when no explicit topology is configured.
             setup+=f'spark_tp={spark_count}\n'
             if spark_count == 2:
-                setup+='MEMORY_RESERVATION=32GiB\nKV_POOL_SIZE=2GiB\npeers=10.55.0.1:19441,10.55.0.2:19441\n'
+                setup+='memory_policy_args=(--gpu-memory-cap 32GiB)\nKV_POOL_SIZE=2GiB\npeers=10.55.0.1:19441,10.55.0.2:19441\n'
             setup+=''.join(f'\nTP2_{option}=on\n' for option in options)
             if dspark_experts is not None:
                 setup+=f'\nTP2_DSPARK_EXPERTS={dspark_experts}\n'
@@ -206,7 +206,7 @@ resolved_decode_lanes=2
         self.assertTrue(all(tail[8:11]==['0','2','1'] for tail in tails))
         coordinator=next(args for tool,args in events if tool=='docker' and args[0]=='run')
         self.assertEqual(coordinator[coordinator.index('--peers')+1], '10.55.0.1:19441,10.55.0.2:19441')
-        self.assertEqual(coordinator[coordinator.index('--memory-reservation')+1], '32GiB')
+        self.assertEqual(coordinator[coordinator.index('--gpu-memory-cap')+1], '32GiB')
         self.assertEqual(coordinator[coordinator.index('--kv-pool-size')+1], '2GiB')
 
     def test_zero_spark_launch_has_no_remote_workers(self):

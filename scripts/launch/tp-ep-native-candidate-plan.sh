@@ -14,7 +14,7 @@ candidate_print_plan() {
   echo "topology tp=$spark_tp ep=$spark_ep world=$spark_world"
   echo "rtx_gpus=$rtx_gpus"
   echo "ownership=coordinator-selected exact layer IDs"
-  echo "budget_bytes=$SPARK_DEVICE_BUDGET_BYTES"
+  echo "budget_bytes=$spark_budget_bytes"
   echo "admission=$admission"
   echo "worker_geometry=coordinator-selected typed model admission"
   echo "coordinator_container=$coordinator_container"

@@ -93,7 +93,7 @@ pub trait FamilyModel: Send + Sync {
     fn default_context_tokens(&self) -> Option<u64> { None }
 
     /// Routed-expert weight bytes one Spark rank may hold when the operator
-    /// sets no `--spark-budget-gib`. Families whose release needs more state
+    /// sets no `--spark-memory-cap`. Families whose release needs more state
     /// the measured reason with their override.
     fn spark_budget_bytes(&self) -> u64 { super::DEFAULT_SPARK_BUDGET_BYTES }
 
