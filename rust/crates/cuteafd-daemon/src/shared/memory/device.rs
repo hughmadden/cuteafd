@@ -127,7 +127,14 @@ pub(crate) struct Allocation<'a> {
     pub device: Device<'a>,
     pub buffer: CuteafdDeviceBuffer,
     backing: Option<std::rc::Rc<Allocation<'a>>>,
+    weight_id: Option<String>,
 }
+
+pub(crate) struct WeightArenaBacking<'b> {
+    pub id: &'b str,
+    pub buffer: CuteafdDeviceBuffer,
+}
+
 impl<'a> Allocation<'a> {
     pub fn attention_plane(device: Device<'a>, rows: usize, stride: usize, name: &str) -> Result<Self> {
         let bytes = rows.checked_mul(stride).ok_or_else(|| anyhow::anyhow!("attention plane size overflow"))?;
@@ -140,7 +147,25 @@ impl<'a> Allocation<'a> {
 
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
         let buffer = device.run(|| device.library.alloc_device_buffer(bytes))?;
-        Ok(Self { device, buffer, backing: None })
+        Ok(Self { device, buffer, backing: None, weight_id: None })
+    }
+
+    pub(super) fn weight_arena(device: Device<'a>, bytes: usize, id: &str) -> Result<Self> {
+        let mut allocation = Self::new(device, bytes)?;
+        allocation.weight_id = Some(id.into());
+        Ok(allocation)
+    }
+
+    pub(crate) fn weight_backing(&self) -> Option<WeightArenaBacking<'_>> {
+        if let Some(backing) = &self.backing { return backing.weight_backing(); }
+        self.weight_id.as_deref().map(|id| WeightArenaBacking { id, buffer: self.buffer })
+    }
+
+    pub(crate) fn inventory(&self, inventory: &mut super::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        match self.weight_backing() {
+            Some(backing) => inventory.weight_view(name, self.buffer, backing),
+            None => inventory.device(name, self.buffer),
+        }
     }
 
     /// A view retains the physical owner, including on partial-load failures.
@@ -151,7 +176,7 @@ impl<'a> Allocation<'a> {
             .ok_or_else(|| anyhow::anyhow!("device allocation view address overflow"))?;
         ensure!(address % 256 == 0, "weight arena view requires 256-byte alignment");
         Ok(Self { device: owner.device, buffer: CuteafdDeviceBuffer {
-            ptr: address as *mut std::ffi::c_void, bytes, ..owner.buffer }, backing: Some(owner.clone()) })
+            ptr: address as *mut std::ffi::c_void, bytes, ..owner.buffer }, backing: Some(owner.clone()), weight_id: None })
     }
 }
 impl Drop for Allocation<'_> {

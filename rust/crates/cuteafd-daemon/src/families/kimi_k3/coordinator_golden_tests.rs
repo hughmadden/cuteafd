@@ -172,15 +172,30 @@ fn recorded_for_ranks<'a>(library: &'a NativeLibrary, model: &Installed,
     load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, ranks: usize)
     -> Result<(Vec<(usize, GlobalWeights<'a>)>, Vec<(String, usize, LayerWeights<'a>)>)> {
     let devices = (0..ranks).map(|id| Device { library, id: id as i32 }).collect::<Vec<_>>();
-    let records = records::KimiRecords::new(&model.checkpoint, &model.cfg, &model.core, load,
+    let mut records = records::KimiRecords::new(&model.checkpoint, &model.cfg, &model.core, load,
         devices.iter().map(|device| (device.id, std::ptr::null_mut())).collect());
     let globals = GlobalLayout::ranks_with_core(&model.cfg, &model.core, ranks)?;
+    let selected = (0..model.cfg.layers).map(|layer| LayerLayout::ranks_with_core(&model.cfg, layer,
+        if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } } else { LayerMode::HeadSplit },
+        &model.core, ranks)).collect::<Result<Vec<_>>>()?;
+    records.arenas = devices.iter().enumerate().map(|(rank, &device)| {
+        let global = globals[rank].shared_layout();
+        let layers = selected.iter().map(|layouts| layouts[rank].shared_layout()).collect::<Vec<_>>();
+        let layout = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(
+            rank, &global, &layers.iter().collect::<Vec<_>>())?;
+        Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?))
+    }).collect::<Result<BTreeMap<_, _>>>()?.into();
     let mut global = Vec::new();
     for (rank, layout) in globals.iter().enumerate() { global.push((rank, records.global(devices[rank], layout)?)); }
     let mut layers = Vec::new();
     for (layer, mode) in fixture_layers(&model.cfg, ranks)? {
         let layouts = LayerLayout::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks)?;
-        for (rank, weights) in records.layer_ranks(&devices, layer, &layouts)?.into_iter().enumerate() {
+        // Whole-MLA variants are independent golden scopes. The selected heads
+        // path exercises the same complete per-GPU arena as production.
+        let alternate = records::KimiRecords::new(&model.checkpoint, &model.cfg, &model.core, load,
+            records.streams.clone());
+        let target = if ranks == 1 || mode == LayerMode::HeadSplit { &records } else { &alternate };
+        for (rank, weights) in target.layer_ranks(&devices, layer, &layouts)?.into_iter().enumerate() {
             layers.push((format!("layers.{layer}.{}.{rank}", mode_tag(mode)), rank, weights));
         }
     }

@@ -65,33 +65,22 @@ impl CoreWeightLayout {
         }
     }
 
-    pub(crate) fn arena_tensors(&self, prefix: &str) -> Result<Vec<(String, usize)>> {
-        self.shared_layout().arena_tensors(prefix)
-    }
-
-    /// The shared native K6 recipe, used unchanged by mount and push loads.
+    /// Nonadopted families retain standalone requests until their arena migration.
     pub(crate) fn load_recorded<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
         dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void) -> Result<CoreWeights<'a>> {
-        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
-            format!("K6/{}", self.stem), self.arena_tensors("projection")?)?;
-        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
-        self.load_recorded_in(device, checkpoint, dense, stream, &arena, "projection")
+        self.load_recorded_with(device, checkpoint, dense, stream,
+            |name, bytes| crate::shared::memory::weight_arena::weight_allocation(device, None, name, bytes))
     }
 
-    pub(crate) fn load_recorded_in<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
+    /// The shared mount/push recipe; only final named storage is injected.
+    pub(crate) fn load_recorded_with<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
         dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void,
-        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>, prefix: &str) -> Result<CoreWeights<'a>> {
+        mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<CoreWeights<'a>> {
         use crate::shared::experts::rtx::dense::{Job, Operand, Rect, Step};
         let metadata = |name: &str| -> Result<&cuteafd_loader::SafetensorsTensorMetadata> {
             let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("checkpoint lacks {name}"))?;
             Ok(&checkpoint.tensors[at].meta)
-        };
-        let allocate = |suffix: &str, bytes| arena.view(&format!("{prefix}.{suffix}"), bytes);
-        let landed = |suffix: &str, r: Rect, bytes| -> Result<Allocation<'a>> {
-            let allocation = allocate(suffix, bytes)?;
-            dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(r, 0)], bytes })?;
-            Ok(allocation)
         };
         let stem = &self.stem;
         let suffixes = ["trellis", "suh", "svh", self.codebook.marker()];
@@ -113,18 +102,20 @@ impl CoreWeightLayout {
             TrellisSide::Input => local_n == n && local_k * self.ranks == k }
             && local_n % 128 == 0 && local_k % 128 == 0, "{stem}: K6 shard geometry");
         let tile_bytes = 32 * module.bits;
-        let payload = allocate("payload", local_n * local_k * module.bits / 8)?;
+        let payload = allocate(&format!("{stem}.trellis"), local_n * local_k * module.bits / 8)?;
         let k16 = local_k / 16;
         for (kr, source) in self.payload_rects(checkpoint, n)? {
             let rows = source.rows.len();
             dense.step(Step { device: device.id, rects: vec![source], jobs: vec![Job::TrellisTiles { rows, k0: kr, tiles: local_n / 16, tile_bytes,
                 k16, input: self.side == TrellisSide::Input, dst: payload.buffer }] }, stream)?;
         }
-        let vector = |suffix: &str, start: usize, count: usize| -> Result<Allocation<'a>> {
+        let mut vector = |suffix: &str, start: usize, count: usize| -> Result<Allocation<'a>> {
             let name = format!("{stem}.{suffix}");
             let r = Rect::tensor(checkpoint, &name, None, Some(start * 2..(start + count) * 2))?;
             let bytes = r.bytes();
-            landed(suffix, r, bytes)
+            let allocation = allocate(&name, bytes)?;
+            dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(r, 0)], bytes })?;
+            Ok(allocation)
         };
         let suh = vector("suh", k0, local_k)?;
         let svh = vector("svh", n0, local_n)?;

@@ -409,6 +409,44 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_arenas_cover_final_tp1_and_tp2_operands_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        crate::plan::testing::write_kimi_core_snapshot(dir.path(), false);
+        let checkpoint = crate::plan::checkpoint::Checkpoint::open(dir.path())?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let core = crate::plan::families::kimi::core_inventory(&checkpoint)?;
+        for ranks in [1, 2] {
+            let global = GlobalLayout::ranks_with_core(&cfg, &core, ranks)?;
+            let layers = (0..cfg.layers).map(|layer| LayerLayout::ranks_with_core(&cfg, layer,
+                if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } } else { LayerMode::HeadSplit },
+                &core, ranks)).collect::<Result<Vec<_>>>()?;
+            for rank in 0..ranks {
+                let local = layers.iter().map(|ranks| &ranks[rank]).collect::<Vec<_>>();
+                let arena = coordinator_arena(rank, &global[rank], &local)?;
+                let expected = local.iter().try_fold(global[rank].bytes()?, |sum, layer|
+                    sum.checked_add(layer.bytes()?).context("fixture arena overflow"))?;
+                assert_eq!(arena.payload_bytes(), expected);
+                assert_eq!(arena.bytes(), expected + arena.padding_bytes());
+                let mut views = arena.views().values().copied().collect::<Vec<_>>();
+                views.sort_by_key(|view| view.offset());
+                let mut end = 0;
+                for view in views {
+                    assert_eq!(view.offset() % 256, 0);
+                    assert!(view.offset() >= end);
+                    end = view.offset() + view.bytes();
+                }
+                assert_eq!(end, arena.bytes());
+                assert!(arena.views().keys().all(|key| !key.contains("staging") && !key.contains("temporary")));
+                if global[rank].core_head.is_some() {
+                    assert!(arena.view("global.head.trellis").is_some());
+                    assert!(arena.view("global.head").is_none());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn one_rank_preserves_native_k6_without_bf16_shadows() -> Result<()> {
         let dir = tempfile::tempdir()?;
         crate::plan::testing::write_kimi_core_snapshot(dir.path(), false);

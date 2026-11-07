@@ -8,21 +8,36 @@ use std::{collections::BTreeMap, ops::Range};
 /// Static coordinator weights. Every tensor view retains the physical owner,
 /// independently of the loader; graph capture never changes their addresses.
 pub(crate) struct DeviceWeightArena<'a> {
-    pub layout: cuteafd_loader::serving_capacity::WeightArenaLayout,
+    layout: cuteafd_loader::serving_capacity::WeightArenaLayout,
     allocation: std::rc::Rc<Allocation<'a>>,
 }
 impl<'a> DeviceWeightArena<'a> {
     pub fn new(device: Device<'a>, layout: cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<Self> {
-        ensure!(layout.bytes > 0, "empty device weight arena");
         let _scope = cuteafd_ffi::memory_ledger::scope("weights/coordinator arena");
-        let allocation = std::rc::Rc::new(Allocation::new(device, layout.bytes)?);
-        ensure!(allocation.buffer.bytes == layout.bytes, "weight arena allocation differs from admitted backing");
+        let allocation = std::rc::Rc::new(Allocation::weight_arena(device, layout.bytes(), layout.id())?);
+        ensure!(allocation.buffer.bytes == layout.bytes(), "weight arena allocation differs from admitted backing");
         Ok(Self { layout, allocation })
     }
+    pub fn layout(&self) -> &cuteafd_loader::serving_capacity::WeightArenaLayout { &self.layout }
     pub fn view(&self, name: &str, bytes: usize) -> Result<Allocation<'a>> {
-        let view = self.layout.views.get(name).with_context(|| format!("{} lacks weight {name}", self.layout.id))?;
-        ensure!(view.bytes == bytes, "{name}: weight view differs from admitted extent");
-        Allocation::view(&self.allocation, view.offset, view.bytes)
+        let view = self.layout.view(name).with_context(|| format!("{} lacks weight {name}", self.layout.id()))?;
+        ensure!(view.bytes() == bytes, "{name}: weight view differs from admitted extent");
+        Allocation::view(&self.allocation, view.offset(), view.bytes())
+    }
+}
+
+/// Named immutable weights only; scratch, staging and temporary representations
+/// keep their own allocations and retirement. Nonadopted scopes stay standalone.
+pub(crate) fn weight_allocation<'a>(device: Device<'a>, arena: Option<&DeviceWeightArena<'a>>,
+    name: &str, bytes: usize) -> Result<Allocation<'a>> {
+    ensure!(!name.is_empty() && bytes > 0, "empty named weight allocation");
+    match arena {
+        Some(arena) => {
+            ensure!(device.id == arena.allocation.device.id
+                && std::ptr::eq(device.library, arena.allocation.device.library), "weight arena device mismatch");
+            arena.view(name, bytes)
+        }
+        None => Allocation::new(device, bytes),
     }
 }
 

@@ -19,6 +19,8 @@ fn static_weight_views_retain_backing_and_match_tensor_checksums() -> Result<()>
     let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
         tensors.iter().map(|(name, data)| (name.clone(), data.len())))?;
     let arena = DeviceWeightArena::new(device, layout)?;
+    assert_eq!(arena.layout().padding_bytes(), 255);
+    assert!(weight_allocation(Device { library: &library, id: 0 }, Some(&arena), "payload", 513).is_err());
     assert!(arena.view("absent", 513).is_err());
     assert!(arena.view("payload", 512).is_err());
     let views = tensors.iter().map(|(name, data)| arena.view(name, data.len())).collect::<Result<Vec<_>>>()?;
@@ -38,10 +40,83 @@ fn static_weight_views_retain_backing_and_match_tensor_checksums() -> Result<()>
         })?;
     }
     drop(arena);
-    assert_eq!(fixture.mapped_bytes(&library)?, 1026, "views retain the full physical request");
+    assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, (1 << 20) - 1026,
+        "views retain the full physical request");
+    assert_eq!(views[0].weight_backing().unwrap().id, "test/core/1");
     drop(views);
-    assert_eq!(fixture.mapped_bytes(&library)?, 0);
+    assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 1 << 20);
+    let events = fixture.events()?;
+    assert_eq!(events.matches('D').count(), 3);
+    assert_eq!(events.matches('d').count(), 3);
     assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+    Ok(())
+}
+
+#[test]
+fn static_weight_receipts_share_one_backing_across_inventories() -> Result<()> {
+    use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
+    use cuteafd_core::memory_layout::Category;
+    use super::super::receipts::{Census, Inventory};
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.strict_device_free(&library, true)?;
+    let device = Device { library: &library, id: 1 };
+    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
+        [("first".into(), 257), ("second".into(), 2)])?;
+    let arena = DeviceWeightArena::new(device, layout)?;
+    let first = arena.view("first", 257)?;
+    let second = super::super::DeviceAllocation::from_allocation(arena.view("second", 2)?);
+    let devices = [1];
+    let devices = CoordinatorDevices::new(&devices)?;
+    let mut one = Inventory::new(devices, "one", Lifetime::TARGET, Category::Weights, "fixture");
+    let mut two = Inventory::new(devices, "two", Lifetime::TARGET, Category::Weights, "fixture");
+    first.inventory(&mut one, "first")?;
+    second.inventory(&mut two, "second")?;
+    drop(arena);
+    let mut census = Census::default();
+    census.owners(one.receipts);
+    census.owners(two.receipts);
+    census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+    assert_eq!(census.receipts.len(), 3);
+    let backings = census.receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+    assert_eq!(backings.len(), 1);
+    assert_eq!((backings[0].allocation.id.as_str(), backings[0].allocation.bytes), ("test/core/1", 514));
+    for receipt in census.receipts.iter().filter(|r| r.allocation.view.is_some()) {
+        assert_eq!(receipt.allocation.view.as_ref().unwrap().backing, "test/core/1");
+    }
+    assert_eq!(census.receipts[2].allocation.view.as_ref().unwrap().offset, 512);
+    drop(first);
+    assert_eq!(fixture.events()?.matches('d').count(), 0);
+    drop(second);
+    assert_eq!(fixture.events()?.matches('d').count(), 1);
+    assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+    Ok(())
+}
+
+#[test]
+fn static_weight_partial_load_and_failed_drain_keep_owner_contract() -> Result<()> {
+    for failed_drain in [false, true] {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.strict_device_free(&library, true)?;
+        let device = Device { library: &library, id: 1 };
+        let load = || -> Result<()> {
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
+                [("first".into(), 257), ("second".into(), 2)])?;
+            let arena = DeviceWeightArena::new(device, layout)?;
+            let first = arena.view("first", 257)?;
+            if failed_drain { library.quarantine_module_after_failed_drain(); }
+            // A later tensor's rejected extent unwinds the partially loaded views.
+            let _second = arena.view("second", 3)?;
+            drop(first);
+            Ok(())
+        };
+        assert!(load().is_err());
+        assert_eq!(fixture.events()?.matches('D').count(), 1);
+        assert_eq!(fixture.events()?.matches('d').count(), usize::from(!failed_drain));
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        assert_eq!(library.cuda_get_device()?, 0);
+    }
     Ok(())
 }
 

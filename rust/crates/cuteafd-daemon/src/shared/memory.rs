@@ -59,6 +59,13 @@ impl<'a> DeviceAllocation<'a> {
         Self { library: allocation.device.library, buffer: allocation.buffer, backing: Some(allocation) }
     }
 
+    pub(crate) fn inventory(&self, inventory: &mut receipts::Inventory<'_>, name: &str) -> Result<()> {
+        match &self.backing {
+            Some(allocation) => allocation.inventory(inventory, name),
+            None => inventory.device(name, self.buffer),
+        }
+    }
+
     pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope(scope);
         Self::new(library, bytes)

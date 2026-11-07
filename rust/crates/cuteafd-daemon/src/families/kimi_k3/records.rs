@@ -83,9 +83,9 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
     }
 
     fn allocate(&self, device: Device<'a>, name: &str, bytes: usize) -> Result<Allocation<'a>> {
-        ensure!(bytes > 0, "Kimi operand is empty");
-        self.arenas.get(&device.id).context("Kimi device weight arena absent")?
-            .view(&format!("{}.{name}", self.prefix), bytes)
+        let arena = self.arenas.get(&device.id).context("Kimi device weight arena absent")?;
+        crate::shared::memory::weight_arena::weight_allocation(device, Some(arena),
+            &format!("{}.{name}", self.prefix), bytes)
     }
 
     /// An allocation of exactly `bytes` whose `lands` fill it unchanged.
@@ -153,8 +153,10 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
     fn core(&self, device: Device<'a>, key: &str, layout: &CoreWeightLayout) -> Result<CoreWeights<'a>> {
         let stream = self.streams.iter().find(|(id, _)| *id == device.id)
             .context("Kimi load stream for device")?.1;
-        layout.load_recorded_in(device, self.checkpoint, self.dense, stream,
-            self.arenas.get(&device.id).context("Kimi K6 device arena")?, &format!("{}.{key}", self.prefix))
+        layout.load_recorded_with(device, self.checkpoint, self.dense, stream, |name, bytes| {
+            let suffix = name.strip_prefix(&format!("{}.", layout.stem)).context("Kimi K6 member key")?;
+            self.allocate(device, &format!("{key}.{suffix}"), bytes)
+        })
     }
 
     /// One rank's global weights, allocated from `layout`.

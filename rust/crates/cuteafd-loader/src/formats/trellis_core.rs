@@ -71,7 +71,7 @@ impl CoreWeightLayout {
         let [n, k] = self.shape;
         let payload = n.checked_mul(k).and_then(|v| v.checked_mul(self.bits))
             .context("dense trellis arena payload overflow")? / 8;
-        let tensors = vec![(format!("{prefix}.payload"), payload),
+        let tensors = vec![(format!("{prefix}.trellis"), payload),
             (format!("{prefix}.suh"), k.checked_mul(2).context("trellis suh overflow")?),
             (format!("{prefix}.svh"), n.checked_mul(2).context("trellis svh overflow")?)];
         ensure!(tensors.iter().try_fold(0usize, |sum, (_, bytes)| sum.checked_add(*bytes)) == Some(self.bytes),
