@@ -122,7 +122,8 @@ use crate::shared::native_attention::{NativeAttentionWeights, AttentionRecord, a
 pub(crate) struct GlmfWeights<'a> {
     pub layers: Vec<GlmfLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
-    /// The one resident vocabulary head (BF16, or FP8 with --fp8-head).
+    /// The one resident vocabulary head (BF16, FP8 with --fp8-head, or after
+    /// [`super::head::GlmfHead::pack`] the exact 12-bit copy with --fp8-head packed).
     pub head: super::head::GlmfHead<'a>,
 }
 
@@ -132,7 +133,9 @@ pub(crate) struct Residency {
     pub kda_bf16: usize,
     pub kda_fp8: usize,
     pub head_bf16: usize,
+    /// The FP8 head, or a native checkpoint's own (K6, row-FP8) head.
     pub head_fp8: usize,
+    pub head_packed: usize,
 }
 
 impl GlmfWeights<'_> {
@@ -162,14 +165,16 @@ impl GlmfWeights<'_> {
         }
         match &self.head {
             super::head::GlmfHead::Bf16(w) => r.head_bf16 = w.buffer.bytes,
+            head @ super::head::GlmfHead::Packed { .. } => r.head_packed = head.bytes(),
             head => r.head_fp8 = head.bytes(),
         }
         r
     }
 
-    /// Single residency: no KDA layer and no head holds both a BF16 and an FP8
-    /// copy, and the selected representation is the one resident.
-    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, fp8_head: bool) -> Result<Residency> {
+    /// Single residency: no KDA layer holds both a BF16 and an FP8 copy, the head is one
+    /// allocation set of one form, and the selected representations are the ones resident.
+    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, head: super::head::GlmfHeadFormat)
+        -> Result<Residency> {
         for (index, layer) in self.layers.iter().enumerate().filter(|(_, l)| l.attention == GlmNextAttention::Kda) {
             let (bf16, fp8) = (layer.has("w_in") || layer.has("w_o"), layer.has("w_in_fp8") || layer.has("w_o_fp8"));
             ensure!(!(bf16 && fp8), "KDA layer {index} holds BF16 and FP8 in/out projections");
@@ -178,9 +183,8 @@ impl GlmfWeights<'_> {
             ensure!(native || fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
                 "KDA layer {index}: --kda-fp8 {kda_fp8:?} but {} projections are resident", if fp8 { "FP8" } else { "BF16" });
         }
-        ensure!(matches!(self.head, super::head::GlmfHead::K6(_) | super::head::GlmfHead::RowFp8(_))
-            || matches!(self.head, super::head::GlmfHead::Fp8 { .. }) == fp8_head,
-            "--fp8-head {fp8_head} but the resident head is {}", self.head.name());
+        ensure!(self.head.format().is_none_or(|resident| resident == head),
+            "--fp8-head {} but the resident head is {}", head.setting(), self.head.name());
         Ok(self.residency())
     }
 }
@@ -195,6 +199,9 @@ pub(crate) struct GlmfLoader<'a> {
     /// Replicate FP8 KDA output weights for token-row sharding; requires two GPUs and FP8 KDA.
     pub kda_output_shard: bool,
     pub fp8_head: bool,
+    /// `--fp8-head packed`: the BF16 head lands outside the weight arena, as the transient source
+    /// the exact 12-bit copy packs from (the arena holds that copy, `packed12`).
+    pub packed_head: bool,
     /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
     pub kda_nvfp4: Option<bool>,
     /// Scale rule of copies quantized from BF16.
@@ -510,9 +517,18 @@ impl<'a> GlmfLoader<'a> {
 
     /// Records or fills one class-2 operand of `bytes` on rank `rank`'s GPU.
     fn landed(&self, rank: usize, name: &str, lands: Vec<(Rect, usize)>, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        self.landed_in(rank, name, lands, bytes, true)
+    }
+
+    /// [`Self::landed`] into the rank's weight arena (`arena`) or a transient allocation of its own.
+    fn landed_in(&self, rank: usize, name: &str, lands: Vec<(Rect, usize)>, bytes: usize, arena: bool)
+        -> Result<DeviceAllocation<'a>> {
         let device = self.rank_device(rank)?;
         self.on_rank(rank, || {
-            let allocation = self.allocation(rank, name, bytes)?;
+            let allocation = if arena { self.allocation(rank, name, bytes)? } else {
+                DeviceAllocation::from_allocation(Allocation::new(Device { library: self.library, id: device },
+                    bytes.max(256))?)
+            };
             let operand = crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer, lands, bytes };
             self.dense.operand(operand)?;
             Ok(allocation)
@@ -525,11 +541,14 @@ impl<'a> GlmfLoader<'a> {
     }
 
     /// A whole checkpoint tensor (one row for 1-D) landing unchanged on `rank`.
-    fn whole(&self, rank: usize, name: &str) -> Result<DeviceAllocation<'a>> {
+    fn whole(&self, rank: usize, name: &str) -> Result<DeviceAllocation<'a>> { self.whole_in(rank, name, true) }
+
+    /// [`Self::whole`] into the arena or a transient allocation ([`Self::landed_in`]).
+    fn whole_in(&self, rank: usize, name: &str, arena: bool) -> Result<DeviceAllocation<'a>> {
         let tensor = self.tensor(name)?;
         let rows = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
         let bytes = tensor.meta.byte_length as usize;
-        self.landed(rank, name, vec![(rect(self.checkpoint, name, 0..rows, 0..bytes / rows)?, 0)], bytes)
+        self.landed_in(rank, name, vec![(rect(self.checkpoint, name, 0..rows, 0..bytes / rows)?, 0)], bytes, arena)
     }
 
     /// `make(rank)` on every rank: in push mode each rank receives its own copy;
@@ -1470,6 +1489,10 @@ impl<'a> GlmfLoader<'a> {
             } else if self.fp8_head {
                 let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
                 super::head::GlmfHead::Fp8 { values, scales }
+            } else if self.packed_head {
+                ensure!(self.tensor("lm_head.weight")?.meta.dtype == DType::Bf16, "--fp8-head packed packs a BF16 head");
+                let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+                super::head::GlmfHead::Bf16(self.whole_in(0, "lm_head.weight", false)?)
             } else {
                 super::head::GlmfHead::Bf16(self.one("lm_head.weight")?)
             },

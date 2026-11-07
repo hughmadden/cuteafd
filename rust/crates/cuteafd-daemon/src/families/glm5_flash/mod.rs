@@ -214,18 +214,22 @@ pub(crate) struct EngineArgs {
     /// Expand W8A16 prefill weights once in existing scratch.
     #[arg(long, env = "CUTEAFD_GLMF_KDA_PREFILL_EXPANDED", default_value_t = false)]
     pub kda_prefill_expanded: bool,
-    /// Keep only an E4M3 LM head (per row x 128-K scales, quantized at load):
-    /// every logits call (target, verify, prefill, DFlash drafts) runs the FP8
-    /// head program in 16-row spans; no BF16 head stays resident.
-    /// Default off (BF16 head, one copy); opt-in with the FP8 KDA projections above.
-    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true",
+    /// The one resident LM head target logits and the drafter share. `false` (also `bf16`,
+    /// `off`; the default): the checkpoint's BF16 head. `true` (a bare `--fp8-head`; also `fp8`,
+    /// `on`): only an E4M3 copy (per row x 128-K scales, quantized at load); every logits call
+    /// (target, verify, prefill, DFlash drafts) runs the FP8 head program in 16-row spans.
+    /// `packed`: only the exact 12-bit copy of the BF16 values (`shared::packed_head`), packed
+    /// and verified at load, then the BF16 released: target logits read it exactly on its
+    /// tensor-core GEMV, the drafter through its coarse plane; one GPU (no --split-device).
+    /// Opt-in FP8 with the FP8 KDA projections above.
+    #[arg(long = "fp8-head", default_value = "false", num_args = 0..=1, default_missing_value = "true",
         action = clap::ArgAction::Set)]
-    pub fp8_head: bool,
+    pub head_format: head::GlmfHeadFormat,
     /// The target's logits through the BF16 head (the shared route, `crate::shared::target_head`):
     /// `tensor`, a BF16 tensor-core GEMM with FP32 accumulation at every row count, or `exact`
     /// (diagnostic), the pedantic FP32 cuBLAS GEMM on CUDA cores. Unset: CUTEAFD_TARGET_HEAD
-    /// (tensor by default). Unset with --fp8-head, the FP8 head's own program runs; an explicit
-    /// `tensor` with --fp8-head is refused.
+    /// (tensor by default). Unset with the FP8 or packed head, that head's own GEMV runs (an
+    /// explicit `exact` is inert); an explicit `tensor` with either is refused.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_TARGET_HEAD")]
     pub target_head: Option<head::TargetHead>,
     /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
@@ -616,7 +620,7 @@ mod draft_cli_tests {
         let mut ordinary = parse(&[]);
         let mut converted = ordinary.clone();
         converted.kda_fp8 = fp8::KdaFp8::Row128;
-        converted.fp8_head = true;
+        converted.head_format = head::GlmfHeadFormat::Packed;
         converted.kda_fp32_partials = true;
         converted.kda_output_shard = true;
         converted.kda_prefill_expanded = true;
@@ -756,8 +760,9 @@ mod draft_cli_tests {
         let mut checkpoint = Checkpoint { view: None, snapshot: "fixture".into(), config, quantize_config: None,
             weight_map: Default::default(), tensors, missing_shards: vec![], shard_bytes: 0 };
         for ranks in [1, 2] {
-            for fp8_head in [false, true] {
-                let representation = GlmfRepresentation { fp8_head, ..Default::default() };
+            for head in [head::GlmfHeadFormat::Bf16, head::GlmfHeadFormat::Fp8, head::GlmfHeadFormat::Packed]
+                .into_iter().filter(|&head| ranks == 1 || head != head::GlmfHeadFormat::Packed) {
+                let representation = GlmfRepresentation { head, ..Default::default() };
                 let gpu = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Gpu, Default::default()).unwrap();
                 let host = runtime_resident_weights(&checkpoint, &cfg, cfg.layers, ranks, representation, EmbedPlacement::Host, Default::default()).unwrap();
                 assert_eq!((gpu[0].embedding, host[0].embedding), (524_288, 0));
@@ -819,6 +824,37 @@ mod draft_cli_tests {
         let error = check_options(&parse(&["--target-head", "tensor", "--fp8-head"])).unwrap_err().to_string();
         assert!(error.contains("--target-head tensor") && error.contains("--fp8-head"), "{error}");
         check_options(&parse(&["--target-head", "exact", "--fp8-head"])).unwrap();
+        // The packed head runs its own exact GEMV too: tensor is refused, exact inert.
+        let error = check_options(&parse(&["--fp8-head", "packed", "--target-head", "tensor"])).unwrap_err().to_string();
+        assert!(error.contains("--target-head tensor") && error.contains("--fp8-head packed"), "{error}");
+        check_options(&parse(&["--fp8-head", "packed", "--target-head", "exact"])).unwrap();
+    }
+
+    /// `--fp8-head` keeps its boolean spellings (a bare flag is FP8) and adds `packed`, the exact
+    /// 12-bit head, which serves one GPU: the head split is refused before any load.
+    #[test]
+    fn fp8_head_selects_bf16_fp8_or_the_packed_head_on_one_gpu() {
+        use head::GlmfHeadFormat::{Bf16, Fp8, Packed};
+        for (extra, format) in [(&[][..], Bf16), (&["--fp8-head"][..], Fp8), (&["--fp8-head", "true"][..], Fp8),
+            (&["--fp8-head", "on"][..], Fp8), (&["--fp8-head", "false"][..], Bf16), (&["--fp8-head", "bf16"][..], Bf16),
+            (&["--fp8-head", "packed"][..], Packed), (&["--fp8-head", "--kda-fp8", "row128"][..], Fp8)] {
+            let args = parse(extra);
+            assert_eq!(args.head_format, format, "{extra:?}");
+            check_options(&args).unwrap();
+            let settings: std::collections::BTreeMap<_, _> = native::resolved_settings(&args).into_iter().collect();
+            assert_eq!(settings["fp8-head"], format.setting());
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--fp8-head", "maybe"]).is_err());
+        let error = check_options(&parse(&["--fp8-head", "packed", "--split-device", "1"])).unwrap_err().to_string();
+        assert!(error.contains("--fp8-head packed") && error.contains("--split-device"), "{error}");
+        for format in ["true", "false"] {
+            check_options(&parse(&["--fp8-head", format, "--split-device", "1"])).unwrap();
+        }
+        // A native checkpoint's own head ignores the setting.
+        let mut native_args = parse(&["--fp8-head", "packed"]);
+        native::normalize(&mut native_args);
+        assert_eq!(native_args.head_format, Bf16);
     }
 
     #[test]
@@ -833,7 +869,8 @@ mod draft_cli_tests {
     #[test]
     fn kda_w8a8_prefill_needs_fp8_kda_weights() {
         let defaults = parse(&[]);
-        assert_eq!((defaults.kda_fp8, defaults.fp8_head, defaults.draft_fp8), (fp8::KdaFp8::Off, false, None));
+        assert_eq!((defaults.kda_fp8, defaults.head_format, defaults.draft_fp8),
+            (fp8::KdaFp8::Off, head::GlmfHeadFormat::Bf16, None));
         check_options(&parse(&["--kda-fp8", "row128", "--fp8-prefill", "kda-in"])).unwrap();
         for extra in [&["--kda-fp8", "off", "--fp8-prefill", "kda-in"][..],
             &["--kda-fp8", "off", "--fp8-prefill", "mla,kda-o"][..], &["--kda-fp8", "off", "--fp8-prefill", "kda-o"][..]] {
@@ -1531,8 +1568,12 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.decode_rows == engine::DECODE_ROWS || args.split_device.is_none(),
         "--decode-rows {} runs the wide decode programs on one GPU: a head split (--split-device) takes \
         --decode-rows {}", args.decode_rows, engine::DECODE_ROWS);
-    ensure!(args.target_head != Some(head::TargetHead::Tensor) || !args.fp8_head,
-        "--target-head tensor runs the BF16 head; the FP8 head (--fp8-head) has its own program");
+    ensure!(args.target_head != Some(head::TargetHead::Tensor) || args.head_format == head::GlmfHeadFormat::Bf16,
+        "--target-head tensor runs the BF16 head; the {} head (--fp8-head {}) has its own GEMV",
+        args.head_format.name(), args.head_format.setting());
+    ensure!(args.head_format != head::GlmfHeadFormat::Packed || args.split_device.is_none(),
+        "--fp8-head packed keeps one exact 12-bit head on one GPU; the two-GPU head split (--split-device) \
+         is not supported yet: use --fp8-head true or false");
     Ok(())
 }
 
@@ -1676,6 +1717,9 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let native = format == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     let mut resolved = args.clone();
     if native {
+        if args.head_format != head::GlmfHeadFormat::Bf16 {
+            tracing::warn!(requested = args.head_format.setting(), "--fp8-head does not apply to a native checkpoint's own head");
+        }
         native::normalize(&mut resolved);
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
@@ -1871,7 +1915,7 @@ impl Opened {
         }).collect();
         let headers = Checkpoint::coordinator_view(&self.view, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
-            fp8_head: args.fp8_head, output_shard: args.kda_output_shard };
+            head: args.head_format, output_shard: args.kda_output_shard };
         let resident = if let Some(native) = native_admission { native.resident.clone() } else {
             runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
                 args.token_io.embed_placement, attention)? };
@@ -2073,7 +2117,12 @@ impl Opened {
             resolved.kda_output_shard = false;
             resolved.kda_prefill_expanded = false;
         }
-        if core.get_weight("lm_head").is_some() { resolved.fp8_head = false; }
+        if core.get_weight("lm_head").is_some() {
+            if args.head_format != head::GlmfHeadFormat::Bf16 {
+                tracing::warn!(requested = args.head_format.setting(), "--fp8-head does not apply to the native K6 head");
+            }
+            resolved.head_format = head::GlmfHeadFormat::Bf16;
+        }
         if args.split_device.is_some()
             && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
             resolved.split_device = None;
@@ -2116,8 +2165,15 @@ impl Opened {
         if args.kda_fp8 != fp8::KdaFp8::Off && args.kda_state == engine::KdaState::F32 {
             needed.extend(["glmf_kda_w8_m64", "glmf_kda_w8_m4096"]);
         }
-        if args.fp8_head {
+        if args.head_format == head::GlmfHeadFormat::Fp8 {
             needed.push("glmf_head_fp8");
+        }
+        if args.head_format == head::GlmfHeadFormat::Packed {
+            // On the head's GPU: the native GEMV fixes its SM count at the first query.
+            crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(||
+                self.library.packed_head_workspace(cuteafd_core::packed_head::PASS_ROWS as usize, self.cfg.hidden,
+                    self.cfg.vocab_size)).context("--fp8-head packed needs the shared packed head kernels \
+                (cuteafd_packed_head_*); this native library predates them")?;
         }
         let compact = args.index_cache == engine::IndexCache::Compact;
         if compact && !self.native {
@@ -2232,7 +2288,10 @@ impl Opened {
             context_mode.is_some())?;
         let loader = weights::GlmfLoader { arenas: Default::default(), library: &self.library, checkpoint: &self.checkpoint, stream,
             kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
-            fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
+            // A packed head lands as BF16 and packs once every operand has landed (below).
+            fp8_head: args.head_format == head::GlmfHeadFormat::Fp8,
+            packed_head: args.head_format == head::GlmfHeadFormat::Packed,
+            kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect(), dense: std::rc::Rc::new(weights::DenseLoad::mount(&self.library)) };
@@ -2385,7 +2444,7 @@ impl Opened {
                     source.allocation_request("embedding.table", cuteafd_loader::placement::planner::EmbeddingHome::Device(embedding_rank as u8))))
                 .transpose()?.map(|request| (embedding_rank, request.bytes as usize));
             weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8,
-                args.kda_output_shard, args.fp8_head, embedding)?
+                args.kda_output_shard, args.head_format, embedding)?
         };
         let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {
             Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(*device, layout)?))
@@ -2680,16 +2739,27 @@ impl Opened {
             aliases = weight_census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),
             "GLM Flash retained weight arena census");
         probe("target-weights")?;
+        // `--fp8-head packed`: every operand has landed (through the mount, or the committed push
+        // group), so the BF16 head packs into its exact 12-bit copy and is released.
+        let model = if args.head_format == head::GlmfHeadFormat::Packed {
+            let weights::GlmfWeights { layers: body, norm, head } = model;
+            let head = crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(|| {
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                let _memory_format = cuteafd_ffi::memory_ledger::format("bf16-packed12");
+                head.pack(&self.library, self.cfg.vocab_size, self.cfg.hidden, loader.arenas.get(&args.device))
+            })?;
+            weights::GlmfWeights { layers: body, norm, head }
+        } else { model };
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
-        let single = model.check_single_residency(args.kda_fp8, args.fp8_head)?;
+        let single = model.check_single_residency(args.kda_fp8, args.head_format)?;
         // Header-only resident inventory uses the actual loader flags, not launcher defaults.
         if native_admission.is_none() && args.kda_nvfp4_gate.is_none() {
             let headers = cuteafd_loader::plan::Checkpoint::coordinator_view(&self.view, false, false)?;
             let expected = cuteafd_loader::families::glm5_flash::resident::resident_weights_placed(
                 &headers, &self.cfg, layers, 1 + usize::from(peer_stream.is_some()),
                 cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
-                    kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off, fp8_head: args.fp8_head,
+                    kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off, head: args.head_format,
                     output_shard: args.kda_output_shard,
                 }, attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)?;
             let actual = resident + model.norm.buffer.bytes + model.head.bytes();
@@ -2707,7 +2777,7 @@ impl Opened {
             split_gib = peer_resident as f64 / (1u64 << 30) as f64,
             kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
             kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
-            head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
+            head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8 + single.head_packed),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "GLM 5.3 Flash coordinator weights validated after Spark admission (one copy each; elapsed includes wait)");
         let moe = (0..layers).any(|l| !self.cfg.dense[l]);
@@ -2748,7 +2818,9 @@ impl Opened {
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
         engine.mark_slots = mark_slots;
         engine.target_head = args.resolved_target_head();
-        tracing::info!(target_head = ?engine.target_head, requested = ?args.target_head, fp8_head = args.fp8_head,
+        // The route applies to the BF16 head only; the FP8 and packed heads run their own GEMVs.
+        tracing::info!(target_head = ?engine.target_head, requested = ?args.target_head,
+            fp8_head = args.head_format.setting(), head = engine.weights.head.name(),
             "GLM 5.3 Flash target head");
         if let Some((device, peer_stream)) = peer_stream {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?, &execution)?;

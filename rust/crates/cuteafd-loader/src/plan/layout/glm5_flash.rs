@@ -170,7 +170,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             representation.kda_fp8 = false;
             representation.output_shard = false;
         }
-        if native { representation.fp8_head = false; }
+        if native { representation.head = resident::GlmfHeadFormat::Bf16; }
         let state = options.glmf_kda_state;
         anyhow::ensure!(!native || state == crate::serving_capacity::GlmfKdaState::F32,
             "native Flash requires F32 KDA state programs");
@@ -178,7 +178,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             "BF16 KDA state needs one GPU; head-split BF16 state is not yet qualified");
         notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
             if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else if representation.kda_fp8 { "FP8" } else { "BF16" },
-            if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else if representation.fp8_head { "FP8" } else { "BF16" }));
+            if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else { representation.head.name() }));
         let mut resident = if exlr8.is_some() { native_resident(attention.first_owner as usize)? }
             else { resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
                 attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)? };
@@ -600,7 +600,7 @@ mod tests {
                 assert_eq!(context.partial_scratch, expected_context);
                 let planned = glmf_step_workspace(&selected, &checkpoint, &ExpertPlacement::Local, 1,
                     4096, 1 << 20, 64, 0, true, true,
-                    resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false }, false, true, false,
+                    resident::GlmfRepresentation { kda_fp8: false, head: resident::GlmfHeadFormat::Bf16, output_shard: false }, false, true, false,
                     crate::serving_capacity::GlmfKdaState::F32, Some(native)).unwrap();
                 // Runtime narrows individual specs, independently of the planner's manifest adapter.
                 let lookup = |name: &str| {
