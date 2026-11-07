@@ -664,6 +664,27 @@ impl MimoResidentLayout {
                 what: "resident model geometry or selected layers",
             });
         }
+        Self::describe(checkpoint, cfg, options)
+    }
+
+    /// The final operands a load admitted by `new` allocates, without
+    /// re-deciding serving support (predictor-only and fixture loads too).
+    pub fn describe(
+        checkpoint: &Checkpoint,
+        cfg: &MimoV2Config,
+        options: &MimoResidentOptions,
+    ) -> Result<Self, CacheGeometryError> {
+        if options.layers > cfg.layers
+            || ![1, 2].contains(&options.coordinator_ranks)
+            || cfg.attention.len() != cfg.layers
+            || cfg.dense.len() != cfg.layers
+            || options.checkpoint_tp == 0
+        {
+            return Err(CacheGeometryError::Unsupported {
+                family: "mimo_v2",
+                what: "resident layer selection",
+            });
+        }
         let mut costs = vec![Vec::new(); options.coordinator_ranks];
         let mut temporary = vec![0; options.coordinator_ranks];
         for layer in 0..options.layers {

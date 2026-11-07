@@ -5,7 +5,8 @@ use anyhow::Result;
 
 #[derive(Debug)]
 pub struct MimoArenaLayouts {
-    pub target: Vec<WeightArenaLayout>,
+    /// One per coordinator rank; `None` where the rank holds no target weight.
+    pub target: Vec<Option<WeightArenaLayout>>,
     pub mtp: Option<WeightArenaLayout>,
 }
 
@@ -28,7 +29,8 @@ impl MimoArenaLayouts {
                 if request.name.starts_with("model.mtp.") { mtp.push(entry); }
                 else { core.push(entry); }
             }
-            target.push(WeightArenaLayout::new(format!("mimo.target.rank{rank}"), core)?);
+            target.push(if core.is_empty() { None }
+                else { Some(WeightArenaLayout::new(format!("mimo.target.rank{rank}"), core)?) });
         }
         Ok(Self { target, mtp: if mtp.is_empty() { None } else {
             Some(WeightArenaLayout::new("mimo.mtp.rank0", mtp)?)
@@ -85,9 +87,11 @@ mod tests {
         let layouts = MimoArenaLayouts::new(checkpoint, resident).unwrap();
         assert_eq!(layouts.target.len(), resident.ranks.len());
         for (rank, layout) in layouts.target.iter().enumerate() {
+            let core = resident.ranks[rank].iter().filter(|r| !r.name.starts_with("model.mtp.")).collect::<Vec<_>>();
+            let Some(layout) = layout else { assert!(core.is_empty()); continue };
             assert_eq!(layout.id(), format!("mimo.target.rank{rank}"));
-            assert_eq!(layout.views().len(), resident.ranks[rank].len(), "unique final keys");
-            assert_eq!(layout.payload_bytes() as u64, resident.ranks[rank].iter().map(|r| r.bytes).sum::<u64>());
+            assert_eq!(layout.views().len(), core.len(), "unique final keys");
+            assert_eq!(layout.payload_bytes() as u64, core.iter().map(|r| r.bytes).sum::<u64>());
             let mut views = layout.views().iter().map(|(name, v)| (v.offset(), v.bytes(), name)).collect::<Vec<_>>();
             views.sort();
             for pair in views.windows(2) {
@@ -116,7 +120,7 @@ mod tests {
                     let resident = MimoResidentLayout::new(&checkpoint, &cfg, &fixture_options(ranks, tp, format)).unwrap();
                     let layouts = check(&checkpoint, &resident);
                     assert!(layouts.mtp.is_none());
-                    let lead = &layouts.target[0];
+                    let lead = layouts.target[0].as_ref().unwrap();
                     let head = if format == R::Fp8 { "lm_head.weight.fp8" } else { "lm_head.weight" };
                     assert!(lead.view(head).is_some(), "{head}");
                     assert!(lead.view("embedding.table").is_some());
@@ -129,9 +133,10 @@ mod tests {
                     } else {
                         format!("{}.fp8", operand_key(["q", "k", "v"].map(|p| format!("model.layers.0.self_attn.{p}_proj.weight"))))
                     };
-                    for layout in &layouts.target { assert!(layout.view(&qkv).is_some(), "{qkv}"); }
+                    for layout in layouts.target.iter().flatten() { assert!(layout.view(&qkv).is_some(), "{qkv}"); }
                     if ranks == 2 {
-                        assert!(layouts.target[1].views().keys().all(|n| !n.starts_with("lm_head") && n != "embedding.table"));
+                        assert!(layouts.target[1].as_ref().unwrap().views().keys()
+                            .all(|n| !n.starts_with("lm_head") && n != "embedding.table"));
                     }
                 }
             }
@@ -156,7 +161,22 @@ mod tests {
         assert_eq!(mtp.views().keys().cloned().collect::<Vec<_>>(), [
             "model.mtp.layers.0.enorm.weight".to_string(),
             operand_key(["model.mtp.layers.0.mlp.gate_proj.weight", "model.mtp.layers.0.mlp.up_proj.weight"]) + ".fp8"]);
-        assert_eq!(layouts.target[0].views().keys().collect::<Vec<_>>(), ["model.norm.weight"]);
+        assert_eq!(layouts.target[0].as_ref().unwrap().views().keys().collect::<Vec<_>>(), ["model.norm.weight"]);
+        check(&checkpoint, &resident);
+    }
+
+    /// A head-split predictor-only load leaves the peer without a target arena.
+    #[test]
+    fn rank_without_target_weights_gets_no_arena() {
+        use crate::plan::testing::{mimo_flash_config, mimo_flash_tensors, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+        let resident = MimoResidentLayout::describe(&checkpoint, &cfg,
+            &MimoResidentOptions { layers: 0, ..fixture_options(2, 1, R::Bf16) }).unwrap();
+        let layouts = check(&checkpoint, &resident);
+        assert!(layouts.target[0].is_some() && layouts.target[1].is_none());
     }
 
     /// Header-only before/after inventory of the selected `mimo26-flash-max`
@@ -191,7 +211,7 @@ mod tests {
                     let requests = requests.iter().filter(|r| r.name.starts_with("model.mtp.") == mtp)
                         .map(|r| r.bytes).collect::<Vec<_>>();
                     let layout = if mtp { if rank == 0 { layouts.mtp.as_ref() } else { None } }
-                        else { Some(&layouts.target[rank]) };
+                        else { layouts.target[rank].as_ref() };
                     let Some(layout) = layout else { assert!(requests.is_empty()); continue };
                     let large = requests.iter().filter(|&&b| b > MIB).collect::<Vec<_>>();
                     let rounding = large.iter().map(|&&b| b.div_ceil(SM120_GRANULE) * SM120_GRANULE - b).sum::<u64>();

@@ -884,7 +884,7 @@ impl<'a> MimoLoader<'a> {
         -> Result<(crate::shared::token_io::TokenEmbedding<'a>,
             ((MimoWeights<'a>, Vec<Vec<MimoLayer<'a>>>), Vec<MtpWeights<'a>>))> {
         use cuteafd_loader::families::mimo_v2::resident::{MimoResidentLayout, MimoResidentOptions};
-        let resident = MimoResidentLayout::new(self.checkpoint, cfg, &MimoResidentOptions {
+        let resident = MimoResidentLayout::describe(self.checkpoint, cfg, &MimoResidentOptions {
             layers, coordinator_ranks: self.ranks(), checkpoint_tp: self.checkpoint_tp,
             native_mtp_layers: stages, gpu_embedding: placement == crate::shared::token_io::EmbedPlacement::Gpu,
             head_format: if self.fp8_head { MimoProjectionRepresentation::Fp8 } else { MimoProjectionRepresentation::Bf16 },
@@ -893,6 +893,7 @@ impl<'a> MimoLoader<'a> {
         let layouts = MimoArenaLayouts::new(self.checkpoint, &resident)?;
         let mut arenas = Vec::new();
         for (rank, layout) in layouts.target.into_iter().enumerate() {
+            let Some(layout) = layout else { continue };
             let (id, _) = self.rank_device(rank)?;
             arenas.push(DeviceWeightArena::new(Device { library: self.library, id }, layout)?);
         }
@@ -905,7 +906,7 @@ impl<'a> MimoLoader<'a> {
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
             Ok((target.model(cfg, layers)?, draft.mtp_weights(cfg, stages)?))
         }, |name, bytes| weight_allocation(Device { library: self.library, id: self.device },
-            target.arenas.first(), name, bytes))
+            target.arenas.iter().find(|arena| arena.layout().id() == "mimo.target.rank0"), name, bytes))
     }
 
     pub fn mtp_weights(&self, cfg: &MimoV2Config, stages: usize) -> Result<Vec<MtpWeights<'a>>> {
