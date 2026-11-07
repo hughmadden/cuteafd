@@ -743,8 +743,7 @@ impl SparkBudgetInventory {
         if onboard == self.layers.len() { return Ok(0); }
         let resident = costs[onboard..].iter().try_fold(0u64, |sum, bytes|
             sum.checked_add(*bytes).context("Spark resident arena overflow"))?;
-        let growth = if cuteafd_core::memory_policy::MemoryPolicy::current().spark_reserve.is_some() { 0 }
-            else { cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(resident) };
+        let growth = cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(resident);
         resident.checked_add(self.overhead[rank]).and_then(|bytes| bytes.checked_add(growth))
             .context("Spark estimated retained bytes overflow")
     }

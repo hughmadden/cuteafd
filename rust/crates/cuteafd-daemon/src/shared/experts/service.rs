@@ -400,13 +400,13 @@ fn worker_ring_budget(config: &NativeExpertServiceConfig, geometry: cuteafd_core
     Ok(cuteafd_transport::RingBudget::new(limit))
 }
 
-/// Shared measured arena terms plus the single-sample startup placeholder (#1454).
-/// Actual load/serve owners remain separate; pre-gate occupancy is not recharged.
+/// Future arena metadata and staging only. Process/context occupancy already
+/// reduced the live MemAvailable sample and must not be charged a second time.
 fn spark_runtime_headroom(config: &NativeExpertServiceConfig,
     geometry: cuteafd_core::ExpertGeometry, resident: usize) -> Result<usize> {
     let executions = &config.model_admission.as_ref()
         .context("Spark runtime allowance requires typed execution admission")?.executions;
-    let bytes = cuteafd_core::memory_layout::spark_runtime_bytes(Some((geometry, config.world,
+    let bytes = cuteafd_core::memory_layout::spark_worker_future_bytes(Some((geometry, config.world,
         executions.compiled_capacity())), u64::try_from(resident)?)
         .context("Spark runtime reserve overflow")?;
     Ok(usize::try_from(bytes)?)
@@ -974,8 +974,8 @@ mod tests {
         let _ = ExpertLayer::BackboneExl3Tp { layer: 0, rank: 0, world: 3 }.expert(0);
     }
 
-    /// Both phase peaks include the shared measured-residual estimate, alongside
-    /// their own disjoint source-known transient and retained owners.
+    /// Both phase peaks include only future allocations, with each disjoint
+    /// transient and retained owner charged once.
     #[test]
     fn explicit_admission_counts_every_known_transient_exactly() {
         let topology = SparkTopology::new(2, 2).unwrap();
@@ -1030,10 +1030,13 @@ mod tests {
                 + io.host_exchange + io.row_indices + io.endpoint_staging
                 + kimi_k3::spark::reserve_bytes(6, 3, 1024)?
                 + cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(resident as u64);
-            assert_eq!(coordinator, 120_494_972_128);
-            assert_eq!(budget.headroom, 2_395_973_632);
-            assert_eq!(budget.load_peak, 120_401_405_952);
-            assert_eq!(budget.serve_peak, 120_483_716_320);
+            assert_eq!(budget.headroom as u64,
+                cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(resident as u64) + 4096);
+            assert_eq!(budget.load_peak, resident + 44_826_624 + 268_435_456 + budget.headroom);
+            assert_eq!(budget.serve_peak, resident + workspace + budget.exchange + budget.row_indices
+                + budget.rings + budget.endpoint_staging + budget.headroom);
+            assert_eq!(coordinator - budget.serve_peak as u64,
+                cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_BYTES + io.intake);
             assert!(budget.load_peak > config.device_budget);
             assert!(budget.serve_peak > config.device_budget);
             assert!(budget.load_peak as u64 <= coordinator);
@@ -1079,17 +1082,17 @@ mod tests {
                 plans.iter().map(|plan| plan.read_scratch_bytes).max().unwrap(), workspace)?;
             assert_eq!(resident, 117_692_170_240);
             assert_eq!(workspace, 253_875_296);
-            assert_eq!(peak.load_peak, 120_401_405_952);
-            assert_eq!(peak.serve_peak, 120_483_716_320);
-            assert!(peak.load_peak <= 120_494_972_128 && peak.serve_peak <= 120_494_972_128);
-            eprintln!("Kimi min real metadata preflight rank={rank}: resident={resident} workspace={workspace} load={} serve={} coordinator=120494972128 budget={}",
+            assert_eq!(peak.load_peak, resident + 44_826_624 + 268_435_456 + peak.headroom);
+            assert_eq!(peak.serve_peak, resident + workspace + peak.exchange + peak.row_indices
+                + peak.rings + peak.endpoint_staging + peak.headroom);
+            eprintln!("Kimi min real metadata preflight rank={rank}: resident={resident} workspace={workspace} load={} serve={} budget={}",
                 peak.load_peak, peak.serve_peak, config.device_budget);
         }
         Ok(())
     }
 
     #[test]
-    fn every_worker_keeps_startup_residual_and_charges_its_arena() -> Result<()> {
+    fn every_worker_charges_only_future_arena_not_resident_process() -> Result<()> {
         use cuteafd_core::ExpertGeometry;
         for geometry in [ExpertGeometry::DEEPSEEK_V41, ExpertGeometry::DEEPSEEK_V4_FLASH,
             ExpertGeometry::DEEPSEEK_V4_PRO, ExpertGeometry::GLM5,
@@ -1100,10 +1103,9 @@ mod tests {
                 config.model_admission.as_mut().unwrap().executions =
                     cuteafd_loader::families::kimi_k3::spark_executions(3, 1024)?;
                 assert_eq!(spark_runtime_headroom(&config, geometry, 0)? as u64,
-                    cuteafd_core::memory_layout::spark_runtime_residual().bytes);
+                    0);
                 assert_eq!(spark_runtime_headroom(&config, geometry, 64 << 30)? as u64,
-                    cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES
-                        + cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(64 << 30));
+                    cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(64 << 30));
             }
         }
         for (world, rows) in [(4, 1024), (6, 2752), (8, 1024)] {
@@ -1111,7 +1113,7 @@ mod tests {
             config.model_admission.as_mut().unwrap().executions =
                 cuteafd_loader::families::kimi_k3::spark_executions(3, rows)?;
             assert_eq!(spark_runtime_headroom(&config, ExpertGeometry::KIMI_K3, 0)? as u64,
-                cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+                0);
         }
         Ok(())
     }

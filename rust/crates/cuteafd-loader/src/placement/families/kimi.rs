@@ -759,9 +759,9 @@ impl Recipe for KimiRecipe {
             for (owner_kind, group, bytes, category) in [
                 ("experts", "routed experts (balanced H128, replicated 3584 rotations)", spark.experts, Category::Experts),
                 ("overhead", "Spark rank I/O and execution owners", spark.overhead, Category::Workspace),
-                ("startup", cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP, spark.runtime, Category::Runtime),
+                ("startup", cuteafd_core::memory_layout::spark_runtime_reserve_group(), spark.runtime, Category::Runtime),
                 ("arena-growth", cuteafd_core::memory_layout::SPARK_ARENA_DRIVER_OVERHEAD_GROUP,
-                    if spark.runtime == 0 { 0 } else { cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(spark.experts) }, Category::Runtime),
+                    cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(spark.experts), Category::Workspace),
             ] {
                 if bytes == 0 { continue; }
                 let owner = Allocation::buffer(format!("spark.{}.{owner_kind}.{}", spark.rank, spark.count),

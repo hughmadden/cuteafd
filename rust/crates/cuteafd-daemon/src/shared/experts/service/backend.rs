@@ -582,9 +582,9 @@ mod admission_tests {
             host: 469_860_352, pinned: 369_098_752 });
         bytes.load(Fp8LayerLoad { resident: 2_214_592_512,
             host: 738_197_504, pinned: 738_197_504 });
-        let headroom = cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES as usize;
+        let headroom = cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(permanent as u64) as usize;
         let peak = permanent + bytes.host + bytes.pinned + headroom;
-        assert_eq!(peak, 104_987_576_320);
+        assert_eq!(peak, permanent + 2 * 738_197_504 + headroom);
         assert!(peak < 100 << 30);
         // The pinned owner from the larger group must survive even if a later
         // group has smaller host buffers.

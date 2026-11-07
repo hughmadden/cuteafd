@@ -26,7 +26,9 @@ pub fn reserve_bytes(world: usize, waves: u64, unit_rows: u64) -> Result<u64> {
     let runtime = cuteafd_core::memory_layout::spark_runtime_bytes(Some((
         cuteafd_core::ExpertGeometry::KIMI_K3, world, executions.compiled_capacity())), 0)
         .context("Kimi Spark runtime reserve overflow")?;
-    executions.workspace_bytes(|extent| owner_bytes(world, extent))?
+    executions.workspace_bytes(|extent| {
+        if calibrated(world, &executions) { owner_bytes(world, extent) } else { super::spark_owner_bytes(extent) }
+    })?
         .and_then(|bytes| bytes.total()).and_then(|bytes| bytes.checked_add(runtime))
         .context("Kimi calibrated Spark reserve overflow")
 }
@@ -61,7 +63,8 @@ mod tests {
         let rings = 134_217_728;
         let legacy_io = 1024 * ((3584 + 112 + 128 + 7168) + (128 + 7168) + 4) + 1024 * 4 + 128;
         let conservative_total = resident + rings + legacy_io + reserve_bytes(6, 3, 1024)?;
-        assert_eq!(conservative_total, 119_805_369_568);
+        assert_eq!(conservative_total, resident + rings + legacy_io + retained.total().unwrap()
+            + cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_BYTES + 4096);
         let inventory = crate::placement::SparkBudgetInventory {
             layers: (1..=92).collect(), resident: vec![vec![1_279_262_720; 92]; 6],
             overhead: vec![conservative_total - resident; 6], budget: 110 << 30,
@@ -81,7 +84,7 @@ mod tests {
             capacity_bytes: 121 << 30, worker_budget_bytes: 110 << 30,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "arena", "", 64 << 30, Basis::Exact)] };
         for _ in 0..2 {
-            device.items.push(cuteafd_core::memory_layout::spark_runtime_residual());
+            device.items.push(cuteafd_core::memory_layout::spark_worker_process_resident_item());
             charge(&mut device, 6, &executions)?;
             assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), (64 << 30)
                 + cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(64 << 30)
@@ -89,7 +92,7 @@ mod tests {
         }
         // Other worlds keep their original residual and owner accounting.
         let mut device = DeviceLayout { items: vec![Item::new(Category::Workspace,
-            cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP, "", 5 << 29, Basis::Calibrated),
+            cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_GROUP, "", 5 << 29, Basis::Calibrated),
             Item::new(Category::Experts, "arena", "", 64 << 30, Basis::Exact)], ..device };
         charge(&mut device, 5, &executions)?;
         assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), (64 << 30)

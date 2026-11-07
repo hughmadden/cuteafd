@@ -599,11 +599,11 @@ impl<'a> ProductionInput<'a> {
                         owners, Lifetime::RESIDENT, Category::Workspace, "Spark I/O and execution owners", maximum_pages));
                     components.extend(buffer(format!("muse.spark.startup.{rank}.{count}"), location,
                         runtime, Lifetime::RESIDENT, Category::Runtime,
-                        cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP, maximum_pages));
+                        cuteafd_core::memory_layout::spark_runtime_reserve_group(), maximum_pages));
                     let resident = spark_budget.resident[rank][count..].iter().sum();
                     components.extend(buffer(format!("muse.spark.arena-growth.{rank}.{count}"), location,
                         cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(resident),
-                        Lifetime::RESIDENT, Category::Runtime,
+                        Lifetime::RESIDENT, Category::Workspace,
                         cuteafd_core::memory_layout::SPARK_ARENA_DRIVER_OVERHEAD_GROUP, maximum_pages));
                 }
             }
