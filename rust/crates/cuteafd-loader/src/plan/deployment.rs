@@ -198,7 +198,7 @@ impl<'a> DeploymentSpec<'a> {
             prefill_span_rows: report.prefill_span_rows.unwrap_or(0),
             prefill_reserve_rows: report.prefill_reserve_rows
                 .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS), topology, roles, peers,
-            speculator: &options.speculator, admission: &options.admission,
+            speculator: report.speculator.unwrap_or(&options.speculator), admission: &options.admission,
             spark_admission: SparkAdmission::CoordinatorAuthoritative,
             launch: report.launch.as_ref(), exlr8: native.map(|n| &n.selection),
             spark_requirements: native.map(|n| &n.sparks),

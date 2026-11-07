@@ -1560,6 +1560,8 @@ if [[ $family == deepseek_v4 ]]; then
   dsv4_dspark="$(python3 -c 'import json,sys; print(int(int(json.load(open(sys.argv[1])).get("dspark_block_size") or 0) > 0))' "$root/snapshots/$revision/$selected_config")"
 fi
 speculator="$(get SPECULATOR)"
+# Qwen resolves auto only after expert admission, not from configured inventory.
+if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 default_drafter=""
 [[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
 if [[ -z "$speculator" ]]; then
@@ -1598,16 +1600,10 @@ if [[ -z "$speculator" ]]; then
     speculator=mtp
     echo "note: Step-5 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
   fi
-  # Only the resident local paths are qualified (EXL3, and NVFP4 with its FP8
-  # MTP package). Spark workers serve backbone layers, not mtp.layers.0; other
-  # expert formats keep their opt-in status. SPECULATOR=off disables the default.
-  if [[ $speculator == off && ( $qwen_exl3 == 1 || $qwen_nvfp4 == 1 ) && $qwen_mtp == 1 && $ranks == 0 ]]; then
-    speculator=mtp
-    echo "note: Qwen local $([[ $qwen_exl3 == 1 ]] && echo EXL3 || echo NVFP4) drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
-  fi
+
 fi
 case "$family:$speculator" in
-  qwen4:mtp) ;;
+  qwen4:mtp|qwen4:auto) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
   *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|muse_spark:dflash2|deepseek_v4:dspark) ;;
@@ -1737,6 +1733,9 @@ if [[ $family == mimo_v2 ]]; then
     esac
   done
 fi
+mtp_depth=1
+[[ "$family" != step5 ]] || mtp_depth=3
+[[ ( $qwen_exl3 != 1 && $qwen_nvfp4 != 1 ) || $qwen_mtp != 1 ]] || mtp_depth=3
 case "$speculator" in
   off)
     [[ "$family" != step5 ]] || family_args+=(--mtp 0) ;;
@@ -1769,9 +1768,6 @@ case "$speculator" in
       echo "SPECULATOR=$speculator needs SPECULATOR_MODEL_ID (a ${speculator/dflash2/DFlash2} checkpoint)" >&2; exit 2
     fi ;;
   mtp)
-    mtp_depth=1
-    [[ "$family" != step5 ]] || mtp_depth=3
-    [[ ( $qwen_exl3 != 1 && $qwen_nvfp4 != 1 ) || $qwen_mtp != 1 ]] || mtp_depth=3
     family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
@@ -2416,6 +2412,9 @@ audio_encoder_hash=""
     on) plan_draft_args+=(--expert-usage) ;;
     off) plan_draft_args+=(--expert-usage=false) ;;
   esac
+  if [[ "$family" == qwen4 ]]; then
+    plan_draft_args+=(--native-mtp-layers "$(get SPECULATOR_DEPTH "$mtp_depth")")
+  fi
   if [[ "$family" == qwen3_5 ]]; then
     plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --prefill-rows 4096
       --prefix-cache-entries "$effective_prefix_entries")
@@ -2578,19 +2577,22 @@ audio_encoder_hash=""
     [[ "$selected_ranks" == "$ranks" ]] || echo "Spark roles use $selected_ranks of $ranks configured ranks"
   fi
   deployment_peer_csv="$(jq -er '.peers | join(",")' <<<"$plan_json")"
-  [[ "$(jq -r '.speculator' <<<"$plan_json")" == "$speculator" ]] || release_die "deployment changed resolved speculator"
+  if [[ "$speculator" != auto ]]; then
+    [[ "$(jq -r '.speculator' <<<"$plan_json")" == "$speculator" ]] || release_die "deployment changed resolved speculator"
+  fi
   # Media still reads the complete report's capability diagnostics. Launch roles,
   # admission policy and endpoints come from the typed deployment above.
   deployment_json="$plan_json"
   release_deployment_spark_roles "$deployment_json" "$ranks"
+  if [[ "$family:$speculator" == qwen4:auto ]]; then
+    speculator="$(jq -er '.speculator | select(. == "mtp" or . == "off")' <<<"$deployment_json")" ||
+      release_die "Qwen deployment does not name a resolved speculator"
+    [[ "$speculator" != mtp ]] || family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")")
+    echo "Qwen planner selected SPECULATOR=$speculator (admitted Spark expert world $spark_expert_world)"
+  fi
   if [[ "$family" == glm5_flash ]]; then
-    resolved_replay_records="$(jq -r '.replay_records // empty' <<<"$deployment_json")"
-    if [[ -z "$resolved_replay_records" ]]; then
-      if [[ "${requested_replay_records:-auto}" == shared ]]; then resolved_replay_records=shared
-      elif [[ "${requested_replay_records:-auto}" == own ]]; then resolved_replay_records=own
-      elif [[ $head_split == 0 && $glmf_pool == 0 ]] && ((spark_expert_world > 0)); then resolved_replay_records=shared
-      else resolved_replay_records=own; fi
-    fi
+    resolved_replay_records="$(jq -er '.replay_records | select(. == "own" or . == "shared")' <<<"$deployment_json")" ||
+      release_die "GLM Flash deployment does not name resolved replay records"
     replay_eligible=0
     if [[ "$resolved_replay_records" == shared ]]; then
       replay_eligible=1; replay_reason="one GPU; automatic measured pool with Spark experts"
