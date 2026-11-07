@@ -464,7 +464,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
  {
         return Err(invalid("GLM Flash executor geometry"));
     }
-    if i.shared_replay && (gpus != 1 || i.spark_ranks == 0) {
+    if i.shared_replay && (gpus != 1 || i.spark_ranks == 0 || !process.remote_experts) {
         return Err(invalid("--replay-records shared needs one coordinator GPU with Spark experts"));
     }
     for profile in [&i.workspace, &i.local_workspace] {
@@ -487,6 +487,10 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         else if let Some(n) = i.onboard.layers(routed.len()) { vec![n] }
         else if rtx_experts { (0..=routed.len()).collect() } else { vec![0] };
     let counts = counts.into_iter().filter(|&count| process.remote_experts || count == routed.len()).collect::<Vec<_>>();
+    if i.shared_replay && counts.iter().all(|&count| count == routed.len()) {
+        return Err(invalid("--replay-records shared needs one coordinator GPU with Spark experts"));
+    }
+    let counts = counts.into_iter().filter(|&count| !i.shared_replay || count < routed.len()).collect::<Vec<_>>();
     if counts.is_empty() || counts.iter().any(|&n| n > routed.len()) || !rtx_experts && counts.iter().any(|&n| n > 0) {
         return Err(p::Refusal::Unsupported);
     }
@@ -954,5 +958,30 @@ mod tests {
             let scratch = owners.iter().find(|owner| owner.id == "glmf.load.shared.scratch").unwrap();
             assert_eq!(scratch.lifetime.last, p::Phase::Load);
         }
+    }
+
+    #[test]
+    fn shared_replay_requires_admitted_spark_experts() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let routed = cfg.dense[..cfg.layers].iter().filter(|&&d| !d).count();
+        let mut input = crate::placement::families::glm5_flash::tests::inputs(&cfg, 1, 96 << 30);
+        input.shared_replay = true;
+        input.spark_ranks = 2;
+
+        // Admitted Spark experts succeed.
+        let process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        assert!(prepare(&input, 188, true, process).is_ok());
+
+        // Media-only Spark ranks without remote experts refuse shared replay.
+        let mut media_only = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        media_only.remote_experts = false;
+        let err = prepare(&input, 188, true, media_only).err().unwrap().to_string();
+        assert!(err.contains("--replay-records shared needs one coordinator GPU with Spark experts"), "{err}");
+
+        // Onboarding all routed layers to RTX leaves admitted expert world 0 and refuses shared replay.
+        input.onboard = Onboard::Layers(routed);
+        let process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        let err = prepare(&input, 188, true, process).err().unwrap().to_string();
+        assert!(err.contains("--replay-records shared needs one coordinator GPU with Spark experts"), "{err}");
     }
 }

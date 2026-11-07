@@ -529,9 +529,10 @@ pub(crate) struct PlanArgs {
     /// itself, as its measured admission does; other layouts keep at least the allowance.
     #[arg(long)]
     pub(crate) graph_budget_mib: Option<u64>,
-    /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU).
+    /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU;
+    /// `auto`: `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`).
     #[arg(long, value_enum, default_value = "own")]
-    pub(crate) replay_records: crate::families::glm5_flash::engine::ReplayRecords,
+    pub(crate) replay_records: PlanReplayRecords,
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
@@ -615,6 +616,13 @@ pub(crate) struct PlanArgs {
     /// Matching image PROGRAMS.json for exact V4 Flash/Pro workspaces.
     #[arg(long)]
     pub(crate) workspace_manifest: Option<PathBuf>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanReplayRecords {
+    Auto,
+    Own,
+    Shared,
 }
 
 #[derive(Debug, Args)]

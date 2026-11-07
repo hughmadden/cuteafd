@@ -1128,8 +1128,17 @@ for key, field in (("encoder", "encoder"), ("audio_encoder", "audio_encoder")):
 ranks = len(roles)
 report["spark_ranks"] = ranks
 peers = peers[:expert_world]
+requested_replay = value("--replay-records", "own")
+resolved_replay = (
+    ("shared" if gpus == 1 and int(value("--pool-tokens", "0") or 0) == 0 and expert_world > 0 else "own")
+    if requested_replay == "auto"
+    else requested_replay
+)
+if family == "glm5_flash":
+    report["replay_records"] = resolved_replay
 deployment = dict(encoder=report.get("encoder"), audio_encoder=report.get("audio_encoder"),
-    encoder_plan_hash=report.get("encoder_plan_hash", "ab" * 32), spark_expert_world=expert_world, spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
+    encoder_plan_hash=report.get("encoder_plan_hash", "ab" * 32), spark_expert_world=expert_world,
+    replay_records=report.get("replay_records"), spark_roles=roles, version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=expert_world, ep=ep,
                   wire="native_ownership" if explicit and expert_world else "canonical"), peers=peers,
     speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_reserve_rows=8192, decode_lanes=decode_lanes,
@@ -4318,8 +4327,10 @@ def test_glmf_auto_defaults_and_encoder_plan_agree(tmp_path, split, fixed, local
     for command in (planner, serve):
         assert "--decode-rows 128" not in command, command
         assert ("--index-cache compact" in command) == (not split), command
-        assert ("--replay-records shared" in command) == (not split and not fixed and not local), command
         assert "--prefix-marks pool" not in command
+    assert "--replay-records auto" in planner, planner
+    assert "--replay-records shared" not in planner, planner
+    assert ("--replay-records shared" in serve) == (not split and not fixed and not local), serve
     assert result.stderr.count("GLM5_FLASH_DECODE_ROWS=auto ->") == 1
     assert result.stderr.count("GLM5_FLASH_INDEX_CACHE=auto ->") == 1
     assert result.stderr.count("GLM5_FLASH_REPLAY_RECORDS=auto ->") == 1
@@ -5232,3 +5243,75 @@ def test_glmf_expertless_vision_handoff_preserves_physical_ranks(tmp_path, visio
                if line.startswith("docker run -d") and "cuteafd expertd-native" in line]
     assert {int(worker[worker.index("--rank") + 1]) for worker in workers} == set(vision_ranks)
     assert all("--encoder-only" in worker and "--world" not in worker for worker in workers)
+
+
+@pytest.mark.parametrize("case,spark_count,expert_world,vision_rank,explicit_replay,expect_shared", [
+    ("zero_inventory", 0, 0, None, None, False),
+    ("nonzero_inventory_expert_world_zero", 3, 0, None, None, False),
+    ("sparse_tower_only_vision_rank2", 3, 0, 2, None, False),
+    ("admitted_spark_experts", 2, 2, None, None, True),
+    ("explicit_own_override", 2, 2, None, "own", False),
+    ("explicit_shared_override", 2, 2, None, "shared", True),
+])
+def test_glmf_auto_replay_records_follow_admitted_expert_world(
+    tmp_path, case, spark_count, expert_world, vision_rank, explicit_replay, expect_shared,
+):
+    placement = (
+        {"kind": {"kind": "spark", "rank": vision_rank}, "replicas": []}
+        if vision_rank is not None
+        else {"kind": {"kind": "off"}, "replicas": []}
+    )
+    roles = []
+    if expert_world > 0:
+        roles = [
+            dict(rank=i, experts=True, layers=[1], encoder=None, audio_encoder=None, drafter=None)
+            for i in range(expert_world)
+        ]
+    elif vision_rank is not None:
+        roles = [
+            dict(rank=vision_rank, experts=False, layers=[], encoder=placement, audio_encoder=None, drafter=None)
+        ]
+    keys = f"RTX_GPUS=1\nSPARK_COUNT={spark_count}\nSPECULATOR=off\n"
+    keys += "VISION=auto\nAUDIO=off\n" if vision_rank is not None else "VISION=off\nAUDIO=off\n"
+    if spark_count == 0:
+        keys += "EXPERT_BACKEND=local\n"
+    if explicit_replay is not None:
+        keys += f"GLM5_FLASH_REPLAY_RECORDS={explicit_replay}\n"
+    result = _family_launch_result(
+        tmp_path,
+        GLMF_VISION,
+        "zai-org/GLM-5.3-Flash",
+        keys,
+        extra_args=("--wip", f"glmf-replay-{case}"),
+        execute_workers=vision_rank is not None,
+        encoder_plan={
+            "placement_supported": True,
+            "fits": True,
+            "spark_expert_world": expert_world,
+            "spark_roles": roles,
+            "encoder": placement if vision_rank is not None else None,
+            "encoder_plan_hash": "ab" * 32,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    planner = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd serve-glmf --snapshot" in line)
+    if explicit_replay is None:
+        assert "--replay-records" in planner and planner[planner.index("--replay-records") + 1] == "auto"
+        expected_note = (
+            "GLM5_FLASH_REPLAY_RECORDS=auto -> shared (one GPU; automatic measured pool with Spark experts)"
+            if expect_shared
+            else "GLM5_FLASH_REPLAY_RECORDS=auto -> own (local experts keep their own records)"
+        )
+        assert expected_note in result.stderr
+    elif explicit_replay == "shared":
+        assert "--replay-records" in planner and planner[planner.index("--replay-records") + 1] == "shared"
+    else:
+        assert "--replay-records" not in planner
+    assert ("--replay-records" in serve and serve[serve.index("--replay-records") + 1] == "shared") == expect_shared
+    assert ("--local-experts" in serve) == (expert_world == 0)
+    if vision_rank is not None:
+        assert serve[serve.index("--vision") + 1] == f"spark:{vision_rank}"
+        assert serve[serve.index("--vision-peer-ranks") + 1] == str(vision_rank)
+        assert "--peers" not in serve
+

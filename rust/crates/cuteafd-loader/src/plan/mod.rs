@@ -364,6 +364,9 @@ pub struct PlanReport {
     /// Native EXLR8 trellis prefill activations the layout charged (EXLR8 native plans only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exlr8_prefill_activations: Option<exlr8::PrefillActivations>,
+    /// GLM Flash KDA replay-record storage (`own` or `shared`) resolved by the planner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_records: Option<&'static str>,
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
@@ -376,6 +379,25 @@ pub struct PlanReport {
 }
 
 impl PlanReport {
+    pub fn spark_expert_layers(&self) -> Vec<u32> {
+        if let Some(placement) = &self.solver_placement {
+            placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                (home.experts == crate::placement::ExpertHome::Spark).then_some(layer as u32)).collect()
+        } else if self.placement == ExpertPlacement::Local || self.spark_ranks == 0 {
+            Vec::new()
+        } else {
+            // Failed or shape-only reports have no solved ownership to narrow.
+            let first = self.launch.as_ref().map_or(0, |launch| launch.first_expert_layer);
+            let end = self.launch.as_ref().and_then(|launch| launch.last_expert_layer.map(|l| l + 1))
+                .or_else(|| self.spec.as_ref().map(|spec| spec.layers.len())).unwrap_or(first);
+            (first..end).map(|layer| layer as u32).collect()
+        }
+    }
+
+    pub fn spark_expert_world(&self) -> usize {
+        if self.spark_expert_layers().is_empty() { 0 } else { self.spark_ranks }
+    }
+
     pub(crate) fn refuse_placement(&mut self, what: String, how: impl Into<String>) {
         self.fits = false;
         self.placement_supported = false;
@@ -953,6 +975,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         expert_storage: None,
         hints: Vec::new(),
         exlr8_prefill_activations: None,
+        replay_records: None,
         memory_layout: None,
         solver_placement: None,
         tp2_dflash: None,

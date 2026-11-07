@@ -75,6 +75,12 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     let checkpoint = input.checkpoint();
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
+    report.replay_records = Some(if options.glmf_shared_replay
+        || (options.glmf_auto_replay && ranks == 1 && options.pool_tokens.filter(|&n| n > 0).is_none() && expert_world > 0) {
+        "shared"
+    } else {
+        "own"
+    });
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes), worker_budget_bytes: 0,
         items: vec![], kv_tokens: 0 }).collect();
@@ -202,15 +208,18 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
             options.glmf_mark_lanes.unwrap_or(sequences), options.prefix_entries("glm5_flash"),
             geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
-        let shared = if options.glmf_shared_replay { crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, ranks, decode_rows)? } else { 0 };
-        let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
+        let shared_replay = options.glmf_shared_replay
+            || (options.glmf_auto_replay && ranks == 1 && options.pool_tokens.filter(|&n| n > 0).is_none() && expert_world > 0);
+        let shared = if shared_replay { crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, ranks, decode_rows)? } else { 0 };
+        let local_shared = if options.glmf_shared_replay { shared } else { 0 };
+        let step_workspace = |placement: &ExpertPlacement, lanes, shared| manifest.and_then(|m|
             glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
                 index == crate::serving_capacity::GlmfIndexCache::Compact,
                 ranks == 2, representation, options.glmf_prefill_expanded && !native_kda,
                 available.is_some() && (ranks == 2 || (exlr8.is_none() && catalog.fp8().is_some())),
                 options.glmf_kda_fp32_partials && !native_kda, state, Some(native_mask)));
-        let mut workspace = step_workspace(&report.placement, lanes);
-        let mut local_workspace = step_workspace(&ExpertPlacement::Local, lanes);
+        let mut workspace = step_workspace(&report.placement, lanes, shared);
+        let mut local_workspace = step_workspace(&ExpertPlacement::Local, lanes, local_shared);
         if (workspace.is_none() || local_workspace.is_none()) && manifest.is_some() {
             anyhow::bail!("GLM Flash program manifest lacks the requested step scratch geometry");
         }
@@ -340,7 +349,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation, state_slots: options.resolved_state_slots("glm5_flash"),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0,
-            index, kda_state_bytes: state.bytes(), shared_replay: options.glmf_shared_replay, representation,
+            index, kda_state_bytes: state.bytes(), shared_replay, representation,
             resident, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
@@ -444,6 +453,12 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     let mut selected = None;
     match admitted {
         Ok((placed, working)) => {
+            report.replay_records = Some(if options.glmf_shared_replay
+                || (options.glmf_auto_replay && ranks == 1 && options.pool_tokens.filter(|&n| n > 0).is_none() && working.spark_ranks > 0) {
+                "shared"
+            } else {
+                "own"
+            });
             report.solver_placement = Some(placed.clone());
             pool = placed.pool_tokens;
             selected = Some(working);
