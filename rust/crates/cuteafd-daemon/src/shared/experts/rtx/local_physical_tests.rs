@@ -51,6 +51,226 @@ fn modules<'a>(fixture: &cuteafd_ffi::native_library_lifetime_fixture::Fixture,
     })).collect()
 }
 
+/// Default-tier qualification uses real header parsing, mount/push loaders,
+/// execution workspaces and pair receipts, without installed checkpoints or CUDA.
+#[test]
+fn glm_exl3_local_physical_equals_serving() -> Result<()> {
+    use cuteafd_loader::plan::testing::{exl3, exl3_compact, glm5_compact_weights, write_snapshot};
+    use crate::shared::experts::layer::ExpertLayer;
+    use sha2::{Digest, Sha256};
+    const CHILD: &str = "CUTEAFD_GLM_ARENA_PHYSICAL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["shared::experts::rtx::local_physical_tests::glm_exl3_local_physical_equals_serving", "--exact", "--nocapture"])
+            .env(CHILD, "1").output()?;
+        ensure!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "physical equality: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return Ok(());
+    }
+    let (mut config, _) = glm5_compact_weights();
+    config["num_hidden_layers"] = 3.into();
+    config["indexer_types"] = serde_json::json!(["full", "shared", "shared"]);
+    config["mlp_layer_types"] = serde_json::json!(["dense", "sparse", "sparse"]);
+    config["quantization_config"] = exl3_compact(4);
+    let cfg = GlmDsaConfig::from_hf(&config)?;
+    let geometry = ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
+        intermediate: cfg.moe_intermediate as u32, topk: cfg.topk as u32, layers: cfg.layers as u32 };
+    cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("unexpected geometry {g:?}"))?;
+    let root = tempfile::tempdir()?;
+    let tensors = [1, 2].into_iter().flat_map(|layer| (0..cfg.experts).flat_map(move |expert|
+        ["gate_proj", "up_proj", "down_proj"].into_iter().flat_map(move |projection|
+            exl3(&format!("model.layers.{layer}.mlp.experts.{expert}.{projection}"), 256, 256, 4))))
+        .collect::<Vec<_>>();
+    write_snapshot(root.path(), &config, &tensors, None);
+    let path = root.path().join("model-00001-of-00001.safetensors");
+    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    use std::os::unix::fs::FileExt;
+    for tensor in cuteafd_loader::read_safetensors_metadata(&path)? {
+        if tensor.name.ends_with(".mcg") { file.write_all_at(&0xcbac1fedu32.to_le_bytes(), tensor.byte_offset)?; }
+    }
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    fixture.strict_device_free(&library, true)?;
+    for rank in 0..2 { fixture.configure_memory(&library, rank, 1usize << 30)?; }
+    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+    let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
+    let ranks = [0, 1].map(|rank| RankDevice { device: rank as i32, stream: streams[rank].raw });
+    let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/../../../third_party/sparkinfer.lock.json")))?;
+    for world in [1, 2] {
+        let package = root.path().join(format!("tp{world}"));
+        for capacity in cuteafd_core::Exl3RowPolicy::Nearest.capacities(256)? {
+            let directory = package.join(format!("m{capacity}"));
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(directory.join("lut"), [0u8; 16])?;
+            let meta = serde_json::json!({
+                "schema":"cuteafd.v41-exl3-aot.v1", "sparkinfer_revision":lock["revision"],
+                "hidden":cfg.hidden,"intermediate":cfg.moe_intermediate/world,"experts":cfg.experts,
+                "top_k":cfg.topk,"capacity":capacity,"bits":[4],"output_dtype":"fp32",
+                "swiglu_limit":geometry.swiglu_limit(),"direct":true,"sms":1,"blocks_per_sm":1,
+                "decode_capacity":capacity <= 80,"tile":[64,128,64,128],
+                "objects":[{"label":"v41_exl3_core","pointer_slots":["gate_suh_ptr"],"scalar_slots":["active_m"]},
+                    {"label":"v41_exl3_sum","pointer_slots":["output_ptr"],"scalar_slots":["active_m"]}],
+                "trellis_lut":{"file":"lut","bytes":16,"sha256":format!("{:x}",Sha256::digest([0u8;16]))},
+                "buffers":{
+                    "output":{"bytes":capacity*cfg.hidden*4,"dtype":"torch.float32","allocation":"output","zero_on_create":false},
+                    "fc2":{"bytes":capacity*32,"dtype":"torch.float32","allocation":"fc2","zero_on_create":false},
+                    "state":{"bytes":16,"dtype":"torch.int32","allocation":"state","zero_on_create":true}}
+            });
+            std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
+        }
+        let local = glm5::LocalInventory { package: package.clone(), format: glm5::GlmLocalFormat::Exl3,
+            experts: vec![], backend_workspace: 0, extra_workspace: [0;2], world, unit_limit: 0 };
+        for rows in [64, 256] {
+            let mut selected = LocalPhysicalInput { layers: vec![1, 2], max_rows: rows, lanes: 2,
+                storage: LocalStorage::Mount, route_checks: true, peer_diagnostics: false,
+                activations: PrefillActivations::A16 };
+            let source = LocalPhysicalSource::read(&cfg, &catalog, &local, &selected, None)?;
+            for layers in [vec![1], vec![1, 2], vec![2]] {
+                selected.layers = layers;
+                for storage in [LocalStorage::Mount, LocalStorage::Push] {
+                    selected.storage = storage;
+                    let expected = source.inventory(&selected)?;
+                    let budgets = [usize::try_from(expected.backend_bytes(0)?)?, usize::try_from(expected.backend_bytes(1)?)?];
+                    let weights = if storage == LocalStorage::Push {
+                        let mut ranks = Vec::new();
+                        for rank in 0..world {
+                            let layouts = selected.layers.iter().map(|&layer| catalog.exl3().unwrap()
+                                .residency(cuteafd_loader::V41Exl3Layer::Backbone(layer), world, rank)).collect::<Result<Vec<_>>>()?;
+                            let arena = ready(devices[rank], layouts.iter().map(|layout| layout.device_arena_layout().map(|(_, bytes)| bytes))
+                                .collect::<std::result::Result<Vec<_>, _>>()?)?;
+                            ranks.push(layouts.into_iter().enumerate().map(|(index, layout)| {
+                                let layer = if world == 1 { ExpertLayer::BackboneFull { layer: selected.layers[index] } }
+                                    else { ExpertLayer::BackboneTp2 { layer: selected.layers[index], rank } };
+                                Exl3Weights::from_push(arena.clone(), index, layout, Exl3Weights::plan(&catalog, layer)?)
+                            }).collect::<Result<Vec<_>>>()?);
+                        }
+                        Some(ranks)
+                    } else { None };
+                    let owners = if world == 1 {
+                        vec![if let Some(mut weights) = weights {
+                            exl3::Exl3Tp2::pushed_whole_weights(devices[0], &catalog, &package, selected.layers.clone(), rows,
+                                budgets[0], RtxSelectionPolicy::CanonicalDecode, weights.remove(0))?
+                        } else { exl3::Exl3Tp2::load_whole_weights(devices[0], &catalog, &package, selected.layers.clone(), rows,
+                            budgets[0], RtxSelectionPolicy::CanonicalDecode)? }]
+                    } else if let Some(weights) = weights {
+                        exl3::Exl3Tp2::pushed_pair_weights(devices, &catalog, geometry, [&package, &package], selected.layers.clone(), rows,
+                            budgets, RtxSelectionPolicy::CanonicalDecode, weights.try_into().map_err(|_| anyhow::anyhow!("rank count"))?)?.into()
+                    } else { exl3::Exl3Tp2::load_pair_weights(devices, &catalog, geometry, [&package, &package], selected.layers.clone(), rows,
+                        budgets, RtxSelectionPolicy::CanonicalDecode)?.into() };
+                    let mut backend = owners.iter().enumerate().map(|(rank, owner)|
+                        owner.execution_with_modules(Some(modules(&fixture, devices[rank], &package, rows)?))
+                            .map(|execution| Box::new(execution) as Box<dyn RtxExpertLayer>)).collect::<Result<Vec<_>>>()?;
+                    let mut actual = Inventory::new(CoordinatorDevices::new(&[0, 1])?, "glm", Lifetime::TARGET,
+                        Category::Experts, "resident expert owners");
+                    // Check the backend's complete physical sum before pair routes/checks are added.
+                    for (rank, executor) in backend.iter().enumerate() {
+                        let mut receipts = Inventory::new(CoordinatorDevices::new(&[0, 1])?, "glm", Lifetime::TARGET,
+                            Category::Experts, "resident expert owners");
+                        executor.allocation_receipts(&mut receipts, &format!("expert.routed.rank.{rank}"))?;
+                        assert_eq!(receipts.receipts.iter().filter(|r| r.allocation.view.is_none()).map(|r| r.allocation.bytes).sum::<u64>(),
+                            budgets[rank] as u64, "backend bytes omit a shared root or include pair owners");
+                    }
+                    if world == 1 {
+                        backend[0].allocation_receipts(&mut actual, "expert.routed.rank.0")?;
+                    } else {
+                        let pair = pair::Pair::new(&library, ranks, [backend.remove(0), backend.remove(0)], cfg.hidden, cfg.topk,
+                            rows, 64, selected.lanes, ExchangeDtype::Bf16)?;
+                        assert!(pair.start_checks(true)?);
+                        pair.allocation_receipts(&mut actual, "expert.routed")?;
+                    }
+                    let actual_len = actual.receipts.len();
+                    let actual = actual.receipts.into_iter().map(|r| (r.allocation.id.clone(), r.allocation)).collect::<BTreeMap<_, _>>();
+                    let expected_len = expected.owners.len() + expected.views.len();
+                    let expected = expected.owners.into_iter().chain(expected.views).map(|a| (a.id.clone(), a)).collect::<BTreeMap<_, _>>();
+                    assert_eq!(actual.len(), actual_len, "duplicate runtime IDs");
+                    assert_eq!(expected.len(), expected_len, "duplicate planner IDs");
+                    assert_eq!(actual, expected, "TP{world} {storage:?} {rows} {:?}", selected.layers);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn glm_fp8_package_physical_weights_equal_mount_and_push() -> Result<()> {
+    use crate::shared::{experts::fp8::{Fp8Layer, regions}, memory::push_fp8::RankPlan};
+    use cuteafd_loader::{formats::fp8_experts::ExpertFormat, plan::testing::glm5_compact_weights};
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    fixture.strict_device_free(&library, true)?;
+    let root = tempfile::tempdir()?;
+    let catalog = crate::shared::memory::push_fp8::tests::fixture(root.path(), ExpertFormat::Nvfp4, false)?;
+    let tensors = catalog.fp8().context("NVFP4 fixture headers missing")?.for_coordinator();
+    let shape = tensors.shape();
+    let (config, _) = glm5_compact_weights();
+    let mut cfg = GlmDsaConfig::from_hf(&config)?;
+    cfg.hidden = shape.hidden;
+    cfg.experts = shape.experts;
+    cfg.topk = shape.topk;
+    cfg.moe_intermediate = shape.intermediate;
+    cfg.first_moe_layer = shape.first_layer;
+    cfg.layers = shape.layers;
+    let package = root.path().join("package/tp2");
+    std::fs::create_dir_all(&package)?;
+    std::fs::write(package.parent().unwrap().join("manifest.json"), serde_json::to_vec(&serde_json::json!({
+        "layouts":{"tp2":{"capacities":[{"capacity":64,"scratch_bytes":256}]}}
+    }))?)?;
+    let local = glm5::LocalInventory { package: package.clone(), format: glm5::GlmLocalFormat::Nvfp4 { w4a4:true },
+        experts:vec![], backend_workspace:0, extra_workspace:[0;2], world:2, unit_limit:0 };
+    let mut selected = LocalPhysicalInput { layers:vec![1,2], max_rows:64, lanes:2,
+        storage:LocalStorage::Mount, route_checks:true, peer_diagnostics:false, activations:PrefillActivations::A16 };
+    let source = LocalPhysicalSource::read(&cfg, &catalog, &local, &selected, None)?;
+    for layers in [vec![1], vec![1,2], vec![2]] {
+        selected.layers = layers;
+        for storage in [LocalStorage::Mount, LocalStorage::Push] {
+            selected.storage = storage;
+            let expected = source.inventory(&selected)?;
+            let mut actual = Inventory::new(CoordinatorDevices::new(&[0,1])?, "glm", Lifetime::TARGET,
+                Category::Experts, "resident expert owners");
+            for rank in 0..2 {
+                let device = Device { library:&library, id:rank as i32 };
+                let (_, slicing) = cuteafd_loader::formats::fp8_experts::exact_layout_directory(&package, &tensors, 2, rank);
+                let weights = if storage == LocalStorage::Mount {
+                    let arena = crate::shared::experts::weight_layout::arena(device, "fp8",
+                        regions(&tensors, &selected.layers, 2, rank, slicing)?)?;
+                    device.run(|| selected.layers.iter().map(|&layer| Fp8Layer::load_into(&library,
+                        &tensors.for_layer_metadata(layer)?, layer, 2, rank, slicing, &arena)).collect::<Result<Vec<_>>>())?
+                } else {
+                    let plan = RankPlan::from_tensors(&tensors,
+                        &selected.layers.iter().map(|&layer| (layer,slicing)).collect::<Vec<_>>(), 2, rank, usize::MAX)?;
+                    let sizes = plan.layers.iter().map(|layer| layer.planes.iter().map(|plane| plane.end).max().unwrap()
+                        - layer.planes.iter().filter(|plane| !plane.is_empty()).map(|plane| plane.start).min().unwrap())
+                        .collect::<Vec<_>>();
+                    let arena = ready(device, sizes)?;
+                    plan.layers.iter().enumerate().map(|(index, layer)| Fp8Layer::from_push(arena.clone(), index, layer,
+                        plan.layout.region(index)?.start)).collect::<Result<Vec<_>>>()?
+                };
+                for weight in &weights {
+                    weight.allocation_receipts(&mut actual, &format!("expert.routed.rank.{rank}.weight.{}",weight.layer))?;
+                }
+                let actual_bytes = actual.receipts.iter().filter(|r| r.allocation.location == Location::coordinator(rank as u8)
+                    && r.allocation.view.is_none()).map(|r| r.allocation.bytes).sum::<u64>();
+                let workspace = expected.owners.iter().filter(|owner| owner.location == Location::coordinator(rank as u8)
+                    && (owner.id.ends_with(".scratch") || owner.id.ends_with(".output"))).map(|owner| owner.bytes).sum::<u64>();
+                assert_eq!(expected.backend_bytes(rank)?, actual_bytes + workspace,
+                    "FP8 backend sum drops shared root or includes pair/check owners");
+            }
+            let actual_len = actual.receipts.len();
+            let actual = actual.receipts.into_iter().map(|r| (r.allocation.id.clone(),r.allocation)).collect::<BTreeMap<_,_>>();
+            let expected = expected.owners.into_iter().chain(expected.views).filter(|a| a.id.starts_with("experts.")
+                || a.id.contains(".weight.")).map(|a| (a.id.clone(),a)).collect::<BTreeMap<_,_>>();
+            assert_eq!(actual.len(),actual_len,"duplicate FP8 runtime IDs");
+            assert_eq!(actual,expected,"FP8 {storage:?} {:?}",selected.layers);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("set CUTEAFD_GLM_EXL3_WORKSPACE_MANIFEST to the share/PROGRAMS.json of a built GLM EXL3 TP2 installation, including its adjacent lib/exl3 module package")]
 struct MissingGlmExl3Input;
