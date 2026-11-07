@@ -525,10 +525,10 @@ mod selected_spark_io_tests {
             assert_eq!(device.items.iter().find(|item| item.group == "rdma rings").unwrap().bytes, expected);
             let residual = device.items.iter().find(|item|
                 item.group == cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP).unwrap();
-            assert_eq!(residual.bytes, 5 * (1 << 29));
+            assert_eq!(residual.bytes, cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
             assert_eq!(residual.basis, Basis::Estimated);
             assert_eq!(residual.lifetime, cuteafd_core::memory_layout::ItemLifetime::ReadyResident);
-            assert!(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
+            assert!(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_SOURCE.contains("one sample"));
         }
     }
 

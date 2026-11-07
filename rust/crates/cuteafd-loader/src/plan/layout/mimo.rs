@@ -82,6 +82,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                     // rank I/O; the final solve re-charges it for its own working set.
                     spark_io(report, model, options, &working, &mut sparks, &mut notes);
                 }
+                for device in &mut sparks {
+                    if cuteafd_core::memory_layout::charge_spark_runtime(device).is_none() {
+                        return unsupported_prefill(report, anyhow::anyhow!("Spark arena reserve overflow"));
+                    }
+                }
                 resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(admission) {
@@ -102,6 +107,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 }
                 if expert_world > 0 {
                     let _ = spark_experts(input, options, &mut sparks, 0);
+                }
+                for device in &mut sparks {
+                    if cuteafd_core::memory_layout::charge_spark_runtime(device).is_none() {
+                        return unsupported_prefill(report, anyhow::anyhow!("Spark arena reserve overflow"));
+                    }
                 }
                 resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);

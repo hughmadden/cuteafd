@@ -116,10 +116,17 @@ Each device has one cap, and weights, KV, workspaces and the reserve all live in
 The planner fixes the layout (layer placement, onboarding, buffers) for `KV_TARGET_TOKENS`;
 the pool then grows into what the fixed layout leaves, up to `KV_MAX_TOKENS`, and the launch
 is refused below `KV_MIN_TOKENS`. The reserve is the sum of named, measured components
-(CUDA context and cuBLAS, loaded code, graphs, runtime growth, the Spark runtime residual)
+(CUDA context and cuBLAS, loaded code, graphs, runtime growth, Spark arena driver overhead and unattributed Spark startup)
 plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the whole reserve and zero
 every built-in component. Startup and `cuteafd plan` print one line per device with the cap,
 weights, workspaces, every reserve component and the KV target, min, max and pool.
+Spark startup reserves temporarily split the 11-04 Kimi TP6 measurement into
+16 B per 4096-B arena page (`nvidia_pte_t`, ARM driver source), 2 MiB/GiB of
+arena (`SecPageTables`, moa probe 2026-11-07), and a 1,706,366,976-B
+unattributed startup placeholder (#1454). Their sum at that run's
+117,692,170,240-B arena is exactly the measured 2,395,969,536 B. This replaces
+the old flat 2.5 GiB; it is not a maximum envelope. Ring, workspace, validation
+and upload owners stay separate. `SPARK_RESERVE` replaces the entire split once.
 Sizes take `B`, `MB`, `GB`, `MiB` or `GiB` (a bare number is bytes); there are no percentages.
 Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`, ...).
 

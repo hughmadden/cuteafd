@@ -300,7 +300,7 @@ mod tests {
         // A Spark's cap is its worker ceiling; its residual is a named component.
         assert!(lines[1].starts_with("spark0: cap 110592MiB; weights 92160MiB"), "{}", lines[1]);
         // Sparks carry no family reserve; the residual is their named component.
-        assert!(lines[1].contains("reserve 2560MiB [Spark runtime residual 2560MiB]"), "{}", lines[1]);
+        assert!(lines[1].contains("reserve 1627MiB [unattributed Spark worker startup placeholder 1627MiB]"), "{}", lines[1]);
         let overridden = MemoryPolicy { spark_reserve: Some(3 << 30), ..Default::default() }
             .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
         assert!(overridden[1].contains("(overridden)") && overridden[1].contains("SPARK_RESERVE 3072MiB"), "{}", overridden[1]);
