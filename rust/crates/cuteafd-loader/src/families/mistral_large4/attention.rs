@@ -8,8 +8,8 @@ use super::Ml4Config;
 pub enum AttentionError {
     #[error("Mistral Large 4 HQA {tensor}: expected {expected}")]
     NativeTensor { tensor: String, expected: String },
-    #[error("Mistral Large 4: native FP8 attention projection pending; use --compact-attention")]
-    ProjectionPending,
+    #[error("{0}")]
+    UnsupportedFp8Conversion(#[from] crate::formats::native_attention::UnsupportedFp8Conversion),
 }
 
 /// Check the complete restored wq/wo inventory before runtime admission. The
@@ -47,7 +47,10 @@ pub fn validate(checkpoint: &Checkpoint, cfg: &Ml4Config) -> Result<(), Attentio
             }
         }
     }
-    // Remove this admission guard only with the native projection's exports,
-    // per-projection planner owners and decode row-invariance qualification.
-    Err(AttentionError::ProjectionPending)
+    if checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact {
+        return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
+            tensor: "layers.0.attention.wq.weight".into(), found: "E4M3".into(),
+        }.into());
+    }
+    Ok(())
 }

@@ -579,11 +579,12 @@ fn hqa_snapshot() -> tempfile::TempDir {
     let mut quant: serde_json::Value = crate::read_json_file(&root.join("quantize_config.json")).unwrap();
     let mut index: serde_json::Value = crate::read_json_file(&root.join("consolidated.safetensors.index.json")).unwrap();
     let mut compact = config.clone();
-    compact["transformers_weights"] = json!(COMPACT_INDEX);
+    compact["transformers_weights"] = json!("consolidated.compact-attention.safetensors.index.json");
     compact["quantization_config"]["per_module_metadata"] = json!(format!("{COMPACT_QUANT}:tensor_storage"));
     let mut compact_quant = quant.clone();
     compact_quant["per_module_metadata"] = json!(format!("{COMPACT_QUANT}:tensor_storage"));
-    for (name, value) in [(COMPACT_CONFIG, &compact), (COMPACT_INDEX, &index), (COMPACT_QUANT, &compact_quant)] {
+    for (name, value) in [(COMPACT_CONFIG, &compact), (COMPACT_INDEX, &index),
+        ("consolidated.compact-attention.safetensors.index.json", &index), (COMPACT_QUANT, &compact_quant)] {
         std::fs::write(root.join(name), value.to_string()).unwrap();
     }
     let restored: Vec<_> = testing::mistral_large4_tensors(Some(&[]), false).into_iter()
@@ -595,7 +596,9 @@ fn hqa_snapshot() -> tempfile::TempDir {
     let view = json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa", "views": {
         "hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
         "compact-attention":{"config":COMPACT_CONFIG, "index":COMPACT_INDEX, "quantize":COMPACT_QUANT}},
-        "native_modules":"quantize_config.json:native_attention"});
+        "native_modules":"quantize_config.json:native_attention",
+        "index_aliases":{"hqa":["consolidated.safetensors.index.json"],
+            "compact-attention":["consolidated.compact-attention.safetensors.index.json"]}});
     let mut native = serde_json::Map::new();
     for (name, _, shape) in restored.iter().filter(|(name, _, _)| name.ends_with(".weight")) {
         let stem = name.strip_suffix(".weight").unwrap();
@@ -610,27 +613,27 @@ fn hqa_snapshot() -> tempfile::TempDir {
                 "semantics":"checkpoint-native: original FP8 weight with its original per-block FP32 scale"}}));
     }
     for (name, _, _) in &restored { index["weight_map"][name] = json!(shard); }
-    config["transformers_weights"] = json!("model.safetensors.index.json");
+    config["transformers_weights"] = json!("consolidated.safetensors.index.json");
     config["quantization_config"]["attention_view"] = view.clone();
     quant["attention_view"] = view;
     quant["native_attention"] = json!(native);
     for (name, value) in [("config.json", &config), ("quantize_config.json", &quant),
-        ("model.safetensors.index.json", &index)] {
+        ("model.safetensors.index.json", &index), ("consolidated.safetensors.index.json", &index)] {
         std::fs::write(root.join(name), value.to_string()).unwrap();
     }
     dir
 }
 
 #[test]
-fn hqa_native_fp8_attention_is_complete_and_refuses_until_projection_is_available() {
+fn hqa_native_fp8_attention_is_complete_and_executable() {
     use crate::families::mistral_large4::attention::{self, AttentionError};
     use crate::plan::checkpoint::view::{AttentionMode, CheckpointView};
     let dir = hqa_snapshot();
     let view = CheckpointView::select(dir.path(), AttentionMode::Hqa).unwrap();
     let checkpoint = Checkpoint::open_view(&view).unwrap();
     let cfg = Ml4Config::from_hf(&checkpoint.config).unwrap();
-    assert!(matches!(attention::validate(&checkpoint, &cfg), Err(AttentionError::ProjectionPending)));
-    assert!(Model::open(&checkpoint).err().unwrap().to_string().contains("native FP8 attention projection pending"));
+    attention::validate(&checkpoint, &cfg).unwrap();
+    Model::open(&checkpoint).unwrap();
     assert!(!checkpoint.contains_tensor("layers.0.attention.wq.trellis"));
     assert_eq!(checkpoint.tensors.iter().filter(|tensor| tensor.shard.starts_with("hqa-attention-")).count(), 288);
     for (name, dtype) in [("layers.0.attention.wq.weight", cuteafd_core::DType::Bf16),
@@ -642,6 +645,62 @@ fn hqa_native_fp8_attention_is_complete_and_refuses_until_projection_is_availabl
     let mut missing = Checkpoint::open_view(&view).unwrap();
     missing.tensors.retain(|tensor| tensor.meta.name != "layers.39.attention.wo.qscale_weight");
     assert!(matches!(attention::validate(&missing, &cfg), Err(AttentionError::NativeTensor { .. })));
+}
+
+#[test]
+fn hqa_modes_select_native_inventory_and_shared_runtime_owners() {
+    use crate::families::glm5::{GlmDsaConfig, core::{self, CoreInventory}};
+    use crate::placement::{families::glm5::weights::WeightInventory, planner::EmbeddingHome};
+    use crate::plan::checkpoint::view::{AttentionMode, CheckpointView};
+    use cuteafd_ffi::draft_projection::ProjectionOutput;
+    let dir = hqa_snapshot();
+    for (mode, native) in [(AttentionMode::Hqa, true), (AttentionMode::Compact, false)] {
+        let view = CheckpointView::select(dir.path(), mode).unwrap();
+        // A Spark's role excludes attention, but declared native headers must
+        // still reach family validation through the selected view.
+        let role = Checkpoint::open_view_for_role(&view, "ML4 expert role", |name| name.contains(".experts.")).unwrap();
+        Model::open(&role).unwrap();
+        let checkpoint = Checkpoint::open_view(&view).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        let inventory = CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
+        assert_eq!(inventory.native.len(), if native { 144 } else { 0 });
+        for layer in 0..cfg.layers {
+            for leaf in ["wq", "wo"] {
+                let stem = format!("layers.{layer}.attention.{leaf}");
+                assert_eq!(inventory.native.contains_key(&stem), native);
+                assert_eq!(inventory.projections.contains_key(&stem), !native);
+            }
+            core::validate_attention_format(&cfg, layer, &inventory).unwrap();
+        }
+        let layer_owners = crate::placement::families::glm5::attention_owners(&cfg, cfg.layers).unwrap();
+        for (ranks, owners) in [(1, None), (2, None), (2, Some(layer_owners.as_slice()))] {
+            let weights = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers, owners,
+                false, false, EmbeddingHome::Device(0)).unwrap();
+            let native_bytes: u64 = weights.owners.iter().filter(|owner| owner.allocation.id.contains(".native."))
+                .map(|owner| owner.allocation.bytes).sum();
+            assert_eq!(native_bytes, if native { 7_249_526_784 } else { 0 });
+            for layer in 0..cfg.layers {
+                let layouts = inventory.layer_native(&cfg, layer, ranks, owners.map(|owners| owners[layer])).unwrap();
+                let parts = if owners.is_some() { 1 } else { ranks };
+                for (rank, layouts) in layouts.iter().enumerate() {
+                    let owns = native && owners.is_none_or(|owners| usize::from(owners[layer]) == rank);
+                    assert_eq!(layouts.len(), if owns { 2 } else { 0 });
+                    if owns {
+                        let q = &layouts["q_b"];
+                        let o = &layouts["o"];
+                        assert_eq!(q.shape, [8192 / parts, 6144]);
+                        assert_eq!(o.shape, [6144, 8192 / parts]);
+                        assert!(q.fp8 && o.fp8);
+                        assert_eq!(core::native_output(q), ProjectionOutput::Bf16);
+                        assert_eq!(core::native_output(o), if parts == 2 { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 });
+                    }
+                }
+            }
+        }
+    }
+    let error = CheckpointView::select(dir.path(), AttentionMode::Fp8Compact).unwrap_err();
+    assert!(error.is::<crate::formats::native_attention::UnsupportedFp8Conversion>(), "{error:#}");
+    assert!(error.to_string().contains("HQA attention is already FP8"));
 }
 
 #[test]
@@ -664,6 +723,97 @@ fn compact_hqa_view_loads_without_native_shards_and_preserves_parent_owners() {
     for (ranks, owners) in [(1, None), (2, None), (2, Some(owners.as_slice()))] {
         assert_eq!(crate::plan::layout::glm5::resident_owned(&checkpoint, ranks, cfg.layers, owners).unwrap(),
             crate::plan::layout::glm5::resident_owned(&parent, ranks, cfg.layers, owners).unwrap());
+    }
+}
+
+#[test]
+fn hqa_declared_index_aliases_preserve_canonical_selection_and_refuse_mismatch() {
+    use crate::plan::checkpoint::view::{AttentionMode, CheckpointView, InvalidIndexAlias, COMPACT_INDEX};
+    use serde_json::json;
+    let dir = hqa_snapshot();
+    for (mode, canonical, alias, native) in [
+        (AttentionMode::Hqa, "model.safetensors.index.json", "consolidated.safetensors.index.json", true),
+        (AttentionMode::Compact, COMPACT_INDEX, "consolidated.compact-attention.safetensors.index.json", false),
+    ] {
+        let view = CheckpointView::select(dir.path(), mode).unwrap();
+        assert_eq!(view.index_name(), canonical);
+        assert_eq!(view.config().unwrap()["transformers_weights"], alias);
+        let checkpoint = Checkpoint::open_view(&view).unwrap();
+        assert_eq!(checkpoint.contains_tensor("layers.0.attention.wq.weight"), native);
+        assert_eq!(checkpoint.contains_tensor("layers.0.attention.wq.trellis"), !native);
+
+        let path = dir.path().join(alias);
+        let mut changed: serde_json::Value = crate::read_json_file(&path).unwrap();
+        changed["metadata"] = json!({"alias_only":"not the canonical index identity"});
+        std::fs::write(&path, changed.to_string()).unwrap();
+        let alias_metadata = CheckpointView::select(dir.path(), mode).unwrap();
+        assert_eq!(view.fingerprint(), alias_metadata.fingerprint());
+        changed["weight_map"]["layers.0.attention.wq.weight"] = json!("wrong.safetensors");
+        std::fs::write(&path, changed.to_string()).unwrap();
+        let error = CheckpointView::select(dir.path(), mode).unwrap_err();
+        let error = error.downcast_ref::<InvalidIndexAlias>().expect("typed alias refusal");
+        assert_eq!(error.alias, alias);
+        assert_eq!(error.reason, "weight map differs from canonical index");
+        std::fs::copy(dir.path().join(canonical), &path).unwrap();
+    }
+}
+
+#[test]
+fn native_hqa_projection_exports_preserve_ml4_geometry_and_tp2_output() {
+    use crate::families::glm5_flash::core::NativeLayout;
+    use crate::formats::trellis_core::CoreSplit;
+    use crate::placement::{inventory::ProgramsManifest, planner::native_attention::{
+        NativeProgram, NativePrograms, NativeResolution,
+    }};
+    use cuteafd_ffi::draft_projection::ProjectionOutput;
+    use serde_json::json;
+
+    for (ranks, split_layers) in [(1, false), (2, false), (2, true)] {
+        let parts = if split_layers { 1 } else { ranks };
+        let layouts = [
+            NativeLayout { stem: "layers.0.attention.wq".into(),
+                shape: [8192 / parts, 6144], fp8: true, rank: 0, ranks: parts,
+                split: if parts == 1 { CoreSplit::Whole } else { CoreSplit::Output } },
+            NativeLayout { stem: "layers.0.attention.wo".into(),
+                shape: [6144, 8192 / parts], fp8: true, rank: 0, ranks: parts,
+                split: if parts == 1 { CoreSplit::Whole } else { CoreSplit::Input } },
+        ];
+        let outputs = [ProjectionOutput::Bf16,
+            if parts == 2 { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 }];
+        let requests: Vec<_> = layouts.iter().zip(outputs)
+            .map(|(layout, output)| NativeProgram { layout, output }).collect();
+        let owned_layers = if split_layers { 36 } else { 72 };
+        let bytes: u64 = layouts.iter().map(|layout| layout.bytes().unwrap()).sum();
+        assert_eq!(bytes * owned_layers, 7_249_526_784 / ranks as u64);
+        for rows in [1, 4, 8, 16, 64, 128, 2048, 2752, 4096] {
+            let stage = if rows <= 64 { 64 } else { 4096 };
+            let entries: Vec<_> = requests.iter().enumerate().map(|(index, request)| {
+                let [n, k] = request.layout.shape;
+                let suffix = if request.output == ProjectionOutput::F32 { "_f32" } else { "" };
+                json!({"name":format!("native_attention_n{n}_k{k}_m{stage}{suffix}"),
+                    "capacity_rows":stage,
+                    "pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                    "scalars":[{"type":"int32"}], "scratch_bytes_at_capacity":{"scratch":1024 << index},
+                    "geometry":{"input_features":k,"output_features":n,
+                        "output_dtype":request.output.torch_dtype(),"max_rows":stage,"decode_rows":64,
+                        "scale_block":128,"storage":"row_major_e4m3",
+                        "reduction":"canonical_fp8_gemv64_w8a16"}})
+            }).collect();
+            let manifest = ProgramsManifest::from_manifest(&json!({"programs":entries})).unwrap();
+            let exact = NativePrograms::resolve(&requests, rows, Some(&manifest)).unwrap();
+            assert_eq!(exact.resolution, NativeResolution::Exact);
+            assert_eq!(exact.fp8_scratch_bytes, 2048);
+            assert_eq!(exact.programs.len(), 2);
+            let assumed = NativePrograms::resolve(&requests, rows, None).unwrap();
+            assert_eq!(assumed.programs, exact.programs);
+            assert_eq!(assumed.resolution, NativeResolution::Assumed);
+            assert!(NativePrograms::resolve(&requests, rows, Some(&ProgramsManifest::default())).is_err());
+            if parts == 2 {
+                let wrong = [NativeProgram { layout: &layouts[1], output: ProjectionOutput::Bf16 }];
+                assert!(NativePrograms::resolve(&wrong, rows, Some(&manifest)).is_err(),
+                    "TP2 wo must not substitute a BF16 output for its F32 partial");
+            }
+        }
     }
 }
 
