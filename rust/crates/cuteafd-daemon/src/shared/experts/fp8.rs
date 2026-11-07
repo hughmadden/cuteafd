@@ -486,9 +486,11 @@ impl<'a> Fp8Weights<'a> {
         let mut experts = Self::prepare_with_modules(library, tensors, directory, bf16_directory,
             layers, tp, rank, capacity, budget, modules)?;
         let slicing = tensors.slicing_for_directory(directory, tp);
-        let layout = super::weight_layout::layout(library.cuda_get_device()?, "fp8",
-            super::fp8::regions(tensors, layers, tp, rank, slicing)?)?;
-        super::weight_layout::admit(&layout, 0, 0, budget)?;
+        if !layers.is_empty() {
+            let layout = super::weight_layout::layout(library.cuda_get_device()?, "fp8",
+                super::fp8::regions(tensors, layers, tp, rank, slicing)?)?;
+            super::weight_layout::admit(&layout, 0, 0, budget)?;
+        }
         experts.load_mount(library, tensors, layers, slicing)?;
         Ok(experts)
     }
@@ -514,6 +516,8 @@ impl<'a> Fp8Weights<'a> {
 
     pub(crate) fn load_mount(&mut self, library: &'a NativeLibrary, tensors: &Fp8ExpertTensors,
         layers: &[usize], slicing: Slicing) -> Result<()> {
+        ensure!(self.layers.is_empty(), "native expert weights already published");
+        if layers.is_empty() { return Ok(()); }
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
         let arena = super::weight_layout::arena(device, "fp8",
             super::fp8::regions(tensors, layers, self.tp, self.rank, slicing)?)?;
@@ -878,9 +882,13 @@ impl<'a> Fp8Experts<'a> {
         let mut weights = Fp8Weights::prepare(library, tensors, directory, None, layers,
             tp, rank, capacity, budget)?;
         let bytes = weights.slot_scratch_bytes(capacity)?;
-        let layout = super::weight_layout::layout(library.cuda_get_device()?, "fp8",
-            super::fp8::regions(tensors, layers, tp, rank, tensors.slicing_for_directory(directory, tp))?)?;
-        super::weight_layout::admit(&layout, 0, bytes, budget)?;
+        if layers.is_empty() {
+            ensure!(bytes <= budget, "empty expert window scratch exceeds budget");
+        } else {
+            let layout = super::weight_layout::layout(library.cuda_get_device()?, "fp8",
+                super::fp8::regions(tensors, layers, tp, rank, tensors.slicing_for_directory(directory, tp))?)?;
+            super::weight_layout::admit(&layout, 0, bytes, budget)?;
+        }
         let scratch = Self::allocate_scratch(library, bytes)?;
         weights.load_mount(library, tensors, layers, tensors.slicing_for_directory(directory, tp))?;
         Ok(Self { weights, scratch: Rc::new(scratch) })
@@ -1025,6 +1033,35 @@ mod tests {
             }
         }
         assert_eq!(native.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_window_mount_and_push_keep_no_weight_arena() -> anyhow::Result<()> {
+        use super::*;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        std::fs::hard_link(fixture.module_path(), fixture.directory().join("libcuteafd_fp8moe.so"))?;
+        let root = tempfile::tempdir()?;
+        let catalog = crate::shared::memory::push_fp8::tests::fixture(
+            root.path(), ExpertFormat::Fp8Block128, false)?;
+        let tensors = catalog.fp8().unwrap();
+        let words = [5 | 1 << 8 | 1 << 16 | 1 << 24, 128, 1024, 64, 2, 1024, 1, 7, 0,
+            1, 16, 0, 0, 0, 0, 0];
+        fixture.configure_fp8(&library, &words, &[256, 0, 0, 0, 0, 0])?;
+        let before = fixture.events()?.matches('D').count();
+        let mut mounted = Fp8Weights::load(&library, tensors, fixture.directory(), &[], 1, 0, 1, 256)?;
+        mounted.load_mount(&library, tensors, &[], Slicing::Padded)?;
+        let pushed = Fp8Weights::from_pushed(&library, tensors, fixture.directory(),
+            &[], 1, 0, 1, 256, vec![])?;
+        assert!(mounted.layers.is_empty() && pushed.layers.is_empty());
+        assert_eq!(mounted.resident_bytes() + pushed.resident_bytes(), 0);
+        assert_eq!(fixture.events()?.matches('D').count(), before);
+        let mounted = Fp8Experts::load(&library, tensors, fixture.directory(), &[], 1, 0, 1, 256)?;
+        let pushed = Fp8Experts::from_pushed(&library, tensors, fixture.directory(),
+            &[], 1, 0, 1, 256, vec![])?;
+        assert!(mounted.layers.is_empty() && pushed.layers.is_empty());
+        assert_eq!(fixture.events()?.matches('D').count() - before, 2, "execution scratch only");
         Ok(())
     }
 
