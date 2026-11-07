@@ -345,6 +345,12 @@ impl<'a> RoutedFfn<'a> {
         cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
     }
 
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        prefix: &str) -> Result<()> {
+        let weights = &self.immutable;
+        let native = weights.native.iter().flat_map(|(linears, _)| linears).collect::<Vec<_>>();
+        super::native::inventory_owner(inventory, prefix, weights.weights.iter().map(Some), &native)
+    }
 
     pub fn load(
         device: Device<'a>,

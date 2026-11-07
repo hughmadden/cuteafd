@@ -343,6 +343,13 @@ impl<'a> DenseFfn<'a> {
         )
     }
 
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        prefix: &str) -> Result<()> {
+        let weights = &self.immutable;
+        let native = weights.native.iter().flatten().collect::<Vec<_>>();
+        super::native::inventory_owner(inventory, prefix, weights.weights.iter().map(Some), &native)
+    }
+
     pub fn load_plan(
         device: Device<'a>,
         programs: &'a Programs<'a>,

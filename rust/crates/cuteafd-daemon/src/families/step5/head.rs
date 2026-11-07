@@ -135,6 +135,13 @@ pub(super) struct TargetHeadOwner<'a> {
 }
 
 impl<'a> TargetHeadOwner<'a> {
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        prefix: &str) -> Result<()> {
+        let weights = &self.immutable;
+        let native = weights.native.iter().map(|(linear, _)| linear).collect::<Vec<_>>();
+        super::native::inventory_owner(inventory, prefix, weights.weights.iter().map(Some), &native)
+    }
+
     pub(super) fn device(&self) -> Device<'a> { self.stream.device }
     pub(super) fn workspace_bytes(&self) -> u64 { HeadPlan::plane_bytes(self.rows).expect("admitted rows").iter().sum::<usize>() as u64 }
 

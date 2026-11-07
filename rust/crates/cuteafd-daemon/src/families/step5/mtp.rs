@@ -101,6 +101,12 @@ pub(super) struct InputOwner<'a> {
     rows: usize,
 }
 impl<'a> InputOwner<'a> {
+    fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
+        let weights = &self.immutable;
+        let native = weights.native.iter().map(|(linear, _)| linear).collect::<Vec<_>>();
+        super::native::inventory_owner(inventory, prefix, weights.weights.iter().map(Some), &native)
+    }
+
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint, plan: InputPlan, stream: Rc<Stream<'a>>,
         available: u64, reservations: &[u64], arena: &Arena<'a>, weight_arena: &DeviceWeightArena<'a>) -> Result<Self> {
@@ -232,6 +238,12 @@ pub(super) struct StageOwner<'a> {
     cache_owner: std::cell::Cell<Option<usize>>,
 }
 impl<'a> StageOwner<'a> {
+    fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
+        self.input.inventory(inventory, &format!("{prefix}.input"))?;
+        self.attention.inventory(inventory, &format!("{prefix}.layer"))?;
+        self.head.inventory(inventory, &format!("{prefix}.head"))
+    }
+
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint, stage: usize, rows: usize,
         rope: Rc<super::rope::TargetTables<'a>>, available: u64, reservations: &[u64],
@@ -624,6 +636,14 @@ pub(super) struct Runtime<'a> {
     rank: usize,
 }
 impl<'a> Runtime<'a> {
+    /// Every predictor stage's retained weights; all are views of one MTP arena.
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (stage, owner) in self.stages.borrow().iter().enumerate() {
+            owner.inventory(inventory, &format!("gpu.{}.mtp.{stage}", self.rank))?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load(contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract,
         rope: Rc<super::rope::TargetTables<'a>>, arena: &Arena<'a>, stream: Rc<Stream<'a>>,

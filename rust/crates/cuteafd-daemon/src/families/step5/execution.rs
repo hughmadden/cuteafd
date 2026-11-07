@@ -500,6 +500,29 @@ impl<'e, 'a> Execution<'e, 'a> {
 pub(super) struct LoadedNative<'a>(NativeOwners<'a>);
 
 impl<'a> LoadedNative<'a> {
+    /// Every retained target weight on every rank: attention, FFN and head
+    /// operands plus native trellis owners, each a view of its rank's arena.
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (rank, layers) in self.0.ranks.iter().enumerate() {
+            for (layer, owner) in layers.iter().enumerate() {
+                let Some(owner) = owner else { continue };
+                let prefix = format!("gpu.{rank}.layer.{layer}");
+                match &owner.attention {
+                    Attention::Sliding(attention) => attention.inventory(inventory, &prefix)?,
+                    Attention::Sparse(attention) => attention.inventory(inventory, &prefix)?,
+                }
+                match &owner.ffn {
+                    Ffn::Dense(ffn) => ffn.inventory(inventory, &format!("{prefix}.ffn"))?,
+                    Ffn::Routed(ffn) => ffn.inventory(inventory, &format!("{prefix}.ffn"))?,
+                }
+            }
+        }
+        if let Some(head) = &self.0.head {
+            head.inventory(inventory, &format!("device.{}.head", head.device().id))?;
+        }
+        Ok(())
+    }
+
     /// Predictor weights share the target's admitted owners before publication.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_predictor(&self, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,

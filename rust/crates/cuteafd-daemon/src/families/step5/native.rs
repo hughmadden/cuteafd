@@ -4,7 +4,7 @@
 //! serialized owner per device and lane.
 use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights, Projection, ProjectionLayout, ProjectionScratch};
 use crate::shared::memory::device::Device;
-use crate::shared::memory::weight_arena::{DeviceWeightArena, weight_allocation};
+use crate::shared::memory::{receipts::Inventory, weight_arena::{DeviceWeightArena, weight_allocation}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{dense_trellis::TrellisDType, programs::Programs, CuteafdDeviceBuffer as Buffer};
 use cuteafd_loader::formats::{dense_trellis::TrellisSide, trellis_core::ProjectionScratchLayout};
@@ -20,6 +20,14 @@ pub(super) struct NativeLinear<'a> {
 impl<'a> NativeLinear<'a> {
     pub(super) fn shape(&self) -> [usize; 2] { self.weights.shape }
     pub(super) fn side(&self) -> TrellisSide { self.weights.side }
+
+    /// The three retained trellis owners, named by their arena keys.
+    pub(super) fn inventory(&self, inventory: &mut Inventory<'_>, name: &str) -> Result<()> {
+        for (part, owner) in [("trellis", &self.weights.payload), ("suh", &self.weights.suh), ("svh", &self.weights.svh)] {
+            owner.inventory(inventory, &format!("{name}.{part}"))?;
+        }
+        Ok(())
+    }
 
     /// BF16 [rows, N] from BF16 [rows, K]: the exact BF16-program contract.
     pub(super) fn launch(&self, rows: usize, input: Buffer, output: Buffer, scratch: &ProjectionScratch<'_>,
@@ -130,7 +138,28 @@ pub(super) struct NativeAttention<'a> {
 /// Operand slots (input norm, q, k, v, q_norm, k_norm, g, o) the native core replaces.
 pub(super) const ATTENTION_SLOTS: [usize; 4] = [1, 2, 3, 7];
 
+/// Retained operand slots and native linears of one owner, in load order.
+pub(super) fn inventory_owner<'w, 'a: 'w>(inventory: &mut Inventory<'_>, prefix: &str,
+    weights: impl IntoIterator<Item = Option<&'w crate::shared::memory::device::Allocation<'a>>>,
+    native: &[&NativeLinear<'_>]) -> Result<()> {
+    for (slot, weight) in weights.into_iter().enumerate() {
+        if let Some(weight) = weight { weight.inventory(inventory, &format!("{prefix}.operand{slot}"))?; }
+    }
+    for (index, linear) in native.iter().enumerate() {
+        linear.inventory(inventory, &format!("{prefix}.native{index}"))?;
+    }
+    Ok(())
+}
+
 impl<'a> NativeAttention<'a> {
+    pub(super) fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
+        for (linear, p) in self.qkv.iter().flatten().zip(["q", "k", "v"]) {
+            linear.inventory(inventory, &format!("{prefix}.{p}_proj"))?;
+        }
+        if let Some(o) = &self.o { o.inventory(inventory, &format!("{prefix}.o_proj"))?; }
+        Ok(())
+    }
+
     /// Q/K/V share one route; the output projection may retain native BF16.
     pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &Checkpoint,
         layout: &RankWeightLayout, layer: usize, rows: usize, q: usize, kv: usize, hidden: usize, arena: Option<&DeviceWeightArena<'a>>)

@@ -174,6 +174,16 @@ pub(super) struct SwaLayer<'a> {
 }
 
 impl<'a> SwaLayer<'a> {
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        prefix: &str) -> Result<()> {
+        let weights = &self.immutable;
+        super::native::inventory_owner(inventory, &format!("{prefix}.attention"),
+            weights.weights.iter().map(Option::as_ref), &[])?;
+        if let Some(native) = &weights.native { native.inventory(inventory, &format!("{prefix}.attention"))?; }
+        if let Some(ffn) = &self.ffn { ffn.inventory(inventory, &format!("{prefix}.ffn"))?; }
+        Ok(())
+    }
+
     pub(super) fn device(&self) -> Device<'a> { self.stream.device }
     pub(super) fn rows(&self) -> usize { self.admission.rows }
     pub(super) fn heads(&self) -> usize { self.immutable.heads }
