@@ -19,6 +19,9 @@ impl TargetLayout {
         ensure!(placement.is_some() || !(split_query || split_output), "projection TP2 requires two target GPUs");
         ensure!(placement.as_ref().is_none_or(|map| map.iter().all(|&rank| rank < 2)), "invalid target weight placement");
         let count = if placement.is_some() { 2 } else { 1 };
+        let head_tensor = tensors.get("head.weight").context("missing vocabulary checkpoint operand")?;
+        ensure!(head_tensor.dtype == cuteafd_core::DType::Bf16 && head_tensor.shape == [129280, 5120]
+            && head_tensor.byte_length == 129280 * 10240, "unexpected vocabulary checkpoint geometry");
         let mut requests = vec![BTreeMap::new(); count];
         for layer in 0..40 {
             let rank = placement.map(|map| map[layer]).unwrap_or(0);
@@ -66,12 +69,15 @@ impl TargetLayout {
                 for requests in &mut requests {
                     for stem in ["w1", "w3", "w2"] {
                         let name = format!("layers.{layer}.ffn.shared_experts.{stem}.weight");
-                        insert(requests, name.clone(), 5120 * 1152)?;
-                        insert(requests, packed_scale_name(&name), 5120 * 1152 / 32)?;
+                        let shape = if stem == "w2" { [5120, 2304] } else { [2304, 5120] };
+                        let bytes = fp8_half_bytes(&tensors, &name, shape)?;
+                        insert(requests, name.clone(), bytes)?;
+                        insert(requests, packed_scale_name(&name), bytes / 32)?;
                     }
-                    for (split, stem, bytes) in [(split_query, "wq_b", 1280 * 16384), (split_output, "wo_b", 8192 * 2560)] {
+                    for (split, stem, shape) in [(split_query, "wq_b", [32768, 1280]), (split_output, "wo_b", [5120, 8192])] {
                         if split {
                             let name = format!("layers.{layer}.attn.{stem}.weight");
+                            let bytes = fp8_half_bytes(&tensors, &name, shape)?;
                             insert(requests, name.clone(), bytes)?;
                             insert(requests, packed_scale_name(&name), bytes / 32)?;
                         }
@@ -118,6 +124,21 @@ pub fn draft_layout(catalog: &OfficialV41Catalog) -> Result<WeightArenaLayout> {
     WeightArenaLayout::new("v41/dspark/dense", requests)
 }
 
+fn fp8_half_bytes(tensors: &BTreeMap<&str, &SafetensorsTensorMetadata>, name: &str,
+    shape: [usize; 2]) -> Result<usize> {
+    let tensor = tensors.get(name).with_context(|| format!("missing TP2 weight {name}"))?;
+    ensure!(tensor.dtype == cuteafd_core::DType::F8E4M3 && tensor.shape == shape
+        && tensor.byte_length == (shape[0] * shape[1]) as u64, "unexpected TP2 weight geometry: {name}");
+    let scale = name.strip_suffix(".weight").context("TP2 matrix name lacks weight suffix")?;
+    let scale_name = format!("{scale}.scale");
+    let scale = tensors.get(scale_name.as_str()).with_context(|| format!("missing TP2 scales {scale_name}"))?;
+    ensure!(scale.shape == [shape[0] / 32, shape[1] / 32]
+        && scale.dtype == cuteafd_core::DType::F8E8M0
+        && scale.byte_length == (shape[0] * shape[1] / 1024) as u64,
+        "unexpected TP2 scale geometry: {scale_name}");
+    Ok(usize::try_from(tensor.byte_length)? / 2)
+}
+
 fn insert(requests: &mut BTreeMap<String, usize>, name: String, bytes: usize) -> Result<()> {
     ensure!(bytes > 0 && requests.insert(name.clone(), bytes).is_none(), "invalid or duplicate V4.1 weight {name}");
     Ok(())
@@ -133,4 +154,47 @@ pub fn head_requests(rows: usize, mode: Fp8Head) -> Result<Vec<(String, usize)>>
         requests.push(("head.packed12".into(), cuteafd_core::packed_head::PackedHeadLayout::new(rows, 5120)?.total_bytes()));
     }
     Ok(requests)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn tensor(name: &str, dtype: cuteafd_core::DType, shape: &[usize], bytes: u64) -> SafetensorsTensorMetadata {
+        SafetensorsTensorMetadata { name: name.into(), dtype, shape: shape.to_vec(), byte_offset: 0, byte_length: bytes }
+    }
+
+    #[test]
+    fn tp2_extents_come_from_validated_native_headers() -> Result<()> {
+        let weight = tensor("layers.0.attn.wq_b.weight", cuteafd_core::DType::F8E4M3, &[32768, 1280], 32768 * 1280);
+        let scale = tensor("layers.0.attn.wq_b.scale", cuteafd_core::DType::F8E8M0, &[1024, 40], 1024 * 40);
+        let headers = BTreeMap::from([(weight.name.as_str(), &weight), (scale.name.as_str(), &scale)]);
+        assert_eq!(fp8_half_bytes(&headers, &weight.name, [32768, 1280])?, 16384 * 1280);
+        assert!(fp8_half_bytes(&headers, &weight.name, [1280, 32768]).is_err());
+        let mut invalid = scale.clone();
+        invalid.byte_length *= 4;
+        let headers = BTreeMap::from([(weight.name.as_str(), &weight), (invalid.name.as_str(), &invalid)]);
+        assert!(fp8_half_bytes(&headers, &weight.name, [32768, 1280]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn target_rejects_invalid_placement_and_missing_vocabulary() {
+        let empty = Vec::<SafetensorsTensorMetadata>::new();
+        assert!(TargetLayout::from_headers(&empty, None, false, Fp8Head::All, true, false).is_err());
+        assert!(TargetLayout::from_headers(&empty, Some([2; 40]), false, Fp8Head::All, false, false).is_err());
+        assert!(TargetLayout::from_headers(&empty, None, false, Fp8Head::All, false, false).is_err());
+    }
+
+    #[test]
+    fn head_transient_matches_final_backing_chronology() -> Result<()> {
+        for ranks in [1, 2] {
+            assert_eq!(TargetLayout::vocabulary_transient_bytes(Fp8Head::Packed, ranks)?, 129280 / ranks * 10240);
+            assert_eq!(TargetLayout::vocabulary_transient_bytes(Fp8Head::All, ranks)?, 16 * 10240);
+            for head in [Fp8Head::Off, Fp8Head::Draft] {
+                assert_eq!(TargetLayout::vocabulary_transient_bytes(head, ranks)?, 0);
+            }
+        }
+        assert!(TargetLayout::vocabulary_transient_bytes(Fp8Head::All, 3).is_err());
+        Ok(())
+    }
 }
