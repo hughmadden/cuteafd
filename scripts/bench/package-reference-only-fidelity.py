@@ -329,6 +329,35 @@ def identity_note(path, set_id):
                           'roles and score geometry and differs only in recipe metadata.')
 
 
+def reference_provenance(meta, panel):
+    provenance = {k: meta[k] for k in ('snapshot_identity', 'source_pin', 'platform', 'tokenizers', 'torch',
+                                      'transformers', 'attention', 'mtp', 'use_cache')}
+    if meta.get('source_identity_provider'):
+        provenance['source_identity_provider'] = meta['source_identity_provider']
+    provenance['gates'] = meta['gates'] if 'gates' in meta else {
+        k: meta[k] for k in ('arithmetic', 'expert_storage', 'official_forward', 'fixed_rows') if k in meta}
+    if not provenance['gates']:
+        raise ValueError('golden records no reference gates')
+    # A family's gate block must not hide a separately recorded forward comparison.
+    if 'official_forward' in meta:
+        provenance['official_forward'] = copy.deepcopy(meta['official_forward'])
+    provenance['native_fp32_parameters'] = meta.get(
+        'native_fp32_parameters', 'checkpoint F32 tensors kept F32; all computation in F32')
+    if meta.get('harness_commit'):
+        provenance['harness_commit'] = meta['harness_commit']
+    if meta.get('root_arithmetic') is not None:
+        provenance['root_arithmetic'] = meta['root_arithmetic']
+        provenance['reference_precision'] = reference_precision(meta, panel)
+    if sparse_launch_note(meta):
+        provenance['sparse_attention_launch'] = meta['sparse_attention_launch']
+    return provenance
+
+
+def official_forward_note(meta):
+    comparison = meta.get('official_forward', {}).get('comparison')
+    return f'Forward qualification: {comparison}.\n' if comparison else ''
+
+
 def package(source, out, config, tokenizer_path, license_path, identity=None, *, expected_source_pins=None):
     if out.exists() or not config or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in config) or config in ('.', '..'):
         raise ValueError('output must be fresh and config must be a safe component')
@@ -406,24 +435,7 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
         files.append(dict(window=wid, path=target.name, bytes=target.stat().st_size,
                           sha256=digest(target), shape=[512, 1024], source_full_sha256=entry['sha256']))
         print(f'packaged {config}/{wid}', flush=True)
-    provenance = {k: meta[k] for k in ('snapshot_identity', 'source_pin', 'platform', 'tokenizers', 'torch',
-                                      'transformers', 'attention', 'mtp', 'use_cache')}
-    if meta.get('source_identity_provider'):
-        provenance['source_identity_provider'] = meta['source_identity_provider']
-    # Layer-major goldens record their checks as arithmetic/expert storage/official forward.
-    provenance['gates'] = meta['gates'] if 'gates' in meta else {
-        k: meta[k] for k in ('arithmetic', 'expert_storage', 'official_forward', 'fixed_rows') if k in meta}
-    if not provenance['gates']:
-        raise ValueError('golden records no reference gates')
-    provenance['native_fp32_parameters'] = meta.get(
-        'native_fp32_parameters', 'checkpoint F32 tensors kept F32; all computation in F32')
-    if meta.get('harness_commit'):
-        provenance['harness_commit'] = meta['harness_commit']
-    if meta.get('root_arithmetic') is not None:
-        provenance['root_arithmetic'] = meta['root_arithmetic']
-        provenance['reference_precision'] = reference_precision(meta, panel)
-    if launch_note:
-        provenance['sparse_attention_launch'] = meta['sparse_attention_launch']
+    provenance = reference_provenance(meta, panel)
     if digest(source / 'platform.json') != inventory['platform.json']['sha256']:
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
@@ -478,6 +490,7 @@ def package(source, out, config, tokenizer_path, license_path, identity=None, *,
             f'{standard_generated_note(generated_rows)}'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
             f'{arithmetic}\n'
+            f'{official_forward_note(meta)}'
             f'{launch_note}'
             f'Pinned {runtime_source}, tokenizer runtime, platform and oracle seal hashes are in qualification.json.\n'
             'No engine run is required to finish or publish this dataset.\n'

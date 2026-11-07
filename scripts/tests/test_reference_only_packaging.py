@@ -311,6 +311,28 @@ def test_k31_finalizer_reconstructs_source_identity_and_rejects_tampering(tmp_pa
     assert not (tmp_path / 'out').exists()
 
 
+@pytest.mark.parametrize('separate_gates', [False, True])
+def test_official_forward_roundtrips_into_reference_provenance(separate_gates):
+    import copy
+    meta = dict(snapshot_identity={}, source_pin={}, platform={}, tokenizers='test', torch='test',
+                transformers='test', attention='eager', mtp=False, use_cache=False,
+                official_forward=dict(passed=True, comparison='eager IDs; candidate-native weights; scoring unforced',
+                                      layers=[dict(layer=1, natural_routing=dict(selection_flip_tokens=1))]))
+    if separate_gates:
+        meta['gates'] = {'arithmetic': 'F32'}
+    original = copy.deepcopy(meta)
+    qualification = json.loads(json.dumps({'reference_provenance': packager.reference_provenance(meta, {})}))
+    assert qualification['reference_provenance']['official_forward'] == meta['official_forward']
+    assert 'candidate-native weights; scoring unforced' in packager.official_forward_note(meta)
+    if separate_gates:
+        assert qualification['reference_provenance']['gates'] == meta['gates']
+    assert meta == original
+    without = {key: value for key, value in meta.items() if key != 'official_forward'}
+    without['gates'] = {'arithmetic': 'F32'}
+    assert 'official_forward' not in packager.reference_provenance(without, {})
+    assert packager.official_forward_note(without) == ''
+
+
 def test_reference_role_metrics_and_card_explain_aggregate_nll():
     validation = dict(nll=3.4, scored_tokens=10, nll_gen=.2, nll_ctx=8.2,
                       gen_top1=.95, scored_tokens_gen=6, scored_tokens_ctx=4)
