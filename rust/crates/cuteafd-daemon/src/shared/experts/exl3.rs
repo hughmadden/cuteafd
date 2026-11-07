@@ -121,8 +121,18 @@ fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<Exper
 impl<'a> Exl3Weights<'a> {
     pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         name: &str) -> Result<()> {
+        if let ArenaOwner::Mount(owner) = &self._arena {
+            owner.inventory(inventory, name)?;
+            if let Some(backing) = owner.backing.as_ref().and_then(|a| a.weight_backing()) {
+                for (index, buffer) in self.buffers.iter().enumerate() {
+                    inventory.weight_view(&format!("{name}.{index}"), buffer.buffer,
+                        crate::shared::memory::device::WeightArenaBacking { id: backing.id, buffer: backing.buffer })?;
+                }
+                return Ok(());
+            }
+        }
         let owner = match &self._arena {
-            ArenaOwner::Mount(owner) => owner.buffer,
+            ArenaOwner::Mount(owner) => owner.backing.as_ref().and_then(|a| a.weight_backing()).map_or(owner.buffer, |b| b.buffer),
             ArenaOwner::Push { _rank } => _rank.allocation_buffer(),
         };
         for (index, buffer) in self.buffers.iter().enumerate() {
@@ -185,6 +195,18 @@ impl<'a> Exl3Weights<'a> {
         let started = std::time::Instant::now();
         let mut weights = [devices[0].own(|| Ok(Vec::new()))?, devices[1].own(|| Ok(Vec::new()))?];
         let mut remaining = available;
+        let layouts = (0..2).map(|rank| {
+            let selections = layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank }).collect::<Vec<_>>();
+            let layout = super::weight_layout::layout(devices[rank].id, "exl3",
+                super::exl3::regions(catalog, selections.iter().copied())?)?;
+            let staging = selections.into_iter().map(|layer| Self::plan(catalog, layer))
+                .collect::<Result<Vec<_>>>()?.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0);
+            super::weight_layout::admit(&layout, staging, 0, available[rank])?;
+            Ok(layout)
+        }).collect::<Result<Vec<_>>>()?;
+        let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout))
+            .collect::<Result<Vec<_>>>()?;
         let mut full_bytes = 0;
         let mut pinned_admitted = 0;
         for &layer in layers {
@@ -204,7 +226,7 @@ impl<'a> Exl3Weights<'a> {
                 full_bytes = full_bytes.max(plan.buffers.iter().map(|b| b.initial_words.len() * 4).max().unwrap_or(0));
                 devices[rank].run(|| {
                     let (offsets, bytes) = arena_layout(&plan)?;
-                    let arena = DeviceAllocation::new(devices[rank].library, bytes)?;
+                    let arena = DeviceAllocation::from_allocation(arenas[rank].view(&super::weight_layout::name(ExpertLayer::BackboneTp2 { layer, rank }, 0), bytes)?);
                     let buffers = plan.buffers.iter().zip(offsets).map(|(spec, offset)| {
                         let mut buffer = arena.buffer;
                         // SAFETY: checked arena layout reserves every aligned buffer.
@@ -341,6 +363,16 @@ impl<'a> Exl3Weights<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<Self> {
+        ensure!(Self::plan(catalog, layer)?.peak_device_bytes()? <= available_device_bytes,
+            "EXL3 weights and staging exceed admission");
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let arena = super::exl3::arena(device, catalog, [layer])?;
+        Self::load_into(library, catalog, layer, available_device_bytes, &arena)
+    }
+
+    pub(crate) fn load_into(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        layer: ExpertLayer, available_device_bytes: usize,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>) -> Result<Self> {
         let layout = planned_residency(catalog, layer)?;
         let budget = budget(catalog, &layout)?;
         ensure!(
@@ -349,7 +381,7 @@ impl<'a> Exl3Weights<'a> {
             budget.resident_bytes
         );
         let (offsets, bytes) = arena_layout(&layout)?;
-        let arena = DeviceAllocation::new(library, bytes)?;
+        let arena = DeviceAllocation::from_allocation(arena.view(&super::weight_layout::name(layer, 0), bytes)?);
         let buffers: Vec<_> = layout.buffers.iter().zip(offsets).map(|(spec, offset)| {
             let mut buffer = arena.buffer;
             buffer.ptr = unsafe { buffer.ptr.cast::<u8>().add(offset).cast() };
@@ -495,6 +527,76 @@ impl<'a> Exl3Weights<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arena_mount_exl3_views_preserve_all_tensor_destinations() -> Result<()> {
+        use crate::shared::memory::device::Device;
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(2, 4);
+        let tensors = tensors.into_iter().filter(|tensor| !tensor.0.contains(".experts.")
+            || tensor.0.contains(".experts.0.")).collect::<Vec<_>>();
+        let mut config = qwen4_config(2);
+        config["text_config"]["num_experts"] = 1.into();
+        config["text_config"]["num_experts_per_tok"] = 1.into();
+        write_snapshot(root.path(), &config, &tensors, None);
+        let path = root.path().join("model-00001-of-00001.safetensors");
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        use std::os::unix::fs::FileExt;
+        for tensor in cuteafd_loader::read_safetensors_metadata(&path)? {
+            if tensor.name.ends_with(".mcg") {
+                file.write_all_at(&0xcbac1fedu32.to_le_bytes(), tensor.byte_offset)?;
+            }
+        }
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let device = Device { library: &library, id: 1 };
+        for world in [1, 2] {
+            for rank in 0..world {
+                let selections = (0..2).map(|layer| if world == 1 { ExpertLayer::BackboneFull { layer } }
+                    else { ExpertLayer::BackboneTp2 { layer, rank } }).collect::<Vec<_>>();
+                let before = fixture.events()?.matches('D').count();
+                let arena = super::arena(device, &catalog, selections.iter().copied())?;
+                let weights = device.run(|| selections.into_iter().map(|selection|
+                    Exl3Weights::load_into(&library, &catalog, selection, usize::MAX, &arena))
+                    .collect::<Result<Vec<_>>>())?;
+                assert_eq!(fixture.events()?.matches('D').count() - before, 1);
+                let layout = arena.layout().clone();
+                drop(arena);
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(
+                    cuteafd_loader::placement::planner::CoordinatorDevices::new(&[1])?, "fixture",
+                    cuteafd_loader::placement::planner::Lifetime::TARGET,
+                    cuteafd_core::memory_layout::Category::Experts, "expert fixture");
+                for (index, weight) in weights.iter().enumerate() {
+                    weight.allocation_receipts(&mut inventory, &format!("layer.{index}"))?;
+                }
+                super::super::weight_layout::assert_receipts(&inventory.receipts, &[layout])?;
+                for weight in &weights {
+                    let mut staging = vec![0; weight.layout.staging_bytes()];
+                    let mut scratch = vec![0; weight.layout.scratch_bytes(&catalog)? * 64];
+                    for index in 0..weight.layout.loads.len() {
+                        let bytes = weight.layout.read_into(&catalog, index, &mut staging, &mut scratch)?;
+                        for &(buffer, offset) in &weight.layout.loads[index].destinations {
+                            let source = weight.buffers[buffer].buffer;
+                            ensure!(offset + bytes <= source.bytes, "fixture destination bounds");
+                            // SAFETY: checked span belongs to the retained weight backing.
+                            let source = CuteafdDeviceBuffer { ptr: unsafe {
+                                source.ptr.cast::<u8>().add(offset).cast() }, bytes, ..source };
+                            let mut actual = vec![0; bytes];
+                            device.run(|| library.copy_d2h(&mut actual, source))?;
+                            assert_eq!(actual, staging[..bytes]);
+                        }
+                    }
+                }
+                drop(weights);
+            }
+        }
+        assert_eq!(fixture.device_free_mismatch(&library)?.0, 0);
+        Ok(())
+    }
+
     use super::*;
 
     #[test]
@@ -622,4 +724,17 @@ mod tests {
         );
         Ok(())
     }
+}
+
+pub(crate) fn arena<'a>(device: crate::shared::memory::device::Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+    layers: impl IntoIterator<Item = super::layer::ExpertLayer>) -> Result<crate::shared::memory::weight_arena::DeviceWeightArena<'a>> {
+    super::weight_layout::arena(device, "exl3", regions(catalog, layers)?)
+}
+
+pub(crate) fn regions(catalog: &cuteafd_loader::OfficialV41Catalog,
+    layers: impl IntoIterator<Item = super::layer::ExpertLayer>) -> Result<Vec<(String, usize)>> {
+    layers.into_iter().map(|layer| {
+        let layout = super::exl3::planned_residency(catalog, layer)?;
+        Ok((super::weight_layout::name(layer, 0), layout.device_arena_layout()?.1))
+    }).collect()
 }

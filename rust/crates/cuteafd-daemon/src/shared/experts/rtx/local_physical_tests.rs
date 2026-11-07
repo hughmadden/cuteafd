@@ -193,6 +193,13 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
         assert!(pair.start_checks(true)?);
         let mut actual = Inventory::new(CoordinatorDevices::new(&[0, 1])?, "glm", Lifetime::TARGET, Category::Experts, "resident expert owners");
         pair.allocation_receipts(&mut actual, "expert.routed")?;
+        if !native && storage == LocalStorage::Mount {
+            let layouts = (0..2).map(|rank| crate::shared::experts::weight_layout::layout(
+                devices[rank].id, "exl3", crate::shared::experts::exl3::regions(catalog,
+                    selected.layers.iter().map(|&layer| crate::shared::experts::layer::ExpertLayer::BackboneTp2 { layer, rank }))?))
+                .collect::<Result<Vec<_>>>()?;
+            crate::shared::experts::weight_layout::assert_receipts(&actual.receipts, &layouts)?;
+        }
         let actual_count = actual.receipts.iter().filter(|r| r.allocation.location != Location::HOST).count();
         let actual: BTreeMap<_, _> = actual.receipts.into_iter().filter(|r| r.allocation.location != Location::HOST)
             .map(|r| (r.allocation.id.clone(), r.allocation)).collect();

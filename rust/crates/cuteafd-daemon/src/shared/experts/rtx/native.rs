@@ -354,27 +354,13 @@ impl<'a> NativeTp2<'a> {
             output_policy,
             format.is_nvfp4(),
         )?;
-        let mut resident = workspace;
-        for &layer in layers {
-            let plan = ExpertWeights::plan(
-                device.library,
-                catalog,
-                ExpertLayer::BackboneTp2 {
-                    layer,
-                    rank: rank as usize,
-                },
-            )?;
-            resident = resident
-                .checked_add(plan.resident_bytes)
-                .context("TP2 resident overflow")?;
-            ensure!(
-                resident
-                    .checked_add(plan.device_staging_bytes)
-                    .context("TP2 peak overflow")?
-                    <= budget,
-                "TP2 weights + workspace + staging exceed budget {budget}"
-            );
-        }
+        let selections = layers.iter().map(|&layer| ExpertLayer::BackboneTp2 {
+            layer, rank: rank as usize }).collect::<Vec<_>>();
+        let layout = ExpertWeights::arena_layout(device, catalog, selections.iter().copied())?;
+        let plans = selections.into_iter().map(|layer| device.run(||
+            ExpertWeights::plan(device.library, catalog, layer))).collect::<Result<Vec<_>>>()?;
+        crate::shared::experts::weight_layout::admit(&layout,
+            plans.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0), workspace, budget)?;
         Ok(workspace)
     }
 
@@ -485,36 +471,24 @@ impl<'a> NativeTp2<'a> {
         let weights = if ExpertFormat::of(catalog).is_nvfp4()
             || std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0")
         {
-            let mut remaining = available;
-            let mut weights = [
-                devices[0].own(|| Ok(Vec::new()))?,
-                devices[1].own(|| Ok(Vec::new()))?,
-            ];
-            for &layer in &layers {
-                // SAFETY: fresh, unaliased GPU owners only; both workers drain
-                // before returning and DeviceOwner destroys on its owning GPU.
-                let pair = unsafe {
-                    cuteafd_ffi::synchronized_load::load_pair(|rank| {
-                        devices[rank].own(|| {
-                            let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
-                            Ok(vec![ExpertWeights::load(
-                                devices[rank].library,
-                                catalog,
-                                ExpertLayer::BackboneTp2 { layer, rank },
-                                remaining[rank],
-                            )?])
-                        })
-                    })
-                }?;
-                for (rank, mut loaded) in pair.into_iter().enumerate() {
-                    remaining[rank] -= loaded[0].budget().resident_bytes;
-                    devices[rank].run(|| {
-                        weights[rank].append(loaded.get_mut());
-                        Ok(())
-                    })?;
-                }
-            }
-            weights
+            // SAFETY: each worker builds its own fresh rank backing and drains
+            // all uploads. DeviceOwner retires that backing on its original GPU.
+            unsafe {
+                cuteafd_ffi::synchronized_load::load_pair(|rank| devices[rank].own(|| {
+                    let _memory_scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
+                    let arena = ExpertWeights::arena(devices[rank], catalog,
+                        layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank }))?;
+                    let mut remaining = available[rank];
+                    let mut loaded = Vec::with_capacity(layers.len());
+                    for &layer in &layers {
+                        let weight = ExpertWeights::load_into(devices[rank].library, catalog,
+                            ExpertLayer::BackboneTp2 { layer, rank }, remaining, &arena)?;
+                        remaining -= weight.budget().resident_bytes;
+                        loaded.push(weight);
+                    }
+                    Ok(loaded)
+                }))
+            }?
         } else {
             ExpertWeights::load_tp2_pair(devices, catalog, &layers, available)?
         };
@@ -591,10 +565,12 @@ impl<'a> NativeTp2<'a> {
             NativeOutputPolicy::TokenSums,
         )?;
         let weights = device.own(|| {
+            let arena = ExpertWeights::arena(device, catalog,
+                layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank: rank as usize }))?;
             let mut loaded = Vec::with_capacity(layers.len());
             let mut remaining = budget - workspace_bytes;
             for &layer in &layers {
-                let weight = ExpertWeights::load(
+                let weight = ExpertWeights::load_into(
                     device.library,
                     catalog,
                     ExpertLayer::BackboneTp2 {
@@ -602,6 +578,7 @@ impl<'a> NativeTp2<'a> {
                         rank: rank as usize,
                     },
                     remaining,
+                    &arena,
                 )?;
                 remaining -= weight.budget().resident_bytes;
                 loaded.push(weight);

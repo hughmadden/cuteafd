@@ -667,6 +667,7 @@ pub(super) fn load_fp8<'a>(
     }
     let pushed = push.map(|stream| super::push_fp8::load(library, catalog, config, &groups,
         totals.resident, stream)).transpose()?.flatten();
+    let mut resident = totals.resident;
     if let Some(layers) = pushed {
         // Match the prepared package groups without ever allocating mount weights.
         for layer in layers {
@@ -677,11 +678,22 @@ pub(super) fn load_fp8<'a>(
     } else {
         // Failed candidates have crossed the all-rank drain barrier. Reuse the
         // original modules; no second package preparation on fallback.
+        let regions = groups.iter().map(|group| super::super::fp8::regions(
+            &group.tensors, &group.layers, config.world, config.rank, group.slicing))
+            .collect::<Result<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>();
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let layout = super::super::weight_layout::layout(device.id, "fp8", regions)?;
+        let peak = spark_admission_budget(config, layout.bytes(), 0, totals.pinned, totals.host, workspace)?;
+        ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+            "physical expert arena startup peak exceeds configured device budget");
+        admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+        resident = layout.bytes();
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
         for (owner, group) in owners.iter_mut().zip(&groups) {
-            owner.load_mount(library, &group.tensors, &group.layers, group.slicing)?;
+            owner.load_mount_into(library, &group.tensors, &group.layers, group.slicing, &arena)?;
         }
     }
-    Ok((Weights::Fp8(owners.into_iter().map(Rc::new).collect()), config.device_budget - totals.resident))
+    Ok((Weights::Fp8(owners.into_iter().map(Rc::new).collect()), config.device_budget - resident))
 }
 
 pub(super) fn load_exl3<'a>(
@@ -735,25 +747,35 @@ pub(super) fn load_exl3<'a>(
     tracing::info!(rank=config.rank, resident_bytes=resident, device_staging_bytes=staging,
         pinned_host_bytes=pinned, read_scratch_bytes=scratch, load_peak_bytes=peak.load_peak,
         serve_peak_bytes=peak.serve_peak, "EXL3 Spark admitted loader peak");
+    ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+        "physical expert arena startup peak exceeds configured device budget");
     admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
     if let Some(stream) = push {
         if let Some(weights) = super::push::load(library, catalog, config, &layers, &plans, resident, stream)? {
             return Ok((Weights::Exl3(Rc::new(weights)), config.device_budget - resident));
         }
     }
-    let mut remaining = config.device_budget;
+    let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+    let layout = super::super::weight_layout::layout(device.id, "exl3",
+        super::super::exl3::regions(catalog,
+            layers.iter().map(|&layer| config.exl3_selection(layer)).collect::<Result<Vec<_>>>()?)?)?;
+    let peak = spark_admission_budget(config, layout.bytes(), staging, pinned, scratch, workspace)?;
+    ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+        "physical expert arena startup peak exceeds configured device budget");
+    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+    let remaining = config.device_budget.checked_sub(layout.bytes()).context("EXL3 mount arena exceeds budget")?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {
         let plan = &plans[index];
         let started = std::time::Instant::now();
-        let weight = Exl3Weights::load(
+        let weight = Exl3Weights::load_into(
             library,
             catalog,
             config.exl3_selection(layer)?,
-            remaining,
+            config.device_budget,
+            &arena,
         )?;
-        remaining = remaining
-            .checked_sub(plan.resident_bytes)
-            .context("EXL3 resident budget exhausted")?;
+
         tracing::info!(
             rank = config.rank,
             layer,

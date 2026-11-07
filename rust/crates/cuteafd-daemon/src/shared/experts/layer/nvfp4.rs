@@ -158,6 +158,7 @@ impl<'a> Nvfp4Side<'a> {
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,
         available_device_bytes: usize,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
     ) -> Result<([ResidentPlane<'a>; 4], Self)> {
         let (intermediate, experts) = Self::rank_planes(layer, catalog)?;
         let kernel_intermediate = Self::kernel_intermediate(library, catalog, layer)?;
@@ -169,18 +170,17 @@ impl<'a> Nvfp4Side<'a> {
         );
         let sizes = plane_sizes(kernel_intermediate);
         let mut owned = Vec::with_capacity(4);
-        for size in sizes {
-            owned.push(DeviceAllocation::new(
-                library,
-                size.checked_mul(experts).context("NVFP4 slab overflow")?,
-            )?);
+        for (index, size) in sizes.into_iter().enumerate() {
+            owned.push(DeviceAllocation::from_allocation(arena.view(
+                &super::super::weight_layout::name(layer, index),
+                size.checked_mul(experts).context("NVFP4 slab overflow")?)?));
         }
         let buffers: [DeviceAllocation<'a>; 4] =
             owned.try_into().ok().expect("four NVFP4 slabs");
-        let alphas = DeviceAllocation::new(library, experts * 4)?;
-        let down_alphas = DeviceAllocation::new(library, experts * 4)?;
-        let input_scales_device = DeviceAllocation::new(library, experts * 4)?;
-        let down_input_scales_device = DeviceAllocation::new(library, experts * 4)?;
+        let alphas = DeviceAllocation::from_allocation(arena.view(&super::super::weight_layout::name(layer, 4), experts * 4)?);
+        let down_alphas = DeviceAllocation::from_allocation(arena.view(&super::super::weight_layout::name(layer, 5), experts * 4)?);
+        let input_scales_device = DeviceAllocation::from_allocation(arena.view(&super::super::weight_layout::name(layer, 6), experts * 4)?);
+        let down_input_scales_device = DeviceAllocation::from_allocation(arena.view(&super::super::weight_layout::name(layer, 7), experts * 4)?);
         let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes)?;
         let mut hosts = (0..EXPERT_READ_LANES)
             .map(|_| HostAllocation::new(library, budget.pinned_host_bytes / EXPERT_READ_LANES))

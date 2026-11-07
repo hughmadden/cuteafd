@@ -120,13 +120,23 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
             return Ok((backend::Weights::Exlr8(weights), config.device_budget - resident - retained_host));
         }
     }
+    let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+    let layout = super::super::weight_layout::layout(device.id, "exlr8",
+        plans.iter().map(|plan| (format!("layer.{}", plan.layer), plan.resident_bytes)))?;
+    let peak = spark_admission_budget(config, layout.bytes(), 0, pinned, scratch, retained)?;
+    ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+        "physical expert arena startup peak exceeds configured device budget");
+    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+    let remaining = config.device_budget.checked_sub(layout.bytes()).context("EXLR8 mount arena exceeds budget")?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
     let mut plans: Vec<_> = plans.into_iter().map(Some).collect();
-    let mut remaining = config.device_budget;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, _| {
         let plan = plans[index].take().context("EXLR8 resident plan loaded twice")?;
         let bytes = plan.resident_bytes;
-        let weight = Exlr8Weights::load(library, plan, remaining - workspace)?;
-        remaining = remaining.checked_sub(bytes).context("EXLR8 resident budget exhausted")?;
+        let allocation = crate::shared::memory::DeviceAllocation::from_allocation(
+            arena.view(&format!("layer.{}", plan.layer), bytes)?);
+        let weight = Exlr8Weights::load_into(library, plan,
+            config.device_budget - workspace, allocation)?;
         Ok(weight)
     })?;
     tracing::info!(rank = config.rank, resident, workspace, k1_workspace_bytes, fallback_staging, retained_host,
@@ -422,7 +432,7 @@ mod tests {
         let admission = source.find("admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?").unwrap();
         let order = source.find("crate::shared::experts::load_in_rank_order(&layers, config.rank").unwrap();
         let take = source.find("plans[index].take()").unwrap();
-        let upload = source.find("Exlr8Weights::load(library, plan, remaining - workspace)?").unwrap();
+        let upload = source.find("Exlr8Weights::load_into(library, plan,").unwrap();
         assert!(admission < order && order < take && take < upload);
     }
 

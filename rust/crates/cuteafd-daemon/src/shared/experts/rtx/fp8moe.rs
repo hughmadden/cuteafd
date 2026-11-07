@@ -116,6 +116,11 @@ impl<'a> Fp8MoeTp2<'a> {
         ensure!(resident.checked_add(plan.workspace_bytes).context("FP8 MoE TP2 allocation size overflow")? <= budget,
             "FP8 MoE TP2 rank {rank} needs {resident} resident + {} workspace bytes; budget {budget}",
             plan.workspace_bytes);
+        if pushed.is_none() {
+            let layout = crate::shared::experts::weight_layout::layout(device.id, "fp8",
+                crate::shared::experts::fp8::regions(tensors, &layers, 2, rank, plan.slicing)?)?;
+            crate::shared::experts::weight_layout::admit(&layout, 0, plan.workspace_bytes, budget)?;
+        }
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let completion = RankCompletion::new(Event::new(device)?);
         let experts = device.own(|| match pushed {
@@ -149,9 +154,10 @@ impl<'a> Fp8MoeTp2<'a> {
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let plans = [Self::plan(tensors, directory, &layers, 0, max_rows)?, Self::plan(tensors, directory, &layers, 1, max_rows)?];
         for rank in 0..2 {
-            let required = plans[rank].resident_layer_bytes.checked_mul(layers.len())
-                .and_then(|n| n.checked_add(plans[rank].workspace_bytes)).context("FP8 MoE TP2 allocation overflow")?;
-            ensure!(required <= budgets[rank], "FP8 MoE TP2 rank {rank} needs {required} bytes; budget {}", budgets[rank]);
+            let layout = crate::shared::experts::weight_layout::layout(devices[rank].id, "fp8",
+                crate::shared::experts::fp8::regions(tensors, &layers, 2, rank, plans[rank].slicing)?)?;
+            crate::shared::experts::weight_layout::admit(&layout, 0,
+                plans[rank].workspace_bytes, budgets[rank])?;
         }
         if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
             let ranks = [
