@@ -74,6 +74,13 @@ fn driver_page_tables_preserve_backings_aliases_activation_and_lifetimes() {
         assert_eq!(driver_page_table_bytes(bytes), expected);
     }
     assert_eq!(driver_page_table_bytes(u64::MAX), u64::MAX / 512 + 1);
+    cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+        let mut overridden = contract.clone();
+        let mut overridden_budgets = budgets.clone();
+        search::apply_reserve_override(&mut overridden, &mut overridden_budgets);
+        assert_eq!(overridden.components.iter().filter(|component|
+            matches!(component.kind, ComponentKind::DriverPageTables { .. })).count(), 4);
+    });
 }
 
 #[test]
@@ -93,6 +100,113 @@ fn driver_page_table_staircase_limits_pool_without_rounding_slope() {
         let plan = solve(request(), vec![budget(bytes), host.clone()], &Prepared(contract.clone())).unwrap();
         assert_eq!(plan.pool_tokens, expected * 64);
         assert!(plan.facts.driver_page_tables.iter().any(|a| a.backing == "mapped"));
+    }
+}
+
+#[test]
+fn driver_models_preserve_physical_backings_opaque_costs_and_fixed_replay() {
+    let maximum = 8;
+    let spark = Location { device: Device::Spark(0), domain: Domain::Managed };
+    let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+    let option = contract.variables.len();
+    contract.variables.push(Variable::Encoder(vec![0, 1]));
+    let curve = ByteCurve::linear(1, 4097, maximum);
+    let arena = Allocation::buffer("arena", spark, 1, Lifetime::RESIDENT, Category::Experts, "experts");
+    let mut owner = Component::allocation(arena.clone(), curve.clone(), false, maximum);
+    owner.byte_extent(curve.clone()).unwrap();
+    owner.activation = Activation::choice(option, 0);
+    contract.components.push(owner);
+    let mut alias = arena;
+    alias.id = "arena.alias".into();
+    alias.view = Some(View { backing: "arena".into(), offset: 0 });
+    let mut alias = Component::allocation(alias, ByteCurve::fixed(1, maximum), false, maximum);
+    alias.activation = Activation::choice(option, 0);
+    contract.components.push(alias);
+    contract.components.push(Component {
+        activation: Activation::choice(option, 0), bytes: curve,
+        kind: ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena,
+            location: spark, lifetime: Lifetime::RESIDENT, backing: "arena".into() },
+    });
+    contract.components.push(Component::allocation(
+        Allocation::buffer("portable", Location::PINNED, 513, Lifetime::TARGET, Category::Prefix, "prefix"),
+        ByteCurve::fixed(513, maximum), false, maximum));
+    contract.add_driver_page_tables();
+    contract.add_driver_page_tables();
+    let mut host = budget(1 << 30);
+    host.id = "host".into();
+    host.locations = vec![Location::PINNED];
+    let mut worker = budget(1 << 30);
+    worker.id = "spark".into();
+    worker.locations = vec![spark];
+    let budgets = vec![budget(1 << 30), host, worker];
+    let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+    for selected in [&[0, 0, 0, 0][..], &[0, 0, 0, 1][..]] {
+        for pages in 1..=maximum {
+            let owners = contract.facts(selected, pages).unwrap();
+            let phases = evaluate(&owners, &budgets).unwrap();
+            assert_eq!(compiled.phases(&budgets, selected, pages).unwrap(), phases);
+            let json = serde_json::to_vec(&owners).unwrap();
+            let restored: Facts = serde_json::from_slice(&json).unwrap();
+            let mut replay = Contract::fixed(64, 1, 1, restored);
+            replay.add_driver_page_tables();
+            replay.add_driver_page_tables();
+            replay.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+            assert_eq!(replay.facts(&[0, 0], 1).unwrap(), owners);
+            for phase in phases.iter().filter(|row| row.budget == "spark") {
+                let bytes = if selected[option] == 0 { 1 + (pages - 1) * 4097 } else { 0 };
+                assert_eq!((phase.owned, phase.opaque), (bytes, DriverPageTableModel::Sm121Arena.bytes(bytes)));
+            }
+            for row in &owners.driver_page_tables {
+                let mut wrong_model = owners.clone();
+                wrong_model.driver_page_tables.iter_mut().find(|item| item.backing == row.backing).unwrap().model =
+                    match row.model {
+                        DriverPageTableModel::Sm120Portable => DriverPageTableModel::Sm121Arena,
+                        DriverPageTableModel::Sm121Arena => DriverPageTableModel::Sm120Portable,
+                    };
+                assert!(matches!(evaluate(&wrong_model, &budgets), Err(Refusal::InvalidFact(_))));
+            }
+            if selected[option] == 0 {
+                let mut alias = owners.clone();
+                alias.driver_page_tables.iter_mut().find(|row| row.backing == "arena").unwrap().backing = "arena.alias".into();
+                assert!(matches!(evaluate(&alias, &budgets), Err(Refusal::InvalidFact(_))));
+                let mut stale = owners.clone();
+                stale.driver_page_tables.iter_mut().find(|row| row.backing == "arena").unwrap().mapped_bytes += 1;
+                assert!(matches!(evaluate(&stale, &budgets), Err(Refusal::InvalidFact(_))));
+                let mut wrong_owner = owners.clone();
+                wrong_owner.allocations.iter_mut().find(|owner| owner.id == "arena").unwrap().category = Category::Workspace;
+                assert!(matches!(evaluate(&wrong_owner, &budgets), Err(Refusal::InvalidFact(_))));
+            }
+        }
+    }
+}
+
+#[test]
+fn spark_driver_staircase_matches_exact_search_and_affine_pricing() {
+    let maximum = 8;
+    let spark = Location { device: Device::Spark(0), domain: Domain::Managed };
+    for slope in [4096, 4097] {
+        let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+        let curve = ByteCurve::linear(1, slope, maximum);
+        let mut owner = Component::allocation(
+            Allocation::buffer("arena", spark, 1, Lifetime::RESIDENT, Category::Experts, "experts"),
+            curve.clone(), false, maximum);
+        owner.byte_extent(curve.clone()).unwrap();
+        contract.components.push(owner);
+        contract.components.push(Component { activation: Activation::always(), bytes: curve,
+            kind: ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm121Arena,
+                location: spark, lifetime: Lifetime::RESIDENT, backing: "arena".into() } });
+        for bytes in [4144, 4145, 8241, 8242, 8243, 12400] {
+            let expected = (1..=maximum).filter(|pages| {
+                let arena = 1 + (pages - 1) * slope;
+                arena + DriverPageTableModel::Sm121Arena.bytes(arena) <= bytes
+            }).max().unwrap();
+            let mut worker = budget(bytes);
+            worker.id = "spark".into();
+            worker.locations = vec![spark];
+            let plan = solve(request(), vec![budget(1 << 30), worker], &Prepared(contract.clone())).unwrap();
+            assert_eq!(plan.pool_tokens, expected * 64, "slope={slope}, budget={bytes}");
+            assert_eq!(plan.facts.driver_page_tables.len(), 1);
+        }
     }
 }
 

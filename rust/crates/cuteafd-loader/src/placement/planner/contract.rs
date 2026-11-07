@@ -196,8 +196,8 @@ pub enum ComponentKind {
     Sequential(Sequential),
     Reservation(Reservation),
     Allowance(Allowance),
-    /// `bytes` is the portable pinned backing extent, not its driver residency.
-    DriverPageTables { location: Location, lifetime: Lifetime, backing: String },
+    /// `bytes` is the physical backing extent, not its driver residency.
+    DriverPageTables { model: DriverPageTableModel, location: Location, lifetime: Lifetime, backing: String },
     /// Weight residency can outlive or precede the future allocation ledger.
     ResidentWeight(ResidentWeight),
 }
@@ -336,7 +336,7 @@ impl Contract {
             activation: Activation::always(),
             bytes: ByteCurve::fixed(mapping.mapped_bytes, maximum_pages),
             kind: ComponentKind::DriverPageTables {
-                location: mapping.location, lifetime: mapping.lifetime, backing: mapping.backing,
+                model: mapping.model, location: mapping.location, lifetime: mapping.lifetime, backing: mapping.backing,
             },
         }));
         components.extend(facts.resident_weights.into_iter().map(|owner| {
@@ -371,7 +371,8 @@ impl Contract {
     /// Portable CUDA host backings map into every coordinator context. Aliases
     /// do not register storage again; Spark arena page tables have their own row.
     pub fn add_driver_page_tables(&mut self) {
-        self.components.retain(|component| !matches!(component.kind, ComponentKind::DriverPageTables { .. }));
+        self.components.retain(|component| !matches!(component.kind,
+            ComponentKind::DriverPageTables { model: DriverPageTableModel::Sm120Portable, .. }));
         let mut mappings = Vec::new();
         for component in &self.components {
             let owner = match &component.kind {
@@ -389,6 +390,7 @@ impl Contract {
                         activation: component.activation.clone(),
                         bytes: component.bytes.clone(),
                         kind: ComponentKind::DriverPageTables {
+                            model: DriverPageTableModel::Sm120Portable,
                             location: Location::coordinator(gpu as u8), lifetime, backing: backing.clone(),
                         },
                     });
@@ -454,9 +456,9 @@ impl Contract {
                     allowance.bytes = bytes;
                     result.allowances.push(allowance);
                 }
-                ComponentKind::DriverPageTables { location, lifetime, backing } => {
+                ComponentKind::DriverPageTables { model, location, lifetime, backing } => {
                     result.driver_page_tables.push(DriverPageTable {
-                        location: *location, lifetime: *lifetime, backing: backing.clone(), mapped_bytes: bytes,
+                        model: *model, location: *location, lifetime: *lifetime, backing: backing.clone(), mapped_bytes: bytes,
                     });
                 }
                 ComponentKind::ResidentWeight(template) => {

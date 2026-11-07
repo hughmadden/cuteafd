@@ -166,13 +166,39 @@ pub const SPARK_WORKER_PROCESS_RESIDENT: &[SparkWorkerProcessResident] = &[
 pub const SPARK_WORKER_PROCESS_RESIDENT_BYTES: u64 = SPARK_WORKER_PROCESS_RESIDENT[0].bytes();
 pub const SPARK_WORKER_PROCESS_RESIDENT_GROUP: &str = "Spark worker process resident";
 pub const SPARK_WORKER_PROCESS_RESIDENT_SOURCE: &str = SPARK_WORKER_PROCESS_RESIDENT[0].source;
-pub const SPARK_ARENA_DRIVER_OVERHEAD_GROUP: &str = "driver page tables";
-pub const SPARK_ARENA_DRIVER_OVERHEAD_SOURCE: &str = "moa ARM/SM121 driver 580.178.04 actual-worker 40.508/75.059/103.652-GiB arenas, 2026-11-07 #1454: zero-intercept VmallocUsed fit 10.052338 MiB/GiB and SecPageTables 1.949590 MiB/GiB, calibrated to 40+8 B/page; nvidia_pte_t 16 B/page and nv_dma pages[] 8 B/page source-known, remaining vmalloc 16 B/page unattributed; no fitted intercept or maximum envelope";
+pub const DRIVER_PAGE_TABLES_GROUP: &str = "driver page tables";
 
-/// Kernel-field calibration: 40 B/page vmalloc metadata plus 8 B/page secondary
-/// tables. The whole-host reclaim delta is noisy and is not a fixed allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverPageTableModel {
+    Sm120Portable,
+    Sm121Arena,
+}
+impl DriverPageTableModel {
+    pub fn quantum(self) -> u64 {
+        match self { Self::Sm120Portable => 512, Self::Sm121Arena => 4096 }
+    }
+
+    pub fn bytes_per_quantum(self) -> u64 {
+        match self { Self::Sm120Portable => 1, Self::Sm121Arena => 48 }
+    }
+
+    /// Round once per physical backing, not once per logical pool page or view.
+    pub fn bytes(self, backing_bytes: u64) -> u64 {
+        backing_bytes.div_ceil(self.quantum()) * self.bytes_per_quantum()
+    }
+
+    pub fn source(self) -> &'static str {
+        match self {
+            Self::Sm120Portable => "SM120 CUDA 13.2, RTX PRO 6000 both contexts, Portable|Mapped allocation and Portable registration 1/4/16/32 GiB, 2026-11-07: mapped bytes/512, zero intercept and residuals; cudaMalloc control zero",
+            Self::Sm121Arena => "moa ARM/SM121 driver 580.178.04 actual-worker 40.508/75.059/103.652-GiB arenas, 2026-11-07 #1454: zero-intercept VmallocUsed fit 10.052338 MiB/GiB and SecPageTables 1.949590 MiB/GiB, calibrated to 40+8 B/page; nvidia_pte_t 16 B/page and nv_dma pages[] 8 B/page source-known, remaining vmalloc 16 B/page unattributed; no fitted intercept or maximum envelope",
+        }
+    }
+}
+
+/// The live worker and offline receipt use the same SM121 arena calibration.
 pub fn spark_arena_driver_overhead_bytes(resident: u64) -> u64 {
-    (u128::from(resident).div_ceil(4096) * 48) as u64
+    DriverPageTableModel::Sm121Arena.bytes(resident)
 }
 
 pub fn calibrated_kimi_spark(selected: Option<(crate::ExpertGeometry, usize, u32)>) -> bool {
@@ -216,16 +242,26 @@ pub fn charge_spark_runtime(device: &mut DeviceLayout) -> Option<()> {
     if device.kind != DeviceKind::Spark { return Some(()); }
     let resident = device.items.iter().filter(|item| item.category == Category::Experts)
         .try_fold(0u64, |sum, item| sum.checked_add(item.bytes))?;
+    let driver_present = device.items.iter().any(|item|
+        item.group == DRIVER_PAGE_TABLES_GROUP && !item.format.is_empty());
     device.items.retain(|item| !matches!(item.group.as_str(), "Spark runtime residual" | "SPARK_RESERVE")
-        && item.group != SPARK_WORKER_PROCESS_RESIDENT_GROUP && item.group != SPARK_ARENA_DRIVER_OVERHEAD_GROUP);
-    if resident == 0 { return Some(()); }
+        && item.group != SPARK_WORKER_PROCESS_RESIDENT_GROUP
+        && !(item.group == DRIVER_PAGE_TABLES_GROUP && item.format.is_empty()));
+    if resident == 0 {
+        device.items.retain(|item| item.group != DRIVER_PAGE_TABLES_GROUP);
+        return Some(());
+    }
     if let Some(bytes) = crate::memory_policy::MemoryPolicy::current().spark_reserve {
         device.items.push(Item::new(Category::Runtime, "SPARK_RESERVE", "", bytes, Basis::Formula));
     } else {
         device.items.push(spark_worker_process_resident_item());
     }
-    device.items.push(Item::new(Category::Workspace, SPARK_ARENA_DRIVER_OVERHEAD_GROUP, "",
-        spark_arena_driver_overhead_bytes(resident), Basis::Calibrated));
+    // Typed receipts already price each physical backing. Legacy layout producers
+    // have one expert arena; do not replace typed rows with an aggregate reprice.
+    if !driver_present {
+        device.items.push(Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, "",
+            spark_arena_driver_overhead_bytes(resident), Basis::Calibrated));
+    }
     Some(())
 }
 
@@ -509,6 +545,34 @@ mod tests {
     }
 
     #[test]
+    fn spark_runtime_keeps_attributed_physical_driver_rows_without_aggregate_rounding() {
+        let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 << 30,
+            worker_budget_bytes: 110 << 30, kv_tokens: 0, items: vec![
+                Item::new(Category::Experts, "arenas", "", 2, Basis::Exact),
+                Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, "backing a", 48, Basis::Calibrated),
+                Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, "backing b", 48, Basis::Calibrated),
+            ] };
+        for _ in 0..2 {
+            charge_spark_runtime(&mut device).unwrap();
+            let rows: Vec<_> = device.items.iter().filter(|row| row.group == DRIVER_PAGE_TABLES_GROUP).collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.iter().map(|row| row.bytes).sum::<u64>(), 96);
+        }
+        device.items.retain(|row| row.category != Category::Experts);
+        charge_spark_runtime(&mut device).unwrap();
+        assert!(!device.items.iter().any(|row| row.group == DRIVER_PAGE_TABLES_GROUP));
+        for model in [DriverPageTableModel::Sm120Portable, DriverPageTableModel::Sm121Arena] {
+            assert_eq!(model.bytes(0), 0);
+            assert_eq!(model.bytes(1), model.bytes_per_quantum());
+            assert_eq!(model.bytes(model.quantum()), model.bytes_per_quantum());
+            assert_eq!(model.bytes(model.quantum() + 1), 2 * model.bytes_per_quantum());
+            assert!(model.source().contains("2026-11-07"));
+            let json = serde_json::to_value(model).unwrap();
+            assert_eq!(serde_json::from_value::<DriverPageTableModel>(json).unwrap(), model);
+        }
+    }
+
+    #[test]
     fn spark_process_census_is_named_ready_resident_and_not_worker_future_headroom() {
         let item = spark_worker_process_resident_item();
         assert_eq!(item.bytes, 1_596_606_464);
@@ -528,9 +592,9 @@ mod tests {
                     worker_budget_bytes: 110 << 30, kv_tokens: 0, items: vec![
                         Item::new(Category::Experts, "arena", "", resident, Basis::Exact)] };
                 charge_spark_runtime(&mut device).unwrap();
-                let driver = device.items.iter().find(|item| item.group == SPARK_ARENA_DRIVER_OVERHEAD_GROUP).unwrap();
+                let driver = device.items.iter().find(|item| item.group == DRIVER_PAGE_TABLES_GROUP).unwrap();
                 assert_eq!(driver.bytes, spark_arena_driver_overhead_bytes(resident));
-                assert_eq!(driver.category, Category::Workspace);
+                assert_eq!(driver.category, Category::Runtime);
                 assert!(!device.items.iter().any(|item| item.group == SPARK_WORKER_PROCESS_RESIDENT_GROUP));
             });
         }

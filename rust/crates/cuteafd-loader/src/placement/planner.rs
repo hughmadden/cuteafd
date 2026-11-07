@@ -1,7 +1,8 @@
 //! Pure, phase-aware allocation planning. Recipes describe one legal candidate;
 //! policy, exact pins and allocation reconciliation belong here, not in families.
 use super::{LayerMode, ResidentWeights};
-use cuteafd_core::{spark_reply::SparkReplyFormats, memory_layout::{Basis, Category, Item}};
+use cuteafd_core::{spark_reply::SparkReplyFormats, memory_layout::{Basis, Category, Item, DRIVER_PAGE_TABLES_GROUP}};
+pub use cuteafd_core::memory_layout::DriverPageTableModel;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -445,15 +446,17 @@ pub struct Facts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriverPageTable {
+    pub model: DriverPageTableModel,
     pub location: Location,
     pub lifetime: Lifetime,
     pub backing: String,
+    /// Physical backing extent, not a reservation, view or driver allocation.
     pub mapped_bytes: u64,
 }
 impl DriverPageTable {
-    pub fn bytes(&self) -> u64 { driver_page_table_bytes(self.mapped_bytes) }
+    pub fn bytes(&self) -> u64 { self.model.bytes(self.mapped_bytes) }
     pub fn source(&self) -> String {
-        format!("driver page tables: {} (SM120 CUDA 13.2, 2026-11-07, mapped bytes/512)", self.backing)
+        format!("{} ({})", self.backing, self.model.source())
     }
 }
 
@@ -462,7 +465,7 @@ impl DriverPageTable {
 /// 1/512, zero intercept and residuals; cudaMalloc control had no extra charge.
 /// Fractional bytes round only once per backing, never once per pool page.
 pub fn driver_page_table_bytes(mapped_bytes: u64) -> u64 {
-    mapped_bytes.div_ceil(512)
+    DriverPageTableModel::Sm120Portable.bytes(mapped_bytes)
 }
 
 mod contract;
@@ -531,7 +534,7 @@ impl ResolvedPlan {
                 if allowance.assumed { Basis::Estimated } else { Basis::Calibrated })));
         items.extend(self.facts.driver_page_tables.iter().filter(|mapping|
             mapping.location == location && mapping.lifetime.contains(Phase::Ready, self.facts.phase_order))
-            .map(|mapping| Item::new(Category::Runtime, mapping.source(), "", mapping.bytes(), Basis::Calibrated)));
+            .map(|mapping| Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, mapping.source(), mapping.bytes(), Basis::Calibrated)));
         Ok(items)
     }
     pub fn remaining(&self, budget: &str, phase: Phase) -> Option<u64> {
@@ -727,10 +730,17 @@ fn validate_owners(facts: &Facts) -> Result<(), Refusal> {
             .map(|owner| (owner.location, owner.bytes, owner.lifetime))
             .or_else(|| facts.sequential.iter().find(|group| group.id == mapping.backing)
                 .map(|group| (group.members[0].location, group.peak(), group.members[0].lifetime)));
-        if !matches!(mapping.location.device, Device::Coordinator(_))
-            || mapping.location.domain != Domain::Device
+        let backing_location = match (mapping.model, mapping.location) {
+            (DriverPageTableModel::Sm120Portable,
+                Location { device: Device::Coordinator(_), domain: Domain::Device }) => Some(Location::PINNED),
+            (DriverPageTableModel::Sm121Arena,
+                location @ Location { device: Device::Spark(_), domain: Domain::Managed })
+                if ids.get(&mapping.backing).is_some_and(|owner| owner.category == Category::Experts) => Some(location),
+            _ => None,
+        };
+        if backing_location.is_none()
             || !mapped.insert((mapping.location, mapping.backing.as_str()))
-            || backing != Some((Location::PINNED, mapping.mapped_bytes, mapping.lifetime))
+            || backing != backing_location.map(|location| (location, mapping.mapped_bytes, mapping.lifetime))
         {
             return Err(Refusal::InvalidFact(format!("invalid driver page-table backing {}", mapping.backing)));
         }

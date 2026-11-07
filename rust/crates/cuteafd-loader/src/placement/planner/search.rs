@@ -60,6 +60,7 @@ struct Group {
     costs: Vec<Vec<Cost>>,
 }
 struct Mapping {
+    model: DriverPageTableModel,
     activation: Activation,
     rows: Vec<usize>,
     bytes: ByteCurve,
@@ -102,9 +103,13 @@ impl Compiled {
             } else {
                 continue;
             };
-            let driver = matches!(component.kind, ComponentKind::DriverPageTables { .. });
-            if driver && component.bytes.0.iter().any(|piece| piece.bytes_per_page % 512 != 0) {
-                mappings.push(Mapping { activation: component.activation.clone(), rows: charged_rows,
+            let driver = match component.kind {
+                ComponentKind::DriverPageTables { model, .. } => Some(model),
+                _ => None,
+            };
+            if let Some(model) = driver.filter(|model| component.bytes.0.iter()
+                .any(|piece| piece.bytes_per_page % model.quantum() != 0)) {
+                mappings.push(Mapping { model, activation: component.activation.clone(), rows: charged_rows,
                     bytes: component.bytes.clone() });
                 continue;
             }
@@ -114,8 +119,8 @@ impl Compiled {
             for (index, &first) in starts[..starts.len() - 1].iter().enumerate() {
                 let piece = component.bytes.piece(first)?;
                 let bytes = component.bytes.at(first)?;
-                let (bytes, slope) = if driver {
-                    (driver_page_table_bytes(bytes), piece.bytes_per_page / 512)
+                let (bytes, slope) = if let Some(model) = driver {
+                    (model.bytes(bytes), piece.bytes_per_page / model.quantum() * model.bytes_per_quantum())
                 } else { (bytes, piece.bytes_per_page) };
                 let cost = if opaque {
                     Cost { opaque: bytes, opaque_slope: slope, ..Cost::default() }
@@ -189,7 +194,7 @@ impl Compiled {
         let piece = self.piece(pages);
         let mut mapping_bytes = vec![0u64; self.memory_rows];
         for mapping in self.mappings.iter().filter(|mapping| mapping.activation.active(selected)) {
-            let bytes = driver_page_table_bytes(mapping.bytes.at(pages)?);
+            let bytes = mapping.model.bytes(mapping.bytes.at(pages)?);
             for &row in &mapping.rows {
                 mapping_bytes[row] = mapping_bytes[row].checked_add(bytes)
                     .ok_or(Refusal::Overflow("driver page tables"))?;
@@ -394,7 +399,7 @@ impl Compiled {
             for piece in &mapping.bytes.0 {
                 let first = lower.max(piece.first);
                 if first <= upper.min(piece.last) {
-                    minimum = minimum.min(driver_page_table_bytes(mapping.bytes.at(first)?));
+                    minimum = minimum.min(mapping.model.bytes(mapping.bytes.at(first)?));
                 }
             }
             let mut bytes = vec![0; self.rows];
@@ -781,7 +786,8 @@ pub(crate) fn apply_reserve_override(contract: &mut Contract, budgets: &mut [Bud
     contract.components.retain(|component| {
         let reserve = match &component.kind {
             ComponentKind::Allowance(allowance) => Some(allowance.location),
-            ComponentKind::DriverPageTables { location, .. } => Some(*location),
+            // Explicit reserve replaces anonymous reserve owners, not physical driver costs.
+            ComponentKind::DriverPageTables { .. } => None,
             ComponentKind::Allocation { template, .. } if matches!(template.category,
                 Category::Runtime | Category::Reserved) => Some(template.location),
             _ => None,

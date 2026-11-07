@@ -116,7 +116,8 @@ The planner fixes the layout (layer placement, onboarding, buffers) for `KV_TARG
 the pool then grows into what the fixed layout leaves, up to `KV_MAX_TOKENS`, and the launch
 is refused below `KV_MIN_TOKENS`. The reserve is the sum of named, measured components
 (CUDA context and cuBLAS, loaded code, graphs, runtime growth, Spark worker process residency)
-plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the reserve components.
+plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the reserve components,
+not physical driver page tables.
 Startup and `cuteafd plan` print one line per device with the cap,
 weights, workspaces, every reserve component and the KV target, min, max and pool.
 The coordinator charges the SM121 worker process census (1,596,606,464 B,
@@ -126,14 +127,17 @@ context-phase file PSS growth to avoid overlap. The worker's live admission
 checks future allocations against `MemAvailable`, so it does not charge that
 already-resident process/context a second time. The historical 109,760,512-B
 unattributed startup remainder is not an owner and is not charged.
-Arena driver metadata is a workspace owner, not a replaceable reserve:
-48 B per 4096-B page (40 B vmalloc metadata + 8 B secondary page tables).
+`driver page tables` is one opaque runtime owner with distinct backing models,
+not a tracked workspace or replaceable reserve. RTX portable pinned backings pay
+ceil(bytes/512) per mapping coordinator context; aliases do not pay again.
+Spark expert arenas pay 48 B per 4096-B page
+(40 B vmalloc metadata + 8 B secondary page tables), rounded once per backing.
 This is calibrated from real-worker kernel fields at 40.508, 75.059 and
 103.652 GiB (zero-intercept fits 10.052338 + 1.949590 MiB/GiB).
 Source attributes 16 B/page to `nvidia_pte_t` and 8 B/page to the retained DMA
 page array; 16 B/page of vmalloc remains unattributed. Neither the fit's
 intercept nor whole-host reclaim residuals are charged as fixed allowances.
-Driver bytes survive `SPARK_RESERVE`, including zero. Ring, workspace,
+Driver bytes survive `GPU_RESERVE` / `SPARK_RESERVE`, including zero. Ring, workspace,
 validation and upload owners also stay separate and are charged once.
 Sizes take `B`, `MB`, `GB`, `MiB` or `GiB` (a bare number is bytes); there are no percentages.
 Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`, ...).
@@ -145,7 +149,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
 | `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark engine ceiling, including worker process residency and routed weights; the outside-cap gap leaves room for OS/services. |
-| `GPU_RESERVE` | auto | size | Sets the total GPU reserve; every built-in GPU reserve component becomes 0. Still inside the cap. |
+| `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components become 0, but physical driver page tables stay charged. Still inside the cap. |
 | `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
 | `FAMILY_RESERVE` | per-family constant (0; GLM 5.3 Flash 2 GiB until #1442) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |

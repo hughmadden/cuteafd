@@ -760,8 +760,6 @@ impl Recipe for KimiRecipe {
                 ("experts", "routed experts (balanced H128, replicated 3584 rotations)", spark.experts, Category::Experts),
                 ("overhead", "Spark rank I/O and execution owners", spark.overhead, Category::Workspace),
                 ("startup", cuteafd_core::memory_layout::spark_runtime_reserve_group(), spark.runtime, Category::Runtime),
-                ("arena-growth", cuteafd_core::memory_layout::SPARK_ARENA_DRIVER_OVERHEAD_GROUP,
-                    cuteafd_core::memory_layout::spark_arena_driver_overhead_bytes(spark.experts), Category::Workspace),
             ] {
                 if bytes == 0 { continue; }
                 let owner = Allocation::buffer(format!("spark.{}.{owner_kind}.{}", spark.rank, spark.count),
@@ -771,6 +769,18 @@ impl Recipe for KimiRecipe {
                     ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages);
                 component.activation = activation.clone();
                 contract.components.push(component);
+            }
+            if spark.experts != 0 {
+                contract.components.push(Component {
+                    activation,
+                    bytes: ByteCurve::fixed(spark.experts, self.maximum_pages),
+                    kind: ComponentKind::DriverPageTables {
+                        model: DriverPageTableModel::Sm121Arena,
+                        location: Location { device: Device::Spark(spark.rank as u8), domain: Domain::Managed },
+                        lifetime: Lifetime::RESIDENT,
+                        backing: format!("spark.{}.experts.{}", spark.rank, spark.count),
+                    },
+                });
             }
         }
         if let Some(draft) = &self.draft {
@@ -1166,6 +1176,12 @@ mod tests {
         assert_eq!(admitted.onboard, 1);
         assert_eq!(admitted.placement.layers[1].experts, ExpertHome::RtxWhole { gpu: 0 });
         assert_eq!(admitted.placement.layers[2].experts, ExpertHome::Spark);
+        let row = admitted.solved.phases.iter().find(|row| row.budget == "spark0" && row.phase == Phase::Ready).unwrap();
+        assert_eq!((row.owned, row.opaque), (100, 48));
+        let driver = &admitted.solved.facts.driver_page_tables[0];
+        assert_eq!(driver.model, DriverPageTableModel::Sm121Arena);
+        assert_eq!(driver.backing, "spark.0.experts.1");
+        assert!(!admitted.solved.facts.allocations.iter().any(|owner| owner.id.contains("arena-growth")));
     }
 
     #[test]

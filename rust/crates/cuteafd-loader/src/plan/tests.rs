@@ -5544,7 +5544,8 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
     assert_eq!(marks(&legacy) - marks(&staged), released);
     let prefix_driver = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
-        .filter(|item| item.group.starts_with("driver page tables: glmf.host.prefix."))
+        .filter(|item| item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP
+            && item.format.starts_with("glmf.host.prefix."))
         .map(|item| item.bytes).sum::<u64>();
     let mapped_prefix = prefix_driver(&staged) - prefix_driver(&legacy);
     assert_eq!(mapped_prefix, (32u64 << 30) / 512);
