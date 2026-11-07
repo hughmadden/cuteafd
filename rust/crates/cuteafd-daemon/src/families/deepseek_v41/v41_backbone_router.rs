@@ -21,13 +21,9 @@ unsafe fn record_v41_routes(usage: Option<&cuteafd_ffi::expert_usage::ExpertUsag
     phase: cuteafd_ffi::expert_usage::UsagePhase, stream: *mut std::ffi::c_void) -> Result<()> {
     let Some(usage) = usage else { return Ok(()); };
     let tally = usage.routes(device, layer, phase)?;
-    // Bounded launches follow the real router, outside its phase-less graph.
-    for first in (0..rows).step_by(64) {
-        // SAFETY: the caller retains rows * 6 ids on the router's producer stream.
-        unsafe { tally.record(ids.cast::<u32>().add(first * 6).cast(),
-            (rows - first).min(64), None, 511, true, stream)?; }
-    }
-    Ok(())
+    // Count the live rows in one launch outside the router's phase-less graph.
+    // SAFETY: the caller retains rows * 6 ids on the router's producer stream.
+    unsafe { tally.record(ids, rows, None, 511, true, stream) }
 }
 
 /// Reserve planes: hidden, mask, scores, ids, routing, wire. These outputs
@@ -1136,18 +1132,19 @@ mod expert_usage_tests {
         for (device, layer) in [(0, 2), (1, 20)] {
             library.cuda_set_device(device)?;
             let weights = BackboneRouterWeights::load(&library, &catalog, layer, usize::MAX, 1 << 20)?;
-            let mut wave = weights.wave(144, usize::MAX)?;
+            let capacity = 2768;
+            let mut wave = weights.wave(capacity, usize::MAX)?;
             wave.install_expert_usage(Some(usage.clone()));
             wave.set_local_mode(true)?;
             let [input, mask] = wave.inputs();
-            let hidden = (0..144 * 5120).flat_map(|i| {
+            let hidden = (0..capacity as usize * 5120).flat_map(|i| {
                 let x = ((i * 7 % 31) as f32 - 15.0) / 128.0;
                 ((x.to_bits() >> 16) as u16).to_ne_bytes()
             }).collect::<Vec<_>>();
             library.copy_h2d(input, &hidden)?;
-            library.copy_h2d(mask, &[0; 144])?;
+            library.copy_h2d(mask, &vec![0; capacity as usize])?;
             // Warmup and cold capture use the uncounted low-level entrypoint.
-            // SAFETY: all 144 input rows and masks are initialized and wave-owned.
+            // SAFETY: all capacity rows and masks are initialized and wave-owned.
             unsafe { wave.execute_captured(13)?; }
             let graph = wave.graphs.get_shape(layer, &weights, 13).unwrap().0;
             let captures = cuteafd_ffi::graph_capture_sites();
@@ -1166,17 +1163,19 @@ mod expert_usage_tests {
                 assert_eq!(wave.graphs.get_shape(layer, &weights, 13).unwrap().0, graph);
             }
             assert_eq!(cuteafd_ffi::graph_capture_sites(), captures);
-            // Known metadata-bearing IDs exercise three bounded <=64-row launches;
-            // the final capacity row is poison and must never count.
-            let words = (0..144 * 6).map(|i| if i < 129 * 6 {
-                (i % 384) as u32 | 0xa000_0000
-            } else { 383 }).collect::<Vec<_>>();
-            let bytes = words.iter().flat_map(|n| n.to_ne_bytes()).collect::<Vec<_>>();
-            library.copy_h2d(wave.b(3), &bytes)?;
-            // SAFETY: 129 complete ID rows remain live on this wave's stream.
-            unsafe { wave.record_routes(129, Some(UsagePhase::Prefill))?; }
-            wave.synchronize()?;
-            for &word in &words[..129 * 6] { expected_prefill[layer * 384 + (word & 511) as usize] += 1; }
+            // Each tally covers only live rows, including a full prefill unit;
+            // metadata and poison in the capacity suffix must not affect counts.
+            for rows in [0, 129, 2752] {
+                let words = (0..capacity as usize * 6).map(|i| if i < rows * 6 {
+                    (i % 384) as u32 | 0xa000_0000
+                } else { 383 }).collect::<Vec<_>>();
+                let bytes = words.iter().flat_map(|n| n.to_ne_bytes()).collect::<Vec<_>>();
+                library.copy_h2d(wave.b(3), &bytes)?;
+                // SAFETY: rows complete ID rows remain live on this wave's stream.
+                unsafe { wave.record_routes(rows as u32, Some(UsagePhase::Prefill))?; }
+                wave.synchronize()?;
+                for &word in &words[..rows * 6] { expected_prefill[layer * 384 + (word & 511) as usize] += 1; }
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let value = reader.snapshot();
@@ -1184,7 +1183,7 @@ mod expert_usage_tests {
         let total = &value["windows"]["total"];
         assert_eq!(total["prefill_routed_rows"], serde_json::json!(expected_prefill));
         assert_eq!(total["decode_routed_rows"], serde_json::json!(expected_decode));
-        assert_eq!(expected_prefill.iter().sum::<u64>(), 2 * (13 + 129) * 6);
+        assert_eq!(expected_prefill.iter().sum::<u64>(), 2 * (13 + 129 + 2752) * 6);
         assert_eq!(expected_decode.iter().sum::<u64>(), 2 * 3 * 13 * 6);
         library.cuda_set_device(0)?;
         Ok(())
