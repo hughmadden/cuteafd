@@ -173,7 +173,7 @@ def draft_bf16_shapes():
         "dflash2-muse-radix": (8192, 64, 8, 128, 28672, 5),
         "dflash2-muse-nvidia": (8192, 128, 16, 64, 24576, 5),
     }
-    for family in ("dflash-mimo-pro", "dflash-mimo-flash"):
+    for family in ("dflash-mimo-pro", "dflash-mimo-flash", "dflash2-glmf"):
         h, heads, kv, d, inter, taps = families[family]
         families[f"{family}-tp2"] = (h, heads // 2, kv // 2, d, inter // 2, taps)
     result = {}

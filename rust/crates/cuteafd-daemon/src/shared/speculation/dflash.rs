@@ -26,6 +26,9 @@
 //! glm53f-afd (MIT, v1.1.0 16de2a6).
 use crate::shared::fp8_linear;
 use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::device::{Device, DeviceOwner};
+use crate::shared::peer_split::{PeerExchange, DIRECT};
+use std::rc::Rc;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -194,6 +197,7 @@ enum LayerBody<'a> {
 /// The drafted rows' head after the target's vocabulary head: DFlash2's top-16
 /// candidate selector, or mtp_dspark's soft cap and recurrent Markov head.
 enum DraftHeadOps<'a> {
+    Peer,
     Selector { projection: DraftWeight<'a>, predecessor: Dev<'a>, successor: Dev<'a> },
     RnnMarkov { softcap: f32, embedding: Dev<'a>, joint_w: Dev<'a>, joint_b: Dev<'a>, output: Dev<'a>,
         norms: Dev<'a>, rank: usize },
@@ -502,22 +506,20 @@ struct Workspace<'a> {
     delta: Dev<'a>,
     gate_up: Dev<'a>,
     act: Dev<'a>,
-    logits: Dev<'a>,
-    anchors: Dev<'a>,
-    /// The block's input ids (anchor, then mask tokens) for the device embedding gather.
-    ids: Dev<'a>,
-    tokens: Dev<'a>,
-    /// Pinned landing of `tokens` then optional selector `features`: both download behind the
-    /// round's one host wait.
-    landing: crate::shared::memory::HostAllocation<'a>,
     positions: Dev<'a>,
-    head: VocabularyHead<'a>,
-    _head_workspace: Dev<'a>,
+    head: Option<HeadWorkspace<'a>>,
+}
+
+struct HeadWorkspace<'a> {
+    logits: Dev<'a>, anchors: Dev<'a>, ids: Dev<'a>, tokens: Dev<'a>,
+    landing: crate::shared::memory::HostAllocation<'a>,
+    head: VocabularyHead<'a>, _head_workspace: Dev<'a>,
+    unary: Option<Dev<'a>>, candidates: Option<Dev<'a>>, projected: Option<Dev<'a>>,
+    features: Option<Dev<'a>>, topk_workspace: Option<Dev<'a>>,
 }
 
 struct DflashWorkspace<'a> {
-    conv: Dev<'a>, dynamic: Dev<'a>, unary: Dev<'a>, candidates: Dev<'a>,
-    projected: Dev<'a>, features: Dev<'a>, topk_workspace: Dev<'a>,
+    conv: Dev<'a>, dynamic: Dev<'a>,
 }
 
 #[allow(dead_code)]
@@ -565,6 +567,9 @@ impl MlaWorkspace<'_> {
 }
 
 impl<'a> Workspace<'a> {
+    fn head(&self) -> Result<&HeadWorkspace<'a>> {
+        self.head.as_ref().context("peer drafter has no selector/head workspace")
+    }
     fn dflash(&self) -> Result<&DflashWorkspace<'a>> {
         self.dflash.as_ref().context("DFlash-only workspace requested by plain drafter")
     }
@@ -578,17 +583,22 @@ impl<'a> Workspace<'a> {
             cfg.hidden as u32, (sequences * cfg.block) as u32, cfg.vocab as u32)? };
         let plain = layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark;
         let dflash = if plain { None } else { Some(DflashWorkspace {
-            conv: owners.take("conv")?, dynamic: owners.take("dynamic")?, unary: owners.take("unary")?,
-            candidates: owners.take("candidates")?, projected: owners.take("projected")?,
-            features: owners.take("features")?, topk_workspace: owners.take("topk_workspace")?,
+            conv: owners.take("conv")?, dynamic: owners.take("dynamic")?,
         }) };
         let landing_bytes = if plain { layout.host_owner("host.landing")?.bytes }
             else { sequences * cfg.drafts() * 20 };
-        Ok(Self { sequences, head, _head_workspace: head_workspace, dflash,
+        Ok(Self { sequences, dflash,
             h: owners.take("h")?, n: owners.take("n")?, delta: owners.take("delta")?,
-            gate_up: owners.take("gate_up")?, act: owners.take("act")?, logits: owners.take("logits")?,
+            gate_up: owners.take("gate_up")?, act: owners.take("act")?,
+            head: Some(HeadWorkspace { head, _head_workspace: head_workspace, logits: owners.take("logits")?,
             anchors: owners.take("anchors")?, ids: owners.take("ids")?, tokens: owners.take("tokens")?,
             landing: crate::shared::memory::HostAllocation::new(library, landing_bytes)?,
+            unary: if plain { None } else { Some(owners.take("unary")?) },
+            candidates: if plain { None } else { Some(owners.take("candidates")?) },
+            projected: if plain { None } else { Some(owners.take("projected")?) },
+            features: if plain { None } else { Some(owners.take("features")?) },
+            topk_workspace: if plain { None } else { Some(owners.take("topk_workspace")?) },
+            }),
             positions: owners.take("positions")?,
             attention: AttentionWorkspace::Mla(MlaWorkspace {
                 query: owners.take("query")?,
@@ -799,6 +809,7 @@ pub(crate) struct DflashDrafter<'a> {
     projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     context_fc: Option<cuteafd_ffi::mla_draft::Ml4ContextProjection<'a>>,
     physical: Option<cuteafd_loader::families::glm5::draft_physical::GlmDflashPhysicalLayout>,
+    head_split: Option<GqaHeadSplit<'a>>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
     head_ops: DraftHeadOps<'a>,
@@ -830,6 +841,13 @@ pub(crate) struct DflashDrafter<'a> {
     fp8_admitted: fp8_linear::Fp8Rows,
     confidence_directory: std::path::PathBuf,
     confidence_scales: fp8_linear::Fp8Scales,
+}
+
+struct GqaHeadSplit<'a> {
+    peer: DeviceOwner<'a, Box<DflashDrafter<'a>>>,
+    exchange: Rc<PeerExchange<'a>>,
+    reduced: Dev<'a>,
+    peer_reduced: DeviceOwner<'a, Dev<'a>>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -1042,27 +1060,59 @@ impl<'a> DflashDrafter<'a> {
     pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
+        Self::load_rank(library, programs, snapshot, Some(Rc::new(file)), stream, slots, max_sequences,
+            mask_row, row_window, representation, scales, fp8_rows, kv_cache, 0, 1)
+    }
+
+    /// Reuses the target's peer exchange and cooperative streams; no extra transport owners.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_tp2(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        snapshot: &Path, file: Vec<u8>, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
+        row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
+        fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        exchange: Rc<PeerExchange<'a>>) -> Result<Self> {
+        let file = Rc::new(file);
+        let mut lead = Self::load_rank(library, programs, snapshot, Some(file.clone()), exchange.stream(0), slots,
+            max_sequences, mask_row.clone(), row_window, representation, scales, fp8_rows, kv_cache, 0, 2)?;
+        let device = Device { library, id: exchange.device(1) };
+        let peer = device.own(|| Self::load_rank(library, programs, snapshot, Some(file), exchange.stream(1), slots,
+            max_sequences, mask_row, row_window, representation, scales, fp8_rows, kv_cache, 1, 2).map(Box::new))?;
+        let bytes = max_sequences * lead.cfg.block * lead.cfg.hidden * 2;
+        let reduced = DeviceAllocation::new(library, bytes)?;
+        let peer_reduced = device.own(|| DeviceAllocation::new(library, bytes))?;
+        lead.head_split = Some(GqaHeadSplit { peer, exchange, reduced, peer_reduced });
+        Ok(lead)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_rank(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path,
+        file: Option<Rc<Vec<u8>>>, stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
+        row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
+        fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        rank: usize, ranks: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
-        let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
+        let source_cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
+        let cfg = source_cfg.for_tp(ranks)?;
         let projections = Self::load_projections(programs, &cfg, representation, false, false, max_sequences)?;
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
-        let physical = cuteafd_loader::families::glm5::draft_physical::GlmDflashPhysicalLayout::read(
-            snapshot, representation, capacity, library.sm_count()?, fp8_rows.code() as u8, kv_cache)?;
-        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
-        let residency = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
-            &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8, kv_cache)?;
-        tracing::info!(resident_bytes = residency.owned, scratch_bytes = residency.scratch,
-            resident_weight_bytes = residency.weights.0, kv_cache = %kv_cache, "DFlash shared readiness inventory");
+        let physical = cuteafd_loader::families::glm5::draft_physical::GlmDflashPhysicalLayout::read_tp(
+            snapshot, representation, capacity, library.sm_count()?, fp8_rows.code() as u8, kv_cache, rank, ranks)?;
+        tracing::info!(rank, ranks, resident_bytes = physical.owners().iter()
+            .map(|owner| owner.bytes).sum::<u64>(), resident_weight_bytes = physical.resident_weights().0,
+            kv_cache = %kv_cache, "DFlash shared readiness inventory");
         ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
-        let checkpoint = super::weights::Load::with_prefetched(library, snapshot, file)?;
-        checkpoint.validate(cfg.tensor_shapes())?;
+        let checkpoint = match file {
+            Some(file) => super::weights::Load::with_shared_prefetched_file(library, &snapshot.join("model.safetensors"), file)?,
+            None => super::weights::Load::open(library, snapshot)?,
+        };
+        checkpoint.validate(source_cfg.tensor_shapes())?;
         let zeroed = |id: &str| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, physical.owner_bytes(id)?)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
-        let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
+        let h = cfg.hidden;
         let fp8_workspace = layout.fp8_scratch.as_ref().map(|scratch| {
             let shapes: Vec<_> = scratch.shapes.iter().map(|shape|
                 Ok((usize::try_from(shape.k)?, usize::try_from(shape.n)?))).collect::<Result<_>>()?;
@@ -1071,6 +1121,9 @@ impl<'a> DflashDrafter<'a> {
         let tensor = |name: &str, shape: &[usize]| checkpoint.tensor(name, shape);
         let matrix = |parts: &[(&str, usize)], cols| checkpoint.matrix(parts, cols,
             representation == GlmDraftRepresentation::Fp8Only, scales, stream);
+        let sharded = |parts: &[(&str, usize)], cols, axis| checkpoint.matrix_shard(parts, cols,
+            axis, rank, ranks, representation == GlmDraftRepresentation::Fp8Only, scales, stream);
+        use super::weights::ShardAxis;
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
             let a = format!("{p}.self_attn");
@@ -1084,22 +1137,23 @@ impl<'a> DflashDrafter<'a> {
                     mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
                 },
                 attention: DraftAttention::Gqa(GqaAttention {
-                    qkv: matrix(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
-                        (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?,
+                    qkv: sharded(&[(&format!("{a}.q_proj.weight"), source_cfg.heads * cfg.head_dim),
+                        (&format!("{a}.k_proj.weight"), source_cfg.kv_width()),
+                        (&format!("{a}.v_proj.weight"), source_cfg.kv_width())], h, ShardAxis::Rows)?,
                     q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                     k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                    o: matrix(&[(&format!("{a}.o_proj.weight"), h)], cfg.heads * cfg.head_dim)?,
+                    o: sharded(&[(&format!("{a}.o_proj.weight"), h)], source_cfg.heads * cfg.head_dim, ShardAxis::Columns)?,
                     k_ring: zeroed(&format!("layer.{l}.k_ring"))?,
                     v_ring: zeroed(&format!("layer.{l}.v_ring"))?,
                 }),
-                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
-                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], inter)?,
+                gate_up: sharded(&[(&format!("{p}.mlp.gate_proj.weight"), source_cfg.intermediate),
+                    (&format!("{p}.mlp.up_proj.weight"), source_cfg.intermediate)], h, ShardAxis::Rows)?,
+                down: sharded(&[(&format!("{p}.mlp.down_proj.weight"), h)], source_cfg.intermediate, ShardAxis::Columns)?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
         tracing::info!(?representation, context_slots = slots, max_batch_sequences = max_sequences,
-            own_weight_bytes = layout.weights.resident_bytes()?, max_load_staging = layout.weights.max_load_staging,
+            own_weight_bytes = physical.resident_weights().0, max_load_staging = layout.weights.max_load_staging,
             "DFlash single-copy storage admitted; vocabulary head borrowed from target");
         Ok(Self {
             kv_cache,
@@ -1110,11 +1164,11 @@ impl<'a> DflashDrafter<'a> {
             fc: matrix(&[("fc.weight", h)], taps)?, context_fc: None, projections,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
-            head_ops: DraftHeadOps::Selector {
+            head_ops: if rank > 0 { DraftHeadOps::Peer } else { DraftHeadOps::Selector {
                 projection: matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h)?,
                 predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
                 successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
-            },
+            } },
             layers,
             taps: zeroed("taps")?,
             fused: zeroed("fused")?,
@@ -1137,7 +1191,7 @@ impl<'a> DflashDrafter<'a> {
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
-            physical: Some(physical),
+            physical: Some(physical), head_split: None,
             cfg,
         })
     }
@@ -1203,9 +1257,9 @@ impl<'a> DflashDrafter<'a> {
                     cache: owners.take(&format!("layer.{index}.cache"))?,
                     page_table: owners.take(&format!("layer.{index}.page_table"))?,
                 }),
-                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
-                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], inter)?,
+                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), cfg.intermediate),
+                    (&format!("{p}.mlp.up_proj.weight"), cfg.intermediate)], h)?,
+                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], cfg.intermediate)?,
             });
         }
         let workspace = Workspace::admitted_mla(library, &cfg, layout.capacity().max_batch_sequences, &layout, &mut owners)?;
@@ -1214,7 +1268,7 @@ impl<'a> DflashDrafter<'a> {
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream, slots: layout.capacity().context_slots,
             max_sequences: layout.capacity().max_batch_sequences,
-            fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?, context_fc: None, physical: None, projections,
+            fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?, context_fc: None, physical: None, head_split: None, projections,
             hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
             head_ops: DraftHeadOps::Selector {
                 projection: matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h)?,
@@ -1322,7 +1376,7 @@ impl<'a> DflashDrafter<'a> {
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream,
             slots: layout.capacity().context_slots, max_sequences: layout.capacity().max_batch_sequences,
             fc: DraftWeight::Bf16(tensor(&mut owners, "backbone.target_projection.weight", &[h, cfg.taps.len() * h])?),
-            context_fc: Some(context_fc), physical: None, projections,
+            context_fc: Some(context_fc), physical: None, head_split: None, projections,
             hidden_norm: tensor(&mut owners, "backbone.target_norm.weight", &[h])?,
             norm: tensor(&mut owners, "backbone.final_norm.weight", &[h])?,
             head_ops: DraftHeadOps::RnnMarkov { softcap,
@@ -1355,6 +1409,7 @@ impl<'a> DflashDrafter<'a> {
     pub fn set_draft_linear(&self, mode: fp8_linear::Fp8Rows) -> Result<()> {
         ensure!(mode <= self.fp8_admitted, "the DFlash2 FP8 scratch was admitted for {:?}, not {mode:?}",
             self.fp8_admitted);
+        if let Some(split) = &self.head_split { split.peer.set_draft_linear(mode)?; }
         self.fp8_rows.set(mode);
         Ok(())
     }
@@ -1490,17 +1545,23 @@ impl<'a> DflashDrafter<'a> {
         }
         if let Some(w) = self.workspace.borrow().as_ref() {
             if let Some(d) = &w.dflash {
-                for (name, buffer) in [("conv", &d.conv), ("dynamic", &d.dynamic), ("unary", &d.unary),
-                    ("candidates", &d.candidates), ("projected", &d.projected), ("features", &d.features),
-                    ("topk_workspace", &d.topk_workspace)] {
+                for (name, buffer) in [("conv", &d.conv), ("dynamic", &d.dynamic)] {
                     ranges.push((format!("drafter/step/{name}"), buffer.buffer));
                 }
             }
             for (name, buffer) in [("h", &w.h), ("n", &w.n), ("delta", &w.delta), ("gate_up", &w.gate_up),
-                ("act", &w.act), ("logits", &w.logits), ("anchors", &w.anchors),
-                ("ids", &w.ids), ("tokens", &w.tokens), ("positions", &w.positions),
-                ("head_workspace", &w._head_workspace)] {
+                ("act", &w.act), ("positions", &w.positions)] {
                 ranges.push((format!("drafter/step/{name}"), buffer.buffer));
+            }
+            if let Some(head) = &w.head {
+                for (name, buffer) in [("logits", &head.logits), ("anchors", &head.anchors),
+                    ("ids", &head.ids), ("tokens", &head.tokens), ("head_workspace", &head._head_workspace)] {
+                    ranges.push((format!("drafter/step/{name}"), buffer.buffer));
+                }
+                for (name, buffer) in [("unary", &head.unary), ("candidates", &head.candidates),
+                    ("projected", &head.projected), ("features", &head.features), ("topk_workspace", &head.topk_workspace)] {
+                    if let Some(buffer) = buffer { ranges.push((format!("drafter/step/{name}"), buffer.buffer)); }
+                }
             }
             let attention = match &w.attention {
                 AttentionWorkspace::Gqa(a) => vec![("qkv", &a.qkv), ("q", &a.q), ("k", &a.k),
@@ -1515,12 +1576,35 @@ impl<'a> DflashDrafter<'a> {
             };
             ranges.extend(attention.into_iter().map(|(name, buffer)| (format!("drafter/step/{name}"), buffer.buffer)));
         }
+        if let Some(split) = &self.head_split {
+            ranges.push(("drafter/reduced".into(), split.reduced.buffer));
+            ranges.push(("drafter/peer/reduced".into(), split.peer_reduced.buffer));
+            ranges.extend(split.peer.replay_write_ranges().into_iter()
+                .map(|(name, buffer)| (format!("drafter/peer/{name}"), buffer)));
+        }
         ranges
     }
 
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
-        self.update_with(rows, || Ok(()))
+        let Some(split) = &self.head_split else { return self.update_with(rows, || Ok(())); };
+        if rows.is_empty() { return Ok(()); }
+        self.checked_head_split(|| self.update_tp2(rows, split))
+    }
+
+    fn update_tp2(&self, rows: &[ContextRow], split: &GqaHeadSplit<'_>) -> Result<()> {
+        let first = rows.iter().map(|row| row.tap_row).min().context("draft tap span")?;
+        let last = rows.iter().map(|row| row.tap_row).max().context("draft tap span")?;
+        ensure!(last < TAP_ROWS, "draft tap span exceeds admitted rows");
+        let bytes = self.cfg.taps.len() * self.cfg.hidden * 2;
+        split.peer.device.run(|| split.peer.update_with(rows, || {
+            split.exchange.push_to(0, DIRECT, at(&self.taps, first * bytes),
+                at(&split.peer.taps, first * bytes), (last - first + 1) * bytes)?;
+            split.exchange.wait(1, DIRECT)
+        }))?;
+        split.exchange.signal(1, DIRECT)?;
+        self.update_with(rows, || Ok(()))?;
+        split.exchange.wait(0, DIRECT)
     }
 
     /// Upload metadata before a remote tap wait is enqueued. `ready` orders
@@ -1655,6 +1739,9 @@ impl<'a> DflashDrafter<'a> {
     pub(crate) fn drain_mla(&self) -> Result<()> {
         // SAFETY: request/turn barriers retain the common stream and all Context owners.
         unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        if let Some(split) = &self.head_split {
+            split.peer.device.run(|| split.peer.drain_mla())?;
+        }
         if let DraftContext::Mla(context) = &self.context {
             if let Some(split) = &context.split { split.drain()?; }
         }
@@ -2020,6 +2107,139 @@ impl<'a> DflashDrafter<'a> {
         unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
     }
 
+    pub(crate) fn require_live(&self) -> Result<()> {
+        self.head_split.as_ref().map_or(Ok(()), |split| split.exchange.require_live())
+    }
+
+    fn checked_head_split<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.require_live()?;
+        let result = work();
+        if result.is_err() {
+            if let Some(split) = &self.head_split {
+                // Unmatched peer waits must observe abort before the family drains or releases owners.
+                if split.exchange.terminal_state() == crate::shared::peer_split::TerminalState::Active {
+                    if let Err(error) = split.exchange.publish_abort() {
+                        self.library.quarantine_module_after_failed_drain();
+                        return Err(error.context("TP2 DFlash abort publication failed"));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn forward_tp2(&self, w: &Workspace<'a>, split: &GqaHeadSplit<'a>, positions: &[i64],
+        tables: &[i32], sequences: usize, max_keys: usize) -> Result<()> {
+        let rows = sequences * self.cfg.block;
+        let h = self.cfg.hidden;
+        let peer_work = split.peer.workspace.borrow();
+        let pw = peer_work.as_ref().context("TP2 draft workspace not primed")?;
+        split.peer.device.run(|| {
+            split.peer.put(&pw.positions, bytes_of(positions))?;
+            split.peer.put(&pw.attention.gqa()?.tables, bytes_of(tables))
+        })?;
+        split.exchange.push_to(0, DIRECT, w.h.buffer.ptr, pw.h.buffer.ptr, rows * h * 2)?;
+        split.exchange.wait(1, DIRECT)?;
+        split.peer.device.run(|| {
+            // SAFETY: peer residual and normalized arenas cover this admitted block.
+            unsafe { self.library.glm_dflash_rmsnorm(pw.h.buffer.ptr, split.peer.layers[0].input_norm.buffer.ptr,
+                pw.n.buffer.ptr, rows, h, self.cfg.eps, split.peer.stream) }
+        })?;
+        for index in 0..self.layers.len() {
+            self.gqa_attention_partial(w, index, sequences, max_keys)?;
+            split.peer.device.run(|| split.peer.gqa_attention_partial(pw, index, sequences, max_keys))?;
+            Self::reduce_gqa(split, [w, pw], rows * h)?;
+            self.gqa_ffn_partial(w, index, rows, split.reduced.buffer.ptr)?;
+            split.peer.device.run(|| split.peer.gqa_ffn_partial(pw, index, rows, split.peer_reduced.buffer.ptr))?;
+            Self::reduce_gqa(split, [w, pw], rows * h)?;
+            self.gqa_finish_layer(w, index, rows, split.reduced.buffer.ptr)?;
+            split.peer.device.run(|| split.peer.gqa_finish_layer(pw, index, rows, split.peer_reduced.buffer.ptr))?;
+        }
+        split.exchange.signal(1, DIRECT)?;
+        split.exchange.wait(0, DIRECT)
+    }
+
+    fn gqa_attention_partial(&self, w: &Workspace<'_>, index: usize, sequences: usize, max_keys: usize) -> Result<()> {
+        let c = &self.cfg;
+        let rows = sequences * c.block;
+        let layer = &self.layers[index];
+        let a = layer.attention.gqa()?;
+        let attention = w.attention.gqa()?;
+        let LayerBody::Dflash { attn_conv, attn_base, .. } = &layer.body else {
+            anyhow::bail!("head-split GQA requires the DFlash block body");
+        };
+        let d = w.dflash()?;
+        // SAFETY: rank-local projections and KV share the checked local geometry.
+        unsafe {
+            self.linear(w.n.buffer.ptr, attn_conv, 0, d.dynamic.buffer.ptr, rows, c.hidden, c.conv_width())?;
+            self.library.glm_dflash_conv(w.n.buffer.ptr, d.dynamic.buffer.ptr, attn_base.buffer.ptr,
+                d.conv.buffer.ptr, rows, c.block, c.hidden, c.group, self.stream)?;
+            self.linear(d.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, c.hidden, c.qkv_width())?;
+            self.library.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
+                w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr,
+                attention.v.buffer.ptr, rows, c.heads, c.kv_heads, c.theta, c.eps, false, c.head_dim, self.stream)?;
+            self.library.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
+                a.k_ring.buffer.ptr, a.v_ring.buffer.ptr, attention.tables.buffer.ptr,
+                at(&attention.tables, sequences * 4), at(&attention.tables, sequences * 8),
+                attention.attn.buffer.ptr, attention.scratch.buffer.ptr, sequences, c.block, c.heads, c.kv_heads,
+                RING, max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(),
+                self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, c.head_dim, self.stream)?;
+            self.linear(attention.attn.buffer.ptr, &a.o, 0, w.delta.buffer.ptr, rows, c.heads * c.head_dim, c.hidden)
+        }
+    }
+
+    fn gqa_ffn_partial(&self, w: &Workspace<'_>, index: usize, rows: usize, delta: *const c_void) -> Result<()> {
+        let c = &self.cfg;
+        let layer = &self.layers[index];
+        let LayerBody::Dflash { attn_base, mlp_conv, mlp_base, .. } = &layer.body else {
+            anyhow::bail!("head-split GQA requires the DFlash block body");
+        };
+        let d = w.dflash()?;
+        // SAFETY: reduced full-hidden attention feeds replicated convolution and rank-local MLP.
+        unsafe {
+            self.library.glm_dflash_conv_residual_norm(delta, d.dynamic.buffer.ptr, attn_base.buffer.ptr,
+                w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr,
+                rows, c.block, c.hidden, c.group, c.eps, self.stream)?;
+            self.linear(w.n.buffer.ptr, mlp_conv, 0, d.dynamic.buffer.ptr, rows, c.hidden, c.conv_width())?;
+            self.library.glm_dflash_conv(w.n.buffer.ptr, d.dynamic.buffer.ptr, mlp_base.buffer.ptr, d.conv.buffer.ptr,
+                rows, c.block, c.hidden, c.group, self.stream)?;
+            self.linear(d.conv.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr, rows, c.hidden, 2 * c.intermediate)?;
+            self.library.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, c.intermediate, self.stream)?;
+            self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows, c.intermediate, c.hidden)
+        }
+    }
+
+    fn gqa_finish_layer(&self, w: &Workspace<'_>, index: usize, rows: usize, delta: *const c_void) -> Result<()> {
+        let c = &self.cfg;
+        let LayerBody::Dflash { mlp_base, .. } = &self.layers[index].body else {
+            anyhow::bail!("head-split GQA requires the DFlash block body");
+        };
+        let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |layer| layer.input_norm.buffer.ptr);
+        // SAFETY: reduced full-hidden MLP and replicated residual/norm have matching extents.
+        unsafe { self.library.glm_dflash_conv_residual_norm(delta, w.dflash()?.dynamic.buffer.ptr, mlp_base.buffer.ptr,
+            w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, c.block, c.hidden, c.group, c.eps, self.stream) }
+    }
+
+    fn reduce_gqa(split: &GqaHeadSplit<'_>, work: [&Workspace<'_>; 2], elements: usize) -> Result<()> {
+        let exchange = &split.exchange;
+        let window = exchange.slot_bytes() / 2;
+        ensure!(window > 0, "empty draft peer exchange");
+        for first in (0..elements).step_by(window) {
+            let count = window.min(elements - first);
+            for (rank, w) in work.iter().enumerate() {
+                exchange.push(rank, 0, at(&w.delta, first * 2), count * 2)?;
+            }
+            for (rank, w) in work.iter().enumerate() {
+                let reduced = if rank == 0 { &split.reduced } else { &*split.peer_reduced };
+                exchange.wait(rank, 0)?;
+                exchange.add(rank, at(&w.delta, first * 2), exchange.recv(rank, 0)?, at(reduced, first * 2), count)?;
+            }
+            for rank in 0..2 { exchange.signal(rank, DIRECT)?; }
+            for rank in 0..2 { exchange.wait(rank, DIRECT)?; }
+        }
+        Ok(())
+    }
+
     /// Shared startup path for every serving DFlash family; diagnostics may
     /// still allocate their GQA workspace lazily. Priming never borrows a target.
     pub(crate) fn prepare_workspace(&self) -> Result<()> {
@@ -2041,6 +2261,26 @@ impl<'a> DflashDrafter<'a> {
     }
 
     fn prime_isolated(&self) -> Result<()> {
+        self.prime_rank(true)
+    }
+
+    fn prime_rank(&self, paired: bool) -> Result<()> {
+        if paired {
+            if let Some(split) = &self.head_split {
+                // First-use module loading may synchronize a context: warm both
+                // ranks independently before either can enqueue a peer wait.
+                self.prime_rank(false)?;
+                self.startup_primed.set(false);
+                split.peer.device.run(|| split.peer.prime_remote())?;
+                for (rank, owner) in [self, &*split.peer].iter().enumerate() {
+                    let workspace = owner.workspace.borrow();
+                    let work = workspace.as_ref().context("TP2 startup workspace missing")?;
+                    let reduced = if rank == 0 { &split.reduced } else { &*split.peer_reduced };
+                    split.exchange.add(rank, work.delta.buffer.ptr, work.h.buffer.ptr, reduced.buffer.ptr, 128)?;
+                }
+                self.drain_mla()?;
+            }
+        }
         if self.workspace.borrow().is_none() {
             ensure!(matches!(self.context, DraftContext::Gqa(_)), "MLA draft lost its admitted workspace");
             *self.workspace.borrow_mut() = Some(self.workspace(self.max_sequences)?);
@@ -2048,8 +2288,10 @@ impl<'a> DflashDrafter<'a> {
         self.prime_metadata()?;
         if matches!(self.context, DraftContext::Mla(_)) { self.reset_context(0, 0)?; }
         self.library.cuda_zero_bytes(self.taps.buffer, self.taps.buffer.bytes)?;
-        self.update(&(0..TAP_ROWS).map(|tap_row| ContextRow { tap_row, slot: 0,
-            position: tap_row }).collect::<Vec<_>>())?;
+        let context_rows = (0..TAP_ROWS).map(|tap_row| ContextRow { tap_row, slot: 0,
+            position: tap_row }).collect::<Vec<_>>();
+        if paired { self.update(&context_rows)?; }
+        else { self.update_with(&context_rows, || Ok(()))?; }
         if matches!(self.context, DraftContext::Mla(_)) {
             for slot in 0..self.slots { self.reset_context(slot, TAP_ROWS)?; }
         }
@@ -2068,7 +2310,8 @@ impl<'a> DflashDrafter<'a> {
                 unsafe { self.library.cuda_zero_bytes_async(CuteafdDeviceBuffer { ptr: out.cast(), bytes,
                     ..Default::default() }, bytes, stream) }
             };
-            self.draft_device_with(&sequences, &input, TargetHead::Launch(Box::new(head)))?;
+            let head: HeadLaunch<'_> = Box::new(head);
+            self.draft_from_rank(&sequences, DraftInput::Launch(&input), HeadCall::Launch(&head), true, paired)?;
         }
         for layer in &self.layers {
             if let DraftAttention::Gqa(layer) = &layer.attention {
@@ -2076,6 +2319,18 @@ impl<'a> DflashDrafter<'a> {
                     self.library.cuda_zero_bytes(ring.buffer, ring.buffer.bytes)?;
                 }
             }
+        }
+        if let Some(split) = &self.head_split {
+            split.peer.device.run(|| {
+                for layer in &split.peer.layers {
+                    if let DraftAttention::Gqa(layer) = &layer.attention {
+                        for ring in [&layer.k_ring, &layer.v_ring] {
+                            self.library.cuda_zero_bytes(ring.buffer, ring.buffer.bytes)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
         }
         for slot in 0..self.slots { self.discard_context(slot)?; }
         self.startup_primed.set(true);
@@ -2085,7 +2340,8 @@ impl<'a> DflashDrafter<'a> {
     fn prime_metadata(&self) -> Result<()> {
         let workspace = self.workspace.borrow();
         let w = workspace.as_ref().context("DFlash startup workspace missing")?;
-        let mut buffers = vec![&self.context_positions, &w.positions, &w.anchors, &w.ids];
+        let mut buffers = vec![&self.context_positions, &w.positions];
+        if let Some(head) = &w.head { buffers.extend([&head.anchors, &head.ids]); }
         match (&self.context, &w.attention) {
             (DraftContext::Gqa(context), AttentionWorkspace::Gqa(attention)) => {
                 buffers.extend([&context.slots, &attention.tables]);
@@ -2115,11 +2371,26 @@ impl<'a> DflashDrafter<'a> {
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();
         let physical = self.physical.as_ref().context("GQA draft has no physical layout")?;
+        let has_head = !matches!(self.head_ops, DraftHeadOps::Peer);
+        if has_head {
         ensure!(physical.owner_bytes("workspace.head")? == VOCABULARY_HEAD_WORKSPACE,
             "native vocabulary head scratch differs from layout");
         ensure!(self.library.glm_dflash_topk_workspace(drafted)?.max(256) == physical.owner_bytes("workspace.dflash.topk")?, "native DFlash selector scratch differs from layout");
+        }
         let alloc = |id: &str| DeviceAllocation::new(self.library, physical.owner_bytes(&format!("workspace.{id}"))?);
-        let head_workspace = alloc("head")?;
+        let head = if has_head {
+            let head_workspace = alloc("head")?;
+            // SAFETY: the retained scratch outlives this borrowed handle.
+            let head = unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
+                rows as u32, c.vocab as u32)? };
+            Some(HeadWorkspace { head, _head_workspace: head_workspace,
+                logits: alloc("logits")?, anchors: alloc("anchors")?, ids: alloc("ids")?, tokens: alloc("tokens")?,
+                landing: crate::shared::memory::HostAllocation::new(self.library, physical.owner_bytes("workspace.landing")?)?,
+                unary: Some(alloc("dflash.unary")?), candidates: Some(alloc("dflash.candidates")?),
+                projected: Some(alloc("dflash.projected")?), features: Some(alloc("dflash.features")?),
+                topk_workspace: Some(alloc("dflash.topk")?),
+            })
+        } else { None };
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
             let bytes = self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block, c.head_dim)?;
@@ -2132,9 +2403,7 @@ impl<'a> DflashDrafter<'a> {
             n: alloc("n")?,
             dflash: Some(DflashWorkspace {
                 conv: alloc("dflash.conv")?, dynamic: alloc("dflash.dynamic")?,
-                unary: alloc("dflash.unary")?, candidates: alloc("dflash.candidates")?,
-                projected: alloc("dflash.projected")?, features: alloc("dflash.features")?,
-                topk_workspace: alloc("dflash.topk")?,
+
             }),
             attention: AttentionWorkspace::Gqa(GqaWorkspace {
                 qkv: alloc("attention.qkv")?,
@@ -2148,16 +2417,9 @@ impl<'a> DflashDrafter<'a> {
             delta: alloc("delta")?,
             gate_up: alloc("gate_up")?,
             act: alloc("act")?,
-            logits: alloc("logits")?,
-            anchors: alloc("anchors")?,
-            ids: alloc("ids")?,
-            tokens: alloc("tokens")?,
-            landing: crate::shared::memory::HostAllocation::new(self.library, physical.owner_bytes("workspace.landing")?)?,
             positions: alloc("positions")?,
-            // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                rows as u32, c.vocab as u32)? },
-            _head_workspace: head_workspace,
+            head,
+
         })
     }
 
@@ -2211,6 +2473,11 @@ impl<'a> DflashDrafter<'a> {
 
     fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>,
         serving: bool) -> Result<Vec<Draft>> {
+        self.draft_from_rank(sequences, input, head, serving, true)
+    }
+
+    fn draft_from_rank(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>,
+        serving: bool, paired: bool) -> Result<Vec<Draft>> {
         ensure!(!matches!(head, HeadCall::Bf16(p) if p.is_null()), "DFlash has no borrowed target head");
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
@@ -2293,7 +2560,7 @@ impl<'a> DflashDrafter<'a> {
             self.put(&attention.tables, bytes_of(&tables))?;
         }
         let anchors: Vec<u32> = sequences.iter().map(|s| s.anchor).collect();
-        self.put(&w.anchors, bytes_of(&anchors))?;
+        if let Some(head) = &w.head { self.put(&head.anchors, bytes_of(&anchors))?; }
         match input {
             DraftInput::Rows(anchor_rows) => {
                 let mut embed = Vec::with_capacity(rows * h * 2);
@@ -2307,7 +2574,7 @@ impl<'a> DflashDrafter<'a> {
             }
             DraftInput::Table(embedding) => {
                 let ids = draft_input_ids(sequences, c.mask_token, block);
-                embedding.embed(&ids, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+                embedding.embed(&ids, w.head()?.ids.buffer, 1, w.h.buffer, self.stream)?;
             }
             DraftInput::Launch(input) => {
                 let ids = draft_input_ids(sequences, c.mask_token, block);
@@ -2333,6 +2600,9 @@ impl<'a> DflashDrafter<'a> {
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
+            if let Some(split) = self.head_split.as_ref().filter(|_| paired) {
+                self.checked_head_split(|| self.forward_tp2(w, split, &positions, &tables, s_count, max_keys))?;
+            } else {
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_span = self.timing.begin("layer", Some(index), rows, s)?;
                 // The attention input: DFlash2's convolved rows, or (plain) the normed rows.
@@ -2418,38 +2688,43 @@ impl<'a> DflashDrafter<'a> {
                 }
                 self.timing.end(layer_span, s)?;
             }
+            }
             self.timing.end(forward_span, s)?;
+            if matches!(self.head_ops, DraftHeadOps::Peer) {
+                return Ok(Vec::new());
+            }
             let head_span = self.timing.begin("head_topk", None, rows, s)?;
             match &head {
-                HeadCall::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head,
-                    w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
-                HeadCall::Bf16(weight) => launch_draft_head(l, &w.head, w.n.buffer.ptr, *weight,
-                    w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
-                HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
+                HeadCall::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head()?.head,
+                    w.n.buffer.ptr.cast(), weight.cast(), w.head()?.logits.buffer.ptr.cast(), rows, s)?,
+                HeadCall::Bf16(weight) => launch_draft_head(l, &w.head()?.head, w.n.buffer.ptr, *weight,
+                    w.head()?.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
+                HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.head()?.logits.buffer.ptr.cast(), rows, s)?,
             }
             match &self.head_ops {
+                DraftHeadOps::Peer => anyhow::bail!("peer drafter cannot launch selection"),
                 DraftHeadOps::Selector { projection, predecessor, successor } => {
-                    l.glm_dflash_topk(w.logits.buffer.ptr, w.dflash()?.unary.buffer.ptr, w.dflash()?.candidates.buffer.ptr,
-                        w.dflash()?.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
+                    l.glm_dflash_topk(w.head()?.logits.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr,
+                        w.head()?.topk_workspace.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
                     self.timing.end(head_span, s)?;
                     let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
                     self.linear(w.n.buffer.ptr, projection, 0,
-                        w.dflash()?.projected.buffer.ptr, rows, h, c.rank)?;
-                    l.glm_dflash_select(predecessor.buffer.ptr, successor.buffer.ptr, w.dflash()?.projected.buffer.ptr,
-                        w.dflash()?.candidates.buffer.ptr, w.dflash()?.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
-                        w.dflash()?.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
+                        w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr, rows, h, c.rank)?;
+                    l.glm_dflash_select(predecessor.buffer.ptr, successor.buffer.ptr, w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr,
+                        w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.anchors.buffer.ptr, w.head()?.tokens.buffer.ptr,
+                        w.head()?.features.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
                     self.timing.end(select_span, s)?;
                 }
                 DraftHeadOps::RnnMarkov { softcap, embedding, joint_w, joint_b, output, norms, rank } => {
                     // The target's soft cap on the base logits, then the recurrent Markov
                     // head draws every block row greedily (its bias is not capped).
-                    l.cuda_logits_softcap_f32_async(w.logits.buffer.ptr, rows, c.vocab, c.vocab, *softcap, s)?;
+                    l.cuda_logits_softcap_f32_async(w.head()?.logits.buffer.ptr, rows, c.vocab, c.vocab, *softcap, s)?;
                     self.timing.end(head_span, s)?;
                     let markov_span = self.timing.begin("markov", None, rows, s)?;
                     let workspace = self.markov_workspace.as_ref().context("mtp_dspark Markov workspace")?;
-                    l.ml4_dspark_markov(w.logits.buffer.ptr, w.n.buffer.ptr, embedding.buffer.ptr,
+                    l.ml4_dspark_markov(w.head()?.logits.buffer.ptr, w.n.buffer.ptr, embedding.buffer.ptr,
                         joint_w.buffer.ptr, joint_b.buffer.ptr, output.buffer.ptr, norms.buffer.ptr,
-                        w.anchors.buffer.ptr, w.tokens.buffer.ptr, workspace.buffer.ptr, s_count, block, c.vocab,
+                        w.head()?.anchors.buffer.ptr, w.head()?.tokens.buffer.ptr, workspace.buffer.ptr, s_count, block, c.vocab,
                         *rank, h, s)?;
                     self.timing.end(markov_span, s)?;
                 }
@@ -2459,20 +2734,21 @@ impl<'a> DflashDrafter<'a> {
             // covers the round and both copies (no second, synchronous drain).
             // SAFETY: the device buffers hold `drafted` rows; the landing is
             // pinned, owned by the workspace and read only after the wait.
+            let host = w.head()?.landing.buffer;
             let landing = |offset: usize, bytes: usize| cuteafd_ffi::CuteafdHostBuffer {
-                ptr: w.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes, ..w.landing.buffer };
+                ptr: host.ptr.cast::<u8>().add(offset).cast(), bytes, ..host };
             let token_buffer = if let DraftContext::Mla(context) = &self.context {
                 if context.layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark {
                     let views = context.layout.result_views(s_count)?;
-                    ensure!(views[1].offset + views[1].bytes <= w.landing.buffer.bytes,
+                    ensure!(views[1].offset + views[1].bytes <= w.head()?.landing.buffer.bytes,
                         "draft landing differs from admitted host view");
-                    bind_draft_view(w.tokens.buffer, &views[0])?
-                } else { draft_view(w.tokens.buffer, 0, drafted * 4)? }
-            } else { draft_view(w.tokens.buffer, 0, drafted * 4)? };
+                    bind_draft_view(w.head()?.tokens.buffer, &views[0])?
+                } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? }
+            } else { draft_view(w.head()?.tokens.buffer, 0, drafted * 4)? };
             l.copy_d2h_host_buffer_async(landing(0, drafted * 4), token_buffer, drafted * 4, s)?;
             if matches!(self.head_ops, DraftHeadOps::Selector { .. }) {
                 l.copy_d2h_host_buffer_async(landing(drafted * 4, drafted * 16),
-                    CuteafdDeviceBuffer { bytes: drafted * 16, ..w.dflash()?.features.buffer }, drafted * 16, s)?;
+                    CuteafdDeviceBuffer { bytes: drafted * 16, ..w.head()?.features.as_ref().context("selector workspace missing")?.buffer }, drafted * 16, s)?;
             }
             self.round.borrow_mut().wait(s)?;
         }
@@ -2490,7 +2766,7 @@ impl<'a> DflashDrafter<'a> {
         let drafted = s_count * c.drafts();
         let selector = matches!(self.head_ops, DraftHeadOps::Selector { .. });
         let landing_bytes = drafted * if selector { 20 } else { 4 };
-        let (tokens, features) = w.landing.bytes()[..landing_bytes].split_at(drafted * 4);
+        let (tokens, features) = w.head()?.landing.bytes()[..landing_bytes].split_at(drafted * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         Ok((0..s_count).map(|i| Draft {
             tokens: (0..c.drafts()).map(|j| word(&tokens, i * c.drafts() + j)).collect(),
@@ -2520,9 +2796,9 @@ impl<'a> DflashDrafter<'a> {
         let w = slot.as_ref().context("no draft step ran")?;
         let bytes = sequences.checked_mul(self.cfg.block).and_then(|n| n.checked_mul(self.cfg.vocab))
             .and_then(|n| n.checked_mul(4)).context("draft logit readback overflow")?;
-        ensure!(sequences > 0 && bytes <= w.logits.buffer.bytes, "draft logit readback exceeds workspace");
+        ensure!(sequences > 0 && bytes <= w.head()?.logits.buffer.bytes, "draft logit readback exceeds workspace");
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.logits.buffer })?;
+        self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.head()?.logits.buffer })?;
         Ok(out.chunks_exact(4).map(|value| f32::from_le_bytes(value.try_into().unwrap())).collect())
     }
 
