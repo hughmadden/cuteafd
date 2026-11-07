@@ -935,20 +935,8 @@ fn installed_native_dense_shared_and_vocabulary_equal_reader_requests() -> Resul
             for (layer, record) in records.layers.iter().enumerate() {
                 dense_weights::layer_requests(record, &[], |request| {
                     for (name, bytes) in request.owners {
-                        let key = if name.starts_with("w_") {
-                            format!("operand.{name}")
-                        } else if name == dense_weights::key("router", "bf16") {
-                            "operand.gate".into()
-                        } else if let Some((key, _)) = cfg
-                            .plain_owners(layer)
-                            .into_iter()
-                            .find(|(_, tensor)| *tensor == name)
-                        {
-                            format!("operand.{key}")
-                        } else {
-                            format!("native.{name}")
-                        };
-                        add(rank, format!("layer.{layer}.{key}"), bytes);
+                        let key = GlmLoader::native_layer_owner(&cfg, layer, &format!("layers.{layer}.{name}"))?;
+                        add(rank, key, bytes);
                     }
                     Ok(())
                 })?;

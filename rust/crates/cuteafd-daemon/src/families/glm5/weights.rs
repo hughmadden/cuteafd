@@ -1174,6 +1174,22 @@ impl<'a> GlmLoader<'a> {
         Ok((weights, shares.collect()))
     }
 
+    fn native_layer_owner(cfg: &GlmDsaConfig, layer: usize, name: &str) -> Result<String> {
+        let prefix = format!("layers.{layer}.");
+        let name = name.strip_prefix(&prefix).context("native GLM allocation layer differs")?;
+        let key = if name.starts_with("w_") {
+            format!("operand.{name}")
+        } else if name == crate::shared::experts::exlr8::dense_weights::key("router", "bf16") {
+            "operand.gate".into()
+        } else if let Some((key, _)) = cfg.plain_owners(layer).into_iter().find(|(_, tensor)| tensor == name) {
+            format!("operand.{key}")
+        } else {
+            ensure!(name.starts_with("n."), "unknown native GLM allocation {name}");
+            format!("native.{name}")
+        };
+        Ok(format!("layer.{layer}.{key}"))
+    }
+
     /// An EXLR8 checkpoint's own dense operands (no official snapshot):
     /// `records[rank]` for each head-split rank, filled through `load` (mount
     /// now, or recorded for the push group), the final norm on rank 0 and the
@@ -1199,7 +1215,10 @@ impl<'a> GlmLoader<'a> {
                 ensure!(layer_records.kv_b.is_some() == attention_resident, "native GLM attention record ownership");
                 let part = self.on_rank(rank, |stream| -> Result<GlmLayer<'a>> {
                     let _memory_format = cuteafd_ffi::memory_ledger::format("native");
-                    let mut native = crate::shared::experts::exlr8::dense_weights::load_layer(self.library, load, layer_records, stream)?;
+                    let mut native = crate::shared::experts::exlr8::dense_weights::load_layer_packed_with(
+                        self.library, load, layer_records, &[], stream, |name, bytes| {
+                            self.allocate_owner(&Self::native_layer_owner(cfg, layer, name)?, bytes)
+                        })?;
                     let p = format!("model.layers.{layer}");
                     let mut operands: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
                     for (key, name) in [("w_uk_fp8", "w_uk_fp8"), ("w_uk_scale", "w_uk_scale"), ("w_uv_fp8", "w_uv_fp8"),
@@ -1230,9 +1249,10 @@ impl<'a> GlmLoader<'a> {
             }
         }
         let norm = self.on_rank(0, |stream| {
-            crate::shared::experts::exlr8::dense_weights::landed(self.library, load,
+            crate::shared::experts::exlr8::dense_weights::landed_with(self.library, load,
                 cfg.final_norm(), &records[0].norm,
-                cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, stream)
+                cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, stream,
+                |_, bytes| self.allocate_owner("norm", bytes))
         })?;
         let mut shares = shares.into_iter();
         let weights = GlmWeights { layers: shares.next().context("rank 0")?, norm, head: GlmHead::RowFp8(vocabulary),
