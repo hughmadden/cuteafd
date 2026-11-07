@@ -12,39 +12,39 @@ impl DflashDrafter<'_> {
         for (name, owner) in [("hidden_norm", &self.hidden_norm), ("norm", &self.norm),
             ("taps", &self.taps), ("fused", &self.fused), ("fused_norm", &self.fused_norm),
             ("context_positions", &self.context_positions)] {
-            inventory.device(name, owner.buffer)?;
+            owner.inventory(&mut inventory, name)?;
         }
         for (name, owner) in [("mask_rows", &self.mask_rows), ("markov_workspace", &self.markov_workspace),
             ("fp8_workspace", &self.fp8_workspace)] {
-            if let Some(owner) = owner { inventory.device(name, owner.buffer)?; }
+            if let Some(owner) = owner { owner.inventory(&mut inventory, name)?; }
         }
         inventory.host("mask_row", &self.mask_row)?;
         match &self.head_ops {
             DraftHeadOps::Peer => {}
             DraftHeadOps::Selector { projection, predecessor, successor } => {
                 projection.allocation_receipts(&mut inventory, "head.projection")?;
-                inventory.device("head.predecessor", predecessor.buffer)?;
-                inventory.device("head.successor", successor.buffer)?;
+                predecessor.inventory(&mut inventory, "head.predecessor")?;
+                successor.inventory(&mut inventory, "head.successor")?;
             }
             DraftHeadOps::RnnMarkov { embedding, joint_w, joint_b, output, norms, .. } => {
                 for (name, owner) in [("embedding", embedding), ("joint_w", joint_w), ("joint_b", joint_b),
                     ("output", output), ("norms", norms)] {
-                    inventory.device(&format!("head.{name}"), owner.buffer)?;
+                    owner.inventory(&mut inventory, &format!("head.{name}"))?;
                 }
             }
         }
         for (index, layer) in self.layers.iter().enumerate() {
             let prefix = format!("layer.{index}");
             for (name, owner) in [("input_norm", &layer.input_norm), ("post_norm", &layer.post_norm)] {
-                inventory.device(&format!("{prefix}.{name}"), owner.buffer)?;
+                owner.inventory(&mut inventory, &format!("{prefix}.{name}"))?;
             }
             layer.gate_up.allocation_receipts(&mut inventory, &format!("{prefix}.gate_up"))?;
             layer.down.allocation_receipts(&mut inventory, &format!("{prefix}.down"))?;
             if let LayerBody::Dflash { attn_conv, attn_base, mlp_conv, mlp_base } = &layer.body {
                 attn_conv.allocation_receipts(&mut inventory, &format!("{prefix}.attn_conv"))?;
                 mlp_conv.allocation_receipts(&mut inventory, &format!("{prefix}.mlp_conv"))?;
-                inventory.device(&format!("{prefix}.attn_base"), attn_base.buffer)?;
-                inventory.device(&format!("{prefix}.mlp_base"), mlp_base.buffer)?;
+                attn_base.inventory(&mut inventory, &format!("{prefix}.attn_base"))?;
+                mlp_base.inventory(&mut inventory, &format!("{prefix}.mlp_base"))?;
             }
             match &layer.attention {
                 DraftAttention::Gqa(attention) => {
@@ -52,7 +52,7 @@ impl DflashDrafter<'_> {
                     attention.o.allocation_receipts(&mut inventory, &format!("{prefix}.o"))?;
                     for (name, owner) in [("q_norm", &attention.q_norm), ("k_norm", &attention.k_norm),
                         ("k_ring", &attention.k_ring), ("v_ring", &attention.v_ring)] {
-                        inventory.device(&format!("{prefix}.{name}"), owner.buffer)?;
+                        owner.inventory(&mut inventory, &format!("{prefix}.{name}"))?;
                     }
                 }
                 DraftAttention::Mla(attention) => {
@@ -60,7 +60,7 @@ impl DflashDrafter<'_> {
                         ("kv_norm", &attention.kv_norm), ("q_b", &attention.q_b), ("uk", &attention.uk),
                         ("uv", &attention.uv), ("output", &attention.output), ("cache", &attention.cache),
                         ("page_table", &attention.page_table)] {
-                        inventory.device(&format!("{prefix}.{name}"), owner.buffer)?;
+                        owner.inventory(&mut inventory, &format!("{prefix}.{name}"))?;
                     }
                 }
             }
@@ -82,22 +82,22 @@ impl DflashDrafter<'_> {
         if let Some(workspace) = self.workspace.try_borrow()?.as_ref() {
             for (name, owner) in [("h", &workspace.h), ("n", &workspace.n), ("delta", &workspace.delta),
                 ("gate_up", &workspace.gate_up), ("act", &workspace.act), ("positions", &workspace.positions)] {
-                inventory.device(&format!("workspace.{name}"), owner.buffer)?;
+                owner.inventory(&mut inventory, &format!("workspace.{name}"))?;
             }
             if let Some(head) = &workspace.head {
                 for (name, owner) in [("logits", &head.logits), ("anchors", &head.anchors), ("ids", &head.ids),
                     ("tokens", &head.tokens), ("head", &head._head_workspace)] {
-                    inventory.device(&format!("workspace.{name}"), owner.buffer)?;
+                    owner.inventory(&mut inventory, &format!("workspace.{name}"))?;
                 }
                 inventory.pinned("workspace.landing", head.landing.buffer)?;
                 for (name, owner) in [("unary", &head.unary), ("candidates", &head.candidates),
                     ("projected", &head.projected), ("features", &head.features), ("topk", &head.topk_workspace)] {
-                    if let Some(owner) = owner { inventory.device(&format!("workspace.dflash.{name}"), owner.buffer)?; }
+                    if let Some(owner) = owner { owner.inventory(&mut inventory, &format!("workspace.dflash.{name}"))?; }
                 }
             }
             if let Some(workspace) = &workspace.dflash {
                 for (name, owner) in [("conv", &workspace.conv), ("dynamic", &workspace.dynamic)] {
-                    inventory.device(&format!("workspace.dflash.{name}"), owner.buffer)?;
+                    owner.inventory(&mut inventory, &format!("workspace.dflash.{name}"))?;
                 }
             }
             match &workspace.attention {
@@ -105,7 +105,7 @@ impl DflashDrafter<'_> {
                     for (name, owner) in [("qkv", &workspace.qkv), ("q", &workspace.q), ("k", &workspace.k),
                         ("v", &workspace.v), ("attn", &workspace.attn), ("tables", &workspace.tables),
                         ("scratch", &workspace.scratch)] {
-                        inventory.device(&format!("workspace.attention.{name}"), owner.buffer)?;
+                        owner.inventory(&mut inventory, &format!("workspace.attention.{name}"))?;
                     }
                 }
                 AttentionWorkspace::Mla(workspace) => {
@@ -113,10 +113,10 @@ impl DflashDrafter<'_> {
                         ("lse", &workspace.lse), ("scratch", &workspace.scratch), ("lengths", &workspace.lengths),
                         ("query_offsets", &workspace.query_offsets), ("slots", &workspace.slots),
                         ("positions", &workspace.positions), ("inverse_frequencies", &workspace.inverse_frequencies)] {
-                        inventory.device(&format!("workspace.attention.{name}"), owner.buffer)?;
+                        owner.inventory(&mut inventory, &format!("workspace.attention.{name}"))?;
                     }
                     if let Some(owner) = &workspace.q_residual {
-                        inventory.device("workspace.attention.q_residual", owner.buffer)?;
+                        owner.inventory(&mut inventory, "workspace.attention.q_residual")?;
                     }
                 }
             }

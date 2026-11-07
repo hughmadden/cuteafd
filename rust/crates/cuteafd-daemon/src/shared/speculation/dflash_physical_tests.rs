@@ -75,11 +75,18 @@ fn installed_standard_dflash_physical_layout_equals_serving_receipts() -> Result
                         capacity, library.sm_count()?, mode.code() as u8, kv)?;
                     // Real loader, matrix pack destinations and workspace constructor; recording
                     // suppresses checkpoint payload reads, not any device owner allocations.
+                    let planned = DflashDrafter::arena_requests(&snapshot, representation, &[0], 0)?;
+                    let mut requested = BTreeMap::<i32, Vec<(String, usize)>>::new();
                     let (drafter, records) = crate::shared::experts::rtx::dense::recording(|| {
-                        DflashDrafter::load(&library, &programs, &snapshot, Vec::new(), std::ptr::null_mut(),
+                        DflashDrafter::load_with(&library, &programs, &snapshot, Vec::new(), std::ptr::null_mut(),
                             slots, sequences, vec![0; cfg.hidden * 2], false, representation,
-                            fp8_linear::Fp8Scales::Amax, mode, kv)
+                            fp8_linear::Fp8Scales::Amax, mode, kv, |device, name, bytes| {
+                                assert_eq!(device, library.cuda_get_device()?);
+                                requested.entry(device).or_default().push((name.to_owned(), bytes));
+                                super::super::weights::standalone(&library, device, name, bytes)
+                            })
                     })?;
+                    assert_eq!(requested, planned, "TP1 exact immutable requests");
                     ensure!(!records.operands.is_empty(), "real weight load did not run");
                     ensure!(representation == GlmDraftRepresentation::Bf16Only || !records.steps.is_empty(),
                         "real FP8 packing destinations did not run");
@@ -161,10 +168,17 @@ fn installed_tp2_dflash_physical_layout_equals_both_rank_receipts() -> Result<()
                     let layouts = cuteafd_loader::placement::families::glm5_flash::drafter_tp2_inventory(
                         &snapshot, capacity, &[library.sm_count()? as u64; 2], representation,
                         fp8_linear::Fp8Rows::Wide.code() as u8, kv)?;
-                    let (drafter, _) = crate::shared::experts::rtx::dense::recording(|| DflashDrafter::load_tp2_on(
+                    let planned = DflashDrafter::arena_requests(&snapshot, representation, &[0, 1], lead)?;
+                    let mut requested = BTreeMap::<i32, Vec<(String, usize)>>::new();
+                    let (drafter, _) = crate::shared::experts::rtx::dense::recording(|| DflashDrafter::load_tp2_on_with(
                         &library, &programs, &snapshot, Vec::new(), 20, 16, vec![0; cfg.hidden * 2],
                         true, representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::Wide,
-                        kv, exchange.clone(), lead))?;
+                        kv, exchange.clone(), lead, |device, name, bytes| {
+                            assert_eq!(device, library.cuda_get_device()?);
+                            requested.entry(device).or_default().push((name.to_owned(), bytes));
+                            super::super::weights::standalone(&library, device, name, bytes)
+                        }))?;
+                    assert_eq!(requested, planned, "{repo}: TP2 head rank {lead} exact immutable requests");
                     *drafter.workspace.borrow_mut() = Some(drafter.workspace(16)?);
                     drafter.prime_metadata()?;
                     let peer = &drafter.head_split.as_ref().context("missing head split")?.peer;

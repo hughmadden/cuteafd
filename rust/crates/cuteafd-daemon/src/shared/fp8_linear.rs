@@ -2,7 +2,7 @@
 //! packed at load by `fp8_gemv.cu` (FP32 scales per output row and 128-wide
 //! K block, `amax / 448` or with `pow2` the smallest power of two >= it) and
 //! applied by its W8A16 tensor-core GEMV (BF16 activations, FP32 sums).
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, device::{Allocation, Device}};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
@@ -76,9 +76,15 @@ impl<'a> Fp8Weight<'a> {
     /// retains its source owner if completion cannot be proved).
     pub fn pack(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, scales: Fp8Scales,
         stream: *mut c_void) -> Result<Self> {
-        ensure!(n % 16 == 0 && k % 128 == 0, "FP8 copy of [{n}, {k}]: needs n % 16 == 0 and k % 128 == 0");
-        let packed = DeviceAllocation::new(library, n * k)?;
-        let scale = DeviceAllocation::new(library, n * k / 128 * 4)?;
+        Self::pack_with(library, w, n, k, scales, stream, "weight", |_, bytes| {
+            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+        })
+    }
+
+    pub fn pack_with(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, scales: Fp8Scales,
+        stream: *mut c_void, name: &str,
+        allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
+        let Self { packed, scale, .. } = Self::allocate_with(library, n, k, name, allocate)?;
         // SAFETY: `w` is a live [n, k] BF16 weight; the new buffers hold the packed copy.
         let launched = unsafe { library.fp8_w8a16_pack(w, packed.buffer.ptr, scale.buffer.ptr, n, k, scales.code(), stream) };
         if let Err(error) = launched {
@@ -105,9 +111,31 @@ impl<'a> Fp8Weight<'a> {
 
     /// Unfilled storage for an `[n, k]` copy (filled by W8A16 pack jobs).
     pub fn allocate(library: &'a NativeLibrary, n: usize, k: usize) -> Result<Self> {
-        ensure!(n % 16 == 0 && k % 128 == 0, "FP8 copy of [{n}, {k}]: needs n % 16 == 0 and k % 128 == 0");
-        Ok(Self { packed: DeviceAllocation::new(library, n * k)?, scale: DeviceAllocation::new(library, n * k / 128 * 4)?,
-            n, k })
+        Self::allocate_with(library, n, k, "weight", |_, bytes| {
+            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+        })
+    }
+
+    pub fn allocate_with(library: &'a NativeLibrary, n: usize, k: usize, name: &str,
+        mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
+        ensure!(n > 0 && k > 0 && n % 16 == 0 && k % 128 == 0,
+            "FP8 copy of [{n}, {k}]: needs n % 16 == 0 and k % 128 == 0");
+        let payload = n.checked_mul(k).ok_or_else(|| anyhow::anyhow!("FP8 weight extent overflow"))?;
+        let scales = (payload / 128).checked_mul(4).ok_or_else(|| anyhow::anyhow!("FP8 scale extent overflow"))?;
+        let mut plane = |suffix: &str, bytes| -> Result<DeviceAllocation<'a>> {
+            let device = library.cuda_get_device()?;
+            let owner = allocate(&format!("{name}.{suffix}"), bytes)?;
+            ensure!(library.cuda_get_device()? == device && std::ptr::eq(owner.device.library, library)
+                && owner.device.id == device && owner.buffer.device_id == device
+                && owner.buffer.bytes == bytes && !owner.buffer.ptr.is_null(), "FP8 weight allocation differs from request");
+            Ok(DeviceAllocation::from_allocation(owner))
+        };
+        Ok(Self { packed: plane("payload", payload)?, scale: plane("scales", scales)?, n, k })
+    }
+
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, name: &str) -> Result<()> {
+        self.packed.inventory(inventory, &format!("{name}.values"))?;
+        self.scale.inventory(inventory, &format!("{name}.scales"))
     }
 
     /// The packed values and scales.

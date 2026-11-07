@@ -7,6 +7,57 @@
 #include <cmath>
 #include <algorithm>
 
+// Mirror fp8_gemv.cu's per-row scales and 16x32 A-fragment packing.
+// Allocation-only and lifetime tests retain the C fixture's no-math mode.
+extern "C" int fixture_fp8_w8a16_pack(const void* source, void* packed, void* scales,
+                                       int n, int k, int rule) {
+  using namespace cuteafd_load_quant;
+  if (!source || !packed || !scales || n <= 0 || k <= 0 || n % 16 || k % 128 || rule < 0 || rule > 2) return 1;
+  const auto* w = static_cast<const uint16_t*>(source);
+  auto* q = static_cast<uint8_t*>(packed);
+  auto* scale = static_cast<float*>(scales);
+  for (int r = 0; r < n; ++r) for (int kb = 0; kb < k / 128; ++kb) {
+    float maximum = 0.0f;
+    for (int c = 0; c < 128; ++c) maximum = fmax32(maximum, fabs32(bf16(w[size_t(r) * k + kb * 128 + c])));
+    const float sa = amax_scale(maximum);
+    const uint32_t bits = f32_bits(maximum);
+    const int exponent = std::clamp(int(bits >> 23) - 135 + int((bits & 0x7FFFFFu) > 0x600000u), -126, 127);
+    const float sp = maximum > 0 ? bits_f32(uint32_t(exponent + 127) << 23) : 1.0f;
+    float chosen = rule == 1 ? sp : sa;
+    if (rule == 2) {
+      float ea[32] = {}, ep[32] = {};
+      for (int lane = 0; lane < 32; ++lane) for (int j = 0; j < 4; ++j) {
+        const float x = bf16(w[size_t(r) * k + kb * 128 + lane * 4 + j]);
+        const float da = fsub(fmul(e4m3_value(e4m3(fdiv(x, sa))), sa), x);
+        const float dp = fsub(fmul(e4m3_value(e4m3(fdiv(x, sp))), sp), x);
+        ea[lane] = fadd(ea[lane], fmul(da, da));
+        ep[lane] = fadd(ep[lane], fmul(dp, dp));
+      }
+      for (int offset = 16; offset; offset >>= 1) {
+        float next_a[32], next_p[32];
+        for (int lane = 0; lane < 32; ++lane) {
+          next_a[lane] = fadd(ea[lane], ea[lane ^ offset]);
+          next_p[lane] = fadd(ep[lane], ep[lane ^ offset]);
+        }
+        memcpy(ea, next_a, sizeof(ea)); memcpy(ep, next_p, sizeof(ep));
+      }
+      chosen = ep[0] < ea[0] ? sp : sa;
+    }
+    scale[size_t(r) * (k / 128) + kb] = chosen;
+  }
+  for (int rt = 0; rt < n / 16; ++rt) for (int kb = 0; kb < k / 128; ++kb)
+    for (int kt = 0; kt < 4; ++kt) for (int lane = 0; lane < 32; ++lane) {
+      const int g = lane / 4, c = lane % 4 * 2;
+      const size_t at = ((size_t(rt) * (k / 32) + kb * 4 + kt) * 32 + lane) * 16;
+      for (int step = 0; step < 2; ++step) for (int j = 0; j < 8; ++j) {
+        const int row = rt * 16 + g + ((j % 4 >= 2) ? 8 : 0);
+        const int col = kb * 128 + kt * 32 + step * 16 + c + (j >= 4 ? 8 : 0) + j % 2;
+        q[at + step * 8 + j] = e4m3(fdiv(bf16(w[size_t(row) * k + col]), scale[size_t(row) * (k / 128) + kb]));
+      }
+    }
+  return 0;
+}
+
 // Preserve the warp's accumulation/reduction order for deferred-load tests.
 static int32_t markov_norms(const void* source, void* output, int32_t rows, int32_t cols, bool slack) {
   if (!source || !output || rows < 1 || cols != (slack ? 512 : 256)) return 1;

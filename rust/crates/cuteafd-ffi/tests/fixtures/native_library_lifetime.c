@@ -399,12 +399,14 @@ int cuteafd_cuda_graph_exec_destroy(void *handle) {
     return 0;
 }
 
+int fixture_fp8_w8a16_pack(const void *source, void *packed, void *scale,
+                           int n, int k, int rule);
 int cuteafd_fp8_w8a16_pack(const void *source, void *packed, void *scale,
                          int n, int k, int rule, void *stream) {
-    (void)source; (void)packed; (void)scale; (void)n; (void)k;
-    (void)rule; (void)stream;
+    (void)stream;
     event('P');
-    return pack_status;
+    if (pack_status || !immediate_copies || extent_only) return pack_status;
+    return fixture_fp8_w8a16_pack(source, packed, scale, n, k, rule);
 }
 
 struct upload { void *dst; const void *src; size_t bytes; void *stream; };
