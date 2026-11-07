@@ -570,7 +570,13 @@ fn precision_optimizations(family: &str, options: &PlanOptions) -> Vec<String> {
             let repr = options.layout.as_ref().map(|layout| layout.glmf_representation).unwrap_or_default();
             active.push("MLA and shared experts: FP8 block weights; W8A8 prefill (existing launcher default)".into());
             if repr.kda_fp8 { active.push("KDA projections: row-K128 FP8 weights (existing launcher default)".into()); }
-            if repr.fp8_head { active.push("head: row-K128 FP8 weights (existing launcher default)".into()); }
+            match repr.head {
+                crate::families::glm5_flash::resident::GlmfHeadFormat::Fp8 =>
+                    active.push("head: row-K128 FP8 weights (existing launcher default)".into()),
+                crate::families::glm5_flash::resident::GlmfHeadFormat::Packed =>
+                    active.push("head: exact 12-bit copy of the BF16 weights (target logits exact; drafter reads its coarse plane)".into()),
+                crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16 => {}
+            }
             if !options.layout.as_ref().is_some_and(|layout| layout.glmf_drafter_disabled) {
                 active.push("external drafter: FP8 weights and W8A8 draft linear (existing launcher default)".into());
             }

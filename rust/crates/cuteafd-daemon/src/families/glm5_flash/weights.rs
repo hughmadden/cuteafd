@@ -105,7 +105,8 @@ use crate::shared::native_attention::{NativeAttentionWeights, AttentionRecord, a
 pub(crate) struct GlmfWeights<'a> {
     pub layers: Vec<GlmfLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
-    /// The one resident vocabulary head (BF16, or FP8 with --fp8-head).
+    /// The one resident vocabulary head (BF16, FP8 with --fp8-head, or after
+    /// [`super::head::GlmfHead::pack`] the exact 12-bit copy with --fp8-head packed).
     pub head: super::head::GlmfHead<'a>,
 }
 
@@ -115,7 +116,9 @@ pub(crate) struct Residency {
     pub kda_bf16: usize,
     pub kda_fp8: usize,
     pub head_bf16: usize,
+    /// The FP8 head, or a native checkpoint's own (K6, row-FP8) head.
     pub head_fp8: usize,
+    pub head_packed: usize,
 }
 
 impl GlmfWeights<'_> {
@@ -128,14 +131,16 @@ impl GlmfWeights<'_> {
         }
         match &self.head {
             super::head::GlmfHead::Bf16(w) => r.head_bf16 = w.buffer.bytes,
+            head @ super::head::GlmfHead::Packed { .. } => r.head_packed = head.bytes(),
             head => r.head_fp8 = head.bytes(),
         }
         r
     }
 
-    /// Single residency: no KDA layer and no head holds both a BF16 and an FP8
-    /// copy, and the selected representation is the one resident.
-    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, fp8_head: bool) -> Result<Residency> {
+    /// Single residency: no KDA layer holds both a BF16 and an FP8 copy, the head is one
+    /// allocation set of one form, and the selected representations are the ones resident.
+    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, head: super::head::GlmfHeadFormat)
+        -> Result<Residency> {
         for (index, layer) in self.layers.iter().enumerate().filter(|(_, l)| l.attention == GlmNextAttention::Kda) {
             let (bf16, fp8) = (layer.has("w_in") || layer.has("w_o"), layer.has("w_in_fp8") || layer.has("w_o_fp8"));
             ensure!(!(bf16 && fp8), "KDA layer {index} holds BF16 and FP8 in/out projections");
@@ -144,9 +149,8 @@ impl GlmfWeights<'_> {
             ensure!(native || fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
                 "KDA layer {index}: --kda-fp8 {kda_fp8:?} but {} projections are resident", if fp8 { "FP8" } else { "BF16" });
         }
-        ensure!(matches!(self.head, super::head::GlmfHead::K6(_) | super::head::GlmfHead::RowFp8(_))
-            || matches!(self.head, super::head::GlmfHead::Fp8 { .. }) == fp8_head,
-            "--fp8-head {fp8_head} but the resident head is {}", self.head.name());
+        ensure!(self.head.format().is_none_or(|resident| resident == head),
+            "--fp8-head {} but the resident head is {}", head.setting(), self.head.name());
         Ok(self.residency())
     }
 }

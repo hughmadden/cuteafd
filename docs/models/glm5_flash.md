@@ -99,8 +99,8 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
   FP32 accumulation at every row count, one read of the head (the shared route
   for every family, launcher key `TARGET_HEAD`). `GLM5_FLASH_TARGET_HEAD=exact`
   or `TARGET_HEAD=exact` keeps the pedantic FP32 GEMM as a diagnostic. With the
-  FP8 head the setting does not apply, and an explicit `tensor` there is
-  refused.
+  FP8 or packed head the setting does not apply, and an explicit `tensor` there
+  is refused.
 - 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` keeps `64`;
   explicit `128` (`--decode-rows 128`) remains opt-in on one GPU. Builds with
   `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128` run steps of 65-128 rows on the
@@ -175,7 +175,11 @@ it chooses the serving layout: with one coordinator GPU,
 `GLM5_FLASH_FP8_HEAD=auto` selects `on`; with the two-GPU head split they
 select `off` (BF16 KDA and head). Explicit `off/row128/channel` KDA and
 `on/off` head settings always win, including the deprecated `GLMF_*` keys;
-current names take precedence over deprecated names. The DFlash2 drafter
+current names take precedence over deprecated names. `GLM5_FLASH_FP8_HEAD=packed`
+(`--fp8-head packed`, as `V41_FP8_HEAD=packed`) keeps instead the exact 12-bit
+copy of the BF16 head, packed and verified at load, then the BF16 released
+(956 MB resident against 1,269 MB BF16 and 654 MB FP8): target logits read it
+exactly, the drafter its coarse plane; one GPU only (a head split refuses it). The DFlash2 drafter
 defaults to FP8 on both layouts; `SPECULATOR_FP8=off` keeps it BF16.
 
 Matched recheck, 2026-10-04: GLM 5.3 Flash EXL3 K3.25, RTX PRO 6000 at

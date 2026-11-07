@@ -1393,7 +1393,7 @@ fn declared_numerics_report_preserves_optimizations_and_names_pending_kernel() {
     assert!(defaults.iter().any(|text| text.contains("head:")));
     let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
-            kda_fp8: false, fp8_head: false, output_shard: false },
+            kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false },
         glmf_drafter_disabled: true, ..Default::default() }), ..Default::default() };
     let overridden = precision_optimizations("glm5_flash", &options);
     assert!(!overridden.iter().any(|text| text.contains("KDA") || text.contains("head:") || text.contains("drafter:")));
@@ -3455,6 +3455,42 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     assert!(refused.hints.iter().any(|hint| hint.what.contains("live-slot reserve")));
 }
 
+/// `--fp8-head packed` reaches the plan: its notes name the exact 12-bit head, the target weights
+/// charge its PackedHeadLayout bytes instead of the FP8 or BF16 ones, the drafter's coarse-plane
+/// scratch is a workspace of its own, and a head split refuses it.
+#[test]
+fn glm5_flash_layout_charges_the_packed_head_on_one_gpu() {
+    use crate::families::glm5_flash::resident::{GlmfHeadFormat, GlmfRepresentation};
+    use cuteafd_core::memory_layout::{Category, MemoryLayout};
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
+    let planned = |head, gpus: usize| {
+        let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![32 << 30; gpus], head_split: gpus == 2, drafter_bytes: 256 << 20, context_tokens: 131_072,
+            glmf_representation: GlmfRepresentation { head, ..Default::default() }, ..Default::default() }), ..sparks(4) };
+        plan(dir.path(), &options).unwrap()
+    };
+    let weights = |memory: &MemoryLayout| memory.devices[0].items.iter()
+        .filter(|item| item.category == Category::Weights).map(|item| item.bytes).sum::<u64>();
+    let draft_scratch = |memory: &MemoryLayout| memory.devices[0].items.iter()
+        .filter(|item| item.group == "packed head draft scratch").map(|item| item.bytes).sum::<u64>();
+    let [bf16, fp8, packed] = [GlmfHeadFormat::Bf16, GlmfHeadFormat::Fp8, GlmfHeadFormat::Packed].map(|head| {
+        let report = planned(head, 1);
+        assert!(report.placement_supported, "{head:?}: {:?}", report.hints);
+        let memory = report.memory_layout.unwrap();
+        assert!(memory.notes.iter().any(|note| note.contains(&format!("shared target/draft head: {}", head.name()))),
+            "{:?}", memory.notes);
+        memory
+    });
+    // The fixture's [64, 4096] head: BF16 512 KiB, FP8 values and row128 scales, exact 12-bit layout.
+    assert_eq!(weights(&bf16) - weights(&fp8), 524_288 - 270_336);
+    assert_eq!(weights(&packed) - weights(&fp8), 395_776 - 270_336);
+    assert_eq!([draft_scratch(&bf16), draft_scratch(&fp8), draft_scratch(&packed)], [0, 0, 1 << 20]);
+    let split = planned(GlmfHeadFormat::Packed, 2);
+    assert!(!split.placement_supported);
+    assert!(split.hints.iter().any(|hint| hint.what.contains("one coordinator GPU")), "{:?}", split.hints);
+}
+
 #[test]
 fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
@@ -3519,7 +3555,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(setting),
             prefill_rows: 4096, prefill_lanes: lanes, state_slots: Some(8), prefix_slots: Some(8),
             glmf_drafter_disabled: true, glmf_prefill_expanded: false,
-            glmf_representation: resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false },
+            glmf_representation: resident::GlmfRepresentation { kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false },
             workspace_manifest: Some(path.clone()), ..Default::default() }),
             attention_placement: Some(AttentionPlacement::Heads), ..sparks(peers) };
         let report = plan(dir.path(), &options).unwrap();
@@ -3980,7 +4016,7 @@ fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
         // The fixture manifest is the plain program set: no W8 KDA, no expanded prefill, no
         // sharded output.
         glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
-            kda_fp8: false, fp8_head: false, output_shard: false }, glmf_prefill_expanded: false,
+            kda_fp8: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16, output_shard: false }, glmf_prefill_expanded: false,
         ..Default::default() }),
         attention_placement: attention, ..sparks(4) };
     let heads = plan(dir.path(), &options(Some(AttentionPlacement::Heads))).unwrap();

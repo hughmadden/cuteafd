@@ -712,6 +712,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// The exact 12-bit head (`--fp8-head packed`) owns, beside its resident bytes (the caller's
+    /// inventory), the landed BF16 head while loading and the drafter's coarse-plane scratch
+    /// from the drafter's load on; its target GEMV runs in the step workspaces' head workspace.
+    /// It serves one coordinator GPU; the other forms add nothing.
+    #[test]
+    fn packed_head_adds_its_bf16_load_source_and_draft_scratch_on_one_gpu() {
+        use crate::families::glm5_flash::resident::GlmfHeadFormat;
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let fp8 = inputs(&cfg, 1, inventory::PRO_TOTAL_BYTES);
+        let mut packed = fp8.clone();
+        packed.representation.head = GlmfHeadFormat::Packed;
+        let before = contract(&fp8).unwrap();
+        let after = contract(&packed).unwrap();
+        let ids = |admitted: &admission::AdmittedGlmf| admitted.solved.facts.allocations.iter()
+            .map(|owner| owner.id.clone()).collect::<std::collections::BTreeSet<_>>();
+        assert!(ids(&before).is_subset(&ids(&after)));
+        assert_eq!(ids(&after).difference(&ids(&before)).cloned().collect::<Vec<_>>(),
+            ["glmf.draft.head.0", "glmf.load.head.bf16"]);
+        let owner = |id: &str| after.solved.facts.allocations.iter().find(|owner| owner.id == id).unwrap().clone();
+        let source = owner("glmf.load.head.bf16");
+        assert_eq!((source.bytes, source.location), (64 * 4096 * 2, planner::Location::coordinator(0)));
+        assert_eq!(source.lifetime, planner::Lifetime { first: planner::Phase::Load, last: planner::Phase::Load });
+        // The fixture's 64-row vocabulary splits K 32 ways: one pass's fragments and partials.
+        let scratch = owner("glmf.draft.head.0");
+        assert_eq!(scratch.bytes, 4096 * 64 * 2 + 32 * 64 * 64 * 4);
+        assert_eq!(scratch.lifetime, planner::Lifetime { first: planner::Phase::DraftLoad, last: planner::Phase::Growth });
+        let mut undrafted = packed.clone();
+        (undrafted.drafter_bytes, undrafted.drafter_weights) = (0, ResidentWeights(0));
+        assert_eq!(admission::packed_head_owners(&undrafted, 188).unwrap().draft_scratch, 0);
+        for head in [GlmfHeadFormat::Bf16, GlmfHeadFormat::Fp8] {
+            let mut other = fp8.clone();
+            other.representation.head = head;
+            assert_eq!(admission::packed_head_owners(&other, 188).unwrap(), Default::default());
+        }
+        let mut split = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        split.representation.head = GlmfHeadFormat::Packed;
+        assert!(contract(&split).err().unwrap().to_string().contains("one coordinator GPU"));
+        // GLM 5.3 Flash's real head keeps one K split, 512 KiB, until 606 SMs split it past the
+        // 4 MiB head workspace.
+        let mut flash = cfg.clone();
+        flash.vocab_size = 154_880;
+        let mut real = packed.clone();
+        real.cfg = &flash;
+        let owners = admission::packed_head_owners(&real, 605).unwrap();
+        assert_eq!(owners.draft_scratch, 524_288);
+        assert_eq!(owners.source.unwrap().bytes, 1_268_776_960);
+        assert!(admission::packed_head_owners(&real, 606).unwrap_err().to_string().contains("head workspace"));
+    }
+
     #[test]
     fn contract_graph_bound_covers_exact_selected_shapes_without_pool_walk() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
