@@ -1878,7 +1878,7 @@ pub(super) mod tests {
                 "--workspace-manifest".into(), manifest_path.as_os_str().to_owned(),
                 "--coordinator-weight-budget-gib".into(), gib.to_string().into(),
                 "--attention-placement".into(), "heads".into(), "--rtx-expert-layers".into(), "0".into(),
-                "--context-tokens".into(), "262144".into(), "--pool-tokens".into(), "262144".into(),
+                "--max-context-tokens".into(), "262144".into(), "--pool-tokens".into(), "262144".into(),
                 "--concurrency".into(), "2".into(), "--prefix-slots".into(), "0".into(),
                 "--host-cache-bytes".into(), "0".into(), "--prefill-rows".into(), "2048".into(),
                 "--prefill-waves".into(), "2".into(), "--kv-cache".into(), "bf16".into(),
@@ -2125,7 +2125,7 @@ pub(super) mod tests {
             for context in [262_144, 524_288, 1_048_576] {
                 let text = context.to_string();
                 let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-kimi", "--snapshot", "/fixture",
-                    "--native-lib", "/fixture.so", "--max-context", &text, "--pool-tokens", &text,
+                    "--native-lib", "/fixture.so", "--max-context-tokens", &text, "--pool-tokens", &text,
                     "--kv-cache", format.label()])?;
                 let crate::cli::Commands::ServeKimi(args) = cli.command else { panic!("Kimi command") };
                 let mut i = inputs(&cfg);

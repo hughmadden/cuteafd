@@ -870,7 +870,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                 "disable",
                 "16",
                 "20",
-                "1048576",
+                "auto",
                 "131072",
                 "0.0.0.0:8000",
                 "19441",
@@ -910,7 +910,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
             for args, message in (
                 (["--set", "CONCURRENCY=65"], "CONCURRENCY must be in 1..64"),
                 (["--set", "PREFIX_CACHE_ENTRIES=-1"], "PREFIX_CACHE_ENTRIES must be auto or non-negative"),
-                (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be in 1..1048576"),
+                (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be auto or in 1..1048576"),
                 (["--set", "MAX_OUTPUT_TOKENS=12k"], "MAX_OUTPUT_TOKENS must be an integer"),
                 (["--set", "RTX_GPUS=3"], "RTX_GPUS must be auto, 1, or 2"),
                 (["--set", "DSPARK_DRAFT_LIMIT=8"], "DSPARK_DRAFT_LIMIT must be in 1..7"),

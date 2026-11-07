@@ -142,13 +142,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
 fn resolve_context_tokens(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     if args.context_tokens.is_none() {
         args.context_tokens = cfg.get("MAX_CONTEXT_TOKENS").filter(|value| !value.is_empty())
-            .map(|value| {
-                anyhow::ensure!(value.bytes().all(|byte| byte.is_ascii_digit()) && !value.starts_with('0'),
-                    "MAX_CONTEXT_TOKENS must be in 1..1048576");
-                let tokens = value.parse::<u64>().context("MAX_CONTEXT_TOKENS must be in 1..1048576")?;
-                anyhow::ensure!((1..=1048576).contains(&tokens), "MAX_CONTEXT_TOKENS must be in 1..1048576");
-                Ok(tokens)
-            }).transpose()?;
+            .map(|value| crate::shared::context::parse_tokens::<u64>(value)
+                .map_err(|error| anyhow::anyhow!("MAX_CONTEXT_TOKENS: {error}"))).transpose()?;
     }
     Ok(())
 }
@@ -871,8 +866,63 @@ mod tests {
         let cfg = launch_config(request.config.as_deref()).unwrap();
         resolve_context_tokens(&mut request, &cfg).unwrap();
         let layout = options(&request).unwrap().layout.unwrap();
-        cuteafd_loader::placement::planner::Context::resolve(1048576,
-            (layout.context_tokens > 0).then_some(layout.context_tokens))
+        let value = flags.get(1).copied().unwrap_or(&cfg["MAX_CONTEXT_TOKENS"]);
+        let crate::cli::Commands::ServeMuse(serve) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "serve-muse", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--max-context-tokens", value]).unwrap().command else { panic!("serve-muse") };
+        let served = cuteafd_loader::placement::planner::Context::resolve(1048576, serve.max_context);
+        let planned = cuteafd_loader::placement::planner::Context::resolve(1048576,
+            (layout.context_tokens > 0).then_some(layout.context_tokens));
+        assert_eq!(planned, served);
+        planned
+    }
+
+    #[test]
+    fn installed_kimi_min_auto_context_matches_serve_and_admitted_pool() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::placement::planner::Context;
+        let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/configs/kimi-k3-exl3-k6-min.config");
+        let cfg = launch_config(Some(&config))?;
+        let hf_home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(PathBuf::from)
+            .unwrap_or_else(default_hf_home);
+        let snapshot = cuteafd_loader::model_cache_dir(&hf_home, &cfg["MODEL_ID"])
+            .join("snapshots").join(&cfg["MODEL_REVISION"]);
+        if !snapshot.is_dir() {
+            eprintln!("installed Kimi minimum checkpoint absent; skipping installed context check");
+            return Ok(());
+        }
+        let manifest = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
+        anyhow::ensure!(manifest.is_file(), "installed Kimi context check requires {}", manifest.display());
+        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "plan", snapshot.to_str().unwrap(), "--layout", "--config", config.to_str().unwrap(),
+            "--rtx", "1", "--spark-ranks", "6", "--speculator", "dflash2", "--vision", "off", "--audio", "off",
+            "--workspace-manifest", manifest.to_str().unwrap(), "--prefill-rows", "1024",
+            "--spark-memory-cap", "118111600640"]).unwrap().command else { panic!("plan") };
+        request.hf_home = Some(hf_home);
+        resolve_context_tokens(&mut request, &cfg)?;
+        let mut request = file_args(request, &snapshot)?;
+        let mut selected = options(&request)?;
+        resolve_speculator(&mut request, &snapshot, "kimi_k3", &cfg)?;
+        selected.layout.as_mut().unwrap().kimi_drafter_snapshot = request.drafter_snapshot.clone();
+        let report = plan(&snapshot, &selected)?;
+        anyhow::ensure!(report.fits && report.placement_supported, "installed Kimi minimum refused: {:?}", report.hints);
+        let memory = report.memory_layout.context("installed Kimi minimum memory layout")?;
+        let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let maximum = cuteafd_loader::serving_capacity::checkpoint_context_limit(&checkpoint)?.context("Kimi model maximum")?;
+        let crate::cli::Commands::ServeKimi(serve) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "serve-kimi", "--snapshot", snapshot.to_str().unwrap(), "--native-lib", "/native.so",
+            "--max-context-tokens", cfg.get("MAX_CONTEXT_TOKENS").map(String::as_str).unwrap_or("auto")])?.command
+            else { panic!("serve-kimi") };
+        let served = crate::shared::context::pool_context("kimi_k3",
+            Context::resolve(maximum, serve.max_context.map(|tokens| tokens as u64)), memory.pool_tokens as usize)?;
+        assert_eq!(served as u64, maximum.min(memory.pool_tokens));
+        assert!(served <= cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT);
+        assert!(memory.notes.iter().any(|note| note.starts_with(&format!("Kimi API max context: {served} tokens;"))),
+            "{:?}", memory.notes);
+        Ok(())
     }
 
     #[test]
@@ -884,14 +934,14 @@ mod tests {
     #[test]
     fn plan_context_cli_overrides_installed_muse_config() {
         use cuteafd_loader::placement::planner::{Context, Pin};
-        assert_eq!(configured_context(&["--context-tokens", "131072"]),
+        assert_eq!(configured_context(&["--max-context-tokens", "131072"]),
             Context { maximum: 1048576, pin: Pin::Exact(131072) });
-        assert_eq!(configured_context(&["--context-tokens", "0"]), Context::automatic(1048576));
+        assert_eq!(configured_context(&["--max-context-tokens", "auto"]), Context::automatic(1048576));
     }
 
     #[test]
     fn plan_config_context_omitted_or_empty_stays_automatic() {
-        for configured in [None, Some("")] {
+        for configured in [None, Some(""), Some("auto")] {
             let mut request = args(std::path::Path::new("model"), 4, false);
             request.context_tokens = None;
             let cfg = configured.map(|value| ("MAX_CONTEXT_TOKENS".into(), value.into()))
@@ -903,12 +953,12 @@ mod tests {
 
     #[test]
     fn plan_config_context_rejects_non_launcher_values() {
-        for value in ["0", "auto", "-1", "+1", "01", "1048577", "18446744073709551616"] {
+        for value in ["0", "-1", "+1", "01", "1048577", "18446744073709551616"] {
             let mut request = args(std::path::Path::new("model"), 4, false);
             request.context_tokens = None;
             let cfg = [("MAX_CONTEXT_TOKENS".into(), value.into())].into_iter().collect();
             assert!(resolve_context_tokens(&mut request, &cfg).unwrap_err().to_string()
-                .contains("MAX_CONTEXT_TOKENS must be in 1..1048576"), "{value}");
+                .contains("MAX_CONTEXT_TOKENS: context must be auto or a positive integer in 1..1048576"), "{value}");
         }
     }
 

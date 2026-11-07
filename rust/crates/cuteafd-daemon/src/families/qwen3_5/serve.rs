@@ -510,6 +510,9 @@ pub(crate) struct ServeArgs {
     pub device: i32,
     #[arg(long)]
     pub pool_tokens: Option<u64>,
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<u64>)]
+    pub max_context: Option<u64>,
     /// Full-attention KV storage only; GDN recurrence remains FP32.
     #[arg(long, default_value = "fp8")]
     pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -595,7 +598,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
                 Some((&engine_args.prefix, lanes,
-                    engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device)), false)?);
+                    engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false)?);
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
             let drafts = if let Some(snapshot) = &engine_args.draft {

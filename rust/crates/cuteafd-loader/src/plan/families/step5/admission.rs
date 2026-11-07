@@ -514,7 +514,7 @@ fn admit_depth_with(
                 | Refusal::FullContextShortfall { .. });
             let error = anyhow::Error::from(error);
             if !inputs.marks.host && recipe.marks > 0 && clamped {
-                anyhow::anyhow!("{error}; Step-5 device-only prefix retention with HOST_CACHE_BYTES=0 does not fit at request context {}; enable --host-cache-bytes auto (HOST_CACHE_BYTES=auto), or lower --max-context/--context-tokens (MAX_CONTEXT_TOKENS), for example to 262144", inputs.context)
+                anyhow::anyhow!("{error}; Step-5 device-only prefix retention with HOST_CACHE_BYTES=0 does not fit at request context {}; enable --host-cache-bytes auto (HOST_CACHE_BYTES=auto), or lower --max-context-tokens/--max-context-tokens (MAX_CONTEXT_TOKENS), for example to 262144", inputs.context)
             } else {
                 error
             }

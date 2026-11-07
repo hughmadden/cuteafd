@@ -80,6 +80,16 @@ class ReleaseGpuSelectionTest(unittest.TestCase):
                 env=os.environ.copy(),
             )
 
+    def test_auto_context_sizes_only_minimum_screening_groups(self) -> None:
+        result = self.invoke(extra=("--max-context-tokens", "auto"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["groups"], 80)
+        for value in ("0", "01", "-1", "+1", "1048577", "18446744073709551617"):
+            with self.subTest(value=value):
+                invalid = self.invoke(extra=("--max-context-tokens", value))
+                self.assertNotEqual(invalid.returncode, 0)
+                self.assertNotIn("Traceback", invalid.stderr)
+
     def test_auto_selects_ordered_pair_for_default_pool(self) -> None:
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)

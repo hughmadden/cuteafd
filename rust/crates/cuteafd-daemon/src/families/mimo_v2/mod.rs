@@ -69,8 +69,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (layer 0 is the only dense layer).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence; 0 selects the checkpoint's full context.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<usize>)]
     pub max_context: usize,
     /// Tokens the full-attention record pool holds across sequences; 0 sizes
     /// it from what every GPU has left after weights, workspaces, graphs and
@@ -347,7 +347,7 @@ mod draft_storage_tests {
         assert_eq!(automatic.pool_tokens, 0);
         assert_eq!(automatic.prefill_span_rows, 16384);
         assert_eq!(automatic.token_io.embed_placement, None);
-        let explicit = args(&["--max-context", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
+        let explicit = args(&["--max-context-tokens", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
         assert_eq!(explicit.max_context, 32768);
         assert_eq!(explicit.pool_tokens, 131072);
         assert_eq!(explicit.token_io.embed_placement, Some(crate::shared::token_io::EmbedPlacement::Gpu));

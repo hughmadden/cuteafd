@@ -136,6 +136,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
         if role == "coordinator":
             expected_command.append("--expert-usage")
+            expected_command[expected_command.index("--max-context-tokens") + 1] = "auto"
         # With Sparks, serve's unit is the planner's third of the reserve (fixed depth 3).
         if role == "coordinator" and value("--prefill-waves") == "3" and "--prefill-batch-tokens" in expected_command:
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
@@ -159,6 +160,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         cap_index = expected.index("--coordinator-gpu-budget-gib")
         expected[cap_index:cap_index + 2] = ["--gpu-memory-cap",
                                              str(int(float(expected[cap_index + 1]) * 2**30))]
+        expected[expected.index("--max-context-tokens") + 1] = "auto"
         expected.insert(expected.index("--require-ready"), "--deployment")
         if case in KIT_CARDS:
             expected.remove("--require-ready")
@@ -257,7 +259,7 @@ def test_v41_sim5090_launches_pinned_single_gpu_tp4() -> None:
     coordinator = containers[0]
     assert coordinator["env"]["CUTEAFD_SPARK_INTAKE"] == "pinned"
     command = dict(flag_values(coordinator["command"]))
-    for flag, value in {"--rtx-gpus": "1", "--max-context-tokens": "1048576"}.items():
+    for flag, value in {"--rtx-gpus": "1", "--max-context-tokens": "auto"}.items():
         assert command[flag] == value
     assert "--spark-tp" not in command and "--spark-ep" not in command
     assert len(containers) == 5

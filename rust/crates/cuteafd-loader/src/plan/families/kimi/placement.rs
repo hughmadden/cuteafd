@@ -43,7 +43,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
     if context > COMPILED_CAPACITY {
         report.refuse_placement(format!("Kimi context {context} exceeds compiled capacity {COMPILED_CAPACITY}"),
-            "Lower --context-tokens to at most 1M; the pool must cover the selected context extent.");
+            "Lower --max-context-tokens to at most 1M; the pool must cover the selected context extent.");
         return memory;
     }
     let context_split = attention == AttentionPlacement::Context;

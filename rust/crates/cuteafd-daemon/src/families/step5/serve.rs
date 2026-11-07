@@ -84,7 +84,7 @@ pub(crate) struct ServeArgs {
     /// Immutable target and native predictor KV storage.
     #[arg(long, default_value = "fp8")]
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<u64>)]
     max_context: u64,
     /// Prefill unit rows (PLAN "Prefill contract"); a prefill call holds
     /// `--prefill-waves` units; zero selects the shared topology shape.

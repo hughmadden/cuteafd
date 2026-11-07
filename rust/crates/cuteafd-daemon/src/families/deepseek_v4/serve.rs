@@ -46,8 +46,8 @@ pub(crate) struct ServeArgs {
     /// Packed short-prompt arithmetic: unrestricted by default, exact keeps loaded routes.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
-    /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
-    #[arg(long, default_value_t = 0)]
+    /// Served context: auto fits the admitted pool; a positive count pins it.
+    #[arg(long = "max-context-tokens", default_value = "auto", value_parser = crate::shared::context::parse_tokens::<u32>)]
     pub max_context: u32,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
@@ -198,7 +198,7 @@ fn serve_loop(
         }
         if max_context > engine.max_context {
             tracing::warn!(requested = max_context, supported = engine.max_context,
-                "--max-context exceeds the exported programs; requests are limited to the programs' context");
+                "--max-context-tokens exceeds the exported programs; requests are limited to the programs' context");
         }
         engine.configure_packing(packing, transports)?;
         let shared = super::draft_binding::new(engine, &loaded, transports)?;

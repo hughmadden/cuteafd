@@ -1527,7 +1527,7 @@ mod draft_tests {
         for context in [0usize, 1_048_576] {
             let mut args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", manifest.to_str().unwrap(),
-                "--max-context", &context.to_string(), "--dspark", "--max-sequences", "16",
+                "--max-context-tokens", &context.to_string(), "--dspark", "--max-sequences", "16",
                 "--host-cache-bytes", "auto"])?.args;
             args.prefix.resolve_entries(args.max_sequences.unwrap());
             let mut resolved = super::super::ResolvedEngineArgs::new(&args.engine)?;

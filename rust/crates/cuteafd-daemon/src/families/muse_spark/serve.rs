@@ -27,9 +27,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
-    /// API ceiling and compiled extent; unset takes the checkpoint's 1M with the
-    /// pool deciding the admitted context.
-    #[arg(long)] pub max_context: Option<u64>,
+    /// Served context: auto fits the admitted pool, bounded by the checkpoint maximum; a number pins it.
+    #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<u64>)]
+    pub max_context: Option<u64>,
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
@@ -106,7 +106,7 @@ impl ServeArgs {
         let worlds = cuteafd_loader::plan::experts::spark_worlds(cuteafd_loader::plan::families::muse_spark::PACKAGE, 4096);
         ensure!((self.peers.is_empty() || worlds.contains(&self.peers.len())) && distinct == self.peers.len(),
             "Muse Spark serves its EXL3 TP experts on {worlds:?} distinct Spark endpoints, not {}", self.peers.len());
-        ensure!(self.max_context.is_none_or(|context| (1..=1 << 20).contains(&context)),
+        ensure!(self.max_context.is_none_or(|context| context == 0 || (1..=1 << 20).contains(&context)),
             "Muse Spark context exceeds the checkpoint's 1M extent");
         self.prefill()?;
         for (name, mode, peers, hash, revision) in [
@@ -207,7 +207,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         full_prefill_logits: args.full_prefill_logits, slots: u64::from(args.max_sequences),
         mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
             .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
-        max_context: args.max_context,
+        max_context: args.max_context.filter(|&tokens| tokens > 0),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
         spark_budget_bytes: args.spark_budget_bytes(),
         partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
@@ -521,7 +521,7 @@ mod tests {
     fn live_tp2_one_token_forward_and_selection() -> Result<()> {
         use crate::shared::{qwen::scheduler::Backend as _, token_io::{RowSelect, SelectBatch, SelectPlacement, TokenSelector}};
         let mut args = args(&["--split-device", "1", "--rtx-expert-layers", "0",
-            "--pool-tokens", "16384", "--max-context", "8192", "--max-sequences", "1"])?;
+            "--pool-tokens", "16384", "--max-context-tokens", "8192", "--max-sequences", "1"])?;
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
         args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
         args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
@@ -734,10 +734,10 @@ mod tests {
         }
         for extra in [vec!["--peers", nine.as_str()], vec!["--peers", "127.0.0.1:1,127.0.0.1:1"],
             vec!["--peers", PEERS, "--device", "1", "--split-device", "1"], vec!["--peers", PEERS, "--split-device", "0"],
-            vec!["--peers", PEERS, "--max-context", "1048577"], vec!["--peers", PEERS, "--max-context", "0"],
+            vec!["--peers", PEERS, "--max-context-tokens", "1048577"], vec!["--peers", PEERS, "--max-context-tokens", "0"],
             vec!["--peers", PEERS, "--prefill-rows", "4097"], vec!["--peers", PEERS, "--prefix-partial", "on"],
             vec!["--peers", PEERS, "--expert-partial-bf16-max-rows", "8"]] {
-            assert!(args(&extra)?.validate().is_err(), "{extra:?}");
+            assert!(args(&extra).is_err() || args(&extra)?.validate().is_err(), "{extra:?}");
         }
         assert!(args(&["--peers", PEERS, "--max-sequences", "65"]).is_err());
         Ok(())
