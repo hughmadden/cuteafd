@@ -143,9 +143,20 @@ pub const SPARK_RUNTIME_RESIDUAL_BYTES: u64 = 5 * (1 << 29);
 pub const SPARK_RUNTIME_RESIDUAL_GROUP: &str = "Spark runtime residual";
 pub const SPARK_RUNTIME_RESIDUAL_SOURCE: &str = "V4.1 min/max seven-rank system/cgroup census at 0a6fc7b1; maximum measured residual 2,083,518,960 B plus margin; shared cross-family estimate, attribution pending #388";
 
+/// Allocation allowance for the selected Spark worker. An unselected shape
+/// keeps the conservative census. Kimi TP6's measured narrow-export ledger
+/// charges upload staging only; OS/driver occupancy is already unavailable.
+pub fn spark_runtime_bytes(selected: Option<(crate::ExpertGeometry, usize, u32)>) -> u64 {
+    match selected {
+        Some((geometry, 6, compiled)) if geometry == crate::ExpertGeometry::KIMI_K3
+            && compiled <= 1024 => 4096,
+        _ => SPARK_RUNTIME_RESIDUAL_BYTES,
+    }
+}
+
 pub fn spark_runtime_residual() -> Item {
     Item::new(Category::Runtime, SPARK_RUNTIME_RESIDUAL_GROUP, "",
-        SPARK_RUNTIME_RESIDUAL_BYTES, Basis::Estimated).with_lifetime(ItemLifetime::ReadyResident)
+        spark_runtime_bytes(None), Basis::Estimated).with_lifetime(ItemLifetime::ReadyResident)
 }
 
 impl Item {
@@ -399,6 +410,24 @@ mod tests {
         assert!(HostLayout::new(u64::MAX, u64::MAX, 1, u64::MAX, vec![]).is_none());
         let item = Item::new(Category::Workspace, "resident", "", u64::MAX, Basis::Exact);
         assert!(HostLayout::new(u64::MAX, u64::MAX, 0, 0, vec![item.clone(), item]).is_none());
+    }
+
+    #[test]
+    fn spark_allocation_allowance_is_shared_and_calibration_is_shape_scoped() {
+        use crate::ExpertGeometry as G;
+        for geometry in [G::DEEPSEEK_V41, G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO,
+            G::GLM5, G::GLM5_FLASH, G::MIMO_V2_FLASH, G::MIMO_V26_PRO, G::QWEN4,
+            G::KIMI_K3, G::MISTRAL_LARGE4, G::STEP5, G::MUSE_SPARK] {
+            for world in 1..=8 {
+                for compiled in [1, 16, 80, 256, 1024, 4096] {
+                    let expected = if geometry == G::KIMI_K3 && world == 6 && compiled <= 1024 {
+                        4096
+                    } else { spark_runtime_residual().bytes };
+                    assert_eq!(spark_runtime_bytes(Some((geometry, world, compiled))), expected,
+                        "{geometry:?} world={world} compiled={compiled}");
+                }
+            }
+        }
     }
 
     #[test]

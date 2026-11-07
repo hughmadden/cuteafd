@@ -402,9 +402,8 @@ fn spark_runtime_headroom(config: &NativeExpertServiceConfig,
     geometry: cuteafd_core::ExpertGeometry) -> Result<usize> {
     let executions = &config.model_admission.as_ref()
         .context("Spark runtime allowance requires typed execution admission")?.executions;
-    let bytes = if geometry == cuteafd_core::ExpertGeometry::KIMI_K3 {
-        cuteafd_loader::families::kimi_k3::spark::runtime_bytes(config.world, executions)
-    } else { cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES };
+    let bytes = cuteafd_core::memory_layout::spark_runtime_bytes(Some((geometry, config.world,
+        executions.compiled_capacity())));
     env_usize("CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES", usize::try_from(bytes)?)
 }
 
@@ -1096,7 +1095,7 @@ mod tests {
                 config.model_admission.as_mut().unwrap().executions =
                     cuteafd_loader::families::kimi_k3::spark_executions(3, 1024)?;
                 assert_eq!(spark_runtime_headroom(&config, geometry)? as u64,
-                    cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+                    cuteafd_core::memory_layout::spark_runtime_residual().bytes);
             }
         }
         for (world, rows) in [(4, 1024), (6, 2752), (8, 1024)] {

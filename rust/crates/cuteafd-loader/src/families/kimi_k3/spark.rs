@@ -4,15 +4,15 @@ use anyhow::{Context, Result};
 use cuteafd_core::{OwnerBytes, OwnerExtent, SparkExecutions};
 
 fn calibrated(world: usize, executions: &SparkExecutions) -> bool {
-    world == 6 && executions.compiled_capacity() <= 1024
+    runtime_bytes(world, executions) != cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES
 }
 
 /// Allocation allowance shared by coordinator admission and worker load/serve
 /// checks. MemAvailable already excludes OS/driver occupancy; the calibrated
 /// TP6 ledger retains only the synchronous upload allocation instead.
 pub fn runtime_bytes(world: usize, executions: &SparkExecutions) -> u64 {
-    if calibrated(world, executions) { 4096 }
-    else { cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES }
+    cuteafd_core::memory_layout::spark_runtime_bytes(Some((cuteafd_core::ExpertGeometry::KIMI_K3,
+        world, executions.compiled_capacity())))
 }
 
 /// The 2026-11-04 TP6 census retained m1/m80 decode and m1/m80/m256/m1024
