@@ -1,21 +1,21 @@
 //! Native dense BF16/E4M3 operands with checkpoint-format scales and BF16 gates.
-use crate::shared::memory::device::Allocation;
+use crate::shared::memory::{device::{Allocation, Device}, receipts::Inventory, weight_arena::DeviceWeightArena};
 use crate::shared::qwen::weights::WeightReader;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::families::qwen::HybridAttention;
-use cuteafd_loader::families::qwen3_5::Qwen35Config;
+use cuteafd_loader::{families::qwen3_5::Qwen35Config, serving_capacity::WeightArenaLayout};
 #[cfg(test)]
-use cuteafd_loader::{plan::checkpoint::Checkpoint, serving_capacity::WeightArenaLayout};
+use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::{collections::HashMap, ffi::c_void};
 
 const PREFIX: &str = "model.language_model.";
 
 use cuteafd_loader::families::qwen3_5::weight_layout::{layer_requests, native_operands,
     validate_native_matrices, Storage};
-pub(crate) use cuteafd_loader::families::qwen3_5::weight_layout::DenseFormat;
+pub(crate) use cuteafd_loader::families::qwen3_5::weight_layout::{mtp_arena, target_arena, DenseFormat};
 #[cfg(test)]
-use cuteafd_loader::families::qwen3_5::weight_layout::{layer_operands, mtp_arena, target_arena};
+use cuteafd_loader::families::qwen3_5::weight_layout::layer_operands;
 
 pub(crate) struct DenseLayer<'a> {
     pub(crate) attention: HybridAttention,
@@ -53,20 +53,67 @@ fn packed_native_layout(tensors: &[(Vec<u8>, DType, Vec<usize>)], storage: Stora
     Ok(out)
 }
 
-impl<'a> WeightReader<'a> {
-    pub(crate) fn dense_bytes(&self, cfg: &Qwen35Config, norm_dtype: DType, _format: DenseFormat)
-        -> Result<cuteafd_loader::placement::families::qwen3_5::NativeWeights> {
-        cuteafd_loader::placement::families::qwen3_5::NativeWeights::native(self.checkpoint, cfg, norm_dtype)
+/// Caller-named final weight owner; an arena view in serving, standalone otherwise.
+pub(crate) type Allocate<'a, 'b> = dyn FnMut(&str, usize) -> Result<Allocation<'a>> + 'b;
+
+/// A preplanned per-device weight arena for one independently retired scope.
+/// Every planned view must be requested exactly once, at its planned extent.
+pub(crate) struct ScopeArena<'a> {
+    arena: DeviceWeightArena<'a>,
+    taken: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+impl<'a> ScopeArena<'a> {
+    pub(crate) fn new(device: Device<'a>, layout: WeightArenaLayout) -> Result<Self> {
+        Ok(Self { arena: DeviceWeightArena::new(device, layout)?, taken: Default::default() })
     }
 
+    pub(crate) fn allocate(&self, name: &str, bytes: usize) -> Result<Allocation<'a>> {
+        ensure!(self.taken.borrow_mut().insert(name.to_owned()), "{name}: weight view requested twice");
+        self.arena.view(name, bytes)
+    }
+
+    /// The loader has bound every planned view; nothing in the backing is unowned.
+    pub(crate) fn complete(&self) -> Result<()> {
+        let taken = self.taken.borrow();
+        let missing: Vec<_> = self.arena.layout().views().keys().filter(|name| !taken.contains(*name)).collect();
+        ensure!(missing.is_empty(), "{} views never loaded: {missing:?}", self.arena.layout().id());
+        Ok(())
+    }
+
+    pub(crate) fn layout(&self) -> &WeightArenaLayout { self.arena.layout() }
+}
+
+impl DenseWeights<'_> {
+    pub(crate) fn inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.inventory(inventory, &format!("layer.{index}"))?;
+        }
+        self.norm.inventory(inventory, "norm")?;
+        self.head.inventory(inventory, "head")
+    }
+}
+
+impl DenseLayer<'_> {
+    pub(crate) fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
+        let mut names: Vec<_> = self.operands.keys().collect();
+        names.sort();
+        for name in names { self.operands[name].inventory(inventory, &format!("{prefix}.{name}"))?; }
+        Ok(())
+    }
+}
+
+impl<'a> WeightReader<'a> {
     /// Validate every header before uploading any weights.
-    pub(crate) fn dense_native(&self, cfg: &Qwen35Config, norm_dtype: DType, format: DenseFormat) -> Result<DenseWeights<'a>> {
-        self.dense_bytes(cfg, norm_dtype, format)?;
+    pub(crate) fn dense_native(&self, cfg: &Qwen35Config, norm_dtype: DType, format: DenseFormat,
+        allocate: &mut Allocate<'a, '_>) -> Result<DenseWeights<'a>> {
+        cuteafd_loader::placement::families::qwen3_5::NativeWeights::native(self.checkpoint, cfg, norm_dtype)?;
         let norm_name = format!("{PREFIX}norm.weight");
         let head_name = if cfg.tied_embeddings { format!("{PREFIX}embed_tokens.weight") } else { "lm_head.weight".into() };
         let layers = cfg.attention.iter().enumerate().map(|(index, &kind)|
-            self.dense_layer(&format!("{PREFIX}layers.{index}"), kind, format)).collect::<Result<_>>()?;
-        Ok(DenseWeights { layers, norm: self.bf16(&norm_name)?, head: self.bf16(&head_name)? })
+            self.dense_layer(&format!("{PREFIX}layers.{index}"), kind, format, allocate)).collect::<Result<_>>()?;
+        Ok(DenseWeights { layers, norm: self.bf16_with(&norm_name, &norm_name, &mut *allocate)?,
+            head: self.bf16_with("head.weight", &head_name, &mut *allocate)? })
     }
 
     pub(crate) fn dense_layer_bytes(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<u64> {
@@ -76,19 +123,23 @@ impl<'a> WeightReader<'a> {
     }
 
     /// MTP and target blocks share the checkpoint-native projection packing.
-    pub(crate) fn dense_layer(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<DenseLayer<'a>> {
+    /// Each operand is one caller-named owner `{prefix}/{operand}`.
+    pub(crate) fn dense_layer(&self, prefix: &str, attention: HybridAttention, format: DenseFormat,
+        allocate: &mut Allocate<'a, '_>) -> Result<DenseLayer<'a>> {
         let operands = native_operands(prefix, attention, format).into_iter().map(|spec| {
+                let name = format!("{prefix}/{}", spec.name);
+                let allocate = &mut *allocate;
                 let weight = match spec.storage {
-                    Storage::Bf16 if spec.tensors.len() > 1 => self.rows(&spec.tensors, 0)?,
-                    Storage::Bf16 => self.bf16(&spec.tensors[0])?,
-                    Storage::F32 => self.f32(&spec.tensors[0])?,
+                    Storage::Bf16 if spec.tensors.len() > 1 => self.rows_with(&name, &spec.tensors, 0, allocate)?,
+                    Storage::Bf16 => self.bf16_with(&name, &spec.tensors[0], allocate)?,
+                    Storage::F32 => self.f32_with(&name, &spec.tensors[0], allocate)?,
                     Storage::Fp8 | Storage::Scales => {
                         let headers = spec.tensors.iter().map(|name| self.tensor(name)).collect::<Result<Vec<_>>>()?;
                         validate_native_matrices(headers.iter().map(|tensor|
                             (&tensor.meta.dtype, tensor.meta.shape.as_slice(), tensor.meta.byte_length)), spec.storage)?;
-                        self.native(&spec.tensors, spec.storage == Storage::Scales)?
+                        self.native_with(&name, &spec.tensors, spec.storage == Storage::Scales, allocate)?
                     },
-                    Storage::NativeNorm => self.native(&spec.tensors, false)?,
+                    Storage::NativeNorm => self.native_with(&name, &spec.tensors, false, allocate)?,
                 };
             Ok((spec.name, weight))
         }).collect::<Result<_>>()?;
