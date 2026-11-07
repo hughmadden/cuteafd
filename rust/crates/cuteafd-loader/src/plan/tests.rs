@@ -4868,6 +4868,9 @@ fn v4_pro_exl3_tp6_and_explicit_refusal_keep_default_fallback_reason() {
     let tp6 = plan_spark_count(dir.path(), &options, 6, Some(6)).unwrap();
     assert!(tp6.executable(), "{}", render(&tp6));
     assert_eq!(tp6.spark_ranks, 6);
+    // A uniform K2 checkpoint serves the shipped k23 decoder-tier package, so the
+    // deployment's Spark packages name what WIP and release images build.
+    assert_eq!(tp6.experts.as_ref().unwrap().package, "dsv4p:exl3-k23 (expertd-native)");
     // Seven ranks exceed the qualified package range; automatic selection still
     // chooses the largest supported count, while an explicit request refuses.
     let refused = plan_spark_count(dir.path(), &options, 7, Some(7)).unwrap();

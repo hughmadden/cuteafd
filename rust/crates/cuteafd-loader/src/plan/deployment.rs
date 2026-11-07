@@ -601,10 +601,13 @@ mod tests {
         options.peers.push("worker:0".into());
         assert!(DeploymentSpec::from_report(&report, &options).is_err());
         options.peers.clear();
-        report.experts.as_mut().unwrap().package = "dsv4p:exl3-k2".into();
+        report.experts.as_mut().unwrap().package = "dsv4p:exl3-k23 (expertd-native)".into();
         report.family = Some("deepseek_v4".into());
         report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = 3072;
-        assert_eq!(DeploymentSpec::from_report(&report, &options).unwrap().topology.tp, 4);
+        let pro = DeploymentSpec::from_report(&report, &options).unwrap();
+        assert_eq!(pro.topology.tp, 4);
+        // The shipped k23 tier-pair package a WIP or release image carries.
+        assert_eq!(pro.artifact_requirements.spark_packages.keys().collect::<Vec<_>>(), ["exl3/exl3-dsv4p-k23"]);
         report.memory_layout = None;
         assert!(DeploymentSpec::from_report(&report, &options).is_err());
     }

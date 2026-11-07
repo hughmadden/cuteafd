@@ -220,3 +220,15 @@ def test_exporter_and_build_inputs_change_the_native_key(source_copy, tmp_path, 
     with (source_copy / name).open('a') as handle:
         handle.write('\n')
     assert native_key(source_copy, tmp_path) != before
+
+
+def test_shipped_v4_pro_k2_config_scopes_the_k23_package_the_launcher_loads():
+    # The uniform K2 checkpoint decodes with the k23 tier pair (v41_catalog
+    # exl3_catalog_or_read(.., &[2, 3]); the planner's deployment names the same).
+    values = aot.read_config(ROOT / 'examples/configs/deepseek-v4-pro-exl3-max.config')
+    assert 'K2' in values['MODEL_ID']
+    family, derived = aot.config_scopes({**values, 'FAMILY': 'deepseek_v4'})
+    assert family == 'deepseek_v4'
+    assert 'dsv4p:exl3-k23' in derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
+    assert 'dsv4p:exl3-k23' in derived['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
+    assert derived['CUTEAFD_WIP_DSV4_AOT'] == 'ON' and 'CUTEAFD_WIP_V41_AOT' not in derived

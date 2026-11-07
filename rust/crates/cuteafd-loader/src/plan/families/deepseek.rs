@@ -481,7 +481,11 @@ impl FamilyModel for DeepSeekModel {
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let geometry = self.geometry()?;
         let format = match operand.exl3_bits() {
-            Some(bits) => format!("exl3-k{bits}"),
+            // The decoder-tier package the runtime loads, not the checkpoint
+            // tier: Pro K2/K3 serve the shipped k23 pair (v41_catalog
+            // exl3_catalog_or_read(.., &[2, 3])), a uniform tier its adjacent pair.
+            Some(2 | 3) => "exl3-k23".into(),
+            Some(bits) => format!("exl3-k{bits}{}", if bits == 6 { 5 } else { bits + 1 }),
             None if operand.is_mxfp4(32) => "mxfp4".into(),
             None if operand.is_nvfp4() => "nvfp4".into(),
             None => return None,
