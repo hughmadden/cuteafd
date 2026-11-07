@@ -217,8 +217,9 @@ def test_native_key_covers_every_native_input():
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     block = script[script.index('wip_native_key() {'):script.index('\n}\n', script.index('wip_native_key() {'))]
     for part in ('CUTEAFD_WIP_DEV_IMAGE_ID', "grep -E '^CUTEAFD_WIP_[A-Z0-9_]+='", '"$source_dir/third_party/"*.lock.json',
-                 'find native python scripts/build', '"$role" "$cuda_arch"'):
+                 'python3 "$source_dir/scripts/build/native-key-files.py" "$source_dir"', '"$role" "$cuda_arch"'):
         assert part in block, part
+    assert "TREES = ('native', 'python', 'scripts/build')" in (ROOT / 'scripts/build/native-key-files.py').read_text()
     # A hit restores every native output and nothing else; the daemon always comes from Cargo.
     assert 'native_items=(libcuteafd_native.so lib-variants PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json V41_EXPERT_WORKSPACES exl3 fp8)' in script
     assert script.index('cp -a "$native_entry/output/." "$output_dir/"') < script.index('install -m 0755 "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "${host_isas[0]}")"')

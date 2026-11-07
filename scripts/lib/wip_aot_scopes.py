@@ -27,6 +27,10 @@ PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_
                         qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE', mistral_large4='ML4')
 FORMAT_ALIASES = dict(exl3='exl3', tr3='exl3', nvfp4='nvfp4', nvfp4a4='nvfp4',
                       fp8='fp8', mxfp4='fp8', bf16='fp8', native='fp8')
+# Families whose bundled vision tower runs the shared BF16 attention exports
+# (native/shared/cuda/vision_runtime.cu ABI-2 towers). MiMo's ABI-1 tower and
+# V4.1's own tower (v41_vision.cu) need none; text-only families place none.
+VISION_ATTENTION_FAMILIES = {'qwen4', 'glm5_flash', 'muse_spark', 'mistral_large4'}
 NATIVE_FAMILY_TOKENS = {'deepseek', 'glm', 'glmf', 'mimo', 'mimof', 'mimop', 'qwen', 'qwen4', 'step', 'step5'}
 NATIVE_FP8_SLUGS = {
     'deepseek-v4-flash', 'deepseek-v4-flash-0731', 'deepseek-v4-pro',
@@ -159,8 +163,13 @@ def family_scopes(cards, config_reader):
             env['CUTEAFD_WIP_' + dense_switch(values) + '_AOT'] = 'ON'
         scopes_before = set(scopes)
         scopes = set()
-        if family == 'deepseek_v41' and count != 4 and count in native_spark_artifacts('v41'):
-            roles.add('tp' + str(count))
+        if family == 'deepseek_v41':
+            # The V4.1 coordinator and expert exports (native, NVFP4, FP8, attention).
+            env['CUTEAFD_WIP_V41_AOT'] = 'ON'
+            if count != 4 and count in native_spark_artifacts('v41'):
+                roles.add('tp' + str(count))
+        if family in VISION_ATTENTION_FAMILIES and values.get('VISION', 'auto') != 'off':
+            env['CUTEAFD_WIP_VISION_ATTENTION_AOT'] = 'ON'
         if family == 'deepseek_v4':
             tag = 'dsv4p' if is_pro_variant(values) else 'dsv4f'
             scopes.update({tag + ':rtx_backbone', tag + (f':spark_tp{count}' if count != 4 and count in native_spark_artifacts(tag) else ':spark')})
