@@ -396,11 +396,16 @@ fn worker_ring_budget(config: &NativeExpertServiceConfig, geometry: cuteafd_core
     Ok(cuteafd_transport::RingBudget::new(limit))
 }
 
-/// Shared ready-resident residual estimate from the seven-rank Spark census.
-/// It is separate from known context/modules and applies to every family.
-fn spark_runtime_headroom() -> Result<usize> {
-    env_usize("CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES",
-        usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?)
+/// Match the coordinator's allocation allowance. The scoped Kimi census
+/// replaces the generic system residual; actual load/serve owners stay separate.
+fn spark_runtime_headroom(config: &NativeExpertServiceConfig,
+    geometry: cuteafd_core::ExpertGeometry) -> Result<usize> {
+    let executions = &config.model_admission.as_ref()
+        .context("Spark runtime allowance requires typed execution admission")?.executions;
+    let bytes = if geometry == cuteafd_core::ExpertGeometry::KIMI_K3 {
+        cuteafd_loader::families::kimi_k3::spark::runtime_bytes(config.world, executions)
+    } else { cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES };
+    env_usize("CUTEAFD_SPARK_RUNTIME_HEADROOM_BYTES", usize::try_from(bytes)?)
 }
 
 /// Query installed packages at each owner's live/export extent. The tuple is
@@ -437,7 +442,7 @@ fn spark_admission_budget_for_geometry(config: &NativeExpertServiceConfig,
     let (exchange, row_indices) = (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?);
     let rings = usize::try_from(io.mapped_rings)?;
     let endpoint_staging = usize::try_from(io.endpoint_staging)?;
-    let headroom = spark_runtime_headroom()?;
+    let headroom = spark_runtime_headroom(config, geometry)?;
     // Backend preflight already sums capacity-specific execution owners,
     // including retained pinned staging; weights and rings stay shared.
     // The loader's pinned buffers and read scratch live only for one layer load;
@@ -973,7 +978,7 @@ mod tests {
         let mut config = config(4, 0, Some(topology));
         config.capacity = 4096;
         set_model(&mut config, 4096, false, 2);
-        let headroom = spark_runtime_headroom().unwrap();
+        let headroom = spark_runtime_headroom(&config, cuteafd_core::expert_geometry()).unwrap();
         let rings = spark_transport_bytes(&config).unwrap();
         let budget = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
         let exchange = HostExpertExchange::bytes_for(4096).unwrap();
@@ -989,6 +994,119 @@ mod tests {
         assert!(budget.serve_peak > budget.load_peak);
         assert!(rings > exchange);
         assert_eq!(HostExpertExchange::bytes_for(16).unwrap(), 16 * (48 + 10240));
+    }
+
+    #[test]
+    fn kimi_min_worker_peaks_fit_coordinator_retained_owners() -> Result<()> {
+        use cuteafd_core::ExpertGeometry;
+        use cuteafd_loader::{families::kimi_k3, placement::SparkWorkingSet};
+        let geometry = ExpertGeometry::KIMI_K3;
+        let executions = kimi_k3::spark_executions(3, 1024)?;
+        let working = SparkWorkingSet { spark_layers: (1..93).collect(), spark_ranks: 6,
+            prefill_lanes: 1, ..Default::default() };
+        for rank in 0..6 {
+            let mut config = config(6, rank, None);
+            config.capacity = 1024;
+            config.device_budget = 110 << 30;
+            set_model(&mut config, 1024, false, 1);
+            config.model_admission.as_mut().unwrap().executions = executions.clone();
+            let workspace = spark_execution_workspace(&config, |_, _, _, extent| {
+                let bytes = kimi_k3::spark::owner_bytes(6, extent)?;
+                Ok((bytes.scratch as usize, bytes.io as usize, bytes.pinned_staging as usize))
+            })?.total().context("workspace overflow")? as usize;
+            assert_eq!(workspace, 253_875_296);
+            let resident = 117_692_170_240;
+            let budget = spark_admission_budget_for_geometry(&config, geometry, resident,
+                0, 44_826_624, 268_435_456, workspace)?;
+            let rings = worker_ring_geometry(&config)?;
+            let io = working.rank_io(rank, geometry, 1024, false, rings)?;
+            let coordinator = resident as u64 + io.mapped_rings + io.intake
+                + io.host_exchange + io.row_indices + io.endpoint_staging
+                + kimi_k3::spark::reserve_bytes(6, 3, 1024)?;
+            assert_eq!(coordinator, 118_099_002_592);
+            assert_eq!(budget.headroom, 4096);
+            assert_eq!(budget.load_peak, 118_005_436_416);
+            assert_eq!(budget.serve_peak, 118_087_746_784);
+            assert!(budget.load_peak as u64 <= coordinator);
+            assert!(budget.serve_peak as u64 <= coordinator);
+            assert!(coordinator <= config.device_budget as u64);
+            let push = super::push::admit_peak(resident, 989_184, 268_435_456,
+                budget.headroom, coordinator as usize)?;
+            assert!(push <= coordinator as usize);
+            // Both historical runs reported the same inflated peaks. The old
+            // residual rejects a budget the calibrated coordinator admits.
+            let old = cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES as usize - budget.headroom;
+            assert_eq!(budget.load_peak + old, 120_689_786_880);
+            assert_eq!(budget.serve_peak + old, 120_772_097_248);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "CPU-only real Kimi checkpoint/package preflight; requires CUTEAFD_KIMI_EXL3_SNAPSHOT and CUTEAFD_KIMI_SPARK_PACKAGE; run alone"]
+    fn mounted_kimi_min_worker_preflight_matches_coordinator() -> Result<()> {
+        use crate::shared::experts::exl3::{execution::Exl3Epilogue, Exl3Weights, worker::Exl3Worker};
+        use cuteafd_loader::families::kimi_k3;
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .map_err(|_| anyhow::anyhow!("run mounted Kimi preflight alone"))?;
+        let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("checkpoint")?);
+        let package = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_SPARK_PACKAGE").context("package")?);
+        let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        for rank in 0..6 {
+            let mut config = config(6, rank, None);
+            config.snapshot = snapshot.clone();
+            config.capacity = 1024;
+            config.device_budget = 110 << 30;
+            config.selected_layers = Some((1..93).collect());
+            set_model(&mut config, 1024, false, 1);
+            config.model_admission.as_mut().unwrap().executions = kimi_k3::spark_executions(3, 1024)?;
+            let directory = package.join(format!("tp6-rank{rank}"));
+            let workspace = spark_execution_workspace(&config, |capacity, _, rows, _| {
+                Ok((Exl3Worker::plan(&directory, capacity, Default::default(), Exl3Epilogue::Sum)?,
+                    0, rows as usize * 16 * 8))
+            })?.total().context("workspace overflow")? as usize;
+            let plans = (1..93).map(|layer| Exl3Weights::plan(&catalog, config.exl3_selection(layer)?))
+                .collect::<Result<Vec<_>>>()?;
+            let resident = plans.iter().map(|plan| plan.resident_bytes).sum::<usize>();
+            let peak = spark_admission_budget(&config, resident,
+                plans.iter().map(|plan| plan.device_staging_bytes).max().unwrap(),
+                plans.iter().map(|plan| plan.pinned_host_bytes).max().unwrap(),
+                plans.iter().map(|plan| plan.read_scratch_bytes).max().unwrap(), workspace)?;
+            assert_eq!(resident, 117_692_170_240);
+            assert_eq!(workspace, 253_875_296);
+            assert_eq!(peak.load_peak, 118_005_436_416);
+            assert_eq!(peak.serve_peak, 118_087_746_784);
+            assert!(peak.load_peak <= 118_099_002_592 && peak.serve_peak <= 118_099_002_592);
+            eprintln!("Kimi min real metadata preflight rank={rank}: resident={resident} workspace={workspace} load={} serve={} coordinator=118099002592 budget={}",
+                peak.load_peak, peak.serve_peak, config.device_budget);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn only_calibrated_kimi_workers_replace_the_runtime_residual() -> Result<()> {
+        use cuteafd_core::ExpertGeometry;
+        for geometry in [ExpertGeometry::DEEPSEEK_V41, ExpertGeometry::DEEPSEEK_V4_FLASH,
+            ExpertGeometry::DEEPSEEK_V4_PRO, ExpertGeometry::GLM5,
+            ExpertGeometry::GLM5_FLASH, ExpertGeometry::MIMO_V2_FLASH, ExpertGeometry::MIMO_V26_PRO,
+            ExpertGeometry::QWEN4, ExpertGeometry::MISTRAL_LARGE4, ExpertGeometry::MUSE_SPARK, ExpertGeometry::STEP5] {
+            for world in 1..=8 {
+                let mut config = config(world, 0, None);
+                config.model_admission.as_mut().unwrap().executions =
+                    cuteafd_loader::families::kimi_k3::spark_executions(3, 1024)?;
+                assert_eq!(spark_runtime_headroom(&config, geometry)? as u64,
+                    cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+            }
+        }
+        for (world, rows) in [(4, 1024), (6, 2752), (8, 1024)] {
+            let mut config = config(world, 0, None);
+            config.model_admission.as_mut().unwrap().executions =
+                cuteafd_loader::families::kimi_k3::spark_executions(3, rows)?;
+            assert_eq!(spark_runtime_headroom(&config, ExpertGeometry::KIMI_K3)? as u64,
+                cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+        }
+        Ok(())
     }
 
     #[test]

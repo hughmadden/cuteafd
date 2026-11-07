@@ -7,6 +7,14 @@ fn calibrated(world: usize, executions: &SparkExecutions) -> bool {
     world == 6 && executions.compiled_capacity() <= 1024
 }
 
+/// Allocation allowance shared by coordinator admission and worker load/serve
+/// checks. MemAvailable already excludes OS/driver occupancy; the calibrated
+/// TP6 ledger retains only the synchronous upload allocation instead.
+pub fn runtime_bytes(world: usize, executions: &SparkExecutions) -> u64 {
+    if calibrated(world, executions) { 4096 }
+    else { cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES }
+}
+
 /// The 2026-11-04 TP6 census retained m1/m80 decode and m1/m80/m256/m1024
 /// prefill owners. Use those maxima for smaller admitted exports too; never
 /// extrapolate this rank-width measurement to other Spark worlds.
@@ -27,7 +35,7 @@ pub fn reserve_bytes(world: usize, waves: u64, unit_rows: u64) -> Result<u64> {
     let executions = super::spark_executions(waves, unit_rows)?;
     if !calibrated(world, &executions) { return super::spark_reserve_bytes(waves, unit_rows); }
     executions.workspace_bytes(|extent| owner_bytes(world, extent))?
-        .and_then(|bytes| bytes.total()).and_then(|bytes| bytes.checked_add(4096))
+        .and_then(|bytes| bytes.total()).and_then(|bytes| bytes.checked_add(runtime_bytes(world, &executions)))
         .context("Kimi calibrated Spark reserve overflow")
 }
 
@@ -39,7 +47,7 @@ pub fn charge(device: &mut cuteafd_core::memory_layout::DeviceLayout, world: usi
     if calibrated(world, executions) {
         device.items.retain(|item| item.group != SPARK_RUNTIME_RESIDUAL_GROUP);
         device.items.push(Item::new(Category::Staging, "Kimi synchronous upload staging", "pinned",
-            4096, Basis::Calibrated));
+            runtime_bytes(world, executions), Basis::Calibrated));
     }
     crate::plan::layout::spark_slots::charge_owners(device, executions, |extent| {
         if calibrated(world, executions) { owner_bytes(world, extent) } else { super::spark_owner_bytes(extent) }
