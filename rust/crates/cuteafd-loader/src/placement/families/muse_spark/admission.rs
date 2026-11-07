@@ -887,7 +887,9 @@ impl Recipe for MuseRecipe<'_> {
                     }
                 }
             }
-            let owned = if drafter.tp2.is_empty() { drafter.owned + drafter.scratch } else { 0 };
+            let owned = if drafter.tp2.is_empty() {
+                drafter.owned.checked_add(drafter.scratch).ok_or(Refusal::Overflow("Muse drafter"))?
+            } else { 0 };
             let resident = if drafter.tp2.is_empty() { drafter.weights.0 } else { 0 };
             let bytes = [owned, drafter.head_scratch, drafter.runtime].into_iter()
                 .try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).ok_or(Refusal::Overflow("Muse drafter"))?;

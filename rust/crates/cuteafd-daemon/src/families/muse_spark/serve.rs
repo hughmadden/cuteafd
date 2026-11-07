@@ -470,6 +470,22 @@ mod tests {
     const PEERS: &str = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
 
     #[test]
+    fn tp2_dflash_requires_a_drafter_and_two_distinct_devices() -> Result<()> {
+        let mut a = args(&["--peers", PEERS])?;
+        assert!(!a.tp2_dflash);
+        a.tp2_dflash = true;
+        assert!(a.validate().is_err());
+        a.draft = Some("/draft".into());
+        assert!(a.validate().is_err());
+        a.split_device = Some(1);
+        a.validate()?;
+        a.tp2_dflash = false;
+        a.split_device = None;
+        a.validate()?;
+        Ok(())
+    }
+
+    #[test]
     fn worker_error_logs_full_chain_before_owner_teardown() {
         use std::sync::Mutex;
         #[derive(Clone)]
