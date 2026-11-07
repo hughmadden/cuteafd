@@ -621,7 +621,7 @@ pub fn budgets(inputs: &RuntimeInputs) -> Result<Vec<Budget>, Refusal> {
             physical_bytes: gpu.capacity_bytes,
             logical_bytes: gpu.capacity_bytes,
             baseline,
-            headroom: gpu.headroom_bytes,
+            headroom: gpu.reserve_bytes,
         });
     }
     let bytes = crate::plan::DEFAULT_SPARK_BUDGET_BYTES;

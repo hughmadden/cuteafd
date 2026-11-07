@@ -367,6 +367,10 @@ pub struct PlanReport {
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
+    /// One line per device from the memory policy (`placement::reserve::layout_lines`):
+    /// the cap, weights, workspaces, named reserve components and KV target/min/max.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memory_policy_lines: Vec<String>,
     /// Offline solver result; runtime admission still samples live resources.
     #[serde(skip)]
     pub solver_placement: Option<crate::placement::Placement>,
@@ -951,6 +955,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         hints: Vec::new(),
         exlr8_prefill_activations: None,
         memory_layout: None,
+        memory_policy_lines: Vec::new(),
         solver_placement: None,
     })
 }
@@ -1121,7 +1126,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     };
     report.vision = model.vision_mode(options.vision);
     // An unset Spark budget is the family's own (Kimi K3 admits more than the
-    // shared default); an explicit --spark-budget-gib always wins.
+    // shared default); an explicit --spark-memory-cap always wins.
     let mut resolved = options.clone();
     if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();
@@ -1276,6 +1281,15 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             }
         }
         let refused = !report.placement_supported && memory.devices.is_empty();
+        if !memory.devices.is_empty() {
+            // The serving context: explicit, else the checkpoint's maximum.
+            let context = if layout_options.context_tokens > 0 { layout_options.context_tokens } else {
+                report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
+            let physical = layout_options.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
+                bytes, layout_options.physical_sms).physical_bytes).min().unwrap_or(u64::MAX);
+            report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
+                report.family.as_deref().unwrap_or(""), context, &layout_options.rtx_bytes, physical);
+        }
         report.memory_layout = Some(memory);
         if !refused && !model.contract_admission() {
             layout::charge_host(&mut report, &layout_options, input, false)?;
@@ -1707,6 +1721,7 @@ pub fn render(report: &PlanReport) -> String {
             .map(|maximum| format!("; max_pool_tokens_no_onboard {maximum}")).unwrap_or_default();
         let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers{maximum}");
     }
+    for line in &report.memory_policy_lines { let _ = writeln!(out, "memory     {line}"); }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
     if let Some(cap) = report.max_image_tokens {

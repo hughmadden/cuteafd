@@ -5,7 +5,6 @@
 //! and its retained weights, and the TP2 route exchange. Plan and serve build
 //! the same `MimoRecipe`; only the sampled baseline differs. Execution later
 //! consumes the admitted owners and never re-samples memory or re-solves.
-use crate::families::mimo_v2::admission::headroom_bytes;
 use crate::families::mimo_v2::{MimoAttention, MimoKvFormats, MimoV2Config, MimoExpertInput, MimoPrefillOutput};
 use crate::families::mimo_v2::capacity::MimoCapacityProfiles;
 use crate::placement::planner::{
@@ -102,12 +101,12 @@ pub fn production_budgets(cards: &[(u64, u64)], headrooms: &[u64], baselines: Ve
     Ok(budgets)
 }
 
-/// Rank headroom in admission order: the card's own reserve, the startup
-/// intake probe on the head GPU, then any operator floor.
-pub fn device_headroom(capacity: u64, rank: usize, startup_probe_bytes: u64, floor: u64) -> u64 {
-    headroom_bytes(capacity, false)
-        .max(if rank == 0 { startup_probe_bytes.saturating_add(capacity - capacity * 97 / 100) } else { 0 })
-        .max(floor)
+/// Rank reserve kept free: the memory policy's named reserve, and on the head
+/// GPU at least the drained Spark intake startup probe (a named component,
+/// released before serving; zero under `GPU_RESERVE`).
+pub fn device_headroom(rank: usize, startup_probe_bytes: u64) -> u64 {
+    let probe = if rank == 0 { crate::placement::reserve::gpu_component(startup_probe_bytes) } else { 0 };
+    crate::placement::reserve::gpu("mimo_v2").max(probe)
 }
 
 pub fn production_request(context: u64, pool: Option<u64>, onboard: crate::placement::Onboard,

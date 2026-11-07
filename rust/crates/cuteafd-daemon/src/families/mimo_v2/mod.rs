@@ -103,13 +103,6 @@ pub(crate) struct EngineArgs {
     /// Modules belong to the measured baseline; this cap is not reserved storage.
     #[arg(long, default_value_t = 1024)]
     pub runtime_reserve_mib: usize,
-    /// Calibrated conservative storage envelope per retained decode graph.
-    /// Different graph composition still needs its own startup memory gate.
-    #[arg(long, default_value_t = (cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES >> 10) as usize)]
-    pub decode_graph_reserve_kib: usize,
-    /// Separate provisional driver/rounding margin for the graph arena.
-    #[arg(long, default_value_t = (cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES >> 20) as usize)]
-    pub decode_graph_driver_reserve_mib: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family, for MoE layers.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,

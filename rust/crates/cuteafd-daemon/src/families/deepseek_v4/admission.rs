@@ -119,6 +119,7 @@ pub(crate) fn admit(inputs: &v4::V4Inputs)
     for note in prepared.prefix().notes(inputs.max_context, inputs.sequences) { tracing::info!("{note}"); }
     let request = v4::production_request(inputs);
     let admitted = prepared.admit(request).map_err(anyhow::Error::msg)?;
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "deepseek_v4");
     tracing::info!(solve_us = admitted.solve_us, admissions = 1,
         "V4 admission prepare + solve/execution (excludes checkpoint inventory)");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
@@ -207,9 +208,9 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
     Ok(v4::V4Inputs {
         expert_usage: args.expert_usage_enabled()?,
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), automatic_context: args.max_context == 0, cfg: cache_cfg, weights, cache_stages: inputs.cache_stages,
-        gpus: baselines, headroom_floor: 0, spark_ranks,
+        gpus: baselines, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: shape.waves, decode_rows: decode,
-        max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
+        max_context: inputs.max_context as u64, mark_slots,
         workspace: Some(workspace), draft_half: if args.tp2_dspark_experts { v4::draft_half_costs(inputs.catalog, stages)? } else { Vec::new() },
         experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,

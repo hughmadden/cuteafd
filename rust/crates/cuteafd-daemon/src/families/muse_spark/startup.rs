@@ -98,6 +98,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         else { cuteafd_loader::placement::planner::Operation::Serving },
         Some(crate::shared::memory::budget::resident_weight_limit()), options.partial_reply_formats);
     let admitted = prepared.admit(request)?;
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "muse_spark");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::ResolvedSettings::prefill(options.prefill).value("max-context", context).publish();
     Ok(admitted)
@@ -206,7 +207,7 @@ mod tests {
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
                 full_prefill_logits: opts.full_prefill_logits,
-                headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
+                headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
                 max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
@@ -286,7 +287,7 @@ mod tests {
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
                 full_prefill_logits: opts.full_prefill_logits,
-                headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
+                headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
                 max_context: Some(opts.context_tokens),
@@ -335,7 +336,7 @@ mod tests {
                     measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                         untracked_bytes: arch.context_bytes }; gpus],
                     full_prefill_logits: opts.full_prefill_logits,
-                    headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
+                    headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
                     mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                         shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
                     max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,
@@ -412,7 +413,7 @@ mod tests {
             measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                 untracked_bytes: arch.context_bytes }; gpus],
             full_prefill_logits: opts.full_prefill_logits,
-            headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
+            headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: sparks, prefill, slots: 16,
             mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                 shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
             max_context: Some(opts.context_tokens), pool_tokens: None, onboard: Onboard::Auto,

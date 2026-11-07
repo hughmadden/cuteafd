@@ -776,7 +776,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         cuteafd_ffi::coordinator_gpu_budget().map_or(gpu.capacity_bytes, |limit| limit.0.min(gpu.capacity_bytes))))
         .collect::<Vec<_>>();
     let sparks = spark_budget.as_ref().map_or_else(Vec::new, |budget| vec![budget.budget; budget.resident.len()]);
-    let mut budgets = kimi::budgets(&cards, request.inventory.gpus[0].headroom_bytes, &vec![0; RANKS], &sparks)?;
+    let mut budgets = kimi::budgets(&cards, request.inventory.gpus[0].reserve_bytes, &vec![0; RANKS], &sparks)?;
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let resident = modes.iter().enumerate().fold(vec![0usize; RANKS], |mut resident, (layer, mode)| {
         if cfg.attention[layer] == KimiAttention::Mla {
@@ -811,6 +811,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         recipe.prefill, contract::Operation::Serving, request.resident_weight_limit.unwrap_or(ResidentWeights::DEFAULT_LIMIT),
         cuteafd_core::spark_reply::requested()), budgets)?;
     tracing::info!(phases = ?admitted.solved.phases, "Kimi admitted per-phase physical ledger");
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "kimi_k3");
     let placement = admitted.placement;
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     let mark_selection = MarkSelection { legacy_slots: legacy_marks as u64, slots: legacy_marks as u64, reduction_reason: None };
@@ -1096,7 +1097,7 @@ pub(super) mod tests {
             let make_inputs = || -> Result<Inputs<'_>> {
                 let mut i = inputs(&cfg);
                 i.gpus = std::array::from_fn(|rank| GpuBudget { capacity_bytes: total[rank],
-                    headroom_bytes: 2 << 30, baseline: Baseline::Measured { free_bytes: free[rank] } });
+                    reserve_bytes: 2 << 30, baseline: Baseline::Measured { free_bytes: free[rank] } });
                 i.state_slots = 8; i.prefix_marks = 1; i.lanes = 1; i.requested_pool = Some(1 << 20);
                 i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, 4096, 4096, context, scratch).unwrap())];
                 i.fixed = startup::exchange_demands(4096, false)?;
@@ -1177,7 +1178,7 @@ pub(super) mod tests {
                         let mut trial = candidate.clone();
                         trial.pool.compiled_context = 0;
                         trial.pool.requested = Some(tokens); trial.pool.floor = tokens;
-                        trial.pool.target = tokens; trial.pool.ceiling = tokens;
+                        trial.pool.target = tokens; trial.pool.ceiling = tokens; trial.pool.max = tokens;
                         if enabled {
                             let layout = draft.with_pool_tokens(pool_cap.map_or(tokens as usize, |cap| cap.min(tokens as usize)))?;
                             let (mut demand, peak) = layout.demands(1)?;
@@ -1213,7 +1214,7 @@ pub(super) mod tests {
     }
 
     fn inputs_for_ranks<const RANKS: usize>(cfg: &KimiK3Config) -> Inputs<'_, RANKS> {
-        Inputs { expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
+        Inputs { expert_usage: false, cfg, resident_weight_limit: ResidentWeights::DEFAULT_LIMIT, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; RANKS], devices: std::array::from_fn(|rank| rank as i32), peer_access: RANKS == 2, spark_ranks: 6,
             attention: (RANKS == 2).then_some(AttentionPlacement::Layers), context: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::for_ranks(
@@ -1719,7 +1720,7 @@ pub(super) mod tests {
         assert!(admitted.placement.pool_tokens >= 1 << 20);
         assert!(admitted.mark_selection.slots > 0);
         let error = admit(make(Onboard::Layers(1))).err().context("strict override must refuse")?.to_string();
-        assert!(error.contains("explicit --rtx-expert-layers 1") && error.contains("--spark-budget-gib"));
+        assert!(error.contains("explicit --rtx-expert-layers 1") && error.contains("--spark-memory-cap"));
         Ok(())
     }
 
@@ -1808,7 +1809,7 @@ pub(super) mod tests {
                 code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1, 1)?];
             i.startup = vec![super::super::graphs::demand(
                 &super::super::graphs::inventory_for_ranks(&cfg, 1, unit, slots, 0, 1, |_, _| true)?.inventory, 0)];
-            i.gpus[0] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+            i.gpus[0] = GpuBudget { capacity_bytes: capacity, reserve_bytes: 2 << 30,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
             Ok(i)
         };
@@ -1854,7 +1855,7 @@ pub(super) mod tests {
             let cli = crate::cli::Cli::try_parse_from([
                 "cuteafd".into(), "plan".into(), snapshot.path().as_os_str().to_owned(),
                 "--layout".into(), "--rtx".into(), "2".into(), "--spark-ranks".into(), "6".into(),
-                "--spark-budget-gib".into(), "256".into(),
+                "--spark-memory-cap".into(), "256GiB".into(),
                 "--workspace-manifest".into(), manifest_path.as_os_str().to_owned(),
                 "--coordinator-weight-budget-gib".into(), gib.to_string().into(),
                 "--attention-placement".into(), "heads".into(), "--rtx-expert-layers".into(), "0".into(),
@@ -1867,6 +1868,7 @@ pub(super) mod tests {
             ])?;
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan command") };
             args.coordinator_weight_budget_gib = cli.coordinator_weight_budget_gib.context("global cap")?;
+            args.memory = cli.memory;
             let planned = crate::commands::plan::run_plan(args);
             let mut i = inputs(&cfg);
             i.resident_weight_limit = ResidentWeights(gib << 30);
@@ -2005,7 +2007,7 @@ pub(super) mod tests {
                 // Model an identical post-module sample: context + resident code are
                 // already allocated, while BLAS and private head handles are future.
                 let resident = code.bytes - arch.cublas_bytes;
-                i.gpus[rank] = GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
+                i.gpus[rank] = GpuBudget { capacity_bytes: capacity, reserve_bytes: 2 << 30,
                     baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
                 i.fixed.push(super::super::startup::code_demand(rank,
                     code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1)?);

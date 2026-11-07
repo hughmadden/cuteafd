@@ -48,7 +48,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes.saturating_sub(options.headroom_bytes.max(3 * GIB)), worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 })
+            capacity_bytes: bytes.saturating_sub(crate::placement::reserve::gpu("qwen4")), worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
@@ -250,7 +250,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
-            full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
+            full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: crate::placement::reserve::gpu("qwen4") },
         capacity_bytes: options.rtx_bytes[0],
         baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
         pending_code_bytes: 0, max_context: shape.context_tokens,
@@ -599,7 +599,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         options.prefix_entries("qwen4"), geometry.ranks[0].retained_mark_bytes, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
-    let headroom = options.headroom_bytes.max(3 * GIB);
+    let headroom = crate::placement::reserve::gpu("qwen4");
     let inputs = qwen4::QwenDualInputs {
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), automatic_context: options.context_tokens == 0,
         owner_manifests,
@@ -608,7 +608,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", rows, cfg.vocab_size as u64) } else { 0 },
             ple, future_expert_bytes: 0, headroom },
-        gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: options.rtx_bytes[rank], headroom_bytes: headroom,
+        gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: options.rtx_bytes[rank], reserve_bytes: headroom,
             baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: devices[rank].used_bytes() } }),
         layer_weights: &resident.layer_bytes, layer_experts: &costs, layer_extra: &extra, fixed,
         tp2_workspace: workspace, pending_code_bytes: [0; 2], mark_slots: marks, max_context: context,

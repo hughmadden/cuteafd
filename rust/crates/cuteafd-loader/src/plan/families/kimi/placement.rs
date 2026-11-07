@@ -491,7 +491,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     memory.notes.push(format!("Kimi push Load-only host owners include {} GiB estimated dense staging per coordinator rank; #1329 measured 9,606,907,904 B aggregate with unknown rank split. These do not add to the Ready host ledger.",
         kimi::PUSH_DENSE_BYTES_PER_RANK >> 30));
     let mut budgets = match kimi::budgets(&opts.rtx_bytes.iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
-        opts.headroom_bytes, &occupied, &sparks) {
+        crate::placement::reserve::gpu("kimi_k3"), &occupied, &sparks) {
         Ok(value) => value,
         Err(error) => { report.refuse_placement(format!("Kimi physical budgets refused: {error}"),
             "Check the requested card capacities."); return memory; }
@@ -521,9 +521,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             for gpu in 0..gpus {
                 let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu], worker_budget_bytes: 0,
                     items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
-                // The solver subtracts this guard from availability, not from its item ledger.
-                device.items.push(Item::new(Category::Reserved, "coordinator headroom", "", opts.headroom_bytes, Basis::Formula)
-                    .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve));
+                // The solver subtracts the named reserve from availability, not from its item ledger.
+                device.items.extend(crate::placement::reserve::gpu_item("kimi_k3"));
                 let owned = placed.layers.iter().enumerate().filter_map(|(layer, assignment)|
                     matches!(assignment.mode, LayerMode::Whole { gpu: owner, .. } if usize::from(owner) == gpu).then_some(layer))
                     .collect::<Vec<_>>();
@@ -531,7 +530,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 memory.notes.push(format!("RTX{gpu}: owned MLA layers {owned:?}; weights {} B, KV/state {} B, total {} B, \
                     reserved {} B, remaining {} B",
                     categories.get(&Category::Weights).unwrap_or(&0) + categories.get(&Category::Embedding).unwrap_or(&0),
-                    categories.get(&Category::Kv).unwrap_or(&0), device.used_bytes(), opts.headroom_bytes, device.free_bytes()));
+                    categories.get(&Category::Kv).unwrap_or(&0), device.used_bytes(), crate::placement::reserve::gpu("kimi_k3"), device.free_bytes()));
                 memory.devices.push(device);
             }
             memory.notes.push(format!("MLA latent {} B/token over {} layers; {} placement, KDA and FFNs on {gpus} physical owner(s); \

@@ -2622,3 +2622,74 @@ fn infeasible_singletons_are_refused_without_an_option_probe() {
     let refusal = solve(request.clone(), vec![budget(63)], &Prepared(contract)).unwrap_err();
     assert!(matches!(refusal, Refusal::Capacity { required: 64, available: 63, .. }));
 }
+
+/// A Linear contract (64 B per 64-token page) with built-in GPU reserve
+/// components: an opaque runtime allowance and a Runtime-category allocation.
+fn with_reserve_components(maximum_pages: u64) -> Contract {
+    let mut contract = Linear { maximum: 64 * maximum_pages, ..Linear::new() }.prepare(&request()).unwrap();
+    contract.components.push(Component { activation: Activation::always(),
+        bytes: ByteCurve::fixed(1000, maximum_pages), kind: ComponentKind::Allowance(Allowance {
+            location: Location::coordinator(0), bytes: 1000, lifetime: Lifetime::RESIDENT,
+            source: "estimated runtime growth".into(), assumed: true }) });
+    let graphs = Allocation::buffer("graphs", Location::coordinator(0), 500, Lifetime::RESIDENT,
+        Category::Runtime, "graphs");
+    contract.components.push(Component::allocation(graphs, ByteCurve::fixed(500, maximum_pages), false, maximum_pages));
+    contract
+}
+
+#[test]
+fn gpu_reserve_override_replaces_every_builtin_reserve_component() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = with_reserve_components(1 << 15);
+    // Default: both components charged; 64 * 100 B of pool beside 1500 B.
+    let auto = solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract.clone())).unwrap();
+    assert_eq!(auto.pool_tokens, 64 * 100);
+    assert!(auto.facts.allocations.iter().any(|owner| owner.id == "graphs"));
+    assert_eq!(auto.facts.allowances.len(), 1);
+    // GPU_RESERVE 200 B: components dropped, the budget keeps 200 B free.
+    let overridden = MemoryPolicy { gpu_reserve: Some(200), ..Default::default() }
+        .scoped(|| solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract.clone()))).unwrap();
+    assert!(!overridden.facts.allocations.iter().any(|owner| owner.id == "graphs"));
+    assert!(overridden.facts.allowances.is_empty());
+    assert_eq!(overridden.budgets[0].headroom, 200);
+    assert_eq!(overridden.pool_tokens, 64 * ((1500 + 64 * 100 - 200) / 64));
+    // A Spark override leaves GPU components alone.
+    let spark = MemoryPolicy { spark_reserve: Some(200), ..Default::default() }
+        .scoped(|| solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract.clone()))).unwrap();
+    assert_eq!((spark.pool_tokens, spark.budgets[0].headroom), (auto.pool_tokens, 0));
+}
+
+#[test]
+fn family_reserve_adds_to_the_measured_components() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = with_reserve_components(1 << 15);
+    let solved = MemoryPolicy { family_reserve: Some(640), ..Default::default() }.scoped(|| {
+        let mut budgets = vec![budget(1500 + 64 * 100)];
+        budgets[0].headroom = crate::placement::reserve::gpu("glm5");
+        solve(request(), budgets, &Prepared(contract.clone()))
+    }).unwrap();
+    // The components stay charged and the named reserve comes off on top.
+    assert!(solved.facts.allocations.iter().any(|owner| owner.id == "graphs"));
+    assert_eq!(solved.facts.allowances.len(), 1);
+    assert_eq!(solved.budgets[0].headroom, 640);
+    assert_eq!(solved.pool_tokens, 64 * 90);
+}
+
+#[test]
+fn kv_min_refuses_and_kv_max_grows_an_automatic_pool_past_the_target() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = Linear { maximum: 64 * 1000, ..Linear::new() }.prepare(&request()).unwrap();
+    let solve_with = |policy: MemoryPolicy, bytes: u64| policy.scoped(||
+        solve(request(), vec![budget(bytes)], &Prepared(contract.clone())));
+    // Target 64 pages: the layout is sized for it; without a max the pool stops there.
+    let target = MemoryPolicy { kv_target: Some(64 * 64), kv_min: Some(64), ..Default::default() };
+    assert_eq!(solve_with(target, 64 * 500).unwrap().pool_tokens, 64 * 64);
+    // KV max 640 pages: the pool grows into what is left, up to the max.
+    let grow = MemoryPolicy { kv_max: Some(64 * 640), ..target };
+    assert_eq!(solve_with(grow, 64 * 500).unwrap().pool_tokens, 64 * 500);
+    assert_eq!(solve_with(grow, 64 * 900).unwrap().pool_tokens, 64 * 640);
+    // KV min above what fits is refused, never published.
+    let minimum = MemoryPolicy { kv_min: Some(64 * 64), ..target };
+    assert!(solve_with(minimum, 64 * 32).is_err());
+    assert_eq!(solve_with(minimum, 64 * 64).unwrap().pool_tokens, 64 * 64);
+}

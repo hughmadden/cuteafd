@@ -8,12 +8,11 @@ use std::path::PathBuf;
 
 use crate::cli::PlanArgs;
 
-/// The coordinator GPU budget: `--coordinator-gpu-budget-gib`, else the RTX PRO
-/// 6000's CUDA-reported total (`placement::inventory::PRO_TOTAL_BYTES`), what the
+/// The coordinator GPU cap: `--gpu-memory-cap`, else the RTX PRO 6000's
+/// CUDA-reported total (`placement::inventory::PRO_TOTAL_BYTES`), what the
 /// runtime's own sample sees.
-fn coordinator_bytes(gib: Option<f64>) -> Result<u64, PlanError> {
-    gib.map_or(Ok(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES),
-        |gib| budget_bytes("--coordinator-gpu-budget-gib", gib))
+fn coordinator_bytes(args: &PlanArgs) -> u64 {
+    args.memory.policy().gpu_cap.unwrap_or(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES)
 }
 
 /// The planning options `args` name, validated before any checkpoint is read.
@@ -34,9 +33,9 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         vision: args.vision,
         audio: args.audio,
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks)),
-        spark_budget_bytes: args.spark_budget_gib.map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
+        spark_budget_bytes: args.memory.spark_memory_cap,
         coordinator_budget_bytes: budget_bytes("--coordinator-weight-budget-gib", args.coordinator_weight_budget_gib)?,
-        coordinator_gpu_budget_bytes: coordinator_bytes(args.coordinator_gpu_budget_gib)?,
+        coordinator_gpu_budget_bytes: coordinator_bytes(args),
         layout: args.layout.then(|| -> Result<_, PlanError> {
             if !(1..=2).contains(&args.rtx) {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
@@ -49,9 +48,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
                 },
                 media_cache_bytes: args.media_cache_bytes,
-                rtx_bytes: vec![coordinator_bytes(args.coordinator_gpu_budget_gib)?; args.rtx],
-                spark_allocation_budget_bytes: args.spark_budget_gib
-                    .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
+                rtx_bytes: vec![coordinator_bytes(args); args.rtx],
+                spark_allocation_budget_bytes: args.memory.spark_memory_cap,
                 pool_tokens: args.pool_tokens,
                 dense_qwen_kv: args.kv_format.map(|format| match format {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
@@ -90,8 +88,6 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     fp8_head: args.fp8_head, ..Default::default() },
                 glmf_kda_state: args.kda_state.into(),
                 glmf_index: args.index_cache.into(),
-                headroom_bytes: budget_bytes("--headroom-gib", args.headroom_gib)?,
-                graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
                 glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
                 concurrency: args.concurrency,
@@ -217,9 +213,6 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if let Some(value) = &args.kv_pool_size {
             value.parse::<crate::shared::memory::budget::ByteSize>()?;
         }
-        if let Some(value) = &args.memory_reservation {
-            value.parse::<crate::shared::memory::budget::Reservation>()?;
-        }
     }
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
@@ -288,7 +281,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
                 let deployment = DeploymentOptions { rtx_gpus: args.rtx, spark_tp: None, spark_ep: None,
                     peers: args.deployment_peers.clone(), speculator: args.speculator.clone(),
                     admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
-                        memory_reservation: args.memory_reservation.clone(), pool_tokens: args.pool_tokens } };
+                        pool_tokens: args.pool_tokens, memory_policy: args.memory.policy() } };
                 println!("{}", serde_json::to_string_pretty(&DeploymentSpec::from_exlr8(&native, &deployment)?)?);
             } else if args.json { println!("{}", serde_json::to_string_pretty(&native.report)?); }
             else { print!("{}", render(&native.report));
@@ -448,7 +441,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             spark_ep: args.spark_ep.map(usize::from), peers: args.deployment_peers.clone(),
             speculator: args.speculator.clone(),
             admission: AdmissionArgs { kv_pool_size: args.kv_pool_size.clone(),
-                memory_reservation: args.memory_reservation.clone(), pool_tokens: args.pool_tokens },
+                pool_tokens: args.pool_tokens, memory_policy: args.memory.policy() },
         };
         println!("{}", serde_json::to_string_pretty(&DeploymentSpec::from_report(&report, &deployment)?)?);
     } else if args.json {
@@ -1117,11 +1110,11 @@ mod tests {
             spark_ranks: Some(spark_ranks),
             available_sparks: 6,
             spark_range: false,
-            spark_budget_gib: Some(100.0),
             coordinator_weight_budget_gib: 80.0,
+            memory: crate::cli::MemoryArgs { spark_memory_cap: Some(100 << 30), ..Default::default() },
             json: true,
             deployment: false, spark_tp: None, spark_ep: None, deployment_peers: vec![],
-            kv_pool_size: None, memory_reservation: None,
+            kv_pool_size: None,
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,
@@ -1129,7 +1122,6 @@ mod tests {
             require_ready,
             layout: true,
             rtx: 2,
-            coordinator_gpu_budget_gib: None,
             pool_tokens: None,
             kv_format: Default::default(),
             fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
@@ -1147,8 +1139,6 @@ mod tests {
             prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
-            headroom_gib: 2.0,
-            graph_budget_mib: None,
             replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
             concurrency: 8,
             dspark_draft_limit: None,
@@ -1766,27 +1756,27 @@ mod tests {
     }
 
     #[test]
-    fn rtx_budget_flag_and_legacy_alias_bound_every_layout_gpu() {
+    fn gpu_memory_cap_bounds_every_layout_gpu_and_rejects_percentages() {
         use clap::Parser;
-        for flag in ["--coordinator-gpu-budget-gib", "--rtx-budget-gib", "--rtx-gib"] {
-            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--rtx", "2", flag, "32"])
-                .unwrap();
+        for (size, bytes) in [("32GiB", 32u64 << 30), ("34359738368", 32 << 30), ("32768MiB", 32 << 30), ("40GB", 40_000_000_000)] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--layout", "--rtx", "2",
+                "--gpu-memory-cap", size]).unwrap();
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
-            args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
+            args.memory = cli.memory;
             let options = options(&args).unwrap();
-            assert_eq!(options.coordinator_gpu_budget_bytes, 32 << 30);
-            assert_eq!(options.layout.unwrap().rtx_bytes, vec![32 << 30; 2]);
+            assert_eq!(options.coordinator_gpu_budget_bytes, bytes);
+            assert_eq!(options.layout.unwrap().rtx_bytes, vec![bytes; 2]);
             assert_eq!(options.coordinator_budget_bytes, cuteafd_loader::placement::ResidentWeights::DEFAULT_LIMIT.0);
         }
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read"]).unwrap();
         let crate::cli::Commands::Plan(plan_args) = cli.command else { panic!("plan") };
         assert!(options(&plan_args).unwrap().layout.is_none());
-        for layout in [false, true] {
-            for gib in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-                let dir = tempfile::tempdir().unwrap();
-                let error = options(&PlanArgs { layout, coordinator_gpu_budget_gib: Some(gib), ..args(dir.path(), 4, false) }).unwrap_err();
-                assert!(matches!(error, PlanError::InvalidOption { option: "--coordinator-gpu-budget-gib", .. }));
-            }
+        for invalid in ["50%", "-1GiB", "NaN", "32TB", "GiB"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--gpu-memory-cap", invalid]).is_err(),
+                "{invalid}");
+        }
+        for removed in ["--coordinator-gpu-budget-gib", "--rtx-budget-gib", "--rtx-gib"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", removed, "32"]).is_err(), "{removed}");
         }
         let mut invalid = PlanOptions::default();
         invalid.coordinator_gpu_budget_bytes = 0;
@@ -1827,38 +1817,31 @@ mod tests {
     }
 
     #[test]
-    fn unified_budget_matches_aliases_and_serving_capacity() {
+    fn gpu_memory_cap_is_global_on_either_side_of_the_subcommand() {
         use clap::Parser;
-        let parse = |flag: &str, before: bool| {
+        let parse = |before: bool| {
             let argv = if before {
-                vec!["cuteafd", flag, "31.8", "plan", "/not-read", "--layout"]
+                vec!["cuteafd", "--gpu-memory-cap", "31.8GiB", "plan", "/not-read", "--layout"]
             } else {
-                vec!["cuteafd", "plan", "/not-read", "--layout", flag, "31.8"]
+                vec!["cuteafd", "plan", "/not-read", "--layout", "--gpu-memory-cap", "31.8GiB"]
             };
             let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
             let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
-            args.coordinator_gpu_budget_gib = cli.coordinator_gpu_budget_gib;
+            args.memory = cli.memory;
             let mut selected = options(&args).unwrap();
             selected.layout.as_mut().unwrap().host_memory = Some((128 << 30, 128 << 30));
             selected
         };
-        let expected = parse("--coordinator-gpu-budget-gib", false);
+        let expected = parse(false);
         let snapshot = tempfile::tempdir().unwrap();
         write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
         let expected_report = serde_json::to_value(plan(snapshot.path(), &expected).unwrap()).unwrap();
-        for flag in ["--coordinator-gpu-budget-gib", "--rtx-budget-gib", "--rtx-gib"] {
-            for before in [false, true] {
-                let actual = parse(flag, before);
-                assert_eq!(serde_json::to_value(plan(snapshot.path(), &actual).unwrap()).unwrap(), expected_report);
-                assert_eq!(actual.layout.unwrap().rtx_bytes, expected.layout.as_ref().unwrap().rtx_bytes);
-                assert_eq!(actual.coordinator_budget_bytes, expected.coordinator_budget_bytes);
-            }
-        }
+        let actual = parse(true);
+        assert_eq!(serde_json::to_value(plan(snapshot.path(), &actual).unwrap()).unwrap(), expected_report);
+        assert_eq!(actual.layout.unwrap().rtx_bytes, expected.layout.as_ref().unwrap().rtx_bytes);
+        // The same decimal size the serving cap would install.
         let serving = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(31.8).unwrap();
         assert_eq!(expected.layout.unwrap().rtx_bytes, vec![serving.0]);
-        assert_eq!(crate::cli::deprecated_budget_flags(["--rtx-gib=31.8", "--rtx-budget-gib", "31.8"]),
-            vec!["--coordinator-gpu-budget-gib"]);
-        assert!(crate::cli::deprecated_budget_flags(["--coordinator-gpu-budget-gib", "31.8"]).is_empty());
     }
 
     #[test]
@@ -1880,7 +1863,7 @@ mod tests {
     #[test]
     fn spark_encoder_admission_honors_runtime_budget() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
-        request.spark_budget_gib = Some(82.0);
+        request.memory.spark_memory_cap = Some(82 << 30);
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, Some(82 << 30));
         let layout = options.layout.unwrap();
@@ -1891,7 +1874,7 @@ mod tests {
     #[test]
     fn unset_spark_budget_preserves_separate_defaults() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
-        request.spark_budget_gib = None;
+        request.memory.spark_memory_cap = None;
         let options = options(&request).unwrap();
         assert_eq!(options.spark_budget_bytes, None);
         assert_eq!(options.spark_budget(), 100 << 30);
@@ -2056,9 +2039,10 @@ mod tests {
         let model = snapshot.path().display().to_string();
         let layout = |extra: &[&str]| {
             let argv = ["cuteafd", "plan", model.as_str(), "--layout", "--spark-ranks", "4", "--rtx", "1",
-                "--rtx-gib", "96", "--pool-tokens", "0", "--drafter-gib", "2"];
+                "--gpu-memory-cap", "96GiB", "--pool-tokens", "0", "--drafter-gib", "2"];
             let cli = crate::cli::Cli::try_parse_from(argv.into_iter().chain(extra.iter().copied())).unwrap();
-            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            let crate::cli::Commands::Plan(mut args) = cli.command else { panic!("plan") };
+            args.memory = cli.memory;
             options(&args).unwrap()
         };
         // (marks, state) bytes on the GPU.
@@ -2130,7 +2114,8 @@ mod tests {
     fn layout_refuses_full_storage_shortfall_even_when_weights_fit() {
         let snapshot = tempfile::tempdir().unwrap();
         write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
-        let tiny = PlanArgs { coordinator_gpu_budget_gib: Some(2.0), ..args(snapshot.path(), 4, true) };
+        let tiny = PlanArgs { memory: crate::cli::MemoryArgs { gpu_memory_cap: Some(2 << 30), ..args(snapshot.path(), 4, true).memory },
+            ..args(snapshot.path(), 4, true) };
         let mut weight_only = options(&tiny).unwrap();
         weight_only.layout = None;
         assert_eq!(weight_only.coordinator_budget_bytes, 80 << 30);
@@ -2152,8 +2137,8 @@ mod tests {
         let snapshot = tempfile::tempdir().unwrap();
         write_snapshot(snapshot.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
         for layout in [false, true] {
-            let request = PlanArgs { layout, coordinator_gpu_budget_gib: Some(95.5),
-                ..args(snapshot.path(), 4, true) };
+            let request = PlanArgs { layout, memory: crate::cli::MemoryArgs { gpu_memory_cap: Some((95 << 30) + (1 << 29)),
+                ..args(snapshot.path(), 4, true).memory }, ..args(snapshot.path(), 4, true) };
             let admitted = plan(snapshot.path(), &options(&request).unwrap()).unwrap();
             assert!(admitted.executable(), "{:?}", admitted.hints);
             let capped = PlanArgs { coordinator_weight_budget_gib: 0.125, ..request };
@@ -2247,10 +2232,11 @@ mod tests {
         let error = run_plan(args(pro.path(), 4, true)).unwrap_err();
         assert!(error.to_string().contains("is not servable by this build"), "{error:#}");
         // Options that describe no deployment fail before the checkpoint is read.
-        for (ranks, budget) in [(9, 100.0), (4, f64::NAN), (4, 0.0), (4, -3.0)] {
-            let error = run_plan(PlanArgs { spark_budget_gib: Some(budget), ..args(flash.path(), ranks, false) }).unwrap_err();
+        for (ranks, budget) in [(9, 100u64 << 30), (4, 0)] {
+            let error = run_plan(PlanArgs { memory: crate::cli::MemoryArgs { spark_memory_cap: Some(budget), ..Default::default() },
+                ..args(flash.path(), ranks, false) }).unwrap_err();
             assert!(matches!(error.downcast_ref::<PlanError>(), Some(PlanError::InvalidOption { .. })),
-                "{ranks} ranks, {budget} GiB: {error:#}");
+                "{ranks} ranks, {budget} bytes: {error:#}");
         }
     }
 }

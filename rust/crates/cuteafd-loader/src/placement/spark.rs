@@ -765,7 +765,7 @@ impl SparkBudgetInventory {
         }
         if let Some(count) = request.onboard.layers(layers.len()) {
             anyhow::ensure!(count >= minimum,
-                "explicit --rtx-expert-layers {count} is below {minimum} required by estimated --spark-budget-gib ({budget} bytes including reserve and I/O)",
+                "explicit --rtx-expert-layers {count} is below {minimum} required by estimated --spark-memory-cap ({budget} bytes including reserve and I/O)",
                 budget = self.budget);
         }
         request.minimum_expert_layers = request.minimum_expert_layers.max(minimum);

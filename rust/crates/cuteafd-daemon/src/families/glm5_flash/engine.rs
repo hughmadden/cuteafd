@@ -1471,7 +1471,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// decode step, once every rank's stream has drained.
     use_graphs: bool,
     /// Every serving decode graph captured at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless 0);
-    /// a graph budget (`--graph-budget-mib`) captures lazily within it instead.
+    /// an engine graph budget captures lazily within it instead.
     pub(crate) startup_graphs: bool,
     warming_graphs: std::cell::Cell<bool>,
     logged_graph_shapes: RefCell<std::collections::HashSet<(usize, usize, bool, GraphGeometry)>>,

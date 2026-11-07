@@ -88,10 +88,6 @@ pub struct LayoutOptions {
     pub glmf_prefill_expanded: bool,
     /// GLM Flash index storage; a head split keeps the token keys, as serving does.
     pub glmf_index: crate::serving_capacity::GlmfIndexCache,
-    /// Decode graph budget (GLM 5.3 Flash `--graph-budget-mib`), in place of the graph allowance
-    /// where the engine admits from measured memory (one GPU, Spark experts, an automatic pool),
-    /// else in its place only when larger.
-    pub graph_budget_bytes: Option<u64>,
     /// GLM 5.3 Flash's prefix marks in pool units (`--prefix-marks pool`): no mark arena, and
     /// `GLMF_POOL_MARK_RESERVED_UNITS` units allocated beside the pool and never handed out.
     pub glmf_pool_marks: bool,
@@ -128,8 +124,6 @@ pub struct LayoutOptions {
     pub muse_partial_bf16_max_rows: usize,
     pub kimi_draft_fp8: bool,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
-    /// Keep this much of every GPU free for runtime growth.
-    pub headroom_bytes: u64,
     /// Concurrent sequences; automatic active state slots equal concurrency.
     pub concurrency: u64,
     /// Exact diagnostic engine slots when they differ from active concurrency.
@@ -273,7 +267,6 @@ impl Default for LayoutOptions {
             glmf_kda_state: Default::default(),
             glmf_prefill_expanded: true,
             glmf_index: crate::serving_capacity::GlmfIndexCache::Keys,
-            graph_budget_bytes: None,
             glmf_pool_marks: false,
             glmf_shared_replay: false,
             spark_capacity_rows: 4096,
@@ -294,7 +287,6 @@ impl Default for LayoutOptions {
             muse_partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
             kimi_draft_fp8: false,
             mla_kv: Default::default(),
-            headroom_bytes: 2 * GIB,
             concurrency: 0,
             state_slots: None,
             glmf_mark_lanes: None,

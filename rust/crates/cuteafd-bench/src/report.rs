@@ -135,8 +135,12 @@ impl ServerInfo {
         if small { &[1, 4, 8] } else { &[1, 4, 8, 16] }
     }
 
+    /// The per-GPU cap in GiB: `gpu-memory-cap` (bytes); published reports
+    /// from before the memory policy recorded `coordinator-gpu-budget-gib`.
     pub fn coordinator_budget(&self) -> Option<f64> {
-        self.setting("coordinator-gpu-budget-gib")?.parse::<f64>().ok()
+        self.setting("gpu-memory-cap").and_then(|bytes| bytes.parse::<u64>().ok())
+            .map(|bytes| bytes as f64 / (1u64 << 30) as f64)
+            .or_else(|| self.setting("coordinator-gpu-budget-gib")?.parse::<f64>().ok())
             .filter(|gib| gib.is_finite() && *gib > 0.0)
     }
 

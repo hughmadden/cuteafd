@@ -698,6 +698,36 @@ impl Search<'_> {
     }
 }
 
+/// `GPU_RESERVE` / `SPARK_RESERVE` replace a device kind's whole reserve:
+/// every built-in reserve component (runtime, graph and reserved charges,
+/// opaque allowances) on those devices is dropped and the budget keeps the
+/// override free instead. Sampled occupancy stays in the baseline: those
+/// bytes are already held, not a component.
+pub(crate) fn apply_reserve_override(contract: &mut Contract, budgets: &mut [Budget]) {
+    use cuteafd_core::memory_policy::{DeviceKind, MemoryPolicy};
+    let policy = MemoryPolicy::current();
+    let kind = |device: Device| match device {
+        Device::Coordinator(_) => Some(DeviceKind::Gpu),
+        Device::Spark(_) => Some(DeviceKind::Spark),
+        _ => None,
+    };
+    let overridden = |location: &Location| kind(location.device)
+        .is_some_and(|kind| policy.reserve_override(kind).is_some());
+    contract.components.retain(|component| {
+        let reserve = match &component.kind {
+            ComponentKind::Allowance(allowance) => Some(allowance.location),
+            ComponentKind::Allocation { template, .. } if matches!(template.category,
+                Category::Runtime | Category::Reserved) => Some(template.location),
+            _ => None,
+        };
+        !reserve.is_some_and(|location| overridden(&location))
+    });
+    for budget in budgets.iter_mut() {
+        let Some(kind) = budget.locations.first().and_then(|location| kind(location.device)) else { continue };
+        if let Some(bytes) = policy.reserve_override(kind) { budget.headroom = bytes; }
+    }
+}
+
 pub fn solve(
     request: Request,
     budgets: Vec<Budget>,
@@ -706,6 +736,8 @@ pub fn solve(
     let started = std::time::Instant::now();
     let mut contract = recipe.prepare(&request)?;
     contract.resident_weight_limit = request.resident_weight_limit;
+    let mut budgets = budgets;
+    apply_reserve_override(&mut contract, &mut budgets);
     let requested = request.spark_reply_formats;
     let resolved = contract.spark_reply_formats;
     if [(requested.prefill, resolved.and_then(|formats| formats.prefill)),
@@ -752,19 +784,23 @@ pub fn solve(
     }
     let minimum = request.context.div_ceil(pool_rows).checked_mul(multiple)
         .ok_or(Refusal::Overflow("minimum pool pages"))?;
-    let small = budgets.iter().any(|b| {
-        b.physical_bytes <= 34 << 30
-            && b.locations
-                .iter()
-                .any(|l| matches!(l.device, Device::Coordinator(_)))
-    });
-    let target = (if small { 1u64 << 20 } else { 2u64 << 20 })
-        .max(request.context)
-        .div_ceil(page);
+    // KV target, min and max (`cuteafd_core::memory_policy`). The layout is
+    // searched at the target; an automatic pool then grows to the max.
+    // The card class picks the default target (a capped PRO keeps the PRO
+    // target, as `PoolPolicy` and the live sample do).
+    let smallest = budgets.iter().filter(|b| b.locations.iter()
+        .any(|l| matches!(l.device, Device::Coordinator(_))))
+        .map(|b| b.physical_bytes).min().unwrap_or(u64::MAX);
+    let spark_free = !budgets.iter().any(|b| b.locations.iter().any(|l| matches!(l.device, Device::Spark(_))));
+    let kv = cuteafd_core::memory_policy::MemoryPolicy::current().kv(smallest, request.context, spark_free)
+        .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+    let aligned = |tokens: u64| tokens.div_ceil(page).div_ceil(multiple).checked_mul(multiple)
+        .ok_or(Refusal::Overflow("target pool pages"));
+    let compiled = contract.maximum_pages / multiple * multiple;
+    let target = aligned(kv.target.max(request.context))?;
+    let ceiling = aligned(kv.max.max(kv.target).max(request.context))?.min(compiled);
     let wanted = match request.pool {
-        Pin::Auto => target.div_ceil(multiple).checked_mul(multiple)
-            .ok_or(Refusal::Overflow("target pool pages"))?
-            .min(contract.maximum_pages / multiple * multiple),
+        Pin::Auto => target.min(compiled),
         Pin::Exact(n) => n / page,
     };
     if wanted < minimum || wanted > contract.maximum_pages {
@@ -841,6 +877,19 @@ pub fn solve(
         components = contract.components.len(), preparation_search_us = started.elapsed().as_micros() as u64,
         "priced propagated contract assignments");
     let (_, selected) = best.ok_or(search.last)?;
+    // The layout is fixed; an automatic pool grows into what it leaves.
+    let pages = if matches!(request.pool, Pin::Auto) && ceiling > pages {
+        costs.limit(&budgets, &selected, pages, ceiling)?.unwrap_or(pages).max(pages)
+    } else { pages };
+    // An explicit KV_MIN_TOKENS refuses a smaller automatic pool; unset, the
+    // family's own context floor (`minimum`, above) is the refusal.
+    let explicit_min = cuteafd_core::memory_policy::MemoryPolicy::current().kv_min;
+    if matches!(request.pool, Pin::Auto) && explicit_min.is_some()
+        && pages.saturating_mul(page) < kv.min.min(compiled.saturating_mul(page)) {
+        return Err(Refusal::FullContextShortfall { context: kv.min,
+            tokens: pages.checked_mul(page).ok_or(Refusal::Overflow("feasible pool tokens"))?,
+            limiting: Box::new(Refusal::InvalidFact(format!("KV_MIN_TOKENS {} is above the admitted pool", kv.min))) });
+    }
     let decisions = contract.decisions(&selected)?;
     let facts = contract.facts(&selected, pages)?;
     let phases = evaluate(&facts, &budgets)?;

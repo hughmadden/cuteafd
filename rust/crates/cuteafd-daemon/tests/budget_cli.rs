@@ -2,29 +2,26 @@
 use std::process::Command;
 
 #[test]
-fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
-    for (flag, replacement) in [
-        ("--coordinator-gpu-budget-gib", None),
-        ("--rtx-budget-gib", Some("--coordinator-gpu-budget-gib")),
-        ("--rtx-gib", Some("--coordinator-gpu-budget-gib")),
-        ("--coordinator-weight-budget-gib", None),
+fn plan_accepts_the_global_memory_policy_and_refuses_removed_budget_flags() {
+    for (flag, value, accepted) in [
+        ("--gpu-memory-cap", "31.8GiB", true), ("--spark-memory-cap", "100GiB", true),
+        ("--gpu-reserve", "3GiB", true), ("--spark-reserve", "512MiB", true), ("--family-reserve", "1GiB", true),
+        ("--kv-target-tokens", "1048576", true), ("--kv-min-tokens", "65536", true), ("--kv-max-tokens", "4194304", true),
+        ("--coordinator-weight-budget-gib", "31.8", true),
+        ("--gpu-memory-cap", "97%", false), ("--coordinator-gpu-budget-gib", "31.8", false),
+        ("--rtx-budget-gib", "31.8", false), ("--rtx-gib", "31.8", false), ("--headroom-gib", "2", false),
+        ("--graph-budget-mib", "512", false), ("--spark-budget-gib", "100", false),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
-            .args(["plan", "/budget-cli-missing-snapshot", "--layout", flag, "31.8"])
-            .env_remove("COORDINATOR_GPU_BUDGET_GIB")
+            .args(["plan", "/budget-cli-missing-snapshot", "--layout", flag, value])
             .output().unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
-        // Missing checkpoint fails after budget resolution, not at command admission.
+        // Missing checkpoint fails after policy resolution, not at command admission.
         assert!(!output.status.success());
         assert!(!stderr.contains("applies only"), "{stderr}");
-        assert!(!stderr.contains("unexpected argument"), "{stderr}");
-        let warnings: Vec<_> = stderr.lines().filter(|line| line.starts_with("warning: deprecated coordinator budget flag")).collect();
-        if let Some(replacement) = replacement {
-            assert_eq!(warnings.len(), 1, "{stderr}");
-            assert!(warnings[0].contains(replacement), "{stderr}");
-        } else {
-            assert!(warnings.is_empty(), "{stderr}");
-        }
+        assert_eq!(!stderr.contains("unexpected argument") && !stderr.contains("invalid value"), accepted,
+            "{flag} {value}: {stderr}");
+        assert!(!stderr.contains("deprecated"), "{stderr}");
     }
 }
 
@@ -45,10 +42,10 @@ fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_inpu
             for explicit in [None, Some(expected), Some(4)] {
                 let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
                 command.args([family, "--snapshot", snapshot.path().to_str().unwrap(), "--native-lib", "/unused",
-                    "--coordinator-gpu-budget-gib", &gib.to_string(), "--vision", "off", "--audio", "off"]);
+                    "--gpu-memory-cap", &format!("{gib}GiB"), "--vision", "off", "--audio", "off"]);
                 if let Some(value) = explicit { command.args(["--max-sequences", &value.to_string()]); }
                 let output = command.env("RUST_LOG", "info")
-                    .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+                    .output().unwrap();
                 assert!(!output.status.success());
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let resolved = stderr.lines().find(|line| line.contains("resolved boot-time serving concurrency"))
@@ -91,12 +88,12 @@ fn global_resident_weight_flag_reaches_plan_admission() {
         let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["--coordinator-weight-budget-gib", gib, "plan"])
             .arg(snapshot.path()).arg("--workspace-manifest").arg(&manifest)
-            .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--spark-budget-gib", "256",
+            .args(["--layout", "--rtx", "2", "--spark-ranks", "6", "--spark-memory-cap", "256GiB",
                 "--speculator", "off", "--attention-placement", "heads", "--rtx-expert-layers", "0", "--context-tokens", "262144",
                 "--pool-tokens", "262144", "--concurrency", "2", "--prefix-slots", "0",
                 "--host-cache-bytes", "0", "--prefill-rows", "2048", "--prefill-waves", "2",
                 "--vision", "off", "--audio", "off", "--json", "--require-ready"])
-            .env_remove("COORDINATOR_GPU_BUDGET_GIB")
+            
             .env("HF_HOME", snapshot.path()).output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -121,13 +118,13 @@ fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
     for layout in [false, true] {
         for (gib, accepted) in [("95.5", true), ("2", false)] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
-            command.args(["--coordinator-gpu-budget-gib", gib,
+            command.args(["--gpu-memory-cap", &format!("{gib}GiB"),
                 "--coordinator-weight-budget-gib", "80", "plan"]).arg(snapshot.path())
-                .args(["--spark-ranks", "4", "--spark-budget-gib", "100", "--speculator", "off",
+                .args(["--spark-ranks", "4", "--spark-memory-cap", "100GiB", "--speculator", "off",
                     "--context-tokens", "262144", "--concurrency", "8", "--prefill-rows", "2048",
                     "--prefill-waves", "2", "--vision", "off", "--audio", "off", "--json", "--require-ready"]);
             if layout { command.args(["--layout", "--rtx", "2"]); }
-            let output = command.env_remove("COORDINATOR_GPU_BUDGET_GIB")
+            let output = command
                 .env("HF_HOME", snapshot.path()).output().unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
             let report: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -180,7 +177,7 @@ fn deployment_rejects_conflicting_modes_and_incomplete_topology() {
 
 #[test]
 fn deployment_validates_admission_before_checkpoint_access() {
-    for (flag, invalid) in [("--kv-pool-size", "-1GiB"), ("--memory-reservation", "101%")] {
+    for (flag, invalid) in [("--kv-pool-size", "-1GiB"), ("--gpu-memory-cap", "101%")] {
         let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
             .args(["plan", "/deployment-cli-missing-snapshot", "--deployment"])
             .arg(format!("{flag}={invalid}")).output().unwrap();
@@ -388,9 +385,9 @@ fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
                 .args(["--rtx", gpus, "--spark-ranks", &ranks.to_string(),
                     "--vision", "off", "--audio", "off", "--speculator", "off",
                     "--exlr8-manifest", config["EXLR8_MANIFEST"]])
-                .env_remove("COORDINATOR_GPU_BUDGET_GIB");
+                ;
             command.arg("--workspace-manifest").arg(&programs);
-            if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
+            if let Some(budget) = explicit { command.args(["--spark-memory-cap", &format!("{budget}GiB")]); }
             let start = std::time::Instant::now();
             let output = command.output().unwrap();
             let elapsed = start.elapsed();
@@ -446,8 +443,8 @@ fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabili
                 // Keep a Spark suffix for this wire-budget proof; automatic TP2 can onboard every layer.
                 .args(["--deployment", "--rtx", gpus, "--spark-ranks", &ranks.to_string(),
                     "--rtx-expert-layers", "1", "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
-                    "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB");
-            if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
+                    "--workspace-manifest"]).arg(&programs);
+            if let Some(budget) = explicit { command.args(["--spark-memory-cap", &format!("{budget}GiB")]); }
             let output = command.output().unwrap();
             assert!(output.status.success(), "{name}, budget={explicit:?}: {}", String::from_utf8_lossy(&output.stderr));
             let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -493,7 +490,7 @@ fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
     let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
         .arg(&snapshot).args(["--deployment", "--rtx", "2", "--spark-ranks", ranks,
             "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
-            "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB")
+            "--workspace-manifest"]).arg(&programs)
         .output().unwrap();
     assert!(output.status.success(), "requested ranks={ranks}: {}", String::from_utf8_lossy(&output.stderr));
     serde_json::from_slice(&output.stdout).unwrap()
@@ -581,7 +578,7 @@ fn installed_mimo_min_onboarding_matches_smoke(root: &std::path::Path,
         .args(["--rtx", "1", "--spark-ranks", "2", "--pool-tokens", "0", "--native-mtp-layers", "0",
             "--speculator", "dflash2", "--vision", "auto", "--audio", "auto", "--workspace-manifest"])
         .arg(programs).arg("--mimo-expert-manifest").arg(manifest)
-        .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+        .output().unwrap();
     assert!(output.status.success(), "MiMo min installed native plan: {}", String::from_utf8_lossy(&output.stderr));
     let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(deployment["report"]["fits"], true, "{deployment}");
@@ -773,7 +770,7 @@ capture_qwen4_real_planner_launch(*map(Path, sys.argv[2:]))
             "--deployment", "--config"]).arg(&example)
             .args(["--rtx", config["RTX_GPUS"], "--vision", "off", "--audio", "off",
                 "--speculator", "off", "--hf-home"]).arg(&hf_home)
-            .env("HF_HOME", &hf_home).env_remove("COORDINATOR_GPU_BUDGET_GIB");
+            .env("HF_HOME", &hf_home);
         if let Some(revision) = config.get("MODEL_REVISION") {
             command.args(["--revision", revision]);
         }
@@ -991,12 +988,12 @@ fn installed_kimi_tp1_automatic_plan_finishes_within_ten_seconds() {
     let output = Command::new("timeout")
         .args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
         .arg(required("CUTEAFD_KIMI_SNAPSHOT"))
-        .args(["--deployment", "--rtx", "1", "--spark-ranks", "6", "--spark-budget-gib", "110",
+        .args(["--deployment", "--rtx", "1", "--spark-ranks", "6", "--spark-memory-cap", "110GiB",
             "--speculator", "dflash2", "--drafter-snapshot"])
         .arg(required("CUTEAFD_KIMI_DRAFTER"))
         .args(["--vision", "off", "--audio", "off", "--workspace-manifest"])
         .arg(required("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"))
-        .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+        .output().unwrap();
     let elapsed = start.elapsed();
     assert!(output.status.success(), "{elapsed:?}: {}", String::from_utf8_lossy(&output.stderr));
     assert!(elapsed <= std::time::Duration::from_secs(10), "TP1 plan took {elapsed:?}");

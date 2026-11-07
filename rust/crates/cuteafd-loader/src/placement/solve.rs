@@ -83,9 +83,30 @@ pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_s
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
+    let overridden;
+    let request = if cuteafd_core::memory_policy::MemoryPolicy::current().gpu_reserve.is_some() {
+        overridden = reserve_override(request);
+        &overridden
+    } else { request };
     let mut placement = solve_attention(request)?;
     placement.max_pool_tokens_no_onboard = Some(max_pool_without_onboard(request, &placement));
     Ok(placement)
+}
+
+/// `GPU_RESERVE` replaces every built-in GPU reserve component (runtime,
+/// graph and reserved fixed demands and startup peaks); each GPU keeps the
+/// override free instead. A measured baseline stays: its bytes are held.
+fn reserve_override(request: &PlacementRequest) -> PlacementRequest {
+    let mut request = request.clone();
+    let reserve = |demand: &Demand| matches!(demand.category, Category::Runtime | Category::Reserved);
+    request.fixed.retain(|demand| !reserve(demand));
+    request.startup.retain(|demand| !reserve(demand));
+    let bytes = super::reserve::gpu("");
+    for gpu in &mut request.inventory.gpus {
+        gpu.reserve_bytes = bytes;
+        if let Baseline::Planned { context_bytes, .. } = &mut gpu.baseline { *context_bytes = 0; }
+    }
+    request
 }
 
 /// One extra solve: the same request and attention modes with the RTX
@@ -97,6 +118,8 @@ fn max_pool_without_onboard(request: &PlacementRequest, placement: &Placement) -
     trial.onboard = Onboard::Layers(0);
     trial.minimum_expert_layers = 0;
     trial.pool.requested = None;
+    // A diagnostic: the largest pool the build indexes, not KV_MAX_TOKENS.
+    trial.pool.ceiling = u64::MAX;
     trial.pool.target = trial.pool.ceiling;
     let chosen = placement.attention_by_kind.clone();
     solve_once(&trial, &chosen, None).map_or(placement.pool_tokens, |free| free.pool_tokens.max(placement.pool_tokens))
@@ -472,6 +495,13 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
             let caps = [if request.expert_gpus > 0 { usize::MAX } else { 0 }, if request.expert_gpus > 1 { usize::MAX } else { 0 }];
             let (ranges, homes, _, tp2_range, _) = place_experts(request, &available, &pool_used, &resident_weights, &mut arenas, first_moe,
                 request.layers.len(), &caps)?;
+            // The layout is fixed for the target; an automatic pool then grows
+            // into what it leaves, up to KV_MAX_TOKENS.
+            let units = if request.pool.requested.is_none() {
+                let after = pool_fit(request, &available, &used, &arenas, &unit_bytes);
+                units.max(after.min(request.pool.max_units()))
+            } else { units };
+            let units = if context { units / 2 * 2 } else { units };
             // Successful diagnostics describe installed experts, not the larger
             // pre-onboarding capacity used to choose the pool-first reservation.
             let limits = pool_limits(request, &available, &used, &arenas, &unit_bytes);

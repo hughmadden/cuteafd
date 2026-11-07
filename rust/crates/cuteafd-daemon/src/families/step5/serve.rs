@@ -314,9 +314,9 @@ fn with_backend<T>(args: &ServeArgs,
     let pending_code = ids.iter().enumerate().map(|(rank, &id)| crate::shared::inventory::pending_code(
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
-    let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
+    let reserve = cuteafd_loader::placement::reserve::gpu("step5");
     let mut inputs = RuntimeInputs { host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
-        .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
+        .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, reserve_bytes: reserve }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
         full_prefill_logits: args.full_prefill_logits,
         waves: usize::from(args.prefill_waves), unit: args.prefill_rows as usize,
@@ -757,7 +757,7 @@ mod tests {
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
-                headroom_bytes: LayoutOptions::default().headroom_bytes }; 2], spark_ranks: 6, peer_access: true },
+                reserve_bytes: 0 }; 2], spark_ranks: 6, peer_access: true },
             rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(

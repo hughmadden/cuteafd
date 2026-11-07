@@ -83,7 +83,9 @@ fn checkpoint_admission(
     inputs: &RuntimeInputs,
 ) -> Result<admission::Admission> {
     measured(inputs)?;
-    admission::admit(checkpoint, inputs)
+    let admitted = admission::admit(checkpoint, inputs)?;
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "step5");
+    Ok(admitted)
 }
 #[cfg(test)]
 mod tests {
@@ -275,7 +277,7 @@ mod tests {
                     );
                     GpuBudget {
                         capacity_bytes,
-                        headroom_bytes: opts.headroom_bytes,
+                        reserve_bytes: 0,
                         baseline: Baseline::Measured {
                             free_bytes: capacity_bytes - arch.context_bytes,
                         },

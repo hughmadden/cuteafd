@@ -46,7 +46,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     let mut notes = vec![format!("resolved context {context} tokens")];
     let ranks = if options.head_split && options.rtx_bytes.len() >= 2 { 2 } else { 1 };
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
-        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes), worker_budget_bytes: 0,
+        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(crate::placement::reserve::gpu("glm5_flash")), worker_budget_bytes: 0,
         items: vec![], kv_tokens: 0 }).collect();
     let mut pool = 0;
     let mut waste = Vec::new();
@@ -289,12 +289,11 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         }
         let automatic_target = placement::PoolPolicy::resolve(&options.rtx_bytes[..ranks], context, None, 256, spark_ranks == 0).target;
         let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or(automatic_target);
-        let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
-            .unwrap_or_else(|| glmf::startup_graph_bound(&cfg, cfg.layers, context as usize, target as usize,
-                sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
+        let graphs = glmf::startup_graph_bound(&cfg, cfg.layers, context as usize, target as usize,
+                sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize);
         let inputs = glmf::GlmfInputs {
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
-            headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
+            headroom_bytes: crate::placement::reserve::gpu("glm5_flash"), spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.resolved_state_slots("glm5_flash"),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0,
             index, kda_state_bytes: state.bytes(), shared_replay: options.glmf_shared_replay, representation,
@@ -330,7 +329,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         };
         let hardware = EncoderHardware { v41: false,
             gpus: options.rtx_bytes[..ranks].iter().map(|&total| EncoderGpuBudget {
-                free_bytes: total.saturating_sub(options.headroom_bytes), kv_target_bytes: 0 }).collect(),
+                free_bytes: total.saturating_sub(crate::placement::reserve::gpu("glm5_flash")), kv_target_bytes: 0 }).collect(),
             sparks: (0..spark_ranks).map(|rank| EncoderSparkBudget { rank, host: format!("spark{rank}"),
                 idle: false, expert_bytes: 0, free_bytes: options.spark_allocation_budget_bytes.unwrap_or(121 << 30) }).collect() };
         process.encoders = encoder::candidates(&EncoderRequest { mode: report.vision, weights, scratch,

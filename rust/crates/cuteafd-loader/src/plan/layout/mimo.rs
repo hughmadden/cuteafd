@@ -525,8 +525,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         else { EmbeddingHome::Device(0) };
     let budgets = admission::production_budgets(
         &options.rtx_bytes[..ranks].iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
-        &(0..ranks).map(|rank| admission::device_headroom(options.rtx_bytes[rank], rank,
-            probe, options.headroom_bytes)).collect::<Vec<_>>(),
+        &(0..ranks).map(|rank| admission::device_headroom(rank, probe)).collect::<Vec<_>>(),
         devices.iter().map(|device| Baseline::Forecast { occupied: device.used_bytes(),
             source: "retained checkpoint and media owners before the shared MiMo contract".into(),
             assumed: false }).collect(),
@@ -551,8 +550,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
             // Failed plans still name the full fixed contract, not fictitious
             // free space left by returning before its storage was described.
             for (rank, device) in devices.iter_mut().enumerate() {
-                device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(
-                    admission::device_headroom(options.rtx_bytes[rank], rank, probe, options.headroom_bytes));
+                device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(admission::device_headroom(rank, probe));
                 for cost in &profiles.steady.devices[rank].reservations {
                     device.items.push(Item::new(reservation_category(&cost.name),
                         crate::placement::families::mimo_v2::reservation_group(&cost.name), "", cost.bytes, Basis::Formula));
@@ -567,8 +565,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let placement = admitted.placement;
     let working = admitted.spark;
     for (rank, device) in devices.iter_mut().enumerate() {
-        device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(
-            admission::device_headroom(options.rtx_bytes[rank], rank, probe, options.headroom_bytes));
+        device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(admission::device_headroom(rank, probe));
         device.items.extend(placement.items[rank].iter().cloned());
         device.kv_tokens = placement.pool_tokens;
     }
@@ -717,23 +714,27 @@ mod tests {
         for (total, baseline) in [(101_973_491_712u64, 586_416_128u64),
             (101_970_345_984, 586_416_128), (34_144_990_003, 596_901_888)] {
             let baseline = baseline + 35_651_584;
-            let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![total], headroom_bytes: 0, concurrency: 4, ..Default::default() };
+            let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![total], concurrency: 4, ..Default::default() };
             let mut profile = profile(&checkpoint, &opts, 1, 2, 4096, 4, 1 << 20, None).unwrap();
             let cublas = crate::placement::inventory::ArchContext::for_device("sm_120", total).cublas_bytes;
             profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
                 name: "runtime.cublas_first_gemm".into(), bytes: cublas,
             });
-            let policy = CapacityPolicy { concurrency: 4, small_card_headroom: true,
+            // The plan keeps the drained 64 MiB intake probe as rank 0's named reserve.
+            let reserve = crate::placement::families::mimo_v2::admission::device_headroom(0, 64 << 20);
+            assert_eq!(reserve, 64 << 20);
+            profile.steady.devices[0].reserve_bytes = reserve;
+            let policy = CapacityPolicy { concurrency: 4,
                 target_pool_tokens: if total <= 32 * GIB { 1 << 20 } else { 2 << 20 },
                 max_context_tokens: Some(1 << 20), ..Default::default() };
             let admitted = resolve_capacity_with_startup_peaks(policy, &profile.steady,
                 &[DeviceMemory { device: 0, total_bytes: total, baseline_free_bytes: total - baseline }],
-                &[(0, 64 << 20)]).unwrap();
+                &[]).unwrap();
             let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: total, worker_budget_bytes: 0,
                 items: vec![Item::new(Category::Runtime, "context+modules", "", baseline + cublas, Basis::Exact)], kv_tokens: 0 }];
             let pool = apply(&input, &opts, &mut devices, 2, 4096, 4, 1 << 20, None).unwrap().pool_tokens;
             assert_eq!(pool, admitted.allocated_gpu_kv_tokens, "recorded total {total}");
-            assert_eq!(devices[0].capacity_bytes, total - headroom_bytes(total, true));
+            assert_eq!(devices[0].capacity_bytes, total - reserve);
         }
     }
 

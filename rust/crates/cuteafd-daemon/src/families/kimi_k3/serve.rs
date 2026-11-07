@@ -36,8 +36,6 @@ pub(crate) struct ServeArgs {
     /// RTX expert layers: auto, all (every routed-expert layer of the target
     /// model), or an exact N.
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
-    /// Complete per-rank allocation ceiling, estimated until the first worker census.
-    #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
@@ -96,8 +94,6 @@ impl ServeArgs {
             "Kimi serving accepts at most eight distinct Spark endpoints");
         ensure!(self.max_context.is_none_or(|context| (1..=COMPILED_CONTEXT).contains(&context)),
             "Kimi context exceeds the compiled 1M extent");
-        ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
-            "Kimi requires a finite positive estimated --spark-budget-gib");
         self.prefill()?;
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
@@ -120,7 +116,6 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
         cache_format: args.kv_cache, devices, native_lib: &args.native_lib,
         attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
         peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
-        spark_budget_gib: args.spark_budget_gib,
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
         max_context: args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?),
@@ -381,7 +376,6 @@ mod tests {
         assert_eq!(defaults.max_sequences, 16);
         assert!(args(&["--peers", peers, "--native-k6"]).is_err());
         assert_eq!(defaults.pool_tokens, None);
-        assert_eq!(defaults.spark_budget_gib, None);
         assert_eq!(defaults.api_limits(DEFAULT_CONTEXT)?.context(), DEFAULT_CONTEXT as u32);
         assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), COMPILED_CONTEXT as u32);
         args(&["--peers", peers, "--max-context", "1048576"])?.validate()?;
@@ -395,10 +389,9 @@ mod tests {
             cuteafd_loader::placement::OnboardSetting::Layers(3));
         assert_eq!(args(&["--peers", peers, "--rtx-expert-layers", "all"])?.rtx_expert_layers,
             cuteafd_loader::placement::OnboardSetting::All);
-        args(&["--peers", peers, "--rtx-expert-layers", "auto", "--spark-budget-gib", "108"])?.validate()?;
-        for budget in ["0", "NaN", "inf"] {
-            assert!(args(&["--peers", peers, "--spark-budget-gib", budget])?.validate().is_err());
-        }
+        args(&["--peers", peers, "--rtx-expert-layers", "auto"])?.validate()?;
+        // The Spark cap is the global --spark-memory-cap, not a serve-kimi flag.
+        assert!(args(&["--peers", peers, "--spark-budget-gib", "108"]).is_err());
         args(&[])?.validate()?;
         for extra in [["--split-device", "0"], ["--max-context", "1048577"],
             ["--embedding-placement", "host"], ["--prefix-partial", "on"]] {
