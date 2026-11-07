@@ -60,3 +60,63 @@ fn final_key(checkpoint: &Checkpoint, name: &str) -> String {
     }
     name.into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::families::mimo_v2::{MimoV2Config, qkv::checkpoint_tp, projection::MimoProjectionRepresentation as R,
+        resident::MimoResidentOptions, weight_policy::{default_policy, MimoDefaultPolicy}};
+
+    const MIB: u64 = 1 << 20;
+    const SM120_GRANULE: u64 = 2 * MIB;
+
+    /// Header-only before/after inventory of the selected `mimo26-flash-max`
+    /// layout (TP2 head split, native MTP, GPU embedding): per-tensor requests
+    /// with their SM120 2 MiB rounding versus one packed arena per scope.
+    #[test]
+    #[ignore = "requires MiMo-V2.6-Flash-MOPD@2479e2d0 in CUTEAFD_CHECKPOINT_TEST_HUB or the Hugging Face cache"]
+    fn flash_max_inventory() -> Result<()> {
+        let hub = std::env::var_os("CUTEAFD_CHECKPOINT_TEST_HUB").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_hf_home().join("hub"));
+        let snapshot = hub.join("models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/2479e2d0029eca9a34cc7e7f55a121925f81908e");
+        let checkpoint = Checkpoint::open(&snapshot)?;
+        let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
+        let qualified = default_policy(&checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
+        let source = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
+            .map(|t| if t.meta.dtype == cuteafd_core::DType::Bf16 && !qualified { R::Bf16 } else { R::Fp8 });
+        let stages = checkpoint.tensors.iter().filter_map(|t|
+            t.meta.name.strip_prefix("model.mtp.layers.")?.split('.').next()?.parse::<usize>().ok())
+            .max().map_or(0, |stage| stage + 1);
+        for ranks in [1, 2] {
+            let resident = MimoResidentLayout::new(&checkpoint, &cfg, &MimoResidentOptions {
+                layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: checkpoint_tp(&snapshot)?,
+                native_mtp_layers: stages, gpu_embedding: true,
+                head_format: source("lm_head.weight").unwrap_or(R::Bf16),
+                output_formats: checkpoint.tensors.iter()
+                    .filter(|t| t.meta.name.ends_with(".self_attn.o_proj.weight"))
+                    .filter_map(|t| source(&t.meta.name).map(|f| (t.meta.name.clone(), f))).collect(),
+            })?;
+            let layouts = MimoArenaLayouts::new(&checkpoint, &resident)?;
+            for (rank, requests) in resident.ranks.iter().enumerate() {
+                for (scope, mtp) in [("target", false), ("mtp", true)] {
+                    let requests = requests.iter().filter(|r| r.name.starts_with("model.mtp.") == mtp)
+                        .map(|r| r.bytes).collect::<Vec<_>>();
+                    let layout = if mtp { if rank == 0 { layouts.mtp.as_ref() } else { None } }
+                        else { Some(&layouts.target[rank]) };
+                    let Some(layout) = layout else { assert!(requests.is_empty()); continue };
+                    let large = requests.iter().filter(|&&b| b > MIB).collect::<Vec<_>>();
+                    let rounding = large.iter().map(|&&b| b.div_ceil(SM120_GRANULE) * SM120_GRANULE - b).sum::<u64>();
+                    let bytes = layout.bytes() as u64;
+                    let tail = if bytes > MIB { bytes.div_ceil(SM120_GRANULE) * SM120_GRANULE - bytes } else { 0 };
+                    assert_eq!(layout.views().len(), requests.len(), "unique final keys");
+                    assert_eq!(layout.payload_bytes() as u64, requests.iter().sum::<u64>());
+                    eprintln!("tp{ranks} rank{rank} {scope}: before n={} sum={} large n={} sum={} sm120_rounding={} \
+                        | after arena={} padding={} tail={} saved={}",
+                        requests.len(), requests.iter().sum::<u64>(), large.len(), large.iter().copied().sum::<u64>(),
+                        rounding, bytes, layout.padding_bytes(), tail, rounding as i64 - (layout.padding_bytes() as u64 + tail) as i64);
+                }
+            }
+        }
+        Ok(())
+    }
+}
