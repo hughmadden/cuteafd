@@ -23,7 +23,7 @@ def verify(root, requirements, identity):
 def main():
     try:
         requirements, identity, *roots = sys.argv[1:]
-        verify(Path(roots[0] if roots else '/opt/cuteafd/lib'), json.loads(requirements), identity)
+        verify(Path(roots[0] if roots else '/opt/cuteafd/lib').expanduser(), json.loads(requirements), identity)
     except (ValueError, OSError) as error:
         print(error, file=sys.stderr)
         return 2
