@@ -592,20 +592,43 @@ pub(crate) fn with_engine<T>(
         }
         crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/before-push", Default::default())?;
         let started = Instant::now();
+        let operands = cuteafd_loader::families::deepseek_v4::resident::resident_operands(
+            &loaded.cfg, &loaded_modes, devices.len(), args.dspark,
+            loaded.catalog.tensors().iter().map(|t| &t.metadata))?;
+        let target_arenas = devices.iter().enumerate().map(|(rank, &id)| {
+            let layout = cuteafd_loader::families::deepseek_v4::weight_arena::coordinator_arena(
+                &operands, rank, false, args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu)?
+                .context("V4 target weight arena absent")?;
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                crate::shared::memory::device::Device { library: &loaded.library, id }, layout)
+        }).collect::<Result<Vec<_>>>()?;
+        let draft_arena = cuteafd_loader::families::deepseek_v4::weight_arena::coordinator_arena(
+            &operands, 0, true, false)?.map(|layout|
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                crate::shared::memory::device::Device { library: &loaded.library, id: args.device }, layout)).transpose()?;
         let loader = weights::WeightLoader {
             library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
-            device: args.device,
+            device: args.device, target_arenas: &target_arenas, draft_arena: draft_arena.as_ref(),
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect(),
         };
         let dense_devices = devices.iter().map(|&id| crate::shared::memory::device::Device {
             library: loaded.library.as_ref(), id }).collect::<Vec<_>>();
         let (embedding, (model, shares)) = crate::shared::experts::rtx::push::load_alone(
-            &loaded.snapshot, &dense_devices, || crate::shared::token_io::TokenEmbedding::load(&loaded.library,
+            &loaded.snapshot, &dense_devices, || crate::shared::token_io::TokenEmbedding::load_with(&loaded.library,
                 embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement,
                 || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                    loader.model_modes(&loaded.cfg, args.dspark, &loaded_modes) }))?;
-        crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-dense-push", Default::default())?;
+                    loader.model_modes(&loaded.cfg, args.dspark, &loaded_modes) },
+                |name, bytes| target_arenas[0].view(name, bytes)))?;
+        if crate::shared::inventory::startup_probe_enabled() {
+            let coordinates = cuteafd_loader::placement::planner::CoordinatorDevices::new(&devices)?;
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(embedding.allocation_receipts(coordinates, "v4/embedding")?);
+            census.owners(model.allocation_receipts(&shares, coordinates)?);
+            census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+            crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-dense-push",
+                crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+        }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
 
         tracing::info!(pool_tokens = placement.pool_tokens, onboard = %onboard, onboard_layers = placement.onboard_layers,

@@ -2,7 +2,7 @@
 //! b12x.integration.cuteafd.weights.WEIGHT_SOURCES prescribes: every operand is
 //! checkpoint bytes (row-concatenated where listed) except block-FP8 scales,
 //! which the scale-prep program re-lays into MMA tile order.
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, device::Device, weight_arena::DeviceWeightArena};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::Programs;
 use cuteafd_ffi::NativeLibrary;
@@ -59,6 +59,45 @@ pub(crate) struct ModelWeights<'a> {
     pub norm: DeviceAllocation<'a>,
 }
 
+impl ModelWeights<'_> {
+    pub(crate) fn allocation_receipts(&self, shares: &[Vec<LayerWeights<'_>>],
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::planner::Lifetime;
+        use crate::shared::memory::receipts::Inventory;
+        let mut inventory = Inventory::new(devices, "v4/weights", Lifetime::TARGET,
+            Category::Weights, "retained V4 target and drafter weights");
+        for (rank, layers) in std::iter::once(&self.layers).chain(shares).enumerate() {
+            for (layer, weights) in layers.iter().enumerate() {
+                for (name, owner) in &weights.operands {
+                    owner.inventory(&mut inventory, &format!("rank{rank}.layers.{layer}.{name}"))?;
+                }
+            }
+        }
+        for (name, owner) in [("head.weight", &self.head), ("hc_head_fn", &self.head_fn),
+            ("hc_head_scale", &self.head_scale), ("hc_head_base", &self.head_base), ("norm.weight", &self.norm)] {
+            owner.inventory(&mut inventory, name)?;
+        }
+        if let Some(draft) = &self.dspark {
+            for (stage, weights) in draft.stages.iter().enumerate() {
+                for (name, owner) in &weights.operands {
+                    owner.inventory(&mut inventory, &format!("mtp.{stage}.{name}"))?;
+                }
+            }
+            for (name, owner) in [("mtp.0.main_proj.weight", &draft.main_proj),
+                ("mtp.0.main_proj.scale", &draft.main_proj_scale), ("mtp.0.main_norm.weight", &draft.main_norm),
+                ("mtp.2.hc_head_fn", &draft.head_fn), ("mtp.2.hc_head_scale", &draft.head_scale),
+                ("mtp.2.hc_head_base", &draft.head_base), ("mtp.2.norm.weight", &draft.norm),
+                ("mtp.2.markov_head.markov_w1.weight", &draft.markov_w1),
+                ("mtp.2.markov_head.markov_w2.weight", &draft.markov_w2)] {
+                owner.inventory(&mut inventory, name)?;
+            }
+        }
+        Ok(inventory.receipts)
+    }
+}
+
 pub(crate) struct WeightLoader<'a, 'p> {
     pub library: &'a NativeLibrary,
     pub catalog: &'a OfficialV41Catalog,
@@ -69,6 +108,9 @@ pub(crate) struct WeightLoader<'a, 'p> {
     pub device: i32,
     /// The other GPU of a head split (rank 1), if any.
     pub peers: Vec<crate::shared::peer_split::RankDevice>,
+    /// One final target arena per rank and the independently admitted drafter.
+    pub target_arenas: &'p [DeviceWeightArena<'a>],
+    pub draft_arena: Option<&'p DeviceWeightArena<'a>>,
 }
 
 fn native_rectangle(name: &str, path: std::path::PathBuf, base: u64, shape: &[usize], bytes: usize,
@@ -97,6 +139,20 @@ fn native_rectangle(name: &str, path: std::path::PathBuf, base: u64, shape: &[us
 }
 
 impl<'a> WeightLoader<'a, '_> {
+    fn allocate(&self, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        let device = Device { library: self.library, id: self.library.cuda_get_device()? };
+        let rank = if device.id == self.device { 0 } else {
+            1 + self.peers.iter().position(|peer| peer.device == device.id).context("V4 allocation on unknown device")?
+        };
+        let arena = if name.starts_with("mtp.") {
+            self.draft_arena.context("V4 drafter arena absent")?
+        } else {
+            self.target_arenas.get(rank).context("V4 target arena absent")?
+        };
+        Ok(DeviceAllocation::from_allocation(crate::shared::memory::weight_arena::weight_allocation(
+            device, Some(arena), name, bytes)?))
+    }
+
     fn rectangles(&self, names: &[String], kind: Share, rank: usize) -> Result<Vec<Rect>> {
         names.iter().map(|name| {
             cuteafd_ffi::memory_ledger::tensor(name);
@@ -107,24 +163,24 @@ impl<'a> WeightLoader<'a, '_> {
         }).collect()
     }
 
-    fn native(&self, rects: Vec<Rect>) -> Result<DeviceAllocation<'a>> {
+    fn native(&self, name: &str, rects: Vec<Rect>) -> Result<DeviceAllocation<'a>> {
         let mut bytes = 0usize;
         let lands = rects.into_iter().map(|rect| {
             let at = bytes;
             bytes = bytes.checked_add(rect.bytes()).context("V4 operand size overflow")?;
             Ok((rect, at))
         }).collect::<Result<Vec<_>>>()?;
-        let allocation = DeviceAllocation::new(self.library, bytes.max(16))?;
+        let allocation = self.allocate(name, bytes.max(16))?;
         DenseLoad::mount(self.library).operand(Operand { device: allocation.buffer.device_id,
             buffer: allocation.buffer, lands, bytes })?;
         Ok(allocation)
     }
 
     pub fn tensor(&self, name: &str) -> Result<DeviceAllocation<'a>> {
-        self.native(self.rectangles(&[name.into()], Share::All, 0)?)
+        self.native(name, self.rectangles(&[name.into()], Share::All, 0)?)
     }
 
-    fn scale_on(&self, rects: Vec<Rect>, n: usize, k: usize, groups: usize,
+    fn scale_on(&self, name: &str, rects: Vec<Rect>, n: usize, k: usize, groups: usize,
         stream: *mut c_void) -> Result<DeviceAllocation<'a>> {
         ensure!(n % 128 == 0 && k % 128 == 0, "block-FP8 weights need 128-multiple extents");
         let n_blocks = groups.checked_mul(n / 128).context("V4 scale rows overflow")?;
@@ -132,7 +188,7 @@ impl<'a> WeightLoader<'a, '_> {
         let bytes = n_blocks.checked_mul(k_blocks).context("V4 scale grid overflow")?;
         ensure!(bytes > 0 && bytes <= STEP_BYTES && rects.iter().map(Rect::bytes).sum::<usize>() == bytes,
             "V4 scale grid exceeds bounded staging or its headers");
-        let output = DeviceAllocation::new(self.library, bytes.checked_mul(512).context("V4 expanded scale overflow")?)?;
+        let output = self.allocate(name, bytes.checked_mul(512).context("V4 expanded scale overflow")?)?;
         // Load the existing export before recording so missing capabilities fail
         // before any push group starts; replay resolves it on this rank's device.
         self.programs.program(&format!("{}_block_fp8_scale_prep", self.family), &["scale", "scale_mma"])?;
@@ -141,13 +197,13 @@ impl<'a> WeightLoader<'a, '_> {
         Ok(output)
     }
 
-    fn ids(&self, name: &str, stream: *mut c_void) -> Result<DeviceAllocation<'a>> {
+    fn ids(&self, key: &str, name: &str, stream: *mut c_void) -> Result<DeviceAllocation<'a>> {
         let meta = &self.catalog.tensor(name)?.metadata;
         ensure!(meta.dtype == cuteafd_core::DType::I64, "{name}: hash router requires I64 IDs");
         let rects = self.rectangles(&[name.into()], Share::All, 0)?;
         let rect = &rects[0];
         ensure!(rect.width() % 8 == 0 && rect.width() <= STEP_BYTES, "{name}: invalid ID row extent");
-        let out = DeviceAllocation::new(self.library, rect.bytes() / 2)?;
+        let out = self.allocate(key, (rect.bytes() / 2).max(16))?;
         let rows = STEP_BYTES / rect.width();
         for first in (0..rect.rows.len()).step_by(rows) {
             let part = rect.sub(first..(first + rows).min(rect.rows.len()));
@@ -201,14 +257,15 @@ impl<'a> WeightLoader<'a, '_> {
         for source in layer_sources(cfg, ratio) {
             let kind = share(source.operand, layout.attention, layout.ffn);
             let names: Vec<String> = source.tensors.iter().map(|t| format!("{prefix}.{t}")).collect();
+            let key = format!("{prefix}.{}", source.operand);
             for (rank, operands) in operands.iter_mut().enumerate() {
                 if layout.operand(source.operand, rank).is_none() { continue; }
                 let rects = self.rectangles(&names, kind, rank)?;
                 let allocation = self.on_rank(rank, |stream| match source.prep {
-                    Prep::Raw => self.native(rects),
+                    Prep::Raw => self.native(&key, rects),
                     Prep::Scale { n, k, groups } => {
                         let (n, k, groups) = scale_extents(source.operand, kind, n, k, groups, ranks);
-                        self.scale_on(rects, n, k, groups, stream)
+                        self.scale_on(&key, rects, n, k, groups, stream)
                     }
                 })?;
                 operands.insert(source.operand, allocation);
@@ -216,8 +273,9 @@ impl<'a> WeightLoader<'a, '_> {
         }
         for (rank, operands) in operands.iter_mut().enumerate() {
             let name = format!("{prefix}.ffn.gate.{}", if hash { "tid2eid" } else { "bias" });
-            let allocation = self.on_rank(rank, |stream| if hash { self.ids(&name, stream) }
-                else { self.tensor(&name) })?;
+            let key = format!("{prefix}.gate.{}", if hash { "tid2eid" } else { "bias" });
+            let allocation = self.on_rank(rank, |stream| if hash { self.ids(&key, &name, stream) }
+                else { self.native(&key, self.rectangles(&[name], Share::All, 0)?) })?;
             operands.insert(if hash { "gate.tid2eid" } else { "gate.bias" }, allocation);
         }
         Ok(operands.into_iter().map(|operands| LayerWeights {
@@ -230,17 +288,18 @@ impl<'a> WeightLoader<'a, '_> {
         let mut operands = HashMap::new();
         for source in layer_sources(cfg, ratio) {
             let names: Vec<String> = source.tensors.iter().map(|t| format!("{prefix}.{t}")).collect();
+            let key = format!("{prefix}.{}", source.operand);
             let rects = self.rectangles(&names, Share::All, 0)?;
             let allocation = match source.prep {
-                Prep::Raw => self.native(rects)?,
-                Prep::Scale { n, k, groups } => self.scale_on(rects, n, k, groups, self.stream)?,
+                Prep::Raw => self.native(&key, rects)?,
+                Prep::Scale { n, k, groups } => self.scale_on(&key, rects, n, k, groups, self.stream)?,
             };
             operands.insert(source.operand, allocation);
         }
         if hash {
-            operands.insert("gate.tid2eid", self.ids(&format!("{prefix}.ffn.gate.tid2eid"), self.stream)?);
+            operands.insert("gate.tid2eid", self.ids(&format!("{prefix}.gate.tid2eid"), &format!("{prefix}.ffn.gate.tid2eid"), self.stream)?);
         } else {
-            operands.insert("gate.bias", self.tensor(&format!("{prefix}.ffn.gate.bias"))?);
+            operands.insert("gate.bias", self.native(&format!("{prefix}.gate.bias"), self.rectangles(&[format!("{prefix}.ffn.gate.bias")], Share::All, 0)?)?);
         }
         Ok(LayerWeights { ratio, hash, attention_split: false, ffn_split: false, operands })
     }
