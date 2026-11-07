@@ -370,6 +370,9 @@ pub struct PlanReport {
     /// Offline solver result; runtime admission still samples live resources.
     #[serde(skip)]
     pub solver_placement: Option<crate::placement::Placement>,
+    /// Resolved GLM Flash drafter placement, including automatic comparisons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tp2_dflash: Option<bool>,
 }
 
 impl PlanReport {
@@ -952,6 +955,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         exlr8_prefill_activations: None,
         memory_layout: None,
         solver_placement: None,
+        tp2_dflash: None,
     })
 }
 

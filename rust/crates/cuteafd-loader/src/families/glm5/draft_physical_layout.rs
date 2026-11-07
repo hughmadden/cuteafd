@@ -18,8 +18,18 @@ pub struct GlmDflashPhysicalLayout {
 impl GlmDflashPhysicalLayout {
     pub fn read(snapshot: &Path, representation: GlmDraftRepresentation, capacity: GlmDraftCapacity,
         sm_count: usize, fp8_mode: u8, kv_cache: Qwen4KvCache) -> Result<Self> {
+        Self::read_tp(snapshot, representation, capacity, sm_count, fp8_mode, kv_cache, 1)
+    }
+
+    pub fn read_tp(snapshot: &Path, representation: GlmDraftRepresentation, capacity: GlmDraftCapacity,
+        sm_count: usize, fp8_mode: u8, kv_cache: Qwen4KvCache, ranks: usize) -> Result<Self> {
         let cfg = GlmDflashConfig::read(snapshot)?;
-        let layout = Self::new(&cfg, representation, capacity, sm_count, fp8_mode, kv_cache)?;
+        let mut layout = Self::new(&cfg.for_tp(ranks)?, representation, capacity, sm_count, fp8_mode, kv_cache)?;
+        if ranks == 2 {
+            layout.owners.push(Allocation::buffer("workspace.reduced", Location::coordinator(0),
+                (capacity.block_rows * cfg.hidden * 2).max(256) as u64,
+                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "draft owners"));
+        }
         let path = snapshot.join("model.safetensors");
         let file_bytes = std::fs::metadata(&path)?.len();
         let headers: BTreeMap<_, _> = crate::read_safetensors_metadata(&path)?.into_iter()

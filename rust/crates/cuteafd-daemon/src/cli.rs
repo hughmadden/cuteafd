@@ -5,14 +5,32 @@ use std::path::PathBuf;
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
 pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
-    matches!(family, "mimo_v2" | "kimi_k3") && split && draft
+    matches!(family, "mimo_v2" | "kimi_k3" | "glm5_flash") && split && draft
 }
 
 /// Resolve the topology-dependent bool once, without losing an explicit false.
 pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatches) {
+    let explicit = matches.subcommand().is_some_and(|(_, sub)|
+        sub.try_contains_id("tp2_dflash").is_ok_and(|present| present)
+            && sub.value_source("tp2_dflash") == Some(clap::parser::ValueSource::CommandLine));
+    let glmf = match command {
+        Commands::ServeGlmf(args) => Some(&mut args.engine),
+        Commands::GlmfGolden(args) => Some(&mut args.engine),
+        _ => None,
+    };
+    if let Some(engine) = glmf {
+        engine.tp2_dflash_auto = !explicit && engine.split_device.is_some()
+            && engine.draft.as_ref().is_some_and(|path|
+                crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|plain| !plain));
+        return;
+    }
     let (enabled, family, split, draft) = match command {
         Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
+        Commands::ServeGlmf(args) => (&mut args.engine.tp2_dflash, "glm5_flash", args.engine.split_device.is_some(),
+            args.engine.draft.as_ref().is_some_and(|path| crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|plain| !plain))),
+        Commands::GlmfGolden(args) => (&mut args.engine.tp2_dflash, "glm5_flash", args.engine.split_device.is_some(),
+            args.engine.draft.as_ref().is_some_and(|path| crate::families::glm5_flash::dspark::is_dspark(path).is_ok_and(|plain| !plain))),
         Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
         _ => return,
     };
@@ -524,7 +542,7 @@ pub(crate) struct PlanArgs {
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
-    /// Split MiMo/Kimi DFlash over both target GPUs (explicit false wins over config).
+    /// Split MiMo/Kimi/GLM Flash DFlash over both target GPUs (explicit false wins over config).
     #[arg(long, action = clap::ArgAction::Set)]
     pub(crate) tp2_dflash: Option<bool>,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
@@ -788,6 +806,29 @@ mod tests {
                     let cli = super::Cli::try_parse_from(argv).unwrap();
                     assert_eq!(cli.spark_prefill_reply_format, Some(prefill.parse::<SparkReplyFormat>().unwrap()));
                     assert_eq!(cli.spark_decode_reply_format, Some(decode.parse::<SparkReplyFormat>().unwrap()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glmf_tp2_dflash_default_requires_compatible_draft_and_preserves_off() {
+        use clap::{CommandFactory, FromArgMatches};
+        let draft = tempfile::tempdir().unwrap();
+        for (config, compatible) in [("{}", true), (r#"{"speculators_model_type":"dspark"}"#, false)] {
+            std::fs::write(draft.path().join("config.json"), config).unwrap();
+            for split in [false, true] {
+                for explicit in [None, Some("false"), Some("true")] {
+                    let mut argv = vec!["cuteafd", "serve-glmf", "--snapshot", "/model", "--native-lib", "/native.so",
+                        "--draft", draft.path().to_str().unwrap()];
+                    if split { argv.extend(["--split-device", "1"]); }
+                    if let Some(value) = explicit { argv.extend(["--tp2-dflash", value]); }
+                    let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
+                    let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
+                    super::resolve_tp2_dflash(&mut cli.command, &matches);
+                    let super::Commands::ServeGlmf(args) = cli.command else { panic!("expected GLM Flash"); };
+                    assert_eq!(args.engine.tp2_dflash, explicit.is_some_and(|v| v == "true"));
+                    assert_eq!(args.engine.tp2_dflash_auto, explicit.is_none() && split && compatible);
                 }
             }
         }

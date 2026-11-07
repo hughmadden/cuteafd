@@ -1666,14 +1666,15 @@ if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family
   esac
 fi
 tp2_dflash_default=off
-if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
+if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$split" != off && "$speculator" == dflash2 ]]; then
   tp2_dflash_default=on
+  [[ "$family" != glm5_flash ]] || tp2_dflash_default=auto
 fi
 tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
-case "$tp2_dflash" in on|off) ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
-[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
-  release_die "TP2_DFLASH requires MiMo/Kimi, two selected RTX GPUs and DFlash2"
-if [[ "$family" == mimo_v2 || "$family" == kimi_k3 ]]; then
+case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == glm5_flash && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
+[[ "$tp2_dflash" != on || ( ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 && "$speculator" == dflash2 ) ]] ||
+  release_die "TP2_DFLASH requires MiMo/Kimi/GLM Flash, two selected RTX GPUs and DFlash2"
+if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && "$tp2_dflash" != auto ]]; then
   # Forward false as well: an explicit off must survive future default changes.
   tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"
   family_args+=(--tp2-dflash "$tp2_dflash_bool")
@@ -2340,11 +2341,6 @@ if [[ $family == glm5_flash ]]; then
     on) trace_args+=(-e "CUTEAFD_GLMF_ROUTE_RING_CHECK=1") ;;
     *) echo "GLM5_FLASH_ROUTE_RING_CHECK must be on or off" >&2; exit 2 ;;
   esac
-  remote_drafter="$(get GLM5_FLASH_REMOTE_DRAFTER)"
-  case "$remote_drafter" in
-    ""|on|off) ;;
-    *) echo "GLM5_FLASH_REMOTE_DRAFTER must be on or off" >&2; exit 2 ;;
-  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
@@ -2360,15 +2356,7 @@ case "$family" in
   glm5)
     # Prefill units, waves and span come from the deployment plan (units-span).
     ;;
-  glm5_flash)
-    # Planner and server must offer the same conditional drafter homes.
-    # Explicit config overrides the legacy process-wide diagnostic switch.
-    case "$remote_drafter" in
-      on) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=1) ;;
-      off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
-      "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
-    esac ;;
-  qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2) ;;
+  glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
@@ -2405,7 +2393,7 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t,b=map(float,sys.argv[1:]);print(max(0,b-(t-f)/1024))' "$free_mib" "$total_mib" "$profile_gib")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
-  if [[ "$family" == mimo_v2 || "$family" == kimi_k3 ]]; then
+  if [[ ( "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
@@ -2601,6 +2589,11 @@ audio_encoder_hash=""
     esac
   fi
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
+  if [[ "$family" == glm5_flash && "$tp2_dflash" == auto ]]; then
+    tp2_dflash_bool="$(jq -er '.tp2_dflash | if . == true then "true" elif . == false then "false" else error("missing drafter choice") end' <<<"$plan_json")"
+    family_args+=(--tp2-dflash "$tp2_dflash_bool")
+    echo "GLM Flash planner selected TP2_DFLASH=$tp2_dflash_bool"
+  fi
   release_prefill_shape "$deployment_json" "$family"
   resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$deployment_json")" ||
     release_die "deployment does not name a supported decode lane count"

@@ -693,7 +693,8 @@ impl ExpertGeometry {
     }
 }
 
-fn architecture(config: &Value) -> Result<&'static str> {
+/// Resolve the native EXLR8 family from its checkpoint configuration without tensor reads.
+pub fn architecture(config: &Value) -> Result<&'static str> {
     match config["architectures"].as_array().and_then(|a| {
         (a.len() == 1).then(|| a[0].as_str()).flatten()
     }) {

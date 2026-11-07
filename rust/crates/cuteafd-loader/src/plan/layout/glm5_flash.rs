@@ -23,6 +23,33 @@ pub(crate) fn native_layout(report: &mut PlanReport, model: &dyn super::super::F
 fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions,
     exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
+    if options.glmf_tp2_dflash_auto && options.head_split && options.rtx_bytes.len() == 2
+        && !options.glmf_drafter_disabled && options.drafter_bytes == 0 {
+        let mut whole_report = report.clone();
+        let mut whole_options = options.clone();
+        whole_options.glmf_tp2_dflash_auto = false;
+        whole_options.tp2_dflash = false;
+        let mut whole = layout_with_native(&mut whole_report, model, input, &mut whole_options, exlr8);
+        let mut split_report = report.clone();
+        let mut split_options = whole_options.clone();
+        split_options.tp2_dflash = true;
+        let mut split = layout_with_native(&mut split_report, model, input, &mut split_options, exlr8);
+        let whole_pool = whole_report.solver_placement.as_ref().map(|p| p.pool_tokens);
+        let split_pool = split_report.solver_placement.as_ref().map(|p| p.pool_tokens);
+        let selected = glmf::prefer_tp2_dflash(whole_pool, split_pool);
+        let note = format!("TP2_DFLASH auto: {}; whole pool {whole_pool:?}, split pool {split_pool:?}",
+            if selected { "split" } else { "whole" });
+        options.tp2_dflash = selected;
+        if selected {
+            split.notes.push(note);
+            *report = split_report;
+            return split;
+        }
+        whole.notes.push(note);
+        *report = whole_report;
+        return whole;
+    }
+    report.tp2_dflash = Some(options.tp2_dflash);
     let remote_experts = report.spark_ranks > 0 && (exlr8.is_some() || report.experts.as_ref().is_some_and(|contract|
         model.spec().moe.as_ref().is_some_and(|moe|
             (super::super::experts::frozen_refusal(&contract.package, report.spark_ranks).is_none()
@@ -52,6 +79,9 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
     let mut waste = Vec::new();
     let admitted = (|| -> anyhow::Result<(placement::Placement, glmf::GlmfWorkingSet)> {
         let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
+        anyhow::ensure!(!options.tp2_dflash || (ranks == 2 && !options.glmf_drafter_disabled
+            && options.drafter_bytes == 0),
+            "TP2 DFlash requires two coordinator GPUs and checkpoint-derived physical owners");
         let spark_ranks = match report.placement { ExpertPlacement::Local => 0, ExpertPlacement::Sparks { ranks } => ranks };
         let lanes = prefill.waves;
         let decode_rows = options.glmf_decode_rows;
@@ -207,6 +237,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
         // Explicit fixture totals remain opaque: do not add inferred scratch on top.
         let mut draft_rows = None;
+        let mut draft_tp2 = Vec::new();
         let (draft, drafter_weights, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, placement::ResidentWeights::default(), vec![0; ranks], None) }
             else if options.drafter_bytes > 0 && options.glmf_drafter_snapshot.is_none() {
                 (options.drafter_bytes, placement::ResidentWeights(options.drafter_bytes), vec![0; ranks], None)
@@ -214,14 +245,22 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             let (config, capacity, _) = draft_config.as_ref().context("resolved Flash drafter config")?;
             let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
             draft_rows = Some(capacity.block_rows);
+            if options.tp2_dflash {
+                let (_, _, path) = draft_config.as_ref().context("TP2 drafter snapshot")?;
+                draft_tp2 = glmf::drafter_tp2_inventory(path, *capacity, &draft_sms,
+                    crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only,
+                    2, options.draft_kv_cache)?;
+                (0, placement::ResidentWeights::default(), vec![0; ranks], None)
+            } else {
             let (bytes, scratch) = glmf::drafter_inventory(config, slots, batch,
                 &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
-            let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
-                glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
+            // GPU1-whole remains unqualified; only GPU0-whole competes with TP2.
+            let bridge = None;
             anyhow::ensure!(options.drafter_bytes == 0 || options.drafter_bytes == bytes.resident_weights.0,
                 "drafter weight override {} differs from checkpoint-resident weights {}",
                 options.drafter_bytes, bytes.resident_weights.0);
             (bytes.memory.resident, bytes.resident_weights, scratch, bridge)
+            }
         };
         let core_charge = if native && exlr8.is_none() {
             let owners = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
@@ -287,15 +326,16 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             }
             baselines.push((total, Baseline::Planned { context_bytes: code, loaded_bytes: 0 }));
         }
+        let speculation = draft > 0 || !draft_tp2.is_empty();
         let automatic_target = placement::PoolPolicy::resolve(&options.rtx_bytes[..ranks], context, None, 256, spark_ranks == 0).target;
         let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or(automatic_target);
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
             .unwrap_or_else(|| glmf::startup_graph_bound(&cfg, cfg.layers, context as usize, target as usize,
-                sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
+                sequences as usize, speculation, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
         let inputs = glmf::GlmfInputs {
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
-            decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.resolved_state_slots("glm5_flash"),
+            decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation, state_slots: options.resolved_state_slots("glm5_flash"),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0,
             index, kda_state_bytes: state.bytes(), shared_replay: options.glmf_shared_replay, representation,
             resident, workspace, local_workspace, graphs, experts,
@@ -346,10 +386,11 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         process.spark_link(&inputs, checkpoint.spark_input_is_bf16())?;
         process.push_host = glmf::admission::push_host_envelope(checkpoint, &cfg, ranks, Some(&catalog), exlr8)?;
         // The serving drafter loads FP8-packed (its default) as its own push group.
-        process.draft_push = draft_config.as_ref().filter(|_| draft > 0).map(|(config, _, path)|
+        process.draft_tp2 = draft_tp2;
+        process.draft_push = draft_config.as_ref().filter(|_| draft > 0 || !process.draft_tp2.is_empty()).map(|(config, _, path)|
             glmf::admission::DraftPush::for_snapshot(path, config,
                 crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only))
-            .transpose()?.flatten();
+            .transpose()?.flatten().map(|push| push.for_tp(if options.tp2_dflash { 2 } else { 1 })).transpose()?;
         if exlr8.is_none() && process.push_host.is_none() {
             process.mount_load = Some(glmf::admission::mount_load(checkpoint, ranks)?);
         }

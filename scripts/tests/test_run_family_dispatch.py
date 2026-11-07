@@ -856,8 +856,10 @@ def test_glmf_remote_dflash_metadata_and_terminal_ownership_ordering() -> None:
     assert "self.bridge.exchange.wait(" not in prime and "self.bridge.exchange.push" not in prime
     isolated = shared.split("    pub(crate) fn prime_remote(", 1)[1].split("    fn workspace(", 1)[0]
     assert "0..TAP_ROWS" in isolated and "1..=self.max_sequences" in isolated
-    assert "self.draft_device_with(" in isolated
-    assert isolated.index("self.draft_device_with(") < isolated.index("for ring in")
+    assert "self.prime_rank(true)" in isolated
+    assert isolated.index("self.prime_rank(false)?") < isolated.index("split.peer.prime_remote()") < isolated.index("split.exchange.add(")
+    assert "HeadCall::Launch(&head), true, paired)" in isolated
+    assert isolated.index("self.draft_from_rank(") < isolated.index("for ring in")
     assert "DraftAttention::Gqa(layer)" in isolated and "self.discard_context(slot)?" in isolated
     assert "buffers.push(&layer.page_table)" in isolated
     assert "&attention.lengths, &attention.query_offsets" in isolated
@@ -2893,7 +2895,6 @@ def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, 
     ("GLM5_FLASH_DRAFT_POLICY=cycle\n", "unknown configuration key: GLM5_FLASH_DRAFT_POLICY"),
     ("GLM5_FLASH_ROUTE_RING_CHECK=yes\n", "GLM5_FLASH_ROUTE_RING_CHECK must be"),
     ("GLM5_FLASH_DRAFT_TRACE=yes\n", "unknown configuration key: GLM5_FLASH_DRAFT_TRACE"),
-    ("GLM5_FLASH_REMOTE_DRAFTER=yes\n", "GLM5_FLASH_REMOTE_DRAFTER must be"),
 ])
 def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
@@ -4129,40 +4130,19 @@ def test_glmf_encoder_defaults_auto_and_forwards_remote_identity(tmp_path, mode,
         assert f"--vision {mode or 'auto'}" in preflight
 
 
-@pytest.mark.parametrize("setting,value,legacy", [("on", "1", "0"), ("off", "0", "1")])
-def test_glmf_remote_drafter_config_overrides_env_for_plan_and_server(tmp_path, setting, value, legacy):
-    config = {**SPLIT_CONFIGS["glm5_flash"], "vision_config": {"depth": 24}}
+@pytest.mark.parametrize("selected", [False, True])
+def test_glmf_tp2_dflash_auto_passes_planner_choice_to_server(tmp_path, selected):
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
-            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
-    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
-                                  f"RTX_GPUS=2\nSPECULATOR=off\nVISION=rtx\nGLM5_FLASH_REMOTE_DRAFTER={setting}\n",
-                                  encoder_plan=plan, extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": legacy})
+            "tp2_dflash": selected}
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/tp2-dflash",
+        "RTX_GPUS=2\nSPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/tp2-dflash\nVISION=off\nAUDIO=off\n",
+        encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
     server = next(line for line in lines if "cuteafd serve-glmf" in line)
-    for command in (planner, server):
-        assert command.count("-e CUTEAFD_GLMF_REMOTE_DFLASH=") == 1, command
-        assert f"-e CUTEAFD_GLMF_REMOTE_DFLASH={value}" in command, command
-    assert not any("CUTEAFD_GLMF_REMOTE_DFLASH=" in line for line in lines if "cuteafd expertd-native" in line)
-
-
-@pytest.mark.parametrize("value", ["", "0", "1"])
-def test_glmf_remote_dflash_candidate_env_matches_plan_and_server(tmp_path, value):
-    config = {**SPLIT_CONFIGS["glm5_flash"], "vision_config": {"depth": 24}}
-    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
-            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
-    result = _family_launch_result(tmp_path, config, "zai-org/GLM-5.3-Flash",
-                                  "RTX_GPUS=2\nSPECULATOR=off\nVISION=rtx\n", encoder_plan=plan,
-                                  extra_env={"CUTEAFD_GLMF_REMOTE_DFLASH": value})
-    assert result.returncode == 0, result.stderr
-    lines = result.stderr.splitlines()
-    planner = next(line for line in lines if "cuteafd plan" in line and "--deployment" in line)
-    server = next(line for line in lines if "cuteafd serve-glmf" in line)
-    expected = f"-e CUTEAFD_GLMF_REMOTE_DFLASH={value}"
-    for command in (planner, server):
-        assert (expected in command) == bool(value), command
-    assert not any("CUTEAFD_GLMF_REMOTE_DFLASH=" in line for line in lines if "cuteafd expertd-native" in line)
+    assert "--tp2-dflash" not in shlex.split(planner)
+    assert f"--tp2-dflash {str(selected).lower()}" in server
 
 
 @pytest.mark.parametrize("vision", [None, "auto"])
@@ -5059,7 +5039,8 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert "prefill reserve does not fit" not in result.stderr
 
 
-@pytest.mark.parametrize("family,command", [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi")])
+@pytest.mark.parametrize("family,command", [("mimo_v2", "serve-mimo"), ("kimi_k3", "serve-kimi"),
+                                           ("glm5_flash", "serve-glmf")])
 @pytest.mark.parametrize("value,expected", [(None, None), ("off", "false"), ("on", "true")])
 def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, command, value, expected):
     if expected is None:
@@ -5068,18 +5049,25 @@ def test_tp2_dflash_explicit_boolean_reaches_plan_and_serve(tmp_path, family, co
     if family == "kimi_k3":
         config = {"model_type": family, "text_config": {"model_type": "kimi_linear",
                   "num_hidden_layers": 93, "first_k_dense_replace": 1, "moe_layer_freq": 1}}
+    if family == "glm5_flash":
+        config = GLMF_TWO_LAYER
     keys = "RTX_GPUS=2\nSPECULATOR=dflash2\nVISION=off\nAUDIO=off\n"
-    if family == "kimi_k3":
+    if family in {"kimi_k3", "glm5_flash"}:
         keys += "SPECULATOR_MODEL_ID=test/tp2-dflash\n"
     if value is not None:
         keys += f"TP2_DFLASH={value}\n"
-    result = _family_launch_result(tmp_path, config, "test/tp2-dflash", keys)
+    automatic = family == "glm5_flash" and value is None
+    result = _family_launch_result(tmp_path, config, "test/tp2-dflash", keys,
+        encoder_plan={"tp2_dflash": True} if automatic else None)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     serve = next(line for line in lines if f"cuteafd {command} --snapshot" in line)
     plans = [line for line in lines if "cuteafd plan " in line]
     assert f"--tp2-dflash {expected}" in serve
-    assert plans and all(f"--tp2-dflash {expected}" in line for line in plans)
+    if automatic:
+        assert plans and all("--tp2-dflash" not in shlex.split(line) for line in plans)
+    else:
+        assert plans and all(f"--tp2-dflash {expected}" in line for line in plans)
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=1\nSPECULATOR=dflash2\n",

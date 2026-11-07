@@ -128,6 +128,12 @@ impl DflashDrafter<'_> {
             }
         }
         inventory.ordered_uploads(self.library, self.stream)?;
+        if let Some(split) = &self.head_split {
+            inventory.device("workspace.reduced", split.reduced.buffer)?;
+            inventory.device("peer.workspace.reduced", split.peer_reduced.buffer)?;
+            inventory.receipts.extend(split.peer.device.run(||
+                split.peer.allocation_receipts(devices, &format!("{prefix}.peer")))?);
+        }
         Ok(inventory.receipts)
     }
 }

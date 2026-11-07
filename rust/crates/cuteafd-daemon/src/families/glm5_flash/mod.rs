@@ -281,6 +281,12 @@ pub(crate) struct EngineArgs {
     /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
+    /// Split GQA drafter heads, KV and MLP over the target's peer GPUs.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
+    #[arg(skip = true)]
+    pub tp2_dflash_auto: bool,
+
     /// Diagnostic drafter head arithmetic for golden/replay and --draft-modes: `exact` uses
     /// the target's FP32 path; `tensor` uses the legacy tensor route past one draft block.
     /// Serving always uses the shared BF16 tensor head at every row count. The target's own
@@ -1940,11 +1946,18 @@ impl Opened {
         }
         let sms = inventory.gpus[0].sms as usize;
         let draft_sms: Vec<_> = inventory.gpus.iter().map(|gpu| gpu.sms as u64).collect();
+        let mut draft_tp2 = Vec::new();
         let (drafter_bytes, drafter_weights, drafter_scratch, drafter_bridge) = args.draft.as_ref().map(|path| -> Result<_> {
             let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
             let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
                 args.draft_context_slots, args.draft_sequences)?;
             let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
+            if args.tp2_dflash {
+                draft_tp2 = admission::drafter_tp2_inventory(path, capacity, &draft_sms,
+                    cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
+                    args.draft_linear.code() as u8, args.draft_kv_cache)?;
+                return Ok((0, placement::ResidentWeights::default(), vec![0; devices.len()], None));
+            }
             let (bytes, scratch) = admission::drafter_inventory(&config, slots, batch, &draft_sms,
                 cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
                 args.draft_linear.code() as u8, args.draft_kv_cache)?;
@@ -2009,6 +2022,7 @@ impl Opened {
         process.push_host = admission::admission::push_host_envelope(&headers, &self.cfg, devices.len(),
             self.experts.as_ref(),
             native_admission.map(|native| (&native.facts, &native.metadata)))?;
+        process.draft_tp2 = draft_tp2;
         process.draft_push = self.draft_push(args)?;
         if native_admission.is_none() && process.push_host.is_none() {
             process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);
@@ -2017,25 +2031,10 @@ impl Opened {
         tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
             "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
-        let attention = admission::placed_attention(attention, &placement);
         ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0 || *id == placement::MovableId::Drafter),
             "GLM Flash placement has no matching movable executor");
         placement::draft::require_home(&placement, "GLM Flash",
             if remote_draft { &[0, 1] } else { &[0] })?;
-        tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
-            prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers,
-            attention_first_owner = attention.first_owner, "GLM Flash admission before weights");
-        let devices: Vec<_> = placement.items.iter().zip(&inventory.gpus).enumerate().map(|(rank, (items, gpu))| {
-            serde_json::json!({"kind": "rtx", "index": rank, "device": gpu.device, "items": items})
-        }).collect();
-        tracing::info!(target: "cuteafd::placement", plan = %serde_json::json!({
-            "memory_layout": {"devices": devices, "pool_tokens": placement.pool_tokens},
-            "graph_shapes": graphs.shapes, "graphs": graphs.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(),
-            "speculation": speculation, "sequences": sequences,
-            "attention_first_owner": attention.first_owner,
-            "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
-        }), "GLM Flash startup plan");
-        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host, admitted.mount_load))
     }
 
@@ -2231,11 +2230,11 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect(), dense: std::rc::Rc::new(weights::DenseLoad::mount(&self.library)) };
-        let remote_draft = match (split_device, args.draft.as_ref()) {
-            (Some(_), Some(path)) => cuteafd_loader::placement::families::glm5_flash::remote_dflash_requested()
-                && !dspark::is_dspark(path)?,
-            _ => false,
-        };
+        ensure!(!args.tp2_dflash || (split_device.is_some() && args.draft.as_ref()
+            .is_some_and(|path| dspark::is_dspark(path).is_ok_and(|plain| !plain))),
+            "TP2 DFlash requires two coordinator GPUs and a GQA DFlash2 checkpoint");
+        // GPU1-whole has an unresolved cold-replay mismatch; keep it out of admission.
+        let remote_draft = false;
         let native_admission = self.native.then(|| {
             let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
             native::Admission::new(args, &self.cfg, layers, 1 + usize::from(split_device.is_some()),
@@ -2246,8 +2245,27 @@ impl Opened {
             cuteafd_loader::plan::families::glm::GLM5_FLASH.exlr8_execution()
                 .check(1 + usize::from(split_device.is_some()), false)?;
         }
-        let (placement, admitted_graphs, working, admitted_host, admitted_native_load, admitted_push_host, admitted_mount_load) = self.admit(args, &programs, layers, index_cache, mark_slots,
-            split_device, automatic_context, remote_draft, attention, native_admission.as_ref())?;
+        let mut draft_args = args.clone();
+        let admitted = if args.tp2_dflash_auto {
+            draft_args.tp2_dflash = false;
+            let whole = self.admit(&draft_args, &programs, layers, index_cache, mark_slots,
+                split_device, automatic_context, false, attention, native_admission.as_ref());
+            draft_args.tp2_dflash = true;
+            let split = self.admit(&draft_args, &programs, layers, index_cache, mark_slots,
+                split_device, automatic_context, false, attention, native_admission.as_ref());
+            let whole_pool = whole.as_ref().ok().map(|a| a.0.pool_tokens);
+            let split_pool = split.as_ref().ok().map(|a| a.0.pool_tokens);
+            draft_args.tp2_dflash = cuteafd_loader::placement::families::glm5_flash::prefer_tp2_dflash(whole_pool, split_pool);
+            tracing::info!(whole_pool, split_pool, split = draft_args.tp2_dflash, "TP2_DFLASH auto selection");
+            if draft_args.tp2_dflash { split } else { whole }
+        } else {
+            self.admit(args, &programs, layers, index_cache, mark_slots,
+                split_device, automatic_context, remote_draft, attention, native_admission.as_ref())
+        }?;
+        let args = &draft_args;
+        let remote_draft = false;
+        cuteafd_bench::context::set_resolved("tp2-dflash", if args.tp2_dflash { "on" } else { "off" });
+        let (placement, admitted_graphs, working, admitted_host, admitted_native_load, admitted_push_host, admitted_mount_load) = admitted;
         if let Some(receipt) = admitted_mount_load { loader.dense.admit_mount(receipt)?; }
         let media = prepare_media()?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
@@ -2260,6 +2278,22 @@ impl Opened {
         ensure!(placement.attention_placement == attention.mode,
             "GLM Flash admission placed {} attention, the engine serves {}",
             placement.attention_placement, attention.mode);
+        tracing::info!(placement = %placement.summary(), spark_ranks = working.spark_ranks,
+            prefill_lanes = working.prefill_lanes, spark_layers = ?working.spark_layers,
+            attention_first_owner = attention.first_owner, "GLM Flash admission before weights");
+        let devices: Vec<_> = placement.items.iter().zip(std::iter::once(args.device).chain(split_device))
+            .enumerate().map(|(rank, (items, device))|
+                serde_json::json!({"kind": "rtx", "index": rank, "device": device, "items": items})).collect();
+        let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
+        tracing::info!(target: "cuteafd::placement", plan = %serde_json::json!({
+            "memory_layout": {"devices": devices, "pool_tokens": placement.pool_tokens},
+            "graph_shapes": admitted_graphs.shapes,
+            "graphs": admitted_graphs.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(),
+            "speculation": speculation, "sequences": sequences,
+            "attention_first_owner": attention.first_owner,
+            "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
+        }), "GLM Flash startup plan");
+        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         let draft_gpu = cuteafd_loader::placement::draft::home(&placement).unwrap_or(0);
         let mut prepared_draft = if draft_gpu == 1 {
             ensure!(remote_draft, "remote drafter was not declared before admission");
@@ -2755,7 +2789,8 @@ impl Opened {
         }
         engine.bind_expert_homes(&placement, &spark_layers, args.skip_experts)?;
         finish_loading(&self.library, &mut engine, |engine| {
-            engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read)?;
+            engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read,
+                if args.tp2_dflash { Some(engine.draft_exchange()?) } else { None })?;
             engine.bind_draft_core_head()?;
             engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
             cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
@@ -2806,7 +2841,7 @@ impl Opened {
     /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
     fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>, stream: *mut std::ffi::c_void,
         embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<crate::shared::draft::remote::Prepared<'s>>,
-        read: Option<dspark::DraftRead>)
+        read: Option<dspark::DraftRead>, exchange: Option<std::rc::Rc<crate::shared::peer_split::PeerExchange<'s>>>)
         -> Result<Option<dspark::Drafter<'s>>> {
         let Some(snapshot) = &args.draft else { return Ok(None) };
         let read = read.context("the drafter read was not started with --draft")?;
@@ -2820,7 +2855,21 @@ impl Opened {
         // Admitted standalone push group of the drafter's own GPU, after the target
         // group committed; priming (RemoteDflash::new) reads only committed weights.
         let admitted = self.draft_push(args)?.map(|draft| draft.host);
-        let drafter = if let Some(prepared) = prepared {
+        let drafter = if let Some(exchange) = exchange {
+            use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
+            ensure!(prepared.is_none(), "TP2 DFlash cannot use a remote single-home drafter");
+            let cfg = DflashConfig::read(snapshot)?;
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "DFlash2 does not fit this target");
+            let mask = embedding.host_rows(&[cfg.mask_token])?;
+            let file = read.join_dflash()?;
+            let devices = [args.device, exchange.device(1)].map(|id|
+                crate::shared::memory::device::Device { library: &self.library, id });
+            dspark::Drafter::Dflash2(crate::shared::experts::rtx::push::load_alone_admitted(snapshot,
+                &devices, admitted, || DflashDrafter::load_tp2(&self.library, programs, snapshot, file,
+                    slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear,
+                    args.draft_kv_cache, exchange))?)
+        } else if let Some(prepared) = prepared {
             use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             let cfg = DflashConfig::read(snapshot)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
@@ -2852,7 +2901,8 @@ impl Opened {
         let Some(snapshot) = &args.draft else { return Ok(None) };
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         cuteafd_loader::placement::families::glm5_flash::admission::DraftPush::for_snapshot(snapshot, &config,
-            cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8))
+            cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8))?
+            .map(|push| push.for_tp(if args.tp2_dflash { 2 } else { 1 })).transpose()
     }
 
     /// The one-expert NVFP4 package of ModelOpt NVFP4 dense MLPs, when `layers` have them.
