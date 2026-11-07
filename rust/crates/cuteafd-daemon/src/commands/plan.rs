@@ -896,11 +896,13 @@ mod tests {
             .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap())
                 .join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
         anyhow::ensure!(manifest.is_file(), "installed Kimi context check requires {}", manifest.display());
-        let crate::cli::Commands::Plan(mut request) = crate::cli::Cli::try_parse_from([
+        let cli = crate::cli::Cli::try_parse_from([
             "cuteafd", "plan", snapshot.to_str().unwrap(), "--layout", "--config", config.to_str().unwrap(),
             "--rtx", "1", "--spark-ranks", "6", "--speculator", "dflash2", "--vision", "off", "--audio", "off",
             "--workspace-manifest", manifest.to_str().unwrap(), "--prefill-rows", "1024",
-            "--spark-memory-cap", "118111600640"]).unwrap().command else { panic!("plan") };
+            "--spark-memory-cap", "118111600640"])?;
+        let crate::cli::Commands::Plan(mut request) = cli.command else { panic!("plan") };
+        request.memory = cli.memory;
         request.hf_home = Some(hf_home);
         resolve_context_tokens(&mut request, &cfg)?;
         let mut request = file_args(request, &snapshot)?;

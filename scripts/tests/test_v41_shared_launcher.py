@@ -259,7 +259,7 @@ def test_v41_sim5090_launches_pinned_single_gpu_tp4() -> None:
     coordinator = containers[0]
     assert coordinator["env"]["CUTEAFD_SPARK_INTAKE"] == "pinned"
     command = dict(flag_values(coordinator["command"]))
-    for flag, value in {"--rtx-gpus": "1", "--max-context-tokens": "auto"}.items():
+    for flag, value in {"--rtx-gpus": "1", "--max-context-tokens": "1048576"}.items():
         assert command[flag] == value
     assert "--spark-tp" not in command and "--spark-ep" not in command
     assert len(containers) == 5
