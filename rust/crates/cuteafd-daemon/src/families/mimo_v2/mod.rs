@@ -1198,6 +1198,9 @@ impl Opened {
             Ok(loaded)
         })?;
         loader.release_transient();
+        crate::shared::inventory::startup_probe(&self.library,
+            &std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect::<Vec<_>>(),
+            "mimo_v2/weights-loaded", Default::default())?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {

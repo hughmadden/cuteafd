@@ -70,6 +70,95 @@ mod tests {
     const MIB: u64 = 1 << 20;
     const SM120_GRANULE: u64 = 2 * MIB;
 
+    fn fixture_options(ranks: usize, tp: usize, format: R) -> MimoResidentOptions {
+        MimoResidentOptions {
+            layers: 2, coordinator_ranks: ranks, checkpoint_tp: tp, native_mtp_layers: 0, gpu_embedding: true,
+            head_format: format,
+            output_formats: (0..2).map(|l| (format!("model.layers.{l}.self_attn.o_proj.weight"), format)).collect(),
+        }
+    }
+
+    /// Every resident request has one 256-aligned, nonoverlapping view under a
+    /// source key the loader derives from checkpoint names; no staging or
+    /// transient representation enters the arena.
+    fn check(checkpoint: &Checkpoint, resident: &MimoResidentLayout) -> MimoArenaLayouts {
+        let layouts = MimoArenaLayouts::new(checkpoint, resident).unwrap();
+        assert_eq!(layouts.target.len(), resident.ranks.len());
+        for (rank, layout) in layouts.target.iter().enumerate() {
+            assert_eq!(layout.id(), format!("mimo.target.rank{rank}"));
+            assert_eq!(layout.views().len(), resident.ranks[rank].len(), "unique final keys");
+            assert_eq!(layout.payload_bytes() as u64, resident.ranks[rank].iter().map(|r| r.bytes).sum::<u64>());
+            let mut views = layout.views().iter().map(|(name, v)| (v.offset(), v.bytes(), name)).collect::<Vec<_>>();
+            views.sort();
+            for pair in views.windows(2) {
+                assert!(pair[0].0 + pair[0].1 <= pair[1].0, "{} overlaps {}", pair[0].2, pair[1].2);
+            }
+            for (offset, _, name) in &views {
+                assert_eq!(offset % 256, 0, "{name}");
+                assert!(!name.contains("staging") && !name.ends_with("_scale_inv") && !name.contains(".bf16"), "{name}");
+                assert!(!name.starts_with("model.mtp."), "{name}: MTP stays out of the target arena");
+            }
+            assert!(views.last().map_or(0, |v| v.0 + v.1) <= layout.bytes());
+        }
+        layouts
+    }
+
+    #[test]
+    fn target_layouts_cover_selected_tp1_tp2_formats_with_source_keys() {
+        use crate::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors, write_snapshot};
+        for (config, tensors, tp) in [(mimo_flash_config(), mimo_flash_tensors(), 1), (mimo_pro_config(), mimo_pro_tensors(), 8)] {
+            let dir = tempfile::tempdir().unwrap();
+            write_snapshot(dir.path(), &config, &tensors, Some(tp));
+            let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+            for ranks in [1, 2] {
+                for format in [R::Bf16, R::Fp8] {
+                    let resident = MimoResidentLayout::new(&checkpoint, &cfg, &fixture_options(ranks, tp, format)).unwrap();
+                    let layouts = check(&checkpoint, &resident);
+                    assert!(layouts.mtp.is_none());
+                    let lead = &layouts.target[0];
+                    let head = if format == R::Fp8 { "lm_head.weight.fp8" } else { "lm_head.weight" };
+                    assert!(lead.view(head).is_some(), "{head}");
+                    assert!(lead.view("embedding.table").is_some());
+                    // Both retained scale layouts of every FP8 linear (the FP8 head keeps one bank).
+                    for name in lead.views().keys().filter(|n| n.ends_with(".row_scale") && !n.starts_with("lm_head")) {
+                        assert!(lead.view(&name.replace(".row_scale", ".k_scale")).is_some(), "{name}");
+                    }
+                    let qkv = if checkpoint.contains_tensor("model.layers.0.self_attn.qkv_proj.weight") {
+                        "model.layers.0.self_attn.qkv_proj.weight.fp8".to_string()
+                    } else {
+                        format!("{}.fp8", operand_key(["q", "k", "v"].map(|p| format!("model.layers.0.self_attn.{p}_proj.weight"))))
+                    };
+                    for layout in &layouts.target { assert!(layout.view(&qkv).is_some(), "{qkv}"); }
+                    if ranks == 2 {
+                        assert!(layouts.target[1].views().keys().all(|n| !n.starts_with("lm_head") && n != "embedding.table"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_requests_get_their_own_rank0_arena() {
+        use cuteafd_core::serving_capacity::MemoryReservation;
+        let resident = MimoResidentLayout { ranks: vec![vec![
+            MemoryReservation { name: "model.norm.weight".into(), bytes: 8192 },
+            MemoryReservation { name: "model.mtp.layers.0.enorm.weight".into(), bytes: 8192 },
+            MemoryReservation { name: "model.mtp.layers.0.gate_up.fp8".into(), bytes: 3 << 20 },
+        ]], loading_temporary_rank_bytes: vec![0] };
+        let dir = tempfile::tempdir().unwrap();
+        use crate::plan::testing::{mimo_flash_config, mimo_flash_tensors, write_snapshot};
+        write_snapshot(dir.path(), &mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let layouts = MimoArenaLayouts::new(&checkpoint, &resident).unwrap();
+        let mtp = layouts.mtp.unwrap();
+        assert_eq!(mtp.id(), "mimo.mtp.rank0");
+        assert_eq!(mtp.views().keys().cloned().collect::<Vec<_>>(), [
+            "model.mtp.layers.0.enorm.weight".to_string(),
+            operand_key(["model.mtp.layers.0.mlp.gate_proj.weight", "model.mtp.layers.0.mlp.up_proj.weight"]) + ".fp8"]);
+        assert_eq!(layouts.target[0].views().keys().collect::<Vec<_>>(), ["model.norm.weight"]);
+    }
+
     /// Header-only before/after inventory of the selected `mimo26-flash-max`
     /// layout (TP2 head split, native MTP, GPU embedding): per-tensor requests
     /// with their SM120 2 MiB rounding versus one packed arena per scope.
