@@ -27,11 +27,7 @@ impl BudgetedPlanInput {
     #[track_caller]
     pub fn plan_spark_count(&self, options: &super::PlanOptions, available: usize,
         explicit: Option<usize>) -> Result<super::PlanReport, super::PlanError> {
-        let started = std::time::Instant::now();
-        let result = self.input.plan_spark_count(options, available, explicit);
-        assert!(started.elapsed() < std::time::Duration::from_secs(30),
-            "full Spark-count plan exceeded 30s: snapshot={} options={options:?}", self.checkpoint().snapshot.display());
-        result
+        super::plan_spark_count_with(&self.input, options, available, explicit, |candidate| self.plan(candidate))
     }
 
     #[track_caller]
