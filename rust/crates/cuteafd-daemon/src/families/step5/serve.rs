@@ -1300,6 +1300,56 @@ mod push_admission_tests {
     use super::*;
 
     #[test]
+    fn whole_zero_one_admission_matches_required_push_arena() -> Result<()> {
+        use cuteafd_loader::{placement::Onboard, plan::families::step5::admission::OnboardInputs};
+        use crate::shared::{experts::rtx::push::CoordinatorExperts,
+            memory::push_coordinator::CoordinatorExpertPlan};
+        let root = tempfile::tempdir()?;
+        let snapshot = root.path().join("snapshot");
+        cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
+        let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        let manifest = root.path().join("PROGRAMS.json");
+        let package = root.path().join("exl3/exl3-step5-k46/rtx-tp1");
+        let rows = 2752;
+        let geometry = ExpertGeometry::STEP5;
+        for capacity in cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(rows)? {
+            let directory = package.join(format!("m{capacity}"));
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+                "capacity": capacity, "decode_capacity": capacity <= 80, "hidden": geometry.hidden,
+                "intermediate": geometry.intermediate, "experts": geometry.experts, "top_k": geometry.topk,
+                "tile": [64, 128, 64, 128], "output_dtype": "fp32", "activation": "silu_post_clamp",
+                "trellis_lut": {"bytes": 32}, "buffers": {
+                    "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 256,
+                        "zero_on_create": false}
+                }
+            }))?)?;
+        }
+        assert!(OnboardInputs::new(&catalog, Some(&manifest), rows, 1, 1, Onboard::Layers(0))?.is_none());
+        assert!(CoordinatorExpertPlan::whole(vec![], 0).is_err());
+        let admitted = OnboardInputs::new(&catalog, Some(&manifest), rows, 1, 1, Onboard::Layers(1))?
+            .context("one whole layer")?;
+        let resident = usize::try_from(admitted.costs[0].whole.resident)?;
+        let peak = resident + usize::try_from(admitted.workspace)?;
+        let push = OnboardBudget::Whole(peak).push_plan(&catalog, &package, &[3], rows, 1)?;
+        let CoordinatorExperts::Whole { owners } = push else { anyhow::bail!("whole push expected") };
+        assert_eq!(owners[0].budget, resident);
+        let residency = catalog.exl3().context("EXL3")?
+            .residency(cuteafd_loader::V41Exl3Layer::Backbone(3), 1, 0)?;
+        let plan = CoordinatorExpertPlan::whole(vec![residency], owners[0].budget)?;
+        assert_eq!(plan.layout.bytes(), resident);
+        // The old BF16 charge missed exactly the observed 22,544,384 bytes.
+        let missing = rows * geometry.hidden as usize * 2;
+        assert_eq!(missing, 22_544_384);
+        let underbudget = OnboardBudget::Whole(peak - missing).push_plan(&catalog, &package, &[3], rows, 1)?;
+        let CoordinatorExperts::Whole { owners } = underbudget else { anyhow::bail!("whole push expected") };
+        let residency = catalog.exl3().context("EXL3")?
+            .residency(cuteafd_loader::V41Exl3Layer::Backbone(3), 1, 0)?;
+        assert!(CoordinatorExpertPlan::whole(vec![residency], owners[0].budget).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn push_resident_budget_never_spends_execution_workspace() -> Result<()> {
         assert_eq!(resident_budget(768, 256)?, 512);
         assert_eq!(resident_budget(256, 256)?, 0);

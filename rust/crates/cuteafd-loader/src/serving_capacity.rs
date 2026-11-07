@@ -24,7 +24,7 @@ pub use peer_storage::PeerStorageLayout;
 pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format, spark_intake_bytes, PrefillShape};
 mod exl3_workspace;
 pub(crate) use exl3_workspace::exl3_workspace_bytes_from_refs;
-pub use exl3_workspace::{exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
+pub use exl3_workspace::{exl3_rtx_output_bytes, exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
 pub mod glmf_graphs;
 mod glmf_workspace;
