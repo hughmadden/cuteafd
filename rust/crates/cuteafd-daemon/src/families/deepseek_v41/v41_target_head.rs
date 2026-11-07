@@ -49,18 +49,23 @@ impl<'a> TargetHeadWeights<'a> {
         budget: usize,
         staging: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, budget, staging, None)
+    }
+    pub fn load_in(
+        library: &'a NativeLibrary,
+        catalog: &OfficialV41Catalog,
+        budget: usize,
+        staging: usize,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>,
+    ) -> Result<Self> {
         ensure!(
             Self::device_bytes(catalog)? <= budget,
             "target norm exceeds budget"
         );
         Ok(Self {
             library,
-            norm: NativeRtxTensors::load(
-                library,
-                catalog,
-                &["norm.weight".into()],
-                budget,
-                staging,
+            norm: NativeRtxTensors::load_in(
+                library, catalog, &["norm.weight".into()], budget, staging, arena,
             )?,
         })
     }

@@ -34,6 +34,16 @@ impl<'a> EngramLayerWeights<'a> {
         device_budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer_index, device_budget, staging_bytes, None)
+    }
+    pub fn load_in(
+        library: &'a NativeLibrary,
+        catalog: &OfficialV41Catalog,
+        layer_index: usize,
+        device_budget: usize,
+        staging_bytes: usize,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>,
+    ) -> Result<Self> {
         let layer = *cuteafd_core::ENGRAM_LAYERS
             .get(layer_index)
             .context("invalid engram layer index")?;
@@ -48,14 +58,14 @@ impl<'a> EngramLayerWeights<'a> {
             required <= device_budget,
             "engram weights and packed scales exceed device budget"
         );
-        let tensors = NativeRtxTensors::load(
-            library,
-            catalog,
-            &names,
-            device_budget - packed_bytes,
-            staging_bytes,
+        let tensors = NativeRtxTensors::load_in(
+            library, catalog, &names, device_budget - packed_bytes, staging_bytes, arena,
         )?;
-        let packed_scales = DeviceAllocation::new(library, packed_bytes)?;
+        let packed_scales = crate::families::deepseek_v41::weight_layout::allocation(
+            library, arena,
+            &crate::families::deepseek_v41::weight_layout::packed_scale_name(&names[0]),
+            packed_bytes,
+        )?;
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,
