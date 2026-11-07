@@ -201,7 +201,7 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             config = dict(line.split("=", 1) for line in (ROOT / selected["config"]).read_text().splitlines()
                           if line and not line.startswith("#"))
             config.update(selected["set"])
-            expected = str(config.get("SPARK_DEVICE_BUDGET_BYTES", 108 << 30))
+            expected = str(config.get("SPARK_MEMORY_CAP", 108 << 30))
             assert after["command"][after["command"].index("--device-budget-bytes") + 1] == expected
             before["command"][before["command"].index("--device-budget-bytes") + 1] = expected
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
@@ -216,13 +216,13 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
 def test_v41_worker_budget_comes_from_typed_deployment(explicit: int | None) -> None:
     entry = release_entry(next(e for e in ENTRIES if e["name"] == "v41-flash-min"))
     if explicit is not None:
-        entry["set"]["SPARK_DEVICE_BUDGET_BYTES"] = str(explicit)
+        entry["set"]["SPARK_MEMORY_CAP"] = str(explicit)
     result = capture(ROOT, entry["name"], release_entry=entry)
     for plan in result["plans"]:
         if explicit is None:
-            assert "--spark-budget-gib" not in plan
+            assert "--spark-memory-cap" not in plan
         else:
-            assert float(plan[plan.index("--spark-budget-gib") + 1]) == explicit / 2**30
+            assert plan[plan.index("--spark-memory-cap") + 1] == str(explicit)
     workers = [parse_run(run["argv"])["command"] for run in result["containers"] if run["host"] != "coordinator"]
     assert len(workers) == int(entry["set"]["SPARK_COUNT"])
     for worker in workers:

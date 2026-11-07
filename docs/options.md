@@ -86,7 +86,6 @@ the launcher derives from them.
 | `RTX_EXPERT_PEER` | `off` | `off` | `on` is refused; TP2 halves replaced it. |
 | `EMBEDDING` | `gpu` | `host`, `gpu` | Untied token-embedding placement. |
 | `EXPERT_PORT` | `19441` | 1–65535 | Expert-worker port. |
-| `SPARK_DEVICE_BUDGET_BYTES` | `107374182400` | positive int | Per-Spark worker allocation ceiling. |
 | `SPARK_REDUCTION_MIN_ROWS` | `16` | positive int | Row threshold for the reduction path. |
 | `HOST_ISA` | `auto` | `auto`, `x86-64-v2`, `x86-64-v4` | Native library ISA. |
 | `RDMA_BOND_BALANCE` | `off` | `off`, `labels`, `probe` | RoCE v2 flow-label placement on a coordinator bond. |
@@ -104,16 +103,33 @@ the launcher derives from them.
 
 ## Memory and pools
 
+One memory policy covers every family
+([`cuteafd-core/src/memory_policy.rs`](../rust/crates/cuteafd-core/src/memory_policy.rs)).
+Each device has one cap, and weights, KV, workspaces and the reserve all live inside it.
+The planner fixes the layout (layer placement, onboarding, buffers) for `KV_TARGET_TOKENS`;
+the pool then grows into what the fixed layout leaves, up to `KV_MAX_TOKENS`, and the launch
+is refused below `KV_MIN_TOKENS`. The reserve is the sum of named, measured components
+(CUDA context and cuBLAS, loaded code, graphs, runtime growth, the Spark runtime residual)
+plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the whole reserve and zero
+every built-in component. Startup and `cuteafd plan` print one line per device with the cap,
+weights, workspaces, every reserve component and the KV target, min, max and pool.
+Sizes take `B`, `MB`, `GB`, `MiB` or `GiB` (a bare number is bytes); there are no percentages.
+Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`, ...).
+
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `COORDINATOR_GPU_BUDGET_GIB` | planner default 95.5 | positive GiB | Logical per-GPU ceiling for plan/serve/golden. |
-| `MEMORY_RESERVATION` | unset | size or `%` | V4.1 only: explicit admission ceiling; unset uses full capacity minus sampled occupancy and declared owners, with no automatic percentage or small-card margin. |
+| `KV_TARGET_TOKENS` | 2M; 1M on cards of 32 GB or less | positive count | KV the layout is sized for: layer placement, onboarding, buffers. |
+| `KV_MIN_TOKENS` | the serving context; at least 256K on Spark-free layouts | positive count | Refuse the launch below this; missing the target is fine down to it. With Sparks an automatic context may be clamped to the pool. |
+| `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
+| `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
+| `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark ceiling (worker allocation ceiling and routed-weight budget); the cap is what leaves room for the OS. |
+| `GPU_RESERVE` | auto | size | Sets the total GPU reserve; every built-in GPU reserve component becomes 0. Still inside the cap. |
+| `SPARK_RESERVE` | auto | size | Same as `GPU_RESERVE`, for Sparks. |
+| `FAMILY_RESERVE` | per-family constant (0; GLM 5.3 Flash 2 GiB until #1442) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |
 | `POOL_TOKENS` | `auto` where offered | `auto` or count | Planner-sized pool up to 2M tokens; a number pins it. |
 | `HOST_CACHE_BYTES` | `auto` | `auto`, `0`, byte size | Prefix-cache host tier; `0` disables it. |
-| `GLM5_FLASH_HEADROOM_GIB` | engine 2 GiB (1 on 32 GB) | non-negative | GLM Flash automatic pool headroom. |
-| `GLM5_FLASH_GRAPH_BUDGET_MIB` | unbounded | positive MiB | Captured decode graphs the device may hold. |
 
 ## Attention and KV
 
@@ -360,7 +376,6 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `RTX_EXPERT_PEER` | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `EMBEDDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `EXPERT_PORT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
-| `SPARK_DEVICE_BUDGET_BYTES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `SPARK_REDUCTION_MIN_ROWS` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `HOST_ISA` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `RDMA_BOND_BALANCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
@@ -374,14 +389,18 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `MIMO_SNAPSHOT_WAIT` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `MIMO_PREFILL_CHUNK_S` | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Memory and pools** | | | | | | | | | | |
-| `COORDINATOR_GPU_BUDGET_GIB` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `MEMORY_RESERVATION` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `KV_TARGET_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KV_MIN_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KV_MAX_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GPU_MEMORY_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_MEMORY_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `GPU_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `SPARK_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `FAMILY_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_POOL_TOKENS` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `KV_POOL_SIZE` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `POOL_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `HOST_CACHE_BYTES` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GLM5_FLASH_HEADROOM_GIB` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `GLM5_FLASH_GRAPH_BUDGET_MIB` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Attention and KV** | | | | | | | | | | |
 | `ATTENTION_MODE` | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ |
 | `ATTENTION_PLACEMENT` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |

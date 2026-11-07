@@ -94,14 +94,14 @@ Common launcher settings: `CONCURRENCY=4`, `MAX_CONTEXT_TOKENS=16384`,
 `SPECULATOR=mtp`, `SPECULATOR_DEPTH=3`, `COPY_DRAFTS=off`. Keep the default
 BF16 projections, shared single-copy FP8 head, and mapped host PLE table.
 
-- Minimum: `RTX_GPUS=1`, `COORDINATOR_GPU_BUDGET_GIB=32`,
+- Minimum: `RTX_GPUS=1`, `GPU_MEMORY_CAP=32GiB`,
   `EXPERT_BACKEND=spark`, `SPARK_COUNT=1`, `SPARK_HOSTS=moa`,
-  `SPARK_DEVICE_BUDGET_BYTES=110000000000`. All backbone experts are on moa;
+  `SPARK_MEMORY_CAP=110000000000`. All backbone experts are on moa;
   only the one MTP expert layer stays on the coordinator.
 - Maximum: `RTX_GPUS=1`, `EXPERT_BACKEND=local`, `SPARK_COUNT=0`; omit the
-  coordinator budget. Backbone and MTP experts stay resident on the RTX.
+  GPU memory cap. Backbone and MTP experts stay resident on the RTX.
 
-`cuteafd plan MODEL --layout --rtx 1 --coordinator-gpu-budget-gib 32 --spark-ranks 1`
+`cuteafd plan MODEL --layout --rtx 1 --gpu-memory-cap 32GiB --spark-ranks 1`
 models the ceiling. The same launcher budget is enforced before weight,
 KV, workspace and graph allocations and includes physical/untracked device
 usage; it does not reserve a dummy allocation or alter SM/L2 geometry.

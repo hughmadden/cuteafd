@@ -264,9 +264,10 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
 - Iterate with `./wip.sh --slot S` then `./run.sh --wip S --restart`; A/B two
   checkouts with `scripts/bench/bench-ab.py`. `cuteafd plan MODEL` (any HF id or
   snapshot dir) says what a checkpoint needs before any kernel work.
-  `--coordinator-gpu-budget-gib` is the logical per-GPU ceiling for plan,
-  serve and golden; plan defaults to 95.5 GiB. Its distinct weights-only
-  cap is `--coordinator-weight-budget-gib` (default 80 GiB);
+  `--gpu-memory-cap` (`GPU_MEMORY_CAP`) is the total per-GPU ceiling for
+  plan, serve and golden (default: the full device); reserves and KV
+  target/min/max are the other memory policy keys in `docs/options.md`. Its
+  distinct weights-only cap is `--coordinator-weight-budget-gib` (default 80 GiB);
   `cuteafd fabric` shows ports, link/PCIe rates, subnets and the rail plan
   (services log the same line at startup).
 
