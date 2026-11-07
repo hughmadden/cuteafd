@@ -857,8 +857,7 @@ impl PreparedGlmf<'_> {
         } else { i.graphs.clone() };
         if i.local_tp2_exl3 && working.spark_ranks == 0 { calibrate_local_tp2_graphs(&mut graphs); }
         let declared_graphs = if graphs.lifetime == Lifetime::Startup {
-            let context = glmf_graphs::admitted_graph_context(i.max_context as usize,
-                solved.pool_tokens as usize, i.automatic_context);
+            let context = solved.request.context.served(solved.pool_tokens) as usize;
             let buckets = glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(i.decode_rows as usize, self.sms));
             let shapes = glmf_graphs::serving_graph_shapes(context,
                 (solved.pool_tokens as usize).div_ceil(glmf_graphs::PAGE_ROWS), i.cfg.dense_context(),
