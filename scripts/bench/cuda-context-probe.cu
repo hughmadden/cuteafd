@@ -1,6 +1,6 @@
 // Named CUDA owners. Run in the matching toolchain image on idle, locked GPUs.
 // nvcc -O2 -o probe cuda-context-probe.cu -lcublas -lcublasLt -arch=sm_120
-// probe handles|lt|lt-with-blas [device=0] [count=4]
+// probe handles|lt|lt-with-blas [device=0] [count=4] [prewarm]
 // probe mappings [device0=0] [device1=1]
 #include <cstdio>
 #include <cstdlib>
@@ -53,15 +53,41 @@ static void identity(int device) {
     if (i == 4 || i == 6 || i == 8 || i == 10) std::putchar('-');
     std::printf("%02x", (unsigned char)prop.uuid.bytes[i]);
   }
-  std::printf("\"}\n");
+  const char* loading = std::getenv("CUDA_MODULE_LOADING");
+  std::printf("\",\"module_loading\":\"%s\"}\n", loading ? loading : "default");
 }
-static void handles(int device, int count) {
+static void prewarm_sgemm(int device) {
+  const auto before = used(device);
+  const auto host_before = mem_available_kb();
+  float* p = nullptr;
+  CUDA(cudaMalloc(&p, 3 * 64 * 64 * sizeof(float)));
+  CUDA(cudaMemset(p, 0, 3 * 64 * 64 * sizeof(float)));
+  const auto buffered = used(device);
+  cublasHandle_t handle = nullptr;
+  BLAS(cublasCreate(&handle));
+  const auto created = used(device);
+  const float alpha = 1, beta = 0;
+  BLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 64, 64, 64,
+      &alpha, p, 64, p + 4096, 64, &beta, p + 8192, 64));
+  const auto multiplied = used(device);
+  BLAS(cublasDestroy(handle));
+  CUDA(cudaFree(p));
+  const auto after = used(device);
+  std::printf("{\"mode\":\"prewarm\",\"device\":%d,\"operation\":\"sgemm_64\","
+      "\"create_bytes\":%lld,\"gemm_bytes\":%lld,\"retained_bytes\":%lld,"
+      "\"host_retained_bytes\":%lld}\n", device, (long long)created - buffered,
+      (long long)multiplied - created, (long long)after - before,
+      1024 * (host_before - mem_available_kb()));
+  std::fflush(stdout);
+}
+static void handles(int device, int count, bool prewarm) {
   CUDA(cudaSetDevice(device));
   CUDA(cudaFree(nullptr));
   cudaDeviceProp prop{};
   CUDA(cudaGetDeviceProperties(&prop, device));
   int driver = 0;
   CUDA(cudaDriverGetVersion(&driver));
+  if (prewarm) prewarm_sgemm(device);
   // Allocate disjoint A/B/C before sampling: buffers are not handle residency.
   float* p = nullptr;
   CUDA(cudaMalloc(&p, 3 * 64 * 64 * sizeof(float)));
@@ -88,13 +114,14 @@ static void handles(int device, int count) {
   for (auto owner : owners) BLAS(cublasDestroy(owner));
   CUDA(cudaFree(p));
 }
-static void lt_handles(int device, int count, bool with_blas) {
+static void lt_handles(int device, int count, bool with_blas, bool prewarm) {
   CUDA(cudaSetDevice(device));
   CUDA(cudaFree(nullptr));
   cudaDeviceProp prop{};
   CUDA(cudaGetDeviceProperties(&prop, device));
   int driver = 0;
   CUDA(cudaDriverGetVersion(&driver));
+  if (prewarm) prewarm_sgemm(device);
   constexpr int n = 4096, k = 4096, rows = 16;
   constexpr size_t weight_bytes = size_t(n) * k * 2;
   constexpr size_t input_bytes = size_t(k) * rows * 2;
@@ -232,9 +259,14 @@ int main(int argc, char** argv) {
   identity(device);
   if (std::strcmp(mode, "mappings") == 0) identity(argc > 3 ? std::atoi(argv[3]) : 1);
   const int last = argc > 3 ? std::atoi(argv[3]) : (std::strcmp(mode, "mappings") == 0 ? 1 : 4);
-  if (std::strcmp(mode, "handles") == 0 && last > 0 && last <= 64) handles(device, last);
+  const bool prewarm = argc == 5 && std::strcmp(argv[4], "prewarm") == 0;
+  if (argc > 5 || (argc == 5 && (!prewarm || std::strcmp(mode, "mappings") == 0))) {
+    std::fprintf(stderr, "invalid prewarm argument\n");
+    return 2;
+  }
+  if (std::strcmp(mode, "handles") == 0 && last > 0 && last <= 64) handles(device, last, prewarm);
   else if ((std::strcmp(mode, "lt") == 0 || std::strcmp(mode, "lt-with-blas") == 0)
-      && last > 0 && last <= 64) lt_handles(device, last, std::strcmp(mode, "lt-with-blas") == 0);
+      && last > 0 && last <= 64) lt_handles(device, last, std::strcmp(mode, "lt-with-blas") == 0, prewarm);
   else if (std::strcmp(mode, "mappings") == 0) mappings(device, last);
-  else { std::fprintf(stderr, "usage: probe handles|lt|lt-with-blas [device] [count] | mappings [device0] [device1]\n"); return 2; }
+  else { std::fprintf(stderr, "usage: probe handles|lt|lt-with-blas [device] [count] [prewarm] | mappings [device0] [device1]\n"); return 2; }
 }
