@@ -148,6 +148,7 @@ fn header_and_installed_min_plans_share_the_physical_weight_granularity_forecast
         requests.extend(LayerLayout::ranks_with_core(model.cfg(), layer,
             LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, &model.core, 1)?[0].allocation_extents(None)?);
     }
+    assert_eq!(requests.iter().sum::<u64>(), 113_509_532_032);
     let expected = allocation_granularity_forecast(&requests)?;
     assert!(expected > 0);
     let package = tempfile::tempdir()?;
@@ -190,7 +191,9 @@ fn single_owner_header_plan_refuses_mandatory_weights_above_default_cap() {
     layout.rtx_bytes = vec![192 << 30];
     layout.head_split = false;
     let report = input.plan(&options).unwrap();
-    let refusal = PlacementError::ResidentWeightLimit { gpu: 0, required: 113_509_540_864,
+    // Unpacked uploads charge payload; allocation backing is a separate forecast.
+    // A future packed arena includes its own 8,832 bytes of inter-view padding.
+    let refusal = PlacementError::ResidentWeightLimit { gpu: 0, required: 113_509_532_032,
         limit: ResidentWeights::DEFAULT_LIMIT.0 };
     assert!(!report.fits && !report.placement_supported);
     assert!(report.solver_placement.is_none());
