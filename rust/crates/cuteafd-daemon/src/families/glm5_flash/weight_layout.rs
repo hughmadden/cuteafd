@@ -50,7 +50,9 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
     if let Some(head) = core.get_weight("lm_head") {
         let layout = cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
             cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
-        for (name, bytes) in layout.arena_tensors(&layout.stem)? { insert(&mut requests[0], name, bytes)?; }
+        for (name, bytes) in layout.arena_tensors(&layout.stem)? {
+            ensure!(requests[0].insert(name.clone(), bytes).is_none(), "duplicate Flash K6 view {name}");
+        }
     } else if fp8_head { fp8(&mut requests[0], vec!["lm_head.weight".into()], 1, true)?; }
     else { one(&mut requests[0], "lm_head.weight".into())?; }
     for (layer, &mode) in modes.iter().enumerate() {
@@ -67,7 +69,7 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
             }}
             for leaf in ["input_layernorm.weight", "post_attention_layernorm.weight"] { one(out, format!("{p}.{leaf}"))?; }
             for layout in native_core[rank].values() { for (name, bytes) in layout.arena_tensors(&layout.stem)? {
-                insert(out, name, bytes)?;
+                ensure!(out.insert(name.clone(), bytes).is_none(), "duplicate Flash K6 view {name}");
             }}
             for layout in native_attention[rank].values() {
                 let [n, k] = layout.shape;
