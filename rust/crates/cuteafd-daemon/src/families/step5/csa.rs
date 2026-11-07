@@ -1,4 +1,5 @@
 //! Layer-selected CSA branch over transaction-owned pages and summaries.
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use super::scratch::{self, Arena, Plane};
 use super::{
     ffn::{DenseFfn, DensePlan},
@@ -217,7 +218,7 @@ impl<'a> CsaLayer<'a> {
         kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format, None, None)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format, None, None, None)
     }
 
     pub fn for_execution(
@@ -235,13 +236,14 @@ impl<'a> CsaLayer<'a> {
         kv_format: Qwen4KvCache,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
         contract: &CoordinatorContract, layout: &RankWeightLayout,
+        weight_arena: &DeviceWeightArena<'a>,
     ) -> Result<Self> {
         let local = ownership.layer(layer, rank)?;
         ensure!(local.query_heads == 64 && local.kv_heads == 4,
             "Step-5 CSA needs a whole native attention owner");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
             reservations, layout.clone(), false, Some((arena, 0)),
-            kv_format, native_scratch, Some(contract))
+            kv_format, native_scratch, Some(contract), Some(weight_arena))
     }
 
     fn load_layout(
@@ -259,6 +261,7 @@ impl<'a> CsaLayer<'a> {
         kv_format: Qwen4KvCache,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
         contract: Option<&CoordinatorContract>,
+        weight_arena: Option<&DeviceWeightArena<'a>>,
     ) -> Result<Self> {
         let owned;
         let contract = match contract { Some(contract) => contract, None => {
@@ -524,16 +527,16 @@ impl<'a> CsaLayer<'a> {
             )?),
         };
         let ffn = dense
-            .map(|plan| DenseFfn::load_plan(device, programs, checkpoint, plan))
+            .map(|plan| DenseFfn::load_plan_shared(device, programs, checkpoint, plan, None, None, weight_arena))
             .transpose()?;
         let native = super::native::NativeAttention::load(device, programs, checkpoint, &layout, layer_id,
-            rows.min(4096), Q, KV, H)?;
+            rows.min(4096), Q, KV, H, weight_arena)?;
         ensure!(native.is_some() == (native_layer || native_o), "CSA native attention inventory");
         ensure!(native.as_ref().and_then(|n| n.o.as_ref()).is_none_or(|o| o.side() == cuteafd_loader::formats::dense_trellis::TrellisSide::Output),
             "CSA attention is whole-owned; its native o_proj is never K-split");
         let weights = weights
             .into_iter()
-            .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w)).transpose())
+            .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w, weight_arena)).transpose())
             .collect::<Result<Vec<_>>>()?;
         let mut owner = Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { kv_format, rope, layer: layer_id, weights,
             programs: resolved, residual, epsilon: contract.norms.input, native, hqa_output }), ffn, arena)?;

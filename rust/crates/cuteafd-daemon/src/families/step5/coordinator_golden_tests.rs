@@ -90,7 +90,7 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     for (prefix, device, layout) in layouts(&checkpoint)? {
         let device = Device { library: &library, id: device };
         for operand in layout.operands.iter().filter(|o| covered(&o.name)) {
-            let allocation = super::weights::load_operand(device, &checkpoint, &layout, operand)?;
+            let allocation = super::weights::load_operand(device, &checkpoint, &layout, operand, None)?;
             actual.insert(format!("{prefix}.{}", operand.name), digest(&library, allocation.buffer)?);
         }
     }
@@ -115,7 +115,7 @@ fn records_match_the_host_packing_on_installed_headers() -> Result<()> {
         let device = Device { library: &library, id: device };
         for operand in layout.operands.iter().filter(|o| covered(&o.name)) {
             let expected = super::weights::pack_reference(operand, &layout, |name| reader.raw(name))?;
-            let allocation = super::weights::load_operand(device, &checkpoint, &layout, operand)?;
+            let allocation = super::weights::load_operand(device, &checkpoint, &layout, operand, None)?;
             let mut actual = vec![0u8; expected.len()];
             library.copy_d2h(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer { bytes: expected.len(), ..allocation.buffer })?;
             anyhow::ensure!(actual == expected, "{prefix}.{}: records differ from the host packing", operand.name);
@@ -170,7 +170,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
         let device = Device { library: &library, id: device };
         for operand in layout.operands.iter().filter(|o| covered(&o.name)) {
             owners.push((format!("{prefix}.{}", operand.name),
-                super::weights::load_operand(device, &checkpoint, &layout, operand)?));
+                super::weights::load_operand(device, &checkpoint, &layout, operand, None)?));
         }
     }
     let records = recorder.finish();

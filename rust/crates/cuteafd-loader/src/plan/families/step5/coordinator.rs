@@ -236,6 +236,24 @@ fn is_exl3_member(name: &str) -> bool {
 }
 
 impl RankWeightLayout {
+    /// Final rank-local owners only; composite FP8 values/scales remain one view.
+    pub fn arena_tensors(&self, select: impl Fn(&str) -> bool) -> Result<Vec<(String, usize)>> {
+        let mut tensors = self.operands.iter().filter(|operand| select(&operand.name))
+            .map(|operand| Ok((if operand.name == "model.embed_tokens.weight" {
+                "embedding.table".to_owned()
+            } else { operand.name.clone() }, usize::try_from(operand.allocation_bytes)?)))
+            .collect::<Result<Vec<_>>>()?;
+        for (name, core) in &self.core {
+            if select(name) { tensors.extend(core.arena_tensors(&core.stem)?); }
+        }
+        Ok(tensors)
+    }
+
+    pub fn arena_layout(&self, id: impl Into<String>, select: impl Fn(&str) -> bool)
+        -> Result<crate::serving_capacity::WeightArenaLayout> {
+        crate::serving_capacity::WeightArenaLayout::new(id, self.arena_tensors(select)?)
+    }
+
     pub fn from_checkpoint(checkpoint: &Checkpoint, rank: usize, ranks: usize) -> Result<Self> {
         Self::build(checkpoint, rank, ranks, None)
     }

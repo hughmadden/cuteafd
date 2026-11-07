@@ -1,5 +1,6 @@
 //! Header-admitted target weights. No routed-expert or MTP residency is implied.
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::weight_arena::{DeviceWeightArena, weight_allocation};
 use crate::shared::peer_split::{slice_2d, Axis};
 #[cfg(test)]
 use crate::shared::qwen::weights::materialize_bf16;
@@ -14,6 +15,18 @@ use cuteafd_loader::plan::families::step5::coordinator::{
 use std::collections::BTreeMap;
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
+
+pub(super) fn target_arena(layout: &RankWeightLayout, device: i32, count: usize, embedding: bool)
+    -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
+    layout.arena_layout(format!("step5/target/gpu{device}"), |name| {
+        if name == EMBEDDING { return embedding; }
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            return rest.split_once('.').and_then(|(layer, _)| layer.parse::<usize>().ok())
+                .is_some_and(|layer| layer < count);
+        }
+        count == 92
+    })
+}
 
 /// The host packing the dense records replaced (the unit tests' oracle).
 #[cfg(test)]
@@ -93,6 +106,7 @@ pub(super) fn load_operand<'a>(
     checkpoint: &'a Checkpoint,
     layout: &RankWeightLayout,
     operand: &WeightOperand,
+    arena: Option<&DeviceWeightArena<'a>>,
 ) -> Result<Allocation<'a>> {
     let _scope = cuteafd_ffi::memory_ledger::scope("step5_target_weights");
     cuteafd_ffi::memory_ledger::tensor(&operand.name);
@@ -101,7 +115,7 @@ pub(super) fn load_operand<'a>(
     } else if operand.dtype == DType::F8E4M3 { "fp8-block128" } else {
         "f32"
     });
-    let allocation = Allocation::new(device, usize::try_from(operand.allocation_bytes)?)?;
+    let allocation = weight_allocation(device, arena, &operand.name, usize::try_from(operand.allocation_bytes)?)?;
     if operand.dtype == DType::F8E4M3 {
         use crate::shared::{native_attention::{attention_records, AttentionRecord}, experts::rtx::dense::DenseLoad};
         let native = operand.native_layout(layout.rank, layout.ranks)?;
@@ -234,7 +248,8 @@ impl<'a> RankWeights<'a> {
     ) -> Result<Self> {
         // No CUDA calls, including device selection, precede these checks.
         let layout = RankWeightLayout::from_checkpoint(checkpoint, rank, ranks)?;
-        layout.check_budget(available, reservations)?;
+        let packed = target_arena(&layout, device.id, 92, true)?;
+        layout.check_budget(available, &[reservations, &[packed.padding_bytes() as u64]].concat())?;
         let source = layout
             .operands
             .iter()
@@ -244,9 +259,10 @@ impl<'a> RankWeights<'a> {
             .first()
             .context("Step-5 embedding source")?;
         let embedding = EmbedSource::new(&checkpoint.snapshot, &source.shard, &source.meta, 4096)?;
+        let arena = DeviceWeightArena::new(device, packed)?;
         device.run(|| {
             let (embedding, operands) =
-                TokenEmbedding::load(device.library, embedding, EmbedPlacement::Gpu, || {
+                TokenEmbedding::load_with(device.library, embedding, EmbedPlacement::Gpu, || {
                     let mut operands = BTreeMap::new();
                     for operand in &layout.operands {
                         if operand.name == EMBEDDING {
@@ -254,11 +270,11 @@ impl<'a> RankWeights<'a> {
                         }
                         operands.insert(
                             operand.name.clone(),
-                            load_operand(device, checkpoint, &layout, operand)?,
+                            load_operand(device, checkpoint, &layout, operand, Some(&arena))?,
                         );
                     }
                     Ok(operands)
-                })?;
+                }, |name, bytes| weight_allocation(device, Some(&arena), name, bytes))?;
             Ok(Self {
                 embedding,
                 operands,

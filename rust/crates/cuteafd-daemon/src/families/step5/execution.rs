@@ -8,6 +8,7 @@ use crate::shared::{experts::{rtx::pair::{self, SubmissionScope}, staging::Route
         HeadKernels, HeadMerge, HeadPrecision, HeadProjection, HeadSequence,
         LaneOrder, LayerKernels, LayerProtocol, PipelineKernels}, hop::{HopLink, HopTicket}, TerminalState}, spark_intake::SparkLink};
 use anyhow::{ensure, Context, Result};
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use cuteafd_loader::families::qwen4::Qwen4KvCache;
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_hostcache::copy::CopyEngine;
@@ -127,7 +128,7 @@ impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize, span: usize, logits: usize,
         count: usize, available: &[u64], reservations: &[u64], depth: usize, kv_format: Qwen4KvCache,
-        plan: &NativePlan) -> Result<Self> {
+        plan: &NativePlan, weight_arenas: &[DeviceWeightArena<'a>]) -> Result<Self> {
         validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
         ensure!(matches!(count, 1 | 92), "Step-5 native layer inventory");
         let head_rank = ownership.execution().spec().head_gpu as usize;
@@ -143,6 +144,7 @@ impl<'a> NativeOwners<'a> {
                     cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
             }
         }
+        ensure!(weight_arenas.len() == devices.len(), "Step-5 target arena rank inventory");
         let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog_view(
             checkpoint.view.as_ref().context("Step-5 execution requires its selected checkpoint view")?)).transpose()?;
         admit_native(&admission, available, reservations, || {
@@ -168,11 +170,11 @@ impl<'a> NativeOwners<'a> {
                     let attention = if contract.layers[layer].sliding.is_some() {
                         Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
                             rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format,
-                            native_scratch.clone(), contract, rank_layout)?)
+                            native_scratch.clone(), contract, rank_layout, &weight_arenas[rank])?)
                     } else {
                         Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
                             rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format,
-                            native_scratch.clone(), contract, rank_layout)?)
+                            native_scratch.clone(), contract, rank_layout, &weight_arenas[rank])?)
                     };
                     // Every FFN kind lives in one region after this rank's largest
                     // attention region: no attention or other FFN kind overwrites a
@@ -182,7 +184,7 @@ impl<'a> NativeOwners<'a> {
                         let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership, contract, rank_layout)?
                             .with_span(span)?;
                         Ffn::Dense(DenseFfn::load_plan_shared(device, programs, checkpoint, plan, Some((&arena, offset)),
-                            native_scratch.clone())?)
+                            native_scratch.clone(), Some(&weight_arenas[rank]))?)
                     } else {
                         let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership, contract, rank_layout)?
                             .with_span(span)?
@@ -191,14 +193,14 @@ impl<'a> NativeOwners<'a> {
                                 super::experts::StepExperts::from_catalog(catalog)?.layer_bf16_input(catalog, layer)?
                             });
                         Ffn::Routed(RoutedFfn::load_shared(device, programs, checkpoint, layer, plan, Some((&arena, offset)),
-                            native_scratch.clone())?)
+                            native_scratch.clone(), Some(&weight_arenas[rank]))?)
                     };
                     ranks[rank].push(Some(Layer { attention, ffn }));
                 }
                 arenas.push(arena);
             }
             let head = head_plan.map(|plan| super::head::TargetHeadOwner::load_in(devices[head_rank],
-                programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)))).transpose()?;
+                programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)), Some(&weight_arenas[head_rank]))).transpose()?;
             Ok(Self { contract: plan.contract.clone(), ranks, head, arenas, rope: tables, onboarded: None, onboarded_tp2: None })
         })
     }
@@ -440,14 +442,14 @@ impl<'e, 'a> Execution<'e, 'a> {
         rows: usize, span: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize) -> Result<LoadedNative<'a>> {
         let plan = NativePlan::new(checkpoint, ownership, Rc::new(CoordinatorContract::from_checkpoint(checkpoint)?))?;
         Self::load_native_with_plan(programs, checkpoint, ownership, caches, stages, rows, span,
-            logits, available, reservations, count, &plan)
+            logits, available, reservations, count, &plan, None)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_native_with_plan(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, caches: &[&'e RefCell<CacheRank<'a>>], stages: &[&'e Staging<'a>],
         rows: usize, span: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize,
-        plan: &NativePlan) -> Result<LoadedNative<'a>> {
+        plan: &NativePlan, weight_arenas: Option<&[DeviceWeightArena<'a>]>) -> Result<LoadedNative<'a>> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         ensure!(rows <= span && (1..=span).contains(&logits), "Step-5 unit or head rows outside the span");
         validate_rank_inventory(ownership.ranks(), &[caches.len(), stages.len(), available.len(), reservations.len()])?;
@@ -465,8 +467,20 @@ impl<'e, 'a> Execution<'e, 'a> {
                 && devices[..rank].iter().all(|other| other.id != device.id)), "Step-5 rank devices/library differ");
         let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
             .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
+        // Standalone diagnostics own their arenas; serve passes the arenas that
+        // also hold the entry embedding.
+        let owned;
+        let weight_arenas = match weight_arenas {
+            Some(arenas) => arenas,
+            None => {
+                owned = devices.iter().enumerate().map(|(rank, &device)| DeviceWeightArena::new(device,
+                    super::weights::target_arena(&plan.layouts[rank], device.id, count, false)?))
+                    .collect::<Result<Vec<_>>>()?;
+                &owned
+            }
+        };
         Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, span, logits, count, available,
-            reservations, depth, kv_format, plan)?))
+            reservations, depth, kv_format, plan, weight_arenas)?))
     }
 
     /// Binds loaded native owners to the caches and the (now connected) transport.

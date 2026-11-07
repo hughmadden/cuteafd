@@ -1,4 +1,5 @@
 //! Native router/shared expert bindings with transport-neutral wave boundaries.
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
@@ -363,7 +364,7 @@ impl<'a> RoutedFfn<'a> {
         plan: RoutedPlan,
         arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
-        Self::load_shared(device, programs, checkpoint, layer, plan, arena, None)
+        Self::load_shared(device, programs, checkpoint, layer, plan, arena, None, None)
     }
 
     /// `native_scratch` is the rank's shared projection scratch (native shared FFNs).
@@ -375,6 +376,7 @@ impl<'a> RoutedFfn<'a> {
         plan: RoutedPlan,
         arena: Option<(&Arena<'a>, usize)>,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        weights_arena: Option<&DeviceWeightArena<'a>>,
     ) -> Result<Self> {
         ensure!(layer == plan.layer, "Step-5 routed plan layer mismatch");
         let native_set = plan.native.is_some();
@@ -393,7 +395,7 @@ impl<'a> RoutedFfn<'a> {
             None => None,
             Some(names) => {
                 let mut core = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
-                    plan.admission.rows, |name| names.iter().any(|n| n == name))?;
+                    plan.admission.rows, |name| names.iter().any(|n| n == name), weights_arena)?;
                 scratch_out = Some(match native_scratch {
                     Some(scratch) => scratch,
                     None => std::rc::Rc::new(super::native::NativeScratch::allocate(device,
@@ -412,7 +414,7 @@ impl<'a> RoutedFfn<'a> {
         let weights = plan
             .weights
             .iter()
-            .map(|w| load_operand(device, checkpoint, &plan.layout, w))
+            .map(|w| load_operand(device, checkpoint, &plan.layout, w, weights_arena))
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, plan.admission, std::rc::Rc::new(RoutedWeights {
             weights, programs: resolved, epsilon: plan.epsilon, layer,

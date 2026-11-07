@@ -1,4 +1,5 @@
 //! Admitted post-attention dense FFN owner used by target and MTP serving blocks.
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::memory::device::{Allocation, Device, Stream};
@@ -358,7 +359,7 @@ impl<'a> DenseFfn<'a> {
         plan: DensePlan,
         arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
-        Self::load_plan_shared(device, programs, checkpoint, plan, arena, None)
+        Self::load_plan_shared(device, programs, checkpoint, plan, arena, None, None)
     }
 
     /// `native_scratch` is the rank's shared projection scratch; a native FFN
@@ -370,6 +371,7 @@ impl<'a> DenseFfn<'a> {
         plan: DensePlan,
         arena: Option<(&Arena<'a>, usize)>,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        weights_arena: Option<&DeviceWeightArena<'a>>,
     ) -> Result<Self> {
         let DensePlan {
             layout,
@@ -390,7 +392,7 @@ impl<'a> DenseFfn<'a> {
                 .map(|(name, pointers, _)| device.run(|| programs.program(name, pointers)))
                 .collect::<Result<Vec<_>>>()?;
             let mut core = super::native::NativeLayer::load(device, programs, checkpoint, &layout, admission.rows,
-                |name| names.iter().any(|n| n == name))?;
+                |name| names.iter().any(|n| n == name), weights_arena)?;
             let scratch = match native_scratch {
                 Some(scratch) => scratch,
                 None => std::rc::Rc::new(super::native::NativeScratch::allocate(device,
@@ -402,7 +404,7 @@ impl<'a> DenseFfn<'a> {
                     .map_err(|_| anyhow::anyhow!("native dense operand shared"))
             };
             let linears = [take(&mut core, &names[0])?, take(&mut core, &names[1])?, take(&mut core, &names[2])?];
-            let loaded = weights.into_iter().map(|w| load_operand(device, checkpoint, &layout, &w))
+            let loaded = weights.into_iter().map(|w| load_operand(device, checkpoint, &layout, &w, weights_arena))
                 .collect::<Result<Vec<_>>>()?;
             let mut owner = Self::workspace(device, admission, std::rc::Rc::new(DenseWeights {
                 weights: loaded, programs: resolved, epsilon, native: Some(linears),
@@ -427,7 +429,7 @@ impl<'a> DenseFfn<'a> {
             .collect::<Result<Vec<_>>>()?;
         let loaded = weights
             .into_iter()
-            .map(|w| load_operand(device, checkpoint, &layout, &w))
+            .map(|w| load_operand(device, checkpoint, &layout, &w, weights_arena))
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, admission, std::rc::Rc::new(DenseWeights {
             weights: loaded, programs: resolved, epsilon, native: None,

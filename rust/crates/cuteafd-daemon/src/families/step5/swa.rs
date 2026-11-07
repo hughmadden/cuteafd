@@ -1,4 +1,5 @@
 //! Layer-selected SWA projections and transaction-owned cache reads.
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use super::scratch::{self, Arena, Plane};
 use super::{
     ffn::{DenseFfn, DensePlan},
@@ -197,7 +198,7 @@ impl<'a> SwaLayer<'a> {
         kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None, kv_format, None, None)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None, kv_format, None, None, None)
     }
 
     pub fn for_execution(
@@ -215,12 +216,13 @@ impl<'a> SwaLayer<'a> {
         kv_format: Qwen4KvCache,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
         contract: &CoordinatorContract, layout: &RankWeightLayout,
+        weight_arena: &DeviceWeightArena<'a>,
     ) -> Result<Self> {
         let heads = ownership.layer(layer, rank)?.query_heads;
         ensure!(heads > 0, "Step-5 SWA is not owned by rank {rank}");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
             reservations, layout.clone(), heads, false, Some((arena, 0)),
-            kv_format, native_scratch, Some(contract))
+            kv_format, native_scratch, Some(contract), Some(weight_arena))
     }
 
     pub(super) fn for_mtp_stage(
@@ -228,11 +230,12 @@ impl<'a> SwaLayer<'a> {
         stage: usize, rows: usize, rope: std::rc::Rc<TargetTables<'a>>,
         available: u64, reservations: &[u64], arena: &Arena<'a>, kv_format: Qwen4KvCache,
         contract: &CoordinatorContract,
+        weight_arena: &DeviceWeightArena<'a>,
     ) -> Result<Self> {
         let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
         let cfg = Config::parse(checkpoint)?;
         Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
-            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None, Some(contract))
+            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None, Some(contract), Some(weight_arena))
     }
 
     fn load_layout(
@@ -251,6 +254,7 @@ impl<'a> SwaLayer<'a> {
         kv_format: Qwen4KvCache,
         native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
         contract: Option<&CoordinatorContract>,
+        weight_arena: Option<&DeviceWeightArena<'a>>,
     ) -> Result<Self> {
         let name = |full: &str| {
             let name = if heads == 32 { full.replacen("step5_", "step52_", 1) }
@@ -463,17 +467,17 @@ impl<'a> SwaLayer<'a> {
                 let attention_bytes = usize::try_from(
                     cuteafd_loader::plan::families::step5::native::plane_bytes(&admission.planes)?)?;
                 let ffn_arena = arena.map(|(arena, offset)| (arena, offset + attention_bytes));
-                DenseFfn::load_plan_in(device, programs, checkpoint, plan, ffn_arena)
+                DenseFfn::load_plan_shared(device, programs, checkpoint, plan, ffn_arena, None, weight_arena)
             })
             .transpose()?;
         let native = super::native::NativeAttention::load(device, programs, checkpoint, &layout, layer_id,
-            rows, q, kv, H)?;
+            rows, q, kv, H, weight_arena)?;
         ensure!(native.is_some() == (native_layer || native_o), "SWA native attention inventory");
         // Native layers keep slot indices; replaced slots hold an empty placeholder
         // only in the index map, never a device allocation.
         let weights = weights
             .into_iter()
-            .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w)).transpose())
+            .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w, weight_arena)).transpose())
             .collect::<Result<Vec<_>>>()?;
         let attention_rope = rope.tables.get(layer.rope)?;
         let mut owner = Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { kv_format, rope, attention_rope,
@@ -1084,7 +1088,7 @@ mod tests {
         );
         let mut chain = SwaLayer::load_layout(device, programs, checkpoint, layer, 513, None,
             u64::MAX, &[], RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true,
-            Some((arena, 0)), Qwen4KvCache::Bf16, None, None)?;
+            Some((arena, 0)), Qwen4KvCache::Bf16, None, None, None)?;
         for (plane, data) in [
             (POSITIONS, (0..513i64).flat_map(i64::to_le_bytes).collect::<Vec<_>>()),
             (REQUESTS, vec![0; 513 * 4]),

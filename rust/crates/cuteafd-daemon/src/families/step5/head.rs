@@ -1,4 +1,5 @@
 //! Admitted final BF16 narrowing, zero-centered norm and shared vocabulary head.
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
@@ -139,21 +140,21 @@ impl<'a> TargetHeadOwner<'a> {
 
     pub fn load(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         plan: HeadPlan, available: u64, reservations: &[u64]) -> Result<Self> {
-        Self::load_in(device, programs, checkpoint, plan, available, reservations, None)
+        Self::load_in(device, programs, checkpoint, plan, available, reservations, None, None)
     }
 
     pub(super) fn load_in(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        plan: HeadPlan, available: u64, reservations: &[u64], arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
+        plan: HeadPlan, available: u64, reservations: &[u64], arena: Option<(&Arena<'a>, usize)>, weights_arena: Option<&DeviceWeightArena<'a>>) -> Result<Self> {
         let total = reservations.iter().try_fold(plan.bytes, |n, v| n.checked_add(*v))
             .context("Step-5 final head reservation overflow")?;
         ensure!(total <= available, "Step-5 final head and reservations exceed admission");
         device.run(|| {
             let norm = programs.program("step5_final_norm", POINTERS)?;
-            let weights = plan.weights.iter().map(|w| load_operand(device, checkpoint, &plan.layout, w))
+            let weights = plan.weights.iter().map(|w| load_operand(device, checkpoint, &plan.layout, w, weights_arena))
                 .collect::<Result<Vec<_>>>()?;
             let native = plan.native.as_ref().map(|name| -> Result<_> {
                 let mut layer = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
-                    plan.kernel_rows, |n| n == name)?;
+                    plan.kernel_rows, |n| n == name, weights_arena)?;
                 let layout = cuteafd_loader::formats::head::native_private_scratch(
                     plan.layout.core[name].shape, plan.kernel_rows)?;
                 let linear = std::rc::Rc::try_unwrap(layer.linears.remove(name).context("native head")?)
