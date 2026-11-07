@@ -354,6 +354,12 @@ report). Missing/empty reports, timeouts and moved HEADs fail closed, including
 with `--base`. Report failing test IDs, not merely exit codes or counts. Commit
 before starting the gate; never move HEAD during it.
 
+Keep maxq busy (TJ, 2026-11-07). Raptor (32 cores) carries cards, seals and
+most agents, and maxq (12 cores) is often idle. When maxq has no CPU gate
+running, run the next gate there, from a worktree at the pushed commit,
+with `~/.cache/cuteafd/gate-venv` linked as `.venv`; otherwise use raptor.
+Don't move all work to maxq.
+
 ## Running agents
 
 - Workers update current state with `scripts/dev/pr-sync push` at checkpoints
