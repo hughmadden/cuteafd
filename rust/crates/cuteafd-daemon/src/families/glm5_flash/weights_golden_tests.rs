@@ -203,7 +203,8 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
             dense: load.clone() };
         let loader = GlmfLoader { arenas: target_arenas(&loader, &cfg, &[kda, mla, dense])?, ..loader };
         let mut operands = Vec::new();
-        for layer in [kda, mla, dense] {
+        // The first KDA layer can also be the dense layer; load each final view once.
+        for layer in std::collections::BTreeSet::from([kda, mla, dense]) {
             if gpus == 2 {
                 let variant = if oshard { ".oshard" } else { "" };
                 for (rank, share) in loader.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.into_iter().enumerate() {
