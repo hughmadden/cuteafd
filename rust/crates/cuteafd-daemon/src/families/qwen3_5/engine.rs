@@ -137,7 +137,7 @@ impl<'a> DenseEngine<'a> {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
         let reader = WeightReader { library, checkpoint };
-        let format = super::weights::DenseFormat::detect(&reader)?;
+        let format = super::weights::DenseFormat::detect(checkpoint)?;
         let admitted = DensePrograms::new(&cfg, programs, kv_format, format)?;
         let weight_bytes = NativeWeights::native(checkpoint, &cfg, admitted.norm_dtype.clone())?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;

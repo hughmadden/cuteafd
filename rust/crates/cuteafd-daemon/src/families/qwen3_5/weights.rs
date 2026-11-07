@@ -4,10 +4,17 @@ use crate::shared::qwen::weights::WeightReader;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::families::qwen::HybridAttention;
-use cuteafd_loader::families::qwen3_5::Qwen35Config;
+use cuteafd_loader::{families::qwen3_5::Qwen35Config, plan::checkpoint::Checkpoint,
+    serving_capacity::WeightArenaLayout};
 use std::{collections::HashMap, ffi::c_void};
 
 const PREFIX: &str = "model.language_model.";
+
+use cuteafd_loader::families::qwen3_5::weight_layout::{layer_requests, native_operands,
+    validate_native_matrices, Storage};
+pub(crate) use cuteafd_loader::families::qwen3_5::weight_layout::DenseFormat;
+#[cfg(test)]
+use cuteafd_loader::families::qwen3_5::weight_layout::{layer_operands, mtp_arena, target_arena};
 
 pub(crate) struct DenseLayer<'a> {
     pub(crate) attention: HybridAttention,
@@ -28,108 +35,6 @@ pub(crate) struct DenseWeights<'a> {
     pub(crate) layers: Vec<DenseLayer<'a>>,
     pub(crate) norm: Allocation<'a>,
     pub(crate) head: Allocation<'a>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Storage { Bf16, F32, NativeNorm, Fp8, Scales }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DenseFormat { Bf16, Fp8 }
-
-impl DenseFormat {
-    pub(crate) fn detect(reader: &WeightReader<'_>) -> Result<Self> {
-        match reader.tensor(&format!("{PREFIX}layers.0.mlp.gate_proj.weight"))?.meta.dtype {
-            DType::Bf16 => Ok(Self::Bf16),
-            DType::F8E4M3 => Ok(Self::Fp8),
-            ref dtype => anyhow::bail!("unsupported dense projection format {dtype:?}"),
-        }
-    }
-
-    pub(crate) fn fp8(self) -> bool { self == Self::Fp8 }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Operand {
-    name: &'static str,
-    tensors: Vec<String>,
-    storage: Storage,
-}
-
-fn layer_operands(prefix: &str, attention: HybridAttention) -> Vec<Operand> {
-    let mut out = Vec::new();
-    let mut add = |name, tensors: &[&str], storage| out.push(Operand { name,
-        tensors: tensors.iter().map(|t| format!("{prefix}.{t}")).collect(), storage });
-    for (operand, tensor) in [("attn.norm", "input_layernorm.weight"), ("ffn.norm", "post_attention_layernorm.weight"),
-        ("ffn.w_down", "mlp.down_proj.weight")] {
-        add(operand, &[tensor], Storage::Bf16);
-    }
-    add("ffn.w_gate_up", &["mlp.gate_proj.weight", "mlp.up_proj.weight"], Storage::Bf16);
-    match attention {
-        HybridAttention::Gdn => {
-            add("w_in", &["linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight",
-                "linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight"], Storage::Bf16);
-            for (operand, tensor) in [("conv_w", "conv1d.weight"), ("a_log", "A_log"), ("dt_bias", "dt_bias")] {
-                add(operand, &[&format!("linear_attn.{tensor}")], Storage::F32);
-            }
-            add("norm_w", &["linear_attn.norm.weight"], Storage::NativeNorm);
-            add("w_out", &["linear_attn.out_proj.weight"], Storage::Bf16);
-        }
-        HybridAttention::Full => {
-            add("w_in", &["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"], Storage::Bf16);
-            for (operand, tensor) in [("q_norm", "q_norm.weight"), ("k_norm", "k_norm.weight"), ("w_o", "o_proj.weight")] {
-                add(operand, &[&format!("self_attn.{tensor}")], Storage::Bf16);
-            }
-        }
-    }
-    out
-}
-
-fn native_operands(prefix: &str, attention: HybridAttention, format: DenseFormat) -> Vec<Operand> {
-    let specs = layer_operands(prefix, attention);
-    if !format.fp8() { return specs; }
-    let mut out = Vec::new();
-    for mut spec in specs {
-        let projection = matches!(spec.name, "w_in" | "w_out" | "w_o" | "ffn.w_gate_up" | "ffn.w_down");
-        if !projection { out.push(spec); continue; }
-        if attention == HybridAttention::Gdn && spec.name == "w_in" {
-            let gates = spec.tensors.split_off(2);
-            out.push(Operand { name: "w_ba", tensors: gates, storage: Storage::Bf16 });
-        }
-        let (weight, scales) = match spec.name {
-            "w_in" if attention == HybridAttention::Gdn => ("w_qkvz_fp8", "w_qkvz_scale"),
-            "w_in" => ("w_in_fp8", "w_in_scale"),
-            "w_out" => ("w_out_fp8", "w_out_scale"),
-            "w_o" => ("w_o_fp8", "w_o_scale"),
-            "ffn.w_gate_up" => ("ffn.w_gate_up_fp8", "ffn.w_gate_up_scale"),
-            "ffn.w_down" => ("ffn.w_down_fp8", "ffn.w_down_scale"),
-            _ => unreachable!(),
-        };
-        out.push(Operand { name: scales, tensors: spec.tensors.iter()
-            .map(|name| format!("{}_scale_inv", name)).collect(), storage: Storage::Scales });
-        out.push(Operand { name: weight, tensors: spec.tensors, storage: Storage::Fp8 });
-    }
-    out
-}
-
-fn validate_native_matrices<'t>(tensors: impl IntoIterator<Item = (&'t DType, &'t [usize], u64)>,
-    storage: Storage) -> Result<()> {
-    let mut cols = None;
-    for (dtype, shape, bytes) in tensors {
-        ensure!(shape.len() == 2 && shape[0] > 0 && shape[1] > 0, "native projection requires nonempty matrices");
-        ensure!(cols.is_none_or(|previous| previous == shape[1]), "native packed matrix columns differ");
-        cols = Some(shape[1]);
-        let width = match (storage, dtype) {
-            (Storage::Fp8, DType::F8E4M3) => 1,
-            (Storage::Scales, DType::Bf16) => 2,
-            (Storage::Scales, DType::F32) => 4,
-            _ => anyhow::bail!("native matrix dtype disagrees with operand storage"),
-        };
-        let size = shape[0].checked_mul(shape[1]).and_then(|n| n.checked_mul(width))
-            .context("native matrix byte size overflow")?;
-        ensure!(u64::try_from(size)? == bytes, "native matrix payload disagrees with shape");
-    }
-    ensure!(cols.is_some(), "empty native matrix packing");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -164,19 +69,8 @@ impl<'a> WeightReader<'a> {
     }
 
     pub(crate) fn dense_layer_bytes(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<u64> {
-        native_operands(prefix, attention, format).into_iter().try_fold(0u64, |total, spec| {
-            let bytes = spec.tensors.iter().try_fold(0u64, |bytes, name| {
-                let tensor = &self.tensor(name)?.meta;
-                ensure!(match spec.storage {
-                    Storage::Bf16 => tensor.dtype == DType::Bf16,
-                    Storage::F32 | Storage::Scales => matches!(tensor.dtype, DType::Bf16 | DType::F32),
-                    Storage::Fp8 => tensor.dtype == DType::F8E4M3,
-                    Storage::NativeNorm => matches!(tensor.dtype, DType::Bf16 | DType::F32),
-                }, "{name}: native dense operand dtype differs from admitted projection format");
-                let widen = matches!(spec.storage, Storage::F32 | Storage::Scales) && tensor.dtype == DType::Bf16;
-                Ok::<_, anyhow::Error>(bytes + tensor.byte_length * if widen { 2 } else { 1 })
-            })?;
-            Ok(total + bytes.max(256))
+        layer_requests(self.checkpoint, prefix, attention, format)?.into_iter().try_fold(0u64, |total, (_, bytes)| {
+            total.checked_add(u64::try_from(bytes)?).context("dense Qwen layer size overflow")
         })
     }
 
@@ -204,6 +98,123 @@ impl<'a> WeightReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture(format: DenseFormat, tied_embeddings: bool) -> (Checkpoint, Qwen35Config) {
+        use cuteafd_loader::{families::qwen::{GdnGeometry, GdnOutputGate}, plan::checkpoint::CheckpointTensor,
+            SafetensorsTensorMetadata};
+        let cfg = Qwen35Config { hidden: 128, intermediate: 128, vocab: 128,
+            attention: vec![HybridAttention::Gdn, HybridAttention::Full], heads: 1, kv_heads: 1, head_dim: 256,
+            gdn: GdnGeometry { key_heads: 1, value_heads: 1, key_dim: 128, value_dim: 128,
+                conv_kernel: 4, output_gate: GdnOutputGate::Silu }, rope_dim: 64, rope_theta: 1e7,
+            rms_norm_eps: 1e-6, max_context: 4096, mtp_layers: 1, tied_embeddings };
+        let mut tensors = std::collections::BTreeMap::new();
+        let mut add = |name: String, dtype: DType, shape: Vec<usize>| {
+            let width = match dtype { DType::F8E4M3 => 1, DType::F32 => 4, _ => 2 };
+            let byte_length = (shape.iter().product::<usize>() * width) as u64;
+            tensors.insert(name.clone(), CheckpointTensor { shard: "model.safetensors".into(),
+                meta: SafetensorsTensorMetadata { name, dtype, shape, byte_offset: 0, byte_length } });
+        };
+        for (prefix, kind) in [(format!("{PREFIX}layers.0"), HybridAttention::Gdn),
+            (format!("{PREFIX}layers.1"), HybridAttention::Full), ("mtp.layers.0".into(), HybridAttention::Full)] {
+            for spec in native_operands(&prefix, kind, format) {
+                for name in spec.tensors {
+                    let (dtype, shape) = match spec.storage {
+                        Storage::Fp8 => (DType::F8E4M3, vec![128, 128]),
+                        Storage::Scales => (DType::Bf16, vec![1, 1]),
+                        Storage::F32 | Storage::NativeNorm => (DType::Bf16, vec![1]),
+                        Storage::Bf16 => (DType::Bf16, vec![128, 128]),
+                    };
+                    add(name, dtype, shape);
+                }
+            }
+        }
+        for name in [format!("{PREFIX}embed_tokens.weight"), "lm_head.weight".into()] {
+            add(name, DType::Bf16, vec![128, 128]);
+        }
+        add(format!("{PREFIX}norm.weight"), DType::Bf16, vec![128]);
+        for name in ["norm", "pre_fc_norm_hidden", "pre_fc_norm_embedding"] {
+            add(format!("mtp.{name}.weight"), DType::Bf16, vec![128]);
+        }
+        add("mtp.fc.weight".into(), DType::Bf16, vec![128, 256]);
+        (Checkpoint { view: None, snapshot: Default::default(), config: serde_json::json!({}), quantize_config: None,
+            weight_map: Default::default(), tensors: tensors.into_values().collect(), missing_shards: vec![], shard_bytes: 0 }, cfg)
+    }
+
+    fn check_layout(layout: &WeightArenaLayout) {
+        let mut views = layout.views().values().copied().collect::<Vec<_>>();
+        views.sort_by_key(|view| view.offset());
+        let mut end = 0;
+        for view in views {
+            assert_eq!(view.offset() % 256, 0);
+            assert!(view.offset() >= end);
+            assert!(view.bytes() >= 256);
+            end = view.offset() + view.bytes();
+        }
+        assert_eq!(end, layout.bytes());
+        assert_eq!(layout.bytes(), layout.payload_bytes() + layout.padding_bytes());
+    }
+
+    #[test]
+    fn arena_layouts_preserve_native_formats_floor_and_separate_mtp_ownership() -> Result<()> {
+        for format in [DenseFormat::Bf16, DenseFormat::Fp8] {
+            for tied in [false, true] {
+                let (mut checkpoint, cfg) = fixture(format, tied);
+                let target = target_arena(&checkpoint, &cfg, DType::Bf16, format)?;
+                let mtp = mtp_arena(&checkpoint, &cfg, format)?;
+                check_layout(&target);
+                check_layout(&mtp);
+                assert_ne!(target.id(), mtp.id());
+                assert_eq!(target.views().len(), if format.fp8() { 30 } else { 21 });
+                assert_eq!(mtp.views().len(), if format.fp8() { 16 } else { 12 });
+                assert!(target.views().keys().all(|name| !name.starts_with("mtp.")));
+                assert!(mtp.views().keys().all(|name| name.starts_with("mtp.")));
+                assert_eq!(target.view("embedding.table").unwrap().bytes(), 32768);
+                assert_eq!(target.view("head.weight").unwrap().bytes(), 32768);
+                let p = format!("{PREFIX}layers.0");
+                assert_eq!(target.view(&format!("{p}/a_log")).unwrap().bytes(), 256);
+                if format.fp8() {
+                    assert_eq!(target.view(&format!("{p}/w_qkvz_scale")).unwrap().bytes(), 256);
+                    assert!(target.view(&format!("{p}/w_in")).is_none());
+                    for tensor in &mut checkpoint.tensors {
+                        if tensor.meta.name.ends_with("weight_scale_inv") {
+                            tensor.meta.dtype = DType::F32;
+                            tensor.meta.byte_length *= 2;
+                        }
+                    }
+                    assert_eq!(target_arena(&checkpoint, &cfg, DType::Bf16, format)?, target);
+                    assert_eq!(mtp_arena(&checkpoint, &cfg, format)?, mtp);
+                }
+                checkpoint.tensors.retain(|t| !t.meta.name.ends_with("linear_attn.A_log"));
+                assert!(target_arena(&checkpoint, &cfg, DType::Bf16, format).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads installed checkpoint headers; set CUTEAFD_QWEN_DENSE_ARENA_SNAPSHOT"]
+    fn installed_arena_inventory() -> Result<()> {
+        let snapshot = std::env::var("CUTEAFD_QWEN_DENSE_ARENA_SNAPSHOT")?;
+        let checkpoint = Checkpoint::open(std::path::Path::new(&snapshot))?;
+        let cfg = Qwen35Config::from_hf(&checkpoint.config)?;
+        let gate = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}layers.0.mlp.gate_proj.weight"))
+            .context("missing first gate")?;
+        let format = if gate.meta.dtype == DType::F8E4M3 { DenseFormat::Fp8 } else { DenseFormat::Bf16 };
+        let norm = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}layers.0.linear_attn.norm.weight"))
+            .context("missing GDN norm")?.meta.dtype.clone();
+        let mut layouts = vec![target_arena(&checkpoint, &cfg, norm, format)?];
+        if cfg.mtp_layers == 1 { layouts.push(mtp_arena(&checkpoint, &cfg, format)?); }
+        for layout in layouts {
+            check_layout(&layout);
+            let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
+            let slack = |bytes: usize| bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+            println!("{}: allocations={} payload={} large_count={} large_bytes={} before_slack={} arena={} padding={} tail={}",
+                layout.id(), layout.views().len(), layout.payload_bytes(), large.len(),
+                large.iter().map(|v| v.bytes()).sum::<usize>(), large.iter().map(|v| slack(v.bytes())).sum::<usize>(),
+                layout.bytes(), layout.padding_bytes(), slack(layout.bytes()));
+        }
+        Ok(())
+    }
 
     #[test]
     fn fp8_operands_keep_raw_weight_bytes_exact_scales_and_bf16_gates() -> Result<()> {
