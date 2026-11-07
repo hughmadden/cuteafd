@@ -2384,7 +2384,7 @@ impl Opened {
                 .then(|| embed.as_ref().context("Flash embedding source").and_then(|source|
                     source.allocation_request("embedding.table", cuteafd_loader::placement::planner::EmbeddingHome::Device(embedding_rank as u8))))
                 .transpose()?.map(|request| (embedding_rank, request.bytes as usize));
-            weight_layout::target(&self.checkpoint, &self.cfg, &execution, gpus, args.kda_fp8,
+            weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8,
                 args.kda_output_shard, args.fp8_head, embedding)?
         };
         let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {

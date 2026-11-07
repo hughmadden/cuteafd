@@ -3,15 +3,15 @@ use super::{weights::PREFIX, fp8::KdaFp8};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::{families::glm5_flash::{GlmNextAttention, GlmNextConfig, core::CoreInventory},
-    placement::{LayerExecutionPlan, LayerMode}, plan::Checkpoint, serving_capacity::WeightArenaLayout};
+    placement::LayerMode, plan::Checkpoint, serving_capacity::WeightArenaLayout};
 use std::collections::BTreeMap;
 
 pub(super) fn joined(names: &[String]) -> String { names.join("+") }
 
-pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, plan: &LayerExecutionPlan,
+pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
     ranks: usize, kda_fp8: KdaFp8, output_shard: bool, fp8_head: bool,
     embedding: Option<(usize, usize)>) -> Result<Vec<WeightArenaLayout>> {
-    ensure!(matches!(ranks, 1 | 2) && plan.modes().len() <= cfg.layers, "Flash arena rank/layer extent");
+    ensure!(matches!(ranks, 1 | 2) && modes.len() <= cfg.layers, "Flash arena rank/layer extent");
     let core = CoreInventory::from_checkpoint(cfg, checkpoint)?;
     let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
         .with_context(|| format!("Flash arena missing {name}"));
@@ -53,7 +53,7 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, plan: &LayerE
         for (name, bytes) in layout.arena_tensors(&layout.stem)? { insert(&mut requests[0], name, bytes)?; }
     } else if fp8_head { fp8(&mut requests[0], vec!["lm_head.weight".into()], 1, true)?; }
     else { one(&mut requests[0], "lm_head.weight".into())?; }
-    for (layer, &mode) in plan.modes().iter().enumerate() {
+    for (layer, &mode) in modes.iter().enumerate() {
         let p = format!("{PREFIX}layers.{layer}");
         let a = |leaf: &str| format!("{p}.self_attn.{leaf}");
         let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(usize::from(gpu)), _ => None };
