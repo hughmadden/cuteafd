@@ -663,7 +663,7 @@ impl SparkAssignment {
                     slice.stored_width = u32::try_from(stored_width)?;
                     let planes = crate::push_load::native::NativePlanes::with_scale_codes(
                         geometry.hidden as usize, width, stored_width, geometry.experts as usize,
-                        catalog.nvfp4().is_some(), catalog.mxfp4_scale_codes())?;
+                        catalog.nvfp4().is_some(), catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes())?;
                     planes.planes.into_iter().chain(planes.vectors)
                         .filter_map(|(_, bytes)| (bytes > 0).then_some(bytes)).collect()
                 }
