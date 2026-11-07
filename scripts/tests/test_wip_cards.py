@@ -3107,6 +3107,7 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
     assert cards.observer_teardown_budget(job) == pytest.approx(3.5)
     hook_wait_s = 0.5
     job['entry']['observer']['finish_timeout_s'] = hook_wait_s
+    job['entry']['sparks'] = []  # This test isolates coordinator sampler teardown.
     budget_s = cards.observer_teardown_budget(job)
     assert 0.1 <= budget_s < hook_wait_s
     stop = tmp_path / 'observer.stop'
@@ -3353,3 +3354,111 @@ def test_unequal_v41_world_needs_its_own_attested_role(attested, refused):
     # A slot with no role manifest at all is refused too (the #1105 shape).
     missing = cards.tp_role_problems('kiwi', 's', 'tp7', False, dict(tp_roles=None))
     assert missing and 'has no V41_EXPERT_TP_AOT.json' in missing[0]
+
+
+@pytest.mark.parametrize('phase,gauges,active,expected', [
+    ('starting', {}, None, 'loading'),
+    ('ready', {'prefilling_n': 1, 'active': 1}, None, 'prefill'),
+    ('ready', {'active': 2}, None, 'decode'),
+    ('ready', {}, {'panel': 'baseline'}, 'panel:baseline'),
+    ('ready', {}, None, 'ready-idle'),
+])
+def test_spark_memory_phase(monkeypatch, phase, gauges, active, expected):
+    def http(url, path, **kwargs):
+        assert kwargs['timeout'] == .5
+        return ({'starting': phase == 'starting', 'g': gauges} if path.endswith('snapshot')
+                else {'active': active})
+    monkeypatch.setattr(cards, 'http', http)
+    assert cards.spark_memory_phase('http://localhost') == expected
+
+
+def test_spark_memory_stream_has_bytes_no_cuda_and_stops_on_eof():
+    command = cards.spark_memory_command(2, 'emu', 5)
+    assert command[:2] == ['ssh', '-T'] and 'ConnectTimeout=5' in command
+    assert 'cuda' not in cards.SPARK_MEMORY_SAMPLER.lower()
+    child = subprocess.Popen([sys.executable, '-I', '-u', '-c', cards.SPARK_MEMORY_SAMPLER,
+                              '2', 'emu', '5'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    try:
+        first = json.loads(child.stdout.readline())
+        assert first['rank'] == 2 and first['host'] == 'emu'
+        assert first['phase'] == 'loading'
+        assert set(first['mem']) == {'MemAvailable', 'MemFree', 'Cached', 'SReclaimable',
+            'AnonPages', 'PageTables', 'SecPageTables', 'Slab', 'VmallocUsed'}
+        assert first['mem']['MemAvailable'] > 0
+        assert all(value is None or value % 1024 == 0 for value in first['mem'].values())
+        child.stdin.write('{"phase":')
+        child.stdin.flush()
+        child.stdout.readline()  # Partial control frames cannot abort the sampler.
+        child.stdin.write('"decode"}\n')
+        child.stdin.flush()
+        for _ in range(10):
+            if json.loads(child.stdout.readline())['phase'] == 'decode':
+                break
+        else:
+            pytest.fail('phase update never reached sampler')
+        child.stdin.close()
+        assert child.wait(timeout=2) == 0, child.stderr.read()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+
+
+def test_spark_memory_report_rank_phase_minima(tmp_path):
+    records = [dict(time=i, rank=0, host='ostrich', phase=phase,
+                    mem={'MemAvailable': available, 'Cached': cached, 'SecPageTables': None})
+               for i, (phase, available, cached) in enumerate([
+                   ('loading', 3000, 100), ('decode', 2000, 50), ('decode', 2500, 200)])]
+    (tmp_path / 'memory-spark-rank0.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
+    rank = cards.spark_memory_report(tmp_path)['0']
+    assert rank['samples'] == 3 and rank['min_mem_available_bytes'] == 2000
+    assert rank['phases']['loading']['min_mem_available_bytes'] == 3000
+    assert rank['phases']['decode'] == dict(samples=2, min_mem_available_bytes=2000,
+                                          peak_bytes={'MemAvailable': 2500, 'Cached': 200})
+
+
+def test_spark_memory_guard_only_triggers_below_threshold(tmp_path, monkeypatch):
+    from io import StringIO
+    stopped = []
+    monkeypatch.setattr(cards, 'stop_memory_worker', lambda job, host: stopped.append(host))
+    threshold = 512 * 1024 * 1024
+    for margin, enabled, expected in [(threshold, threshold, False), (1, 0, False), (1, threshold, True)]:
+        sample = dict(rank=0, host='ostrich', phase='decode', mem={'MemAvailable': margin})
+        output, errors = StringIO(), []
+        child = SimpleNamespace(stdout=StringIO(json.dumps(sample) + '\n'))
+        cards.spark_memory_read(child, output, enabled, {}, 0, 'ostrich', errors)
+        assert bool(errors) == expected
+        assert bool(json.loads(output.getvalue()).get('guard')) == expected
+    assert stopped == ['ostrich']
+
+
+def test_spark_guard_checks_exact_owned_worker_mount(entry, tmp_path, monkeypatch):
+    import shlex
+    job = make(entry, tmp_path)
+    commands = []
+    monkeypatch.setattr(cards, 'run', lambda cmd, **kwargs: commands.append(cmd))
+    cards.stop_memory_worker(job, 'ostrich')
+    argv = shlex.split(commands[0][-1])
+    program, name, layout = argv[-3:]
+    assert name == 'cuteafd-spark-expert-ostrich-' + job['entry']['set']['EXPERT_PORT']
+    assert layout.endswith('/serve-' + job['entry']['set']['INSTANCE'] + '/bin')
+    real_run = subprocess.run
+    for owned in (False, True):
+        stopped = []
+        info = dict(Id='immutable-card-id', Mounts=[dict(Destination='/opt/cuteafd/bin',
+                    Source='/home/tj' + layout if owned else '/foreign/bin')])
+        def fake_run(cmd, **kwargs):
+            if cmd[1] == 'inspect':
+                return SimpleNamespace(returncode=0, stdout=json.dumps([info]))
+            stopped.append(cmd)
+        monkeypatch.setattr(subprocess, 'run', fake_run)
+        monkeypatch.setattr(sys, 'argv', ['guard', name, layout])
+        if owned:
+            exec(program, {})
+            assert stopped == [['docker', 'stop', '-t', '1', 'immutable-card-id']]
+        else:
+            with pytest.raises(RuntimeError, match='refusing foreign card worker'):
+                exec(program, {})
+            assert not stopped
+    monkeypatch.setattr(subprocess, 'run', real_run)

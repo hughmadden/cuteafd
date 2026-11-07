@@ -57,7 +57,7 @@ struct MissingGlmExl3Input;
 
 #[test]
 fn installed_glm_local_physical_equals_serving() -> Result<()> {
-    let manifest = std::env::var_os("CUTEAFD_PLAN_WORKSPACE_MANIFEST").map(PathBuf::from)
+    let manifest = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME"))
             .join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
     installed_local_physical_equals_serving(true, manifest,
