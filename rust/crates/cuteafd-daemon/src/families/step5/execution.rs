@@ -163,7 +163,8 @@ impl<'a> NativeOwners<'a> {
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes)?;
                 let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout)
                     .map(Rc::new)).transpose()?;
-                let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
+                let rope = Rc::new(TargetTables::load_in(device, programs, &contract, super::weights::ROPE_PREFIX,
+                    available[rank], &[], Some(&weight_arenas[rank]))?);
                 tables.push(rope.clone());
                 for layer in 0..count {
                     if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
@@ -474,7 +475,8 @@ impl<'e, 'a> Execution<'e, 'a> {
             Some(arenas) => arenas,
             None => {
                 owned = devices.iter().enumerate().map(|(rank, &device)| DeviceWeightArena::new(device,
-                    super::weights::target_arena(&plan.layouts[rank], device.id, count, false)?))
+                    super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
+                        device.id, count, false)?))
                     .collect::<Result<Vec<_>>>()?;
                 &owned
             }
@@ -519,6 +521,9 @@ impl<'a> LoadedNative<'a> {
         }
         if let Some(head) = &self.0.head {
             head.inventory(inventory, &format!("device.{}.head", head.device().id))?;
+        }
+        for (rank, rope) in self.0.rope.iter().enumerate() {
+            rope.inventory(inventory, &format!("gpu.{rank}"))?;
         }
         Ok(())
     }

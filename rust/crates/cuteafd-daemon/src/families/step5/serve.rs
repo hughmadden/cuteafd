@@ -420,7 +420,8 @@ fn with_backend<T>(args: &ServeArgs,
     let entry = usize::from(ownership.execution().spec().entry_gpu);
     let weight_arenas = devices.iter().enumerate().map(|(rank, &device)|
         crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
-            super::weights::target_arena(&native_plan.layouts[rank], device.id, 92, rank == entry)?))
+            super::weights::target_arena(&native_plan.layouts[rank], Some(&native_plan.contract.rope_tables),
+                device.id, 92, rank == entry)?))
         .collect::<Result<Vec<_>>>()?;
     let load = || TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
         let native = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
