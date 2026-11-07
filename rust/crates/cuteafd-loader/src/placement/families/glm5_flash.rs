@@ -224,6 +224,21 @@ pub struct GlmfInputs<'a> {
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
     pub full_prefill_logits: u64,
+    /// A static GPU expert tier on GPU 0 beside Spark experts (`--expert-tier`): no whole RTX
+    /// layers then, and its bytes are charged before the pool.
+    pub expert_tier: Option<GlmfTierCharge>,
+}
+
+/// The coordinator bytes of a GPU expert tier: its package workspace (the whole-layer package's
+/// arena at the same rows) and its resident experts' exact subset arenas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlmfTierCharge {
+    pub workspace: u64,
+    pub resident: u64,
+}
+
+impl GlmfTierCharge {
+    pub fn bytes(self) -> u64 { self.workspace.saturating_add(self.resident) }
 }
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
@@ -650,6 +665,7 @@ pub(crate) mod tests {
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30, drafter_weights: ResidentWeights(2 << 30),
             drafter_scratch: vec![0; ranks], drafter_bridge: None, requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+            expert_tier: None,
         }
     }
 
@@ -1223,6 +1239,46 @@ pub(crate) mod tests {
             assert_ne!(forged, selected.working);
             assert!(forged.validate(&selected.placement).is_ok());
         }
+    }
+
+    #[test]
+    fn a_gpu_expert_tier_replaces_whole_layers_with_the_same_bytes_and_keeps_every_layer_on_sparks() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        let mut input = inputs(&cfg, 1, inventory::PRO_TOTAL_BYTES);
+        input.graphs = GraphSet::budget(&[64 << 20]);
+        let (whole, _, _) = admitted_case(&input, false, 188, true, None).unwrap();
+        assert!(whole.onboard_layers > 0, "the fixture onboards whole layers by default");
+        let arena = whole.expert_ranges[0].peak_bytes;
+        assert_eq!(arena, input.expert_workspace + whole.onboard_layers as u64 * (2 << 30));
+        // The tier spends exactly the auto onboarding's arena.
+        let tier = GlmfTierCharge { workspace: input.expert_workspace, resident: arena - input.expert_workspace };
+        input.expert_tier = Some(tier);
+        for onboard in [Onboard::Auto, Onboard::Layers(0)] {
+            input.onboard = onboard;
+            let (placed, _, working) = admitted_case(&input, false, 188, true, None).unwrap();
+            assert_eq!((placed.onboard_layers, working.rtx_layers.len()), (0, 0));
+            assert_eq!(working.spark_layers.len(), input.experts.len());
+            assert!(placed.layers.iter().all(|layer| matches!(layer.experts, ExpertHome::Spark | ExpertHome::Dense)));
+            let charged: u64 = placed.items[0].iter().filter(|item| item.group == "GPU expert tier").map(|item| item.bytes).sum();
+            assert_eq!(charged, tier.bytes());
+            assert!(!placed.items[0].iter().any(|item| item.group == "RTX expert arena" && item.bytes > 0));
+            assert_eq!(placed.pool_tokens, whole.pool_tokens, "the same bytes leave the same pool");
+        }
+        // A larger tier takes from the pool; refusals keep the tier single-GPU, Spark-backed, layer-free.
+        input.expert_tier = Some(GlmfTierCharge { resident: tier.resident + (8 << 30), ..tier });
+        input.onboard = Onboard::Layers(0);
+        let (larger, _, _) = admitted_case(&input, false, 188, true, None).unwrap();
+        assert!(larger.pool_tokens < whole.pool_tokens);
+        input.expert_tier = Some(tier);
+        input.onboard = Onboard::Layers(1);
+        assert!(admitted_case(&input, false, 188, true, None).is_err());
+        input.onboard = Onboard::Layers(0);
+        input.spark_ranks = 0;
+        assert!(admitted_case(&input, false, 188, true, None).is_err());
+        let mut split = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
+        split.graphs = GraphSet::budget(&[64 << 20; 2]);
+        split.expert_tier = Some(tier);
+        assert!(admitted_case(&split, false, 188, true, None).is_err());
     }
 
     #[test]

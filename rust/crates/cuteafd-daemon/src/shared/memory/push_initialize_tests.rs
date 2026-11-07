@@ -217,6 +217,7 @@ fn exl3_semantics_reject_nonfinite_and_upload_exact_descriptors() -> Result<()> 
         tiers: vec![4],
         projection_counts: vec![[1; 3]],
         unit_map: None,
+        selected: None,
         buffers: vec![
             V41Exl3ResidentBuffer {
                 name: "rotation".into(),

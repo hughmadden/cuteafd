@@ -43,11 +43,20 @@ pub struct V41Exl3Residency {
     /// Present only for compact runtime-width storage; legacy even splits stay unchanged.
     #[serde(skip)]
     pub unit_map: Option<cuteafd_core::tp_units::RankUnits>,
+    /// A GPU expert tier's resident global expert ids in slot order ([`V41Exl3Manifest::subset_residency`]);
+    /// None: every expert at its own id. `experts` stays the layer's full route namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<Vec<usize>>,
     pub buffers: Vec<V41Exl3ResidentBuffer>,
     pub loads: Vec<V41Exl3Load>,
 }
 
 impl V41Exl3Residency {
+    /// Experts with resident storage and load jobs: the selected subset, or every expert.
+    pub fn loaded_experts(&self) -> usize {
+        self.selected.as_ref().map_or(self.experts, Vec::len)
+    }
+
     /// Installed code follows the storage contract, not a directory-name guess.
     pub fn aot_layout(&self) -> String {
         let compact = if self.unit_map.is_some() { "-compact" } else { "" };
@@ -339,6 +348,59 @@ impl V41Exl3Manifest {
         world: usize,
         rank: usize,
     ) -> Result<V41Exl3Residency> {
+        self.residency_of(layer, world, rank, None)
+    }
+
+    /// A GPU expert tier's whole (world 1) residency of backbone `layer` holding only `experts`
+    /// (strictly increasing global ids), each in the next compact slot. The route namespace and
+    /// the descriptor table keep the layer's full extent, so the unchanged package validates it:
+    /// `global_to_combined` maps a resident expert to its slot and every other one to -1, which
+    /// route packing, rotations and the weighted sum skip. Payload, rotations and load jobs
+    /// cover the selected experts only. Selecting every expert reproduces [`Self::residency`].
+    pub fn subset_residency(&self, layer: usize, experts: &[usize]) -> Result<V41Exl3Residency> {
+        ensure!(layer < self.experts.layers, "EXL3 tier layer {layer} is outside the backbone");
+        ensure!(!experts.is_empty() && experts.windows(2).all(|ids| ids[0] < ids[1])
+            && experts.iter().all(|&expert| expert < self.experts.experts),
+            "EXL3 tier experts of layer {layer} must be strictly increasing ids below {}", self.experts.experts);
+        self.residency_of(V41Exl3Layer::Backbone(layer), 1, 0, Some(experts))
+    }
+
+    /// Exact arena bytes of [`Self::subset_residency`].
+    pub fn subset_arena_bytes(&self, layer: usize, experts: &[usize]) -> Result<u64> {
+        Ok(self.subset_residency(layer, experts)?.device_arena_layout()?.1 as u64)
+    }
+
+    /// Upper bound of one expert's bytes in a tier subset arena: its three projections' payload
+    /// and its rotation rows in every decoder-tier copy.
+    pub fn tier_expert_bytes(&self, layer: usize, expert: usize) -> Result<u64> {
+        ensure!(layer < self.experts.layers && expert < self.experts.experts, "EXL3 tier expert out of range");
+        let (hidden, width) = (self.experts.hidden, self.experts.intermediate);
+        let mut bytes = self.decoder_tiers.len() * (3 * hidden * 2 + 3 * width * 2);
+        for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
+            let p = self.projections.get(&self.naming.projection(false, layer, expert, kind))
+                .context("missing EXL3 tier projection")?;
+            bytes += hidden * width * p.bits / 8;
+        }
+        Ok(bytes as u64)
+    }
+
+    /// Upper bound of a non-empty tier subset arena beyond its experts: the full-namespace
+    /// descriptor, route map and unit scales, every buffer's alignment and 16-byte floor, and
+    /// the arena's 2 MiB page rounding.
+    pub fn tier_layer_bytes(&self) -> Result<u64> {
+        let (experts, tiers) = (self.experts.experts, self.decoder_tiers.len());
+        let buffers = 2 * tiers + 8;
+        let fixed = 3 * experts * tiers * 4 + experts * 4 + 16 + experts * 4;
+        Ok((fixed + buffers * (255 + 16) + (2 << 20)) as u64)
+    }
+
+    fn residency_of(
+        &self,
+        layer: V41Exl3Layer,
+        world: usize,
+        rank: usize,
+        selected: Option<&[usize]>,
+    ) -> Result<V41Exl3Residency> {
         let shape = self.experts;
         let (draft, index, experts) = match layer {
             V41Exl3Layer::Backbone(layer) => {
@@ -356,8 +418,12 @@ impl V41Exl3Manifest {
             (1..=1024).contains(&experts),
             "EXL3 supports 1..1024 routed experts"
         );
-        let mut projections = Vec::with_capacity(experts);
-        for expert in 0..experts {
+        // Slot `s` holds global expert `ids[s]`; the full layout is the identity.
+        let ids: Vec<usize> = selected.map_or_else(|| (0..experts).collect(), <[usize]>::to_vec);
+        ensure!(ids.iter().all(|&id| id < experts), "EXL3 resident expert outside the layer");
+        let slots = ids.len();
+        let mut projections = Vec::with_capacity(slots);
+        for &expert in &ids {
             let mut row = Vec::new();
             for kind in [
                 V41Exl3ProjectionKind::Gate,
@@ -383,10 +449,13 @@ impl V41Exl3Manifest {
         let width = partition.end - partition.start;
         let hidden = shape.hidden;
         let mut counts = vec![[0; 3]; tiers.len()];
+        // The descriptor keeps the full namespace stride; rotations hold one row per slot and copy.
         let stride = experts * tiers.len();
+        let rotation_rows = slots * tiers.len();
         let descriptor_bits = if experts <= 512 { 9 } else { 10 };
         let mut descriptor = vec![-1; 3 * stride];
-        let mut locals = vec![[0; 3]; experts];
+        let mut locals = vec![[0; 3]; slots];
+        // `expert` is the slot: the global id of a subset is `ids[expert]`.
         for (expert, row) in projections.iter().enumerate() {
             for (projection, p) in row.iter().enumerate() {
                 ensure!(
@@ -428,23 +497,24 @@ impl V41Exl3Manifest {
             let w2 = add(format!("tier{tier}_w2"), counts[tier][2] * one, vec![]);
             payload_buffers.push([w13, w2]);
         }
-        let gate = add("gate_suh".into(), stride * hidden * 2, vec![]);
-        let up = add("up_suh".into(), stride * hidden * 2, vec![]);
-        let down = add("down_svh".into(), stride * hidden * 2, vec![]);
+        let gate = add("gate_suh".into(), rotation_rows * hidden * 2, vec![]);
+        let up = add("up_suh".into(), rotation_rows * hidden * 2, vec![]);
+        let down = add("down_svh".into(), rotation_rows * hidden * 2, vec![]);
         let intermediate = add(
             "intermediate_rotations".into(),
-            stride * width * 3 * 2,
+            rotation_rows * width * 3 * 2,
             vec![],
         );
         add("descriptor_map".into(), descriptor.len() * 4, descriptor);
-        add(
-            "global_to_combined".into(),
-            experts * 4,
-            (0..experts as i32).collect(),
-        );
+        let mut combined = vec![-1; experts];
+        for (slot, &id) in ids.iter().enumerate() {
+            combined[id] = i32::try_from(slot)?;
+        }
+        add("global_to_combined".into(), experts * 4, combined);
         add("dummy_scales".into(), 4, vec![0]);
         add("unit_scales".into(), experts * 4, vec![0x3f800000; experts]);
         let mut loads = Vec::new();
+        // `expert` is the slot: the global id of a subset is `ids[expert]`.
         for (expert, row) in projections.iter().enumerate() {
             for (projection, p) in row.iter().enumerate() {
                 let tier = tiers.binary_search(&p.bits).map_err(|_| {
@@ -472,7 +542,7 @@ impl V41Exl3Manifest {
                     };
                     let destinations = (0..tiers.len())
                         .map(|copy| {
-                            let global = copy * experts + expert;
+                            let global = copy * slots + expert;
                             (
                                 buffer,
                                 if is_hidden {
@@ -502,6 +572,7 @@ impl V41Exl3Manifest {
             tiers,
             projection_counts: counts,
             unit_map: None,
+            selected: selected.map(<[usize]>::to_vec),
             buffers,
             loads,
         })
@@ -732,6 +803,82 @@ pub(super) mod tests {
             storage: crate::formats::exl3_storage::Exl3StorageSource::GptqModel,
             resident_bytes: Default::default(),
         }
+    }
+
+    #[test]
+    fn tier_subset_reproduces_the_full_layout_and_maps_only_resident_experts() -> Result<()> {
+        let (experts, hidden, intermediate) = (16, 256, 512);
+        let manifest = fixture_geometry(&[2, 3], hidden, intermediate, experts);
+        let full = manifest.residency(V41Exl3Layer::Backbone(0), 1, 0)?;
+        fn json<T: serde::Serialize>(value: &T) -> serde_json::Value { serde_json::to_value(value).unwrap() }
+        let all: Vec<_> = (0..experts).collect();
+        let same = manifest.subset_residency(0, &all)?;
+        assert_eq!(json(&same.buffers), json(&full.buffers));
+        assert_eq!(json(&same.loads), json(&full.loads));
+        assert_eq!(same.projection_counts, full.projection_counts);
+        assert_eq!(same.device_arena_layout()?, full.device_arena_layout()?);
+        assert_eq!((same.loaded_experts(), full.loaded_experts(), full.selected.as_ref()), (experts, experts, None));
+
+        let picked = [1, 4, 5, 13];
+        let sub = manifest.subset_residency(0, &picked)?;
+        let jobs = full.loads.len() / experts;
+        assert_eq!((sub.experts, sub.loaded_experts(), sub.loads.len()), (experts, picked.len(), picked.len() * jobs));
+        fn buffer<'p>(plan: &'p V41Exl3Residency, name: &str) -> &'p V41Exl3ResidentBuffer {
+            plan.buffers.iter().find(|b| b.name == name).unwrap()
+        }
+        let mut combined = vec![-1; experts];
+        for (slot, &id) in picked.iter().enumerate() { combined[id] = slot as i32; }
+        assert_eq!(buffer(&sub, "global_to_combined").initial_words, combined);
+        assert_eq!(buffer(&full, "global_to_combined").initial_words, (0..experts as i32).collect::<Vec<_>>());
+        // The full namespace keeps the package-validated extents.
+        for name in ["descriptor_map", "unit_scales", "dummy_scales"] {
+            assert_eq!(buffer(&sub, name).bytes, buffer(&full, name).bytes, "{name}");
+        }
+        let tiers = full.tiers.len();
+        let stride = experts * tiers;
+        let (full_map, sub_map) = (&buffer(&full, "descriptor_map").initial_words, &buffer(&sub, "descriptor_map").initial_words);
+        for projection in 0..3 {
+            let mut seen = vec![0; tiers];
+            for (slot, &id) in picked.iter().enumerate() {
+                let tier = full_map[projection * stride + id] >> 9;
+                assert_eq!(sub_map[projection * stride + slot], (tier << 9) | seen[tier as usize]);
+                seen[tier as usize] += 1;
+            }
+            assert!(sub_map[projection * stride + picked.len()..(projection + 1) * stride].iter().all(|&w| w == -1));
+        }
+        for (name, row) in [("gate_suh", hidden * 2), ("up_suh", hidden * 2), ("down_svh", hidden * 2),
+            ("intermediate_rotations", intermediate * 3 * 2)] {
+            assert_eq!(buffer(&sub, name).bytes, picked.len() * tiers * row, "{name}");
+        }
+        for (slot, &id) in picked.iter().enumerate() {
+            for job in 0..jobs {
+                let (a, b) = (&sub.loads[slot * jobs + job], &full.loads[id * jobs + job]);
+                assert_eq!((&a.tensor, a.bytes), (&b.tensor, b.bytes));
+            }
+        }
+        let payload = |plan: &V41Exl3Residency| (0..tiers).map(|t| buffer(plan, &format!("tier{t}_w13")).bytes
+            + buffer(plan, &format!("tier{t}_w2")).bytes).sum::<usize>();
+        let per_expert = |id: usize| (0..3).map(|projection| {
+            let tier = (full_map[projection * stride + id] >> 9) as usize;
+            hidden * intermediate * full.tiers[tier] / 8
+        }).sum::<usize>();
+        assert_eq!(payload(&sub), picked.iter().map(|&id| per_expert(id)).sum::<usize>());
+        assert_eq!(payload(&full), (0..experts).map(per_expert).sum::<usize>());
+        assert_eq!(manifest.subset_arena_bytes(0, &picked)?, sub.device_arena_layout()?.1 as u64);
+        assert!(sub.device_arena_layout()?.1 < full.device_arena_layout()?.1);
+        for bad in [&[][..], &[3, 2], &[2, 2], &[0, experts]] {
+            assert!(manifest.subset_residency(0, bad).is_err(), "{bad:?}");
+        }
+        assert!(manifest.subset_residency(manifest.experts.layers, &[0]).is_err());
+        // The selection's bounds never undercount and overcount by at most one layer's slack.
+        let slack = manifest.tier_layer_bytes()?;
+        for subset in [&[0][..], &[1, 4, 5, 13], &[2, 3, 7, 8, 9, 10, 15], &all[..]] {
+            let exact = manifest.subset_arena_bytes(0, subset)?;
+            let experts = subset.iter().map(|&id| manifest.tier_expert_bytes(0, id)).sum::<Result<u64>>()?;
+            assert!(exact <= experts + slack && experts <= exact, "{subset:?}: {exact} vs {experts} + {slack}");
+        }
+        assert!(manifest.tier_expert_bytes(0, experts).is_err());
+        Ok(())
     }
 
     #[test]

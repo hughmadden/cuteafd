@@ -97,6 +97,8 @@ mod native;
 mod layers;
 #[path = "engine/units.rs"]
 mod units;
+mod tier;
+pub(crate) use tier::ExpertTier;
 pub(crate) use cuteafd_loader::placement::families::glm5_flash::GlmfAttention;
 
 const HC: usize = 4;
@@ -901,6 +903,8 @@ pub(crate) struct StepExperts {
     pub local_fp8: bool,
     pub spark: bool,
     pub tp2: bool,
+    /// A GPU expert tier beside the Spark experts: its `routed` rows on every lane.
+    pub tier: bool,
 }
 
 /// The engine settings a step plan depends on besides its layers and experts.
@@ -963,7 +967,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 lead: true,
                 split,
                 tp2_experts: experts.tp2,
-                local_experts: experts.local_fp8,
+                local_experts: experts.local_fp8 || experts.tier,
                 spark: experts.spark,
                 partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
                 output_shard: settings.kda_output_shard,
@@ -1444,6 +1448,8 @@ pub(crate) struct GlmfEngine<'a> {
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     tp2: Option<Tp2Experts<'a>>,
     local: Option<(Vec<usize>, Experts<'a>)>,
+    /// The static GPU expert tier beside the Spark experts (`--expert-tier`).
+    tier: Option<ExpertTier<'a>>,
     expert_routing: Option<crate::shared::placement::layers::ExpertRouting>,
     /// The drafter (DFlash2 or dSpark): every step taps its target layers.
     pub drafter: Option<super::dspark::Drafter<'a>>,
@@ -1837,7 +1843,7 @@ impl<'a> GlmfEngine<'a> {
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             prefill_slots: RefCell::new(Vec::new()),
-            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
+            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, tier: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
@@ -2318,6 +2324,7 @@ impl<'a> GlmfEngine<'a> {
                 || self.local.as_ref().is_some_and(|(_, e)| matches!(e, Experts::Local(_))),
             spark: matches!(self.experts, Some(Experts::Spark { .. })),
             tp2: self.tp2.is_some(),
+            tier: self.tier.is_some(),
         };
         ensure!(self.step_experts == installed,
             "GLM Flash step expert buffers differ from admission: planned {:?}, installed {installed:?}", self.step_experts);
@@ -5360,11 +5367,16 @@ impl<'a> GlmfEngine<'a> {
                 return Ok(());
             }
             Experts::Spark { transport } => {
-                // The compact reducer adds the shared expert plane to the rank partials.
+                // The compact reducer adds the shared expert plane (with the GPU tier's resident
+                // routes, where it holds any) to the rank partials.
                 let mut transport = transport.borrow_mut();
                 let exchange = transport.exchange()?;
-                let wave = self.spark_send(w, index, t, decode, exchange, None, shared)?;
-                return self.spark_land(w, t, exchange, wave);
+                let wave = self.spark_send(w, index, t, decode, exchange, None, || {
+                    self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
+                    self.tier_run(w, index, t)?;
+                    self.exchange_window(index, decode, false)
+                })?;
+                return self.spark_land(w, index, t, exchange, wave);
             }
         }
         self.run("add", &[("a", w.routed_ptr()?), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
@@ -5453,6 +5465,7 @@ impl<'a> GlmfEngine<'a> {
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
         ensure!(exchange.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", exchange.ranks());
         let audit = self.split_audit && !decode && t >= 256;
+        let tier = self.tier_set(index);
         // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
         // stream order; the copies read them before later stream work.
         let combined_reply = origins.as_ref().map_or_else(|| crate::shared::spark_waves::single_reply_eligible(t, kind),
@@ -5468,6 +5481,8 @@ impl<'a> GlmfEngine<'a> {
                             max_routes = counts.values().max().copied().unwrap_or(0),
                             histogram = %serde_json::to_string(&counts)?, "GLM Flash split audit routes");
                     }
+                    // The GPU tier's resident routes run on the coordinator; the Sparks skip them.
+                    if let Some(tier) = &tier { tier.mark(&mut request)?; }
                     Ok(request)
                 }))?
         };
@@ -5475,15 +5490,16 @@ impl<'a> GlmfEngine<'a> {
         Ok(ticket)
     }
 
-    /// The land half of [`Self::spark_send`]: the stream waits for the wave's
-    /// planes and sums them with the shared expert into `delta`.
-    fn spark_land(&self, w: &Workspace<'_>, t: usize, exchange: &mut crate::shared::spark_waves::Waves<'_>,
+    /// The land half of [`Self::spark_send`] for layer `index`: the stream waits for the wave's
+    /// planes and sums them with the shared expert (and the GPU tier's routes) into `delta`.
+    fn spark_land(&self, w: &Workspace<'_>, index: usize, t: usize, exchange: &mut crate::shared::spark_waves::Waves<'_>,
         wave: crate::shared::spark_waves::WaveTicket) -> Result<()> {
         let slot = wave.slot();
+        let plane = self.tier_plane(w, index)?;
         exchange.land(wave, self.stream)?;
-        // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
+        // SAFETY: the shared (or tier) plane and `delta` are live [t, h] BF16
         // buffers; the slot's planes are ordered after the wave by `land`.
-        unsafe { exchange.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
+        unsafe { exchange.reduce(slot, plane, w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
     /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).

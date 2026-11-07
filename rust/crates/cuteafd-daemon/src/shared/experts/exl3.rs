@@ -89,7 +89,7 @@ pub(crate) fn planned_residency(catalog: &OfficialV41Catalog, layer: ExpertLayer
 
 fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<ExpertLoadBudget> {
     ensure!(
-        plan.loads.len() == plan.experts * JOBS_PER_EXPERT,
+        plan.loads.len() == plan.loaded_experts() * JOBS_PER_EXPERT,
         "EXL3 staging inventory mismatch"
     );
     let staging = plan
@@ -341,7 +341,18 @@ impl<'a> Exl3Weights<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<Self> {
-        let layout = planned_residency(catalog, layer)?;
+        Self::load_layout(library, catalog, planned_residency(catalog, layer)?, available_device_bytes)
+    }
+
+    /// [`Self::load`] of an explicit residency, e.g. a GPU expert tier's resident subset of a
+    /// layer (`V41Exl3Manifest::subset_residency`): only its experts are read and uploaded.
+    pub(crate) fn load_layout(
+        library: &'a NativeLibrary,
+        catalog: &OfficialV41Catalog,
+        layout: V41Exl3Residency,
+        available_device_bytes: usize,
+    ) -> Result<Self> {
+        let layer = layout.layer;
         let budget = budget(catalog, &layout)?;
         ensure!(
             budget.peak_device_bytes()? <= available_device_bytes,
@@ -405,9 +416,10 @@ impl<'a> Exl3Weights<'a> {
         }
         let load_started = std::time::Instant::now();
         let mut storage_bytes_read = 0;
-        for (group, first) in (0..layout.experts).step_by(EXPERT_READ_LANES).enumerate() {
+        let loaded = layout.loaded_experts();
+        for (group, first) in (0..loaded).step_by(EXPERT_READ_LANES).enumerate() {
             let bank = group % BANKS;
-            let count = (layout.experts - first).min(EXPERT_READ_LANES);
+            let count = (loaded - first).min(EXPERT_READ_LANES);
             // Other bank uploads can continue while these CPU readers run.
             unsafe {
                 library.cuda_stream_synchronize(streams[bank].raw)?;

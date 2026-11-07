@@ -525,7 +525,12 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     for &scratch in &i.drafter_scratch {
         i.drafter_bytes.checked_add(scratch).ok_or(p::Refusal::Overflow("Flash draft inventory"))?;
     }
-    let counts = if i.spark_ranks == 0 { vec![routed.len()] }
+    if i.expert_tier.is_some() && (gpus != 1 || i.spark_ranks == 0 || routed.is_empty()
+        || i.onboard.layers(routed.len()).is_some_and(|n| n > 0)) {
+        return Err(invalid("a GPU expert tier runs on one GPU beside Spark experts, without whole RTX expert layers"));
+    }
+    let counts = if i.expert_tier.is_some() { vec![0] }
+        else if i.spark_ranks == 0 { vec![routed.len()] }
         else if let Some(n) = i.onboard.layers(routed.len()) { vec![n] }
         else if rtx_experts { (0..=routed.len()).collect() } else { vec![0] };
     let counts = counts.into_iter().filter(|&count| process.remote_experts || count == routed.len()).collect::<Vec<_>>();
@@ -788,6 +793,10 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 }
             }
         }
+    }
+    if let Some(tier) = i.expert_tier {
+        add_demand(&mut contract, &Demand::new(0, Category::Experts, "GPU expert tier", tier.bytes(), Basis::Exact)
+            .with_resident_weights(ResidentWeights(tier.resident)), "glmf.expert_tier".into(), p::Activation::always())?;
     }
     let mut arena = Vec::new();
     for (option, &count) in counts.iter().enumerate() {

@@ -208,6 +208,8 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` | `200000` | positive int | Dump call cap. |
 | `GLM5_FLASH_ROUTE_RING_CHECK` | `off` | `on`, `off` | Diagnostic router-id copy through the local ring. |
 | `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared`, `own` | GLM Flash replay records (`auto` selects `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`). |
+| `GLM5_FLASH_EXPERT_TIER` | `off` | `off`, absolute route-profile path | Static GPU expert tier ranked from an executed-route census: resident experts of every layer run on the one RTX beside the Spark wave, the Sparks skip them (Spark image with coordinator routes). One RTX with Sparks; `RTX_EXPERT_LAYERS` unset, `auto` or `0`. |
+| `GLM5_FLASH_EXPERT_TIER_BYTES` | `auto` | `auto`, GiB | The tier's RTX bytes, package workspace included; `auto` takes the arena `RTX_EXPERT_LAYERS=auto` would give whole layers. |
 
 ## Media
 
@@ -473,6 +475,8 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_ROUTE_RING_CHECK` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_REPLAY_RECORDS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_EXPERT_TIER` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_EXPERT_TIER_BYTES` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Media** | | | | | | | | | | |
 | `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

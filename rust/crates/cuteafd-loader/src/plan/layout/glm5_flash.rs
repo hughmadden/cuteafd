@@ -375,7 +375,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-            full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
+            full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 },
+            expert_tier: None };
         let host = options.host_memory.map(Ok)
             .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
         let mut process = glmf::admission::ProcessOwners::new(host, (8 << 30).max(host.0 / 10));

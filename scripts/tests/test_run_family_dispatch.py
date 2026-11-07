@@ -2806,6 +2806,42 @@ def test_glmf_exl3_worker_env_rejects_bad_requests_before_launch(tmp_path, keys,
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("budget,forwarded", [("", "auto"), ("GLM5_FLASH_EXPERT_TIER_BYTES=6.5\n", "6.5")])
+def test_glmf_expert_tier_mounts_its_profile_and_reaches_only_the_coordinator(tmp_path, budget, forwarded):
+    """GLM5_FLASH_EXPERT_TIER=PATH reaches the coordinator as --expert-tier PATH with its budget,
+    the profile mounted read-only; Spark workers see neither; unset passes nothing."""
+    profile = tmp_path / "tier" / "coding.json"
+    profile.parent.mkdir()
+    profile.write_text("{}")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                   f"RTX_GPUS=1\nGLM5_FLASH_EXPERT_TIER={profile}\n" + budget)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    coordinator = next(line for line in lines if "cuteafd serve-glmf" in line)
+    assert f"--expert-tier {profile} --expert-tier-bytes {forwarded}" in coordinator, coordinator
+    assert f"-v {profile}:{profile}:ro" in coordinator, coordinator
+    assert not any("--expert-tier" in line for line in lines if "cuteafd expertd-native" in line)
+    plain = _family_launch_result(tmp_path / "off", GLMF_TWO_LAYER, "test/glmf", "RTX_GPUS=1\n")
+    assert plain.returncode == 0 and "--expert-tier" not in plain.stderr, plain.stderr
+
+
+@pytest.mark.parametrize("keys,message", [
+    ("RTX_GPUS=2\nGLM5_FLASH_EXPERT_TIER={profile}\n", "GLM5_FLASH_EXPERT_TIER runs on one RTX"),
+    ("RTX_GPUS=1\nSPARK_COUNT=0\nGLM5_FLASH_EXPERT_TIER={profile}\n", "runs beside Spark experts"),
+    ("RTX_GPUS=1\nRTX_EXPERT_LAYERS=1\nGLM5_FLASH_EXPERT_TIER={profile}\n", "replaces whole RTX expert layers"),
+    ("RTX_GPUS=1\nGLM5_FLASH_EXPERT_TIER=coding.json\n", "must be off or an absolute profile path"),
+    ("RTX_GPUS=1\nGLM5_FLASH_EXPERT_TIER={profile}.absent\n", "readable absolute profile path"),
+    ("RTX_GPUS=1\nGLM5_FLASH_EXPERT_TIER_BYTES=6\n", "GLM5_FLASH_EXPERT_TIER_BYTES sizes a tier"),
+    ("RTX_GPUS=1\nGLM5_FLASH_EXPERT_TIER={profile}\nGLM5_FLASH_EXPERT_TIER_BYTES=lots\n", "must be auto or GiB"),
+])
+def test_glmf_expert_tier_rejects_unsupported_layouts_before_launch(tmp_path, keys, message):
+    profile = tmp_path / "coding.json"
+    profile.write_text("{}")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", keys.format(profile=profile))
+    assert result.returncode == 2 and message in result.stderr, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("keys,compact", [("", False), ("GLM5_FLASH_INDEX_CACHE=keys\n", False),
                                          ("GLM5_FLASH_INDEX_CACHE=compact\n", True)])
 def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact):

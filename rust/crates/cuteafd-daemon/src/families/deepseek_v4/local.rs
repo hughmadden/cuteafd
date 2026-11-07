@@ -428,7 +428,6 @@ impl<'a> LocalExperts<'a> {
         if weights.is_empty() { return Ok(None); }
         let Some((directories, capacities, row_policy)) = Self::exl3_package(native_lib, catalog, max_rows)?
             else { anyhow::bail!("local EXL3 weights without a coordinator package") };
-        let shape = *catalog.routed_experts();
         let stages = selections.iter().filter(|s| matches!(s, ExpertLayer::Dspark { .. })).count();
         ensure!(selections[..stages].iter().all(|s| matches!(s, ExpertLayer::Dspark { .. })),
             "local EXL3 draft stages precede the backbone layers");
@@ -436,6 +435,32 @@ impl<'a> LocalExperts<'a> {
             ExpertLayer::BackboneFull { layer } => Ok(*layer),
             other => anyhow::bail!("local EXL3 backbone takes whole layers, not {other:?}"),
         }).collect::<Result<Vec<_>>>()?;
+        Self::from_exl3_parts(library, catalog, directories, capacities, row_policy, stages, layers, weights, max_rows)
+            .map(Some)
+    }
+
+    /// A GPU expert tier: resident subsets of backbone `layers` (strictly increasing), one
+    /// `subset_residency` weight per layer, on the unchanged coordinator package. Each layer's
+    /// `global_to_combined` maps its non-resident experts to -1, so [`Self::run_into`] sums
+    /// only the resident experts' routes (plus the shared expert) and skips the rest.
+    pub fn from_exl3_tier(library: &'a NativeLibrary, native_lib: &Path, catalog: &OfficialV41Catalog,
+        layers: Vec<usize>, weights: Vec<Exl3Weights<'a>>, max_rows: usize) -> Result<Self> {
+        ensure!(!layers.is_empty() && layers.len() == weights.len() && layers.windows(2).all(|ids| ids[0] < ids[1]),
+            "GPU expert tier layers must be strictly increasing, one resident subset each");
+        ensure!(weights.iter().zip(&layers).all(|(weight, &layer)| weight.layout.selected.is_some()
+            && weight.layout.world == 1 && weight.layout.rank == 0
+            && matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(id) if id == layer)),
+            "GPU expert tier weights differ from their layers");
+        let Some((directories, capacities, row_policy)) = Self::exl3_package(native_lib, catalog, max_rows)?
+            else { anyhow::bail!("GPU expert tier weights without a coordinator EXL3 package") };
+        Self::from_exl3_parts(library, catalog, directories, capacities, row_policy, 0, layers, weights, max_rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_exl3_parts(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, directories: Vec<std::path::PathBuf>,
+        capacities: Vec<u32>, row_policy: Exl3RowPolicy, stages: usize, layers: Vec<usize>,
+        weights: Vec<Exl3Weights<'a>>, max_rows: usize) -> Result<Self> {
+        let shape = *catalog.routed_experts();
         let output_bytes = max_rows * shape.hidden * 2;
         let reduction_plan = Exl3ReductionPlan::new(&directories)?;
         let resident_weights = weights.iter().try_fold(0usize, |sum, weight|
@@ -455,14 +480,14 @@ impl<'a> LocalExperts<'a> {
                 "coordinator EXL3 package must match capacity {capacity} with FP32 output");
             executions.push(execution);
         }
-        Ok(Some(Self {
+        Ok(Self {
             resident_weights,
             backend: Backend::Exl3 { executions, row_policy, reduction_plan, stages, layers },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, output_bytes)?,
             topk: shape.topk,
             device: library.cuda_get_device()?,
-        }))
+        })
     }
 
     /// EXL3 residency: whole-intermediate (world 1) layers bound to the

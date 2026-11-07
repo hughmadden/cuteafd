@@ -2126,6 +2126,31 @@ if [[ $family == glm5_flash ]]; then
       fi ;;
     *) echo "GLM5_FLASH_KDA_EXACT must be off or kx7" >&2; exit 2 ;;
   esac
+  # GLM5_FLASH_EXPERT_TIER: off (default) or an absolute route profile (the executed-route census
+  # JSON) ranking a static GPU expert tier: the hottest routed experts of every layer stay resident on
+  # the one RTX while the Sparks keep every expert; each layer's resident routes run on the RTX inside
+  # its Spark wave and the Sparks skip them (Spark images built with coordinator routes). One RTX with
+  # Sparks and no whole RTX layers (RTX_EXPERT_LAYERS unset, auto or 0). GLM5_FLASH_EXPERT_TIER_BYTES:
+  # auto (the arena RTX_EXPERT_LAYERS=auto would give whole layers) or GiB, package workspace included.
+  expert_tier="$(get GLM5_FLASH_EXPERT_TIER off)"
+  expert_tier_bytes="$(get GLM5_FLASH_EXPERT_TIER_BYTES auto)"
+  case "$expert_tier" in
+    ""|off)
+      [[ "$expert_tier_bytes" == auto ]] ||
+        { echo "GLM5_FLASH_EXPERT_TIER_BYTES sizes a tier; set GLM5_FLASH_EXPERT_TIER to a profile" >&2; exit 2; } ;;
+    /*)
+      [[ "$expert_tier" =~ ^/[A-Za-z0-9._/-]+$ && -f "$expert_tier" && -r "$expert_tier" ]] ||
+        { echo "GLM5_FLASH_EXPERT_TIER must be off or a readable absolute profile path ([A-Za-z0-9._/-])" >&2; exit 2; }
+      [[ $head_split == 0 ]] || { echo "GLM5_FLASH_EXPERT_TIER runs on one RTX; set RTX_GPUS=1" >&2; exit 2; }
+      [[ "$ranks" != 0 ]] || { echo "GLM5_FLASH_EXPERT_TIER runs beside Spark experts; SPARK_COUNT=0 runs none" >&2; exit 2; }
+      [[ -z "$local_layers" || "$local_layers" == auto || "$local_layers" == 0 ]] ||
+        { echo "GLM5_FLASH_EXPERT_TIER replaces whole RTX expert layers; leave RTX_EXPERT_LAYERS unset, auto or 0" >&2; exit 2; }
+      [[ "$expert_tier_bytes" == auto || "$expert_tier_bytes" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        { echo "GLM5_FLASH_EXPERT_TIER_BYTES must be auto or GiB" >&2; exit 2; }
+      trace_args+=(-v "$expert_tier:$expert_tier:ro")
+      family_args+=(--expert-tier "$expert_tier" --expert-tier-bytes "$expert_tier_bytes") ;;
+    *) echo "GLM5_FLASH_EXPERT_TIER must be off or an absolute profile path" >&2; exit 2 ;;
+  esac
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
     ""|auto) if [[ $kda_exact == kx7 ]]; then kda_fp8=off; else kda_fp8=row128; fi ;;

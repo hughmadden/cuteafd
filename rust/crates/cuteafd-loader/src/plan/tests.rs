@@ -3580,7 +3580,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
             drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
-            full_prefill_logits: 0 };
+            full_prefill_logits: 0, expert_tier: None };
         let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
         process.serving(&input, 0, 0, 0, 0).unwrap();
         process.spark_link(&input, checkpoint.spark_input_is_bf16()).unwrap();

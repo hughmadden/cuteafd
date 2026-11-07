@@ -179,6 +179,20 @@ pub(crate) struct EngineArgs {
     /// layer of the target model), or an exact N.
     #[arg(long, env = "RTX_EXPERT_LAYERS", value_parser = parse_onboard)]
     pub rtx_expert_layers: Option<cuteafd_loader::placement::OnboardSetting>,
+    /// A static GPU expert tier: `off`, or a route profile (the executed-route census JSON, layer-major
+    /// decode and prefill counts and their geometry) ranking which routed experts of every layer stay
+    /// resident on this GPU while the Sparks keep every expert. Each layer's resident routes run here
+    /// beside its Spark wave and the Sparks skip them (a Spark image with coordinator routes). One GPU,
+    /// Spark experts, an EXL3 checkpoint, and no whole RTX layers (RTX_EXPERT_LAYERS unset, auto or 0).
+    #[arg(long, env = "GLM5_FLASH_EXPERT_TIER", default_value = "off")]
+    pub expert_tier: cuteafd_loader::placement::expert_tier::TierSetting,
+    /// The tier's coordinator bytes, its package workspace included: `auto`, the arena
+    /// RTX_EXPERT_LAYERS=auto would give whole layers (less the tier's own step rows), or GiB.
+    #[arg(long, env = "GLM5_FLASH_EXPERT_TIER_BYTES", default_value = "auto")]
+    pub expert_tier_bytes: cuteafd_loader::placement::expert_tier::TierBytes,
+    /// The selected tier's admitted charge (set between the budget probe and the admission).
+    #[arg(skip)]
+    pub expert_tier_charge: Option<cuteafd_loader::placement::families::glm5_flash::GlmfTierCharge>,
     #[arg(long)]
     pub experts_snapshot: Option<PathBuf>,
     /// TP1 FP8 package directory (default `<libdir>/fp8/fp8-glmf/tp1`).
@@ -1163,6 +1177,108 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn expert_tier_options_parse_and_refuse_what_one_spark_backed_gpu_cannot_serve() {
+        use cuteafd_loader::placement::expert_tier::{TierBytes, TierSetting};
+        let off = parse(&SPARKS);
+        assert_eq!((off.expert_tier.clone(), off.expert_tier_bytes, off.expert_tier_charge), (TierSetting::Off, TierBytes::Auto, None));
+        check_expert_tier(&off, false, true).unwrap();
+        let tier = |extra: &[&str]| parse(&[&SPARKS[..], &["--expert-tier", "/profiles/coding.json"], extra].concat());
+        let on = tier(&["--expert-tier-bytes", "6.5"]);
+        assert_eq!(on.expert_tier.profile(), Some(std::path::Path::new("/profiles/coding.json")));
+        assert_eq!(on.expert_tier_bytes, TierBytes::Bytes(13 << 29));
+        check_expert_tier(&on, true, false).unwrap();
+        for setting in ["auto", "0"] { check_expert_tier(&tier(&["--rtx-expert-layers", setting]), true, false).unwrap(); }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/c", "--native-lib", "/n", "--expert-tier-bytes", "lots"]).is_err());
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/c", "--native-lib", "/n", "--expert-tier", ""]).is_err());
+        for (args, exl3, bf16) in [
+            (tier(&["--rtx-expert-layers", "2"]), true, false),
+            (tier(&["--rtx-expert-layers", "all"]), true, false),
+            (tier(&["--split-device", "1"]), true, false),
+            (tier(&["--skip-experts"]), true, false),
+            (parse(&["--expert-tier", "/p.json"]), true, false),
+            (tier(&[]), false, false),
+            (tier(&[]), true, true),
+        ] {
+            assert!(check_expert_tier(&args, exl3, bf16).is_err(), "{:?}", (args.rtx_expert_layers, args.split_device, exl3, bf16));
+        }
+        let mut local = tier(&[]);
+        local.local_experts = true;
+        assert!(check_expert_tier(&local, true, false).is_err());
+    }
+
+    /// GPU check of the tier's compact subsets on the unchanged coordinator package: for one routed
+    /// layer, the tier's `run_into` over every route equals, bit for bit, the whole layer's over the
+    /// same routes with every non-resident route's weight zeroed, at decode and prefill widths; the
+    /// loaded bytes equal the subset arena the admission charges.
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT (an EXL3 GLM 5.3 Flash), its rtx-tp1 package and a CUDA GPU"]
+    fn tier_subsets_reproduce_the_whole_layer_on_their_resident_routes() -> Result<()> {
+        use crate::families::deepseek_v4::local::{LocalExperts, LocalLayer};
+        use crate::shared::memory::DeviceAllocation;
+        let (snapshot, lib) = (std::env::var("CUTEAFD_SNAPSHOT")?, std::env::var("CUTEAFD_NATIVE_LIB")?);
+        let args = Parse::try_parse_from(["test", "--snapshot", &snapshot, "--native-lib", &lib, "--local-experts"])?.engine;
+        let opened = open(&args)?;
+        let (library, cfg) = (&opened.library, &opened.cfg);
+        let catalog = opened.experts.as_ref().filter(|c| c.exl3().is_some()).context("an EXL3 checkpoint")?;
+        let manifest = catalog.exl3().context("EXL3 manifest")?;
+        let layer = cfg.dense.iter().position(|dense| !dense).context("a routed layer")?;
+        let resident = [0, 5, 17, 63, 64, 200, cfg.experts - 1];
+        let (rows, topk, h) = (300, cfg.topk, cfg.hidden);
+        let stream = library.cuda_stream_create()?;
+        let mut whole = LocalExperts::load(library, &args.native_lib, catalog, 0, &[layer], rows, usize::MAX, stream)?
+            .context("whole-layer package")?;
+        let layout = manifest.subset_residency(layer, &resident)?;
+        let arena = layout.device_arena_layout()?.1;
+        let weights = crate::shared::experts::exl3::Exl3Weights::load_layout(library, catalog, layout, usize::MAX)?;
+        assert_eq!(weights.resident_bytes(), arena);
+        let mut tier = LocalExperts::from_exl3_tier(library, &args.native_lib, catalog, vec![layer], vec![weights], rows)?;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: u64| { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state % bound };
+        // Finite E4M3 values with UE8M0 scales near one, then routes: distinct ids per row, positive weights.
+        let wire: Vec<u8> = (0..rows).flat_map(|_| (0..h).map(|_| (next(0x7e) as u8) | ((next(2) as u8) << 7)).collect::<Vec<_>>()
+            .into_iter().chain((0..h / 32).map(|_| 120 + next(8) as u8)).collect::<Vec<_>>()).collect();
+        let mut ids = Vec::with_capacity(rows * topk);
+        for _ in 0..rows {
+            let mut row: Vec<u32> = Vec::new();
+            while row.len() < topk {
+                // Half the routes on resident experts, so every width mixes both tiers.
+                let id = if next(2) == 0 { resident[next(resident.len() as u64) as usize] as u32 } else { next(cfg.experts as u64) as u32 };
+                if !row.contains(&id) { row.push(id); }
+            }
+            ids.extend(row);
+        }
+        let weights: Vec<f32> = (0..rows * topk).map(|_| 0.01 + next(1000) as f32 / 4000.0).collect();
+        let masked: Vec<f32> = ids.iter().zip(&weights).map(|(&id, &w)| if resident.contains(&(id as usize)) { w } else { 0.0 }).collect();
+        let upload = |bytes: &[u8]| -> Result<DeviceAllocation<'_>> {
+            let buffer = DeviceAllocation::new(library, bytes.len())?;
+            library.copy_h2d(buffer.buffer, bytes)?;
+            Ok(buffer)
+        };
+        let words = |values: &[u32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+        let (wire, ids) = (upload(&wire)?, upload(&words(&ids))?);
+        let weights = upload(&words(&weights.iter().map(|w| w.to_bits()).collect::<Vec<_>>()))?;
+        let masked = upload(&words(&masked.iter().map(|w| w.to_bits()).collect::<Vec<_>>()))?;
+        let shared = upload(&vec![0; rows * h * 2])?;
+        let (a, b) = (DeviceAllocation::new(library, rows * h * 2)?, DeviceAllocation::new(library, rows * h * 2)?);
+        for t in [1, 8, 16, 80, 256, rows] {
+            // SAFETY: every operand is a live device buffer of at least `t` rows on this stream, which drains below.
+            unsafe {
+                whole.run_into(LocalLayer::Backbone(layer), t, wire.buffer.ptr, ids.buffer.ptr, masked.buffer.ptr,
+                    shared.buffer.ptr, a.buffer.ptr, stream)?;
+                tier.run_into(LocalLayer::Backbone(layer), t, wire.buffer.ptr, ids.buffer.ptr, weights.buffer.ptr,
+                    shared.buffer.ptr, b.buffer.ptr, stream)?;
+                library.cuda_stream_synchronize(stream)?;
+            }
+            let (mut x, mut y) = (vec![0u8; t * h * 2], vec![0u8; t * h * 2]);
+            library.copy_d2h(&mut x, a.buffer)?;
+            library.copy_d2h(&mut y, b.buffer)?;
+            assert!(x.iter().any(|&byte| byte != 0), "{t} rows produced nothing");
+            assert_eq!(x, y, "tier subset differs from the masked whole layer at {t} rows");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_local_default_preserves_automatic_pool_policy_and_explicit_pins() {
         use cuteafd_loader::placement::Onboard;
         let local = parse(&["--local-experts", "--split-device", "1"]);
@@ -1311,21 +1427,21 @@ mod draft_cli_tests {
             residual: vec![], hops: vec![], tp2: None, items: vec![],
         };
         assert_eq!(admitted_step_experts(&cfg, &placement, false, true)?,
-            engine::StepExperts { local_fp8: false, spark: true, tp2: false });
+            engine::StepExperts { local_fp8: false, spark: true, tp2: false, tier: false });
         // Local buffers follow actual layer homes, not the catalog's format alone.
         placement.layers[3].experts = ExpertHome::RtxWhole { gpu: 0 };
         placement.expert_ranges[0].layers = 1;
         assert_eq!(admitted_step_experts(&cfg, &placement, false, true)?,
-            engine::StepExperts { local_fp8: true, spark: true, tp2: false });
+            engine::StepExperts { local_fp8: true, spark: true, tp2: false, tier: false });
         assert_eq!(admitted_step_experts(&cfg, &placement, false, false)?,
-            engine::StepExperts { local_fp8: false, spark: true, tp2: false });
+            engine::StepExperts { local_fp8: false, spark: true, tp2: false, tier: false });
         placement.layers[3].experts = ExpertHome::RtxTp2;
         assert_eq!(admitted_step_experts(&cfg, &placement, false, true)?,
-            engine::StepExperts { local_fp8: false, spark: true, tp2: true });
+            engine::StepExperts { local_fp8: false, spark: true, tp2: true, tier: false });
         assert_eq!(admitted_step_experts(&cfg, &placement, true, true)?,
-            engine::StepExperts { local_fp8: false, spark: false, tp2: false });
+            engine::StepExperts { local_fp8: false, spark: false, tp2: false, tier: false });
         assert_eq!(admitted_step_experts(&cfg, &Placement { layers: placement.layers[..3].to_vec(), ..placement }, false, true)?,
-            engine::StepExperts { local_fp8: false, spark: false, tp2: false });
+            engine::StepExperts { local_fp8: false, spark: false, tp2: false, tier: false });
         Ok(())
     }
 
@@ -1716,6 +1832,23 @@ fn runtime_resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers
     Ok(resident)
 }
 
+/// Refuse a GPU expert tier this engine cannot serve: one GPU with Spark experts (no head split,
+/// local or skipped experts), an EXL3 checkpoint (`exl3`: the coordinator `rtx-tp1` package runs
+/// the resident subsets) whose Spark input is the FP8 K32 wire (`spark_bf16` false: the package
+/// reads those rows), and no whole RTX layers.
+fn check_expert_tier(args: &EngineArgs, exl3: bool, spark_bf16: bool) -> Result<()> {
+    use cuteafd_loader::placement::OnboardSetting;
+    if args.expert_tier.profile().is_none() { return Ok(()); }
+    ensure!(args.split_device.is_none(), "GLM5_FLASH_EXPERT_TIER runs on one GPU: drop --split-device (RTX_GPUS=1)");
+    ensure!(args.peers.is_some() && !args.local_experts && !args.skip_experts,
+        "GLM5_FLASH_EXPERT_TIER runs beside Spark experts: it needs --peers, not --local-experts or --skip-experts");
+    ensure!(matches!(args.rtx_expert_layers, None | Some(OnboardSetting::Auto) | Some(OnboardSetting::Layers(0))),
+        "GLM5_FLASH_EXPERT_TIER replaces whole RTX expert layers: leave RTX_EXPERT_LAYERS unset, auto or 0");
+    ensure!(exl3, "GLM5_FLASH_EXPERT_TIER needs an EXL3 checkpoint (the coordinator rtx-tp1 package)");
+    ensure!(!spark_bf16, "GLM5_FLASH_EXPERT_TIER reads the FP8 K32 wire rows; this checkpoint sends BF16 Spark input");
+    Ok(())
+}
+
 fn validate_expert_layers(cfg: &GlmNextConfig, served: usize, layers: &[usize]) -> Result<()> {
     ensure!(served <= cfg.layers && cfg.dense.len() == cfg.layers
         && layers.windows(2).all(|ids| ids[0] < ids[1])
@@ -1759,6 +1892,7 @@ fn admitted_step_experts(cfg: &GlmNextConfig, placement: &cuteafd_loader::placem
         spark: !admitted_spark_layers(cfg, &placement.layers, skip)?.is_empty(),
         tp2: !admitted_expert_layers(cfg, &placement.layers,
             cuteafd_loader::placement::ExpertHome::RtxTp2, skip)?.is_empty(),
+        tier: false,
     })
 }
 
@@ -2018,7 +2152,8 @@ impl Opened {
                 &self.cfg, layers, devices.len(), args.decode_rows as u64)?);
         }
         let (table_pages, table_pool_pages) = glmf_table_pages(args.max_context as u64);
-        let shape = GlmfStepShape { lead: true, split, local_experts: !args.skip_experts && !split && self.fp8().is_some(),
+        let shape = GlmfStepShape { lead: true, split,
+            local_experts: (!args.skip_experts && !split && self.fp8().is_some()) || args.expert_tier_charge.is_some(),
             tp2_experts: !args.skip_experts && split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
             output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits && !self.native && core.get_weight("lm_head").is_none(), table_pages, table_pool_pages };
         let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
@@ -2116,7 +2251,7 @@ impl Opened {
             full_prefill_logits: if shape.full_prefill_logits {
                 cuteafd_loader::plan::layout::full_prefill_logits_bytes("glm5_flash", args.prefill_rows as u64,
                     self.cfg.vocab_size as u64)
-            } else { 0 } };
+            } else { 0 }, expert_tier: args.expert_tier_charge };
         let host = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         let headroom = args.serving_prefix.as_ref().map_or(8 << 30, |prefix| prefix.host_cache_headroom_bytes).max(host.0 / 10);
         let mut process = admission::admission::ProcessOwners::new(host, headroom);
@@ -2415,6 +2550,13 @@ impl Opened {
         }
         let inventory = self.admission_inventory(args, &programs, layers, split_device, attention,
             native_admission.as_ref())?;
+        // A GPU expert tier is ranked within its budget, then admitted in place of whole layers.
+        let tier = args.expert_tier.profile().is_some().then(|| self.plan_expert_tier(args, layers, attention, |probe|
+            self.admit_candidate(probe, &programs, layers, index_cache, mark_slots, split_device, automatic_context,
+                remote_draft, attention, native_admission.as_ref(), &inventory, expert_usage.as_ref())
+                .map(|admitted| admitted.0))).transpose()?;
+        let (tier, tier_args) = tier.map_or((None, None), |(selection, args)| (Some(selection), Some(args)));
+        let args = tier_args.as_ref().unwrap_or(args);
         let mut draft_args = args.clone();
         let admitted = if args.tp2_dflash_auto {
             draft_args.tp2_dflash = false;
@@ -2882,7 +3024,10 @@ impl Opened {
                 "GLM Flash decode graphs captured lazily within the graph allowance, not at startup");
         }
         let max_context = crate::shared::context::pool_context("glm5_flash", args.max_context, automatic_context, pool_tokens, 256)?;
-        let step_experts = admitted_step_experts(&self.cfg, &placement, args.skip_experts, self.fp8().is_some())?;
+        let mut step_experts = admitted_step_experts(&self.cfg, &placement, args.skip_experts, self.fp8().is_some())?;
+        step_experts.tier = tier.is_some();
+        ensure!(!step_experts.tier || (step_experts.spark && !step_experts.local_fp8 && !step_experts.tp2),
+            "the GPU expert tier was admitted without its Spark layers");
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
             let mut settings = step_settings(args, index_cache);
             settings.max_context = max_context;
@@ -2983,6 +3128,10 @@ impl Opened {
                 if let Some(experts) = self.experts_for_layers(&expert_args, &spark_layers, None, None)? {
                     engine.set_experts(experts)?;
                 }
+            }
+            if let Some(selection) = &tier {
+                probe("expert-tier")?;
+                engine.install_tier(self.load_expert_tier(args, selection)?)?;
             }
         }
         engine.bind_expert_homes(&placement, &spark_layers, args.skip_experts)?;
@@ -3119,6 +3268,82 @@ impl Opened {
         Ok(Some(dense))
     }
 
+    /// The GPU expert tier for `args`: the refusals, the profile (refused on another geometry),
+    /// the budget (auto: the arena `probe` admits for whole layers under RTX_EXPERT_LAYERS=auto,
+    /// less the tier's own `routed` step rows), the ranked selection, and the arguments that admit
+    /// it with no whole layers.
+    fn plan_expert_tier(&self, args: &EngineArgs, layers: usize, attention: engine::GlmfAttention,
+        probe: impl FnOnce(&EngineArgs) -> Result<cuteafd_loader::placement::Placement>)
+        -> Result<(cuteafd_loader::placement::expert_tier::TierSelection, EngineArgs)> {
+        use cuteafd_loader::placement::expert_tier::{select, Exl3TierCosts, RouteProfile, TierBytes};
+        use cuteafd_loader::placement::families::glm5_flash as admission;
+        let path = args.expert_tier.profile().context("GPU expert tier profile")?;
+        let catalog = self.experts.as_ref().filter(|catalog| catalog.exl3().is_some() && !self.native);
+        check_expert_tier(args, catalog.is_some(), self.checkpoint.spark_input_is_bf16())?;
+        let catalog = catalog.context("GPU expert tier EXL3 catalog")?;
+        let manifest = catalog.exl3().context("GPU expert tier EXL3 manifest")?;
+        let geometry = admission::usage_geometry(&self.cfg, layers, true).context("GLM Flash route geometry")?;
+        let profile = RouteProfile::read(path)?;
+        profile.require_geometry(&geometry)?;
+        let workspace = admission::expert_workspace(catalog, Some(&args.manifest), args.expert_rows() as u64, 1)?;
+        let lanes = admission::admitted_prefill_waves(attention.mode, args.prefill_waves as u64).map_err(anyhow::Error::msg)?;
+        let routed_rows = (args.decode_rows as u64 + lanes * args.prefill_rows as u64) * self.cfg.hidden as u64 * 2;
+        let budget = match args.expert_tier_bytes {
+            TierBytes::Bytes(bytes) => bytes,
+            TierBytes::Auto => {
+                let mut whole = args.clone();
+                whole.rtx_expert_layers = None;
+                let placement = probe(&whole)?;
+                ensure!(placement.onboard_layers > 0, "GLM5_FLASH_EXPERT_TIER_BYTES=auto: RTX_EXPERT_LAYERS=auto \
+                    leaves no room for a whole layer here; give the tier GiB explicitly");
+                let arena = placement.expert_ranges.first().map(|range| range.peak_bytes).context("whole-layer arena")?;
+                tracing::info!(whole_layers = placement.onboard_layers, arena, routed_rows,
+                    "GLM Flash GPU expert tier takes the whole-layer arena");
+                arena.saturating_sub(routed_rows)
+            }
+        };
+        let resident = budget.checked_sub(workspace).with_context(|| format!(
+            "GPU expert tier budget {budget} B is below its package workspace {workspace} B"))?;
+        let selection = select(&geometry, &profile.scores(), resident, &Exl3TierCosts(manifest))?;
+        ensure!(selection.experts() > 0, "GPU expert tier budget {budget} B holds no expert");
+        let (decode, prefill) = profile.held(&selection);
+        tracing::info!(profile = %path.display(), budget, workspace, resident_bytes = selection.resident_bytes,
+            experts = selection.experts(), layers = selection.layers.len(), profile_decode_rows_held = decode,
+            profile_prefill_rows_held = prefill, "GLM Flash GPU expert tier selected");
+        cuteafd_bench::context::set_resolved("expert-tier", &format!("{} experts over {} layers, {} resident bytes",
+            selection.experts(), selection.layers.len(), selection.resident_bytes));
+        let mut admitted = args.clone();
+        admitted.rtx_expert_layers = Some(cuteafd_loader::placement::OnboardSetting::Layers(0));
+        admitted.expert_tier_charge = Some(admission::GlmfTierCharge { workspace, resident: selection.resident_bytes });
+        Ok((selection, admitted))
+    }
+
+    /// The admitted tier's resident subsets, read from storage layer by layer, on the coordinator
+    /// package; their bytes must equal the admitted charge.
+    fn load_expert_tier<'s>(&'s self, args: &EngineArgs, selection: &cuteafd_loader::placement::expert_tier::TierSelection)
+        -> Result<engine::ExpertTier<'s>> {
+        let catalog = self.experts.as_ref().filter(|catalog| catalog.exl3().is_some()).context("GPU expert tier EXL3 catalog")?;
+        let manifest = catalog.exl3().context("GPU expert tier EXL3 manifest")?;
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("expert-tier");
+        let started = Instant::now();
+        let mut weights = Vec::with_capacity(selection.layers.len());
+        for (layer, experts) in &selection.layers {
+            let layout = manifest.subset_residency(*layer, experts)?;
+            let free = self.library.cuda_memory_info()?.0;
+            weights.push(crate::shared::experts::exl3::Exl3Weights::load_layout(&self.library, catalog, layout, free)
+                .with_context(|| format!("GPU expert tier layer {layer} ({} experts)", experts.len()))?);
+        }
+        let resident = weights.iter().map(|weight| weight.resident_bytes() as u64).sum::<u64>();
+        ensure!(resident == selection.resident_bytes,
+            "GPU expert tier resident bytes {resident} differ from the admitted {}", selection.resident_bytes);
+        let layers = selection.layers.iter().map(|(layer, _)| *layer).collect();
+        let experts = crate::families::deepseek_v4::local::LocalExperts::from_exl3_tier(&self.library, &args.native_lib,
+            catalog, layers, weights, args.expert_rows())?;
+        tracing::info!(experts = selection.experts(), resident, elapsed_ms = started.elapsed().as_millis() as u64,
+            "GLM Flash GPU expert tier resident");
+        engine::ExpertTier::new(self.cfg.layers, self.cfg.experts, selection, experts)
+    }
+
     fn experts_for_layers<'s>(&'s self, args: &EngineArgs, selected: &[usize], budget: Option<usize>,
         pushed: Option<crate::shared::experts::rtx::push::PushedExperts<'s>>) -> Result<Option<engine::Experts<'s>>> {
         if args.skip_experts {
@@ -3192,6 +3417,12 @@ impl Opened {
         transport.bootstrap(&shape)?;
         let started = Instant::now();
         transport.warm_experts(&shape, selected[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        if args.expert_tier.profile().is_some() {
+            // A Spark image without coordinator routes refuses the flag here, at start-up.
+            let tier = cuteafd_transport::SparkSessionShape { flags: shape.flags
+                | cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_COORDINATOR_ROUTES, ..shape.clone() };
+            transport.warm_experts(&tier, selected[0], self.cfg.experts, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport) }))
     }

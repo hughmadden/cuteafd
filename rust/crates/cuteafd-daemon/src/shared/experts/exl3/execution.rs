@@ -1073,7 +1073,7 @@ mod tests {
             let mut layout = V41Exl3Residency {
                 layer: V41Exl3Layer::Backbone(3), world: 6, rank: 0,
                 intermediate_start: 0, experts: geometry.experts as usize, intermediate: 384,
-                tiers: vec![4, 5], projection_counts: vec![], loads: vec![],
+                tiers: vec![4, 5], projection_counts: vec![], loads: vec![], selected: None,
                 unit_map: compact.then(|| RankUnits::new(UnitRule::Rotated,
                     geometry.experts as usize, geometry.intermediate as usize, 128, 3, 6, 0)).transpose()?,
                 buffers: vec![V41Exl3ResidentBuffer { name: "descriptor_map".into(),
