@@ -22,6 +22,29 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_generic_package_preflight_refuses_before_dry_run_and_startup(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('# Recipe registration is not proof')
+        end = text.index('if ((dry_run)); then', start)
+        block = text[start:end]
+        self.assertLess(end, text.index('# --restart removes only this coordinator', end))
+        script = r'''set -euo pipefail
+repo_root="$1"; checkpoint_family=mistral_large4; spark_image=image:fixture
+wip_slot=all; WIP_ROOT=/fixture/seal; WIP_INSTANCE=fixture
+spark_expert_ranks=(0 1 2 3 4)
+deployment_json='{"artifact_requirements":{"spark_packages":{"exl3/exl3-ml4-k45":["tp5-compact-rank4/m1"]}}}'
+get() { echo "worker-${1}"; }
+release_die() { echo "$*" >&2; exit 2; }
+timeout() { shift; "$@"; }
+ssh() { cat >/dev/null; echo "missing Spark package exl3/exl3-ml4-k45/tp5-compact-rank4/m1" >&2; return 2; }
+'''
+        result = subprocess.run(['bash', '-c', script + block + '\necho SERVING_STARTED', 'test', str(ROOT)],
+                                cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('missing Spark package exl3/exl3-ml4-k45/tp5-compact-rank4/m1', result.stderr)
+        self.assertIn('before startup', result.stderr)
+        self.assertNotIn('SERVING_STARTED', result.stdout)
+
     def test_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
         text = FAMILY.read_text()
         start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 ]]; then')

@@ -7,6 +7,13 @@ use std::sync::Mutex;
 /// Larger payloads use the host-triggered copy engine after the previous reader.
 pub const METADATA_SM_COPY_BYTES: usize = 4 << 20;
 
+/// The native vocabulary retains an unused ordinary embedding-table owner in
+/// addition to its payload/scales. Admission and loader owner totals include it;
+/// logical table residency (used to validate gathers) excludes it.
+pub fn native_embedding_owner_bytes(native_bytes: usize) -> usize {
+    native_bytes + 256
+}
+
 /// Exact pinned bytes and completion records for an admitted upload schedule.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UploadShape { pub bytes: usize, pub ranges: usize, largest: usize }

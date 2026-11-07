@@ -54,6 +54,8 @@ pub enum SparkAdmission {
 
 #[derive(Debug, Serialize)]
 pub struct ArtifactRequirements {
+    /// Exact package-relative directories required on every expert host.
+    pub spark_packages: std::collections::BTreeMap<String, Vec<String>>,
     pub verify_live_identity: bool,
     pub verify_resolved_config_fingerprint: bool,
     pub spark_tp_role: Option<String>,
@@ -136,12 +138,29 @@ impl<'a> DeploymentSpec<'a> {
         let physical = spark_roles.len();
         let exl3 = report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"));
         let topology = Topology { tp: ranks };
+        let mut spark_packages = std::collections::BTreeMap::new();
         if ranks > 0 {
             ensure!(ranks <= 8, "Spark transport supports at most eight ranks");
             let experts = report.experts.as_ref().context("Spark deployment requires an expert package")?;
             let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
                 .context("Spark deployment requires routed expert geometry")?.intermediate;
-            if native.is_none() { super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?; }
+            if native.is_none() {
+                for package in experts.package.split(" + ") {
+                    let package = package.split_whitespace().next().context("expert package key")?;
+                    let recipe = super::experts::spark_recipe(package, intermediate, topology.tp)?;
+                    if !recipe.native_artifacts.is_empty() { continue; }
+                    let (family, format) = package.split_once(':').context("expert package format")?;
+                    let (root, layouts) = if let Some(tiers) = format.strip_prefix("exl3-") {
+                        (format!("exl3/exl3-{family}-{tiers}"), recipe.required_layouts.iter()
+                            .map(|layout| format!("{layout}/m1")).collect())
+                    } else {
+                        let suffix = match format { "fp8" | "mxfp4" => String::new(), "bf16" => "-bf16-weights".into(), "nvfp4" => "-nvfp4a4".into(),
+                            other => format!("-{other}") };
+                        (format!("fp8/fp8-{family}{suffix}"), recipe.required_layouts)
+                    };
+                    spark_packages.insert(root, layouts);
+                }
+            }
             else { ensure!((1..=8).contains(&ranks) && matches!((family, experts.package.as_str()),
                 ("glm5", "glm:exlr8") | ("glm5_flash", "glmf:exlr8")),
                 "EXLR8 deployment requires a matching native family/package and canonical Sparks"); }
@@ -174,7 +193,7 @@ impl<'a> DeploymentSpec<'a> {
             estimated_placement: report.solver_placement.as_ref(), memory_layout,
             encoder: report.encoder.as_ref(), audio_encoder: report.audio_encoder.as_ref(),
             encoder_plan_hash: &report.encoder_plan_hash,
-            artifact_requirements: ArtifactRequirements { verify_live_identity: true,
+            artifact_requirements: ArtifactRequirements { spark_packages, verify_live_identity: true,
                 verify_resolved_config_fingerprint: family == "deepseek_v41",
                 require_symbols_verified: spark_tp_role.is_some(),
                 verify_native_library_sha256: spark_tp_role.is_some(), spark_tp_role,
@@ -514,12 +533,46 @@ mod tests {
                 (0..ranks).collect::<Vec<_>>());
             assert_eq!(deployment.artifact_requirements.spark_tp_role.as_deref(),
                 (ranks != 4).then(|| format!("tp{ranks}")).as_deref(), "TP{ranks}");
+            // Native V4.1 slices are attested by the TP role manifest, not a
+            // generic package root, so the package preflight names none.
+            assert!(deployment.artifact_requirements.spark_packages.is_empty(), "TP{ranks}");
+            assert_eq!(serde_json::to_value(&deployment).unwrap()["artifact_requirements"]["spark_tp_role"],
+                serde_json::json!((ranks != 4).then(|| format!("tp{ranks}"))), "TP{ranks}");
         }
         let (_dir, mut report) = fixture(1, 4);
         report.spark_ranks = 1;
         let options = DeploymentOptions { rtx_gpus: 1, ..Default::default() };
         let error = DeploymentSpec::from_report(&report, &options).unwrap_err().to_string();
         assert!(error.contains("TP1"), "{error}");
+    }
+
+    #[test]
+    fn ml4_deployment_names_every_compact_or_balanced_rank_package() {
+        let (_dir, mut report) = fixture(1, 4);
+        report.family = Some("mistral_large4".into());
+        report.experts.as_mut().unwrap().package = "ml4:exl3-k45".into();
+        report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = 6144;
+        let options = DeploymentOptions { rtx_gpus: 1, ..Default::default() };
+        for ranks in [5, 6] {
+            report.spark_ranks = ranks;
+            let spec = DeploymentSpec::from_report(&report, &options).unwrap();
+            let compact = if ranks == 5 { "-compact" } else { "" };
+            assert_eq!(spec.artifact_requirements.spark_packages["exl3/exl3-ml4-k45"],
+                (0..ranks).map(|rank| format!("tp{ranks}{compact}-rank{rank}/m1")).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn decorated_packages_keep_canonical_artifact_roots() {
+        let (_dir, mut report) = fixture(1, 4);
+        report.family = Some("mimo_v2".into());
+        report.spark_ranks = 6;
+        report.experts.as_mut().unwrap().package = "mimop:fp8 (MXFP4)".into();
+        report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = 2048;
+        let options = DeploymentOptions { rtx_gpus: 1, ..Default::default() };
+        let spec = DeploymentSpec::from_report(&report, &options).unwrap();
+        assert_eq!(spec.artifact_requirements.spark_packages.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["fp8/fp8-mimop"]);
     }
 
     #[test]
