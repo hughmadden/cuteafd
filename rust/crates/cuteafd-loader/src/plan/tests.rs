@@ -6098,6 +6098,106 @@ fn v4_auto_pool_and_count_admission_preserve_one_recipe() {
 }
 
 #[test]
+fn qwen_auto_mtp_matches_explicit_memory_and_deployment() {
+    use spec::DraftOwnership;
+    let mut config = qwen4_config(4);
+    config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    let dir = snapshot(config, &[t("mtp.layers.0.enorm.weight", "BF16", &[2560])]);
+    for ranks in [0, 2] {
+        let options = PlanOptions { qwen_auto_mtp: true,
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                host_cache_bytes: Some(0), ..Default::default() }), ..sparks(ranks) };
+        let auto = plan(dir.path(), &options).unwrap();
+        let selected = if ranks == 0 { "mtp" } else { "off" };
+        assert_eq!(auto.speculator, Some(selected));
+        let explicit = plan(dir.path(), &PlanOptions { qwen_auto_mtp: false,
+            draft_ownership: Some(DraftOwnership::selected("qwen4", selected)), ..options }).unwrap();
+        assert_eq!(serde_json::to_value(&auto.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+        assert_eq!(serde_json::to_value(&auto.memory_layout).unwrap(), serde_json::to_value(&explicit.memory_layout).unwrap());
+        if ranks == 0 {
+            let deployment = deployment::DeploymentOptions { rtx_gpus: 1, speculator: "auto".into(), ..Default::default() };
+            let resolved = deployment::DeploymentSpec::from_report(&auto, &deployment).unwrap();
+            assert_eq!(resolved.speculator, selected);
+        }
+        assert_eq!(component(&auto, Component::Speculator).status == Status::Disabled, selected == "off");
+    }
+    for (quant, stages, qualified) in [
+        (json!({"quant_method":"exl3"}), 1, true),
+        (json!({"quant_method":"exl3"}), 2, false),
+        (json!({"quant_method":"fp8"}), 1, false),
+        (json!({"quant_method":"nvfp4"}), 1, false),
+        (json!({"quant_method":"modelopt", "config_groups":{"g":{"weights":{"num_bits":4}}}}), 1, true),
+    ] {
+        let cfg = json!({"quantization_config":quant, "text_config":{"mtp_num_hidden_layers":stages}});
+        assert_eq!(qualified_qwen_mtp(&cfg), qualified);
+    }
+}
+
+#[test]
+fn qwen_auto_mtp_real_inventory_selects_local_without_losing_mtp() {
+    let mut config = qwen4_config(4);
+    config["text_config"]["mtp_num_hidden_layers"] = json!(1);
+    let mut tensors = qwen4_coordinator(&config, true);
+    let (mut experts, storage) = qwen4_exl3(5, 4);
+    for tensor in &mut experts {
+        tensor.0 = tensor.0.replace("model.language_model.layers.4.", "mtp.layers.0.");
+    }
+    tensors.extend(experts);
+    let storage: Value = serde_json::from_str(&serde_json::to_string(&storage).unwrap()
+        .replace("model.language_model.layers.4.", "mtp.layers.0.")).unwrap();
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &storage);
+    let manifest = write_qwen4_exl3_capacities(dir.path(), "45");
+    let options = PlanOptions { qwen_auto_mtp: true,
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(layout::LayoutOptions { workspace_manifest: Some(manifest),
+            context_tokens: 32768,
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            prefix_slots: Some(0), ..Default::default() }), ..sparks(2) };
+    let input = PlanInput::open(dir.path()).unwrap();
+    // A real Spark solve must not masquerade as a local expert deployment.
+    let spark = input.plan(&options).unwrap();
+    assert!(spark.solver_placement.is_some(), "{}", render(&spark));
+    assert_eq!(spark.spark_expert_world(), 2);
+    assert_eq!(spark.speculator, Some("off"));
+    // Inventory is nonzero; the selected expert count is independently local.
+    let auto = input.plan_spark_count(&options, 2, Some(0)).unwrap();
+    assert!(auto.solver_placement.is_some(), "{}", render(&auto));
+    assert!(auto.placement_supported, "{}", render(&auto));
+    assert_eq!(auto.spark_ranks, 0);
+    assert_eq!(auto.spark_expert_world(), 0);
+    assert_eq!(auto.speculator, Some("mtp"));
+    let explicit = input.plan_spark_count(&PlanOptions { qwen_auto_mtp: false,
+        draft_ownership: Some(spec::DraftOwnership::NativeMtp), ..options.clone() }, 2, Some(0)).unwrap();
+    assert_eq!(serde_json::to_value(&auto.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+    assert_eq!(serde_json::to_value(&auto.memory_layout).unwrap(), serde_json::to_value(&explicit.memory_layout).unwrap());
+    for which in [Component::Speculator, Component::SpeculatorExpert] {
+        let owner = component(&auto, which);
+        assert!(owner.bytes > 0 && owner.status != Status::Disabled, "{which:?}: {owner:?}");
+    }
+    let deployment = deployment::DeploymentOptions { rtx_gpus: 1, speculator: "auto".into(), ..Default::default() };
+    assert_eq!(deployment::DeploymentSpec::from_report(&auto, &deployment).unwrap().speculator, "mtp");
+
+    // The candidate still requests Sparks, but its actual solve puts all experts
+    // on RTX. Auto must re-plan the same candidate with native draft ownership.
+    let mut onboarded_options = options;
+    onboarded_options.layout.as_mut().unwrap().onboard =
+        Some(crate::placement::OnboardSetting::Layers(4));
+    let onboarded = input.plan(&onboarded_options).unwrap();
+    assert!(onboarded.executable(), "{}", render(&onboarded));
+    assert_eq!(onboarded.spark_ranks, 2);
+    assert_eq!(onboarded.spark_expert_world(), 0);
+    assert_eq!(onboarded.speculator, Some("mtp"));
+    let explicit = input.plan(&PlanOptions { qwen_auto_mtp: false,
+        draft_ownership: Some(spec::DraftOwnership::NativeMtp), ..onboarded_options }).unwrap();
+    assert_eq!(serde_json::to_value(&onboarded.components).unwrap(), serde_json::to_value(&explicit.components).unwrap());
+    assert_eq!(serde_json::to_value(&onboarded.memory_layout).unwrap(), serde_json::to_value(&explicit.memory_layout).unwrap());
+    let resolved = deployment::DeploymentSpec::from_report(&onboarded, &deployment).unwrap();
+    assert_eq!(resolved.spark_expert_world, 0);
+    assert_eq!(resolved.speculator, "mtp");
+}
+
+#[test]
 fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_worker() {
     use super::encoder::EncoderKind;
     use cuteafd_core::memory_layout::{Category, DeviceKind};

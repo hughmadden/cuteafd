@@ -253,7 +253,8 @@ impl<'a> QwenSingle<'a> {
             attention_placement: AttentionPlacement::Heads,
             attention_by_kind: by_kind.into_iter().collect(),
             peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
-            layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense })
+            layers: modes.iter().map(|&mode| LayerAssignment { mode,
+                experts: if inputs.spark_ranks > 0 { ExpertHome::Spark } else { ExpertHome::RtxWhole { gpu: 0 } } })
                 .collect(),
             movables: Vec::new(),
             expert_ranges: vec![ExpertRange { first: 0, layers: 0, peak_bytes: 0 }],
