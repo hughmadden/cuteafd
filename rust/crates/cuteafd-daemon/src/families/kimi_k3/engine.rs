@@ -498,6 +498,15 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    pub(crate) fn attach_capture(&self, capture: Rc<super::golden::Capture>) -> Result<()> {
+        self.require_live()?;
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        ensure!(lanes.local.len() == 1 && self.provisional.borrow().is_none(),
+            "Kimi capture requires one idle diagnostic lane after startup");
+        for local in &mut lanes.local[0] { local.capture = Some(capture.clone()); }
+        Ok(())
+    }
+
     pub(crate) fn graph_replays(&self) -> Result<u64> {
         Ok(self.lanes.try_borrow()?.local.iter().flatten().map(LocalLane::graph_replays).sum())
     }

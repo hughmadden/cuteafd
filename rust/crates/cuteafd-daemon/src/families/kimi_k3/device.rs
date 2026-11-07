@@ -529,6 +529,7 @@ pub(crate) struct LocalLane<'a> {
     context: Option<(Rc<super::context::ContextOwner<'a>>, Rc<super::context::Programs<'a>>)>,
     context_pages: Vec<usize>,
     context_units: Vec<Option<ContextUnit>>,
+    pub(super) capture: Option<Rc<super::golden::Capture>>,
 }
 
 #[derive(Clone, Copy)]
@@ -562,7 +563,7 @@ impl<'a> LocalLane<'a> {
         mla.check_reader(lane_index, &lane.stream)?;
         let banks = lane.layout.metadata_banks();
         Ok(Self { lane, programs, cfg, layers, global, lane_index, rank, kda, mla, attention: None, graphs: None,
-            replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks] })
+            replay_enabled: true, context: None, context_pages: vec![0; banks], context_units: vec![None; banks], capture: None })
     }
 
     pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
@@ -1192,7 +1193,24 @@ impl<'a> LocalLane<'a> {
         output:CuteafdDeviceBuffer)->Result<()> {
         let weights = self.layer(layer)?.native.get(name).context("Kimi native projection absent")?;
         self.programs.core.as_ref().context("Kimi native programs not resolved")?.native_projection(weights, rows,
-            input, output, if weights.layout.fp8 { Some(self.lane.buffer("native attention FP8 scratch")?) } else { None }, self.stream().raw)
+            input, output, if weights.layout.fp8 { Some(self.lane.buffer("native attention FP8 scratch")?) } else { None }, self.stream().raw)?;
+        if let Some(capture) = &self.capture {
+            let layout = &weights.layout;
+            let partial = layout.ranks == 2 && layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input;
+            let mut site = self.capture_site(layer, name, rows)?;
+            site["native"] = serde_json::json!({"stem":layout.stem,"shape_nk":layout.shape,
+                "fp8":layout.fp8,"rank":layout.rank,"ranks":layout.ranks,"split":format!("{:?}",layout.split)});
+            capture.record(self.stream(), site, &[("input", input, layout.shape[1], "BF16"),
+                ("output", output, layout.shape[0], if partial { "F32" } else { "BF16" })], None)?;
+        }
+        Ok(())
+    }
+
+    fn capture_site(&self, layer: usize, kind: &str, rows: usize) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({"layer":layer,"kind":kind,"rank":self.rank,"device":self.stream().device.id,
+            "live_rows":rows,"unit_offset":self.lane.window.as_ref().map_or(0, |window| window.start),
+            "attention_kind":format!("{:?}",self.cfg.attention[layer]),
+            "attention_share":format!("{:?}",self.layer(layer)?.attention)}))
     }
     pub(super) fn ffn_result(&self,layer:usize,rows:usize)->Result<CuteafdDeviceBuffer> {
         if self.native_ffn(layer)? && self.kda.heads() == 48 {view(self.lane.buffer("K6 FFN partial")?,0,rows*7168*2)}
@@ -1370,6 +1388,13 @@ impl<'a> LocalLane<'a> {
         let batch = KimiResidualBatch { rows, arena_rows: self.lane.rows(), arena: self.lane.buffer("residual arena")?,
             delta: self.plane("delta", rows, 7168)?, score_weight, norm_weight, output };
         self.lane.stream.device.run(|| self.programs.w8.residual(site, batch, self.lane.stream.raw))?;
+        if let Some(capture) = &self.capture {
+            if let MixSite::Ffn(layer) = site {
+                let prefix = view(self.lane.buffer("residual arena")?, 8 * self.lane.rows() * 7168 * 2, rows * 7168 * 2)?;
+                capture.record(self.stream(), self.capture_site(layer, "post-attention", rows)?,
+                    &[("prefix", prefix, 7168, "BF16"), ("normalized", output, 7168, "BF16")], None)?;
+            }
+        }
         Ok(output)
     }
 
@@ -1418,6 +1443,11 @@ impl<'a> LocalLane<'a> {
             self.programs.wire.launch(rows, self.programs.wire_grid.blocks(rows, 3584), latent, wire, self.lane.stream.raw)?;
             Ok(())
         })?;
+        if let Some(capture) = &self.capture {
+            capture.record(self.stream(), self.capture_site(layer, "router", rows)?,
+                &[("sigmoid_scores", logits, 896, "F32"), ("ids", routes.ids, 16, "U32"),
+                    ("weights", routes.weights, 16, "F32")], Some(bias))?;
+        }
         Ok((routes, wire))
     }
 

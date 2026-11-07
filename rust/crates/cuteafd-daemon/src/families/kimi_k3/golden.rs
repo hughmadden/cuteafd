@@ -72,9 +72,130 @@ pub(crate) struct GoldenArgs {
     #[arg(long, default_value = "on", value_parser = ["on", "off"])] grouped_kda: String,
     /// With --verify-rows: score only the first N verify rows of each window.
     #[arg(long, requires = "verify_rows")] verify_limit: Option<usize>,
+    /// Bounded prefill-only native/residual/router diagnostics, below --save-logits.
+    #[arg(long, value_delimiter = ',', requires_all = ["capture_rows", "nll", "window", "save_logits"], conflicts_with = "verify_rows")]
+    capture_layers: Vec<usize>,
+    /// Half-open input-row interval, at most 64 rows in one prefill unit.
+    #[arg(long, requires = "capture_layers", value_parser = capture_rows)]
+    capture_rows: Option<std::ops::Range<usize>>,
 }
 
 struct Reference { tokens: Vec<u32>, hidden: Vec<f32> }
+
+fn capture_rows(value: &str) -> std::result::Result<std::ops::Range<usize>, String> {
+    let (first, end) = value.split_once(':').ok_or("capture rows must be FIRST:END")?;
+    let first = first.parse::<usize>().map_err(|_| "invalid first capture row")?;
+    let end = end.parse::<usize>().map_err(|_| "invalid capture row end")?;
+    if first >= end || end - first > 64 { return Err("capture needs 1..=64 rows".into()); }
+    Ok(first..end)
+}
+
+/// Golden-only owner, attached after startup and armed for one prefill call.
+/// All blocking readback stays here, never in the serving operator off path.
+pub(crate) struct Capture {
+    root: PathBuf,
+    layers: Vec<usize>,
+    rows: std::ops::Range<usize>,
+    call: std::cell::Cell<Option<usize>>,
+    provenance: Value,
+}
+
+fn router_top17(scores: &[f32], bias: &[f32], selected: &[u32]) -> Result<Value> {
+    ensure!(scores.len() == 896 && bias.len() == 896 && selected.len() == 16,
+        "Kimi captured router geometry differs");
+    let corrected = scores.iter().zip(bias).map(|(score, bias)| score + bias).collect::<Vec<_>>();
+    ensure!(corrected.iter().all(|score| score.is_finite()), "nonfinite captured router score");
+    let mut ids = (0..896usize).collect::<Vec<_>>();
+    ids.sort_by(|&a, &b| corrected[b].partial_cmp(&corrected[a]).unwrap().then(a.cmp(&b)));
+    ensure!(ids[..16].iter().copied().eq(selected.iter().map(|&id| id as usize)),
+        "CPU corrected top16 differs from actual GPU selected IDs; do not interpret margin");
+    Ok(serde_json::json!({"ids":&ids[..17],
+        "corrected_scores":ids[..17].iter().map(|&id| corrected[id]).collect::<Vec<_>>(),
+        "margin_16_17":corrected[ids[15]] - corrected[ids[16]], "gpu_top16_equal":true}))
+}
+
+impl Capture {
+    fn new(args: &GoldenArgs, windows: &[cuteafd_bench::reference::Window], capacity: usize,
+        unit_rows: usize, provenance: Value) -> Result<Option<std::rc::Rc<Self>>> {
+        let Some(rows) = args.capture_rows.clone() else { return Ok(None); };
+        ensure!(args.nll && args.verify_rows.is_none() && windows.len() == 1
+            && !args.capture_layers.is_empty() && args.capture_layers.iter().all(|&layer| layer < 93),
+            "Kimi capture requires one prefill window and valid layers");
+        let chunks = forward_chunks(windows[0].tokens.len(), capacity)?;
+        let chunk = chunks.iter().find(|chunk| chunk.contains(&rows.start))
+            .context("capture rows outside live input")?;
+        ensure!(chunk.len() > 64 && rows.end <= chunk.end
+            && (rows.start - chunk.start) / unit_rows == (rows.end - 1 - chunk.start) / unit_rows,
+            "capture rows must fit one >64-row forward and one prefill unit");
+        Ok(Some(std::rc::Rc::new(Self {
+            root: args.save_logits.as_ref().context("capture output missing")?.join("capture"),
+            layers: args.capture_layers.clone(), rows, call: std::cell::Cell::new(None), provenance,
+        })))
+    }
+
+    fn arm(&self, first: usize, rows: usize) {
+        self.call.set((first <= self.rows.start && self.rows.end <= first + rows).then_some(first));
+    }
+
+    pub(crate) fn record(&self, stream: &crate::shared::memory::device::Stream<'_>, mut site: Value,
+        tensors: &[(&str, cuteafd_ffi::CuteafdDeviceBuffer, usize, &str)],
+        bias: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
+        let Some(first) = self.call.get() else { return Ok(()); };
+        let layer = site["layer"].as_u64().context("capture layer absent")? as usize;
+        if !self.layers.contains(&layer) { return Ok(()); }
+        let unit = site["unit_offset"].as_u64().context("capture unit absent")? as usize;
+        let live = site["live_rows"].as_u64().context("capture rows absent")? as usize;
+        if first + unit > self.rows.start || self.rows.end > first + unit + live { return Ok(()); }
+        let start = self.rows.start - first - unit;
+        let rows = self.rows.len();
+        // Hooks run before scratch reuse; drain only this exact producer stream.
+        stream.drain()?;
+        let download = |buffer: cuteafd_ffi::CuteafdDeviceBuffer| stream.device.run(|| {
+            let mut bytes = vec![0; buffer.bytes];
+            stream.device.library.copy_d2h(&mut bytes, buffer)?;
+            Ok(bytes)
+        });
+        let rank = site["rank"].as_u64().context("capture rank absent")?;
+        let kind = site["kind"].as_str().context("capture kind absent")?;
+        let dir = self.root.join(format!("layer-{layer:02}-rank-{rank}-{kind}"));
+        std::fs::create_dir_all(&dir)?;
+        let mut entries = Vec::new();
+        let mut values = Vec::new();
+        for &(name, buffer, width, dtype) in tensors {
+            let element = if dtype == "BF16" { 2 } else { 4 };
+            let buffer = crate::shared::prefix::view(buffer, start * width * element, rows * width * element)?;
+            let bytes = download(buffer)?;
+            let file = format!("{name}.bin");
+            let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(&file))?;
+            std::io::Write::write_all(&mut output, &bytes)?;
+            entries.push(serde_json::json!({"name":name,"file":file,"dtype":dtype,
+                "shape":[rows,width],"byte_order":"little","sha256":digest(&bytes)}));
+            values.push(bytes);
+        }
+        if let Some(bias) = bias {
+            let bias = download(crate::shared::prefix::view(bias, 0, 896 * 4)?)?;
+            let floats = |bytes: &[u8]| bytes.chunks_exact(4)
+                .map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+            let scores = floats(&values[0]);
+            let correction = floats(&bias);
+            let ids = values[1].chunks_exact(4).map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+            let top = (0..rows).map(|row| router_top17(&scores[row*896..(row+1)*896],
+                &correction, &ids[row*16..(row+1)*16])).collect::<Result<Vec<_>>>()?;
+            std::fs::write(dir.join("bias.f32.bin"), &bias)?;
+            site["router"] = serde_json::json!({"score_semantics":"post-GPU-sigmoid; add F32 bias once",
+                "bias_file":"bias.f32.bin","bias_sha256":digest(&bias),"top17":top});
+        }
+        site["schema"] = serde_json::json!("cuteafd.kimi.capture/1");
+        site["call_offset"] = serde_json::json!(first);
+        site["input_rows"] = serde_json::json!([self.rows.start,self.rows.end]);
+        site["tensors"] = serde_json::json!(entries);
+        site["provenance"] = self.provenance.clone();
+        // A metadata file is the completion marker, published only after all data and checks.
+        let out = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("metadata.json"))?;
+        serde_json::to_writer(out, &site)?;
+        Ok(())
+    }
+}
 
 impl GoldenArgs {
     fn ffn_mode(&self) -> cuteafd_ffi::KimiFfnMode {
@@ -326,6 +447,9 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
     use std::io::Write;
     let root = args.save_logits.as_deref().context("--nll requires --save-logits")?;
     std::fs::create_dir(root).context("Kimi logits output must be a new directory")?;
+    let capture = Capture::new(args, windows, capacity, args.prefill()?.unit_rows as usize,
+        args.loaded_provenance(engine.target_view(), ownership))?;
+    if let Some(capture) = &capture { engine.attach_capture(capture.clone())?; }
     let mut records = Vec::new();
     engine.reset_cold_state()?;
     for window in windows {
@@ -342,6 +466,7 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
         probe.provenance(args.loaded_provenance(engine.target_view(), ownership));
         for chunk in chunks {
             let (first, end) = (chunk.start, chunk.end);
+            if let Some(capture) = &capture { capture.arm(first, end - first); }
             let sequences = vec![vec![super::device::SequenceRows {
                 slot: 0, start: first, rows: end - first, pages: &pages }]];
             engine.forward(&[window.tokens[first..end].to_vec()], &sequences, pool,
@@ -670,6 +795,48 @@ mod tests {
                 .filter_map(|(index, arg)| (!(at..at + 2).contains(&index)).then_some(*arg))).is_err());
         }
         assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(["--nll"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn capture_is_bounded_prefill_only_and_checks_actual_router_ids() -> Result<()> {
+        use clap::Parser;
+        let base = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output"];
+        let capture = ["--window", "a00", "--capture-layers", "0,3,14,92", "--capture-rows", "1440:1500"];
+        let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from(
+            base.into_iter().chain(capture))?.command else { panic!("Kimi command"); };
+        assert_eq!(args.capture_layers, [0,3,14,92]);
+        assert_eq!(args.capture_rows, Some(1440..1500));
+        let mut window = cuteafd_bench::reference::Window { id: "a00".into(), block: "a".into(),
+            bucket: "0-2K".into(), tokens: vec![0;1835], roles: vec![], score_from: 1323,
+            top_k: 32, positions: vec![], media: vec![] };
+        assert!(Capture::new(&args, &[window.clone()], 8256, 2752, Value::Null)?.is_some());
+        assert!(Capture::new(&args, &[window.clone()], 1000, 1000, Value::Null)?.is_some());
+        assert!(Capture::new(&args, &[window.clone()], 1460, 1460, Value::Null).is_err());
+        assert!(Capture::new(&args, &[window.clone()], 8256, 1460, Value::Null).is_err());
+        assert!(Capture::new(&args, &[window.clone(),window.clone()], 8256, 2752, Value::Null).is_err());
+        window.tokens.truncate(1450);
+        assert!(Capture::new(&args, &[window], 8256, 2752, Value::Null).is_err());
+        for bad in [vec!["--capture-rows", "0:1"], vec!["--capture-layers", "3"],
+            vec!["--capture-layers", "3", "--capture-rows", "0:65", "--window", "a00"],
+            vec!["--capture-layers", "3", "--capture-rows", "1:1", "--window", "a00"],
+            vec!["--capture-layers", "3", "--capture-rows", "0:1"],
+            capture.into_iter().chain(["--verify-rows", "8"]).collect()] {
+            assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(bad)).is_err());
+        }
+        let scores = vec![0.5f32;896];
+        let mut bias = vec![0.0f32;896];
+        let ids = (0..16).collect::<Vec<u32>>();
+        let top = router_top17(&scores, &bias, &ids)?;
+        assert_eq!(top["ids"], serde_json::json!((0..17).collect::<Vec<_>>()));
+        assert_eq!(top["margin_16_17"], 0.0);
+        bias[16] = 0.25;
+        assert!(router_top17(&scores, &bias, &ids).is_err());
+        let ids = std::iter::once(16).chain(0..15).collect::<Vec<_>>();
+        assert!(router_top17(&scores, &bias, &ids).is_ok());
+        bias[0] = f32::NAN;
+        assert!(router_top17(&scores, &bias, &ids).is_err());
         Ok(())
     }
 
