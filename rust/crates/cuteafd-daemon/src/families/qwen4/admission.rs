@@ -77,7 +77,7 @@ pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize,
         "qwen4", shape.span_rows, cfg.vocab_size as u64) } else { 0 };
     Ok(QwenAdmissionInputs { prefill_shape: args.prefill_shape()?, cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: shape.span_rows,
         slots: args.slots as u64, mark_bytes: marks, full_prefill_logits: logits, ple, future_expert_bytes,
-        headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) })
+        headroom: cuteafd_loader::placement::reserve::gpu("qwen4") })
 }
 
 pub(super) use cuteafd_loader::families::qwen4::StepTableBytes;
@@ -163,6 +163,7 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
         (available as u64, total as u64), pending, enabled, automatic_context, host);
     inputs.loaded_weights = loaded_weights;
     let (placement, solved) = qwen4::admitted(&inputs)?;
+    cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     tracing::info!(pool_tokens = placement.pool_tokens,
         ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
@@ -659,7 +660,7 @@ mod tests {
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
                         slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                         ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30 },
-                    gpus: [GpuBudget { capacity_bytes: capacity, headroom_bytes: 3 << 30,
+                    gpus: [GpuBudget { capacity_bytes: capacity, reserve_bytes: 3 << 30,
                         baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }; 2],
                     layer_weights: &weights, layer_experts: &experts, layer_extra: &extra,
                     fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
@@ -895,7 +896,7 @@ mod tests {
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs {
         resident_weight_limit: None, automatic_context: false, owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
-                    headroom_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
+                    reserve_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
                         - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
                             .map(|item| item.bytes).sum::<u64>() } }),
                 layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,

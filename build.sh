@@ -182,13 +182,12 @@ spark_release_version="${SPARK_EXPERT_DOCKER_INFERENCE##*:}"
 [[ "$spark_release_version" == "$release_version" ]] ||
   release_die "coordinator and Spark inference image release tags must match"
 
-# Spark expert roles are universal by default: the ARM64 (SM121) image carries the
-# TP2, TP3 and TP6 replicated-group shards on top of the always-built TP4 shard,
-# so one published pair serves every approved native topology (TP4EP1, TP2EP2,
-# TP2EP3, TP3EP2, TP6EP1) and ./run.sh selects the mode. The x86_64 coordinator
-# needs no Spark role: roles are expert-only, so it is topology-independent.
-# CUTEAFD_RELEASE_SPARK_TP_ROLES is an explicit SUBSET override for a bounded
-# topology A/B or a legacy TP4-only rebuild (empty).
+# Spark expert roles are universal by default: the ARM64 (SM121) image carries
+# every other native Spark TP shard on top of the always-built TP4 shard, so one
+# published pair serves every planned Spark count and ./run.sh requires the role
+# the plan names. The x86_64 coordinator needs no Spark role: roles are
+# expert-only. CUTEAFD_RELEASE_SPARK_TP_ROLES is an explicit SUBSET override for
+# a bounded A/B or a legacy TP4-only rebuild (empty).
 # release-spark-tp-roles:start
 release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"
 # `${VAR-default}`, not `:-`, so an explicitly empty override stays the legacy
@@ -196,10 +195,10 @@ release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"
 spark_tp_roles="$(release_spark_tp_roles_canonical \
   "${CUTEAFD_RELEASE_SPARK_TP_ROLES-$release_universal_spark_tp_roles}")"
 [[ "$spark_tp_roles" == "$release_universal_spark_tp_roles" ]] ||
-  echo "== NON-UNIVERSAL expert role subset '${spark_tp_roles:-<none>}'; this pair cannot serve every approved native topology =="
+  echo "== NON-UNIVERSAL expert role subset '${spark_tp_roles:-<none>}'; this pair cannot serve every planned Spark count =="
 # Repeated by --dry-run and the build summary so a subset build is never mistaken
 # for the universal default.
-spark_tp_roles_note='universal, covers every approved native topology'
+spark_tp_roles_note='universal, covers every planned Spark count'
 [[ "$spark_tp_roles" == "$release_universal_spark_tp_roles" ]] ||
   spark_tp_roles_note='explicit subset, not universal'
 # release-spark-tp-roles:end

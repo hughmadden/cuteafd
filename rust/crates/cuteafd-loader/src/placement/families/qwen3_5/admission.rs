@@ -60,7 +60,7 @@ pub fn forecast_budgets(physical: &ArchContext, capacity: u64, module_bytes: u64
                     format!("{}; physical capacity assumes nominal 32 GiB (CUDA total unmeasured)", physical.source)
                 } else { physical.source.into() },
                 assumed: physical.source.contains("5090") },
-            headroom: 1 << 30,
+            headroom: crate::placement::reserve::gpu("qwen3_5"),
         },
         Budget {
             id: "host".into(),

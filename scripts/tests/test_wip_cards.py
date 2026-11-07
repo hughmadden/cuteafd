@@ -31,7 +31,7 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
         'spark_roles': [dict(rank=i, experts=True, audio_encoder=bool((job.get('needs') or {}).get('audio')))
                         for i in range(len(job['entry'].get('sparks', [])))],
-        'artifact_requirements': {'spark_tp_role': (job.get('needs') or {}).get('tp_role')}})
+        'artifact_requirements': {'spark_packages': {}, 'spark_tp_role': (job.get('needs') or {}).get('tp_role')}})
     bin_dir = tmp_path / '.cuteafd-test-bin'
     bin_dir.mkdir(exist_ok=True)
     cuteafd_bin = bin_dir / 'cuteafd'
@@ -1559,9 +1559,9 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
     assert values['MODEL_ID'] == 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
     expected = {
         'RTX_GPUS': '1', 'COORDINATOR_GPUS': '0',
-        'COORDINATOR_GPU_BUDGET_GIB': '31.8', 'SPARK_INTAKE': 'pinned',
+        'GPU_MEMORY_CAP': '31.8GiB', 'SPARK_INTAKE': 'pinned',
         'MAX_CONTEXT_TOKENS': '1048576',
-        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
+        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4',
     }
     assert {key: values[key] for key in expected} == expected
     # The prefill reserve is the planner's (TJ 2026-10-27): no row pin.
@@ -1879,7 +1879,7 @@ def _slot_with_roles(roles, verified=True, nvfp4=(), error=None):
     ([], False, 'TP manifest hash mismatch', 'cannot attest Spark TP role tp3: TP manifest hash mismatch'),
 ])
 def test_preflight_validates_attested_spark_tp_roles_before_enqueue(tmp_path, monkeypatch, roles, verified, error, message):
-    """#98: the card-derived Spark TP (v41-flash-min: SPARK_TP=3) must be attested by
+    """#98: the card-derived Spark TP (v41-flash-min: three Sparks, TP3) must be attested by
     every rank's slot before enqueue, as the launcher refuses it at launch."""
     gate = ROOT / 'scripts/bench/kits/gate'
     argv = ['--kit', str(gate), '--cards', 'v41-flash-min', '--matrix', '--arm', 'c=x:s',
@@ -1916,12 +1916,11 @@ def test_attested_spark_tp_roles_are_checked_again_at_grant(tmp_path, monkeypatc
 
 @pytest.mark.parametrize('keys,role', [
     ({'SPARK_COUNT': '4'}, None),
-    ({'SPARK_COUNT': '3', 'SPARK_TP': '3', 'SPARK_EP': '1'}, 'tp3'),
-    ({'SPARK_COUNT': '6', 'SPARK_TP': '6', 'SPARK_EP': '1'}, 'tp6'),
-    ({'SPARK_COUNT': '4', 'SPARK_TP': '2', 'SPARK_EP': '2'}, 'tp2'),
-    ({'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1'}, None),
     # A native count other than 4 is TP=count at launch.
+    ({'SPARK_COUNT': '3'}, 'tp3'),
+    ({'SPARK_COUNT': '5'}, 'tp5'),
     ({'SPARK_COUNT': '6'}, 'tp6'),
+    ({'SPARK_COUNT': '8'}, 'tp8'),
     ({'SPARK_COUNT': '2', 'EXPERT_FORMAT': 'exl3'}, None),
     ({'SPARK_COUNT': '0'}, None),
 ])
@@ -3229,3 +3228,128 @@ def test_deployment_preflight_checks_only_assigned_spark_roles(entry, tmp_path, 
     cards.assert_absent(job)
     assert len(seen) == len(checked)
     assert all(host in str(seen) for host in checked if host != 'raptor')
+
+
+@pytest.mark.parametrize('tp', [5, 6])
+def test_ml4_preflight_requires_exact_rank_packages(entry, tmp_path, monkeypatch, tp):
+    card = {**entry, 'name': 'ml4-card', 'family': 'mistral_large4',
+            'sparks': list(cards.HOSTS[:tp]), 'set': {'SPARK_COUNT': str(tp)}}
+    job = make(card, tmp_path)
+    package = 'exl3/exl3-ml4-k45'
+    job['needs'] = dict(coordinator=[package], spark=[package], audio=False)
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
+        'spark_roles': [dict(rank=i, experts=True) for i in range(tp)], 'artifact_requirements': {}})
+    layouts = cards.exl3_spark_layouts('ml4:exl3-k45', tp)
+    variants = [f'{package}/{layout}' for layout in layouts]
+    def slot(arm, host):
+        return json.dumps(dict(slot='s', seal_sha256='f07142-seal', artifact_manifest_sha256='art',
+            contents=dict(packages=[package], spark_variants=variants, audio=False)))
+    monkeypatch.setattr(cards, 'slot_check', slot)
+    cards.preflight_job(job, dict(instance='test', slot='s'))
+    # A registered package and balanced aliases do not prove the compact export.
+    variants.remove(f'{package}/{layouts[-1]}')
+    variants.append(f'{package}/tp{tp}-rank{tp-1}/m1' if tp == 5 else f'{package}/tp5-rank0/m1')
+    with pytest.raises(ValueError) as error:
+        cards.preflight_job(job, dict(instance='test', slot='s'))
+    message = str(error.value)
+    assert all(text in message for text in ('ml4-card', 'mistral_large4', layouts[-1], 'f07142-seal'))
+
+
+def test_ml4_min_max_scope_union_includes_both_counts():
+    selected = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['ml4-exl3-min', 'ml4-exl3-max'])
+    scope = cards.build_scopes(selected)
+    assert set(scope['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {'ml4=5', 'ml4=6'}
+    assert cards.exl3_spark_layouts('ml4:exl3-k45', 5) == [f'tp5-compact-rank{rank}/m1' for rank in range(5)]
+    assert cards.exl3_spark_layouts('ml4:exl3-k45', 6) == [f'tp6-rank{rank}/m1' for rank in range(6)]
+
+
+def test_scope_and_package_needs_share_global_arm_settings(entry, tmp_path):
+    entry.update(family='mistral_large4')
+    Path(entry['config']).write_text('SPARK_COUNT=4\nSPARK_TP=4\n')
+    variant = cards.resolved_card(entry, {'SPARK_COUNT': '5'}, {'SPARK_TP'})
+    assert variant['resolved_values']['SPARK_COUNT'] == '5'
+    assert 'SPARK_TP' not in variant['resolved_values']
+    assert cards.build_scopes([variant])['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'ml4=5'
+    assert cards.slot_needs(variant)['spark'] == ['exl3/exl3-ml4-k45']
+    assert 'SPARK_TP' not in make(variant, tmp_path)['entry']['set']
+
+
+def test_shared_launcher_package_verifier_requires_every_rank(tmp_path):
+    spec = importlib.util.spec_from_file_location('spark_preflight', ROOT / 'scripts/launch/preflight-spark-packages.py')
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    package = 'exl3/exl3-ml4-k45'
+    layouts = cards.exl3_spark_layouts('ml4:exl3-k45', 5)
+    for layout in layouts[:-1]:
+        directory = tmp_path / package / layout
+        directory.mkdir(parents=True)
+        (directory / 'libcuteafd_exl3.so').touch()
+    with pytest.raises(ValueError, match='tp5-compact-rank4/m1'):
+        verifier.verify(tmp_path, {package: layouts}, 'ml4 seal fixture')
+    directory = tmp_path / package / layouts[-1]
+    directory.mkdir(parents=True)
+    (directory / 'libcuteafd_exl3.so').touch()
+    verifier.verify(tmp_path, {package: layouts}, 'ml4 seal fixture')
+
+
+def test_seal_inventory_reads_libraries_not_registered_directories(tmp_path):
+    root = tmp_path / 'wip'
+    slot = _sealed_slot(root)
+    artifacts = slot / 'workspace/.cuteafd-wip'
+    good = artifacts / 'exl3/exl3-ml4-k45/tp5-compact-rank0/m1'
+    good.mkdir(parents=True)
+    (good / 'libcuteafd_exl3.so').touch()
+    (artifacts / 'exl3/exl3-ml4-k45/tp5-compact-rank1/m1').mkdir(parents=True)
+    meta = json.loads(cards.slot_check(dict(instance='inst', slot='s', root=str(root)), 'raptor'))
+    assert meta['contents']['spark_variants'] == ['exl3/exl3-ml4-k45/tp5-compact-rank0/m1']
+
+
+def test_global_count_override_builds_and_launches_same_topology(entry, tmp_path, monkeypatch):
+    entry['family'] = 'mistral_large4'
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    seen = []
+    monkeypatch.setattr(cards, 'build_arms', lambda builds, arms, selected, *args: seen.extend(selected))
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', entry['name'],
+        '--matrix', '--arm', 'c=test:s', '--arm-set', 'c:SPARK_COUNT=5', '--state', str(state), '--dry-run'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    assert job['entry']['set']['SPARK_COUNT'] == '5'
+    assert len(job['entry']['sparks']) == 5
+    assert cards.build_scopes(seen)['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'ml4=5'
+
+
+def test_release_preflight_verifies_exact_packages_without_gpu(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    package = 'exl3/exl3-ml4-k45'
+    monkeypatch.setattr(cards, 'preflight_deployment', lambda *args: {
+        'spark_roles': [dict(rank=0, experts=True)],
+        'artifact_requirements': {'spark_packages': {package: ['tp5-compact-rank4/m1']}}})
+    monkeypatch.setattr(cards, 'slot_check', lambda *args: json.dumps(dict(image='image:tag', image_id='digest', repo_digests=[])))
+    commands = []
+    def run(command, **kwargs):
+        commands.append(command)
+        assert '--gpus' not in str(command)
+        assert 'tp5-compact-rank4/m1' in str(command)
+        assert 'def verify(' in kwargs['input']
+        raise subprocess.CalledProcessError(2, command, stderr='missing Spark package tp5-compact-rank4/m1')
+    monkeypatch.setattr(cards, 'run', run)
+    with pytest.raises(ValueError, match='missing Spark package tp5-compact-rank4/m1'):
+        cards.preflight_job(job, dict(release='v4.1.2'))
+    assert len(commands) == 1
+
+
+@pytest.mark.parametrize('attested,refused', [([], True), (['tp3', 'tp6'], True), (['tp7'], False)])
+def test_unequal_v41_world_needs_its_own_attested_role(attested, refused):
+    """A V4.1 TP7 card (adjacent-width packages) is refused before enqueue unless
+    every rank's slot attests tp7 itself; another world's role never stands in."""
+    card = dict(name='v', family='deepseek_v41', config='', set={'SPARK_COUNT': '7'}, sparks=[])
+    assert cards.v41_tp_role(card, {'SPARK_COUNT': '7'})['tp_role'] == 'tp7'
+    problems = cards.tp_role_problems('kiwi', 's', 'tp7', False,
+        dict(tp_roles=dict(roles=attested, verified=True, nvfp4=[], error=None)))
+    assert bool(problems) == refused, problems
+    if refused:
+        assert 'not tp7' in problems[0] and 'CUTEAFD_WIP_SPARK_TP_ROLES=tp7' in problems[0]
+    # A slot with no role manifest at all is refused too (the #1105 shape).
+    missing = cards.tp_role_problems('kiwi', 's', 'tp7', False, dict(tp_roles=None))
+    assert missing and 'has no V41_EXPERT_TP_AOT.json' in missing[0]

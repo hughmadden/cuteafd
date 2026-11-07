@@ -140,7 +140,7 @@ int32_t cuteafd_v41_expert_bind_scratch(void* kernel, void* storage,
 int32_t cuteafd_v41_expert_initialize_scratch_async(void* kernel, void* storage,
     uint64_t bytes, void* stream);
 
-/* Replicated-group Spark TP2/TP3/TP6 shard families (native FP8 K32, SM121 only).
+/* Spark TP2/TP3/TP6 shard families (native FP8 K32, SM121 only).
  * Same per-call contract as cuteafd_v41_expert_*, but a distinct symbol family
  * and role id per TP degree (5: TP2 logical intermediate 1152; 6: TP3 768;
  * 7: TP6 384). All are unpadded (kernel_intermediate == logical_intermediate).
@@ -220,7 +220,7 @@ int32_t cuteafd_reduce_compact_bf16_async(const uint16_t* const planes[4],
  * Same alias/lifetime rules as TP4 above; no allocation or synchronization. */
 int32_t cuteafd_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2],
     const uint16_t* shared, uint16_t* output, uint32_t rows, void* stream);
-/* Replicated-group compact reduction: sum ranks BF16 [rows,hidden] planes
+/* Spark compact reduction: sum ranks BF16 [rows,hidden] planes
  * in physical-rank order in FP32, add optional shared once and round once to
  * BF16. planes is a host array of eight device pointers; ranks is in 1..8.
  * Active pointers must be aligned and non-null; inactive slots must be null.

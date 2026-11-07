@@ -1760,7 +1760,7 @@ mod tests {
             let remote = (3..91).filter(|&layer| !ownership.onboarded(layer)).collect::<Vec<_>>();
             let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
                 "checkpoint": "0".repeat(64), "geometry": [4096, 352, 8, 1536, 91],
-                "world": sparks, "topology": [sparks, 1], "ownership_wire": false,
+                "world": sparks,
             }))?;
             let loaded = WorkerSelection::new(identity.clone(), &remote)?;
             let variants = cuteafd_core::Exl3RowPolicy::Nearest.capacities(64)?.into_iter()

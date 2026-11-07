@@ -15,7 +15,7 @@ use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
-use cuteafd_transport::expert::{BackboneRequest, SparkTopology, SparkWorld};
+use cuteafd_transport::expert::{BackboneRequest, SparkWorld};
 use std::{path::PathBuf, sync::{mpsc, Arc}, thread};
 
 pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> {
@@ -48,21 +48,6 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
             loop { thread::park(); }
         }).await.context("encoder-only owner failed")?;
     }
-    let topology = crate::shared::spark_topology::resolve(
-        args.spark_tp,
-        args.spark_ep,
-        args.world as usize,
-        "expertd-native",
-    )?;
-    if let Some(topology) = topology {
-        ensure!(
-            (args.rank as usize) < topology.world_size(),
-            "expertd-native rank {} is outside the {}x{} topology",
-            args.rank,
-            topology.tp(),
-            topology.ep()
-        );
-    }
     if args.exlr8_manifest.is_none() {
         ensure!(
             args.exlr8_prefill_activations == crate::shared::experts::exlr8::Exlr8PrefillActivations::A16,
@@ -86,8 +71,8 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         device_budget: args.device_budget_bytes,
         max_frame_bytes: 0,
         rdma_endpoints: 0,
-        declared_world: crate::shared::spark_topology::world(topology, args.world as usize)?,
-        native_spark_roles: false,
+        declared_world: crate::shared::spark_topology::world(args.world as usize)?,
+        native_spark_roles: NativeSparkRoles::None,
         bf16_ingress: false,
         encoder,
         audio_encoder,
@@ -121,12 +106,30 @@ pub(crate) struct NativeExpertServiceConfig {
     pub max_frame_bytes: usize,
     /// Explicit selected-family connection geometry, never inferred from a different family.
     pub rdma_endpoints: usize,
-    /// Physical topology and request encoding resolved before worker startup.
+    /// Physical rank world resolved before worker startup.
     pub declared_world: SparkWorld,
-    /// Native Flash's TP2 kernel uses the Spark shard role with legacy wire
-    /// requests. Set only after catalog validation, never from a CLI override.
-    native_spark_roles: bool,
+    /// Which native Spark TP roles this checkpoint's experts use. Set only
+    /// after catalog validation, never from a CLI override.
+    native_spark_roles: NativeSparkRoles,
     bf16_ingress: bool,
+}
+
+/// The native Spark TP role family a checkpoint's experts select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeSparkRoles {
+    /// EXL3, FP8 and EXLR8 load through their own workers.
+    None,
+    /// Native MXFP4 W4A8 TP slices at every packaged width.
+    Mxfp4,
+    /// ModelOpt NVFP4 W4A4 slices (TP3/TP6 roles; TP2 keeps its own layout).
+    Nvfp4,
+}
+
+impl NativeSparkRoles {
+    pub(super) fn of(catalog: &OfficialV41Catalog) -> Self {
+        if catalog.exl3().is_some() || catalog.fp8().is_some() { Self::None }
+        else if catalog.nvfp4().is_some() { Self::Nvfp4 } else { Self::Mxfp4 }
+    }
 }
 
 fn admit_worker_peak(library: &NativeLibrary, load_peak: usize, serve_peak: usize) -> Result<()> {
@@ -202,54 +205,10 @@ fn load_weights<'a>(
     );
     // Every layout admits the unified-pool peak before allocation. Pinned host
     // staging, read scratch and exchange storage compete with device weights on
-    // GB10; explicit topologies also enforce the configured reservation below.
+    // GB10.
     let budget = spark_admission_budget(config, resident, staging, pinned_host,
         read_scratch, workspace)?;
     admit_worker_peak(library, budget.load_peak, budget.serve_peak)?;
-    if let Some(topology) = config.declared_world.ownership_topology() {
-        ensure!(
-            budget.load_peak <= config.device_budget
-                && budget.serve_peak <= config.device_budget,
-            "explicit {}x{} Spark admission exceeds the {}-byte device budget: \
-             resident {} + load peak {} / serve peak {}",
-            topology.tp(),
-            topology.ep(),
-            config.device_budget,
-            resident,
-            budget.load_peak,
-            budget.serve_peak
-        );
-        // A configured budget above the real pool must not admit more than the
-        // startup measurement can hold. The OS reserve stays outside this budget
-        // by construction; page-cache bytes are reclaimable and are not added.
-        // This is a safety gate, so a failed query fails closed instead of
-        // silently skipping the real-availability check.
-        let free = library.cuda_allocatable_memory_info().context("query Spark memory for admission")?.0;
-        ensure!(
-            budget.load_peak <= free && budget.serve_peak <= free,
-            "explicit replicated Spark admission needs {} bytes at load / {} at serve \
-             but only {free} bytes are actually available",
-            budget.load_peak,
-            budget.serve_peak
-        );
-        tracing::info!(
-            rank = config.rank,
-            resident_bytes = resident,
-            staging_bytes = staging,
-            pinned_host_bytes = pinned_host,
-            read_scratch_bytes = read_scratch,
-            workspace_bytes = workspace,
-            exchange_bytes = budget.exchange,
-            row_indices_bytes = budget.row_indices,
-            endpoint_staging_bytes = budget.endpoint_staging,
-            ring_bytes = budget.rings,
-            runtime_headroom_bytes = budget.headroom,
-            load_peak_bytes = budget.load_peak,
-            serve_peak_bytes = budget.serve_peak,
-            device_budget_bytes = config.device_budget,
-            "explicit Spark replicas admission"
-        );
-    }
     if let Some(stream) = push {
         if let Some(weights) = push_native::load(library, catalog, config, resident, stream)? {
             return Ok((backend::Weights::Full(weights), config.device_budget - resident));
@@ -489,7 +448,6 @@ fn log_spark_memory(
         rank = config.rank,
         stage,
         topology = ?config.declared_world.topology(),
-        wire = ?config.declared_world.wire(),
         owned_connections = ?owned_connections,
         cuda_free_bytes = cuda.map(|(free, _)| free),
         cuda_free_scope = "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache, use host MemAvailable for admission",
@@ -561,7 +519,7 @@ mod tests {
                     let planned = |group: &str| device.items.iter().find(|i| i.group == group)
                         .unwrap_or_else(|| panic!("pro={pro} {input:?} {}: no {group}", device.name())).bytes;
                     // Match the coordinator's heterogeneous decode/prefill endpoint admission.
-                    let mut worker = config(ranks, device.index as usize, None);
+                    let mut worker = config(ranks, device.index as usize);
                     worker.capacity = capacity;
                     worker.rdma_endpoints = 2;
                     worker.bf16_ingress = input.bf16(false);
@@ -588,7 +546,7 @@ mod tests {
         }
     }
 
-    fn config(world: usize, rank: usize, topology: Option<SparkTopology>) -> NativeExpertServiceConfig {
+    fn config(world: usize, rank: usize) -> NativeExpertServiceConfig {
         NativeExpertServiceConfig {
             attention: Default::default(),
             library: PathBuf::from("/native.so"),
@@ -612,8 +570,8 @@ mod tests {
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
             rdma_endpoints: 2,
-            declared_world: crate::shared::spark_topology::world(topology, world).unwrap(),
-            native_spark_roles: false,
+            declared_world: crate::shared::spark_topology::world(world).unwrap(),
+            native_spark_roles: NativeSparkRoles::None,
             bf16_ingress: false,
             encoder: None,
             audio_encoder: None,
@@ -646,7 +604,7 @@ mod tests {
         let _identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(&snapshot,
             geometry, SparkWorld::canonical(6)?)?;
         sample("identity")?;
-        let mut worker = config(6, 0, None);
+        let mut worker = config(6, 0);
         worker.snapshot = snapshot;
         worker.selected_layers = Some((6..93).collect());
         validate_topology(&worker, &catalog)?;
@@ -679,7 +637,7 @@ mod tests {
             let mut worst_peak = 0;
             for rank in 0..6 {
                 for capacity in [512, 4096] {
-                    let mut worker = config(6, rank, None);
+                    let mut worker = config(6, rank);
                     worker.capacity = capacity;
                     worker.rdma_endpoints = 1;
                     worker.selected_layers = Some(layers.clone());
@@ -736,7 +694,7 @@ mod tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
         let admit = |world| -> Result<()> {
-            let mut config = config(world, 0, None);
+            let mut config = config(world, 0);
             // Sparse header fixture and no native library: this is the production
             // admission boundary before package warming or weight allocation.
             assert!(!config.library.exists());
@@ -761,7 +719,7 @@ mod tests {
         let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
         let shape = catalog.routed_experts();
-        let mut worker = config(4, 0, None);
+        let mut worker = config(4, 0);
         worker.snapshot = snapshot.clone();
         worker.exlr8_manifest = Some("up1".into());
         for endpoint in &mut worker.model_admission.as_mut().unwrap().endpoints {
@@ -780,8 +738,8 @@ mod tests {
         local::admit_worker_selection(&mut worker, &valid, &catalog)?;
         assert_eq!(worker.resident_layers(shape.layers)?, valid.layers());
         assert!(local::admit_worker_selection(&mut worker, &dense, &catalog).is_err());
-        let mut owned = config(4, 0, Some(SparkTopology::NATIVE_TP4_EP1));
-        assert!(local::admit_worker_selection(&mut owned, &valid, &catalog).is_err());
+        let mut other_world = config(6, 0);
+        assert!(local::admit_worker_selection(&mut other_world, &valid, &catalog).is_err());
         // Idle identity acknowledgement intentionally needs no storage recipe.
         local::admit_worker_selection(&mut worker, &idle, &catalog)?;
         assert!(worker.resident_layers(shape.layers)?.is_empty());
@@ -800,44 +758,37 @@ mod tests {
     }
 
     #[test]
-    fn explicit_topology_maps_every_physical_rank_to_its_local_shard() {
-        for (tp, ep) in [(2u8, 1u8), (3, 1), (4, 1), (2, 2), (3, 2), (2, 3), (6, 1)] {
-            let topology = SparkTopology::new(tp, ep).unwrap();
-            for rank in 0..topology.world_size() {
-                let selection = config(topology.world_size(), rank, Some(topology))
-                    .selection(7)
-                    .unwrap();
+    fn native_worlds_map_every_rank_to_its_spark_tp_shard() {
+        for world in [2usize, 3, 4, 5, 6, 7, 8] {
+            for rank in 0..world {
+                let mut native = config(world, rank);
+                native.native_spark_roles = NativeSparkRoles::Mxfp4;
+                let selection = native.selection(7).unwrap();
                 assert_eq!(selection.layer(), 7);
-                if tp == 4 {
-                    assert_eq!(selection, ExpertLayer::Backbone { layer: 7, rank: rank });
-                } else {
-                    assert_eq!(
-                        selection,
-                        ExpertLayer::BackboneReplicatedTp {
-                            layer: 7,
-                            rank: rank % tp as usize,
-                            world: tp as usize,
-                        }
-                    );
-                    assert_eq!(selection.role(), match tp {
-                        2 => crate::shared::spark_topology::SPARK_TP2_ROLE,
-                        3 => crate::shared::spark_topology::SPARK_TP3_ROLE,
-                        // Pure TP6EP1 is its own native shard family: six
-                        // disjoint intermediate slices of every expert.
-                        6 => crate::shared::spark_topology::SPARK_TP6_ROLE,
-                        other => panic!("unexpected explicit TP degree {other}"),
-                    });
-                    assert_eq!(
-                        selection.expert(3),
-                        cuteafd_loader::V41ExpertSelection::BackboneTp {
-                            layer: 7,
-                            expert: 3,
-                            rank: rank % tp as usize,
-                            world: tp as usize,
-                        }
-                    );
+                if world == 4 {
+                    assert_eq!(selection, ExpertLayer::Backbone { layer: 7, rank });
+                    continue;
                 }
+                assert_eq!(selection, ExpertLayer::BackboneSparkTp { layer: 7, rank, world });
+                assert_eq!(selection.expert(3),
+                    cuteafd_loader::V41ExpertSelection::BackboneTp { layer: 7, expert: 3, rank, world });
+                if let Some(role) = match world {
+                    2 => Some(crate::shared::spark_topology::SPARK_TP2_ROLE),
+                    3 => Some(crate::shared::spark_topology::SPARK_TP3_ROLE),
+                    6 => Some(crate::shared::spark_topology::SPARK_TP6_ROLE),
+                    _ => None,
+                } { assert_eq!(selection.role(), role, "TP{world}"); }
             }
+        }
+        // NVFP4 serves its TP3/TP6 Spark roles on the canonical wire; TP2 keeps
+        // its own layout and TP4 the legacy shard.
+        for (world, expected) in [(2, ExpertLayer::BackboneTp2 { layer: 7, rank: 1 }),
+            (3, ExpertLayer::BackboneSparkTp { layer: 7, rank: 1, world: 3 }),
+            (4, ExpertLayer::Backbone { layer: 7, rank: 1 }),
+            (6, ExpertLayer::BackboneSparkTp { layer: 7, rank: 1, world: 6 })] {
+            let mut nvfp4 = config(world, 1);
+            nvfp4.native_spark_roles = NativeSparkRoles::Nvfp4;
+            assert_eq!(nvfp4.selection(7).unwrap(), expected, "NVFP4 TP{world}");
         }
     }
 
@@ -845,7 +796,7 @@ mod tests {
     fn spark_exl3_uses_compressed_shards_for_every_registered_world() {
         for world in [1, 2, 3, 4, 6] {
             for rank in 0..world {
-                assert_eq!(config(world, rank, None).exl3_selection(7).unwrap(),
+                assert_eq!(config(world, rank).exl3_selection(7).unwrap(),
                     ExpertLayer::BackboneExl3Tp { layer: 7, rank, world });
             }
         }
@@ -853,10 +804,9 @@ mod tests {
 
     #[test]
     fn canonical_tp1_selects_whole_exl3_experts_and_rank_package() {
-        let one = config(1, 0, None);
+        let one = config(1, 0);
         assert_eq!(one.selection(7).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world: 1 });
         assert!(one.selection(7).unwrap().role() > 7);
-        assert_eq!(one.native_group().unwrap(), None);
         assert!(one.exl3_directory_for(&[4, 5], "tp1-rank0").ends_with("tp1-rank0"));
         assert!(one.exl3_directory_for(&[4, 5], "tp6-compact-rank0").ends_with("tp6-compact-rank0"));
         let mut explicit = one;
@@ -867,77 +817,43 @@ mod tests {
     #[test]
     fn unqualified_transport_worlds_are_rejected_before_shard_selection() {
         for world in [0, cuteafd_core::MAX_SPARK_WORLD + 1] {
-            assert!(crate::shared::spark_topology::world(None, world).is_err(), "TP{world}");
+            assert!(crate::shared::spark_topology::world(world).is_err(), "TP{world}");
         }
         for world in [5, 7, 8] {
             for rank in 0..world {
-                assert_eq!(config(world, rank, None).selection(7).unwrap(),
+                assert_eq!(config(world, rank).selection(7).unwrap(),
                     ExpertLayer::BackboneExl3Tp { layer: 7, rank, world });
             }
         }
     }
 
     #[test]
-    fn canonical_selection_is_unchanged_and_topology_must_agree() {
-        assert_eq!(config(4, 3, None).selection(2).unwrap(), ExpertLayer::Backbone { layer: 2, rank: 3 });
-        assert_eq!(config(2, 1, None).selection(2).unwrap(), ExpertLayer::BackboneTp2 { layer: 2, rank: 1 });
-        // Canonical TP3 selects generic compressed shards independently of
-        // the ownership-wire native TP3 shard family.
-        assert_eq!(
-            config(3, 2, None).selection(2).unwrap(),
-            ExpertLayer::BackboneExl3Tp { layer: 2, rank: 2, world: 3 }
-        );
-        // The explicit topology must match the launched rank count.
-        let topology = SparkTopology::new(2, 2).unwrap();
-        let mut mismatch = config(4, 0, Some(topology));
+    fn canonical_selection_is_unchanged_and_world_must_agree() {
+        assert_eq!(config(4, 3).selection(2).unwrap(), ExpertLayer::Backbone { layer: 2, rank: 3 });
+        assert_eq!(config(2, 1).selection(2).unwrap(), ExpertLayer::BackboneTp2 { layer: 2, rank: 1 });
+        // A non-native TP3 selects generic compressed shards.
+        assert_eq!(config(3, 2).selection(2).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 2, rank: 2, world: 3 });
+        let mut mismatch = config(4, 0);
         mismatch.world = 6;
         assert!(mismatch.spark_world().is_err());
-        // A rank outside the topology is rejected before selection is used.
-        assert!(config(4, 4, Some(topology)).selection(0).is_err());
-        // A native three-rank launch therefore has to carry its topology: the
-        // explicit path stays on the native shard family, never the EXL3 layer.
-        let tp3ep1 = SparkTopology::new(3, 1).unwrap();
-        assert_eq!(
-            config(3, 2, Some(tp3ep1)).selection(2).unwrap(),
-            ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 2, world: 3 }
-        );
-    }
-
-    #[test]
-    fn canonical_exl3_keeps_shards_packages_and_rejects_ownership_wire() {
+        assert!(config(4, 4).selection(0).is_err());
         for rank in 0..3 {
-            let canonical = config(3, rank, None);
-            assert_eq!(canonical.exl3_selection(7).unwrap(),
+            assert_eq!(config(3, rank).exl3_selection(7).unwrap(),
                 ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
-            assert!(canonical.exl3_directory_for(&[2, 3], &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
-            assert_eq!(canonical.native_group().unwrap(), None);
-            let owned = config(3, rank, Some(SparkTopology::NATIVE_TP3_EP1));
-            assert!(owned.exl3_selection(7).unwrap_err().to_string().contains("canonical Spark wire"));
-            assert_eq!(owned.native_group().unwrap(), Some(0));
+            assert!(config(3, rank).exl3_directory_for(&[2, 3], &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
         }
-        let config = config(6, 0, Some(SparkTopology::NATIVE_TP3_EP2));
-        assert!(config.exl3_selection(7).is_err());
-    }
-
-    #[test]
-    fn native_canonical_worlds_select_native_roles_without_changing_wire_protocol() {
+        let geometry = cuteafd_core::expert_geometry();
         for family in ["v41", "dsv4f", "dsv4p"] {
             for world in cuteafd_core::tp_units::spark_package_worlds(family, "mxfp4") {
                 for rank in 0..world {
-                    let mut native = config(world, rank, None);
-                    native.native_spark_roles = true;
+                    let mut native = config(world, rank);
+                    native.native_spark_roles = NativeSparkRoles::Mxfp4;
                     let layer = native.selection(7).unwrap();
-                    let expected = if world == 4 { ExpertLayer::Backbone { layer: 7, rank } }
-                        else { ExpertLayer::BackboneReplicatedTp { layer: 7, rank, world } };
-                    assert_eq!(layer, expected, "{family} TP{world} rank {rank}");
-                    let geometry = cuteafd_core::expert_geometry();
                     let shard = layer.native_shard().unwrap();
                     let artifacts = cuteafd_core::tp_units::native_spark_artifacts(
                         geometry.hidden as usize, geometry.intermediate as usize, world).unwrap();
                     let artifact = artifacts.iter().find(|artifact| artifact.logical == shard.width).unwrap();
-                    assert_eq!(layer.role(), artifact.role);
-                    assert!(native.declared_world.ownership_topology().is_none());
-                    assert_eq!(native.native_group().unwrap(), None);
+                    assert_eq!(layer.role(), artifact.role, "{family} TP{world} rank {rank}");
                 }
             }
         }
@@ -948,7 +864,7 @@ mod tests {
     #[test]
     fn exl3_compact_shard_reports_no_native_role() {
         for rank in 0..3 {
-            let shard = config(3, rank, None).selection(7).unwrap();
+            let shard = config(3, rank).selection(7).unwrap();
             assert_eq!(shard.layer(), 7);
             // Native roles occupy 0..=7; the sentinel is outside that range, so
             // every `info.role == layer.role()` guard fails loudly instead of
@@ -968,9 +884,8 @@ mod tests {
     /// Both phase peaks include the shared measured-residual estimate, alongside
     /// their own disjoint source-known transient and retained owners.
     #[test]
-    fn explicit_admission_counts_every_known_transient_exactly() {
-        let topology = SparkTopology::new(2, 2).unwrap();
-        let mut config = config(4, 0, Some(topology));
+    fn worker_admission_counts_every_known_transient_exactly() {
+        let mut config = config(4, 0);
         config.capacity = 4096;
         set_model(&mut config, 4096, false, 2);
         let headroom = spark_runtime_headroom().unwrap();
@@ -993,7 +908,7 @@ mod tests {
 
     #[test]
     fn typed_owner_workspace_charges_one_prefill_scratch_and_retained_staging() -> Result<()> {
-        let mut config = config(4, 0, None);
+        let mut config = config(4, 0);
         let model = config.model_admission.as_mut().unwrap();
         model.executions = cuteafd_core::SparkExecutions::admit(&[64, 80], 4096, 2752, 3,
             &[1, 80, 4096])?;
@@ -1050,9 +965,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_admission_peak_overflow_is_rejected() {
-        let topology = SparkTopology::new(3, 2).unwrap();
-        let mut config = config(6, 0, Some(topology));
+    fn worker_admission_peak_overflow_is_rejected() {
+        let mut config = config(6, 0);
         config.capacity = 16;
         assert!(spark_admission_budget(&config, usize::MAX, 1, 0, 0, 0).is_err());
         assert!(spark_admission_budget(&config, 1, usize::MAX, 1, 1, 1).is_err());
@@ -1084,7 +998,7 @@ mod tests {
             prefill_lanes: 1, ..Default::default() };
         for (unit_rows, waves) in [(256, 3), (2752, 3), (2048, 4)] {
             for bf16 in [false, true] {
-                let mut config = config(6, 0, None);
+                let mut config = config(6, 0);
                 config.capacity = 4096;
                 config.bf16_ingress = bf16;
                 let model = config.model_admission.as_mut().unwrap();
@@ -1130,7 +1044,7 @@ mod tests {
         let working = SparkWorkingSet { spark_layers: (3..91).collect(), spark_ranks: 6,
             prefill_lanes: 1, ..Default::default() };
         for rank in 0..6 {
-            let mut config = config(6, rank, None);
+            let mut config = config(6, rank);
             config.capacity = 640;
             config.bf16_ingress = true;
             config.device_budget = 104 << 30;
@@ -1179,7 +1093,7 @@ mod tests {
     fn typed_v41_ring_budget_covers_three_or_four_endpoints() {
         let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
         for device in [1, 2] {
-            let mut config = config(4, 0, None);
+            let mut config = config(4, 0);
             let mut endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 1024,
                 ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }; 2];
             endpoints.extend(std::iter::repeat_n(cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
@@ -1202,10 +1116,10 @@ mod tests {
     }
 
     #[test]
-    fn v41_replacement_sequence_enforces_budget_on_both_topology_paths() {
-        for topology in [None, Some(SparkTopology::new(3, 1).unwrap())] {
+    fn v41_replacement_sequence_enforces_budget() {
+        {
             for bf16 in [false, true] {
-                let mut config = config(3, 0, topology);
+                let mut config = config(3, 0);
                 config.capacity = 1024;
                 config.bf16_ingress = bf16;
                 set_model(&mut config, 1024, bf16, 2);
@@ -1267,7 +1181,7 @@ mod tests {
             G::GLM5, G::GLM5_FLASH, G::QWEN4, G::MIMO_V2_FLASH, G::MIMO_V26_PRO] {
             for world in [3, 4, 6] {
                 for rtx in [1, 2] {
-                    let mut config = config(world, 0, None);
+                    let mut config = config(world, 0);
                     config.capacity = 4096;
                     let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096,
                         ingress: SparkIngress::Bf16Decode { rows: 80 }, partial_reply_bytes: None }];
@@ -1305,7 +1219,7 @@ mod tests {
 
     #[test]
     fn generic_ring_budget_uses_explicit_endpoints_for_every_format() {
-        let mut config = config(4, 0, None);
+        let mut config = config(4, 0);
         config.capacity = 4096;
         set_model(&mut config, 4096, false, 2);
         for geometry in [cuteafd_core::ExpertGeometry::GLM5,
@@ -1337,8 +1251,7 @@ mod tests {
     #[test]
     fn runtime_ring_budget_bounds_aggregate_endpoint_advertisements() {
         use cuteafd_transport::RingBudget;
-        let topology = SparkTopology::new(2, 2).unwrap();
-        let mut config = config(4, 0, Some(topology));
+        let mut config = config(4, 0);
         config.capacity = 4096;
         set_model(&mut config, 4096, false, 2);
         let limit = spark_transport_bytes(&config).unwrap();
@@ -1373,8 +1286,6 @@ mod tests {
 }
 
 /// Validate format support and exact physical rank identity before allocation.
-/// Compressed compact TP3 shares ownership topology, not native weight storage.
-/// Native V4 Flash TP2 retains the generic coordinator's canonical protocol.
 fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Catalog) -> Result<()> {
     let world = config.spark_world()?;
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
@@ -1404,43 +1315,35 @@ impl NativeExpertServiceConfig {
         Ok(selected.clone())
     }
 
-    /// Declare both physical ownership and the selected request wire contract.
     fn spark_world(&self) -> Result<SparkWorld> {
         ensure!(self.declared_world.topology().world_size() == self.world,
             "Spark worker world differs from its declared topology");
         Ok(self.declared_world)
     }
 
+    /// Every rank holds one TP slice of every expert of its layers and serves
+    /// the same canonical request.
     fn selection(&self, layer: usize) -> Result<ExpertLayer> {
-        let world = self.spark_world()?;
-        let topology = world.topology();
-        let rank = topology.tp_rank(self.rank)? as usize;
-        Ok(match (topology.tp(), world.wire()) {
+        let world = self.spark_world()?.topology().world_size();
+        ensure!(self.rank < world, "Spark worker rank is outside its world");
+        let rank = self.rank;
+        Ok(match (world, self.native_spark_roles) {
             (4, _) => ExpertLayer::Backbone { layer, rank },
-            (2, cuteafd_transport::expert::SparkWire::Canonical) if !self.native_spark_roles =>
-                ExpertLayer::BackboneTp2 { layer, rank },
-            (tp, cuteafd_transport::expert::SparkWire::NativeOwnership) =>
-                ExpertLayer::BackboneReplicatedTp { layer, rank, world: tp as usize },
-            (tp, _) if self.native_spark_roles =>
-                ExpertLayer::BackboneReplicatedTp { layer, rank, world: tp as usize },
-            (tp, _) => ExpertLayer::BackboneExl3Tp { layer, rank, world: tp as usize },
+            (2, NativeSparkRoles::None | NativeSparkRoles::Nvfp4) => ExpertLayer::BackboneTp2 { layer, rank },
+            (_, NativeSparkRoles::Mxfp4 | NativeSparkRoles::Nvfp4) =>
+                ExpertLayer::BackboneSparkTp { layer, rank, world },
+            (_, NativeSparkRoles::None) => ExpertLayer::BackboneExl3Tp { layer, rank, world },
         })
     }
 
     fn exl3_selection(&self, layer: usize) -> Result<ExpertLayer> {
-        let world = self.spark_world()?;
-        ensure!(world.ownership_topology().is_none(),
-            "EXL3 experts require canonical Spark wire");
-        let topology = world.topology();
+        let world = self.spark_world()?.topology().world_size();
+        ensure!(self.rank < world, "Spark worker rank is outside its world");
         // Spark EXL3 always uses the compressed-shard variant. Coordinator
         // BackboneTp2 keeps its separate legacy layout and arithmetic.
-        Ok(ExpertLayer::BackboneExl3Tp { layer,
-            rank: topology.tp_rank(self.rank)? as usize, world: topology.tp() as usize })
+        Ok(ExpertLayer::BackboneExl3Tp { layer, rank: self.rank, world })
     }
 
-    fn native_group(&self) -> Result<Option<u8>> {
-        self.spark_world()?.ownership_topology().map(|topology| topology.group(self.rank)).transpose()
-    }
     /// Resolve this rank's EXL3 AOT package for the running checkpoint's
     /// decoder tiers and family. An explicit --exl3-aot-dir is used verbatim.
     fn exl3_directory_for(&self, tiers: &[usize], layout: &str) -> PathBuf {

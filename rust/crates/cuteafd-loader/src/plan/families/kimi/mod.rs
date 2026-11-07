@@ -27,7 +27,7 @@ const TEXT: &str = "language_model.model.";
 const HEAD: &str = "language_model.lm_head.";
 const GIB: u64 = 1 << 30;
 
-/// Complete per-rank allocation ceiling without `--spark-budget-gib`.
+/// Complete per-rank allocation ceiling without `--spark-memory-cap`.
 /// Exact TP6 header arenas and endpoint I/O plus an estimated runtime/workspace
 /// reserve constrain RTX onboarding alongside marks and the selected context floor.
 /// The default remains estimated until the first full worker load/steady census.

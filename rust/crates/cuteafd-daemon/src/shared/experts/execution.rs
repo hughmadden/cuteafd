@@ -152,10 +152,6 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     slots: [*mut c_void; 44],
     graph: Option<(*mut c_void, u32, bool, u32, u32)>,
     alternate_widths: Vec<NativeWidthState<'library>>,
-    /// Replicated-group index this worker owns; set once at startup for an
-    /// explicit `TP×EP` topology, `None` for every legacy path. The group is
-    /// independent of the resident layer, so rebinding a layer never changes it.
-    native_group: Option<u8>,
     /// Mapped requests return queued; the owner emits each reply after its unit fence.
     deferred: bool,
     pending: timing::PendingUnits<'library>,
@@ -258,8 +254,8 @@ impl<'library> ExpertWeights<'library> {
         let kernel = self.layer.select_kernel(library, compiled, self.is_nvfp4())?;
         let reducer = library.v41_route_reducer()?;
         // Role-gated, DEBUG-only diagnostics. The same routed breakdown is
-        // available for the replicated Spark TP2/TP3 shards (roles 5/6), whose
-        // compact output and reducer buffers are already allocated.
+        // available for the Spark TP2/TP3 shards (roles 5/6), whose compact
+        // output and reducer buffers are already allocated.
         let timing = if compact_output_role(kernel.info().role)
             && tracing::enabled!(target: "cuteafd::expert_timing", tracing::Level::DEBUG)
         {
@@ -384,7 +380,6 @@ impl<'library> ExpertWeights<'library> {
             pending: timing::PendingUnits::new(library, 1)?,
             graph: None,
             alternate_widths: Vec::new(),
-            native_group: None,
             live_capacity: live,
             budget,
         })
@@ -396,25 +391,6 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         Ok(())
     }
 
-    /// Bind this worker to its replicated group before serving. Called once at
-    /// startup; every remote request for this worker must then carry the native
-    /// ownership contract and is unpacked for exactly this group.
-    pub(crate) fn install_native_group(&mut self, group: Option<u8>) -> Result<()> {
-        ensure!(
-            self.graph.is_none(),
-            "cannot install a replicated group on a captured expert graph"
-        );
-        ensure!(
-            self.native_group.is_none(),
-            "replicated expert group already installed"
-        );
-        ensure!(
-            group.map_or(true, |group| group < 3),
-            "replicated expert group index out of range"
-        );
-        self.native_group = group;
-        Ok(())
-    }
     fn add_width(&mut self, weights: &'weights ExpertWeights<'library>, compiled: u32) -> Result<()> {
         let prepare = |rows, name| -> Result<DecodeExecution<'library>> {
             let kernel = weights.layer.select_kernel(self.library, rows, weights.is_nvfp4())?;
@@ -891,7 +867,7 @@ impl ExpertExecution<'_, '_> {
     ) -> Result<()> {
         let layer = match self._weights.layer {
             ExpertLayer::Backbone { layer, .. }
-            | ExpertLayer::BackboneReplicatedTp { layer, .. } => layer,
+            | ExpertLayer::BackboneSparkTp { layer, .. } => layer,
             _ => anyhow::bail!("backbone requests cannot execute on RTX dSpark weights"),
         };
         ensure!(
@@ -908,21 +884,7 @@ impl ExpertExecution<'_, '_> {
             exchange.partials.len() >= bytes,
             "host exchange is too small"
         );
-        // The admission contract and the resident shard must agree: a
-        // topology-bound worker unpacks exactly its own group's routes and masks
-        // every other route to the kernel's unassigned sentinel, while a legacy
-        // worker rejects an ownership-encoded request outright.
-        match (self.native_group, request.is_native_group()) {
-            (Some(group), true) => request.copy_native_group_routes_into(
-                &mut exchange.ids,
-                &mut exchange.routing,
-                group,
-            )?,
-            (None, false) => request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?,
-            _ => anyhow::bail!(
-                "replicated expert group admission differs from this worker's bound topology"
-            ),
-        }
+        request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         // Supported hosts and CUDA use the checkpoint/wire little-endian byte order.
         ensure!(
@@ -1062,8 +1024,6 @@ impl ExpertExecution<'_, '_> {
             let (kernel_us, compact_us) = unsafe { timing.elapsed_us()? };
             let mut histogram = vec![0u32; cuteafd_core::expert_geometry().experts as usize];
             for &expert in &exchange.ids[..routes] {
-                // Ownership-masked routes carry the out-of-range sentinel and
-                // are not real expert work.
                 if let Some(slot) = histogram.get_mut(expert as usize) {
                     *slot += 1;
                 }
@@ -1151,7 +1111,7 @@ mod timing_role_tests {
         }
     }
 
-    /// A pure TP6EP1 worker must allocate the compact output buffer and load
+    /// A TP6 worker must allocate the compact output buffer and load
     /// the compact reducer exactly like the other Spark shard families; a
     /// missing role 7 would silently fall back to the uncompacted path.
     #[test]

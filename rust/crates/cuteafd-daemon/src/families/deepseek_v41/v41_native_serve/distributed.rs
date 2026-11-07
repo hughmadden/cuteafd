@@ -42,12 +42,6 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("CUDA contexts and peer access")?;
     let catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot)?;
     cuteafd_bench::context::set_family(catalog.config().family_id());
-    let topology = crate::shared::spark_topology::resolve(
-        args.spark_tp,
-        args.spark_ep,
-        args.peers.len(),
-        "serve-native",
-    )?;
 
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();
@@ -74,7 +68,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let remote_experts = pool.placement.onboard_layers < catalog.routed_experts().layers;
     let expert_world = if remote_experts { args.peers.len() } else { 0 };
     let spark_world = if remote_experts {
-        let world = crate::shared::spark_topology::world(topology, expert_world)?;
+        let world = crate::shared::spark_topology::world(expert_world)?;
         crate::shared::spark_topology::require_world(world, &catalog,
             &(pool.placement.onboard_layers..catalog.routed_experts().layers).collect::<Vec<_>>())?;
         lib.v41_compact_reducer()?.require_rank_count(world.topology().world_size() as u32)?;
@@ -380,8 +374,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let ffn_arenas = ffn_bytes(prefill_reserve as u32, capacity)? + 2 * ffn_bytes(decode_rows, decode_rows)?;
     admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 2, capacity,
         slots, prefill_reserve, ffn_arenas as u64)?;
-    // Both Spark transport lanes live on GPU1 and reserve one wave each; a
-    // six-rank replicated layout needs its own larger per-wave buffer count.
+    // Both Spark transport lanes live on GPU1 and reserve one wave each, sized
+    // by the physical rank count.
     let spark_ranks = expert_world;
     // Decode lanes' links at their own width (P3); the prefill link at the unit.
     let wave_bytes = if remote_experts { NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)? } else { 0 };
@@ -417,8 +411,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub(ffn_arenas as u64) as usize);
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,"shared dual RTX admission");
-    let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity,
-        topology)?;
+    let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity)?;
     // Coordinator ranks join only a pushing group, planned before membership:
     // a planning error leaves them out (the Sparks still push).
     let coordinator = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&args.snapshot)?.plan(|| {

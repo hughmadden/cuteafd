@@ -24,7 +24,7 @@ def matrix(tmp_path):
     path = tmp_path / 'matrix.json'
     path.write_text(json.dumps(dict(defaults=dict(set=dict(AUDIO='off')), entries=[
         dict(name='glm-fp8', family='glm5', config='glm.config', sparks=['rank-a', 'rank-b'], gpus=[0, 1],
-             set=dict(SPARK_TP='2', RTX_GPUS='1')),
+             set=dict(SPARK_COUNT='2', RTX_GPUS='1')),
         dict(name='flash-nvfp4', family='glm5_flash', config='flash.config', sparks=[], gpus=[0]),
     ])))
     # The helper imports WIP derivation from the source repo, not a fixture repo.
@@ -78,7 +78,7 @@ def test_union_equals_per_entry_derivation(fixture_repo):
                 assert SCOPE.tokens(value) == expected
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS'] <= SCOPE.tokens(union[P + 'GENERIC_SPARK_COUNTS'])
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['EXPERT_FAMILIES'] <= SCOPE.tokens(union[P + 'EXPERT_FAMILIES'])
-    assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 4
+    assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 2  # set wins over config
     assert not SCOPE.requirements(repo, path, 'glm-fp8')[0]['dual']  # set wins over gpus
 
 
@@ -375,7 +375,7 @@ def write_floor_packages(root, role, packages):
         path = root / 'lib' / package
         files = {}
         for layout in layouts:
-            name = layout + '/libcuteafd_package.so'
+            name = layout + ('/m1' if package.startswith('exl3/') and role == 'expert' else '') + '/libcuteafd_package.so'
             file = path / name
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_bytes(b'fake package')
@@ -563,3 +563,45 @@ def test_release_matrix_showcases_both_compressed_v41_reply_formats(matrix):
                           "SPARK_DECODE_REPLY_FORMAT": codec}
         assert config["COORDINATOR_DOCKER_INFERENCE"].startswith("ghcr.io/")
         assert config["SPARK_EXPERT_DOCKER_INFERENCE"].startswith("ghcr.io/")
+
+
+def test_release_all_includes_ml4_min_compact_and_max():
+    matrix = REPO / SCOPE.DEFAULT_MATRIX
+    result, _ = SCOPE.derive(REPO, matrix, 'all', {})
+    assert result[P + 'ML4_AOT'] == 'ON'
+    assert 'ml4:exl3-k45' in result[P + 'EXPERT_FAMILIES'].split(';')
+    assert {'ml4=5', 'ml4=6'} <= set(result[P + 'GENERIC_SPARK_COUNTS'].split(';'))
+    wanted = SCOPE.requirements(REPO, matrix, 'mistral_large4')
+    assert {(entry['spark_tp'], entry['dual']) for entry in wanted} == {(5, False), (6, True)}
+    assert all('ml4' in entry['programs'] for entry in wanted)
+
+
+def test_release_ml4_compact_layouts_are_checked(tmp_path):
+    package = 'exl3/exl3-ml4-k45'
+    root = tmp_path / 'lib' / package
+    write_json(root / 'manifest.json', dict(schema='cuteafd.exl3-package.v1', role='spark',
+        variants=[dict(directory=f'tp5-rank{rank}/m1') for rank in range(5)], files={'dummy.so': {}}))
+    layouts = [layout.removesuffix('/m1') for layout in SCOPE.scopes_module(REPO).exl3_spark_layouts('ml4:exl3-k45', 5)]
+    with pytest.raises(ValueError, match='tp5-compact-rank0'):
+        SCOPE.check_package(tmp_path, package, layouts, 'expert')
+
+
+def test_stdin_ml4_inventory_uses_serialized_compact_layouts(tmp_path):
+    import subprocess
+    requirement = next(e for e in SCOPE.requirements(REPO, REPO / SCOPE.DEFAULT_MATRIX, 'mistral_large4')
+                       if e['spark_tp'] == 5)
+    assert requirement['spark_layouts']['ml4:exl3-k45'] == [f'tp5-compact-rank{r}' for r in range(5)]
+    library = tmp_path / 'lib/libcuteafd_native.so'
+    library.parent.mkdir()
+    subprocess.run(['cc', '-shared', '-x', 'c', '-', '-o', str(library)],
+                   input='void fixture(void) {}', text=True, check=True)
+    package = tmp_path / 'lib/exl3/exl3-ml4-k45'
+    write_json(package / 'manifest.json', dict(schema='cuteafd.exl3-package.v1', role='spark',
+        variants=[dict(directory=f'tp5-rank{r}/m1') for r in range(5)], files={}))
+    helper = REPO / 'scripts/build/release-scope.py'
+    result = subprocess.run(['python3', '-', 'check-files', '--role', 'expert', '--root', str(tmp_path),
+        '--requirements', json.dumps([requirement])], input=helper.read_text(), cwd='/',
+        text=True, capture_output=True)
+    assert result.returncode != 0
+    assert 'tp5-compact-rank0/m1' in result.stderr
+    assert '__file__' not in result.stderr and 'IndexError' not in result.stderr

@@ -57,7 +57,7 @@ _cdi = importlib.util.module_from_spec(_cdi_spec)
 _cdi_spec.loader.exec_module(_cdi)
 cdi_gpu_args = _cdi.cdi_gpu_args
 sys.path.insert(0, str(REPO / 'scripts/lib'))
-from wip_aot_scopes import family_scopes
+from wip_aot_scopes import exl3_spark_layouts, family_scopes
 _hw_spec = importlib.util.spec_from_file_location('hwlock', REPO / 'scripts/hw/hwlock.py')
 hwlock = importlib.util.module_from_spec(_hw_spec)
 _hw_spec.loader.exec_module(hwlock)
@@ -342,8 +342,12 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     entry = json.loads(json.dumps(entry))
     requested_panels(entry.get('profile', 'smoke'), binary=binary)
     entry['fabric'] = 'fabric' in probes
-    values = config(entry['config'])
-    values.update(entry.pop('set', {}))
+    values = entry.pop('resolved_values', None)
+    if values is None:
+        values = config(entry['config'])
+        values.update(entry.pop('set', {}))
+    else:
+        entry.pop('set', None)
     simulated = values.pop('BENCH_SIMULATED', '') or 'sim5090' in entry['name'] or 'sim-5090' in entry['name']
     values.pop('BENCH_HARDWARE_CLASS', None)
     values.update(overrides)
@@ -728,6 +732,13 @@ def preflight_job(job, arm):
     if problems:
         raise ValueError('; '.join(problems))
     deployment = preflight_deployment(job, arm)
+    required_packages = deployment.get('artifact_requirements', {}).get('spark_packages')
+    if required_packages is None:
+        # Older sealed binaries register recipes but do not attest installed variants.
+        tp = deployment.get('topology', {}).get('tp') or int(values.get('SPARK_COUNT', 0))
+        required_packages = {package: exl3_spark_layouts(
+            package.removeprefix('exl3/exl3-').rsplit('-k', 1)[0] + ':exl3-k' + package.rsplit('-k', 1)[1], tp)
+            for package in needs['spark'] if package.startswith('exl3/') and tp}
     inventory = resolve_container_keys(job['entry'])['sparks']
     active_roles = {}
     for role in deployment['spark_roles']:
@@ -742,6 +753,24 @@ def preflight_job(job, arm):
         keys = ('image', 'image_id', 'repo_digests') if release else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
         artifacts[host] = {k: meta[k] for k in keys}
         contents = meta.get('contents')
+        if host != 'raptor' and active_roles[host]['experts'] and required_packages and release:
+            command = ['docker', 'run', '--rm', '--network', 'none', '-i', '--entrypoint', 'python3',
+                       meta['image'], '-', json.dumps(required_packages),
+                       f"{job['card']} {job['entry'].get('family', '<unknown>')} {host} image {meta['image_id']}"]
+            try:
+                run(['ssh', '-o', 'BatchMode=yes', host, shlex.join(command)],
+                    input=(REPO / 'scripts/launch/preflight-spark-packages.py').read_text())
+            except subprocess.SubprocessError as error:
+                problems.append((getattr(error, 'stderr', None) or str(error)).strip())
+        if host != 'raptor' and active_roles[host]['experts'] and required_packages and not release:
+            present = set((contents or {}).get('spark_variants', []))
+            for package, layouts in required_packages.items():
+                for layout in layouts:
+                    variant = f'{package}/{layout}'
+                    if variant not in present:
+                        problems.append(f"{job['card']} {job['entry'].get('family', '<unknown>')}: {host}: "
+                                        f"missing Spark package {variant}; seal {meta['seal_sha256']} "
+                                        f"slot {arm['slot']}")
         if release or contents is None:
             continue
         role = active_roles.get(host)
@@ -1961,7 +1990,10 @@ def contents(p):
             pcm_audio='cuteafd_pcm_required' in symbols
     except (OSError,subprocess.SubprocessError):
         pass
-    return dict(packages=packages,audio=audio,pcm_audio=pcm_audio,tp_roles=tp_roles(p,art))
+    variants=sorted(str(lib.parent.relative_to(art)) for pattern in
+        ('exl3/*/tp*-rank*/m*/libcuteafd_exl3.so','fp8/*/tp*/libcuteafd_fp8moe.so')
+        for lib in art.glob(pattern) if lib.is_file())
+    return dict(packages=packages,spark_variants=variants,audio=audio,pcm_audio=pcm_audio,tp_roles=tp_roles(p,art))
 def tp_roles(p,art):
     # The V4.1 Spark TP roles this slot attests, verified as run-family.sh's
     # launch_deepseek_v41 verifies them; None when the slot carries no manifest.
@@ -1974,7 +2006,7 @@ def tp_roles(p,art):
         assert hashlib.sha256(data).hexdigest()==meta.get('v41_expert_tp_manifest_sha256'),'TP manifest hash mismatch'
         manifest=json.loads(data)
         roles=manifest.get('spark_tp_roles')
-        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp6') for r in roles),'invalid TP roles'
+        assert manifest.get('schema')==1 and isinstance(roles,list) and all(r in ('tp2','tp3','tp5','tp6','tp7','tp8') for r in roles),'invalid TP roles'
         assert roles==meta.get('spark_tp_roles'),'slot and artifact roles differ'
         lib=hashlib.sha256((art/'libcuteafd_native.so').read_bytes()).hexdigest()
         assert lib==manifest.get('native_library_sha256'),'native library hash mismatch'
@@ -2097,6 +2129,18 @@ def cleanup(arms, task, dry, seed=None):
 NEST_BUILD_AREA = Path('/mnt/sparknest/build-cache/wip')
 
 
+def resolved_card(card, overrides, unsets=()):
+    """One effective configuration for scope derivation and package preflight."""
+    values = {**config(card['config']), **card['set'], **overrides}
+    for key in unsets:
+        values.pop(key, None)
+    count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
+    if not 0 <= count <= len(HOSTS):
+        raise ValueError('invalid Spark count')
+    sparks = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
+    return {**card, 'set': values, 'resolved_values': values, 'sparks': sparks}
+
+
 def build_scopes(cards):
     env = family_scopes(cards, config)
     env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '16'), RUST_TEST_THREADS=os.environ.get('RUST_TEST_THREADS', '16'))
@@ -2123,7 +2167,7 @@ def slot_needs(card):
     scopes = build_scopes([card])
     coordinator = {package_dir(s) for s in scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';') if s} - {None}
     spark = {package_dir(s) for s in scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';') if s} - {None}
-    values = {**config(card['config']), **card.get('set', {})}
+    values = card['resolved_values'] if 'resolved_values' in card else {**config(card['config']), **card.get('set', {})}
     if int(values.get('SPARK_COUNT', len(card.get('sparks', [])))) == 0:
         spark = set()
     return dict(coordinator=sorted(coordinator), spark=sorted(spark),
@@ -2132,21 +2176,14 @@ def slot_needs(card):
 
 def v41_tp_role(card, values):
     """The SM121 expert role a DeepSeek V4.1 card's Spark TP requires, as the
-    launcher derives it (scripts/launch/run-family.sh, launch_deepseek_v41): an
-    explicit SPARK_TP/SPARK_EP topology with TP 2, 3 or 6, or a native non-EXL3
+    planner names it (`artifact_requirements.spark_tp_role`): a native non-EXL3
     count other than 0 and 4 (TP = count). TP4 is the built-in default role.
     NVFP4 checkpoints need the role's NVFP4 exports too."""
     if card.get('family') != 'deepseek_v41':
         return dict(tp_role=None, nvfp4=False)
     count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
-    explicit = bool(values.get('SPARK_TP') or values.get('SPARK_EP'))
     exl3 = values.get('EXPERT_FORMAT', 'native') == 'exl3'
-    tp = int(values['SPARK_TP']) if explicit and values.get('SPARK_TP') else count
-    role = None
-    if explicit and tp in (2, 3, 6):
-        role = f'tp{tp}'
-    elif not explicit and not exl3 and count not in (0, 4) and count in (2, 3, 6):
-        role = f'tp{count}'
+    role = f'tp{count}' if not exl3 and 2 <= count <= 8 and count != 4 else None
     return dict(tp_role=role, nvfp4=checkpoint_is_nvfp4(values))
 
 
@@ -2179,7 +2216,7 @@ def toolchain_hash(revision):
 
 # Serving-only keys never belong in a build (staging) config.
 BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING',
-              'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
+              'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
               'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
               'PROFILE_NCU_SKIP', 'PROFILE_SPARK', 'PROFILE_SPARK_RANKS', 'PROFILE_SPARK_NCU_KERNEL', 'PROFILE_SPARK_NCU_COUNT',
@@ -2360,7 +2397,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         arm['build_revision'] = revision
         arm['build_lock_mode'] = build_lock_mode(revision)
         # 0-Spark cards only (#90): a coordinator-only slot, no Spark stage or seed turn.
-        spark_cards = [card for card in cards if int({**config(card['config']), **card.get('set', {})}.get('SPARK_COUNT', len(card.get('sparks', [])))) > 0]
+        spark_cards = [card for card in cards if int((card['resolved_values'] if 'resolved_values' in card else {**config(card['config']), **card.get('set', {})}).get('SPARK_COUNT', len(card.get('sparks', [])))) > 0]
         build_role = 'both' if spark_cards else 'coordinator'
         arm['build_role'] = build_role
         build_cmd = ['nice', '-n', '19', str(source / 'wip.sh'), '--slot', arm['slot'], '--role', build_role, '--config', str(state / ('build-' + name + '.config'))]
@@ -2400,7 +2437,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         # overrides, the union of Spark hosts, and no serving topology. Export
         # scopes (TP counts, families, audio) come from every card through
         # build_scopes, never from how many hosts receive the slot.
-        values = {**config(cards[0]['config']), **cards[0].get('set', {})}
+        values = dict(cards[0]['resolved_values']) if 'resolved_values' in cards[0] else {**config(cards[0]['config']), **cards[0].get('set', {})}
         for key in list(values):
             if key in BUILD_DROP or re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
                 del values[key]
@@ -2752,12 +2789,8 @@ def main():
     build_cards = []
     for name in arms:
         for card in cards:
-            variant = {**card, 'set': {**card['set'], **arm_overrides.get(name, {}).get(card['name'], {})}}
-            values = {**config(variant['config']), **variant['set']}
-            count = int(values.get('SPARK_COUNT', len(variant['sparks'])))
-            if not 0 <= count <= len(HOSTS):
-                raise ValueError('invalid Spark count')
-            variant['sparks'] = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
+            variant = resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}),
+                **arm_config.get(name, {})}, arm_unsets.get(name, set()))
             build_cards.append(variant)
     build_arms(builds, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
     adopt_roots(arms)
@@ -2782,8 +2815,9 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
-    variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
+    jobs = [generate(resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}), **arm_config.get(name, {})}, arm_unsets.get(name, set())), name, arm, state, key_file, {}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    variants = {(c['name'], n): resolved_card(c, {**arm_overrides.get(n, {}).get(c['name'], {}),
+        **arm_config.get(n, {})}, arm_unsets.get(n, set())) for c in cards for n in arms}
     for job in jobs:
         apply_arm_config(job, arm_config.get(job['arm'], {}), arm_unsets.get(job['arm'], set()))
         job['launcher'] = dict(repo=arms[job['arm']]['repo'], commit=arms[job['arm']]['repo_commit'])

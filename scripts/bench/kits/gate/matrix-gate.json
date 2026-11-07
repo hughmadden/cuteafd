@@ -137,7 +137,7 @@
    "set": {
     "ADDR": "0.0.0.0:8733",
     "EXPERT_PORT": "19833",
-    "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+    "GPU_MEMORY_CAP": "31.8GiB",
     "SPARK_COUNT": "2",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo"
@@ -213,13 +213,11 @@
     "EXPERT_PORT": "19848",
     "RTX_GPUS": "1",
     "COORDINATOR_GPUS": "0",
-    "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+    "GPU_MEMORY_CAP": "31.8GiB",
     "SPARK_INTAKE": "pinned",
     "MAX_CONTEXT_TOKENS": "1048576",
     "SPECULATOR": "dspark",
     "SPARK_COUNT": "4",
-    "SPARK_TP": "4",
-    "SPARK_EP": "1",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",
     "SPARK_2_HOST": "emu",
@@ -242,8 +240,6 @@
     "ADDR": "0.0.0.0:8702",
     "EXPERT_PORT": "19802",
     "SPARK_COUNT": "3",
-    "SPARK_TP": "3",
-    "SPARK_EP": "1",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",
     "SPARK_2_HOST": "emu"
@@ -467,7 +463,7 @@
     "SPARK_5_HOST": "moa",
     "RTX_GPUS": "1",
     "COORDINATOR_GPUS": "0",
-    "SPARK_DEVICE_BUDGET_BYTES": "118111600640"
+    "SPARK_MEMORY_CAP": "118111600640"
    }
   },
   {

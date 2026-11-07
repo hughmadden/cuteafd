@@ -26,8 +26,7 @@ fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, wave
 /// The Spark admission (headers only), before any worker is contacted.
 pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     catalog: &cuteafd_loader::OfficialV41Catalog, local_layers: usize,
-    capacity: u32,
-    topology: Option<cuteafd_transport::expert::SparkTopology>)
+    capacity: u32)
     -> Result<Option<crate::shared::placement::SparkAdmission>> {
     let geometry = catalog.routed_experts().geometry()?;
     ensure!(local_layers <= geometry.layers as usize, "V4.1 local boundary exceeds checkpoint");
@@ -38,7 +37,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     }
     let slots = super::AdmittedPrefill::resolve(args)?.waves;
     spark_admission(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
-        &args.snapshot, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, catalog, local_layers, args.peers.len(), capacity, slots, topology).map(Some)
+        &args.snapshot, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, catalog, local_layers, args.peers.len(), capacity, slots).map(Some)
 }
 
 /// The Spark admission for `ranks` workers serving layers `local_layers..`,
@@ -46,12 +45,11 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
 /// `slots` prefill units buffered: what serve (and the GPU fixtures) start
 /// before any transport connects.
 pub(crate) fn spark_admission(view: &cuteafd_loader::plan::checkpoint::CheckpointView, catalog: &cuteafd_loader::OfficialV41Catalog,
-    local_layers: usize, ranks: usize, capacity: u32, slots: usize,
-    topology: Option<cuteafd_transport::expert::SparkTopology>) -> Result<crate::shared::placement::SparkAdmission> {
+    local_layers: usize, ranks: usize, capacity: u32, slots: usize) -> Result<crate::shared::placement::SparkAdmission> {
     let geometry = catalog.routed_experts().geometry()?;
     let working = SparkWorkingSet { spark_layers: (local_layers..geometry.layers as usize).collect(),
         rtx_layers: (0..local_layers).collect(), spark_ranks: ranks, prefill_lanes: slots as u64 };
-    crate::shared::placement::SparkAdmission::plan_view(view, geometry, Some(catalog), &working, ranks, topology,
+    crate::shared::placement::SparkAdmission::plan_view(view, geometry, Some(catalog), &working, ranks,
         spark_model(catalog, capacity, u8::try_from(slots)?, catalog.nvfp4().is_some())?, None)
 }
 
@@ -543,18 +541,14 @@ pub(super) fn resolve_with_owners(
             "explicit V4.1 prefix exceeds available expert inventory"
         );
     }
-    // Only an explicit reservation limits capacity beyond sampled occupancy.
+    // The sampled total is already the device cap (`GPU_MEMORY_CAP`, applied
+    // by `cuda_memory_info`); the named reserve is kept free inside it.
     let mut ceilings = Vec::with_capacity(ranks);
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &(free, total)) in memory.iter().enumerate() {
         ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory sample");
-        let ceiling = args
-            .memory_reservation
-            .map(|r| r.bytes(total))
-            .transpose()?
-            .unwrap_or(total);
-        ceilings.push(ceiling);
-        cards.push((total as u64, ceiling as u64, free as u64));
+        ceilings.push(total);
+        cards.push((total as u64, total as u64, free as u64));
     }
     let totals = memory.iter().map(|&(_, total)| total as u64).collect::<Vec<_>>();
     let tails = args.concurrency as u64 + 2 * args.resolved_prefix_entries() as u64;
@@ -696,6 +690,7 @@ pub(super) fn resolve_with_owners(
         formats,
     );
     let admitted = input.prepare()?.admit(request)?;
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "deepseek_v41");
     let host_ledger = admitted.host_ledger(host.prefix_bytes)?;
     let placement = admitted.placement;
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
@@ -1181,7 +1176,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn strict_pool_respects_each_owner_deferred_bytes_and_reservation_rounding() -> Result<()> {
+    fn strict_pool_respects_each_owner_deferred_bytes_and_the_capped_sample() -> Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),
@@ -1190,7 +1185,9 @@ mod admission_tests {
                 "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"
             )),
         )?;
-        let total = 96usize << 30;
+        // The sample is already capped (`GPU_MEMORY_CAP` via cuda_memory_info);
+        // an odd byte cap checks that no rounding admits past it.
+        let total = "80.000001GiB".parse::<crate::shared::memory::budget::ByteSize>()?.0;
         for (ranks, replicas, expert_usage) in [
             (1, false, true), (1, false, false),
             (2, false, true), (2, false, false),
@@ -1202,9 +1199,8 @@ mod admission_tests {
             args.expert_usage = expert_usage;
             args.rtx_expert_layers = LocalLayers::Count(0);
             args.pool_tokens = Some(1 << 20);
-            args.memory_reservation = Some("80.000001GiB".parse()?);
             let deferred = vec![64u64 << 20; ranks];
-            let roomy = vec![(80usize << 30, total); ranks];
+            let roomy = vec![(64usize << 30, total); ranks];
             let admitted = resolve(&args, &roomy, no_experts(), 0, &deferred, 0, None)?;
             assert_eq!(admitted.expert_usage.is_some(), expert_usage);
             // Counters and the device snapshot are future GPU owners. Pinned
@@ -1215,15 +1211,14 @@ mod admission_tests {
                 assert_eq!(items.iter().filter(|item| item.group == "expert usage")
                     .map(|item| item.bytes).sum::<u64>(), usage_bytes as u64);
             }
-            let ceiling = args.memory_reservation.unwrap().bytes(total)?;
             assert_eq!(admitted.placement.pool_tokens, args.pool_tokens.unwrap());
-            assert_eq!(admitted.reservation_bytes, vec![ceiling; ranks]);
+            assert_eq!(admitted.reservation_bytes, vec![total; ranks]);
             let exact = admitted
                 .cache_bytes
                 .iter()
                 .enumerate()
                 .map(|(gpu, &bytes)| {
-                    let reserve = total - ceiling
+                    let reserve = cuteafd_loader::placement::reserve::gpu("deepseek_v41") as usize
                         + families::deepseek_v41::runtime_reserve(total as u64, ranks)
                             as usize
                         + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
@@ -1367,10 +1362,10 @@ mod admission_tests {
         assert_eq!(admitted.placement.pool_tokens, 1 << 20);
         assert_eq!(admitted.pages[0], 2048 + 56);
         assert_eq!(admitted.reservation_bytes, vec![32usize << 30]);
-        args.memory_reservation = Some(crate::shared::memory::budget::Reservation::Percent(
-            1_000_000,
-        ));
-        assert!(resolve(&args, &[(30usize << 30, 32usize << 30)], no_experts(), 0, &[0], 0, None).is_err());
+        // A GPU_RESERVE that leaves no room for the pool refuses admission.
+        let reserved = cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(31 << 30), ..Default::default() }
+            .scoped(|| resolve(&args, &[(30usize << 30, 32usize << 30)], no_experts(), 0, &[0], 0, None));
+        assert!(reserved.is_err());
         Ok(())
     }
 }

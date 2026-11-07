@@ -1,7 +1,5 @@
 //! Concurrent declared-world TCP dispatch with bounded per-rank response storage.
-use super::{
-    BackboneRequest, SparkTopology, SparkWorld, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG,
-};
+use super::{BackboneRequest, SparkWorld, V41Tp4ChunkReceiver};
 use crate::{
     ExpertProtocolV2Request, TcpProtocolV2PendingChunks, TcpProtocolV2PersistentClient,
     TcpTransportConfig,
@@ -39,14 +37,8 @@ impl V41Tp4Tcp {
     ) -> Result<Self> {
         ensure!(
             peers.len() == executors.len() && (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&peers.len()),
-            "native TP/EP requires 1..=8 matching peers and executors"
+            "native TP requires 1..=8 matching peers and executors"
         );
-        if let Some(topology) = world.ownership_topology() {
-            ensure!(
-                peers.len() == topology.world_size(),
-                "native group topology requires exactly its physical rank count"
-            );
-        }
         ensure!(
             capacity > 0 && capacity <= 4096,
             "invalid native TP capacity"
@@ -83,11 +75,8 @@ impl V41Tp4Tcp {
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }
-    /// Physical ownership and request wire bound before any connection.
+    /// Physical rank world bound before any connection.
     pub fn world(&self) -> SparkWorld { self.world }
-    pub fn ownership_topology(&self) -> Option<SparkTopology> {
-        self.world.ownership_topology()
-    }
     /// Drop idle sockets before a new admission. Pending dispatches borrow this
     /// owner exclusively, so an in-flight wave cannot be reset through this API.
     pub fn reset_connections(&mut self) {
@@ -110,9 +99,6 @@ impl V41Tp4Tcp {
 
     /// Return after every complete request has been written. Expert workers can
     /// execute while the caller produces the coordinator's shared FFN result.
-    ///
-    /// Request flags must match the declared wire: ownership worlds require
-    /// native group requests, while canonical worlds reject ownership flags.
     pub async fn dispatch<'c, 'r>(
         &'c mut self,
         request: &'r ExpertProtocolV2Request,
@@ -122,23 +108,7 @@ impl V41Tp4Tcp {
             frame.len() <= self.max_frame_bytes,
             "native request exceeds TCP frame budget"
         );
-        let flagged = request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0;
-        let native = match self.world.ownership_topology() {
-            Some(topology) => {
-                ensure!(
-                    flagged,
-                    "topology-bound native transport requires a native group request"
-                );
-                BackboneRequest::parse_native_group(&frame, self.capacity, topology)?
-            }
-            None => {
-                ensure!(
-                    !flagged,
-                    "native group request requires a topology-bound transport"
-                );
-                BackboneRequest::parse(&frame, self.capacity)?
-            }
-        };
+        let native = BackboneRequest::parse(&frame, self.capacity)?;
         let rows = native.rows() as usize;
         let receiver = V41Tp4ChunkReceiver::new_ranks(&native, &self.executors, self.max_frame_bytes)?;
         let pending = futures::future::try_join_all(

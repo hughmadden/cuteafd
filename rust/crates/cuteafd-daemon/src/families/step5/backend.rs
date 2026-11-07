@@ -649,7 +649,7 @@ mod tests {
         use crate::shared::prefill_packing::{groups, plan, Limits};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "manifest": null, "geometry": [4096, 352, 8, 1536, 91],
-            "world": 4, "topology": [4, 1], "ownership_wire": false }))?;
+            "world": 4 }))?;
         let variant = |cut| InstalledExpertVariant::from_queries(256, |_| Ok(64))?
             .with_arithmetic_routes(|rows| Ok(Some(if rows <= cut { (1, cut) } else { (2, 256) })));
         let report = InstalledExpertGrouping::new(WorkerSelection::new(identity.clone(), &[3, 4])?,

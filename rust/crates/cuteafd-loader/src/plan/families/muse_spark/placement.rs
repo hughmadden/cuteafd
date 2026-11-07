@@ -153,7 +153,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let spark_budget_bytes = opts.spark_allocation_budget_bytes
         .unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES).min(opts.spark_bytes);
     let mut budgets = cards.iter().enumerate().map(|(gpu, card)| shared::planned_budget(gpu as u8,
-        card.physical_bytes, card.logical_bytes, opts.headroom_bytes,
+        card.physical_bytes, card.logical_bytes, crate::placement::reserve::gpu("muse_spark"),
         ArchContext::for_device("sm_120", card.physical_bytes).context_bytes)).collect::<Vec<_>>();
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, spark_budget_bytes)));
     let maximum_pool_tokens = crate::placement::CoordinatorCard::maximum_pool(&cards, context, opts.pool_tokens, shared::PAGE_ROWS);
@@ -180,7 +180,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Ok(prepared) => prepared,
         Err(error) => {
             report.refuse_placement(format!("Muse Spark joint admission refused: {error}"),
-                "Use more Spark ranks, automatic RTX expert selection, or a larger --spark-budget-gib.");
+                "Use more Spark ranks, automatic RTX expert selection, or a larger --spark-memory-cap.");
             return memory;
         }
     };
@@ -196,7 +196,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         Ok(admitted) => admitted,
         Err(error) => {
             report.refuse_placement(format!("Muse Spark joint admission refused: {error}"),
-                "Use more Spark ranks, automatic RTX expert selection, or a larger --spark-budget-gib.");
+                "Use more Spark ranks, automatic RTX expert selection, or a larger --spark-memory-cap.");
             return memory;
         }
     };
@@ -239,8 +239,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for gpu in 0..gpus {
         let mut device = DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: cards[gpu].physical_bytes.min(cards[gpu].logical_bytes), worker_budget_bytes: 0,
             items: placed.items[gpu].clone(), kv_tokens: placed.pool_tokens };
-        device.items.push(Item::new(Category::Reserved, "coordinator headroom", "", opts.headroom_bytes, Basis::Formula)
-            .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve));
+        device.items.extend(crate::placement::reserve::gpu_item("muse_spark"));
         memory.devices.push(device);
     }
     let onboarded = placed.onboard_layers;

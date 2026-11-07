@@ -50,7 +50,7 @@ ML4 shares the runtime, not GLM 5.3's qualification row.
   layers. Dense first layers, then MoE from `first_moe_layer` on.
 - Router: sigmoid noaux_tc with `e_score_correction_bias`, routed scale 2.5,
   top-8 of the checkpoint's expert count.
-- Routed experts run on Spark TP x EP via `expertd-native`: FP8 128x128
+- Routed experts run on Spark TP via `expertd-native`: FP8 128x128
   blocks, EXL3 K4/K5, or ModelOpt NVFP4 (group 16). The solver can also place
   a local RTX TP2 routed prefix through the shared expert backends
   ([P9 qualification](https://github.com/tpurtell/cuteafd/pull/148)); its measured

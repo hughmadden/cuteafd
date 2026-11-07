@@ -571,18 +571,26 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         }
     }
     let mut budgets = Vec::new();
+    let overridden = cuteafd_core::memory_policy::MemoryPolicy::current().gpu_reserve.is_some();
     for (gpu, &(total, baseline)) in i.gpus.iter().enumerate() {
-        let occupied = match baseline {
-            Baseline::Planned { context_bytes, loaded_bytes } => context_bytes.checked_add(loaded_bytes)
-                .ok_or(p::Refusal::Overflow("GLM Flash runtime baseline"))?,
-            Baseline::Measured { free_bytes } => total.saturating_sub(free_bytes),
+        // One context+modules owner on both sides (plan == runtime). Under a
+        // GPU_RESERVE override, which replaces runtime components, a live
+        // sample is already-held occupancy and moves into the baseline instead.
+        let forecast = || p::Baseline::Forecast { occupied: 0,
+            source: "GLM Flash physical capacity; runtime owner charged in recipe".into(), assumed: false };
+        let (occupied, baseline) = match baseline {
+            Baseline::Planned { context_bytes, loaded_bytes } => (context_bytes.checked_add(loaded_bytes)
+                .ok_or(p::Refusal::Overflow("GLM Flash runtime baseline"))?, forecast()),
+            Baseline::Measured { free_bytes } if overridden => (0, p::Baseline::Sampled { free: free_bytes.min(total),
+                phase: p::Phase::Load, source: "GLM Flash measured free bytes after context and modules".into() }),
+            Baseline::Measured { free_bytes } => (total.saturating_sub(free_bytes), forecast()),
         };
         budgets.push(p::Budget { id: format!("rtx{gpu}"), locations: vec![p::Location::coordinator(gpu as u8)],
-            physical_bytes: total, logical_bytes: total, headroom: i.headroom_bytes,
-            baseline: p::Baseline::Forecast { occupied: 0,
-                source: "GLM Flash physical capacity; runtime owner charged in recipe".into(), assumed: false } });
-        add_demand(&mut contract, &Demand::new(gpu as u8, Category::Runtime, "context+modules", occupied,
-            Basis::Calibrated), format!("glmf.runtime.{gpu}"), p::Activation::always())?;
+            physical_bytes: total, logical_bytes: total, headroom: i.headroom_bytes, baseline });
+        if occupied > 0 {
+            add_demand(&mut contract, &Demand::new(gpu as u8, Category::Runtime, "context+modules", occupied,
+                Basis::Calibrated), format!("glmf.runtime.{gpu}"), p::Activation::always())?;
+        }
     }
     // HOST and PINNED share one physical capacity; external occupancy is sampled
     // once before the recipe's process-owned bytes are admitted.

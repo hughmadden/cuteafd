@@ -863,7 +863,8 @@ impl WeightInventory {
             );
         }
         if embedding {
-            out.embedding(EmbeddingHome::Device(0), 256, "placeholder")?;
+            out.embedding(EmbeddingHome::Device(0),
+                crate::shared::token_table::native_embedding_owner_bytes(0) as u64, "placeholder")?;
         }
         ensure!(
             out.owners.iter().all(|new| self

@@ -1,4 +1,4 @@
-# Replicated-group Spark TP2/TP3/TP6 expert shards (native FP8 K32 family, SM121).
+# Spark TP2/TP3/TP6 expert shards (native FP8 K32 family, SM121).
 #
 # This option is empty for a bare native configure, so such a build compiles and
 # links no extra object or symbol and behaves exactly as the historical Spark TP4
@@ -121,7 +121,7 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
-    COMMENT "Exporting ${role} replicated-group Spark expert kernels"
+    COMMENT "Exporting ${role} Spark expert kernels"
     VERBATIM
   )
   add_custom_target(cuteafd_v41_${role}_experts_export DEPENDS

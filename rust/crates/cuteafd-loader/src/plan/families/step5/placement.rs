@@ -172,7 +172,7 @@ pub(super) fn layout(
                 code.push(allowance.bytes);
                 GpuBudget {
                     capacity_bytes,
-                    headroom_bytes: opts.headroom_bytes,
+                    reserve_bytes: crate::placement::reserve::gpu("step5"),
                     baseline: Baseline::Planned {
                         context_bytes: arch.context_bytes,
                         loaded_bytes: 0,
@@ -264,16 +264,7 @@ pub(super) fn layout(
             ArchContext::coordinator(opts.rtx_bytes[rank], None).context_bytes,
             Basis::Calibrated,
         ));
-        items.push(
-            Item::new(
-                Category::Reserved,
-                "coordinator headroom",
-                "",
-                opts.headroom_bytes,
-                Basis::Formula,
-            )
-            .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve),
-        );
+        items.extend(crate::placement::reserve::gpu_item("step5"));
         memory.devices.push(DeviceLayout {
             kind: DeviceKind::Rtx,
             index: rank as u32,

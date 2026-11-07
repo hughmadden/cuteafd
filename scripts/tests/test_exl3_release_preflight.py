@@ -36,22 +36,19 @@ if tool == 'docker':
         def value(flag, default=None):
             return args[args.index(flag) + 1] if flag in args else default
         ranks = int(value('--spark-ranks'))
-        tp, ep = int(value('--spark-tp', str(ranks))), int(value('--spark-ep', '1'))
-        explicit = '--spark-tp' in args or ranks == 3
         gpus = int(value('--rtx', '1'))
         print(json.dumps(dict(spark_expert_world=ranks,
             spark_roles=[dict(rank=i, experts=True, layers=[], encoder=None, audio_encoder=None, drafter=None) for i in range(ranks)], spark_ranks=ranks, prefill_unit_rows=rows or 1024,
             prefill_waves=1, prefill_span_rows=rows or 1024, prefill_reserve_rows=8192, decode_lanes=2,
             version=1, family='deepseek_v41', executable=True, wip_launchable=True,
             launch=dict(family='deepseek_v41'),
-            topology=dict(tp=tp, ep=ep,
-                  wire="native_ownership" if explicit else "canonical"),
+            topology=dict(tp=ranks),
             artifact_requirements=dict(spark_tp_role=None),
             speculator=value('--speculator', 'off'),
-            admission=dict(kv_pool_size=value('--kv-pool-size'), memory_reservation=value('--memory-reservation')),
+            admission=dict(kv_pool_size=value('--kv-pool-size'), memory_policy={}),
             peers=value('--deployment-peers', '').split(',')[:ranks],
             spark_admission='coordinator_authoritative',
-            memory_layout=fake_deployment_memory_layout(gpus, ranks, value('--spark-budget-gib', '108')))))
+            memory_layout=fake_deployment_memory_layout(gpus, ranks, value('--spark-memory-cap')))))
         sys.exit(0)
 raise SystemExit('Unexpected external action: ' + tool + ' ' + repr(args))
 '''
@@ -59,7 +56,7 @@ raise SystemExit('Unexpected external action: ' + tool + ' ' + repr(args))
 
 class Exl3ReleasePreflightTest(unittest.TestCase):
     def launch(self, *, exl3=False, mismatch=False, spark_count=4,
-               reservation='', rtx_gpus='1', extra=(), gpu_mib=97887,
+               cap='', rtx_gpus='1', extra=(), gpu_mib=97887,
                instance=''):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -83,7 +80,7 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
             config = directory / 'release.config'
             config.write_text((ROOT / 'cuteafd.config').read_text()
                               + f'\nSPARK_COUNT={spark_count}\n'
-                              + (f'MEMORY_RESERVATION={reservation}\n' if reservation else '')
+                              + (f'GPU_MEMORY_CAP={cap}\n' if cap else '')
                               + (f'INSTANCE={instance}\n' if instance else ''))
             result = subprocess.run(['bash', 'run.sh', '--config', str(config),
                                      '--set', f'RTX_GPUS={rtx_gpus}', *extra,
@@ -122,21 +119,18 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Spark ranks: 2; hosts: ostrich,dodo', result.stdout)
         self.assertIn('Spark peers: 10.55.0.1:19441,10.55.0.2:19441\n', result.stdout)
-        self.assertNotIn('memory reservation: 32GiB', result.stdout)
+        self.assertNotIn('--gpu-memory-cap 32GiB', result.stdout)
         self.assertEqual({host for _, host, _ in calls if host}, {'ostrich', 'dodo'})
         four, _ = self.launch()
         self.assertNotEqual(result.stdout.split('release identity: ')[1],
                             four.stdout.split('release identity: ')[1])
 
-    def test_native_tp3_preserves_implicit_and_explicit_topology(self):
-        for explicit in (False, True):
-            extra = ('--set', 'SPARK_TP=3', '--set', 'SPARK_EP=1') if explicit else ()
-            result, _ = self.launch(spark_count=3, extra=extra)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('Spark ranks: 3;', result.stdout)
-            fixed, _ = self.launch(spark_count=3,
-                                   extra=(*extra, '--set', 'RTX_EXPERT_LAYERS=20'))
-            self.assertEqual(fixed.returncode, 0, fixed.stderr)
+    def test_native_tp3_dry_run_reaches_three_ranks(self):
+        result, _ = self.launch(spark_count=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Spark ranks: 3;', result.stdout)
+        fixed, _ = self.launch(spark_count=3, extra=('--set', 'RTX_EXPERT_LAYERS=20'))
+        self.assertEqual(fixed.returncode, 0, fixed.stderr)
 
     def test_native_six_rank_preflight_reaches_every_host(self):
         result, calls = self.launch(spark_count=6)
@@ -159,12 +153,19 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
     def test_native_accepts_nominal_32gib_board_with_smaller_usable_total(self):
         result, _ = self.launch(spark_count=2, gpu_mib=32607)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn('memory reservation: 32GiB', result.stdout)
+        self.assertNotIn('--gpu-memory-cap 32GiB', result.stdout)
 
-    def test_native_two_rank_allows_memory_reservations(self):
-        for reservation in ('33GiB', '90%'):
-            result, _ = self.launch(spark_count=2, reservation=reservation)
+    def test_native_two_rank_allows_memory_caps_and_refuses_percentages(self):
+        for cap in ('33GiB', '90000000000'):
+            result, calls = self.launch(spark_count=2, cap=cap)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f'memory policy: --gpu-memory-cap {cap}', result.stdout)
+            plan = next(args for tool, _, args in calls if tool == 'docker' and 'plan' in args)
+            # The plan takes the resolved per-GPU cap: the smaller of the card and the key.
+            self.assertEqual(plan.count('--gpu-memory-cap'), 1, plan)
+        result, _ = self.launch(spark_count=2, cap='90%')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('GPU_MEMORY_CAP must be a positive size', result.stderr)
 
     def test_full_model_skips_exl3_package_reads(self):
         result, calls = self.launch(exl3=False)

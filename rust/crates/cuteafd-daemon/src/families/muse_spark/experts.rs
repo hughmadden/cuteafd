@@ -6,8 +6,8 @@
 //! Sparks hold experts, what they reply and how the coordinator combines it
 //! are the implementation's; the engine sees none of it.
 //!
-//! The Muse residency is TP (the EP study, `ep_layouts.py`, approved
-//! 2026-10-31): every Spark holds an intermediate slice of every expert and
+//! The Muse residency is TP (approved 2026-10-31 over whole-expert
+//! placement): every Spark holds an intermediate slice of every expert and
 //! replies with its partial down-proj output per routed (row, expert) as
 //! NVFP4 (E2M1 with an E4M3 scale per 16, the hardware cvt); the coordinator
 //! program `muse_tp_combine` dequantizes, sums the ranks per expert, applies

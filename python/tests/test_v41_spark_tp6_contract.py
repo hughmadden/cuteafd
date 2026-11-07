@@ -20,7 +20,7 @@ SLICES = ROOT / "python" / "tools" / "aot" / "export_b12x_slices_aot.py"
 EXPERTS_EXPORTER = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_experts_aot.py"
 NATIVE_HELPER = ROOT / "python" / "tools" / "lib" / "_v41_expert_native.py"
 TOOLS = ROOT / "python" / "tools"
-QUALIFIER = ROOT / "python" / "tools" / "qualify" / "deepseek_v41" / "qualify_v41_replicated_native.py"
+QUALIFIER = ROOT / "python" / "tools" / "qualify" / "deepseek_v41" / "qualify_v41_spark_tp_native.py"
 WIP = ROOT / "wip.sh"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
 CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
@@ -643,15 +643,13 @@ def test_role_gate_accepts_the_matching_library_and_rejects_others() -> None:
 
 
 def test_geometry_test_is_registered_with_the_real_name() -> None:
-    """CMake, the gate wrapper and the packer test must agree on one name."""
+    """CMake and the packer test must agree on one name."""
     cmake = (ROOT / "native" / "CMakeLists.txt").read_text(encoding="utf-8")
     assert "tests/v41_expert_pack_geometry_selftest.cc" in cmake
     assert "cuteafd_v41_expert_pack_geometry_selftest" in cmake
     # The superseded per-degree file must not linger unreferenced.
     assert "v41_expert_pack_tp6_selftest" not in cmake
     assert not (ROOT / "native" / "tests" / "v41_expert_pack_tp6_selftest.cc").exists()
-    wrapper = (ROOT / "scripts" / "bench" / "deepseek_v41" / "run-tp-ep-kernel-checks.sh").read_text(encoding="utf-8")
-    assert "expert_pack_geometry" in wrapper
     # The independent host oracle, the real native geometries and the fail-closed
     # device guard live in that file. Assert SEMANTICS (identifiers and the case
     # table), not prose: a wording change must not break the contract, and a

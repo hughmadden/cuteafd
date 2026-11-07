@@ -36,19 +36,69 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
     }
 }
 
-/// Inspect original argv: clap normalizes aliases before exposing matches.
-pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<&'static str> {
-    let mut replacements = Vec::new();
-    for arg in args {
-        let replacement = match arg.as_ref().split('=').next().unwrap_or("") {
-            "--rtx-budget-gib" | "--rtx-gib" => Some("--coordinator-gpu-budget-gib"),
-            _ => None,
-        };
-        if let Some(replacement) = replacement {
-            if !replacements.contains(&replacement) { replacements.push(replacement); }
+fn parse_size(text: &str) -> std::result::Result<u64, String> {
+    text.parse::<cuteafd_core::memory_policy::Size>().map(|size| size.0).map_err(|error| error.to_string())
+}
+
+/// One device memory policy (`cuteafd_core::memory_policy`). Every size takes
+/// B, MB, GB, MiB or GiB. Each device's cap holds weights, KV, workspaces and
+/// the reserve; the layout is fixed for the KV target and the pool then grows
+/// into what is left, up to the KV max.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+pub(crate) struct MemoryArgs {
+    /// Total per-GPU ceiling (default: the full device). Leaves SM count and L2 unchanged.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) gpu_memory_cap: Option<u64>,
+    /// Total per-Spark ceiling (default: the family's Spark default). Leaves room for the OS.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) spark_memory_cap: Option<u64>,
+    /// Whole GPU reserve; every built-in GPU reserve component becomes 0. Still inside the cap.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) gpu_reserve: Option<u64>,
+    /// Whole Spark reserve; every built-in Spark reserve component becomes 0.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) spark_reserve: Option<u64>,
+    /// Named per-GPU reserve added to the measured components (default: the family constant).
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) family_reserve: Option<u64>,
+    /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).
+    #[arg(long, global = true)]
+    pub(crate) kv_target_tokens: Option<u64>,
+    /// Refuse the launch below this many KV tokens (default: min(256K, model context)).
+    #[arg(long, global = true)]
+    pub(crate) kv_min_tokens: Option<u64>,
+    /// Grow the pool into memory left after the layout is fixed, up to this (default: the target).
+    #[arg(long, global = true)]
+    pub(crate) kv_max_tokens: Option<u64>,
+}
+
+impl MemoryArgs {
+    /// The family argv wins key by key over the outer `serve`/`golden` argv.
+    pub(crate) fn or(self, outer: Self) -> Self {
+        Self {
+            gpu_memory_cap: self.gpu_memory_cap.or(outer.gpu_memory_cap),
+            spark_memory_cap: self.spark_memory_cap.or(outer.spark_memory_cap),
+            gpu_reserve: self.gpu_reserve.or(outer.gpu_reserve),
+            spark_reserve: self.spark_reserve.or(outer.spark_reserve),
+            family_reserve: self.family_reserve.or(outer.family_reserve),
+            kv_target_tokens: self.kv_target_tokens.or(outer.kv_target_tokens),
+            kv_min_tokens: self.kv_min_tokens.or(outer.kv_min_tokens),
+            kv_max_tokens: self.kv_max_tokens.or(outer.kv_max_tokens),
         }
     }
-    replacements
+
+    pub(crate) fn policy(self) -> cuteafd_core::memory_policy::MemoryPolicy {
+        cuteafd_core::memory_policy::MemoryPolicy {
+            gpu_cap: self.gpu_memory_cap, spark_cap: self.spark_memory_cap,
+            gpu_reserve: self.gpu_reserve, spark_reserve: self.spark_reserve,
+            family_reserve: self.family_reserve, kv_target: self.kv_target_tokens,
+            kv_min: self.kv_min_tokens, kv_max: self.kv_max_tokens,
+        }
+    }
+
+    pub(crate) fn any_gpu(self) -> bool {
+        self.gpu_memory_cap.is_some() || self.gpu_reserve.is_some() || self.family_reserve.is_some()
+    }
 }
 
 /// A positive number of seconds (fractions allowed).
@@ -78,10 +128,9 @@ pub(crate) struct Cli {
     /// Remote image URL policy; inline data URLs work in every mode.
     #[arg(long, global = true)]
     pub(crate) image_url_fetch: Option<cuteafd_api::openai::media::ImageUrlFetch>,
-    /// Logical GiB ceiling per coordinator GPU (weights, KV, workspaces,
-    /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
-    #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
-    pub(crate) coordinator_gpu_budget_gib: Option<f64>,
+    /// Device caps, reserves and KV target/min/max (one memory policy for every family).
+    #[command(flatten)]
+    pub(crate) memory: MemoryArgs,
     /// Retained checkpoint weights per coordinator GPU, including drafter
     /// weights (default 80 GiB); independent of KV, workspace and total memory.
     #[arg(long, global = true)]
@@ -344,30 +393,23 @@ pub(crate) struct PlanArgs {
     /// Header-only Spark count policy for both coordinator card columns.
     #[arg(long, conflicts_with_all = ["deployment", "files", "fetch", "role"])]
     pub(crate) spark_range: bool,
-    /// Routed-expert weight budget per Spark rank, GiB (unset: the family's
-    /// default, 100 GiB for most; Kimi K3 108 GiB).
-    #[arg(long)]
-    pub(crate) spark_budget_gib: Option<f64>,
     /// Resolved global resident-weight ceiling, including drafter weights.
     #[arg(skip = 80.0)]
     pub(crate) coordinator_weight_budget_gib: f64,
+    /// Resolved global memory policy (caps, reserves, KV target/min/max).
+    #[arg(skip)]
+    pub(crate) memory: MemoryArgs,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
     /// Emit typed launch decisions; live artifact verification stays with the launcher.
     #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
     pub(crate) deployment: bool,
-    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=8))]
-    pub(crate) spark_tp: Option<u8>,
-    #[arg(long, requires = "deployment", requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub(crate) spark_ep: Option<u8>,
     /// Ordered endpoint inventory; selected ranks take its prefix.
     #[arg(long = "deployment-peers", requires = "deployment", value_delimiter = ',')]
     pub(crate) deployment_peers: Vec<String>,
     /// Preserve launch admission spelling; checked by the native admission parser.
     #[arg(long, requires = "deployment")]
     pub(crate) kv_pool_size: Option<String>,
-    #[arg(long, requires = "deployment")]
-    pub(crate) memory_reservation: Option<String>,
     /// Emit snapshot-relative paths suitable for rsync --files-from.
     #[arg(long)]
     pub(crate) files: bool,
@@ -442,9 +484,6 @@ pub(crate) struct PlanArgs {
     /// Attention placement: auto is the qualified family default (heads until decided).
     #[arg(long, default_value = "auto", value_parser = ["auto", "context", "layers", "heads"])]
     pub(crate) attention_placement: String,
-    /// Resolved global logical GPU ceiling; PRO defaults to its CUDA total (94.97 GiB).
-    #[arg(skip)]
-    pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
@@ -520,15 +559,6 @@ pub(crate) struct PlanArgs {
     /// GLM 5.3 Flash's DSA index storage for --layout (compact is single-GPU only).
     #[arg(long, value_enum, default_value = "keys")]
     pub(crate) index_cache: crate::families::glm5_flash::engine::IndexCache,
-    /// GPU memory (GiB) each coordinator GPU keeps free for runtime growth in --layout (the
-    /// engines' --headroom-gib).
-    #[arg(long, default_value_t = 2.0)]
-    pub(crate) headroom_gib: f64,
-    /// Decode graph budget (MiB) for --layout (GLM 5.3 Flash's --graph-budget-mib; unset: the
-    /// family's graph allowance). One GPU with Spark experts and an automatic pool keeps the budget
-    /// itself, as its measured admission does; other layouts keep at least the allowance.
-    #[arg(long)]
-    pub(crate) graph_budget_mib: Option<u64>,
     /// GLM 5.3 Flash's replay records for --layout (`shared`: in the prefill scratch, one GPU;
     /// `auto`: `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`).
     #[arg(long, value_enum, default_value = "own")]
@@ -703,12 +733,6 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Spark tensor-parallel world; one rank supports whole Qwen EXL3 experts.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) world: u32,
-    /// Replicated-group tensor-parallel degree inside one group (opt-in; all-or-none with --spark-ep).
-    #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
-    pub(crate) spark_tp: Option<u8>,
-    /// Number of replicated expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
-    #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub(crate) spark_ep: Option<u8>,
     /// Total device bytes allowed for resident weights, loading and execution.
     #[arg(long)]
     pub(crate) device_budget_bytes: usize,
@@ -800,6 +824,28 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_policy_flags_parse_sizes_and_reject_percentages() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from(["cuteafd", "--gpu-memory-cap", "32GiB", "--spark-memory-cap", "100GiB",
+            "--gpu-reserve", "3GiB", "--spark-reserve", "512MiB", "--family-reserve", "2GB", "--kv-target-tokens", "1048576",
+            "--kv-min-tokens", "65536", "--kv-max-tokens", "4194304", "plan", "/model"]).unwrap();
+        let policy = cli.memory.policy();
+        assert_eq!(policy, cuteafd_core::memory_policy::MemoryPolicy { gpu_cap: Some(32 << 30), spark_cap: Some(100 << 30),
+            gpu_reserve: Some(3 << 30), spark_reserve: Some(512 << 20), family_reserve: Some(2_000_000_000),
+            kv_target: Some(1 << 20), kv_min: Some(65_536), kv_max: Some(4 << 20) });
+        assert!(policy.validate().is_ok());
+        assert_eq!(super::Cli::try_parse_from(["cuteafd", "plan", "/model"]).unwrap().memory.policy(), Default::default());
+        for (flag, value) in [("--gpu-memory-cap", "50%"), ("--gpu-reserve", "10%"), ("--spark-memory-cap", "1TB"),
+            ("--family-reserve", "-1GiB"), ("--kv-max-tokens", "2M")] {
+            assert!(super::Cli::try_parse_from(["cuteafd", flag, value, "plan", "/model"]).is_err(), "{flag} {value}");
+        }
+        // Family argv wins key by key over the outer argv.
+        let outer = super::MemoryArgs { gpu_memory_cap: Some(1), family_reserve: Some(2), ..Default::default() };
+        let inner = super::MemoryArgs { gpu_memory_cap: Some(3), ..Default::default() };
+        assert_eq!((inner.or(outer).gpu_memory_cap, inner.or(outer).family_reserve), (Some(3), Some(2)));
+    }
+
     #[test]
     fn reply_phase_flags_are_independent_global_selections() {
         use clap::Parser;
@@ -1160,11 +1206,14 @@ mod tests {
         }
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", "160"])).is_ok());
         for concurrency in ["1", "2", "16", "17", "32", "64"] {
-            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency, "--kv-pool-size", "1.5GiB", "--memory-reservation", "87.5%"])).is_ok());
+            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency, "--kv-pool-size", "1.5GiB", "--gpu-memory-cap", "87.5GiB"])).is_ok());
         }
         for concurrency in ["0", "65", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency])).is_err());
         }
+        // Sizes only: no percentage ceiling and no removed reservation key.
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--gpu-memory-cap", "87.5%"])).is_err());
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--memory-reservation", "87.5GiB"])).is_err());
         for (context, output, valid) in [("256", "128", true), ("0", "128", false),
             ("1048577", "128", false), ("256", "0", true), ("256", "-1", true), ("256", "393217", true),
             ("256", "12k", false)] {
@@ -1299,43 +1348,17 @@ mod tests {
     }
 
     #[test]
-    fn spark_topology_flags_are_opt_in_all_or_none_and_range_checked() {
+    fn spark_topology_flags_are_gone_and_worker_world_is_range_checked() {
         use clap::Parser;
         let serve = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         let expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--device-budget-bytes", "1000", "--rank", "0", "--world", "4"];
-        // Absent keys preserve the legacy launch vector exactly.
         for base in [&serve[..], &expert[..]] {
-            let cli = Cli::try_parse_from(base).unwrap();
-            match cli.command {
-                Commands::ServeNative(args) => {
-                    assert_eq!((args.spark_tp, args.spark_ep), (None, None));
-                }
-                Commands::Expertd(args) => {
-                    assert_eq!((args.spark_tp, args.spark_ep), (None, None));
-                }
-                other => panic!("unexpected command {other:?}"),
+            Cli::try_parse_from(base).unwrap();
+            for flag in ["--spark-tp", "--spark-ep"] {
+                assert!(Cli::try_parse_from(base.iter().copied().chain([flag, "2"])).is_err(), "{flag}");
             }
-        }
-        // Both keys parse for either process.
-        let cli = Cli::try_parse_from(serve.into_iter().chain(["--spark-tp", "2", "--spark-ep", "2"]))
-            .unwrap();
-        let Commands::ServeNative(args) = cli.command else { panic!("serve-native") };
-        assert_eq!((args.spark_tp, args.spark_ep), (Some(2), Some(2)));
-        let cli = Cli::try_parse_from(expert.into_iter()
-            .chain(["--spark-tp", "3", "--spark-ep", "2"])).unwrap();
-        let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
-        assert_eq!((args.spark_tp, args.spark_ep), (Some(3), Some(2)));
-        // All-or-none and value ranges are enforced at parse time.
-        for flags in [vec!["--spark-tp", "2"], vec!["--spark-ep", "2"]] {
-            assert!(Cli::try_parse_from(serve.into_iter().chain(flags.clone())).is_err());
-            assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err());
-        }
-        for (tp, ep) in [("1", "2"), ("9", "1"), ("2", "0"), ("2", "4")] {
-            let flags = ["--spark-tp", tp, "--spark-ep", ep];
-            assert!(Cli::try_parse_from(serve.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
-            assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
         }
         // Whole-expert Qwen TP1 must reach the worker's family validation.
         let one = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
@@ -1346,29 +1369,11 @@ mod tests {
         for invalid in ["0", "9"] {
             assert!(Cli::try_parse_from(one.into_iter().chain([invalid])).is_err());
         }
-        // The worker world range also admits the six-rank layouts.
         let cli = Cli::try_parse_from(["cuteafd", "expertd-native", "--snapshot", "/model",
             "--native-lib", "/native.so", "--device-budget-bytes", "1000",
-            "--rank", "5", "--world", "6"]).unwrap();
+            "--rank", "7", "--world", "8"]).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
-        assert_eq!((args.rank, args.world), (5, 6));
-
-        // Pure TP6EP1 parses on both processes; TP9 is outside transport capacity.
-        let six_expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib",
-            "/native.so", "--device-budget-bytes", "1000", "--rank", "5", "--world", "6"];
-        for command in [&serve[..], &six_expert[..]] {
-            let cli = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "6", "--spark-ep", "1"])).unwrap();
-            match cli.command {
-                Commands::ServeNative(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
-                Commands::Expertd(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
-                other => panic!("unexpected command {other:?}"),
-            }
-            let error = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "9", "--spark-ep", "1"]))
-                .expect_err("TP9 exceeds transport capacity");
-            assert!(error.to_string().contains("expected 2 through 8"), "{error}");
-        }
+        assert_eq!((args.rank, args.world), (7, 8));
     }
 }
 
@@ -1457,10 +1462,6 @@ pub(crate) struct NativeServeArgs {
     /// the existing V4.1 pool policy. Cannot be combined with --kv-pool-size.
     #[arg(long, conflicts_with = "kv_pool_size")]
     pub pool_tokens: Option<u64>,
-
-    /// Total device occupancy ceiling (% or B/MB/GB/MiB/GiB); sizes KV after fixed allocations.
-    #[arg(long)]
-    pub memory_reservation: Option<crate::shared::memory::budget::Reservation>,
 
     /// Complete bottom-up RTX routed layers: auto fills available memory, or 0..40.
     #[arg(long, default_value = "auto")]
@@ -1561,25 +1562,6 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long,value_delimiter=',',num_args=1..)] pub peers: Vec<std::net::SocketAddr>,
     #[arg(long,default_value="127.0.0.1:8000")] pub listen: String,
-    /// Replicated-group tensor-parallel degree inside one Spark group (opt-in; all-or-none with --spark-ep).
-    #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
-    pub spark_tp: Option<u8>,
-    /// Number of replicated Spark expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
-    #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
-    pub spark_ep: Option<u8>,
-}
-
-/// Parse transport geometry; checkpoint admission checks native package coverage.
-fn parse_spark_tp(value: &str) -> Result<u8, String> {
-    let value: u8 = value
-        .parse()
-        .map_err(|_| "expected a Spark TP degree between 2 and 8".to_string())?;
-    match value {
-        2..=8 => Ok(value),
-        _ => Err(format!(
-            "unsupported Spark TP degree {value}; expected 2 through 8"
-        )),
-    }
 }
 
 /// `cuteafd plan --decode-rows`: GLM 5.3 Flash's decode programs' 64 rows, or the wide programs' 128.

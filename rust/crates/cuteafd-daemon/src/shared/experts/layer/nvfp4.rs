@@ -99,7 +99,7 @@ impl<'a> Nvfp4Side<'a> {
         let intermediate = match layer {
             ExpertLayer::Backbone { .. } => text.moe_intermediate_size / 4,
             ExpertLayer::BackboneTp2 { .. } => text.moe_intermediate_size / 2,
-            ExpertLayer::BackboneReplicatedTp { world: world @ (3 | 6), rank, .. } => {
+            ExpertLayer::BackboneSparkTp { world: world @ (3 | 6), rank, .. } => {
                 ensure!(rank < world && text.moe_intermediate_size % world == 0,
                     "invalid NVFP4 Spark TP{world} rank {rank}");
                 text.moe_intermediate_size / world
@@ -123,8 +123,8 @@ impl<'a> Nvfp4Side<'a> {
             ExpertLayer::Backbone { .. } => 1,
             ExpertLayer::BackboneTp2 { .. } => 3,
             ExpertLayer::BackboneFull { .. } => 2,
-            ExpertLayer::BackboneReplicatedTp { world: 3, .. } => 4,
-            ExpertLayer::BackboneReplicatedTp { world: 6, .. } => 5,
+            ExpertLayer::BackboneSparkTp { world: 3, .. } => 4,
+            ExpertLayer::BackboneSparkTp { world: 6, .. } => 5,
             _ => anyhow::bail!("NVFP4 covers backbone routed experts only"),
         };
         ensure!(!library.v41_nvfp4_shared_input(role)?,

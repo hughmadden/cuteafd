@@ -106,7 +106,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         projections: cuteafd_loader::families::muse_spark::weight_layout::projections_with_manifest(
             &cfg, &core, GPUS, usize::try_from(prefill.unit_rows)?,
             Some(&cuteafd_loader::placement::inventory::ProgramsManifest::from_manifest(&manifest)?))?,
-        catalog: &catalog, manifest: &manifest, measured, headroom_bytes: 2 << 30, spark_ranks: SPARKS,
+        catalog: &catalog, manifest: &manifest, measured, headroom_bytes: cuteafd_loader::placement::reserve::gpu("muse_spark"), spark_ranks: SPARKS,
         prefill, full_prefill_logits: false, slots: SEQUENCES as u64,
         mark_slots: mark.slots(shared::mark_bytes(&cfg, 1) as usize) as u64, max_context: None,
         pool_tokens: None, onboard: Onboard::Auto,
@@ -123,7 +123,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4)?;
     let spark = super::admission::spark_plan(placement, prefill, cutoff, SEQUENCES, SPARKS)?;
     let admission = SparkAdmission::plan_view(checkpoint.view.as_ref().context("Muse Spark admission requires selected checkpoint view")?, cuteafd_core::ExpertGeometry::MUSE_SPARK,
-        Some(&catalog), &spark.working, SPARKS, None, spark.model.clone(), None)?;
+        Some(&catalog), &spark.working, SPARKS, spark.model.clone(), None)?;
     anyhow::ensure!(admission.coordinator_pushes(), "Muse max planned without a coordinator push group");
     let (layers, assignments) = admission.admitted();
     eprintln!("placement: {}; pool {} tokens; onboard {} RTX expert layers; Spark layers {:?}..={:?}",

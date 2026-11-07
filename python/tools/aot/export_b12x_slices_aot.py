@@ -29,7 +29,7 @@ import _pinned_sparkinfer
 # Plan-time expert placement roles. Geometry, SM guard and native role id are
 # properties of the role, never of the live row count. `spark` is the historical
 # TP4 shard (576 exact storage); `spark_tp2`/`spark_tp3`/`spark_tp6` are
-# the replicated-group shards and are already 128-aligned. These pure tables are
+# the Spark TP shards and are already 128-aligned. These pure tables are
 # the authoritative source for the export geometry and are covered by a CPU-only
 # test that needs neither torch nor CUDA.
 ROLE_GEOMETRY = {

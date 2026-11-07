@@ -203,8 +203,8 @@ fn family_of(command: &str) -> Option<&'static str> {
 
 /// Records a serve command's resolved options (value, default, source) for
 /// the benchmark; other commands record nothing.
-pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>) -> Result<()> {
-    if let Some(mut context) = serve_context(matches, coordinator_budget_gib)? {
+pub(crate) fn capture(matches: &ArgMatches, memory: crate::cli::MemoryArgs) -> Result<()> {
+    if let Some(mut context) = serve_context(matches, Some(memory))? {
         let formats = cuteafd_core::spark_reply::requested();
         let (prefill, decode) = reply_settings(&mut context, formats);
         tracing::info!(%prefill, %decode, prefill_explicit = formats.prefill.is_some(),
@@ -254,7 +254,7 @@ fn derived_argument(family: &str, name: &str) -> bool {
 /// The serve command's resolved settings, without publishing them. Tests read
 /// this directly: `capture` stores one process-wide context, so a test that
 /// called it would replace whatever another test was asserting.
-fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
+fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
     -> Result<Option<cuteafd_bench::context::ServerContext>> {
     let Some((name, sub)) = matches.subcommand() else { return Ok(None) };
     let Some(family) = family_of(name) else { return Ok(None) };
@@ -265,7 +265,8 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     let mut derived = Vec::new();
     for arg in definition.get_arguments() {
         let id = arg.get_id().as_str();
-        if matches!(id, "help" | "version" | "coordinator_gpu_budget_gib") {
+        if matches!(id, "help" | "version" | "gpu_memory_cap" | "spark_memory_cap" | "gpu_reserve" | "spark_reserve"
+            | "family_reserve" | "kv_target_tokens" | "kv_min_tokens" | "kv_max_tokens") {
             continue;
         }
         let value = sub.get_raw(id).map(|values| values.map(|v| v.to_string_lossy().into_owned())
@@ -297,10 +298,16 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
             source: source.to_string() });
     }
     // Global options are not in the unbuilt family definition. Pass the
-    // resolved ceiling explicitly so generic serve's reparse retains it too.
-    if let Some(gib) = coordinator_budget_gib {
-        settings.push(Setting { name: "coordinator-gpu-budget-gib".into(), value: Some(gib.to_string()),
-            default: None, source: "cli".into() });
+    // resolved memory policy explicitly so generic serve's reparse retains it too.
+    if let Some(memory) = memory {
+        for (name, value) in [("gpu-memory-cap", memory.gpu_memory_cap), ("spark-memory-cap", memory.spark_memory_cap),
+            ("gpu-reserve", memory.gpu_reserve), ("spark-reserve", memory.spark_reserve),
+            ("family-reserve", memory.family_reserve), ("kv-target-tokens", memory.kv_target_tokens),
+            ("kv-min-tokens", memory.kv_min_tokens), ("kv-max-tokens", memory.kv_max_tokens)] {
+            if let Some(value) = value {
+                settings.push(Setting { name: name.into(), value: Some(value.to_string()), default: None, source: "cli".into() });
+            }
+        }
     }
     // The parsed flag already applies CUTEAFD_ATTENTION_PLACEMENT (cli over env over
     // default). Report that resolution once; the launch spelling is the same option.
@@ -518,19 +525,19 @@ mod tests {
 
     #[test]
     fn serve_options_are_captured_with_defaults_and_sources() {
-        let argv = ["cuteafd", "--coordinator-gpu-budget-gib", "32", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
+        let argv = ["cuteafd", "--gpu-memory-cap", "32GiB", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
             "/opt/lib.so", "--max-sequences", "2"];
         let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
         let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap();
-        capture(&matches, cli.coordinator_gpu_budget_gib).unwrap();
+        capture(&matches, cli.memory).unwrap();
         let context = cuteafd_bench::context::get();
         assert_eq!(context.family, None);
         assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/hub/models--Qwen--Q/snapshots/abc")));
         let find = |name: &str| context.settings.iter().find(|s| s.name == name).cloned()
             .unwrap_or_else(|| panic!("{name} missing"));
-        let budget = find("coordinator-gpu-budget-gib");
+        let budget = find("gpu-memory-cap");
         assert_eq!((budget.value.as_deref(), budget.default.as_deref(), budget.source.as_str()),
-            (Some("32"), None, "cli"));
+            (Some("34359738368"), None, "cli"));
         assert_eq!(context.settings.iter().filter(|s| s.name == budget.name).count(), 1);
         let sequences = find("max-sequences");
         assert_eq!((sequences.value.as_deref(), sequences.default.as_deref(), sequences.source.as_str()),

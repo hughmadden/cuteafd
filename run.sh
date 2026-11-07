@@ -20,10 +20,6 @@ The CPU planner counts this workspace with plan --layout --full-prefill-logits.
 Unspecified Spark count makes all configured hosts available to the planner.
 SPARK_COUNT or SPARK_HOSTS bounds the available Sparks; the plan may use fewer,
 including 0, and refuses only when the requested deployment cannot fit.
-An optional expert-group topology is selected in the configuration with
-SPARK_TP and SPARK_EP (all-or-none, native checkpoint only); at SPARK_COUNT=3
-the explicit SPARK_TP=3 SPARK_EP=1 form is one unreplicated three-rank group.
-See docs/tp-ep-configuration.md.
 INSTANCE (configuration key, empty by default) names a launch that runs beside
 others on disjoint hardware: its coordinator container is
 cuteafd-coordinator-INSTANCE instead of the one shared cuteafd-coordinator, and
@@ -40,15 +36,15 @@ container-name characters, [A-Za-z0-9_.-].
   --restart                     replace this instance's deployment
   --all                         with --restart, sweep worker ports on selected hosts
   --dry-run                     validate a DeepSeek V4.1 launch without changing services
-  --total-capacity              with --dry-run, plan against total GPU capacity (or COORDINATOR_GPU_BUDGET_GIB) without reading live free memory
+  --total-capacity              with --dry-run, plan against total GPU capacity (or GPU_MEMORY_CAP) without reading live free memory
 
 DeepSeek V4.1 keys (cuteafd.config documents each): RTX_GPUS, RTX_EXPERT_LAYERS,
 CONCURRENCY, HTTP_QUEUE_DEPTH, HTTP_QUEUE_WAIT_MS, POOL_TOKENS, EMBEDDING,
-KV_POOL_SIZE, HOST_CACHE_BYTES, MEMORY_RESERVATION, PREFIX_CACHE_ENTRIES,
+KV_POOL_SIZE, HOST_CACHE_BYTES, GPU_MEMORY_CAP, PREFIX_CACHE_ENTRIES,
 MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS, PREFILL_BATCH_TOKENS, SPECULATOR (dspark|off),
 DSPARK_DRAFT_LIMIT (1..7), TP2_ATTENTION, TP2_QUERY_PROJECTION,
 TP2_OUTPUT_PROJECTION, TP2_DSPARK_EXPERTS. The former command-line spellings
-(--listen, --rtx-gpus, --concurrency, --kv-pool-size, --memory-reservation,
+(--listen, --rtx-gpus, --concurrency, --kv-pool-size,
 --prefix-cache-entries, --dspark-draft-limit, --tp2-*, ...) are these keys.
 
 Optional RDMA tuning env values are forwarded to both roles only when set:
@@ -77,7 +73,7 @@ legacy_key() {
     --http-queue-wait-ms) printf HTTP_QUEUE_WAIT_MS ;; --rtx-expert-layers) printf RTX_EXPERT_LAYERS ;;
     --concurrency) printf CONCURRENCY ;; --host-cache-bytes) printf HOST_CACHE_BYTES ;;
     --pool-tokens) printf POOL_TOKENS ;; --kv-pool-size) printf KV_POOL_SIZE ;;
-    --memory-reservation) printf MEMORY_RESERVATION ;; --prefix-cache-entries) printf PREFIX_CACHE_ENTRIES ;;
+    --prefix-cache-entries) printf PREFIX_CACHE_ENTRIES ;;
     --max-context-tokens) printf MAX_CONTEXT_TOKENS ;; --max-output-tokens) printf MAX_OUTPUT_TOKENS ;;
     --prefill-batch-tokens) printf PREFILL_BATCH_TOKENS ;; --dspark-draft-limit) printf DSPARK_DRAFT_LIMIT ;;
     *) return 1 ;;

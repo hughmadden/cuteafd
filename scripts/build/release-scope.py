@@ -201,7 +201,7 @@ def requirements(repo, matrix, scope):
         experts = tokens(scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'])
         dual = int(values.get('RTX_GPUS', '1').replace('auto', '2')) == 2
         count = int(values.get('SPARK_COUNT', '0'))
-        tp = int(values.get('SPARK_TP') or count or 1)
+        tp = count or 1
         programs = set()
         if family == 'deepseek_v4':
             tag = 'dsv4p' if any(s.startswith('dsv4p:') for s in experts) else 'dsv4f'
@@ -224,10 +224,15 @@ def requirements(repo, matrix, scope):
             programs = {'step5', 'step52'} if dual else {'step5'}
         elif family == 'kimi_k3':
             programs = {'kimik3', 'dense_trellis_k6', 'kimi_split'}
+        elif family == 'mistral_large4':
+            programs = {'ml4', 'dense_trellis_k6'} | ({'ml42'} if dual else set())
         elif family == 'muse_spark':
             programs = {'muse', 'dense_trellis_k6', 'expert_partial'} | ({'muse2'} if dual else set())
+        spark_experts = sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES']))
+        spark_layouts = {item: [layout.removesuffix('/m1') for layout in scopes_module(repo).exl3_spark_layouts(item, tp)]
+                         for item in spark_experts if ':exl3-' in item}
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
-                           experts=sorted(experts), spark_experts=sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'])),
+                           experts=sorted(experts), spark_experts=spark_experts, spark_layouts=spark_layouts,
                            spark_count=count, spark_tp=tp, dual=dual,
                            roles=sorted(tokens(scopes['CUTEAFD_WIP_SPARK_TP_ROLES'])),
                            nvfp4='nvfp4' in values.get('MODEL_ID', '').lower(),
@@ -275,7 +280,11 @@ def check_package(root, package, layouts, role, verified=None):
     require(manifest.get('role') == ('spark' if role == 'expert' else role), f'{package}: wrong role')
     if package.startswith('exl3/'):
         require(manifest.get('schema') == 'cuteafd.exl3-package.v1', f'{package}: invalid EXL3 schema')
-        present = {v['directory'].split('/')[0] for v in manifest.get('variants', [])}
+        variants = {v['directory'] for v in manifest.get('variants', [])}
+        present = {directory.split('/')[0] for directory in variants}
+        if role == 'expert':
+            missing = sorted(layout + '/m1' for layout in layouts if layout + '/m1' not in variants)
+            require(not missing, f'{package}: missing m1 variants {missing}')
     else:
         present = set(manifest.get('layouts', {}))
         # Both Spark and coordinator H128 slices require exact-width siblings.
@@ -303,7 +312,8 @@ def check_package(root, package, layouts, role, verified=None):
         require(file.stat().st_size == record['bytes'] and hashlib.sha256(file.read_bytes()).hexdigest() == record['sha256'],
                 f'{package}: file hash mismatch {name}')
     for layout in layouts:
-        require(any(name.startswith(layout + '/') and name.endswith('.so') for name in files),
+        prefix = layout + ('/m1/' if package.startswith('exl3/') and role == 'expert' else '/')
+        require(any(name.startswith(prefix) and name.endswith('.so') for name in files),
                 f'{package}: missing library for {layout}')
     if verified is not None:
         verified.add(path)
@@ -367,7 +377,7 @@ def check_inventory(root, role, wanted, symbols=None):
             for item in scopes:
                 family, kind = item.split(':')
                 if kind.startswith('exl3-'):
-                    layouts = [f'tp{entry["spark_tp"]}-rank{rank}' for rank in range(entry['spark_tp'])] if role == 'expert' else ['rtx-tp1']
+                    layouts = entry['spark_layouts'][item] if role == 'expert' else ['rtx-tp1']
                     if role == 'coordinator' and entry['dual']:
                         layouts.extend(['rtx-tp2-rank0', 'rtx-tp2-rank1'] if family == 'qwen4' else ['rtx-tp2'])
                     check_package(root, f'exl3/exl3-{family}-{kind[5:]}', layouts, role, verified)

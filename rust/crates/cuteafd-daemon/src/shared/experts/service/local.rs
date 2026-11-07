@@ -134,7 +134,7 @@ mod selection_tests {
         let mut config = NativeExpertServiceConfig { attention: Default::default(), encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
             snapshot: dir.path().into(), exlr8_manifest: None, exlr8_prefill_activations: Default::default(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
-            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_roles: false, bf16_ingress: false };
+            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_roles: super::NativeSparkRoles::None, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission {
             executions: cuteafd_core::SparkExecutions::admit(&[80], 80, 80, 1, &[80]).unwrap(),
             endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
@@ -258,7 +258,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     crate::shared::spark_topology::require_wire(config.spark_world()?, &catalog)?;
     let geometry = catalog.routed_experts().geometry()?;
-    config.native_spark_roles = catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
+    config.native_spark_roles = super::NativeSparkRoles::of(&catalog);
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;
@@ -672,7 +672,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let mut received = false;
             let wait = (intake == 0 && !executions.iter().any(Execution::has_staged)
                 && wait_index == Some(index)).then_some(idle_wait);
-            let mut serve = Serve { config: &config, executor_id, spark_world: &spark_world, resident: &resident,
+            let mut serve = Serve { config: &config, executor_id, resident: &resident,
                 weights: &weights, exchange: &mut exchange, row_indices: &mut row_indices, skip_compute,
                 log_ingress: pending_steady_log };
             let result = {
@@ -680,7 +680,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 // independently of each connection's required reply order.
                 let finished = match holding[index].front().copied() {
                     Some(unit) if queues.ready(unit) => connections[index].finish_deferred(|view, mapped, emit| {
-                        let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?
+                        let response = Serve::device_response(view, mapped, executor_id, &config)?
                             .with_pace(queues.pace(unit));
                         emit(ProtocolV2ExecutorResponseRef::Device(response))
                     }).and_then(|()| {
@@ -745,7 +745,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                                 executions[earlier.owner].synchronize()?;
                                 queues.complete_ready(earlier.owner, &mut executions[earlier.owner])?;
                                 connections[index].finish_deferred(|view, mapped, emit| {
-                                    let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?;
+                                    let response = Serve::device_response(view, mapped, executor_id, &config)?;
                                     emit(ProtocolV2ExecutorResponseRef::Device(response))
                                 })?;
                                 holding[index].pop_front();
@@ -1010,7 +1010,6 @@ impl From<anyhow::Error> for ServeFailure {
 struct Serve<'s, 'w, 'a> {
     config: &'s NativeExpertServiceConfig,
     executor_id: u64,
-    spark_world: &'s SparkWorld,
     resident: &'s [usize],
     weights: &'w Weights<'a>,
     exchange: &'s mut HostExpertExchange,
@@ -1020,22 +1019,17 @@ struct Serve<'s, 'w, 'a> {
 }
 
 impl<'w, 'a> Serve<'_, 'w, 'a> {
-    fn parse<'v>(view: &'v cuteafd_transport::ExpertProtocolV2RequestView<'_>, config: &NativeExpertServiceConfig,
-        spark_world: &SparkWorld) -> Result<BackboneRequest<'v>> {
-        // A topology-bound worker admits only the ownership-aware request
-        // contract; every other family is a protocol mismatch, not a fallback.
-        match spark_world.ownership_topology() {
-            Some(topology) => BackboneRequest::parse_native_group(view.frame_bytes(), config.capacity, topology),
-            None => BackboneRequest::parse(view.frame_bytes(), config.capacity),
-        }
+    fn parse<'v>(view: &'v cuteafd_transport::ExpertProtocolV2RequestView<'_>, config: &NativeExpertServiceConfig)
+        -> Result<BackboneRequest<'v>> {
+        BackboneRequest::parse(view.frame_bytes(), config.capacity)
     }
 
     /// The device response a launched request writes into its send slot.
     fn device_response(view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>,
         mapped: cuteafd_transport::ProtocolV2RequestDevicePayload, executor_id: u64,
-        config: &NativeExpertServiceConfig, spark_world: &SparkWorld)
+        config: &NativeExpertServiceConfig)
         -> Result<cuteafd_transport::ExpertProtocolV2DeviceResponseRef<'static>> {
-        let request = Self::parse(view, config, spark_world)?;
+        let request = Self::parse(view, config)?;
         let slot = mapped.response_slot.context("deferred request lost its response slot")?;
         let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
         let bytes = request.plane_bytes()?;
@@ -1055,7 +1049,7 @@ impl<'w, 'a> Serve<'_, 'w, 'a> {
         if view.header.row_count > self.config.capacity || self.skip_compute || mapped.response_slot.is_none() {
             return Ok(false);
         }
-        let request = Self::parse(view, self.config, self.spark_world)?;
+        let request = Self::parse(view, self.config)?;
         if !request.permits_device_response() { return Ok(false); }
         let layer = self.resident.binary_search(&(request.layer() as usize))
             .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
@@ -1084,7 +1078,7 @@ impl<'w, 'a> Serve<'_, 'w, 'a> {
             emit(ProtocolV2ExecutorResponseRef::Host(response))?;
             return Ok(Served { executed: false });
         }
-        let request = Self::parse(view, config, self.spark_world)?;
+        let request = Self::parse(view, config)?;
         if self.log_ingress {
             tracing::info!(rank = config.rank, ingress_dtype = ?view.header.hidden_dtype,
                 capacity = config.capacity, "Spark endpoint ingress geometry");

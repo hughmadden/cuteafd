@@ -179,32 +179,3 @@ def test_whole_matrix_exl3_count_enumeration(record_property):
     output = os.environ.get('CUTEAFD_SPARK_RANGE_EXPORT_RESULTS')
     if output:
         Path(output).write_text(json.dumps(dict(exl3_objects=results, layout_keys=keys), indent=2) + '\n')
-
-
-def test_variable_world_harness_artifacts_and_partial_tiles_without_cuda():
-    import argparse
-    import ast
-    from spark_packages import native_spark_artifacts, package_worlds
-    expected = native_spark_artifacts()
-    for relative, symbol in [("python/tools/bench/bench_tp_ep_kernel.py", "TP_GEOMETRIES"),
-                             ("python/tools/bench/benchmark_v41_ep_groups.py", "TP_DEGREES")]:
-        path = ROOT / relative
-        tree = ast.parse(path.read_text())
-        nodes = [node for node in tree.body if
-                 (isinstance(node, ast.ImportFrom) and node.module == "spark_packages") or
-                 (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
-                  and target.id in (symbol, "SUPPORTED_SLICE_WIDTHS") for target in node.targets)) or
-                 (isinstance(node, ast.FunctionDef) and node.name == "parse_args")]
-        namespace = {"argparse": argparse, "Path": Path, "__doc__": "CPU parser proof"}
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
-        if symbol == "TP_DEGREES":
-            assert namespace[symbol] == (1, *package_worlds("v41", "mxfp4"))
-        else:
-            assert namespace[symbol] == tuple((tp, artifact, f"tp{tp}-{artifact.name}") for tp, artifacts in expected.items() for artifact in artifacts)
-            for world in range(1, 10):
-                argv = ["--topologies", f"tp{world}", "--widths", "192", "--rows", "1", "--output", "/unused.json"]
-                if world in expected:
-                    assert namespace["parse_args"](argv).topologies == f"tp{world}"
-                else:
-                    with pytest.raises(SystemExit):
-                        namespace["parse_args"](argv)

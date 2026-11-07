@@ -206,25 +206,25 @@ def test_reduction_summary_uses_recorded_layer_samples() -> None:
 
 @pytest.mark.parametrize("ranks", range(1, 10))
 def test_native_qualifiers_share_covered_count_choices_without_cuda(ranks):
-    import qualify_v41_replicated_native as replicated
+    import qualify_v41_spark_tp_native as spark_tp
     from spark_packages import native_spark_artifacts
     covered = ranks in native_spark_artifacts()
     slice_args = ["--native-lib", "/native.so", "--width", "192", "--spark-tp", str(ranks)]
-    replicated_args = ["--native-lib", "/native.so", "--checkpoint", "--spark-tp", str(ranks)]
+    spark_tp_args = ["--native-lib", "/native.so", "--checkpoint", "--spark-tp", str(ranks)]
     if covered:
         assert slice_qualifier().parse_args(slice_args)[0].spark_tp == ranks
-        assert replicated.parse_args(replicated_args).spark_tp == ranks
+        assert spark_tp.parse_args(spark_tp_args).spark_tp == ranks
     else:
         with pytest.raises(SystemExit):
             slice_qualifier().parse_args(slice_args)
         with pytest.raises(SystemExit):
-            replicated.parse_args(replicated_args)
-    assert replicated.native_spark_artifacts() == native_spark_artifacts()
+            spark_tp.parse_args(spark_tp_args)
+    assert spark_tp.native_spark_artifacts() == native_spark_artifacts()
 
 
 def test_native_tp8_role_gate_checks_loaded_geometry_without_cuda():
     import ctypes as C
-    import qualify_v41_replicated_native as replicated
+    import qualify_v41_spark_tp_native as spark_tp
     from _v41_expert_native import Info
     class Library:
         def cuteafd_v41_expert_info(self, capacity, output):
@@ -233,6 +233,6 @@ def test_native_tp8_role_gate_checks_loaded_geometry_without_cuda():
             info.experts, info.hidden_size, info.topk = 384, 5120, 6
             info.capacity_rows = capacity
             return 0
-    replicated.assert_native_role_geometry(Library(), 80, artifact=replicated.native_spark_artifacts()[8][0])
+    spark_tp.assert_native_role_geometry(Library(), 80, artifact=spark_tp.native_spark_artifacts()[8][0])
     with pytest.raises(AssertionError):
-        replicated.assert_native_role_geometry(Library(), 80, artifact=replicated.native_spark_artifacts()[6][0])
+        spark_tp.assert_native_role_geometry(Library(), 80, artifact=spark_tp.native_spark_artifacts()[6][0])

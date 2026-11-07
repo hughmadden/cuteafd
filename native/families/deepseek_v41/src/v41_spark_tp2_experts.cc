@@ -1,4 +1,4 @@
-// Replicated-group Spark TP2 shard modules (native FP8 K32 family, SM121).
+// Spark TP2 shard modules (native FP8 K32 family, SM121).
 // Distinct symbol family from the standard Spark TP4 shard so a single
 // libcuteafd_native.so can hold every Spark TP degree. Geometry is baked into
 // the exported variant table (intermediate 1152, no storage padding).

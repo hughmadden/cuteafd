@@ -244,10 +244,7 @@ python/tools/_pinned_sparkinfer.py	python/tools/lib/_pinned_sparkinfer.py
 python/tools/_v41_expert_native.py	python/tools/lib/_v41_expert_native.py
 python/tools/analyze_expert_reduction_replay.py	python/tools/bench/analyze_expert_reduction_replay.py
 python/tools/bench_real_full_mtp_acceptance.py	python/tools/bench/bench_real_full_mtp_acceptance.py
-python/tools/bench_tp_ep_kernel.py	python/tools/bench/bench_tp_ep_kernel.py
 python/tools/bench_v41_dense_plans.py	python/tools/bench/bench_v41_dense_plans.py
-python/tools/bench_v41_native_ep.py	python/tools/bench/bench_v41_native_ep.py
-python/tools/benchmark_v41_ep_groups.py	python/tools/bench/benchmark_v41_ep_groups.py
 python/tools/build_ds4_flash_calibration_corpus.py	python/tools/qualify/deepseek_v4/build_ds4_flash_calibration_corpus.py
 python/tools/build_ds4_flash_route_alignment_extension.py	python/tools/qualify/deepseek_v4/build_ds4_flash_route_alignment_extension.py
 python/tools/build_ds4_flash_route_coverage_extension.py	python/tools/qualify/deepseek_v4/build_ds4_flash_route_coverage_extension.py
@@ -296,7 +293,7 @@ python/tools/qualify_v41_hc_split.py	python/tools/qualify/deepseek_v41/qualify_v
 python/tools/qualify_v41_local_arena.py	python/tools/qualify/deepseek_v41/qualify_v41_local_arena.py
 python/tools/qualify_v41_local_reduction.py	python/tools/qualify/deepseek_v41/qualify_v41_local_reduction.py
 python/tools/qualify_v41_packed_kv_conversion.py	python/tools/qualify/deepseek_v41/qualify_v41_packed_kv_conversion.py
-python/tools/qualify_v41_replicated_native.py	python/tools/qualify/deepseek_v41/qualify_v41_replicated_native.py
+python/tools/qualify_v41_replicated_native.py	python/tools/qualify/deepseek_v41/qualify_v41_spark_tp_native.py
 python/tools/qualify_v41_rope_fp8.py	python/tools/qualify/deepseek_v41/qualify_v41_rope_fp8.py
 python/tools/qualify_v41_router_gemm.py	python/tools/qualify/deepseek_v41/qualify_v41_router_gemm.py
 python/tools/qualify_v41_router_native_abi.py	python/tools/qualify/deepseek_v41/qualify_v41_router_native_abi.py
@@ -304,7 +301,6 @@ python/tools/qualify_v41_shared_tp2.py	python/tools/qualify/deepseek_v41/qualify
 python/tools/qualify_v41_slice_native.py	python/tools/qualify/deepseek_v41/qualify_v41_slice_native.py
 python/tools/qualify_v41_spark_native.py	python/tools/qualify/deepseek_v41/qualify_v41_spark_native.py
 python/tools/qualify_v41_sparse_skip.py	python/tools/qualify/deepseek_v41/qualify_v41_sparse_skip.py
-python/tools/qualify_v41_tie_seed_replay.py	python/tools/qualify/deepseek_v41/qualify_v41_tie_seed_replay.py
 python/tools/qualify_v41_token_accumulation.py	python/tools/qualify/deepseek_v41/qualify_v41_token_accumulation.py
 python/tools/qualify_v41_tp2_handles.py	python/tools/qualify/deepseek_v41/qualify_v41_tp2_handles.py
 python/tools/qualify_v41_tp2_numerics.py	python/tools/qualify/deepseek_v41/qualify_v41_tp2_numerics.py
@@ -434,7 +430,6 @@ scripts/qualify-ds41-target-taps.py	scripts/qualify/deepseek_v41/qualify-target-
 scripts/qualify-ds41-tool-eval.py	scripts/qualify/deepseek_v41/qualify-tool-eval.py
 scripts/qualify-ds41-tool-grammar.py	scripts/qualify/deepseek_v41/qualify-tool-grammar.py
 scripts/qualify-ds41-tool-serving.py	scripts/qualify/deepseek_v41/qualify-tool-serving.py
-scripts/qualify-ds41-tp-ep-e2e-six.py	scripts/qualify/deepseek_v41/qualify-tp-ep-e2e-six.py
 scripts/qualify-ds41-unicode.py	scripts/qualify/deepseek_v41/qualify-unicode.py
 scripts/qualify-ds41-vision-encoder.py	scripts/qualify/deepseek_v41/qualify-vision-encoder.py
 scripts/qualify-ds41-vision-ops.py	scripts/qualify/deepseek_v41/qualify-vision-ops.py
@@ -448,17 +443,12 @@ scripts/release/verify-release-artifacts.sh	scripts/build/release/verify-release
 scripts/release/write-evidence-sums.sh	scripts/build/release/write-evidence-sums.sh
 scripts/run-dsv4.sh	scripts/launch/run-family.sh
 scripts/run-on-hosts.sh	scripts/launch/run-on-hosts.sh
-scripts/run-tp-ep-kernel-checks.sh	scripts/bench/deepseek_v41/run-tp-ep-kernel-checks.sh
-scripts/run-tp-ep-native-candidate.sh	scripts/launch/run-tp-ep-native-candidate.sh
-scripts/run-tp-ep-six-candidate.sh	scripts/launch/run-tp-ep-six-candidate.sh
 scripts/run-with-python-env.sh	scripts/lib/run-with-python-env.sh
 scripts/select-release-gpus.py	scripts/launch/select-release-gpus.py
 scripts/sparkinfer-release-provenance.py	scripts/build/sparkinfer-release-provenance.py
 scripts/sync-ds41-fp4ple-variant.py	scripts/qualify/deepseek_v41/sync-fp4ple-variant.py
-scripts/tp-ep-native-candidate-plan.sh	scripts/launch/tp-ep-native-candidate-plan.sh
 scripts/validate-native-symbol-inventory.py	scripts/build/validate-native-symbol-inventory.py
 scripts/validate-sampling-campaign.py	scripts/bench/deepseek_v41/validate-sampling-campaign.py
-scripts/validate-tp-ep-reuse-fixture.py	scripts/bench/deepseek_v41/validate-tp-ep-reuse-fixture.py
 scripts/verify-ds41-independent-lane-trace.py	scripts/qualify/deepseek_v41/verify-independent-lane-trace.py
 scripts/verify-nvfp4-modelopt-container.sh	scripts/build/verify-nvfp4-modelopt-container.sh
 scripts/verify-release-source-manifest.py	scripts/build/verify-release-source-manifest.py

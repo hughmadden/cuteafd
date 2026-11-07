@@ -1271,9 +1271,9 @@ impl Opened {
             if !native && spark_bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
             cuteafd_core::SparkRings { max_frame_bytes: frame_bytes, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
             cuteafd_core::spark_reply::requested())?;
-        let budgets = production_budgets(&cards, 2 << 30, host,
+        let budgets = production_budgets(&cards, cuteafd_loader::placement::reserve::gpu("glm5"), host,
             serving.map_or(8 << 30, |(prefix, _)| prefix.host_cache_headroom_bytes).max(host.0 / 10),
-            &vec![cuteafd_loader::plan::layout::DEFAULT_SPARK_DEVICE_BYTES; spark_ranks])?;
+            &vec![cuteafd_loader::placement::reserve::spark_cap(); spark_ranks])?;
         let request = production_request(args.max_context as u64, requested_pool,
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
@@ -1286,6 +1286,7 @@ impl Opened {
             local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
             skip_routed_experts: args.skip_routed_experts, operation, sync_upload_bytes: 0,
             owners: additional, budgets }.prepare()?.admit(request)?;
+        cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5");
         {
             use sha2::{Digest, Sha256};
             let hash = |path: &std::path::Path| -> Result<String> {
@@ -1412,7 +1413,7 @@ impl Opened {
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let admission = crate::shared::placement::SparkAdmission::plan_view(&self.view,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working,
-                peers.len(), None, spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
+                peers.len(), spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
                 args.exlr8_manifest.as_deref())?;
             // Plan coordinator membership before offers; a Required failure
             // refuses startup rather than silently reading through the mount.
@@ -1584,7 +1585,7 @@ impl Opened {
         self.library.cuda_set_device(args.device)?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.bytes();
-        let embedding_bytes = embedding.device_bytes();
+        let embedding_bytes = embedding.device_owner_bytes();
         let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
             .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
             .enumerate().map(|(rank, bytes)| bytes

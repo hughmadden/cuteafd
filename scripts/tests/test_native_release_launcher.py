@@ -22,6 +22,29 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_generic_package_preflight_refuses_before_dry_run_and_startup(self) -> None:
+        text = FAMILY.read_text()
+        start = text.index('# Recipe registration is not proof')
+        end = text.index('if ((dry_run)); then', start)
+        block = text[start:end]
+        self.assertLess(end, text.index('# --restart removes only this coordinator', end))
+        script = r'''set -euo pipefail
+repo_root="$1"; checkpoint_family=mistral_large4; spark_image=image:fixture
+wip_slot=all; WIP_ROOT=/fixture/seal; WIP_INSTANCE=fixture
+spark_expert_ranks=(0 1 2 3 4)
+deployment_json='{"artifact_requirements":{"spark_packages":{"exl3/exl3-ml4-k45":["tp5-compact-rank4/m1"]}}}'
+get() { echo "worker-${1}"; }
+release_die() { echo "$*" >&2; exit 2; }
+timeout() { shift; "$@"; }
+ssh() { cat >/dev/null; echo "missing Spark package exl3/exl3-ml4-k45/tp5-compact-rank4/m1" >&2; return 2; }
+'''
+        result = subprocess.run(['bash', '-c', script + block + '\necho SERVING_STARTED', 'test', str(ROOT)],
+                                cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('missing Spark package exl3/exl3-ml4-k45/tp5-compact-rank4/m1', result.stderr)
+        self.assertIn('before startup', result.stderr)
+        self.assertNotIn('SERVING_STARTED', result.stdout)
+
     def test_expert_usage_serve_flag_defaults_on_and_preserves_explicit_off(self) -> None:
         text = FAMILY.read_text()
         start = text.index('if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 ]]; then')
@@ -173,16 +196,21 @@ get() { printf '%s' "${setting:-$2}"; }
                 with self.assertRaisesRegex(SystemExit, message): exec(source, {})
 
     def test_coordinator_capacity_registry_boundary_and_invalid_inputs(self) -> None:
-        for total, budget, expected in [('98304', '', 16), ('32768', '', 8), ('98304', '32', 8),
-                                        ('98304', '32.001', 16), ('32768', '96', 8)]:
+        # GPU_MEMORY_CAP is a size; the profile is the smaller of the card and the cap, in bytes.
+        for total, cap, expected, logical in [
+                ('98304', '', 16, 98304 << 20), ('32768', '', 8, 32768 << 20),
+                ('98304', '32GiB', 8, 32 << 30), ('98304', '32.001GiB', 16, int(32.001 * 2**30)),
+                ('32768', '96GiB', 8, 32768 << 20), ('98304', '34400000000', 16, 34_400_000_000),
+                ('98304', '1024MiB', 8, 1 << 30)]:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
-                'test', str(int(total) * 2**20) if total.isdigit() else total, budget], cwd=ROOT, text=True, capture_output=True)
+                'test', str(int(total) * 2**20) if total.isdigit() else total, cap], cwd=ROOT, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            gib, concurrency = result.stdout.split()
-            self.assertEqual(float(gib), min(float(total) / 1024, float(budget) if budget else float('inf')))
+            cap_bytes, concurrency = result.stdout.split()
+            self.assertEqual(int(cap_bytes), logical)
             self.assertEqual(int(concurrency), expected)
-        for total, budget in [('0', ''), ('NaN', ''), ('98304', 'inf'), ('98304', '0'), ('bad', '')]:
+        for total, budget in [('0', ''), ('NaN', ''), ('98304', 'inf'), ('98304', '0'), ('bad', ''),
+                              ('98304', '90%'), ('98304', '32TiB')]:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
                 'test', str(int(total) * 2**20) if total.isdigit() else total, budget], cwd=ROOT, text=True, capture_output=True)
@@ -621,14 +649,15 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
 
     def test_small_card_embedding_default_and_explicit_overrides(self) -> None:
         source = v41_source()
-        block = source.split('if python3 -c', 1)[1].split('\nsnapshot_rel=', 1)[0]
-        block = 'if python3 -c' + block
-        for gib, config_value, override, expected in (
-            ('31.8', '', '', 'host'), ('32', '', '', 'host'),
-            ('96', '', '', 'gpu'), ('31.8', 'gpu', '', 'gpu'),
-            ('31.8', '', 'gpu', 'gpu'), ('96', 'host', '', 'host'),
+        block = source.split('if ((profile_cap <= 32 << 30)); then\n  if [[ -z "${cfg_overrides[EMBEDDING]', 1)[1].split('\nsnapshot_rel=', 1)[0]
+        block = 'if ((profile_cap <= 32 << 30)); then\n  if [[ -z "${cfg_overrides[EMBEDDING]' + block
+        gib = lambda value: str(int(float(value) * 2**30))
+        for cap, config_value, override, expected in (
+            (gib('31.8'), '', '', 'host'), (gib('32'), '', '', 'host'),
+            (gib('96'), '', '', 'gpu'), (gib('31.8'), 'gpu', '', 'gpu'),
+            (gib('31.8'), '', 'gpu', 'gpu'), (gib('96'), 'host', '', 'host'),
         ):
-            with self.subTest(gib=gib, config=config_value, override=override):
+            with self.subTest(cap=cap, config=config_value, override=override):
                 with tempfile.NamedTemporaryFile(mode='w') as config:
                     if config_value:
                         config.write(f'EMBEDDING={config_value}\n')
@@ -637,17 +666,16 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
 release_spark_compact_active() { return 1; }
 release_die() { exit 1; }
 declare -A cfg_overrides
-profile_gib=$1
+profile_cap=$1
 config=$2
 EMBEDDING=${3:-gpu}
 cfg_overrides[EMBEDDING]=$4
 [[ -z "$4" ]] || EMBEDDING=$4
 PREFILL_BATCH_TOKENS=2048
-MEMORY_RESERVATION=
 RTX_EXPERT_LAYERS=auto
 '''
                     result = subprocess.run(['bash', '-c', harness + block + '\nprintf "%s" "$EMBEDDING"',
-                        'test', gib, config.name, config_value, override], cwd=ROOT, text=True, capture_output=True)
+                        'test', cap, config.name, config_value, override], cwd=ROOT, text=True, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, expected)
 
@@ -813,7 +841,7 @@ spark_tp_roles=
         # The V4.1 controls are configuration keys, settable per launch with --set.
         for option in ("--set KEY=VALUE", "--dry-run", "--wip", "--restart", "--embedding-placement"):
             self.assertIn(option, help_text)
-        for key in ("RTX_GPUS", "CONCURRENCY", "KV_POOL_SIZE", "MEMORY_RESERVATION", "PREFIX_CACHE_ENTRIES",
+        for key in ("RTX_GPUS", "CONCURRENCY", "KV_POOL_SIZE", "GPU_MEMORY_CAP", "PREFIX_CACHE_ENTRIES",
                     "MAX_CONTEXT_TOKENS", "MAX_OUTPUT_TOKENS", "PREFILL_BATCH_TOKENS", "SPECULATOR",
                     "DSPARK_DRAFT_LIMIT", "TP2_ATTENTION"):
             self.assertIn(key, help_text)

@@ -549,8 +549,6 @@
         "RTX_GPUS": "1",
         "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
-        "SPARK_TP": "",
-        "SPARK_EP": "",
         "ADDR": "0.0.0.0:8813",
         "EXPERT_PORT": "20160",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
@@ -599,7 +597,7 @@
         "SPARK_2_LANE_A": "192.0.2.3",
         "SPARK_2_LANE_B": "198.51.100.3",
         "SPECULATOR": "dspark",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "BENCH_HARDWARE_CLASS": "5090",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       },
@@ -635,7 +633,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dspark",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
@@ -672,7 +670,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dflash2",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
@@ -709,7 +707,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dflash2",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
@@ -746,7 +744,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dflash2",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
@@ -783,7 +781,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPECULATOR": "dflash2",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "EXPERT_BACKEND": "spark",
         "BENCH_HARDWARE_CLASS": "5090",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
@@ -816,7 +814,7 @@
         "EXPERT_PORT": "19940",
         "EXPERT_BACKEND": "spark",
         "SPECULATOR": "mtp",
-        "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+        "GPU_MEMORY_CAP": "31.8GiB",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
         "BENCH_HARDWARE_CLASS": "5090",
@@ -1017,7 +1015,7 @@
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
         "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc",
-        "SPARK_DEVICE_BUDGET_BYTES": "118111600640"
+        "SPARK_MEMORY_CAP": "118111600640"
       }
     },
     {
@@ -1530,6 +1528,76 @@
         "RTX_GPUS": "2",
         "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0"
+      }
+    },
+    {
+      "name": "ml4-exl3-min",
+      "family": "mistral_large4",
+      "config": "examples/configs/mistral-large4-exl3-k4-core-k6-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8750",
+        "EXPERT_PORT": "19850",
+        "COORDINATOR_GPUS": "1",
+        "RTX_GPUS": "1",
+        "SPARK_COUNT": "5",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
+      }
+    },
+    {
+      "name": "ml4-exl3-max",
+      "family": "mistral_large4",
+      "config": "examples/configs/mistral-large4-exl3-k4-core-k6-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "ADDR": "0.0.0.0:8751",
+        "EXPERT_PORT": "19851",
+        "COORDINATOR_GPUS": "0,1",
+        "RTX_GPUS": "2",
+        "SPARK_COUNT": "6",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     }
   ],

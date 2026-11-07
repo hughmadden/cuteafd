@@ -1,4 +1,4 @@
-"""CPU-only contract checks for the replicated-group native expert wrapper.
+"""CPU-only contract checks for the native Spark TP expert wrapper.
 
 Covers the pure symbol/geometry selection added for Spark TP2/TP3 (roles 5/6)
 without loading a library or touching a GPU: the ABI structs, the family prefix

@@ -423,8 +423,8 @@ def test_v41_worker_takes_profile_args_after_every_positional():
     assert '--profile-args' in invocation
     assert '"${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"}' in remote
     positional = ['image', 'name', '1', '107374182400', '19441', 'snapshot', 'fingerprint', '4',
-                  '0', '4', '1', '', '', 'info', '__none__', '-1', '19541', '', 'revision', '1']
-    assert len(positional) == 20
+                  '', '', 'info', '__none__', '-1', '19541', '', 'revision', '1']
+    assert len(positional) == 17
     for tail, expected in [([], []), (['--profile-args', '-e', 'CUTEAFD_EXPERT_TIMING=1', '-e', 'CUTEAFD_PROFILE_HOST=emu'],
                                       ['CUTEAFD_EXPERT_TIMING=1', 'CUTEAFD_PROFILE_HOST=emu'])]:
         result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' + remote.replace(' >/dev/null', ''),
