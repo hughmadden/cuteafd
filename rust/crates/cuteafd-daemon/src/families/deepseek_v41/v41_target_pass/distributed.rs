@@ -1345,7 +1345,8 @@ mod tests {
         // As serve: the workers' selection/admission handshake (layers 20.. on
         // the Sparks, two prefill units) before any link. Endpoints admit the
         // decode owners' verify width (64 rows); the fixture's 16-row links fit.
-        crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(std::path::Path::new(&snapshot),
+        crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
+            std::path::Path::new(&snapshot), cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?,
             &catalog, 20, peers.len(), unit_rows.max(cuteafd_core::V41_VERIFY_ROWS as u32), 2,
             // The workers run TP4 x EP1 (golden-run --spark-tp 4 --spark-ep 1), as serve's admission names it.
             Some(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1))?.start(&peers)?.wait()?;

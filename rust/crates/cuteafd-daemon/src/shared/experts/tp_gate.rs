@@ -256,7 +256,9 @@ fn native_tp_rank_sum() -> Result<()> {
     let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',')
         .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
     ensure!(peers.len() == world, "rank-sum world disagrees with launched peers");
-    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+    let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(&snapshot,
+        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     let geometry = validate_source(&catalog, &family, &format)?;
     let (ingress, dtype) = checkpoint_ingress(&snapshot)?;
     let output_row_bytes = partial_row_bytes(geometry)?;
@@ -273,11 +275,11 @@ fn native_tp_rank_sum() -> Result<()> {
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? });
     library.cuda_set_device(0)?;
     let config = TcpTransportConfig::default();
-    SparkAdmission::plan(&snapshot, geometry, Some(&catalog),
+    SparkAdmission::plan_view(&view, geometry, Some(&catalog),
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
             spark_ranks: world, prefill_lanes: 1 }, world, spark_world.ownership_topology(),
         ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: 16, ingress, partial_reply_bytes: None }],
-            spark_rings(config.max_frame_bytes)?, gate_executions(&catalog, 16)?)?)?.select(&peers)?;
+            spark_rings(config.max_frame_bytes)?, gate_executions(&catalog, 16)?)?, None)?.select(&peers)?;
     let h = geometry.hidden as usize;
     let zero = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
     let output = DeviceAllocation::new(&library, 16 * output_row_bytes)?;

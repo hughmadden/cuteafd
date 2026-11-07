@@ -122,8 +122,8 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4)?;
     let spark = super::admission::spark_plan(placement, prefill, cutoff, SEQUENCES, SPARKS)?;
-    let admission = SparkAdmission::plan(&snapshot, cuteafd_core::ExpertGeometry::MUSE_SPARK,
-        Some(&catalog), &spark.working, SPARKS, None, spark.model.clone())?;
+    let admission = SparkAdmission::plan_view(checkpoint.view.as_ref().context("Muse Spark admission requires selected checkpoint view")?, cuteafd_core::ExpertGeometry::MUSE_SPARK,
+        Some(&catalog), &spark.working, SPARKS, None, spark.model.clone(), None)?;
     anyhow::ensure!(admission.coordinator_pushes(), "Muse max planned without a coordinator push group");
     let (layers, assignments) = admission.admitted();
     eprintln!("placement: {}; pool {} tokens; onboard {} RTX expert layers; Spark layers {:?}..={:?}",

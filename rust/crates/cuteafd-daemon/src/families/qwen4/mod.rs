@@ -628,11 +628,12 @@ impl Opened {
                 ..Default::default()
             };
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
-            crate::shared::placement::SparkAdmission::plan(source, cuteafd_core::ExpertGeometry::QWEN4,
+            crate::shared::placement::SparkAdmission::plan_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
+                source, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, cuteafd_core::ExpertGeometry::QWEN4,
                 self.experts.as_ref(), &working, peers.len(), None,
                 admission::spark_model(cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(
                     self.experts.as_ref().context("Qwen Spark admission requires routed expert headers")?)?,
-                    args.prefill_wave_rows(), args.resolved_prefill()?.waves, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
+                    args.prefill_wave_rows(), args.resolved_prefill()?.waves, self.checkpoint.spark_input_is_bf16())?, None)?.select(&peers)?;
             cuteafd_bench::context::set_rtx_expert_layers(layers - working.spark_layers.len());
         }
         let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
