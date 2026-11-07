@@ -2,8 +2,8 @@
 use super::{v41_backbone_cache::CachePlacement, v41_tensors::Fp8Head};
 use anyhow::{ensure, Result};
 use cuteafd_loader::OfficialV41Catalog;
-use crate::shared::memory::{DeviceAllocation, device::Device,
-    weight_arena::{DeviceWeightArena, weight_allocation}};
+use crate::shared::memory::{device::Device, weight_arena::DeviceWeightArena};
+pub(crate) use super::v41_tensors::allocation;
 pub(crate) use cuteafd_loader::placement::families::deepseek_v41::weight_layout::{
     TargetLayout, packed_scale_name, head_requests,
 };
@@ -14,12 +14,6 @@ pub(crate) fn target_layout(catalog: &OfficialV41Catalog, placement: Option<Cach
         .collect::<Result<Vec<_>>>().map(|map| map.try_into().expect("40 layers"))).transpose()?;
     TargetLayout::new(catalog, placement, gpu_embedding, head, split_query, split_output)
 }
-pub(crate) fn allocation<'a>(library: &'a cuteafd_ffi::NativeLibrary,
-    arena: Option<&DeviceWeightArena<'a>>, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
-    Ok(DeviceAllocation::from_allocation(weight_allocation(
-        Device { library, id: library.cuda_get_device()? }, arena, name, bytes)?))
-}
-
 pub(crate) fn probe_weights(library: &cuteafd_ffi::NativeLibrary, devices: &[i32],
     stage: &str, visit: impl FnOnce(&mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()>) -> Result<()> {
     use crate::shared::memory::receipts::{Census, Inventory};

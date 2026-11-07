@@ -9,6 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 mod vocabulary_shard;
 pub(crate) use vocabulary_shard::VocabularyShard;
 
+pub(crate) fn allocation<'a>(library: &'a NativeLibrary,
+    arena: Option<&DeviceWeightArena<'a>>, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+    Ok(DeviceAllocation::from_allocation(weight_allocation(
+        Device { library, id: library.cuda_get_device()? }, arena, name, bytes)?))
+}
+
 /// Checkpoint tensor `name` (an unsharded coordinator tensor) as one
 /// rectangle: its rows (`rows` of them, or all), each whole.
 pub(crate) fn rect(catalog: &OfficialV41Catalog, name: &str, rows: Option<std::ops::Range<usize>>)

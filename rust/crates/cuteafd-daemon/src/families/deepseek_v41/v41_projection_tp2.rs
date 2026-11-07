@@ -28,7 +28,7 @@ impl<'a> Weights<'a> {
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
         let name = format!("gpu{}.layers.{}.attn.{}.weight", self.device.id, self.layer, self.kind.name());
         self.weight.inventory(inventory, &name)?;
-        self.scales.inventory(inventory, &super::weight_layout::packed_scale_name(&name))
+        self.scales.inventory(inventory, &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&name))
     }
     pub fn device_bytes(kind: Kind) -> usize {
         let (k,n)=kind.geometry(); k*(n/2) + k*(n/2)/32
@@ -54,7 +54,7 @@ impl<'a> Weights<'a> {
         let stream=Stream::new(device)?;
         let weight=crate::shared::memory::weight_arena::weight_allocation(device,arena,&weight_name,k*n)?;
         let scales=crate::shared::memory::weight_arena::weight_allocation(device,arena,
-            &super::weight_layout::packed_scale_name(&weight_name),k*n/32)?;
+            &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),k*n/32)?;
         let raw_scales=Allocation::new(device,k*n/1024)?;
         let mut staging=HostAllocation::new(device.library,k*n)?;
         for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {

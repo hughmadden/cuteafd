@@ -32,7 +32,7 @@ impl<'a> AttentionQueryWeights<'a> {
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
         self.tensors.inventory(inventory)?;
         for (index, scales) in self.scales.iter().enumerate() {
-            scales.inventory(inventory, &super::weight_layout::packed_scale_name(&self.names[index * 2]))?;
+            scales.inventory(inventory, &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&self.names[index * 2]))?;
         }
         Ok(())
     }
@@ -95,8 +95,8 @@ impl<'a> AttentionQueryWeights<'a> {
         let mut scales = vec![];
         for (i, (k, n)) in MATRICES.into_iter().take(if split_query_b {1} else {2}).enumerate() {
             let kernel = library.v41_fp8_matrix_kernel(1, k, n)?;
-            let scale = super::weight_layout::allocation(library, arena,
-                &super::weight_layout::packed_scale_name(&names[i * 2]),
+            let scale = super::v41_tensors::allocation(library, arena,
+                &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&names[i * 2]),
                 kernel.info().packed_weight_scale_bytes as usize)?;
             let launched = unsafe {
                 crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[i * 2 + 1])?, scale.buffer, stream.raw)

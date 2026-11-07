@@ -91,7 +91,7 @@ impl<'a> VocabularyShard<'a> {
         } else {
             // Packed conversion consumes a transient BF16 source; other modes retain it.
             let retained = (super::fp8_head() != super::Fp8Head::Packed).then_some(arena).flatten();
-            let allocation = crate::families::deepseek_v41::weight_layout::allocation(
+            let allocation = super::allocation(
                 library, retained, "head.bf16", bytes)?;
             dense.operand(crate::shared::experts::rtx::dense::Operand { device: device_id, buffer: allocation.buffer,
                 lands: vec![(whole, 0)], bytes })?;
