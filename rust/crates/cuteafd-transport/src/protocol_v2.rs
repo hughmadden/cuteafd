@@ -54,6 +54,10 @@ pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION: u32 = 1 << 11;
 pub const EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES: u32 = 1 << 20;
 /// Combined native replies: the same E4M3/UE8M0 K32 layout as partial FP8 replies.
 pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32: u32 = 1 << 21;
+/// GPU expert tier (request only, canonical compact batches): a route whose word carries
+/// [`crate::expert::COORDINATOR_ROUTE_BIT`] runs on the coordinator GPU, and every worker
+/// unpacks it as the unassigned expert with zero weight. Never in a response.
+pub const EXPERT_PROTOCOL_V2_FLAG_COORDINATOR_ROUTES: u32 = 1 << 22;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT: u32 = 12;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK: u32 =
     0x0f << EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT;
@@ -684,6 +688,7 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
                 | EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION
                 | EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK
                 | EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES
+                | EXPERT_PROTOCOL_V2_FLAG_COORDINATOR_ROUTES
         }
         "response" => {
             EXPERT_PROTOCOL_V2_FLAG_RESPONSE_FP8_E4M3_UE8M0_K32
@@ -747,6 +752,11 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
             || stream_data_enabled(flags) || spark_reduction_enabled(flags)
             || formats != 0) {
             bail!("ExpertProtocolV2 partial replies are whole-row requests with their own reply formats");
+        }
+        if flags & EXPERT_PROTOCOL_V2_FLAG_COORDINATOR_ROUTES != 0 && (stream_plan_enabled(flags)
+            || stream_data_enabled(flags) || spark_reduction_enabled(flags)
+            || flags & (EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES | crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG) != 0) {
+            bail!("ExpertProtocolV2 coordinator routes mark whole compact batches only");
         }
     }
     Ok(())

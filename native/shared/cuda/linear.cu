@@ -949,8 +949,16 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out) {
   auto found = handles.find(device);
   if (found == handles.end()) {
     cublasHandle_t handle = nullptr;
-    const cublasStatus_t status = cublasCreate(&handle);
+    cublasStatus_t status = cublasCreate(&handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
+      return status_from_cublas(status);
+    }
+    // FP32 accumulation end to end: without this, cuBLAS may reduce a split-K BF16 GEMM's
+    // partials in BF16, which at 17..128 rows over K = 4096 left outputs up to ~75x past their
+    // FP64 bound (half a BF16 ulp plus FP32 slack; kx7_selftest's BF16 GEMV check).
+    status = cublasSetMathMode(handle, CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      cublasDestroy(handle);
       return status_from_cublas(status);
     }
     found = handles.emplace(device, handle).first;

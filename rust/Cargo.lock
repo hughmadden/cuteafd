@@ -745,9 +745,11 @@ name = "cuteafd-core"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

@@ -190,7 +190,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
             e.ffn(w, layer, e.cfg.dense_intermediate, PREFILL_CAP, w.delta.buffer.ptr, rows)?;
         } else {
             e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
-                &self.steps[unit.index].0.spans())?;
+                &self.steps[unit.index].0.spans(), false)?;
             let w1 = self.peer(unit)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, unit.slot, w, w1, unit.rows.len(), rows, PREFILL_CAP)?;
@@ -211,18 +211,20 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
                 &self.ranked[unit.index], unit, index, self.total)?));
         }
         e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
-            &self.steps[unit.index].0.spans())?;
+            &self.steps[unit.index].0.spans(), false)?;
         let transport = self.transport.as_mut().context("Spark unit without its transport worker")?;
         // The shared expert runs while the worker sends and the Sparks compute.
-        let wave = e.spark_send(w, index, unit.rows.len(), false, transport, unit.reply_origins()?,
-            || e.ffn(w, layer, e.cfg.moe_intermediate, PREFILL_CAP, w.shared.buffer.ptr, rows))?;
+        let wave = e.spark_send(w, index, unit.rows.len(), false, transport, unit.reply_origins()?, || {
+            e.ffn(w, layer, e.cfg.moe_intermediate, PREFILL_CAP, w.shared.buffer.ptr, rows)?;
+            e.tier_run(w, index, unit.rows.len())
+        })?;
         Ok(Ticket::Spark(wave))
     }
     fn land_experts(&mut self, layer: usize, unit: &Unit, wave: Self::Ticket) -> Result<()> {
         match wave {
             Ticket::Spark(wave) => {
                 let transport = self.transport.as_mut().context("Spark unit without its transport worker")?;
-                self.engine.spark_land(&self.work[unit.slot], unit.rows.len(), transport, wave)?
+                self.engine.spark_land(&self.work[unit.slot], layer, unit.rows.len(), transport, wave)?
             }
             Ticket::Mixed(ticket) => self.engine.unit_ffn_finish(
                 [&self.work[unit.slot], self.peer(unit)?.context("owned peer slot")?],

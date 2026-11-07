@@ -208,6 +208,8 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` | `200000` | positive int | Dump call cap. |
 | `GLM5_FLASH_ROUTE_RING_CHECK` | `off` | `on`, `off` | Diagnostic router-id copy through the local ring. |
 | `GLM5_FLASH_REPLAY_RECORDS` | `auto` | `shared`, `own` | GLM Flash replay records (`auto` selects `shared` on one GPU with an automatic pool and admitted Spark experts, else `own`). |
+| `GLM5_FLASH_EXPERT_TIER` | `off` | `off`, absolute route-profile path | Static GPU expert tier ranked from an executed-route census: resident experts of every layer run on the one RTX beside the Spark wave, the Sparks skip them (Spark image with coordinator routes). One RTX with Sparks; `RTX_EXPERT_LAYERS` unset, `auto` or `0`. |
+| `GLM5_FLASH_EXPERT_TIER_BYTES` | `auto` | `auto`, GiB | The tier's RTX bytes, package workspace included; `auto` takes the arena `RTX_EXPERT_LAYERS=auto` would give whole layers. |
 
 ## Media
 
@@ -238,9 +240,10 @@ weights and scratch alongside the KV pool and routed experts.
 | `QWEN_FP8_HEAD` | unset | `on`, `off` | Qwen head target to resident E4M3. |
 | `MIMO_FP8_HEAD` | `auto` | `auto`, `on`, `off` | MiMo FP8 head. |
 | `MIMO_FP8_O_PROJ` | `auto` | `auto`, `on`, `off` | MiMo FP8 output projection. |
-| `GLM5_FLASH_FP8_HEAD` (alias `GLMF_FP8_HEAD`) | `auto` = `on` | `auto`, `on`, `off` | GLM Flash FP8 head. |
+| `GLM5_FLASH_FP8_HEAD` (alias `GLMF_FP8_HEAD`) | `auto` = `on` | `auto`, `on`, `off`, `packed` | GLM Flash head: FP8 copy, BF16, or the exact 12-bit copy (one GPU). |
 | `GLM5_FLASH_FP8_PREFILL` (alias `GLMF_FP8_PREFILL`) | unset | pass list (`kda-o`, …) | GLM Flash prefill layers run W8A8. |
 | `GLM5_FLASH_KDA_FP8` (alias `GLMF_KDA_FP8`) | `auto` | `auto`, `off`, `row128`, `channel` | GLM Flash KDA FP8 granularity. |
+| `GLM5_FLASH_KDA_EXACT` | `off` | `off`, `kx7` | GLM Flash KDA q/k/v/o as exact KX7 packs of the BF16 (one GPU; KDA FP8 auto resolves to off). |
 | `GLM5_FLASH_KDA_SPLIT` | `auto` | `auto`, `partials` | GLM Flash KDA split output. |
 | `GLM5_FLASH_TARGET_HEAD` | `auto` | `auto`, `tensor`, `exact` | GLM Flash's `TARGET_HEAD` spelling. |
 | `TP2_ATTENTION`, `TP2_QUERY_PROJECTION`, `TP2_OUTPUT_PROJECTION` | `off` | `on`, `off` | V4.1 TP2 projections on the RTX pair. |
@@ -259,7 +262,7 @@ weights and scratch alongside the KV pool and routed experts.
 | `ENABLE_BENCH` | `off` | `on`, `off` | Enable the in-server bench endpoints. |
 | `GATEWAY` | binary default `on` | `on`, `off` | Messages/Responses/Realtime routes. |
 | `USAGE` | `on` | `on`, `off` | Usage history tier. |
-| `EXPERT_USAGE` | `on` | `on`, `off` | Device-side executed expert routes, separate prefill/decode tallies and 5 s / 60 s / total windows at `/v1/stats`. Active for V4.1, V4, MiMo, Kimi K3, GLM 5.3 and ML4 by default; `off` disables counting and telemetry owners. Families without an adapter remain effectively off and show the `/experts` placeholder. V4/GLM 5.3/ML4 `--skip-routed-experts` and MiMo `--skip-experts` disable telemetry before admission, even with `on`. Direct engine/plan CLI uses `--expert-usage=false` to opt out. Shared adapters extend coverage. Each canonical producer GPU owns counters; one worker merges their aggregate snapshots into one bounded engine history. `/experts` uses the console's admin cookie. Rejected speculative verification rows count; GLM 5.3/ML4 startup warm-up and graph-capture replays are excluded; graph padding and TP2 replicas do not. Window and benchmark phase boundaries are approximate asynchronous samples; short phases can share a sample. A 5 s snapshot-completion timeout logs an error and leaves history stale without stopping serving. Totals saturate at u64 limits; merged-counter overflow stops sampling with an error. No disk persistence. |
+| `EXPERT_USAGE` | `on` | `on`, `off` | Device-side executed expert routes, separate prefill/decode tallies and 5 s / 60 s / total windows at `/v1/stats`. Active for V4.1, V4, MiMo, Kimi K3, GLM 5.3, GLM 5.3 Flash and ML4 by default; `off` disables counting and telemetry owners. Families without an adapter remain effectively off and show the `/experts` placeholder. V4/GLM 5.3/ML4 `--skip-routed-experts` and MiMo/GLM 5.3 Flash `--skip-experts` disable telemetry before admission, even with `on`. A GLM 5.3 Flash head split (`--split-device`) counts on `--device` only, whose router is canonical for every routed layer, RTX-onboarded or Spark. Direct engine/plan CLI uses `--expert-usage=false` to opt out. Shared adapters extend coverage. Each canonical producer GPU owns counters; one worker merges their aggregate snapshots into one bounded engine history. `/experts` uses the console's admin cookie. Rejected speculative verification rows count; GLM 5.3/GLM 5.3 Flash/ML4 startup warm-up and graph-capture replays are excluded; graph padding and TP2 replicas do not. Window and benchmark phase boundaries are approximate asynchronous samples; short phases can share a sample. A 5 s snapshot-completion timeout logs an error and leaves history stale without stopping serving. Totals saturate at u64 limits; merged-counter overflow stops sampling with an error. No disk persistence. |
 | `CONSOLE_ASSETS` | `off` | `on`, `off` | Serve console pages from a checkout; `on` needs `--wip`. |
 | `CONSOLE_TEXT` | `on` | `on`, `off` | Live console token text for unlocked viewers. |
 | `HOST_WAIT` | `block` | `spin`, `block` | Serving host-thread wait mode. |
@@ -472,6 +475,8 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_ROUTE_RING_CHECK` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_REPLAY_RECORDS` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_EXPERT_TIER` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_EXPERT_TIER_BYTES` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Media** | | | | | | | | | | |
 | `VISION` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `AUDIO` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -493,6 +498,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `GLM5_FLASH_FP8_HEAD` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_FP8_PREFILL` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_KDA_FP8` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GLM5_FLASH_KDA_EXACT` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_KDA_SPLIT` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLM5_FLASH_TARGET_HEAD` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GLMF_FP8_HEAD` | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |

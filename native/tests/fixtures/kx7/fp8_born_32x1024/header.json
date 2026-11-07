@@ -1,0 +1,60 @@
+{
+  "magic": "KX7",
+  "version": 1,
+  "label": "fp8_born_32x1024",
+  "shape": [
+    32,
+    1024
+  ],
+  "n": 32768,
+  "chunk": 64,
+  "layout": "lane16",
+  "ksplit": 4,
+  "maxlen": 15,
+  "code": "twoclass",
+  "distinct_patterns": 1019,
+  "table_bytes": 162,
+  "pbits": 11,
+  "rare_bits": 12,
+  "esc_len": 3,
+  "n_frequent": 64,
+  "n_rare": 955,
+  "interleave_rows": 8,
+  "quad_stride": 512,
+  "ragged": true,
+  "padding_bytes": 2677,
+  "padding_bpw": 0.6536,
+  "stream_bytes": 33424,
+  "chunks": 512,
+  "stream_bpw": 8.1602,
+  "index_bpw": 0.25,
+  "table_bpw": 0.50537,
+  "total_bpw": 8.9155,
+  "bytes_bf16": 65536,
+  "bytes_kx7": 36518,
+  "esc_index": 0,
+  "rare_format": "u16 [n_rare] patterns in rank order; rank = the rare_bits raw bits after ESC",
+  "lengths_format": "u16 [N*streams_per_row] byte length of each stream (lengths.bin)",
+  "n_sym": 65,
+  "streams_per_row": 16,
+  "symbols_per_stream": 64,
+  "components": [
+    {
+      "name": "fp8_born_32x1024",
+      "rows": [
+        0,
+        32
+      ]
+    }
+  ],
+  "files": {
+    "table": "table.bin",
+    "streams": "streams.bin",
+    "offsets": "offsets.bin",
+    "source": "source.bf16.bin",
+    "rare": "rare.bin",
+    "lengths": "lengths.bin"
+  },
+  "offsets_format": "u32 [N*streams_per_row + 1] byte offsets of each stream (its first quad) into streams.bin, final = total; stream byte p at offset + (p // 16) * quad_stride + p % 16",
+  "table_format": "u16 counts[16] for code lengths 1..16, then n_sym symbols u16 in canonical order"
+}

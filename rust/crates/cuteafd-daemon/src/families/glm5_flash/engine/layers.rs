@@ -397,7 +397,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         } else if layer.dense {
             e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows)?;
         } else {
-            e.moe_front(w, index, layer, real, rows, self.cap(), &[Span { first: 0, rows: real }])?;
+            e.moe_front(w, index, layer, real, rows, self.cap(), &[Span { first: 0, rows: real }],
+                self.tables[0].decode)?;
             e.probe_ring(index, w, real)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, self.lane, w, Some(w1), real, rows, self.cap())?;
@@ -426,7 +427,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             // A device wait on the stream: the QPs, intake planes and staging stay
             // with the link's exchange through teardown.
             let mut transport = transport.borrow_mut();
-            e.spark_land(self.work[0], real, transport.exchange()?, wave)?;
+            e.spark_land(self.work[0], index, real, transport.exchange()?, wave)?;
         }
         if !self.layer(0, index).dense && real < self.rows {
             let offset = real * e.cfg.hidden * 2;

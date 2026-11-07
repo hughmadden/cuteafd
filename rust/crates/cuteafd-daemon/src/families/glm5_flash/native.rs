@@ -22,7 +22,8 @@ pub(super) fn prefill_activations(value: &str)
 
 pub(super) fn normalize(args: &mut EngineArgs) {
     args.kda_fp8 = fp8::KdaFp8::Off;
-    args.fp8_head = false;
+    args.kda_exact = super::kx7::KdaExact::Off;
+    args.head_format = super::head::GlmfHeadFormat::Bf16;
     args.kda_fp32_partials = false;
     args.kda_output_shard = false;
     args.kda_prefill_expanded = false;
@@ -39,8 +40,9 @@ pub(super) fn resolved_settings(args: &EngineArgs) -> Vec<(&'static str, String)
     vec![("kda-output-shard", args.kda_output_shard.to_string()),
         ("kda-prefill-expanded", args.kda_prefill_expanded.to_string()),
         ("kda-fp32-partials", args.kda_fp32_partials.to_string()),
-        ("fp8-head", args.fp8_head.to_string()),
+        ("fp8-head", args.head_format.setting().into()),
         ("kda-fp8", match args.kda_fp8 { fp8::KdaFp8::Off => "off", fp8::KdaFp8::Channel => "channel", fp8::KdaFp8::Row128 => "row128" }.into()),
+        ("kda-exact", args.kda_exact.setting().into()),
         ("kda-nvfp4-gate", args.kda_nvfp4_gate.clone().unwrap_or_else(|| "off".into())),
         ("fp8-prefill", { use clap::ValueEnum; args.fp8_prefill.iter().map(|value| value.to_possible_value().unwrap().get_name().to_owned()).collect::<Vec<_>>().join(",") })]
 }

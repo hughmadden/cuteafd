@@ -421,6 +421,7 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/fp8_load_quant.cu
     shared/cuda/fp8_gemv.cu
     shared/cuda/packed_head.cu
+    shared/cuda/kx7.cu
     shared/cuda/l2_prefetch.cu
     families/deepseek_v41/cuda/v41_dspark_cache.cu
     families/deepseek_v41/cuda/v41_dspark_attention.cu
@@ -767,6 +768,17 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_cuda_scale_codes_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_cuda_scale_codes_selftest COMMAND cuteafd_cuda_scale_codes_selftest)
   set_tests_properties(cuteafd_cuda_scale_codes_selftest PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  # KX7 v1.1 exact packs (cuteafd_core::kx7): host-built pack file sets decode bit for bit
+  # through the reference device decoder, and the KX7 linear equals the BF16 cuBLAS linear
+  # over the source weights (eager and graph replay). Committed fixtures in tests/fixtures/kx7.
+  add_executable(cuteafd_kx7_selftest tests/kx7_selftest.cu)
+  set_target_properties(cuteafd_kx7_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_compile_definitions(cuteafd_kx7_selftest PRIVATE
+    "CUTEAFD_KX7_FIXTURE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kx7\"")
+  target_link_libraries(cuteafd_kx7_selftest PRIVATE cuteafd_native CUDA::cudart)
+  add_test(NAME cuteafd_kx7_selftest COMMAND cuteafd_kx7_selftest)
+  set_tests_properties(cuteafd_kx7_selftest PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   add_executable(cuteafd_cuda_selftest tests/cuda_selftest.cc)
   target_link_libraries(cuteafd_cuda_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   add_test(NAME cuteafd_cuda_selftest COMMAND cuteafd_cuda_selftest)

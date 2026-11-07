@@ -197,6 +197,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         ModelEncoding::Glm(Arc::new(encoding)),
     );
+    profile.expert_usage = args.engine.expert_usage_reader.clone();
     let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -446,6 +447,8 @@ impl SharedPolicy {
         let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
         crate::shared::draft::apply_length_rule(&mut policy);
         engine.arm_draft_probe(engine.decode_rows)?;
+        // Drafts through a launcher (the FP8 head, or the packed head's coarse plane, whose E4M3-like
+        // numerics have no prior of their own) take the FP8 head's selector prior.
         let fp8_head = matches!(engine.draft_head(), crate::shared::speculation::dflash::TargetHead::Launch(_));
         let trace = crate::shared::speculation_trace::Trace::open()?.is_some();
         Ok(Self { policy, prior: drafter.draft_prior(fp8_head)?, observed: 0, skipped: 0, trace, decision: None })

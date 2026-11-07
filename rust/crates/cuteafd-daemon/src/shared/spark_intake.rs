@@ -987,6 +987,7 @@ fn warm_request(shape: &cuteafd_transport::SparkSessionShape, layer: usize, expe
     ensure!(experts > 0 && shape.row_count > 0 && shape.route_count % shape.row_count == 0,
         "Spark warm-up expert geometry");
     let topk = shape.route_count / shape.row_count;
+    let coordinator = cuteafd_transport::expert::coordinator_routes(shape.flags);
     let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, u32::try_from(layer)?,
         shape.hidden_dim, shape.hidden_dtype,
         (0..shape.row_count).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
@@ -994,7 +995,10 @@ fn warm_request(shape: &cuteafd_transport::SparkSessionShape, layer: usize, expe
             token_position: u64::from(row), route_offset: row * topk, route_count: topk,
         }).collect(),
         (0..shape.route_count).map(|route| cuteafd_transport::ExpertProtocolV2RouteEntry {
-            row_index: route / topk, expert_id: (route as usize % experts) as u32, gate_weight: 0.0,
+            row_index: route / topk, expert_id: (route as usize % experts) as u32
+                // A coordinator-route warm-up marks every other route, as a GPU expert tier does.
+                | if coordinator && route % 2 == 0 { cuteafd_transport::expert::COORDINATOR_ROUTE_BIT } else { 0 },
+            gate_weight: 0.0,
         }).collect(), vec![0; usize::try_from(shape.hidden_payload_bytes)?])?;
     request.header.flags = shape.flags;
     Ok(request)
@@ -2405,6 +2409,26 @@ mod session_capacity_tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_coordinator_route_warm_up_marks_every_other_route_on_the_same_frame() -> Result<()> {
+        use cuteafd_transport::expert::{CoordinatorRouteWord, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+        let geometry = G::GLM5_FLASH;
+        let mut session = SparkSessionShape::new(80, geometry.hidden, geometry.topk, ExpertV2Dtype::Fp8E4m3Ue8m0K32)?;
+        session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let plain = warm_request(&session, 3, geometry.experts as usize, ExpertV2SourceKind::Decode)?;
+        let tier = SparkSessionShape { flags: session.flags | cuteafd_transport::EXPERT_PROTOCOL_V2_FLAG_COORDINATOR_ROUTES,
+            ..session.clone() };
+        let marked = warm_request(&tier, 3, geometry.experts as usize, ExpertV2SourceKind::Decode)?;
+        marked.validate()?;
+        assert_eq!(SparkSessionShape::from_request(&marked)?.request_wire_bytes, session.request_wire_bytes);
+        for (index, (a, b)) in marked.routes.iter().zip(&plain.routes).enumerate() {
+            let word = CoordinatorRouteWord::decode(a.expert_id, marked.header.flags);
+            assert_eq!((word.expert_id, word.coordinator), (b.expert_id, index % 2 == 0));
+        }
+        assert!(plain.routes.iter().all(|r| CoordinatorRouteWord::decode(r.expert_id, plain.header.flags).expert_id == r.expert_id));
         Ok(())
     }
 }

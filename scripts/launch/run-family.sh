@@ -1663,7 +1663,7 @@ case "$(get EXPERT_USAGE on)" in
   on|off) ;;
   *) release_die "EXPERT_USAGE must be on or off" ;;
 esac
-if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == kimi_k3 ]]; then
+if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family == glm5_flash || $family == kimi_k3 ]]; then
   case "$(get EXPERT_USAGE on)" in
     on) family_args+=(--expert-usage) ;;
     off) family_args+=(--expert-usage=false) ;;
@@ -2112,12 +2112,56 @@ fi
 if [[ $family == glm5_flash ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
+  # GLM5_FLASH_KDA_EXACT: kx7 keeps the KDA q/k/v/o as exact KX7 packs of the checkpoint's BF16
+  # (v1.1, about 7.5 bits a weight, admitted at 8; packed and verified at load), off (default) leaves
+  # them to GLM5_FLASH_KDA_FP8. kx7 needs the BF16 projections (GLM5_FLASH_KDA_FP8 auto resolves
+  # to off; row128/channel are refused) and one GPU (refused with the two-GPU head split).
+  kda_exact="$(get GLM5_FLASH_KDA_EXACT off)"
+  case "$kda_exact" in
+    ""|off) kda_exact=off ;;
+    kx7)
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_KDA_EXACT=kx7 packs the KDA projections on one GPU; the two-GPU head split takes off (or set RTX_GPUS=1)" >&2
+        exit 2
+      fi ;;
+    *) echo "GLM5_FLASH_KDA_EXACT must be off or kx7" >&2; exit 2 ;;
+  esac
+  # GLM5_FLASH_EXPERT_TIER: off (default) or an absolute route profile (the executed-route census
+  # JSON) ranking a static GPU expert tier: the hottest routed experts of every layer stay resident on
+  # the one RTX while the Sparks keep every expert; each layer's resident routes run on the RTX inside
+  # its Spark wave and the Sparks skip them (Spark images built with coordinator routes). One RTX with
+  # Sparks and no whole RTX layers (RTX_EXPERT_LAYERS unset, auto or 0). GLM5_FLASH_EXPERT_TIER_BYTES:
+  # auto (the arena RTX_EXPERT_LAYERS=auto would give whole layers) or GiB, package workspace included.
+  expert_tier="$(get GLM5_FLASH_EXPERT_TIER off)"
+  expert_tier_bytes="$(get GLM5_FLASH_EXPERT_TIER_BYTES auto)"
+  case "$expert_tier" in
+    ""|off)
+      [[ "$expert_tier_bytes" == auto ]] ||
+        { echo "GLM5_FLASH_EXPERT_TIER_BYTES sizes a tier; set GLM5_FLASH_EXPERT_TIER to a profile" >&2; exit 2; } ;;
+    /*)
+      [[ "$expert_tier" =~ ^/[A-Za-z0-9._/-]+$ && -f "$expert_tier" && -r "$expert_tier" ]] ||
+        { echo "GLM5_FLASH_EXPERT_TIER must be off or a readable absolute profile path ([A-Za-z0-9._/-])" >&2; exit 2; }
+      [[ $head_split == 0 ]] || { echo "GLM5_FLASH_EXPERT_TIER runs on one RTX; set RTX_GPUS=1" >&2; exit 2; }
+      [[ "$ranks" != 0 ]] || { echo "GLM5_FLASH_EXPERT_TIER runs beside Spark experts; SPARK_COUNT=0 runs none" >&2; exit 2; }
+      [[ -z "$local_layers" || "$local_layers" == auto || "$local_layers" == 0 ]] ||
+        { echo "GLM5_FLASH_EXPERT_TIER replaces whole RTX expert layers; leave RTX_EXPERT_LAYERS unset, auto or 0" >&2; exit 2; }
+      [[ "$expert_tier_bytes" == auto || "$expert_tier_bytes" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        { echo "GLM5_FLASH_EXPERT_TIER_BYTES must be auto or GiB" >&2; exit 2; }
+      trace_args+=(-v "$expert_tier:$expert_tier:ro")
+      family_args+=(--expert-tier "$expert_tier" --expert-tier-bytes "$expert_tier_bytes") ;;
+    *) echo "GLM5_FLASH_EXPERT_TIER must be off or an absolute profile path" >&2; exit 2 ;;
+  esac
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
-    ""|auto) kda_fp8=row128 ;;
+    ""|auto) if [[ $kda_exact == kx7 ]]; then kda_fp8=off; else kda_fp8=row128; fi ;;
     off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
+  if [[ $kda_exact == kx7 && $kda_fp8 != off ]]; then
+    echo "GLM5_FLASH_KDA_EXACT=kx7 holds the BF16 KDA projections exactly; set GLM5_FLASH_KDA_FP8=off (or auto), not $kda_fp8" >&2
+    exit 2
+  fi
+  [[ $kda_exact == off ]] || family_args+=(--kda-exact "$kda_exact")
   # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
   glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
@@ -2152,15 +2196,24 @@ if [[ $family == glm5_flash ]]; then
       echo "PREFILL_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
     fi
   fi
+  # GLM5_FLASH_FP8_HEAD: the one resident LM head the target and drafter share. auto (default) = on,
+  # an E4M3 copy; off keeps the checkpoint's BF16; packed keeps the exact 12-bit copy of the BF16
+  # (mirroring V41_FP8_HEAD=packed): target logits exact, drafts through its coarse plane, about
+  # three quarters of the BF16 bytes. packed serves one GPU: refused with the two-GPU head split.
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;
-    on|off) ;;
-    *) echo "GLM5_FLASH_FP8_HEAD must be auto, on or off" >&2; exit 2 ;;
+    on|off|packed) ;;
+    *) echo "GLM5_FLASH_FP8_HEAD must be auto, on, off or packed" >&2; exit 2 ;;
   esac
+  if [[ $fp8_head == packed && $head_split != 0 ]]; then
+    echo "GLM5_FLASH_FP8_HEAD=packed keeps one exact 12-bit head on one GPU; the two-GPU head split takes on or off (or set RTX_GPUS=1)" >&2
+    exit 2
+  fi
   case "$fp8_head" in
     on) family_args+=(--fp8-head true) ;;
     off) family_args+=(--fp8-head false) ;;
+    packed) family_args+=(--fp8-head packed) ;;
   esac
   # GLM5_FLASH_DRAFT_LINEAR: w8a8 with an FP8 drafter; w8a16 runs the W8A16 GEMV in passes of
   # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
@@ -2175,14 +2228,14 @@ if [[ $family == glm5_flash ]]; then
   esac
   # GLM5_FLASH_TARGET_HEAD: GLM 5.3 Flash's own spelling of TARGET_HEAD (--target-head). auto
   # (default) forwards nothing: the shared setting applies (tensor cores at every row count over the
-  # BF16 head; the FP8 head runs its own program). exact (diagnostic) keeps the pedantic GEMM; an
-  # explicit tensor with the FP8 head is refused.
+  # BF16 head; the FP8 and packed heads run their own GEMVs). exact (diagnostic) keeps the pedantic
+  # GEMM; an explicit tensor with the FP8 or packed head is refused.
   target_head="$(get GLM5_FLASH_TARGET_HEAD auto)"
   case "$target_head" in
     ""|auto) ;;
     exact) family_args+=(--target-head exact) ;;
     tensor)
-      if [[ $fp8_head == on ]]; then
+      if [[ $fp8_head != off ]]; then
         echo "GLM5_FLASH_TARGET_HEAD=tensor runs the BF16 head; set GLM5_FLASH_FP8_HEAD=off" >&2
         exit 2
       fi
@@ -2438,7 +2491,9 @@ audio_encoder_hash=""
     [[ -z "$chat_template_from" || "$vision" == off ]] || plan_draft_args+=(--chat-template-from "$chat_template_from")
   fi
   if [[ "$family" == glm5_flash ]]; then
-    plan_draft_args+=(--kda-fp8 "$kda_fp8" --kda-state "${kda_state:-f32}" --fp8-head "$([[ $fp8_head == on ]] && echo true || echo false)")
+    case "$fp8_head" in on) plan_head=true ;; packed) plan_head=packed ;; *) plan_head=false ;; esac
+    plan_draft_args+=(--kda-fp8 "$kda_fp8" --kda-state "${kda_state:-f32}" --fp8-head "$plan_head")
+    [[ "${kda_exact:-off}" == off ]] || plan_draft_args+=(--kda-exact "$kda_exact")
     [[ "${target_head:-auto}" == auto || -z "${target_head:-}" ]] || plan_draft_args+=(--target-head "$target_head")
     # Draft-head arithmetic borrows the same target weight, not a second resident head.
     plan_draft_args+=(--draft-head exact)
@@ -2723,7 +2778,9 @@ if [[ "$package_requirements" != '{}' ]]; then
     host="$(get "SPARK_${rank}_HOST")"
     identity="$checkpoint_family $host image $spark_image"
     if [[ -n "$wip_slot" ]]; then
-      slot_root="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip"
+      # Each Spark resolves its own home (~ expands there): the coordinator's HOME
+      # need not be the Spark's, as on hosts whose HOME is moved off a small root.
+      slot_root="${WIP_ROOT:-~/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip"
       printf -v package_command '%q ' python3 - "$package_requirements" "$identity slot $wip_slot ($slot_root)" "$slot_root"
     else
       printf -v package_command '%q ' docker run --rm --network none -i --entrypoint python3 "$spark_image" - "$package_requirements" "$identity"

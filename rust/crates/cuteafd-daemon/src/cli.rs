@@ -503,13 +503,18 @@ pub(crate) struct PlanArgs {
     /// GLM Flash KDA projection residency (default: launcher's row128).
     #[arg(long, value_enum, default_value = "row128")]
     pub(crate) kda_fp8: crate::families::glm5_flash::fp8::KdaFp8,
+    /// GLM Flash KDA projections held exactly: `off`, or `kx7` (exact KX7 packs of the BF16,
+    /// admitted at 8 bits a weight; needs --kda-fp8 off and one GPU).
+    #[arg(long, value_enum, default_value = "off")]
+    pub(crate) kda_exact: crate::families::glm5_flash::kx7::KdaExact,
     /// GLM Flash recurrent state storage for --layout.
     #[arg(long, value_enum, default_value = "f32")]
     pub(crate) kda_state: crate::families::glm5_flash::engine::KdaState,
-    /// GLM Flash shared target/draft head residency (default: launcher's FP8).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub(crate) fp8_head: bool,
-    /// GLM Flash BF16 target head arithmetic; FP8 heads use their own program.
+    /// GLM Flash shared target/draft head residency: `true` (FP8, the launcher's default; also
+    /// `fp8`), `false` (BF16; also `bf16`) or `packed` (the exact 12-bit copy, one GPU).
+    #[arg(long = "fp8-head", default_value = "true", action = clap::ArgAction::Set)]
+    pub(crate) head_format: crate::families::glm5_flash::head::GlmfHeadFormat,
+    /// GLM Flash BF16 target head arithmetic; FP8 and packed heads use their own GEMVs.
     #[arg(long, value_enum)]
     pub(crate) target_head: Option<crate::shared::target_head::TargetHead>,
     /// GLM Flash draft head arithmetic; it borrows the target's resident copy.
