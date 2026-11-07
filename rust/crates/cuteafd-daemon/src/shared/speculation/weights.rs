@@ -599,8 +599,7 @@ mod tests {
                     Ok(owners.into_inner())
                     })
                 }
-                let load = |arena| run(device, &snapshot, &cfg, rank, ranks, representation, &expected, arena);
-                let baseline = load(None)?;
+                let baseline = run(device, &snapshot, &cfg, rank, ranks, representation, &expected, None)?;
                 let digest = |owners: &std::collections::BTreeMap<String, Weight<'_>>| device.run(|| {
                     let mut bytes = std::collections::BTreeMap::new();
                     for (name, owner) in owners {
@@ -622,13 +621,13 @@ mod tests {
                 for recorded in [false, true] {
                     let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/draft", expected.clone())?)?;
                     let owners = if recorded {
-                        let (owners, records) = dense::recording(|| load(Some(&arena)))?;
+                        let (owners, records) = dense::recording(|| run(device, &snapshot, &cfg, rank, ranks, representation, &expected, Some(&arena)))?;
                         assert!(!records.operands.is_empty());
                         let sockets = tempfile::tempdir_in(fixture.directory())?;
                         crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
                             &records, None, 6, 1)?;
                         owners
-                    } else { load(Some(&arena))? };
+                    } else { run(device, &snapshot, &cfg, rank, ranks, representation, &expected, Some(&arena))? };
                     drop(arena);
                     assert_eq!(digest(&owners)?, baseline_bytes, "{representation:?} TP{ranks} rank{rank} record={recorded}");
                     let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?, "draft",
