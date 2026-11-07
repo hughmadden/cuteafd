@@ -5,15 +5,15 @@
 
 --jobs is the total worker budget: split evenly between Cargo and pytest when
 both run, otherwise given entirely to the requested suite. Default excludes
-measured full-plan/cache and live V4 tests; --full restores them and is required for
-dev merges and releases. This includes the installed-example deployment-to-
+measured full-plan/cache and live V4 tests and is the merge gate; --full
+restores them for release cuts. This includes the installed-example deployment-to-
 release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
 inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing required inputs
 fail, including pinned checkpoint revisions and the published placement-inputs
 PROGRAMS.json with adjacent expert metadata. CUTEAFD_DEPLOYMENT_TEST_PROGRAMS
 overrides manifest discovery; the gate only reads exports, never builds them.
-Receipts name every exclusion. --slow separately
-adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
+Receipts name every exclusion; compiled test inventories reject dead exclusion
+IDs. --slow separately adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
 without root into the persistent architecture Cargo home (see AGENTS.md).
 The gate finds it on PATH or there automatically; cargo test remains the fallback.
 When cargo or rustc is not on PATH (a systemd user unit), the gate prepends the
@@ -79,21 +79,19 @@ INSTALLED_PLANNERS = (
     'installed_example_deployments_publish_executable_prefill_shapes',
     'installed_release_matrix_recipe_ids_parse_from_checkpoint_headers',
 )
-# Actual >60s IDs from the 081a00072 full gate, plus installed-checkpoint planners.
+# Hermetic matrices still >=10s on raptor (2026-11-07), plus external inputs.
 FULL_TESTS = (
     *LIVE_PLANNERS,
     'families::kimi_k3::admission::tests::installed_max_planner_and_runtime_remaining_kv_match_per_gpu',
-    'plan::families::step5::tests::adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity',
     'families::step5::admission::tests::public_nvfp4_min_card_planner_equals_measured_daemon_before_allocation',
+    # Nonhermetic: recursively reads published sets under ~/.cache/cuteafd/fidelity.
     'fidelity_dataset::tests::cached_published_qualifications_and_manifests_load',
     'families::kimi_k3::admission::tests::planner_equals_runtime_context_extent_at_256k_512k_and_1m',
     'families::step5::admission::tests::public_max_card_planner_equals_measured_daemon_before_allocation',
     'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count',
-    'plan::families::step5::tests::full_context_mtp_forecast_charges_private_predictors_before_allocation',
     'plan::layout::draft_prefix_tests::kimi_host_snapshots_use_serve_context_and_selected_draft_record',
     'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only',
     'families::kimi_k3::serve::tests::shared_prefill_policy_matches_planner_and_runtime_admission',
-    'plan::families::kimi::tests::planner_resolves_every_spark_count_before_recipe_refusal',
     'plan::families::kimi::tests::direct_layout_uses_shared_host_mark_rule_and_preserves_overrides',
     'plan::tests::v41_32gib_counts_share_pool_and_local_layer_admission',
     *INSTALLED_PLANNERS,
@@ -401,6 +399,25 @@ def scrub_compiler_cache_env(env):
     return cleaned, scrubbed
 
 
+def validate_full_test_ids(source, root, args, env):
+    """Check exclusions against compiled libtest IDs, independently of the runner."""
+    path = root / 'logs/cargo-test-inventory.log'
+    code, seconds = run_logged(['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked',
+                                '--lib', '--bins', '--tests', '--', '--list', '--format', 'terse'], path, env, source / 'rust', args.cargo_timeout)
+    names = {line.removesuffix(': test') for line in path.read_text(errors='replace').splitlines()
+             if line.endswith(': test')}
+    missing = sorted(set(FULL_TESTS) - names)
+    result = dict(inventory_exit=code, inventory_s=round(seconds), inventory_log=str(path),
+                  missing_full_tests=missing)
+    if code:
+        result['error'] = f'test inventory failed (exit {code})'
+    elif not names:
+        result['error'] = 'test inventory is empty'
+    elif missing:
+        result['error'] = 'FULL_TESTS ids match zero tests: ' + ', '.join(missing)
+    return result
+
+
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
@@ -418,6 +435,9 @@ def cargo(source, root, args, env):
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
                 f'exit {code}; missing or unsuccessful build-finished event')}
+    result.update(validate_full_test_ids(source, root, args, env))
+    if 'error' in result:
+        return {**result, 'status': 'failed'}
     full = getattr(args, 'full', False)
     if full and not args.skip_live_planners:
         # Installed launcher checks import the same pytest helpers as the script suite.
@@ -639,13 +659,13 @@ def render(record):
         if suite.get('skipped_live_planners'):
             note = (note + '; ' if note else '') + 'live planner tests skipped (--skip-live-planners)'
         if suite.get('skipped_full_tests'):
-            note = (note + '; ' if note else '') + f"default tier: {len(suite['skipped_full_tests'])} full tests excluded; not a merge/release gate"
+            note = (note + '; ' if note else '') + f"default tier: {len(suite['skipped_full_tests'])} full tests excluded; merge gate (use --full for releases)"
         elif suite.get('full'):
             note = (note + '; ' if note else '') + 'full tier'
         for test, values in suite.get('medians', {}).items():
             note = (note + '; ' if note else '') + f"{test} medians " + ', '.join(f'{k} {v:.0f} us' for k, v in values.items())
         lines.append(f"| {suite['suite']} | {suite['status']} | {suite.get('passed', '')} | {suite.get('failed', '')} | "
-                     f"{suite.get('build_s', 0) + suite.get('test_s', 0)} | {note} |")
+                     f"{suite.get('build_s', 0) + suite.get('inventory_s', 0) + suite.get('test_s', 0)} | {note} |")
     for suite in record['suites']:
         if suite.get('failing'):
             lines += ['', f"## Failing {suite['suite']} ids", *[f'- {i}' for i in suite['failing']]]
@@ -662,7 +682,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--jobs', type=int, default=os.environ.get('CUTEAFD_TEST_JOBS', max(1, (os.cpu_count() or 2) // 2)),
                         help='total CPU worker budget (default: CUTEAFD_TEST_JOBS or half logical CPUs)')
-    parser.add_argument('--full', action='store_true', help='include measured full-plan/cache tests (required for dev merges and releases)')
+    parser.add_argument('--full', action='store_true', help='include full-plan/cache and installed-checkpoint tests (required for releases)')
     parser.add_argument('--slow', action='store_true', help='also run explicit ignored CPU soaks (required at release cuts; never enables GPU tests)')
     parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
     parser.add_argument('--cargo', action='store_true')

@@ -768,7 +768,13 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
     for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
         let result = report(dir.path(), gpus, gib, ranks, None);
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
-        assert!(result.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark")), "{:?}", result.hints);
+        if ranks == 0 {
+            assert!(result.hints.iter().any(|h| h.what.contains(
+                "no local expert package for step5: missing RTX expert export step5:bf16")),
+                "{:?}", result.hints);
+        } else {
+            assert!(result.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark")), "{:?}", result.hints);
+        }
     }
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
@@ -1284,19 +1290,70 @@ fn shared_ffn_region_keeps_replicated_replies_apart() {
 }
 
 
+fn assert_native_prefill_refusal(kind: &str, gpus: usize, ranks: usize) {
+    let dir = snapshot(kind);
+    let result = report(dir.path(), gpus, 96, ranks, None);
+    assert!(!result.fits && !result.placement_supported && !result.wip_launchable());
+    if ranks == 0 {
+        // #1383 admits local candidates; native checkpoints still need a BF16 tail export.
+        assert!(result.hints.iter().any(|hint| hint.what.contains(
+            "no local expert package for step5: missing RTX expert export step5:bf16")),
+            "{kind} ranks={ranks}: {:?}", result.hints);
+    } else {
+        assert!(result.hints.iter().any(|hint| hint.what.contains("Spark") || hint.what.contains("1..8")),
+            "{kind} ranks={ranks}: {:?}", result.hints);
+    }
+    assert!(result.memory_layout.unwrap().devices.is_empty());
+}
+
 #[test]
 fn native_prefill_refuses_every_unqualified_spark_count() {
     for (kind, gpus) in [("nvfp4", 1), ("fp8", 2)] {
-        let dir = snapshot(kind);
-        // Boundaries plus a transport-valid count that lacks this native executor.
         for ranks in [0, 1, 3, 8] {
-            let result = report(dir.path(), gpus, 96, ranks, None);
-            assert!(!result.fits && !result.placement_supported && !result.wip_launchable());
-            assert!(result.hints.iter().any(|hint| hint.what.contains("Spark") || hint.what.contains("1..8")),
-                "{kind} ranks={ranks}: {:?}", result.hints);
-            assert!(result.memory_layout.unwrap().devices.is_empty());
+            assert_native_prefill_refusal(kind, gpus, ranks);
         }
     }
+}
+
+// Individual cases keep the diagnostic regressions in the default CPU tier.
+#[test]
+fn native_prefill_refuses_nvfp4_local_without_bf16_tail_export() {
+    assert_native_prefill_refusal("nvfp4", 1, 0);
+}
+
+#[test]
+fn native_prefill_refuses_fp8_local_without_bf16_tail_export() {
+    assert_native_prefill_refusal("fp8", 2, 0);
+}
+
+#[test]
+fn native_prefill_refuses_nvfp4_spark_count_one() {
+    assert_native_prefill_refusal("nvfp4", 1, 1);
+}
+
+#[test]
+fn native_prefill_refuses_fp8_spark_count_one() {
+    assert_native_prefill_refusal("fp8", 2, 1);
+}
+
+#[test]
+fn native_prefill_refuses_nvfp4_spark_count_three() {
+    assert_native_prefill_refusal("nvfp4", 1, 3);
+}
+
+#[test]
+fn native_prefill_refuses_fp8_spark_count_three() {
+    assert_native_prefill_refusal("fp8", 2, 3);
+}
+
+#[test]
+fn native_prefill_refuses_nvfp4_spark_count_eight() {
+    assert_native_prefill_refusal("nvfp4", 1, 8);
+}
+
+#[test]
+fn native_prefill_refuses_fp8_spark_count_eight() {
+    assert_native_prefill_refusal("fp8", 2, 8);
 }
 
 #[test]

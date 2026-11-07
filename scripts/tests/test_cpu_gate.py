@@ -34,6 +34,7 @@ def _fake(monkeypatch, outputs):
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
     monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
+    monkeypatch.setattr(gate, 'validate_full_test_ids', lambda *a: {})
     monkeypatch.setattr(gate, 'checked', lambda cmd, **k: '')
     return calls
 
@@ -228,8 +229,8 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
             assert command[command.index('--') + 1:-1:2] == ['--skip'] * len(gate.FULL_TESTS)
             assert command[command.index('--') + 2:-1:2] == list(gate.FULL_TESTS)
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
-    assert ('not a merge/release gate' in gate.render(record)) != full
-    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS)) == 21
+    assert ('merge gate (use --full for releases)' in gate.render(record)) != full
+    assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS))
     for name in gate.INSTALLED_PLANNERS:
         assert name in gate.FULL_TESTS
 
@@ -303,6 +304,7 @@ def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monke
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
     monkeypatch.setattr(gate, 'python_for', lambda source: Path('/gate-venv/bin/python'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
+    monkeypatch.setattr(gate, 'validate_full_test_ids', lambda *a: {})
     monkeypatch.setattr(gate, 'checked', lambda cmd, **kwargs: '')
     env = {'HOME': str(tmp_path)}
     expected = str(tmp_path / '.cache/huggingface')
@@ -657,6 +659,7 @@ def test_gate_scrubs_inherited_compiler_cache_env_and_records_names(tmp_path, mo
     monkeypatch.setattr(gate, 'nextest_for', lambda env: None)
     monkeypatch.setattr(gate, 'python_for', lambda source: Path('/usr/bin/python3'))
     monkeypatch.setattr(gate, 'run_logged', run_logged)
+    monkeypatch.setattr(gate, 'validate_full_test_ids', lambda *a: {})
     args = SimpleNamespace(**vars(ARGS), cargo=True, scripts=True, benches=False, jobs=1)
     record = gate.gate(ROOT, tmp_path, args)
     assert record['status'] == 'pass'
@@ -675,3 +678,49 @@ def test_v4_live_planners_are_explicit_full_tier_requirements():
     assert set(gate.LIVE_PLANNERS) <= set(gate.FULL_TESTS)
     assert 'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_measured' in gate.LIVE_PLANNERS
     assert 'serving_capacity::v4_placement::tp2_tests::real_tp2_costs_match_catalog_reference' in gate.LIVE_PLANNERS
+
+
+@pytest.mark.parametrize('code,text,error', [
+    (0, 'kept::test: test\n', None),
+    (0, 'kept::test: test\nkept::test: test\n', None),
+    (0, 'kept::test_suffix: test\n', 'match zero tests'),
+    (0, '', 'inventory is empty'),
+    (1, 'kept::test: test\n', 'inventory failed'),
+    (124, 'kept::test: test\n', 'inventory failed'),
+])
+def test_full_exclusions_require_exact_compiled_test_ids(tmp_path, monkeypatch, code, text, error):
+    (tmp_path / 'logs').mkdir()
+    monkeypatch.setattr(gate, 'FULL_TESTS', ('kept::test',))
+    def run_logged(cmd, path, env, cwd, timeout):
+        assert '--list' in cmd and '--format' in cmd
+        assert 'build-slot.sh' not in ' '.join(cmd)
+        path.write_text(text)
+        return code, 1.
+    monkeypatch.setattr(gate, 'run_logged', run_logged)
+    result = gate.validate_full_test_ids(ROOT, tmp_path, ARGS, {})
+    if error:
+        assert error in result['error']
+    else:
+        assert 'error' not in result
+    assert result['missing_full_tests'] == ([] if 'kept::test: test' in text else ['kept::test'])
+
+
+@pytest.mark.parametrize('full', [False, True])
+@pytest.mark.parametrize('nextest', [False, True])
+def test_dead_full_exclusion_refuses_before_either_runner(tmp_path, monkeypatch, full, nextest):
+    (tmp_path / 'logs').mkdir()
+    calls = _fake(monkeypatch, [(0, BUILD_OK)])
+    monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest' if nextest else None)
+    monkeypatch.setattr(gate, 'validate_full_test_ids', lambda *a: {
+        'error': 'FULL_TESTS ids match zero tests: removed::test', 'missing_full_tests': ['removed::test']})
+    result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=full), {})
+    assert result['status'] == 'failed' and 'removed::test' in result['error']
+    assert len(calls) == 1
+
+
+def test_named_step5_refusal_cases_are_not_full_tier_exclusions():
+    assert not any('local_without_bf16_tail_export' in name or 'spark_count_one' in name
+                   or 'spark_count_three' in name or 'spark_count_eight' in name
+                   for name in gate.FULL_TESTS)
+    assert 'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count' in gate.FULL_TESTS
+    assert 'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only' in gate.FULL_TESTS
