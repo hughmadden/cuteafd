@@ -66,7 +66,7 @@ impl ModelWeights<'_> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::Lifetime;
         use crate::shared::memory::receipts::Inventory;
-        let mut inventory = Inventory::new(devices, "v4/weights", Lifetime::TARGET,
+        let mut inventory = Inventory::new(devices, "v4/weights", Lifetime::RESIDENT,
             Category::Weights, "retained V4 target and drafter weights");
         for (rank, layers) in std::iter::once(&self.layers).chain(shares).enumerate() {
             for (layer, weights) in layers.iter().enumerate() {
