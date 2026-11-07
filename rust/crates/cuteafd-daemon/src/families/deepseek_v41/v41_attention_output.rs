@@ -57,24 +57,29 @@ impl<'a> AttentionOutputWeights<'a> {
     }
     pub fn load_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,layer:usize,
         budget:usize,staging:usize,split_output_b:bool)->Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, split_output_b, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, split_output_b: bool,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes_with_split(library, catalog, layer,split_output_b)? <= budget,
             "attention output weights exceed budget"
         );
         let names = Self::names(layer)?;
         let grouped_kernel = library.v41_fp8_matrix_kernel(1, 32768, 8192)?;
-        let grouped_scales = DeviceAllocation::new(library, grouped_kernel.info().packed_weight_scale_bytes as usize)?;
+        let grouped_scales = super::weight_layout::allocation(library, arena,
+            &super::weight_layout::packed_scale_name(&names[0]), grouped_kernel.info().packed_weight_scale_bytes as usize)?;
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };
         let kernel = library.v41_fp8_matrix_kernel(1, 8192, 5120)?;
         let scales=if split_output_b {None} else {
-            Some(DeviceAllocation::new(library,kernel.info().packed_weight_scale_bytes as usize)?)
+            Some(super::weight_layout::allocation(library, arena,
+                &super::weight_layout::packed_scale_name(&names[2]), kernel.info().packed_weight_scale_bytes as usize)?)
         };
-        let tensors = NativeRtxTensors::load(
-            library,
-            catalog,
-            &names[..if split_output_b {2} else {4}],
+        let tensors = NativeRtxTensors::load_in(
+            library, catalog, &names[..if split_output_b {2} else {4}],
             budget - grouped_scales.buffer.bytes - scales.as_ref().map_or(0,|s|s.buffer.bytes),
-            staging,
+            staging, arena,
         )?;
         let launched = (|| unsafe {
             crate::shared::experts::rtx::dense::v41_pack_scales(&grouped_kernel, tensors.get(&names[1])?, grouped_scales.buffer, stream.raw)?;

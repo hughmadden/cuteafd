@@ -3,6 +3,32 @@ use super::{v41_backbone_cache::CachePlacement, v41_tensors::Fp8Head};
 use anyhow::{ensure, Result};
 use cuteafd_loader::{OfficialV41Catalog, serving_capacity::WeightArenaLayout};
 use std::collections::BTreeMap;
+use crate::shared::memory::{DeviceAllocation, device::Device,
+    weight_arena::{DeviceWeightArena, weight_allocation}};
+
+pub(crate) fn allocation<'a>(library: &'a cuteafd_ffi::NativeLibrary,
+    arena: Option<&DeviceWeightArena<'a>>, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+    Ok(DeviceAllocation::from_allocation(weight_allocation(
+        Device { library, id: library.cuda_get_device()? }, arena, name, bytes)?))
+}
+
+pub(crate) struct TargetArenas<'a> { arenas: Vec<(i32, DeviceWeightArena<'a>)> }
+impl<'a> TargetArenas<'a> {
+    pub fn new(library: &'a cuteafd_ffi::NativeLibrary, layout: TargetLayout) -> Result<Self> {
+        let original = library.cuda_get_device()?;
+        let count = layout.ranks.len();
+        let arenas = layout.ranks.into_iter().enumerate().map(|(rank, layout)| {
+            let id = if count == 1 { original } else { rank as i32 };
+            Ok((id, DeviceWeightArena::new(Device { library, id }, layout)?))
+        }).collect::<Result<_>>()?;
+        Ok(Self { arenas })
+    }
+    pub fn get(&self, id: i32) -> Result<&DeviceWeightArena<'a>> {
+        self.arenas.iter().find(|(device, _)| *device == id).map(|(_, arena)| arena)
+            .ok_or_else(|| anyhow::anyhow!("V4.1 target arena device {id} missing"))
+    }
+}
+
 
 pub(crate) struct TargetLayout {
     pub ranks: Vec<WeightArenaLayout>,

@@ -68,6 +68,11 @@ impl<'a> AttentionQueryWeights<'a> {
     }
     pub fn load_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,layer:usize,
         budget:usize,staging:usize,split_query_b:bool)->Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, split_query_b, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, split_query_b: bool,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes_with_split(library, catalog, layer,split_query_b)? <= budget,
             "attention query weights exceed budget"
@@ -75,7 +80,7 @@ impl<'a> AttentionQueryWeights<'a> {
         let names = Self::names(layer)?;
         let selected:Vec<_>=names.iter().enumerate().filter(|(i,_)|!split_query_b || !matches!(i,2|3))
             .map(|(_,name)|name.clone()).collect();
-        let tensors = NativeRtxTensors::load(library, catalog, &selected, budget, staging)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &selected, budget, staging, arena)?;
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,
@@ -83,8 +88,9 @@ impl<'a> AttentionQueryWeights<'a> {
         let mut scales = vec![];
         for (i, (k, n)) in MATRICES.into_iter().take(if split_query_b {1} else {2}).enumerate() {
             let kernel = library.v41_fp8_matrix_kernel(1, k, n)?;
-            let scale =
-                DeviceAllocation::new(library, kernel.info().packed_weight_scale_bytes as usize)?;
+            let scale = super::weight_layout::allocation(library, arena,
+                &super::weight_layout::packed_scale_name(&names[i * 2]),
+                kernel.info().packed_weight_scale_bytes as usize)?;
             let launched = unsafe {
                 crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[i * 2 + 1])?, scale.buffer, stream.raw)
             };
