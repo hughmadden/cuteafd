@@ -36,6 +36,8 @@ static size_t memory_total[8], memory_used[8], graph_bytes;
 static int immediate_copies;
 /* Untouched, per-owner virtual extents: allocation tests never launch math. */
 static int extent_only;
+static int peer_abort_initialization;
+void fixture_peer_abort_initialization(void) { peer_abort_initialization = 1; }
 static size_t mapped_bytes;
 size_t fixture_mapped_bytes(void) { return mapped_bytes; }
 void fixture_extent_only(void) { extent_only = 1; immediate_copies = 1; }
@@ -105,7 +107,7 @@ int cuteafd_peer_copy_rows_async(void *dst, const void *src, uint64_t bytes,
     (void)dst; (void)src; (void)bytes; (void)rows;
     (void)dst_pitch; (void)src_pitch; (void)stream; return 1;
 }
-int cuteafd_peer_abort_initialize(void) { return extent_only ? 0 : 1; }
+int cuteafd_peer_abort_initialize(void) { return extent_only || peer_abort_initialization ? 0 : 1; }
 int cuteafd_peer_wait_abortable(const uint32_t *flag, uint32_t *state,
     const uint32_t *aborted, void *stream) {
     (void)flag; (void)state; (void)aborted; (void)stream; return 1;

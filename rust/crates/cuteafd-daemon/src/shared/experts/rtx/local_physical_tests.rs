@@ -131,6 +131,7 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
     let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
     let library = fixture.load()?;
     fixture.immediate_copies(&library)?;
+    fixture.peer_abort_initialization(&library)?;
     fixture.strict_device_free(&library, true)?;
     for rank in 0..2 { fixture.configure_memory(&library, rank, 1usize << 30)?; }
     let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
