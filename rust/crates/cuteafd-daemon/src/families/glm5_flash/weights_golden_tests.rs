@@ -18,7 +18,7 @@ fn arenas<'a>(library: &'a NativeLibrary, layouts: Vec<cuteafd_loader::serving_c
 fn target_arenas<'a>(loader: &GlmfLoader<'a>, cfg: &GlmNextConfig, selected: &[usize])
     -> Result<std::rc::Rc<std::collections::BTreeMap<i32, DeviceWeightArena<'a>>>> {
     let ranks = 1 + loader.peers.len();
-    let layouts = super::weight_layout::target(loader.checkpoint, cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
+    let layouts = crate::families::glm5_flash::weight_layout::target(loader.checkpoint, cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
         loader.kda_fp8, loader.kda_output_shard, loader.fp8_head, None)?;
     let prefixes = selected.iter().map(|layer| format!("{PREFIX}layers.{layer}.")).collect::<Vec<_>>();
     arenas(loader.library, layouts.into_iter().map(|layout| {
