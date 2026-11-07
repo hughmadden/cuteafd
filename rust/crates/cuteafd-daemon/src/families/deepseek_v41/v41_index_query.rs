@@ -56,15 +56,19 @@ impl<'a> IndexQueryWeights<'a> {
         budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging_bytes, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging_bytes: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes(library, catalog, layer)? <= budget,
             "index query weights exceed budget"
         );
         let names = Self::names(layer)?;
-        let tensors = NativeRtxTensors::load(library, catalog, &names, budget, staging_bytes)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &names, budget, staging_bytes, arena)?;
         let kernel = library.v41_fp8_matrix_kernel(1, 1280, 4096)?;
-        let scales =
-            DeviceAllocation::new(library, kernel.info().packed_weight_scale_bytes as usize)?;
+        let scales = super::weight_layout::allocation(library, arena,
+            &super::weight_layout::packed_scale_name(&names[0]), kernel.info().packed_weight_scale_bytes as usize)?;
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,

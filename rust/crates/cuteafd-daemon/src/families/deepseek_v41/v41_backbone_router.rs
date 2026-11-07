@@ -99,6 +99,10 @@ impl<'a> BackboneRouterWeights<'a> {
         budget: usize,
         staging: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes(catalog, layer)? <= budget,
             "backbone router weights exceed budget"
@@ -107,12 +111,8 @@ impl<'a> BackboneRouterWeights<'a> {
             library,
             layer,
             nvfp4: catalog.nvfp4().is_some(),
-            tensors: NativeRtxTensors::load(
-                library,
-                catalog,
-                &Self::names(layer)?,
-                budget,
-                staging,
+            tensors: NativeRtxTensors::load_in(
+                library, catalog, &Self::names(layer)?, budget, staging, arena,
             )?,
         })
     }

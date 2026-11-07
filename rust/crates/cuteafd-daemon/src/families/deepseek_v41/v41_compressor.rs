@@ -315,8 +315,12 @@ impl<'a> CompressorWeights<'a> {
         budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging_bytes, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging_bytes: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         let names = Self::names(layer)?;
-        let tensors = NativeRtxTensors::load(library, catalog, &names, budget, staging_bytes)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &names, budget, staging_bytes, arena)?;
         Ok(Self {
             library,
             tensors,

@@ -269,14 +269,19 @@ impl<'a> WindowWeights<'a> {
         budget: usize,
         staging: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes(library, catalog, layer)? <= budget,
             "window weights exceed budget"
         );
         let names = Self::names(layer)?;
-        let tensors = NativeRtxTensors::load(library, catalog, &names, budget, staging)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &names, budget, staging, arena)?;
         let fp8 = library.v41_fp8_matrix_kernel(1, 5120, 512)?;
-        let scales = DeviceAllocation::new(library, fp8.info().packed_weight_scale_bytes as usize)?;
+        let scales = super::weight_layout::allocation(library, arena,
+            &super::weight_layout::packed_scale_name(&names[0]), fp8.info().packed_weight_scale_bytes as usize)?;
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,
