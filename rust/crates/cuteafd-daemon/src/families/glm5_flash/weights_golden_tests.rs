@@ -8,6 +8,26 @@ use super::*;
 use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
 use sha2::{Digest, Sha256};
 
+fn arenas<'a>(library: &'a NativeLibrary, layouts: Vec<cuteafd_loader::serving_capacity::WeightArenaLayout>)
+    -> Result<std::rc::Rc<std::collections::BTreeMap<i32, DeviceWeightArena<'a>>>> {
+    Ok(std::rc::Rc::new(layouts.into_iter().enumerate().map(|(rank, layout)| {
+        Ok((rank as i32, DeviceWeightArena::new(Device { library, id: rank as i32 }, layout)?))
+    }).collect::<Result<_>>()?))
+}
+
+fn target_arenas<'a>(loader: &GlmfLoader<'a>, cfg: &GlmNextConfig, selected: &[usize])
+    -> Result<std::rc::Rc<std::collections::BTreeMap<i32, DeviceWeightArena<'a>>>> {
+    let ranks = 1 + loader.peers.len();
+    let layouts = super::weight_layout::target(loader.checkpoint, cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
+        loader.kda_fp8, loader.kda_output_shard, loader.fp8_head, None)?;
+    let prefixes = selected.iter().map(|layer| format!("{PREFIX}layers.{layer}.")).collect::<Vec<_>>();
+    arenas(loader.library, layouts.into_iter().map(|layout| {
+        cuteafd_loader::serving_capacity::WeightArenaLayout::new(layout.id(), layout.views().iter()
+            .filter(|(name, _)| !name.starts_with(&format!("{PREFIX}layers.")) || prefixes.iter().any(|p| name.starts_with(p)))
+            .map(|(name, view)| (name.clone(), view.bytes())))
+    }).collect::<Result<_>>()?)
+}
+
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn native_k6_core_and_head_records_match_host_pack() -> Result<()> {
@@ -36,14 +56,18 @@ fn native_k6_core_and_head_records_match_host_pack() -> Result<()> {
     let projection = CoreProjection { stem: stem.into(), bits: 6, codebook: book, shape: [256, 256],
         stored_outputs: 256, split: CoreSplit::Output, source_bytes: 0 };
     let stream = std::ptr::null_mut();
-    let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
+    let loader = GlmfLoader { arenas: Default::default(), library: &library, checkpoint: &checkpoint, stream,
         kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off, kda_output_shard: false,
         fp8_head: false, kda_nvfp4: None, fp8_scales: crate::shared::fp8_linear::Fp8Scales::Pow2,
         device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
         dense: std::rc::Rc::new(DenseLoad::mount(&library)) };
     for (ranks, side) in [(1, TrellisSide::Output), (2, TrellisSide::Output), (2, TrellisSide::Input)] {
         let load = std::rc::Rc::new(DenseLoad::push(&library));
-        let pushed_loader = GlmfLoader { dense: load.clone(), ..loader.clone() };
+        let layouts = (0..ranks).map(|rank| {
+            let layout = CoreWeightLayout::new(&projection, side, rank, ranks)?;
+            cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("fixture/{rank}"), layout.arena_tensors(&layout.stem)?)
+        }).collect::<Result<Vec<_>>>()?;
+        let pushed_loader = GlmfLoader { arenas: arenas(&library, layouts)?, dense: load.clone(), ..loader.clone() };
         let mut actual = Vec::new();
         for rank in 0..ranks {
             let layout = CoreWeightLayout::new(&projection, side, rank, ranks)?;
@@ -101,11 +125,12 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
     let stream = std::ptr::null_mut();
     let mut actual = std::collections::BTreeMap::new();
     for rule in [crate::shared::fp8_linear::Fp8Scales::Pow2, crate::shared::fp8_linear::Fp8Scales::Best] {
-        let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
+        let loader = GlmfLoader { arenas: Default::default(), library: &library, checkpoint: &checkpoint, stream,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true, kda_nvfp4: None,
             fp8_scales: rule, device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
             dense: std::rc::Rc::new(DenseLoad::mount(&library)) };
         let dense = (0..cfg.layers).find(|&l| cfg.dense[l]).context("no dense layer")?;
+        let loader = GlmfLoader { arenas: target_arenas(&loader, &cfg, &[kda, mla, dense])?, ..loader };
         for layer in [kda, mla, dense] {
             for (rank, share) in loader.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.iter().enumerate() {
                 for (name, allocation) in &share.operands {
@@ -115,6 +140,7 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
         }
         // Token-row KDA output sharding (the whole w_o on each GPU).
         let oshard = GlmfLoader { kda_output_shard: true, ..loader.clone() };
+        let oshard = GlmfLoader { arenas: target_arenas(&oshard, &cfg, &[kda, mla, dense])?, ..oshard };
         for layer in [kda, mla, dense] {
             for (rank, share) in oshard.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.iter().enumerate() {
                 for (name, allocation) in &share.operands {
@@ -124,6 +150,7 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
         }
         // The one-GPU coordinator (every operand whole on one device).
         let single = GlmfLoader { peers: Vec::new(), ..loader.clone() };
+        let single = GlmfLoader { arenas: target_arenas(&single, &cfg, &[kda, mla, dense])?, ..single };
         for layer in [kda, mla, dense] {
             for (name, allocation) in &single.layer(&cfg, layer)?.operands {
                 actual.insert(format!("{rule:?}.single.layer{layer}.{name}"), digest(&library, allocation.buffer)?);
@@ -169,11 +196,12 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
     let sparks = 2;
     for (gpus, oshard) in [(2usize, false), (2, true), (1, false)] {
         let load = std::rc::Rc::new(DenseLoad::push(&library));
-        let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
+        let loader = GlmfLoader { arenas: Default::default(), library: &library, checkpoint: &checkpoint, stream,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: oshard, fp8_head: true,
             kda_nvfp4: None, fp8_scales: rule, device: 0,
             peers: if gpus == 2 { vec![crate::shared::peer_split::RankDevice { device: 1, stream }] } else { Vec::new() },
             dense: load.clone() };
+        let loader = GlmfLoader { arenas: target_arenas(&loader, &cfg, &[kda, mla, dense])?, ..loader };
         let mut operands = Vec::new();
         for layer in [kda, mla, dense] {
             if gpus == 2 {

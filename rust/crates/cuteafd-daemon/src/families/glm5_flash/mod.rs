@@ -2927,9 +2927,13 @@ impl Opened {
             let devices = [args.device, exchange.device(1)].map(|id|
                 crate::shared::memory::device::Device { library: &self.library, id });
             dspark::Drafter::Dflash2(crate::shared::experts::rtx::push::load_alone_admitted(snapshot,
-                &devices, admitted, || DflashDrafter::load_tp2(&self.library, programs, snapshot, file,
-                    slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear,
-                    args.draft_kv_cache, exchange))?)
+                &devices, admitted, || {
+                    let arenas = dspark::dflash_arenas(&self.library, snapshot, representation, &devices.map(|d| d.id))?;
+                    DflashDrafter::load_tp2_with(&self.library, programs, snapshot, file,
+                        slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear,
+                        args.draft_kv_cache, exchange,
+                        |device, name, bytes| dspark::draft_allocation(&self.library, &arenas, device, name, bytes))
+                })?)
         } else if let Some(prepared) = prepared {
             use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             let cfg = DflashConfig::read(snapshot)?;
@@ -2939,8 +2943,12 @@ impl Opened {
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
             let draft = crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
-                device.own(|| DflashDrafter::load(&self.library, programs, snapshot, file, prepared.stream.raw,
-                    slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache)))?;
+                device.own(|| {
+                    let arenas = dspark::dflash_arenas(&self.library, snapshot, representation, &[device.id])?;
+                    DflashDrafter::load_with(&self.library, programs, snapshot, file, prepared.stream.raw,
+                        slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache,
+                        |device, name, bytes| dspark::draft_allocation(&self.library, &arenas, device, name, bytes))
+                }))?;
             dspark::Drafter::RemoteDflash(crate::shared::draft::remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
             let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
