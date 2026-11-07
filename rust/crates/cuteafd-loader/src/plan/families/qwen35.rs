@@ -87,7 +87,8 @@ impl FamilyModel for Model {
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
-        if requested != crate::plan::ExpertPlacement::Local {
+        if requested != crate::plan::ExpertPlacement::Local
+            && !matches!(report.vision, crate::plan::MediaMode::Spark(_)) {
             return Some(Err(anyhow::anyhow!("dense Qwen has no Spark layout or dense-FFN offboarding")));
         }
         Some(native_layout(&self.header.config, input, report, options))
@@ -121,10 +122,13 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         Onboard, ProgramSet, ResidentWeights};
     use crate::placement::planner::{Location, Operation, Pin, PrefillShape, Request};
     use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout};
-    ensure!(options.rtx_bytes.len() == 1 && report.spark_ranks == 0,
+    let spark_vision = matches!(report.vision, crate::plan::MediaMode::Spark(Some(_)))
+        || (matches!(report.vision, crate::plan::MediaMode::Spark(_)) && report.spark_ranks > 0);
+    ensure!(options.rtx_bytes.len() == 1 && (report.spark_ranks == 0 || spark_vision),
         "dense Qwen currently requires one coordinator GPU and zero Sparks");
     ensure!(!options.host_embedding, "dense Qwen requires device token embedding");
-    ensure!(report.vision == crate::plan::MediaMode::Off && report.audio == crate::plan::MediaMode::Off,
+    ensure!((report.vision == crate::plan::MediaMode::Off || spark_vision)
+        && report.audio == crate::plan::MediaMode::Off,
         "dense Qwen media execution is not qualified");
     ensure!(options.drafter_bytes == 0 && !(options.dense_qwen_mtp && options.dense_qwen_drafter_snapshot.is_some()),
         "dense native planner requires one checkpoint-native drafter admission");
@@ -229,7 +233,27 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
             plan.facts.resident_weights.iter().map(|owner| owner.weights.0).sum::<u64>(),
             plan.facts.allocations.iter().filter(|owner| owner.view.is_none()).count()),
     ];
-    Ok(MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
-        capacity_bytes: capacity.saturating_sub(crate::placement::reserve::gpu("qwen3_5")), worker_budget_bytes: 0, items, kv_tokens: pool_tokens }],
-        pool_tokens, waste: vec![], notes })
+    let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
+        capacity_bytes: capacity.saturating_sub(crate::placement::reserve::gpu("qwen3_5")), worker_budget_bytes: 0, items, kv_tokens: pool_tokens }];
+    if spark_vision {
+        let mut sparks = Vec::new();
+        for rank in 0..report.spark_ranks {
+            crate::plan::layout::ensure_tower_spark(&mut sparks, rank, options);
+        }
+        let source = crate::plan::layout::vision_source_bytes(report);
+        let towers = crate::plan::layout::Towers {
+            name: "Qwen",
+            vision: Ok(if source > 0 {
+                (source, crate::plan::layout::qwen_scratch_bytes(crate::media::QWEN_MAX_IMAGE_TOKENS as u64))
+            } else { (0, 512 << 20) }),
+            v41: false,
+            audio: crate::plan::layout::no_audio(),
+        };
+        crate::plan::layout::resolve_encoder(report, &towers, &mut devices, &mut sparks, &[0], options, &mut notes);
+        let media_ranks: std::collections::BTreeSet<usize> = report.encoder.as_ref()
+            .map_or_else(Vec::new, crate::plan::encoder::EncoderPlacement::spark_ranks).into_iter().collect();
+        sparks.retain(|device| media_ranks.contains(&(device.index as usize)));
+        devices.extend(sparks);
+    }
+    Ok(MemoryLayout { devices, pool_tokens, waste: vec![], notes })
 }

@@ -13,8 +13,12 @@ const SPARK_HOST_BYTES: u64 = 13 * GIB;
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
-    let local = report.placement == ExpertPlacement::Local;
-    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
+    let routed = model.spec().moe_layers();
+    let all_onboarded = routed > 0
+        && options.resolve_onboard(routed) == Some(Onboard::Layers(routed));
+    let local = report.placement == ExpertPlacement::Local || all_onboarded;
+    let expert_world = if local { 0 } else { report.spark_ranks };
+    let prefill = match resolve_prefill(input, report, options, expert_world,
         crate::families::qwen4::prefill_limits(local)) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
@@ -55,11 +59,14 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         format!("attention placement {}", report.attention_placement)];
     shape.select_card_plans(report, options, &mut notes);
     let mtp = shape.native_layers > 0;
-    let local = report.placement == ExpertPlacement::Local;
+    let routed = model.spec().moe_layers();
+    let all_onboarded = routed > 0
+        && options.resolve_onboard(routed) == Some(Onboard::Layers(routed));
+    let local = report.placement == ExpertPlacement::Local || all_onboarded;
     let exl3 = report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"));
     let package = report.experts.as_ref().map(|e| e.package.as_str());
     let reference = gpus == 1 && (94 * GIB..=96 * GIB).contains(&options.rtx_bytes[0])
-        && mtp && options.onboard.is_none_or(|mode| mode == crate::placement::OnboardSetting::Auto) && local && package == Some("qwen4:exl3-k45")
+        && mtp && options.onboard.is_none_or(|mode| mode == crate::placement::OnboardSetting::Auto) && report.placement == ExpertPlacement::Local && package == Some("qwen4:exl3-k45")
         && model.spec().hidden == 2560 && model.spec().layers.len() == 48
         && shape.prefill_rows == 4096 && shape.concurrency == 8 && matches!(options.prefix_slots, None | Some(18))
         && matches!(shape.context_tokens, 0 | 32768);
@@ -135,16 +142,26 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     if options.drafter_bytes > 0 {
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", options.drafter_bytes, basis));
     }
+    let pkg = if report.placement == ExpertPlacement::Local { local_package(report) }
+        else if !local { "none" } else if exl3 { "exl3" } else { "fp8" };
     devices[0].items.push(runtime_item(shape.manifest.as_deref(), &program_families("qwen4", false),
-        local_package(report), false, 0, options.rtx_bytes[0]));
-    let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
+        pkg, false, 0, options.rtx_bytes[0]));
+    let spark_ranks = if local { 0 } else { report.placement.spark_ranks() };
     let working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: 1 };
     let charges = SparkCharges { host_bytes: Some(SPARK_HOST_BYTES),
         wave_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES, basis };
     let endpoints = spark_endpoints("qwen4", 1);
-    let mut sparks = spark_devices(report, model, input, options, charges, &working, endpoints, &mut waste, &mut notes);
+    let mut sparks = if local {
+        let mut devices = Vec::new();
+        for rank in 0..report.placement.spark_ranks() {
+            ensure_tower_spark(&mut devices, rank, options);
+        }
+        devices
+    } else {
+        spark_devices(report, model, input, options, charges, &working, endpoints, &mut waste, &mut notes)
+    };
     // The vision tower is one choice of the shared solve (no pre-solve pass).
     let encoders = match qwen_encoders(report, options, &sparks, 1) {
         Ok(encoders) => encoders,
@@ -185,6 +202,19 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     }
     charge_spark_devices(report, model, input, options, charges, &working, endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
+    if local {
+        let media_ranks: std::collections::BTreeSet<usize> = report.encoder.as_ref()
+            .map_or_else(Vec::new, super::super::encoder::EncoderPlacement::spark_ranks).into_iter().collect();
+        sparks.retain(|device| media_ranks.contains(&(device.index as usize)));
+        if let Some(encoder) = &report.encoder {
+            for rank in encoder.spark_ranks() {
+                if let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) {
+                    device.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", encoder.weights, Basis::Formula));
+                    device.items.push(Item::new(Category::Workspace, "vision scratch", "resident", encoder.scratch, Basis::Formula));
+                }
+            }
+        }
+    }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
 }
@@ -240,7 +270,9 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let mut loaded_weights = qwen4::single_owner_weights(&resident, host_embedding,
         cfg.ple_layers.first().is_some_and(|&layer| layer < cfg.layers))?
         .checked_add(crate::placement::ResidentWeights(options.drafter_bytes))?;
-    let local = report.placement == ExpertPlacement::Local;
+    let all_onboarded = cfg.layers > 0
+        && options.resolve_onboard(cfg.layers) == Some(Onboard::Layers(cfg.layers));
+    let local = report.placement == ExpertPlacement::Local || all_onboarded;
     if local || mtp {
         loaded_weights = loaded_weights.checked_add(qwen4::single_expert_weights(
             input.expert_catalog()?, cfg.layers, local, mtp)?)?;
@@ -255,12 +287,15 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
         pending_code_bytes: 0, max_context: shape.context_tokens,
         requested_pool: options.pool_tokens.filter(|&n| n > 0),
-        spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 },
+        spark_ranks: if local { 0 } else { report.placement.spark_ranks() },
         startup_graph_modes: Some((shape.concurrency as usize, true)),
         host,
         encoders,
     };
-    let (placement, solved) = crate::placement::families::qwen4::admitted(&inputs)?;
+    let (mut placement, solved) = crate::placement::families::qwen4::admitted(&inputs)?;
+    if all_onboarded {
+        placement.onboard_layers = cfg.layers;
+    }
     publish_host(report, options, &inputs.host, &solved)?;
     adopt_encoder(report, &inputs.encoders, &solved, notes);
     report.prefill_span_rows = Some(span);
@@ -288,7 +323,9 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
         pinned_logits_bytes, scoring_logits_bytes};
     let checkpoint = input.checkpoint();
     let (total, available) = host_sample(options)?;
-    let ranks = report.spark_ranks;
+    let all_onboarded = cfg.layers > 0
+        && options.resolve_onboard(cfg.layers) == Some(Onboard::Layers(cfg.layers));
+    let ranks = if owners == 2 || all_onboarded { 0 } else { report.spark_ranks };
     let unit_rows = options.prefill_unit_rows.unwrap_or(span_rows);
     let waves = options.prefill_waves.max(1);
     let mapped = cfg.ple_layers.first().is_some_and(|&layer| layer < cfg.layers);
@@ -384,6 +421,9 @@ fn qwen_encoders(report: &mut PlanReport, options: &LayoutOptions, sparks: &[Dev
         }
         encoders.push(encoder_placement(MediaMode::Off, &hardware, 0, 0, 1));
     }
+    if encoders.is_empty() && matches!(report.vision, MediaMode::Spark(_)) && sparks.is_empty() {
+        anyhow::bail!("vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS");
+    }
     anyhow::ensure!(!encoders.is_empty() || report.vision == MediaMode::Off,
         "requested Qwen vision placement has no executable device");
     Ok(qwen4::QwenEncoders { candidates: encoders, media_cache: options.media_cache_bytes.unwrap_or_else(||
@@ -463,11 +503,12 @@ fn publish_host(report: &mut PlanReport, options: &LayoutOptions, host: &qwen4::
 /// the backbone and the mixed-format MTP layer load, at the prefill rows' capacity.
 fn package_scratch(input: &super::super::PlanInput, report: &PlanReport, workspace_manifest: Option<&std::path::Path>,
     prefill_rows: u64, mtp: bool) -> Vec<(String, u64)> {
-    let local = report.placement == ExpertPlacement::Local;
     let Ok(catalog) = input.expert_catalog() else { return Vec::new() };
     let Some(tensors) = catalog.fp8() else { return Vec::new() };
     let lib = crate::placement::inventory::image_lib(workspace_manifest);
     let layers = catalog.routed_experts().layers;
+    let all_onboarded = layers > 0 && report.onboard_layers == Some(layers);
+    let local = report.placement == ExpertPlacement::Local || all_onboarded;
     let mut out = Vec::new();
     if local {
         out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", tensors.format(), prefill_rows));
@@ -500,11 +541,12 @@ fn exl3_arenas(input: &super::super::PlanInput, mtp: bool) -> Option<(u64, u64)>
 fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &LayoutOptions, rows: u64, concurrency: u64,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
+    let pkg = if report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) { "exl3" } else { "fp8" };
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &capacity)| {
         let arch = crate::placement::ArchContext::for_device("sm_120", capacity);
         let programs = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]))
             .unwrap_or_else(|| crate::placement::ProgramSet::from_names(&["qwen4"], []));
-        let allowance = crate::placement::inventory::loaded_code_allowance("qwen4", local_package(report),
+        let allowance = crate::placement::inventory::loaded_code_allowance("qwen4", pkg,
             true, rank as u8, arch, Some(&programs));
         DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: capacity, worker_budget_bytes: 0,
             items: vec![Item::new(Category::Runtime, "context+modules", "SM120",
@@ -526,7 +568,11 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
             return MemoryLayout { devices, pool_tokens: 0, waste: Vec::new(), notes };
         }
     };
-    let encoders = match qwen_encoders(report, options, &[], 2) {
+    let mut sparks = Vec::new();
+    for rank in 0..report.placement.spark_ranks() {
+        ensure_tower_spark(&mut sparks, rank, options);
+    }
+    let encoders = match qwen_encoders(report, options, &sparks, 2) {
         Ok(encoders) => encoders,
         Err(error) => {
             report.refuse_placement(format!("Qwen vision: {error:#}"), "Use the bundled tower or --vision=off.");
@@ -556,6 +602,18 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
         }
     };
     refused_encoder(report, &encoders_refused);
+    let media_ranks: std::collections::BTreeSet<usize> = report.encoder.as_ref()
+        .map_or_else(Vec::new, super::super::encoder::EncoderPlacement::spark_ranks).into_iter().collect();
+    sparks.retain(|device| media_ranks.contains(&(device.index as usize)));
+    if let Some(encoder) = &report.encoder {
+        for rank in encoder.spark_ranks() {
+            if let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) {
+                device.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", encoder.weights, Basis::Formula));
+                device.items.push(Item::new(Category::Workspace, "vision scratch", "resident", encoder.scratch, Basis::Formula));
+            }
+        }
+    }
+    devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste: Vec::new(), notes }
 }
 

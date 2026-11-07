@@ -54,6 +54,8 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight on one transport; unset follows the shared six-Spark policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,
+    /// Admit every prefill row's logits for diagnostic fidelity scoring.
+    #[arg(long)] pub full_prefill_logits: bool,
     /// Pack already queued prompts, or run unknown arithmetic routes alone in exact mode.
     #[arg(long, value_enum, default_value = "unrestricted")]
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
@@ -120,6 +122,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
         max_context: args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?),
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
+        full_prefill_logits: args.full_prefill_logits,
         ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0, prefix: Some(&args.prefix),
     })
 }
@@ -318,6 +321,16 @@ mod tests {
         assert!(args(&selected)?.validate().is_err());
         selected.extend(["--split-device", "1"]);
         args(&selected)?.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn full_prefill_logits_is_explicit_and_preserves_shape() -> Result<()> {
+        let ordinary = args(&[])?;
+        let scoring = args(&["--full-prefill-logits"])?;
+        assert!(!ordinary.full_prefill_logits);
+        assert!(scoring.full_prefill_logits);
+        assert_eq!(ordinary.prefill()?, scoring.prefill()?);
         Ok(())
     }
 
