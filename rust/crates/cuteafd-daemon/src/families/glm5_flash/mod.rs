@@ -522,7 +522,7 @@ mod draft_cli_tests {
     fn resolved_flash_capacity_and_native_flags_are_runtime_facts() {
         let mut args = Parse::try_parse_from(["test", "--snapshot", "/s", "--native-lib", "/l"]).unwrap().engine;
         crate::commands::bench::assert_resolved_family_seam("glm5_flash",
-            &["max-context", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device", "attention-plan-rows"], || {
+            &["max-context-tokens", "pool-tokens", "rtx-expert-layers", "prefix-marks", "split-device", "attention-plan-rows"], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
                 serve::resolve_serving_capacity(&mut args, 16);
                 native::normalize(&mut args);

@@ -382,7 +382,7 @@ mod draft_cli_tests {
             argv.extend_from_slice(extra);
             let mut args = Parse::try_parse_from(argv).unwrap().engine;
             crate::commands::bench::assert_resolved_family_seam("glm5",
-                &["max-context", "pool-tokens", "rtx-expert-layers", "draft-window-marks", "attention-plan-rows"], || {
+                &["max-context-tokens", "pool-tokens", "rtx-expert-layers", "draft-window-marks", "attention-plan-rows"], || {
                     crate::commands::bench::fixture_prefix().resolve_entries(16);
                     serve::resolve_serving_capacity(&mut args, 16);
                     resolve_prefill(&mut args)?;

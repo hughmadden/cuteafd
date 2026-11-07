@@ -1257,7 +1257,7 @@ pub(super) mod tests {
         let mut args = Cli::try_parse_from(["serve", "--snapshot", "/fixture", "--native-lib", "/native",
             "--peers", "127.0.0.1:19000,127.0.0.1:19001,127.0.0.1:19002,127.0.0.1:19003,127.0.0.1:19004,127.0.0.1:19005",
             "--prefill-rows", "4096", "--prefill-waves", "2", "--host-cache-bytes", "0"])?.serve;
-        crate::commands::bench::assert_resolved_family_seam("kimi_k3", &["max-context"], || {
+        crate::commands::bench::assert_resolved_family_seam("kimi_k3", &["max-context-tokens"], || {
             args.prefix.resolve_entries(args.max_sequences as usize);
             let shape = args.prefill()?;
             let mut i = inputs(&cfg);

@@ -511,7 +511,7 @@ mod source_format_tests {
     fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
         let automatic = crate::commands::bench::assert_resolved_family_seam("mimo_v2",
-            &["max-context", "pool-tokens", "prefill-rows", "prefill-waves", "prefill-span-rows",
+            &["max-context-tokens", "pool-tokens", "prefill-rows", "prefill-waves", "prefill-span-rows",
                 "onboard", "split-device", "embedding-placement"], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
                 serve::resolve_serving_capacity(&mut args, 16, false);
@@ -1078,7 +1078,7 @@ impl Opened {
         resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
         cuteafd_bench::context::ResolvedSettings::placement(&preflight.placement).publish();
         cuteafd_bench::context::ResolvedSettings::default()
-            .value("max-context", resolved.max_context).value("prefill-rows", resolved.prefill_rows)
+            .value("max-context-tokens", resolved.max_context).value("prefill-rows", resolved.prefill_rows)
             .value("prefill-waves", resolved.prefill_waves).value("prefill-span-rows", resolved.prefill_span_rows)
             .value("embedding-placement", format!("{:?}", resolved.token_io.embed_placement.unwrap()).to_lowercase()).publish();
         let args = &resolved;

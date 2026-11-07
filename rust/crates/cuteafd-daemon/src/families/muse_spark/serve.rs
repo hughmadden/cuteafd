@@ -230,7 +230,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
     let placement = &built.placement;
     cuteafd_bench::context::ResolvedSettings::placement(placement).publish();
-    cuteafd_bench::context::set_resolved("max-context", &cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens).to_string());
+    cuteafd_bench::context::set_resolved("max-context-tokens", &cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens).to_string());
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
