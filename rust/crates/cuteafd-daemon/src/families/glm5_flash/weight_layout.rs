@@ -60,6 +60,7 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
         let native_core = core.layer_weights(cfg, layer, ranks, owner.map(|r| r as u8))?;
         let native_attention = core.layer_native(cfg, layer, ranks, owner.map(|r| r as u8))?;
         let native = core.projections.keys().any(|stem| stem.starts_with(&format!("{p}.")));
+        ensure!(owner.is_none_or(|owner| owner < ranks), "Flash arena attention owner outside ranks");
         for (rank, out) in requests.iter_mut().enumerate() {
             for site in ["attn", "ffn"] { for suffix in ["fn", "scale", "base"] {
                 f32(out, format!("{p}.hc_{site}_{suffix}"))?;
@@ -142,3 +143,71 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
     requests.into_iter().enumerate().map(|(rank, requests)| WeightArenaLayout::new(
         format!("glm5_flash/target/{rank}"), requests)).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(layout: &WeightArenaLayout) {
+        let mut views = layout.views().values().collect::<Vec<_>>();
+        views.sort_by_key(|view| view.offset());
+        let mut end = 0;
+        for view in views {
+            assert_eq!(view.offset() % 256, 0);
+            assert!(view.offset() >= end);
+            end = view.offset() + view.bytes();
+        }
+        assert_eq!(end, layout.bytes());
+        assert_eq!(layout.payload_bytes() + layout.padding_bytes(), layout.bytes());
+        assert!(!layout.views().keys().any(|name| name.contains("staging") || name.contains("temporary")));
+    }
+
+    #[test]
+    fn final_requests_match_residency_for_tp_and_selected_representations() -> Result<()> {
+        use cuteafd_loader::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        use cuteafd_loader::families::glm5_flash::resident::{resident_weights, GlmfRepresentation};
+        let root = tempfile::tempdir()?;
+        let config = glm5_flash_config(6);
+        write_snapshot(root.path(), &config, &glm5_flash_tensors(&config), None);
+        let checkpoint = Checkpoint::open(root.path())?;
+        let cfg = GlmNextConfig::from_hf(&config)?;
+        for ranks in [1, 2] { for kda_fp8 in [KdaFp8::Off, KdaFp8::Row128, KdaFp8::Channel] {
+            for fp8_head in [false, true] { for output_shard in [false, true] {
+                if output_shard && (ranks == 1 || kda_fp8 == KdaFp8::Off) { continue; }
+                let repr = GlmfRepresentation { kda_fp8: kda_fp8 != KdaFp8::Off, fp8_head, output_shard };
+                let old = resident_weights(&checkpoint, &cfg, cfg.layers, ranks, repr).map_err(anyhow::Error::msg)?;
+                let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
+                    kda_fp8, output_shard, fp8_head, Some((0, old[0].embedding as usize)))?;
+                for (rank, layout) in layouts.iter().enumerate() {
+                    check(layout);
+                    assert_eq!(layout.payload_bytes() as u64, old[rank].embedding + old[rank].weights,
+                        "rank={rank} ranks={ranks} repr={repr:?}");
+                }
+            }}
+        }}
+        Ok(())
+    }
+
+    #[test]
+    fn installed_cpu_inventory() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_GLMF") else { return Ok(()) };
+        let checkpoint = Checkpoint::coordinator(std::path::Path::new(&snapshot), false, false)?;
+        let cfg = GlmNextConfig::read(std::path::Path::new(&snapshot))?;
+        for ranks in [1, 2] {
+            let embedding = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}embed_tokens.weight"))
+                .context("installed embedding header")?.meta.byte_length as usize;
+            let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
+                KdaFp8::Row128, ranks == 2, true, Some((0, embedding)))?;
+            for (rank, layout) in layouts.iter().enumerate() {
+                check(layout);
+                let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
+                let slack: usize = large.iter().map(|v| v.bytes().div_ceil(2 << 20)*(2 << 20)-v.bytes()).sum();
+                let tail = layout.bytes().div_ceil(2 << 20)*(2 << 20)-layout.bytes();
+                eprintln!("FLASH_INVENTORY ranks={ranks} rank={rank} allocations={} payload={} large_count={} large_bytes={} old_slack={slack} arena={} padding={} tail={tail}",
+                    layout.views().len(), layout.payload_bytes(), large.len(), large.iter().map(|v| v.bytes()).sum::<usize>(), layout.bytes(), layout.padding_bytes());
+            }
+        }
+        Ok(())
+    }
+}
+

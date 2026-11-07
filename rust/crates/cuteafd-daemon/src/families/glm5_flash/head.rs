@@ -39,6 +39,24 @@ pub(crate) enum GlmfHead<'a> {
 }
 
 impl<'a> GlmfHead<'a> {
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        match self {
+            Self::K6(owner) => {
+                owner.payload.inventory(inventory, "head.trellis")?;
+                owner.suh.inventory(inventory, "head.suh")?;
+                owner.svh.inventory(inventory, "head.svh")?;
+            }
+            Self::Bf16(owner) => owner.inventory(inventory, "head")?,
+            Self::Fp8 { values, scales } => {
+                values.inventory(inventory, "head.values")?;
+                scales.inventory(inventory, "head.scales")?;
+            }
+            // Vocabulary is shared with TokenEmbedding, which visits both retained planes.
+            Self::RowFp8(owner) => owner.head.inventory(inventory, "head")?,
+        }
+        Ok(())
+    }
+
     pub fn allocations(&self) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
         match self {
             Self::K6(weight) => vec![weight.payload.buffer, weight.suh.buffer, weight.svh.buffer],

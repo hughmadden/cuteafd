@@ -62,6 +62,22 @@ pub(crate) struct GlmfLayer<'a> {
 }
 
 impl GlmfLayer<'_> {
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        prefix: &str) -> Result<()> {
+        for (name, owner) in &self.operands { owner.inventory(inventory, &format!("{prefix}.{name}"))?; }
+        for (name, owner) in &self.native { owner.inventory(inventory, &format!("{prefix}.native.{name}"))?; }
+        for (name, owner) in &self.core {
+            owner.payload.inventory(inventory, &format!("{prefix}.{name}.trellis"))?;
+            owner.suh.inventory(inventory, &format!("{prefix}.{name}.suh"))?;
+            owner.svh.inventory(inventory, &format!("{prefix}.{name}.svh"))?;
+        }
+        for (name, owner) in &self.attention_native {
+            owner.values.inventory(inventory, &format!("{prefix}.{name}.values"))?;
+            if let Some(scales) = &owner.scales { scales.inventory(inventory, &format!("{prefix}.{name}.scales"))?; }
+        }
+        Ok(())
+    }
+
     /// The device range of `operand`, when the layer has it.
     pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
