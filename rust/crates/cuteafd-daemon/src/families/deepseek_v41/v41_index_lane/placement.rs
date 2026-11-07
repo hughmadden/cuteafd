@@ -38,6 +38,13 @@ impl<'a> IndexLaneWeights<'a> {
         staging: usize,
         placement: Option<CachePlacement>,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, staging, placement, None)
+    }
+    pub(crate) fn load_in(
+        library: &'a NativeLibrary, catalog: &OfficialV41Catalog, staging: usize,
+        placement: Option<CachePlacement>,
+        arenas: Option<&crate::families::deepseek_v41::weight_layout::TargetArenas<'a>>,
+    ) -> Result<Self> {
         let original = library.cuda_get_device()?;
         let weights = LAYERS
             .into_iter()
@@ -46,13 +53,12 @@ impl<'a> IndexLaneWeights<'a> {
                     Some(map) => map.attention(layer)? as i32,
                     None => original,
                 };
+                let arena = arenas.map(|arenas| arenas.get(id)).transpose()?;
                 Device { library, id }.own(|| {
-                    IndexQueryWeights::load(
-                        library,
-                        catalog,
-                        layer,
+                    IndexQueryWeights::load_in(
+                        library, catalog, layer,
                         IndexQueryWeights::device_bytes(library, catalog, layer)?,
-                        staging,
+                        staging, arena,
                     )
                 })
             })
