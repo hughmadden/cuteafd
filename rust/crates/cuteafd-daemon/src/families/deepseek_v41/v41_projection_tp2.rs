@@ -26,7 +26,7 @@ pub(crate) struct Weights<'a> {
 }
 impl<'a> Weights<'a> {
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
-        let name = format!("layers.{}.attn.{}.weight", self.layer, self.kind.name());
+        let name = format!("gpu{}.layers.{}.attn.{}.weight", self.device.id, self.layer, self.kind.name());
         self.weight.inventory(inventory, &name)?;
         self.scales.inventory(inventory, &super::weight_layout::packed_scale_name(&name))
     }

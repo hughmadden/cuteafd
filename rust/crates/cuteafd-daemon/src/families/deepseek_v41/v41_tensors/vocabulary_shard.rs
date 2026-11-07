@@ -119,9 +119,10 @@ impl<'a> VocabularyShard<'a> {
         Ok(Self { allocation, device_id, tokens, fp8, packed })
     }
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
-        if let Some(allocation) = &self.allocation { allocation.inventory(inventory, "head.bf16")?; }
-        if let Some(fp8) = &self.fp8 { fp8.inventory(inventory, "head.fp8")?; }
-        if let Some(packed) = &self.packed { packed.inventory(inventory, "head")?; }
+        let name = format!("gpu{}.head", self.device_id);
+        if let Some(allocation) = &self.allocation { allocation.inventory(inventory, &format!("{name}.bf16"))?; }
+        if let Some(fp8) = &self.fp8 { fp8.inventory(inventory, &format!("{name}.fp8"))?; }
+        if let Some(packed) = &self.packed { packed.inventory(inventory, &name)?; }
         Ok(())
     }
     pub fn resident_bytes(&self) -> usize {

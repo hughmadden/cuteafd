@@ -181,7 +181,7 @@ pub(crate) struct Weights<'a> {
 impl<'a> Weights<'a> {
     pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
         for (stem, matrix) in ["w1", "w3", "w2"].into_iter().zip(&self.matrices) {
-            let name = format!("layers.{}.ffn.shared_experts.{stem}.weight", self.layer);
+            let name = format!("gpu{}.layers.{}.ffn.shared_experts.{stem}.weight", self.device.id, self.layer);
             matrix.weight.inventory(inventory, &name)?;
             matrix.scales.inventory(inventory,
                 &crate::families::deepseek_v41::weight_layout::packed_scale_name(&name))?;
