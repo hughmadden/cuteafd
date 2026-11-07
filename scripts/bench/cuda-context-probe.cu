@@ -1,6 +1,7 @@
 // Named CUDA owners. Run in the matching toolchain image on idle, locked GPUs.
 // nvcc -O2 -o probe cuda-context-probe.cu -lcublas -lcublasLt -arch=sm_120
-// probe handles [device=0] [count=4] | probe mappings [device0=0] [device1=1]
+// probe handles|lt|lt-with-blas [device=0] [count=4]
+// probe mappings [device0=0] [device1=1]
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -87,6 +88,87 @@ static void handles(int device, int count) {
   for (auto owner : owners) BLAS(cublasDestroy(owner));
   CUDA(cudaFree(p));
 }
+static void lt_handles(int device, int count, bool with_blas) {
+  CUDA(cudaSetDevice(device));
+  CUDA(cudaFree(nullptr));
+  cudaDeviceProp prop{};
+  CUDA(cudaGetDeviceProperties(&prop, device));
+  int driver = 0;
+  CUDA(cudaDriverGetVersion(&driver));
+  constexpr int n = 4096, k = 4096, rows = 16;
+  constexpr size_t weight_bytes = size_t(n) * k * 2;
+  constexpr size_t input_bytes = size_t(k) * rows * 2;
+  constexpr size_t output_bytes = size_t(n) * rows * 2;
+  constexpr size_t workspace_bytes = 4 << 20;
+  void *weight = nullptr, *input = nullptr, *output = nullptr;
+  CUDA(cudaMalloc(&weight, weight_bytes));
+  CUDA(cudaMalloc(&input, input_bytes));
+  CUDA(cudaMalloc(&output, output_bytes));
+  CUDA(cudaMemset(weight, 0, weight_bytes));
+  CUDA(cudaMemset(input, 0, input_bytes));
+  const auto before_blas = used(device);
+  cublasHandle_t blas = nullptr;
+  if (with_blas) BLAS(cublasCreate(&blas));
+  const auto baseline = used(device);
+  std::vector<cublasLtHandle_t> owners(count);
+  std::vector<void*> workspaces(count);
+  std::vector<cublasLtMatmulDesc_t> operations(count);
+  std::vector<cublasLtMatrixLayout_t> weights(count), inputs(count), outputs(count);
+  const float alpha = 1, beta = 0;
+  for (int i = 0; i < count; ++i) {
+    const auto before = used(device);
+    BLAS(cublasLtCreate(&owners[i]));
+    const auto created = used(device);
+    CUDA(cudaMalloc(&workspaces[i], workspace_bytes));
+    const auto workspace = used(device);
+    BLAS(cublasLtMatmulDescCreate(&operations[i], CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    const cublasOperation_t transpose = CUBLAS_OP_T;
+    BLAS(cublasLtMatmulDescSetAttribute(operations[i], CUBLASLT_MATMUL_DESC_TRANSA,
+        &transpose, sizeof(transpose)));
+    BLAS(cublasLtMatrixLayoutCreate(&weights[i], CUDA_R_16BF, k, n, k));
+    BLAS(cublasLtMatrixLayoutCreate(&inputs[i], CUDA_R_16BF, k, rows, k));
+    BLAS(cublasLtMatrixLayoutCreate(&outputs[i], CUDA_R_16BF, n, rows, n));
+    cublasLtMatmulPreference_t preference = nullptr;
+    BLAS(cublasLtMatmulPreferenceCreate(&preference));
+    BLAS(cublasLtMatmulPreferenceSetAttribute(preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes)));
+    cublasLtMatmulHeuristicResult_t candidate{};
+    int found = 0;
+    BLAS(cublasLtMatmulAlgoGetHeuristic(owners[i], operations[i], weights[i], inputs[i],
+        outputs[i], outputs[i], preference, 1, &candidate, &found));
+    if (found != 1 || candidate.state != CUBLAS_STATUS_SUCCESS) {
+      std::fprintf(stderr, "no BF16 M16/K4096/N4096 Lt algorithm\n");
+      std::exit(1);
+    }
+    BLAS(cublasLtMatmulPreferenceDestroy(preference));
+    const auto planned = used(device);
+    BLAS(cublasLtMatmul(owners[i], operations[i], &alpha, weight, weights[i], input,
+        inputs[i], &beta, output, outputs[i], output, outputs[i], &candidate.algo,
+        workspaces[i], workspace_bytes, nullptr));
+    const auto after = used(device);
+    std::printf("{\"mode\":\"lt\",\"with_blas\":%s,\"device\":%d,\"sm\":\"sm_%d%d\","
+        "\"driver\":%d,\"count\":%d,\"existing_blas_bytes\":%lld,\"create_bytes\":%lld,"
+        "\"workspace_bytes\":%lld,\"plan_bytes\":%lld,\"matmul_bytes\":%lld,"
+        "\"total_bytes\":%lld,\"algorithm_workspace_bytes\":%zu}\n",
+        with_blas ? "true" : "false", device, prop.major, prop.minor, driver, i + 1,
+        (long long)baseline - before_blas, (long long)created - before,
+        (long long)workspace - created, (long long)planned - workspace,
+        (long long)after - planned, (long long)after - baseline, candidate.workspaceSize);
+    std::fflush(stdout);
+  }
+  for (int i = 0; i < count; ++i) {
+    BLAS(cublasLtMatmulDescDestroy(operations[i]));
+    BLAS(cublasLtMatrixLayoutDestroy(weights[i]));
+    BLAS(cublasLtMatrixLayoutDestroy(inputs[i]));
+    BLAS(cublasLtMatrixLayoutDestroy(outputs[i]));
+    BLAS(cublasLtDestroy(owners[i]));
+    CUDA(cudaFree(workspaces[i]));
+  }
+  if (blas) BLAS(cublasDestroy(blas));
+  CUDA(cudaFree(weight));
+  CUDA(cudaFree(input));
+  CUDA(cudaFree(output));
+}
 static void mappings(int device0, int device1) {
   if (device0 == device1) {
     std::fprintf(stderr, "mappings requires two distinct GPUs\n");
@@ -147,6 +229,8 @@ int main(int argc, char** argv) {
   if (std::strcmp(mode, "mappings") == 0) identity(argc > 3 ? std::atoi(argv[3]) : 1);
   const int last = argc > 3 ? std::atoi(argv[3]) : (std::strcmp(mode, "mappings") == 0 ? 1 : 4);
   if (std::strcmp(mode, "handles") == 0 && last > 0 && last <= 64) handles(device, last);
+  else if ((std::strcmp(mode, "lt") == 0 || std::strcmp(mode, "lt-with-blas") == 0)
+      && last > 0 && last <= 64) lt_handles(device, last, std::strcmp(mode, "lt-with-blas") == 0);
   else if (std::strcmp(mode, "mappings") == 0) mappings(device, last);
-  else { std::fprintf(stderr, "usage: probe handles [device] [count] | mappings [device0] [device1]\n"); return 2; }
+  else { std::fprintf(stderr, "usage: probe handles|lt|lt-with-blas [device] [count] | mappings [device0] [device1]\n"); return 2; }
 }
