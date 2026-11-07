@@ -1576,7 +1576,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         ensure!(shape.native_layers == 3, "V4.1 dSpark retains all three stages");
         mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
     }
-    let context = if id == "kimi_k3" && options.context_tokens == 0 {
+    let mut context = if id == "kimi_k3" && options.context_tokens == 0 {
         shape.context_tokens.min(report.memory_layout.as_ref().map_or(shape.context_tokens, |memory| memory.pool_tokens))
     } else { shape.context_tokens };
     if id == "kimi_k3" {

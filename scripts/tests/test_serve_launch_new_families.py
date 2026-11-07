@@ -60,9 +60,8 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--max-sequences") == "16"
     assert _flag(serve, "--embedding-placement") == "gpu"
     assert _flag(serve, "--prefix-cache-entries") == "20"
-    # serve-kimi's own defaults stay its own: the checkpoint core picks the context (1M for a K6
-    # core, 512K for BF16; 1M compiled), automatic KV pool;
-    # the planner picks the onboarded layers; it takes no speculator or media options.
+    # Automatic context follows the model maximum and admitted KV pool for every core.
+    # The planner picks onboarded layers; no speculator or media options are passed.
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert _flag(serve, "--max-context-tokens") == "auto"
     for absent in ("--pool-tokens", "--vision", "--audio",
