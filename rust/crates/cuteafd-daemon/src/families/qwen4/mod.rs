@@ -820,6 +820,9 @@ impl Opened {
         engine.admit_host_memory(args)?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.prepare_prefill_units()?;
+        // Weights and experts are resident: the load's pinned upload high-water
+        // is transient (serving's small table uploads regrow only what they use).
+        crate::shared::memory_report::release_load_staging(&self.library)?;
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.
