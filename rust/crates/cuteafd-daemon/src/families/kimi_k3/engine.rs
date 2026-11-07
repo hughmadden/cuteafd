@@ -343,7 +343,7 @@ impl<'a> Engine<'a> {
             vocab_size: local.config().vocab_size, max_context: local.max_context(),
             // A call is the slots' units.
             slots: state.slots(), prefill_rows: local.rows().min(self.depth.call_rows()), decode_rows: local.rows().min(64),
-            full_prefill_logits: false })
+            full_prefill_logits: lanes.io[0][self.head()].full_prefill_logits() })
     }
 
     pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
@@ -564,7 +564,9 @@ impl<'a> Engine<'a> {
             else { None };
         let rows = sequences.iter().try_fold(0usize, |rows, (_, tokens)|
             rows.checked_add(tokens.len()).ok_or_else(|| anyhow::anyhow!("Kimi submission rows overflow")))?;
-        ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= 64,
+        let geometry = self.geometry()?;
+        let logit_capacity = if geometry.full_prefill_logits { geometry.prefill_rows } else { geometry.decode_rows };
+        ensure!(!sequences.is_empty() && logit_rows > 0 && logit_rows <= rows && logit_rows <= logit_capacity,
             "Kimi device submission logit extent");
         // Validate every frontier before enqueue: a failed batch cannot publish
         // only some requests' state. Non-speculative execution commits all rows.

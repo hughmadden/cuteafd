@@ -386,7 +386,9 @@ impl PlanReport {
         if let Some(placement) = &self.solver_placement {
             placement.layers.iter().enumerate().filter_map(|(layer, home)|
                 (home.experts == crate::placement::ExpertHome::Spark).then_some(layer as u32)).collect()
-        } else if self.placement == ExpertPlacement::Local || self.spark_ranks == 0 {
+        } else if self.placement == ExpertPlacement::Local || self.spark_ranks == 0
+            || self.spec.as_ref().is_some_and(|spec| spec.moe.is_none()) {
+            // A dense model has no experts to place, even beside media-only Spark ranks.
             Vec::new()
         } else {
             // Failed or shape-only reports have no solved ownership to narrow.
@@ -1149,8 +1151,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
         let gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
+        let all_onboarded = options.layout.as_ref().is_some_and(|layout|
+            input.family_model().ok().is_some_and(|model| model.spec().moe_layers() > 0
+                && layout.resolve_onboard(model.spec().moe_layers())
+                    == Some(crate::placement::Onboard::Layers(model.spec().moe_layers()))));
         let peer = options.layout.as_ref().is_some_and(|layout| layout.head_split)
-            && (family.id() != "qwen4" || options.placement == ExpertPlacement::Local);
+            && (family.id() != "qwen4" || options.placement == ExpertPlacement::Local || all_onboarded);
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {
@@ -1465,8 +1471,10 @@ fn finalize_media_report(report: &mut PlanReport, checkpoint: &Checkpoint,
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
     routed_operands: &BTreeMap<String, QuantOperand>) {
     if spec.moe.is_none() {
-        report.placement = ExpertPlacement::Local;
-        report.spark_ranks = 0;
+        if !matches!(report.vision, MediaMode::Spark(_)) && !matches!(report.audio, MediaMode::Spark(_)) {
+            report.placement = ExpertPlacement::Local;
+            report.spark_ranks = 0;
+        }
         report.min_spark_ranks = Some(0);
     }
     let bytes_of = |owner: Owner| -> u64 {
@@ -1534,8 +1542,11 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             (_, None) => {} // the routed-expert component already reports its missing kernel
             (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
                 report.spark_rank_share = share(ranks).unwrap_or(0.0);
+                let all_onboarded = options.layout.as_ref()
+                    .and_then(|layout| layout.resolve_onboard(spec.moe_layers()))
+                    == Some(crate::placement::Onboard::Layers(spec.moe_layers()));
                 // Joint admission, not the available host count, chooses expert ownership.
-                if model.admits_expert_packages() && options.layout.is_some() {
+                if options.layout.is_some() && (model.admits_expert_packages() || all_onboarded) {
                     report.experts = Some(contract.clone());
                     return;
                 }
