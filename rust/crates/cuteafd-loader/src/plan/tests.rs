@@ -4013,6 +4013,45 @@ fn glm5_flash_two_gpu_auto_without_context_programs_uses_layers() {
 }
 
 #[test]
+fn glmf_tp2_auto_preserves_selected_prefill_options() {
+    let config = glm5_flash_config(2);
+    let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
+    let manifest = write_glm5_flash_workspaces(dir.path());
+    let draft = tempfile::tempdir().unwrap();
+    let config = json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":5,
+        "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,
+        "rms_norm_eps":1e-5, "sliding_window":2048, "rope_theta":10000,
+        "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
+            "conv_kernel_size":2, "mask_token_id":0, "selector_rank":256,
+            "selector_top_k":16, "block_size":8}});
+    std::fs::write(draft.path().join("config.json"), config.to_string()).unwrap();
+    let geometry = crate::families::glm5::draft_physical::GlmDflashConfig::read(draft.path()).unwrap();
+    let tensors = geometry.tensor_shapes().into_iter().map(|(name, shape)| t(name, "BF16", &shape))
+        .collect::<Vec<_>>();
+    write_safetensors(&draft.path().join("model.safetensors"), &tensors);
+    for ranks in [0, 4] {
+        let mut options = PlanOptions { attention_placement: Some(AttentionPlacement::Heads),
+            layout: Some(layout::LayoutOptions {
+                host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+                head_split: true, context_tokens: 32768, pool_tokens: Some(32768),
+                glmf_tp2_dflash_auto: true, glmf_drafter_snapshot: Some(draft.path().into()),
+                workspace_manifest: Some(manifest.clone()), ..Default::default()
+            }), ..sparks(ranks) };
+        let automatic = plan(dir.path(), &options).unwrap();
+        assert!(automatic.solver_placement.is_some(), "{}", render(&automatic));
+        let selected = automatic.tp2_dflash.unwrap();
+        let layout = options.layout.as_mut().unwrap();
+        layout.glmf_tp2_dflash_auto = false;
+        layout.tp2_dflash = selected;
+        let explicit = plan(dir.path(), &options).unwrap();
+        assert!(explicit.solver_placement.is_some(), "{}", render(&explicit));
+        assert!(automatic.prefill_unit_rows.is_some());
+        assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves, automatic.prefill_span_rows),
+            (explicit.prefill_unit_rows, explicit.prefill_waves, explicit.prefill_span_rows));
+    }
+}
+
+#[test]
 fn glmf_tp2_auto_manual_budget_and_spark_range_keep_whole_single_gpu() {
     let config = glm5_flash_config(2);
     let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));

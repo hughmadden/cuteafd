@@ -42,13 +42,14 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let selected = glmf::prefer_tp2_dflash(whole_pool, split_pool);
         let note = format!("TP2_DFLASH auto: {}; whole pool {whole_pool:?}, split pool {split_pool:?}",
             if selected { "split" } else { "whole" });
-        options.tp2_dflash = selected;
         if selected {
             split.notes.push(note);
+            *options = split_options;
             *report = split_report;
             return split;
         }
         whole.notes.push(note);
+        *options = whole_options;
         *report = whole_report;
         return whole;
     }
