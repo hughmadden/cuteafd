@@ -143,6 +143,24 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         .ok()
         .expect("two ranks");
     let mut records = recorder.map(|r| r.finish());
+    crate::families::deepseek_v41::weight_layout::probe_weights(&lib, &[0, 1], "v41/weights-loaded", |inventory| {
+        weights.inventory(inventory)?;
+        producers.inventory(inventory)?;
+        iw.inventory(inventory)?;
+        ew.inventory(inventory)?;
+        table.inventory(inventory)?;
+        for shard in &vocab { shard.inventory(inventory)?; }
+        hw.inventory(inventory)?;
+        for shards in [&query_shards, &output_shards].into_iter().flatten() {
+            for rank in shards {
+                for shard in rank { shard.inventory(inventory)?; }
+            }
+        }
+        for rank in &shared_owned {
+            for weights in rank { weights.inventory(inventory)?; }
+        }
+        Ok(())
+    })?;
     memory_checkpoint("weights")?;
     tracing::info!(capacity, backbone_lane_bytes=BackboneLane::placed_workspace_bytes_with_split(&lib, capacity,args.tp2_query_projection,args.tp2_output_projection)?,
         producer_bytes=?crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(&lib, map, capacity)?,

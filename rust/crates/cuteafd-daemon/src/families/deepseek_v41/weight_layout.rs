@@ -20,6 +20,21 @@ pub(crate) fn allocation<'a>(library: &'a cuteafd_ffi::NativeLibrary,
         Device { library, id: library.cuda_get_device()? }, arena, name, bytes)?))
 }
 
+pub(crate) fn probe_weights(library: &cuteafd_ffi::NativeLibrary, devices: &[i32],
+    stage: &str, visit: impl FnOnce(&mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()>) -> Result<()> {
+    use crate::shared::memory::receipts::{Census, Inventory};
+    use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
+    if !crate::shared::inventory::startup_probe_enabled() { return Ok(()); }
+    let mut inventory = Inventory::new(CoordinatorDevices::new(devices)?, "v41.weights",
+        Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Weights, "target weights");
+    visit(&mut inventory)?;
+    let mut census = Census::default();
+    census.owners(inventory.receipts);
+    census.normalize(PhaseOrder::TARGET_THEN_DRAFT)?;
+    crate::shared::inventory::startup_probe(library, devices, stage,
+        crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })
+}
+
 pub(crate) struct TargetArenas<'a> { arenas: Vec<(i32, DeviceWeightArena<'a>)> }
 impl<'a> TargetArenas<'a> {
     pub fn new(library: &'a cuteafd_ffi::NativeLibrary, layout: TargetLayout) -> Result<Self> {

@@ -509,6 +509,15 @@ fn worker(
         &lib, &catalog, TargetHeadWeights::device_bytes(&catalog)?, 16 << 20, arena,
     )?;
     let mut records = recorder.map(|recorder| recorder.finish());
+    super::weight_layout::probe_weights(&lib, &[lib.cuda_get_device()?], "v41/weights-loaded", |inventory| {
+        weights.inventory(inventory)?;
+        producers.inventory(inventory)?;
+        index_weights.inventory(inventory)?;
+        table.inventory(inventory)?;
+        for weights in &engram_weights { weights.inventory(inventory)?; }
+        vocabulary.inventory(inventory)?;
+        head_weights.inventory(inventory)
+    })?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
     admission::startup_phase(&lib, "v41/weights:head", device_total)?;
     use crate::families::deepseek_v41::v41_target_pass::TargetTapWave;

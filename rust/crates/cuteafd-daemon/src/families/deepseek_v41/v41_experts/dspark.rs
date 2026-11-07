@@ -506,6 +506,20 @@ impl<'library> DsparkWeights<'library> {
         let shared_scales = shared::pack_scales(library, &auxiliary, &arena)?;
         let projection_scales = projection::pack_scales(library, &auxiliary, &arena)?;
         let grouped_output_scales = attention_output::pack_grouped_scales(library, &auxiliary, &arena)?;
+        crate::families::deepseek_v41::weight_layout::probe_weights(library,
+            &[library.cuda_get_device()?], "v41/dspark-dense-loaded", |inventory| {
+                auxiliary.inventory(inventory)?;
+                for (index, scales) in shared_scales.iter().enumerate() {
+                    scales.inventory(inventory, &format!("dspark.shared_scales.{index}"))?;
+                }
+                for (index, scales) in projection_scales.iter().enumerate() {
+                    scales.inventory(inventory, &format!("dspark.projection_scales.{index}"))?;
+                }
+                for (index, scales) in grouped_output_scales.iter().enumerate() {
+                    scales.inventory(inventory, &format!("dspark.grouped_scales.{index}"))?;
+                }
+                Ok(())
+            })?;
         Ok(PreparedDspark {
             library,
             draft_width: width,

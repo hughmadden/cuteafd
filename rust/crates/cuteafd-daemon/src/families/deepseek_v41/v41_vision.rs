@@ -134,6 +134,8 @@ impl<'a> VisionRuntime<'a> {
         let weights = NativeRtxTensors::load_in(
             lib, catalog, &names, NativeRtxTensors::plan(catalog, &names)?, 16 << 20, Some(&arena),
         )?;
+        super::weight_layout::probe_weights(lib, &[lib.cuda_get_device()?], "v41/vision-weights-loaded",
+            |inventory| weights.inventory(inventory))?;
         let workspace = DeviceAllocation::new(lib, V41VisionOps::WORKSPACE_BYTES)?;
         let ops = unsafe { lib.v41_vision_ops(workspace.buffer)? };
         let buffers = Self::buffer_sizes(capacity)?
