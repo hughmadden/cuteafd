@@ -210,9 +210,6 @@ fn load_weights<'a>(
     // Every layout admits the unified-pool peak before allocation. Pinned host
     // staging, read scratch and exchange storage compete with device weights on
     // GB10.
-    let budget = spark_admission_budget(config, resident, staging, pinned_host,
-        read_scratch, workspace)?;
-    admit_worker_peak(library, config.rank, budget.load_peak, budget.serve_peak)?;
     if let Some(stream) = push {
         if let Some(weights) = push_native::load(library, catalog, config, resident, stream)? {
             return Ok((backend::Weights::Full(weights), config.device_budget - resident));

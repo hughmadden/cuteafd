@@ -113,7 +113,6 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "EXLR8 admission exceeds budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
-    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
     if let Some(stream) = push {
         if let Some(weights) = super::push_exlr8::load(library, config, &plans, &budgets,
             resident, workspace, retained_host, descriptors, stream)? {

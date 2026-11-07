@@ -655,7 +655,7 @@ pub(super) fn load_fp8<'a>(
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "native expert groups exceed budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
-    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+
     tracing::info!(groups = groups.len(), resident = totals.resident, scratch = totals.scratch,
         host = totals.host, pinned = totals.pinned, workspace, "native expert groups admitted before allocation");
     let mut owners = Vec::with_capacity(groups.len());
@@ -749,7 +749,7 @@ pub(super) fn load_exl3<'a>(
         serve_peak_bytes=peak.serve_peak, "EXL3 Spark admitted loader peak");
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "physical expert arena startup peak exceeds configured device budget");
-    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+
     if let Some(stream) = push {
         if let Some(weights) = super::push::load(library, catalog, config, &layers, &plans, resident, stream)? {
             return Ok((Weights::Exl3(Rc::new(weights)), config.device_budget - resident));
