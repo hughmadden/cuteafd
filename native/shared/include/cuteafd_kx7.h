@@ -17,6 +17,12 @@ extern "C" {
 // streams of each 8-row block and K slice quad-interleaved (quad stride 512) with ragged tails,
 // the two-class code (11-bit primary, ESC + 12-bit rare rank).
 #define CUTEAFD_KX7_FORMAT_V11 11u
+// format 12: v1.1's stream layout under the Huffman fallback code, for a matrix whose two-class
+// ESC cannot fit 16 bits (too many distinct patterns for 4,096 rare slots at a short ESC): a
+// canonical Huffman code limited to 16 bits, two-level tables (11-bit primary, sub-tables), at
+// most CUTEAFD_KX7_MAX_HUFFMAN_WORDS words; esc_shift and esc_mask are 0.
+#define CUTEAFD_KX7_FORMAT_V11_HUFFMAN 12u
+#define CUTEAFD_KX7_MAX_HUFFMAN_WORDS 16384u
 
 typedef struct cuteafd_kx7_pack_t {
   uint32_t struct_bytes;        // sizeof(cuteafd_kx7_pack_t) as the caller compiled it

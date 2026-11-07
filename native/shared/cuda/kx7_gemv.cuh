@@ -116,8 +116,9 @@ __device__ __forceinline__ void fold_and_store(float (&acc)[MT][G][4], float* pa
   }
 }
 
-// The KX7 GEMV: out [rows, N] BF16 = X [rows, K] BF16 @ W^T, W a v1.1 pack (two-class code).
-template <int KS, int RG, int G, int MT>
+// The KX7 GEMV: out [rows, N] BF16 = X [rows, K] BF16 @ W^T, W a v1.1-layout pack under the
+// two-class code (TWOCLASS) or its Huffman fallback.
+template <int KS, int RG, int G, int MT, bool TWOCLASS>
 __global__ void __launch_bounds__(KS * RG * 32)
     kx7_gemv_kernel(const uint16_t* __restrict__ X, int rows, int N, int K, const uint8_t* __restrict__ streams,
                     const uint32_t* __restrict__ offsets, const uint16_t* __restrict__ lengths, int streams_per_row,
@@ -149,7 +150,7 @@ __global__ void __launch_bounds__(KS * RG * 32)
   }
   for (int c = 0; c < chunks; ++c) {
     uint32_t bw[G][8];
-    kx7_decode16_multi<G, true>(s, ring_lane, lut, esc_shift, esc_mask, stride, bw);
+    kx7_decode16_multi<G, TWOCLASS>(s, ring_lane, lut, esc_shift, esc_mask, stride, bw);
     mma_tiles<G, MT>(acc, bw, X, rows, K, kb + 16 * j + 64 * c, g);
   }
   __syncthreads();  // the ring is dead: reuse it for the fold

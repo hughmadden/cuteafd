@@ -43,8 +43,28 @@ constexpr int kInterleaveRows = 8;
 constexpr uint32_t kQuadStride = 512;
 // v1.1's two-class tables: 2^11 primary entries, then 2^12 u16 rare patterns two to a word.
 constexpr uint32_t kV11TableWords = (1u << KX7_PBITS) + (1u << 12) / 2;
-constexpr size_t kSmemBytes = kV11TableWords * 4 + size_t(kWarps) * KX7_RING_BYTES;
-static_assert(kSmemBytes <= 48 * 1024, "the decode stays within the default shared memory");
+// Shared memory a kernel may take without opting in.
+constexpr size_t kDefaultSmem = 48 * 1024;
+static_assert(kV11TableWords * 4 + size_t(kWarps) * KX7_RING_BYTES <= kDefaultSmem,
+              "the two-class decode stays within the default shared memory");
+
+bool huffman(const cuteafd_kx7_pack_t* p) { return p->format == CUTEAFD_KX7_FORMAT_V11_HUFFMAN; }
+
+// Raises `kernel`'s dynamic shared memory limit to `bytes` the first time a launch needs more than
+// the default (a Huffman pack's larger tables); `granted` is the launch site's own record.
+// cudaFuncSetAttribute is not a stream operation, so this is safe inside a capture.
+template <typename Kernel>
+cudaError_t allow_smem(Kernel kernel, size_t bytes, size_t& granted) {
+  if (bytes <= kDefaultSmem || bytes <= granted) return cudaSuccess;
+  int device = 0, limit = 0;
+  cudaError_t e = cudaGetDevice(&device);
+  if (e == cudaSuccess) e = cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  if (e != cudaSuccess) return e;
+  if (bytes > size_t(limit)) return cudaErrorInvalidValue;
+  e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes));
+  if (e == cudaSuccess) granted = bytes;
+  return e;
+}
 // The fused GEMV takes decode and verify steps up to this many rows (four 16-row activation
 // tiles); wider steps and prefill decode once and run the BF16 GEMM.
 constexpr int32_t kGemvRows = 64;
@@ -59,16 +79,22 @@ size_t align256(size_t bytes) { return (bytes + 255) / 256 * 256; }
 constexpr size_t kPackV11Bytes = offsetof(cuteafd_kx7_pack_t, streams) + sizeof(void*);
 
 bool valid_v11(const cuteafd_kx7_pack_t* p) {
-  if (!p || p->struct_bytes < kPackV11Bytes || p->format != CUTEAFD_KX7_FORMAT_V11) return false;
+  if (!p || p->struct_bytes < kPackV11Bytes ||
+      (p->format != CUTEAFD_KX7_FORMAT_V11 && p->format != CUTEAFD_KX7_FORMAT_V11_HUFFMAN)) {
+    return false;
+  }
   const bool shape = p->n > 0 && p->n % kInterleaveRows == 0 && p->k > 0 && p->slices >= 1 && p->slices <= 256 &&
                      p->k % (64 * p->slices) == 0 && p->streams_per_row == 4 * p->slices &&
                      p->symbols_per_stream == p->k / (4 * p->slices) &&
                      uint64_t(p->n) * uint64_t(p->streams_per_row) < (uint64_t(1) << 31);
-  return shape && p->quad_stride == kQuadStride && p->ragged <= 1 && p->table_words == kV11TableWords &&
+  const bool tables = huffman(p) ? p->table_words > (1u << KX7_PBITS) && p->table_words <= CUTEAFD_KX7_MAX_HUFFMAN_WORDS
+                                  : p->table_words == kV11TableWords;
+  return shape && p->quad_stride == kQuadStride && p->ragged <= 1 && tables &&
          p->tables && p->offsets && p->lengths && p->streams && aligned(p->tables, 4) && aligned(p->offsets, 4) &&
          aligned(p->lengths, 2) && aligned(p->streams, 16);
 }
 
+template <bool TWOCLASS>
 __global__ void __launch_bounds__(kThreads)
     decode_kernel(const uint32_t* __restrict__ lut_g, int lut_words, const uint32_t* __restrict__ offsets,
                   const uint16_t* __restrict__ lengths, const uint8_t* __restrict__ streams, uint16_t* __restrict__ out,
@@ -92,7 +118,7 @@ __global__ void __launch_bounds__(kThreads)
   uint16_t* dst = out + size_t(row) * k + size_t(slice) * width + 16 * t;
   for (int c = 0; c < width / 64; ++c) {
     uint32_t w[1][8];
-    kx7_decode16_multi<1, true>(s, ring_lane, lut, esc_shift, esc_mask, stride, w);
+    kx7_decode16_multi<1, TWOCLASS>(s, ring_lane, lut, esc_shift, esc_mask, stride, w);
     uint4* at = reinterpret_cast<uint4*>(dst + 64 * c);
     at[0] = make_uint4(w[0][0], w[0][1], w[0][2], w[0][3]);
     at[1] = make_uint4(w[0][4], w[0][5], w[0][6], w[0][7]);
@@ -108,14 +134,17 @@ bool gemv_applies(int32_t rows, int32_t n, int32_t slices) {
 }
 
 // One GEMV configuration <KS, RG, G, MT> launched over `pack`.
-template <int RG, int G, int MT>
+template <int RG, int G, int MT, bool TWOCLASS>
 int32_t launch_gemv(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32_t rows, cudaStream_t s) {
   using Geo = kx7gemv::Geometry<kGemvSlices, RG, G, MT>;
-  constexpr int smem = Geo::kx7_smem(int(kV11TableWords));
-  static_assert(smem <= 48 * 1024, "the GEMV stays within the default shared memory");
+  static_assert(Geo::kx7_smem(int(kV11TableWords)) <= int(kDefaultSmem), "two-class GEMVs need no opt-in");
   static_assert(Geo::COLS == kGemvCols, "every GEMV configuration owns kGemvCols weight rows per CTA");
   if (p->n % Geo::COLS != 0) return cudaErrorInvalidValue;
-  kx7gemv::kx7_gemv_kernel<kGemvSlices, RG, G, MT><<<p->n / Geo::COLS, Geo::THREADS, smem, s>>>(
+  const size_t smem = size_t(Geo::kx7_smem(int(p->table_words)));
+  static size_t granted = kDefaultSmem;
+  const cudaError_t allowed = allow_smem(kx7gemv::kx7_gemv_kernel<kGemvSlices, RG, G, MT, TWOCLASS>, smem, granted);
+  if (allowed != cudaSuccess) return allowed;
+  kx7gemv::kx7_gemv_kernel<kGemvSlices, RG, G, MT, TWOCLASS><<<p->n / Geo::COLS, Geo::THREADS, smem, s>>>(
       static_cast<const uint16_t*>(x), rows, p->n, p->k, static_cast<const uint8_t*>(p->streams),
       static_cast<const uint32_t*>(p->offsets), static_cast<const uint16_t*>(p->lengths), p->streams_per_row,
       p->quad_stride, int(p->ragged), static_cast<const uint32_t*>(p->tables), int(p->table_words), p->esc_shift,
@@ -127,11 +156,16 @@ int32_t launch_gemv(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32
 // best on an RTX 5090 for GLM 5.3 Flash's [8192, 4096] q/k/v and [4096, 8192] o_proj. Every
 // configuration has K split 4 and the same per-element K order and fold, so a row's bits do not
 // depend on the row count.
+template <bool TWOCLASS>
+int32_t gemv_code(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32_t rows, cudaStream_t s) {
+  if (rows <= 16) return launch_gemv<4, 1, 1, TWOCLASS>(p, x, out, rows, s);
+  if (rows <= 32) return launch_gemv<4, 1, 2, TWOCLASS>(p, x, out, rows, s);
+  if (p->n >= 8192) return launch_gemv<4, 1, 4, TWOCLASS>(p, x, out, rows, s);
+  return launch_gemv<2, 2, 4, TWOCLASS>(p, x, out, rows, s);
+}
+
 int32_t gemv(const cuteafd_kx7_pack_t* p, const void* x, void* out, int32_t rows, cudaStream_t s) {
-  if (rows <= 16) return launch_gemv<4, 1, 1>(p, x, out, rows, s);
-  if (rows <= 32) return launch_gemv<4, 1, 2>(p, x, out, rows, s);
-  if (p->n >= 8192) return launch_gemv<4, 1, 4>(p, x, out, rows, s);
-  return launch_gemv<2, 2, 4>(p, x, out, rows, s);
+  return huffman(p) ? gemv_code<false>(p, x, out, rows, s) : gemv_code<true>(p, x, out, rows, s);
 }
 
 }  // namespace
@@ -152,11 +186,22 @@ extern "C" int32_t cuteafd_kx7_decode(const cuteafd_kx7_pack_t* pack, void* out_
   if (!valid_v11(pack) || !out_bf16 || !aligned(out_bf16, 16)) return cudaErrorInvalidValue;
   const int groups = (pack->n / kInterleaveRows) * pack->slices;
   const int blocks = (groups + kWarps - 1) / kWarps;
-  decode_kernel<<<blocks, kThreads, kSmemBytes, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const uint32_t*>(pack->tables), int(pack->table_words), static_cast<const uint32_t*>(pack->offsets),
-      static_cast<const uint16_t*>(pack->lengths), static_cast<const uint8_t*>(pack->streams),
-      static_cast<uint16_t*>(out_bf16), pack->k, pack->slices, pack->streams_per_row, pack->quad_stride,
-      int(pack->ragged), pack->esc_shift, pack->esc_mask, groups);
+  const size_t smem = size_t(pack->table_words) * 4 + size_t(kWarps) * KX7_RING_BYTES;
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  auto launch = [&](auto kernel, size_t& granted) -> cudaError_t {
+    const cudaError_t allowed = allow_smem(kernel, smem, granted);
+    if (allowed != cudaSuccess) return allowed;
+    kernel<<<blocks, kThreads, smem, s>>>(
+        static_cast<const uint32_t*>(pack->tables), int(pack->table_words), static_cast<const uint32_t*>(pack->offsets),
+        static_cast<const uint16_t*>(pack->lengths), static_cast<const uint8_t*>(pack->streams),
+        static_cast<uint16_t*>(out_bf16), pack->k, pack->slices, pack->streams_per_row, pack->quad_stride,
+        int(pack->ragged), pack->esc_shift, pack->esc_mask, groups);
+    return cudaSuccess;
+  };
+  static size_t granted_two_class = kDefaultSmem, granted_huffman = kDefaultSmem;
+  const cudaError_t launched = huffman(pack) ? launch(decode_kernel<false>, granted_huffman)
+                                             : launch(decode_kernel<true>, granted_two_class);
+  if (launched != cudaSuccess) return launched;
   return cudaGetLastError();
 }
 

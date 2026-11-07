@@ -11,7 +11,8 @@
 //! decode. Callers see only [`Kx7Weights::linear`] and byte counts.
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::kx7::{CodeKind, Kx7DeviceBytes, Kx7Layout, Kx7Pack, READ_AHEAD_BYTES, V11_CODE, V11_LAYOUT};
+use cuteafd_core::kx7::{resident_bound, CodeKind, Kx7DeviceBytes, Kx7Layout, Kx7Pack, READ_AHEAD_BYTES,
+    RESIDENT_FALLBACK_CODE, V11_CODE, V11_LAYOUT};
 use cuteafd_ffi::{CuteafdDeviceBuffer, Kx7DevicePack, NativeLibrary};
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -31,6 +32,7 @@ pub(crate) struct Kx7Image {
     pub name: String,
     pub n: usize,
     pub k: usize,
+    code: CodeKind,
     esc_len: u32,
     table_words: usize,
     buffers: [Vec<u8>; 4],
@@ -41,11 +43,13 @@ impl Kx7Image {
     /// ([`Kx7DeviceBytes::bound`]): a matrix that is not FP8-born can pass 8 bits a weight.
     pub fn new(name: &str, pack: &Kx7Pack) -> Result<Self> {
         let header = pack.header();
-        ensure!(header.layout == LAYOUT && pack.code().kind() == CODE,
-            "{name}: KX7 pack in {:?} / {:?}, resident packs are v1.1", header.layout, pack.code().kind());
+        let code = pack.code().kind();
+        ensure!(header.layout == LAYOUT && (code == CODE || code == RESIDENT_FALLBACK_CODE),
+            "{name}: KX7 pack in {:?} / {code:?}, resident packs are v1.1 (two-class or its Huffman fallback)",
+            header.layout);
         let (n, k) = (header.n, header.k);
         let bytes = Kx7DeviceBytes::of(pack)?;
-        let bound = Kx7DeviceBytes::bound(n, k, LAYOUT, CODE)?;
+        let bound = resident_bound(n, k)?;
         ensure!(bytes.within(&bound), "{name}: its KX7 pack takes {:.3} bits a weight, above the admitted 8 \
             (its BF16 values are not FP8-born); serve it with --kda-exact off",
             pack.streams().len() as f64 * 8.0 / (n * k) as f64);
@@ -53,7 +57,7 @@ impl Kx7Image {
         let mut streams = Vec::with_capacity(pack.streams().len() + READ_AHEAD_BYTES);
         streams.extend_from_slice(pack.streams());
         streams.resize(pack.streams().len() + READ_AHEAD_BYTES, 0);
-        let image = Self { name: name.into(), n, k, esc_len: pack.code().esc_len(), table_words: tables.len(),
+        let image = Self { name: name.into(), n, k, code, esc_len: pack.code().esc_len(), table_words: tables.len(),
             buffers: [tables.iter().flat_map(|w| w.to_le_bytes()).collect(), pack.offsets_bin(), pack.lengths_bin(),
                 streams] };
         debug_assert_eq!(image.device_bytes(), bytes);
@@ -84,8 +88,14 @@ pub(crate) fn pack(matrices: &[(String, Vec<u8>, usize, usize)]) -> Result<Vec<K
             values.push(bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect::<Vec<u16>>());
         }
         let sources: Vec<_> = values.iter().zip(matrices).map(|(v, (_, _, n, k))| (v.as_slice(), *n, *k)).collect();
-        let packs = cuteafd_core::kx7::encode_verified_all(&sources, LAYOUT, CODE)
+        let packs = cuteafd_core::kx7::encode_resident_all(&sources)
             .context("KX7 pack of the KDA projections (serve them with --kda-exact off)")?;
+        for (pack, (name, _, _, _)) in packs.iter().zip(matrices) {
+            if pack.code().kind() != CODE {
+                tracing::info!(matrix = name.as_str(), code = ?pack.code().kind(),
+                    "KX7: the two-class ESC cannot fit 16 bits for this matrix; packed under the Huffman fallback");
+            }
+        }
         packs.iter().zip(matrices).map(|(pack, (name, _, _, _))| Kx7Image::new(name, pack)).collect()
     })?;
     let seconds = started.elapsed().as_secs_f64();
@@ -94,7 +104,7 @@ pub(crate) fn pack(matrices: &[(String, Vec<u8>, usize, usize)]) -> Result<Vec<K
         stats.matrices += 1;
         stats.bf16_bytes += (n * k * 2) as u64;
         stats.device_bytes += image.device_bytes().total(FLOOR);
-        stats.bound_bytes += Kx7DeviceBytes::bound(*n, *k, LAYOUT, CODE)?.total(FLOOR);
+        stats.bound_bytes += resident_bound(*n, *k)?.total(FLOOR);
     }
     stats.seconds += seconds;
     STATS.with(|cell| cell.set(stats));
@@ -149,6 +159,7 @@ impl PackSplit {
 /// One resident KX7 matrix [n, k]: its four buffers on one GPU and its code's header scalars.
 pub(crate) struct Kx7Weights<'a> {
     buffers: [DeviceAllocation<'a>; 4],
+    code: CodeKind,
     esc_len: u32,
     table_words: usize,
     pub n: usize,
@@ -165,7 +176,7 @@ impl<'a> Kx7Weights<'a> {
             crate::shared::memory::load_timing::upload(bytes.len(), || library.copy_h2d(allocation.buffer, bytes))?;
             Ok(allocation)
         });
-        Ok(Self { buffers: [tables?, offsets?, lengths?, streams?], esc_len: image.esc_len,
+        Ok(Self { buffers: [tables?, offsets?, lengths?, streams?], code: image.code, esc_len: image.esc_len,
             table_words: image.table_words, n: image.n, k: image.k })
     }
 
@@ -181,9 +192,12 @@ impl<'a> Kx7Weights<'a> {
 
     /// The native header naming this matrix's buffers.
     pub fn device_pack(&self) -> Result<Kx7DevicePack> {
-        let CodeKind::TwoClass { rare_bits, .. } = CODE else { anyhow::bail!("resident KX7 packs are two-class") };
-        Kx7DevicePack::v11(self.n, self.k, LAYOUT.slices, self.esc_len, rare_bits, self.table_words,
-            self.buffers.each_ref().map(|b| b.buffer.ptr.cast_const()))
+        let buffers = self.buffers.each_ref().map(|b| b.buffer.ptr.cast_const());
+        match self.code {
+            CodeKind::TwoClass { rare_bits, .. } =>
+                Kx7DevicePack::v11(self.n, self.k, LAYOUT.slices, self.esc_len, rare_bits, self.table_words, buffers),
+            CodeKind::Huffman => Kx7DevicePack::v11_huffman(self.n, self.k, LAYOUT.slices, self.table_words, buffers),
+        }
     }
 
     /// `out` [rows, n] BF16 = `x` [rows, k] BF16 @ W^T, decoding through `workspace` (at least

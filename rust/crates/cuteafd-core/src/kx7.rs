@@ -1674,6 +1674,49 @@ impl Kx7DeviceBytes {
     }
 }
 
+/// The most decode-table words a resident Huffman pack may take: the kernels copy the tables to
+/// shared memory (native `CUTEAFD_KX7_MAX_HUFFMAN_WORDS`).
+pub const RESIDENT_HUFFMAN_TABLE_WORDS: u64 = 16384;
+
+/// The code a resident pack takes: v1.1's two-class code ([`V11_CODE`]), or for a matrix whose
+/// two-class ESC cannot fit 16 bits (more distinct patterns than 4,096 rare slots hold at a short
+/// ESC), the Huffman code on the same layout.
+pub const RESIDENT_FALLBACK_CODE: CodeKind = CodeKind::Huffman;
+
+/// The admission bound of a resident [n, k] pack in [`V11_LAYOUT`] under either resident code:
+/// [`Kx7DeviceBytes::bound`] of the two-class code with tables of up to
+/// [`RESIDENT_HUFFMAN_TABLE_WORDS`] words, so the Huffman fallback of any matrix fits it.
+pub fn resident_bound(n: usize, k: usize) -> Result<Kx7DeviceBytes> {
+    let mut bound = Kx7DeviceBytes::bound(n, k, V11_LAYOUT, V11_CODE)?;
+    bound.tables = bound.tables.max(4 * RESIDENT_HUFFMAN_TABLE_WORDS);
+    Ok(bound)
+}
+
+/// [`encode_verified`] under [`V11_CODE`], falling back to [`RESIDENT_FALLBACK_CODE`] when the
+/// two-class code cannot be built for this matrix; refuses Huffman tables above
+/// [`RESIDENT_HUFFMAN_TABLE_WORDS`].
+pub fn encode_resident(w: &[u16], n: usize, k: usize) -> Result<Kx7Pack> {
+    match encode_verified(w, n, k, V11_LAYOUT, V11_CODE) {
+        Ok(pack) => Ok(pack),
+        Err(two_class) => {
+            let pack = encode_verified(w, n, k, V11_LAYOUT, RESIDENT_FALLBACK_CODE)
+                .map_err(|fallback| Kx7Error::Code { reason: format!(
+                    "neither the two-class code ({two_class}) nor its Huffman fallback ({fallback})") })?;
+            let words = pack.device_tables()?.len() as u64;
+            if words > RESIDENT_HUFFMAN_TABLE_WORDS {
+                return Err(Kx7Error::Table { reason: format!("the Huffman fallback's tables take {words} words, \
+                    above the resident {RESIDENT_HUFFMAN_TABLE_WORDS} (two-class: {two_class})") });
+            }
+            Ok(pack)
+        }
+    }
+}
+
+/// [`encode_resident`] of every (matrix, n, k) in parallel, in order; the first error wins.
+pub fn encode_resident_all(matrices: &[(&[u16], usize, usize)]) -> Result<Vec<Kx7Pack>> {
+    matrices.par_iter().map(|&(w, n, k)| encode_resident(w, n, k)).collect()
+}
+
 /// Bytes of a decoded [n, k] BF16 matrix in a decode workspace, rounded up to 256.
 pub fn decoded_bytes(n: usize, k: usize) -> u64 {
     (n as u64 * k as u64 * 2).next_multiple_of(256)
