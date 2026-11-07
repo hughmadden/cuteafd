@@ -416,7 +416,14 @@ void device_part(const Pack& p, cudaStream_t s) {
   refused("K off the slices' chunks", [](cuteafd_kx7_pack_t& h) { h.k += 64; });
   refused("streams per row off the slices", [](cuteafd_kx7_pack_t& h) { h.streams_per_row += 1; });
   refused("another quad stride", [](cuteafd_kx7_pack_t& h) { h.quad_stride = 16; });
-  refused("tables of another size", [](cuteafd_kx7_pack_t& h) { h.table_words += 1; });
+  refused("tables of another size", [](cuteafd_kx7_pack_t& h) {
+    // two-class tables have one size; Huffman tables any size up to the resident cap
+    h.table_words = h.format == CUTEAFD_KX7_FORMAT_V11_HUFFMAN ? CUTEAFD_KX7_MAX_HUFFMAN_WORDS + 1 : h.table_words + 1;
+  });
+  refused("Huffman tables without their primary", [](cuteafd_kx7_pack_t& h) {
+    h.format = CUTEAFD_KX7_FORMAT_V11_HUFFMAN;
+    h.table_words = 2048;
+  });
   refused("misaligned streams", [](cuteafd_kx7_pack_t& h) { h.streams = static_cast<const uint8_t*>(h.streams) + 4; });
   refused("missing offsets", [](cuteafd_kx7_pack_t& h) { h.offsets = nullptr; });
   check(cuteafd_kx7_decode(nullptr, ws, s) != 0, "a null pack is refused", p.name);
