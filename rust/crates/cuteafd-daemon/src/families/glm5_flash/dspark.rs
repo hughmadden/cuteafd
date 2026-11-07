@@ -112,6 +112,28 @@ pub(crate) enum Drafter<'a> {
 }
 
 impl<'a> Drafter<'a> {
+    pub(super) fn allocation_receipts(&self,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let mut receipts = match self {
+            Self::Dflash2(draft) => draft.allocation_receipts(devices, "glm5_flash.draft")?,
+            Self::RemoteDflash(draft) => draft.draft.allocation_receipts(devices, "glm5_flash.draft")?,
+            Self::Dspark(draft) => {
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(devices,
+                    "glm5_flash.draft", cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+                    cuteafd_core::memory_layout::Category::Weights, "draft weights");
+                draft.allocation_receipts(&mut inventory, "weights")?;
+                inventory.receipts
+            }
+        };
+        for receipt in &mut receipts {
+            if receipt.allocation.id.starts_with("glm5_flash/draft/") {
+                receipt.allocation.lifetime = cuteafd_loader::placement::planner::Lifetime::RESIDENT;
+            }
+        }
+        Ok(receipts)
+    }
+
     pub fn require_live(&self) -> Result<()> {
         match self { Self::RemoteDflash(d) => d.require_live(), Self::Dflash2(d) => d.require_live(), _ => Ok(()) }
     }

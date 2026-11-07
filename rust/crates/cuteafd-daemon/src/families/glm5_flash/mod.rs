@@ -2967,6 +2967,18 @@ impl Opened {
                     args.draft_linear, args.draft_kv_cache, read))?
         };
         drafter.set_draft_head(args.draft_head);
+        let mut physical = vec![args.device];
+        if let Some(peer) = args.split_device { physical.push(peer); }
+        if let dspark::Drafter::RemoteDflash(remote) = &drafter {
+            if !physical.contains(&remote.draft.device.id) { physical.push(remote.draft.device.id); }
+        }
+        let mut census = crate::shared::memory::receipts::Census::default();
+        census.owners(drafter.allocation_receipts(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?)?);
+        census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        tracing::info!(owners = census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),
+            aliases = census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),
+            "GLM Flash retained draft arena census");
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, draft_head = ?args.draft_head,
             draft_linear = ?args.draft_linear, "{} drafter resident", drafter.name());
         Ok(Some(drafter))
