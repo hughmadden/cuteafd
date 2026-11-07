@@ -3,6 +3,7 @@ pub mod config;
 pub mod draft_representation;
 pub mod qkv;
 pub mod resident;
+pub mod weight_arena;
 pub mod capacity;
 pub mod projection;
 pub mod weight_policy;

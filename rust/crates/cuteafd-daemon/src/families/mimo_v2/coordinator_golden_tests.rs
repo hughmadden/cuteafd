@@ -88,7 +88,7 @@ pub(crate) fn loader<'a>(library: &'a NativeLibrary, setup: &'a Setup, peers: us
         fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, device: 0,
         peers: (1..=peers).map(|device| crate::shared::peer_split::RankDevice { device: device as i32,
             stream: std::ptr::null_mut() }).collect(),
-        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), transient: Default::default() }
+        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), transient: Default::default(), arenas: Default::default() }
 }
 
 /// Every golden operand through `loader`s (two-GPU head split, then one GPU).

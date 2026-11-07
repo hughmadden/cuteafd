@@ -21,7 +21,8 @@
 //! router weight (Flash) becomes `w_hilo = [bf16(w);
 //! bf16(w - bf16(w))]` for the router program's two FP32-accumulated BF16
 //! products, a BF16 one (V2.6 Pro) is `w_router` as stored.
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, device::Device, weight_arena::{DeviceWeightArena, weight_allocation}};
+use cuteafd_loader::families::mimo_v2::weight_arena::{MimoArenaLayouts, operand_key};
 use super::head::MimoHead;
 use cuteafd_loader::families::mimo_v2::projection::{MimoProjectionLayout, MimoProjectionRepresentation, MIMO_PROJECTION_STAGING_ROWS};
 use anyhow::{ensure, Context, Result};
@@ -122,6 +123,8 @@ pub(crate) struct MimoLoader<'a> {
     pub dense: std::rc::Rc<crate::shared::experts::rtx::dense::DenseLoad<'a>>,
     /// Landed scale grids the gathers read (freed once their finishes ran).
     pub transient: std::rc::Rc<std::cell::RefCell<Vec<DeviceAllocation<'a>>>>,
+    /// Target and optional MTP scopes are planned before recording destinations.
+    pub arenas: std::rc::Rc<Vec<DeviceWeightArena<'a>>>,
 }
 
 /// Scale-grid row of every weight row: uniform 128-row blocks, or per
@@ -173,6 +176,23 @@ fn kmajor(row_scales: &[f32], k_blocks: usize) -> Vec<u8> {
 }
 
 impl<'a> MimoLoader<'a> {
+    fn allocation(&self, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        let id = self.library.cuda_get_device()?;
+        let arena = self.arenas.iter().find(|arena| arena.layout().view(name).is_some()
+            && arena.layout().id().ends_with(&format!("rank{}", if id == self.device { 0 } else {
+                self.peers.iter().position(|p| p.device == id).map_or(usize::MAX, |r| r + 1)
+            })));
+        ensure!(self.arenas.is_empty() || arena.is_some(), "MiMo GPU {id} has no planned operand {name}");
+        Ok(DeviceAllocation::from_allocation(weight_allocation(Device { library: self.library, id }, arena,
+            name, bytes.max(256))?))
+    }
+
+    fn upload_weight(&self, name: &str, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
+        let owner = self.allocation(name, bytes.len())?;
+        self.library.copy_h2d(owner.buffer, bytes)?;
+        Ok(owner)
+    }
+
     fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
         cuteafd_ffi::memory_ledger::tensor(name);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
@@ -240,8 +260,8 @@ impl<'a> MimoLoader<'a> {
                 scale_rows(name, rows, shape[0])?))
         } else { None };
         (0..ranks).map(|rank| self.on_rank(rank, |stream| {
-            let values = DeviceAllocation::new(self.library, usize::try_from(layout.values)?)?;
-            let scales = DeviceAllocation::new(self.library, rows * (cols /128) *4)?;
+            let values = self.allocation(&format!("{name}.fp8"), usize::try_from(layout.values)?)?;
+            let scales = self.allocation(&format!("{name}.row_scale"), rows * (cols /128) *4)?;
             let region = |buffer: CuteafdDeviceBuffer, offset: usize, count: usize| CuteafdDeviceBuffer {
                 ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: count, ..buffer
             };
@@ -294,7 +314,7 @@ impl<'a> MimoLoader<'a> {
                     bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
                 } else { Vec::new() }
             };
-            let kscale = if kmajor_scale { Some(self.upload(&kmajor(&row_scales, cols /128))?) } else { None };
+            let kscale = if kmajor_scale { Some(self.upload_weight(&format!("{name}.k_scale"), &kmajor(&row_scales, cols /128))?) } else { None };
             Ok((values, scales, kscale))
         })).collect()
     }
@@ -318,8 +338,8 @@ impl<'a> MimoLoader<'a> {
         (0..ranks).map(|rank| {
             let (device, stream) = self.rank_device(rank)?;
             let (values, scales) = self.on_rank(rank, |_| Ok((
-                DeviceAllocation::new(self.library, usize::try_from(layout.values)?)?,
-                DeviceAllocation::new(self.library, rows * kb * 4)?)))?;
+                self.allocation(&format!("{name}.fp8"), usize::try_from(layout.values)?)?,
+                self.allocation(&format!("{name}.row_scale"), rows * kb * 4)?)))?;
             for first in (0..rows).step_by(per) {
                 let n = per.min(rows - first);
                 let rect = self.rect(name, Some(first..first + n), Some(rank * cols * 2..(rank + 1) * cols * 2))?;
@@ -332,7 +352,7 @@ impl<'a> MimoLoader<'a> {
                     jobs: vec![Job::RowQuant { rows: n, cols, rule: self.fp8_scales, q, scale, block: false }] }, stream))?;
             }
             let kscale = if kmajor_scale {
-                let kscale = self.on_rank(rank, |_| DeviceAllocation::new(self.library, (rows * kb * 4).max(256)))?;
+                let kscale = self.on_rank(rank, |_| self.allocation(&format!("{name}.k_scale"), rows * kb * 4))?;
                 self.on_rank(rank, |_| self.dense.finish(crate::shared::experts::rtx::dense::Finish::ScaleGather {
                     grid: scales.buffer, index: std::sync::Arc::new((0..rows as u32).collect()), kb, grid_cols: kb, col0: 0,
                     row_major: None, k_major: Some(CuteafdDeviceBuffer { bytes: rows * kb * 4, ..kscale.buffer }) },
@@ -376,7 +396,7 @@ impl<'a> MimoLoader<'a> {
         ensure!(tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[1] == cols), "{names:?} do not share columns");
         let k_blocks = cols.div_ceil(128);
         let bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(2)).context("row operand storage overflow")?;
-        let out = DeviceAllocation::new(self.library, bytes)?;
+        let out = self.allocation(&operand_key(names), bytes)?;
         let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
             // SAFETY: callers keep offset + bytes inside the allocation.
             ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(),
@@ -477,7 +497,7 @@ impl<'a> MimoLoader<'a> {
         }
         let k_blocks = cols.context("no FP8 rows")? / 128;
         let values = self.landed(0, lands, at, &[])?;
-        let (scale, kscale) = self.gathered_scales(0, &grids, &rows, k_blocks, 0)?;
+        let (scale, kscale) = self.gathered_scales(&operand_key(names), 0, &grids, &rows, k_blocks, 0)?;
         Ok(Fp8Copy { values, scale, kscale })
     }
 
@@ -526,8 +546,10 @@ impl<'a> MimoLoader<'a> {
                         kscale[(b * n + i) * 4..][..4].copy_from_slice(&v);
                     }
                 }
-                self.on_rank(rank, |_| Ok(Fp8Copy { values: self.upload(&bytes)?, scale: self.upload(&scale)?,
-                    kscale: self.upload(&kscale)? }))
+                self.on_rank(rank, |_| Ok(Fp8Copy {
+                    values: self.upload_weight(&format!("{}.fp8", operand_key(names)), &bytes)?,
+                    scale: self.upload_weight(&format!("{}.row_scale", operand_key(names)), &scale)?,
+                    kscale: self.upload_weight(&format!("{}.k_scale", operand_key(names)), &kscale)? }))
             }).collect()
         })
     }
@@ -577,7 +599,7 @@ impl<'a> MimoLoader<'a> {
             let zero = covered.iter().enumerate().filter(|(_, &c)| !c).map(|(row, _)| row * cols..(row + 1) * cols)
                 .collect::<Vec<_>>();
             let values = self.landed(rank, lands, width * cols, &zero)?;
-            let (scale, kscale) = self.gathered_scales(rank, &[scale_name.clone()], &rows, k_blocks, 0)?;
+            let (scale, kscale) = self.gathered_scales(name, rank, &[scale_name.clone()], &rows, k_blocks, 0)?;
             Ok(Fp8Copy { values, scale, kscale })
         }).collect()
     }
@@ -611,7 +633,12 @@ impl<'a> MimoLoader<'a> {
         zero: &[std::ops::Range<usize>]) -> Result<DeviceAllocation<'a>> {
         let (device, _) = self.rank_device(rank)?;
         self.on_rank(rank, |_| {
-            let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
+            let names = operand_key(lands.iter().map(|(rect, _)| &rect.name));
+            let transient = lands.iter().all(|(rect, _)| rect.name.ends_with("_scale_inv"));
+            let fp8 = !transient && lands.iter().all(|(rect, _)|
+                self.tensor(&rect.name).is_ok_and(|t| t.meta.dtype == DType::F8E4M3));
+            let allocation = if transient { DeviceAllocation::new(self.library, bytes.max(256))? }
+                else { self.allocation(&if fp8 { format!("{names}.fp8") } else { names }, bytes)? };
             for range in zero.iter().filter(|r| !r.is_empty()) {
                 // SAFETY (offset): the range lies inside the new allocation.
                 let at = CuteafdDeviceBuffer { ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(range.start) }.cast(),
@@ -628,7 +655,7 @@ impl<'a> MimoLoader<'a> {
     /// gathered on the GPU from block grids `grids` (each landed whole, back
     /// to back, into a transient operand): output row `i` takes grid row
     /// `rows[i]` = (grid, row), or zeros for `None`, columns `col0..col0 + kb`.
-    fn gathered_scales(&self, rank: usize, grids: &[String], rows: &[Option<(usize, usize)>], k_blocks: usize,
+    fn gathered_scales(&self, name: &str, rank: usize, grids: &[String], rows: &[Option<(usize, usize)>], k_blocks: usize,
         col0: usize) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         let (mut lands, mut firsts, mut at) = (Vec::new(), Vec::new(), 0usize);
         let mut grid_cols = None;
@@ -645,17 +672,17 @@ impl<'a> MimoLoader<'a> {
         let grid = self.landed(rank, lands, at, &[])?;
         let index = rows.iter().map(|row| row.map_or(Ok(u32::MAX), |(g, r)| u32::try_from(firsts[g] + r)))
             .collect::<std::result::Result<Vec<u32>, _>>()?;
-        self.gather(rank, grid, index, k_blocks, grid_cols, col0)
+        self.gather(name, rank, grid, index, k_blocks, grid_cols, col0)
     }
 
     /// Row-major and K-major per-row scales from `grid` (an operand this load
     /// owns until the gather ran) by `index`.
-    fn gather(&self, rank: usize, grid: DeviceAllocation<'a>, index: Vec<u32>, k_blocks: usize, grid_cols: usize,
+    fn gather(&self, name: &str, rank: usize, grid: DeviceAllocation<'a>, index: Vec<u32>, k_blocks: usize, grid_cols: usize,
         col0: usize) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         let n = index.len();
         let (_, stream) = self.rank_device(rank)?;
-        let (scale, kscale) = self.on_rank(rank, |_| Ok((DeviceAllocation::new(self.library, (n * k_blocks * 4).max(256))?,
-            DeviceAllocation::new(self.library, (n * k_blocks * 4).max(256))?)))?;
+        let (scale, kscale) = self.on_rank(rank, |_| Ok((self.allocation(&format!("{name}.row_scale"), n * k_blocks * 4)?,
+            self.allocation(&format!("{name}.k_scale"), n * k_blocks * 4)?)))?;
         let grid_buffer = grid.buffer;
         self.transient.borrow_mut().push(grid);
         self.on_rank(rank, |_| self.dense.finish(crate::shared::experts::rtx::dense::Finish::ScaleGather {
@@ -701,7 +728,7 @@ impl<'a> MimoLoader<'a> {
             .is_some_and(|bytes| bytes as u64 == tensor.meta.byte_length),
             "{name}: BF16 bytes disagree with output projection shape");
         let allocations = (0..ranks).map(|rank| self.on_rank(rank, |_| {
-            DeviceAllocation::new(self.library, (rows * cols * 2).max(256))
+            self.allocation(name, rows * cols * 2)
         })).collect::<Result<Vec<_>>>()?;
         let per = cuteafd_loader::shared::dense_read::ReadBatch::new(
             rows, shape[1] * 2, cols * 2, crate::shared::experts::rtx::dense::STEP_BYTES)?.rows;
@@ -760,7 +787,7 @@ impl<'a> MimoLoader<'a> {
                 rows.extend((first..first + count).map(|r| Some((g, r / 128))));
             }
             let values = self.landed(rank, lands, at, &[])?;
-            let (scale, kscale) = self.gathered_scales(rank, &grids, &rows, k_blocks, col0)?;
+            let (scale, kscale) = self.gathered_scales(&operand_key(names), rank, &grids, &rows, k_blocks, col0)?;
             Ok(Fp8Copy { values, scale, kscale })
         }).collect()
     }
@@ -797,7 +824,7 @@ impl<'a> MimoLoader<'a> {
         for (&x, &h) in values.iter().zip(&hi) {
             out.extend_from_slice(&bf16(x - f32::from_bits(u32::from(h) << 16)).to_le_bytes());
         }
-        self.upload(&out)
+        self.upload_weight(name, &out)
     }
 
     /// Layer `layer`, one share per rank of this loader's head split (one
@@ -812,10 +839,29 @@ impl<'a> MimoLoader<'a> {
         source: crate::shared::token_io::EmbedSource, placement: crate::shared::token_io::EmbedPlacement)
         -> Result<(crate::shared::token_io::TokenEmbedding<'a>,
             ((MimoWeights<'a>, Vec<Vec<MimoLayer<'a>>>), Vec<MtpWeights<'a>>))> {
-        crate::shared::token_io::TokenEmbedding::load(self.library, source, placement, || {
+        use cuteafd_loader::families::mimo_v2::resident::{MimoResidentLayout, MimoResidentOptions};
+        let resident = MimoResidentLayout::new(self.checkpoint, cfg, &MimoResidentOptions {
+            layers, coordinator_ranks: self.ranks(), checkpoint_tp: self.checkpoint_tp,
+            native_mtp_layers: stages, gpu_embedding: placement == crate::shared::token_io::EmbedPlacement::Gpu,
+            head_format: if self.fp8_head { MimoProjectionRepresentation::Fp8 } else { MimoProjectionRepresentation::Bf16 },
+            output_formats: self.output_formats.clone(),
+        })?;
+        let layouts = MimoArenaLayouts::new(self.checkpoint, &resident)?;
+        let mut arenas = Vec::new();
+        for (rank, layout) in layouts.target.into_iter().enumerate() {
+            let (id, _) = self.rank_device(rank)?;
+            arenas.push(DeviceWeightArena::new(Device { library: self.library, id }, layout)?);
+        }
+        let target = Self { arenas: std::rc::Rc::new(arenas), ..self.clone() };
+        let draft = if let Some(layout) = layouts.mtp {
+            Self { arenas: std::rc::Rc::new(vec![DeviceWeightArena::new(
+                Device { library: self.library, id: self.device }, layout)?]), ..self.clone() }
+        } else { self.clone() };
+        crate::shared::token_io::TokenEmbedding::load_with(self.library, source, placement, || {
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-            Ok((self.model(cfg, layers)?, self.mtp_weights(cfg, stages)?))
-        })
+            Ok((target.model(cfg, layers)?, draft.mtp_weights(cfg, stages)?))
+        }, |name, bytes| weight_allocation(Device { library: self.library, id: self.device },
+            target.arenas.first(), name, bytes))
     }
 
     pub fn mtp_weights(&self, cfg: &MimoV2Config, stages: usize) -> Result<Vec<MtpWeights<'a>>> {

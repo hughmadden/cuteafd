@@ -1109,7 +1109,7 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect(),
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)),
-            transient: Default::default() };
+            transient: Default::default(), arenas: Default::default() };
         use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
         let mut pushed_experts = None;
         let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
