@@ -147,6 +147,7 @@ fn selected_modes_own_distinct_native_residency_and_compact_needs_no_native_shar
         let checkpoint = Checkpoint::open_view(&view).with_context(|| format!("open {mode:?}"))?;
         let inventory = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None,
             false, false, EmbeddingHome::Device(0)).with_context(|| format!("inventory {mode:?}"))?;
+        check_arenas(&inventory)?;
         if mode != AttentionMode::Compact {
             assert_eq!(crate::plan::layout::glm5::resident_owned(&checkpoint, 2, cfg.layers, None)?,
                 inventory.resident_groups()?, "{mode:?} display must use Recipe weight owners");

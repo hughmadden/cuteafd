@@ -468,11 +468,19 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
         .into_iter()
         .map(|r| r.allocation)
         .collect::<Vec<_>>();
-    actual.push(
-        embedding
-            .table_receipt(devices, "glm.weights", "embedding")?
-            .allocation,
-    );
+    let embedding_receipts = embedding.allocation_receipts(devices, "glm.fixture.embedding")?;
+    let mut table = embedding_receipts.iter().find(|r|
+        r.allocation.id == "glm.fixture.embedding.table").context("embedding table view")?.allocation.clone();
+    table.id = "glm.weights.embedding".into();
+    table.category = Category::Embedding;
+    actual.push(table);
+    for arena in layout_inventory.coordinator_arenas()? {
+        if placement == EmbedPlacement::Gpu && arena.id().ends_with("/0") {
+            let backing = embedding_receipts.iter().find(|r| r.allocation.id == arena.id())
+                .context("embedding lost target backing")?;
+            assert_eq!(backing.allocation.bytes, arena.bytes() as u64);
+        }
+    }
     let expected = WeightInventory::from_checkpoint(
         &checkpoint,
         2,
@@ -543,6 +551,20 @@ fn glm_and_ml4_k6_min_max_push_plans_preserve_packed_bytes() -> Result<()> {
                 }
             }
             layouts.push((0, SharedLayout::new(core.get_weight(cfg.head()).context("K6 head")?, TrellisSide::Output, 0, 1)?));
+            let arenas = (0..ranks).map(|rank| {
+                let mut tensors = Vec::new();
+                for (_, layout) in layouts.iter().filter(|(owner, _)| *owner == rank) {
+                    let [n, k] = layout.shape;
+                    for (suffix, bytes) in [("payload", n * k * layout.bits / 8), ("suh", k * 2), ("svh", n * 2)] {
+                        tensors.push((format!("glm.weights.gpu.{rank}.{}.{suffix}", layout.stem), bytes));
+                    }
+                }
+                let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                    format!("glm/coordinator/{rank}"), tensors)?;
+                Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                    Device { library: &library, id: rank as i32 }, layout)?))
+            }).collect::<Result<BTreeMap<_, _>>>()?;
+            let loader = GlmLoader { arenas: Some(std::rc::Rc::new(arenas)), ..loader };
             let mut weights = Vec::new();
             let mut expected = Vec::new();
             for (rank, layout) in &layouts {

@@ -1099,6 +1099,7 @@ impl<'a> GlmLoader<'a> {
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &GlmDsaConfig, layers: usize, owners: Option<&[u8]>, native_shared: bool)
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        ensure!(self.arenas.is_some(), "GLM target model requires admitted coordinator arenas");
         ensure!(owners.is_none_or(|o| o.len() == layers && self.ranks() == 2 && o.iter().all(|&r| r < 2)),
             "whole attention needs one owner per layer and two ranks");
         let split = crate::shared::memory::load_timing::Split::start();
@@ -1183,6 +1184,7 @@ impl<'a> GlmLoader<'a> {
         records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords], owners: Option<&[u8]>, load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
         vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        ensure!(self.arenas.is_some(), "native GLM target model requires admitted coordinator arenas");
         let ranks = self.ranks();
         ensure!(records.len() == ranks && cfg.heads % ranks == 0, "native GLM records per coordinator rank");
         ensure!(owners.is_none_or(|owners| ranks == 2 && owners.len() == layers
