@@ -692,8 +692,12 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
     assert!(r.memory_layout.as_ref().unwrap().devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
     let r = report(dir.path(), 2, 96, 6, Some(262_144));
-    assert!(!r.wip_launchable());
-    assert!(r.hints.iter().any(|h| h.what.contains("compiled/max-context floor of 1048576")), "{:?}", r.hints);
+    assert!(r.wip_launchable(), "{:?}", r.hints);
+    assert_eq!(r.phase_ledger.as_ref().unwrap().served_context_tokens, 262_144);
+    assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
+    let pinned = report_context(dir.path(), 2, 96, 6, Some(262_144), 1_048_576);
+    assert!(!pinned.wip_launchable());
+    assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
     for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted);

@@ -620,6 +620,7 @@ mod tests {
         let mut inputs = inputs(2);
         inputs.requested_pool = None;
         inputs.context = EXTENT;
+        inputs.serving_context = crate::placement::planner::Context::pinned(EXTENT);
         inputs.inventory.spark_ranks = 6;
         inputs.kv_format = crate::families::qwen4::Qwen4KvCache::Fp8;
         let groups = cfg.full[..cfg.layers].iter().map(|&full| (full, None)).collect::<Vec<_>>();
@@ -785,6 +786,7 @@ mod tests {
         for ranks in [1, 2] {
             let mut inputs = inputs(ranks);
             inputs.context = EXTENT;
+            inputs.serving_context = crate::placement::planner::Context::pinned(EXTENT);
             inputs.requested_pool = None;
             inputs.marks.host = true;
             for entries in [0, 20, 200] {
@@ -808,6 +810,7 @@ mod tests {
     fn device_only_retention_fit_refusal_names_host_and_context_remedies() -> Result<()> {
         let mut inputs = inputs(1);
         inputs.context = EXTENT;
+        inputs.serving_context = crate::placement::planner::Context::pinned(EXTENT);
         inputs.requested_pool = None;
         inputs.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 50 << 30 };
         inputs.marks.budget_bytes = 32 << 30;
@@ -825,6 +828,7 @@ mod tests {
         run(&inputs)?;
         inputs.marks.host = false;
         inputs.context = FLOOR;
+        inputs.serving_context = crate::placement::planner::Context::pinned(FLOOR);
         run(&inputs)?;
         Ok(())
     }
@@ -924,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_pool_refuses_rather_than_lowering_the_request_context() -> Result<()> {
+    fn automatic_context_uses_admitted_pool_but_explicit_pin_refuses() -> Result<()> {
         let mut inputs = inputs(1);
         inputs.requested_pool = None;
         inputs.context = EXTENT;
@@ -934,12 +938,17 @@ mod tests {
         inputs.inventory.gpus[0].baseline = Baseline::Measured {
             free_bytes: 40 << 30,
         };
-        // A 40 GiB device cannot hold the 1M request context: refuse with the
-        // attainable pool instead of silently serving a shorter context.
-        let error = run(&inputs).expect_err("40 GiB cannot hold a 1M context");
+        inputs.serving_context = crate::placement::planner::Context::automatic(EXTENT);
+        let automatic = run(&inputs)?;
+        assert!((FLOOR..EXTENT).contains(&automatic.placement.pool_tokens));
+        assert_eq!(automatic.solved.served_context(), automatic.placement.pool_tokens);
+        assert_eq!(automatic.cache.context, EXTENT, "physical extent stays unchanged");
+        inputs.serving_context = crate::placement::planner::Context::pinned(EXTENT);
+        let error = run(&inputs).expect_err("40 GiB cannot hold a pinned 1M context");
         assert!(format!("{error:#}").contains("cannot fit"), "{error:#}");
         // The same device admits the 256K floor, at the request context.
         inputs.context = FLOOR;
+        inputs.serving_context = crate::placement::planner::Context::pinned(FLOOR);
         let admission = run(&inputs)?;
         assert!((FLOOR..=EXTENT).contains(&admission.placement.pool_tokens));
         assert_eq!(admission.cache.context, FLOOR);

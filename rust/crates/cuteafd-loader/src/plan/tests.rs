@@ -3526,7 +3526,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {
-        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
+        resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(opts.context_tokens), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, &total)| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
@@ -5960,10 +5960,14 @@ fn qwen_auto_pool_normalization_keeps_one_admission_and_its_refusal() {
     assert_eq!(automatic.prefill_unit_rows, unset.prefill_unit_rows);
     assert_eq!(automatic.prefill_waves, unset.prefill_waves);
     zero.layout.as_mut().unwrap().pool_tokens = Some(64);
+    let small = plan(dir.path(), &zero).unwrap();
+    assert!(small.wip_launchable(), "{}", render(&small));
+    assert_eq!(small.phase_ledger.as_ref().unwrap().served_context_tokens, 64);
+    zero.layout.as_mut().unwrap().context_tokens = 262144;
     let refused = plan(dir.path(), &zero).unwrap();
     assert!(!refused.wip_launchable());
-    // The shared Recipe's typed refusal survives instead of a second solve with
-    // a smaller prefill reserve.
+    // An explicit context pin preserves the typed refusal instead of a second
+    // solve with a smaller prefill reserve.
     assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")
             && hint.what.contains("cannot hold selected context")), "{}", render(&refused));
     assert!(!refused.hints.iter().any(|hint| hint.what.contains("reserve does not fit")));

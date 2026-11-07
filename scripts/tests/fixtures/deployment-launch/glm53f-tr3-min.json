@@ -90,8 +90,6 @@
       "0.0.0.0:8814",
       "--max-sequences",
       "16",
-      "--max-context",
-      "0",
       "--max-output-tokens",
       "131072",
       "--embedding-placement",
