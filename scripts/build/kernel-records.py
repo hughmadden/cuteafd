@@ -316,10 +316,8 @@ class Recorder:
             return function(*args, **kwargs)
         finally:
             reads = self.reads()
-            functions = [list(pair) for pair in sorted(self.functions)]
             for record in self.latest:
                 record["source_reads_sha256"].update(reads)
-                record["source_functions"] = functions
             self.construction = False
 
     def _audit(self, event, args):
@@ -400,7 +398,6 @@ class Recorder:
                 self.modules[id(module)] = {
                     "ir_kind": "original_mlir", "ir_sha256": digest(str(module).encode()),
                     "source_reads_sha256": self.reads(),
-                    "source_functions": [list(pair) for pair in sorted(self.functions)],
                 }
                 return result
             return wrapped
