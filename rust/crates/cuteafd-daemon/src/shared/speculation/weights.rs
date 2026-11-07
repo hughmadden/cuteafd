@@ -564,7 +564,14 @@ mod tests {
         for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
             for ranks in [1, 2] { for rank in 0..ranks {
                 let expected = gqa_arena_requests(&snapshot, representation, rank, ranks)?;
-                let run = |arena: Option<&DeviceWeightArena<'_>>| device.run(|| {
+                #[allow(clippy::too_many_arguments)]
+                fn run<'a>(device: Device<'a>, snapshot: &Path, cfg: &super::super::dflash::DflashConfig,
+                    rank: usize, ranks: usize, representation: GlmDraftRepresentation,
+                    expected: &[(String, usize)], arena: Option<&DeviceWeightArena<'a>>)
+                    -> Result<std::collections::BTreeMap<String, Weight<'a>>> {
+                    let library = device.library;
+                    let path = snapshot.join("model.safetensors");
+                    device.run(|| {
                     let requested = std::cell::RefCell::new(Vec::new());
                     let mut allocate = |id, name: &str, bytes| {
                         assert_eq!(id, device.id);
@@ -590,8 +597,10 @@ mod tests {
                     drop(allocate);
                     assert_eq!(requested.into_inner(), expected);
                     Ok(owners.into_inner())
-                });
-                let baseline = run(None)?;
+                    })
+                }
+                let load = |arena| run(device, &snapshot, &cfg, rank, ranks, representation, &expected, arena);
+                let baseline = load(None)?;
                 let digest = |owners: &std::collections::BTreeMap<String, Weight<'_>>| device.run(|| {
                     let mut bytes = std::collections::BTreeMap::new();
                     for (name, owner) in owners {
@@ -613,13 +622,13 @@ mod tests {
                 for recorded in [false, true] {
                     let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/draft", expected.clone())?)?;
                     let owners = if recorded {
-                        let (owners, records) = dense::recording(|| run(Some(&arena)))?;
+                        let (owners, records) = dense::recording(|| load(Some(&arena)))?;
                         assert!(!records.operands.is_empty());
                         let sockets = tempfile::tempdir_in(fixture.directory())?;
                         crate::shared::experts::rtx::push::tests::receive_pushed(device, None, root.path(), sockets.path(),
                             &records, None, 6, 1)?;
                         owners
-                    } else { run(Some(&arena))? };
+                    } else { load(Some(&arena))? };
                     drop(arena);
                     assert_eq!(digest(&owners)?, baseline_bytes, "{representation:?} TP{ranks} rank{rank} record={recorded}");
                     let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?, "draft",
