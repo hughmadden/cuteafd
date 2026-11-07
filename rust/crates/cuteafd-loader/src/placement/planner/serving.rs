@@ -6,6 +6,8 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct BlasOwners {
     pub name: String,
+    /// Retained libraries are process-local; a remote media worker is not the coordinator.
+    pub process: String,
     pub location: Location,
     pub cublas_handles: u64,
     pub lt_handles: u64,
@@ -13,50 +15,69 @@ pub struct BlasOwners {
     pub activation: Activation,
 }
 
-/// SM120/driver 13020, 2026-11-07: four retained handles on each PRO 6000;
-/// first SGEMM added zero. Lt alone and beside BLAS added no per-handle bytes
-/// through heuristic selection and BF16 M16/K4096/N4096 (explicit 4 MiB scratch).
-/// Both APIs share one 2 MiB initialization per device, not per handle group.
+/// SM120/driver 13020: 64 MiB/cuBLAS handle, shared 2 MiB initialization;
+/// first SGEMM and representative Lt plans add zero (explicit 4 MiB scratch).
+/// SM121/driver 13020, LAZY: four warmed handles average 67,508,224 B;
+/// destroying the warm handle leaves 158,674,944 B. First Lt planning beside
+/// BLAS adds 201,461,760 B, later creates/plans zero. These are separate
+/// process-local owners, not a padded per-handle price. Probe: 2026-11-07,
+/// BF16 M16/K4096/N4096. SM121 Lt-only processes need a separate qualification.
 pub fn blas_components(arch: &str, owners: &[BlasOwners], maximum: u64,
     order: PhaseOrder) -> Result<Vec<Component>, Refusal> {
-    if maximum == 0 || arch != "sm_120" {
-        return Err(Refusal::InvalidFact(format!("unmeasured BLAS owner architecture {arch}")));
-    }
+    let per_handle = match arch {
+        "sm_120" => 64 << 20,
+        "sm_121" => 67_508_224,
+        _ => return Err(Refusal::InvalidFact(format!("unmeasured BLAS owner architecture {arch}"))),
+    };
+    if maximum == 0 { return Err(Refusal::InvalidFact("empty BLAS owner pool domain".into())); }
     let mut names = BTreeSet::new();
     let mut out = Vec::new();
     for owner in owners {
-        if owner.name.is_empty() || !names.insert((owner.location, owner.name.as_str()))
-            || !matches!(owner.location.device, Device::Coordinator(_))
-            || owner.location.domain != Domain::Device
-            || !order.at_or_before(owner.lifetime.first, owner.lifetime.last)
+        let device_matches = match arch {
+            "sm_120" => matches!(owner.location, Location { device: Device::Coordinator(_), domain: Domain::Device }),
+            _ => matches!(owner.location, Location { device: Device::Spark(_), domain: Domain::Managed }),
+        };
+        if owner.name.is_empty() || owner.process.is_empty()
+            || !names.insert((owner.location, owner.process.as_str(), owner.name.as_str()))
+            || !device_matches || !order.at_or_before(owner.lifetime.first, owner.lifetime.last)
         {
             return Err(Refusal::InvalidFact("invalid retained BLAS owner".into()));
         }
-        let bytes = owner.cublas_handles.checked_mul(64 << 20)
+        if arch == "sm_121" && owner.lt_handles > 0 && owner.cublas_handles == 0 {
+            return Err(Refusal::InvalidFact("SM121 Lt-only process lacks a qualified first-use owner (#1463)".into()));
+        }
+        let bytes = owner.cublas_handles.checked_mul(per_handle)
             .ok_or(Refusal::Overflow("retained cuBLAS handles"))?;
         if bytes > 0 {
             out.push(Component { activation: owner.activation.clone(), bytes: ByteCurve::fixed(bytes, maximum),
                 kind: ComponentKind::Allowance(Allowance { location: owner.location, bytes,
                     lifetime: owner.lifetime, assumed: false,
-                    source: format!("cuBLAS handles: {} ({} x 64 MiB, SM120 driver13020, 2026-11-07)",
-                        owner.name, owner.cublas_handles) }) });
+                    source: format!("cuBLAS handles: {} ({} x {per_handle} B, {arch} driver13020, 2026-11-07, process {})",
+                        owner.name, owner.cublas_handles, owner.process) }) });
         }
     }
-    for location in owners.iter().map(|owner| owner.location).collect::<BTreeSet<_>>() {
-        for &phase in order.phases() {
-            // Initialization remains resident once either library has been used.
-            // Union the active groups: target/draft/media never pay it twice.
-            let clauses = owners.iter().filter(|owner| owner.location == location
-                && (owner.cublas_handles > 0 || owner.lt_handles > 0)
-                && order.at_or_before(owner.lifetime.first, phase))
-                .flat_map(|owner| owner.activation.clauses.iter().cloned()).collect::<BTreeSet<_>>();
-            if !clauses.is_empty() {
-                let bytes = 2 << 20;
-                out.push(Component { activation: Activation { clauses: clauses.into_iter().collect() },
-                    bytes: ByteCurve::fixed(bytes, maximum),
-                    kind: ComponentKind::Allowance(Allowance { location, bytes,
-                        lifetime: Lifetime { first: phase, last: phase }, assumed: false,
-                        source: "BLAS device initialization (cuBLAS/cuBLASLt shared, SM120 driver13020, 2026-11-07)".into() }) });
+    let initialization = if arch == "sm_120" {
+        vec![("BLAS device initialization (cuBLAS/cuBLASLt shared)", 2 << 20, false)]
+    } else {
+        vec![("cuBLAS first use", 158_674_944, false), ("cuBLASLt first plan", 201_461_760, true)]
+    };
+    for (location, process) in owners.iter().map(|owner| (owner.location, owner.process.as_str()))
+        .collect::<BTreeSet<_>>() {
+        for &(source, bytes, lt_only) in &initialization {
+            for &phase in order.phases() {
+                // Library residency survives handle destruction. Union selected
+                // triggers per process/context; independent workers pay separately.
+                let clauses = owners.iter().filter(|owner| owner.location == location && owner.process == process
+                    && if lt_only { owner.lt_handles > 0 } else { owner.cublas_handles > 0 || owner.lt_handles > 0 })
+                    .filter(|owner| order.at_or_before(owner.lifetime.first, phase))
+                    .flat_map(|owner| owner.activation.clauses.iter().cloned()).collect::<BTreeSet<_>>();
+                if !clauses.is_empty() {
+                    out.push(Component { activation: Activation { clauses: clauses.into_iter().collect() },
+                        bytes: ByteCurve::fixed(bytes, maximum),
+                        kind: ComponentKind::Allowance(Allowance { location, bytes,
+                            lifetime: Lifetime { first: phase, last: phase }, assumed: false,
+                            source: format!("{source} ({arch} driver13020, LAZY, 2026-11-07, process {process})") }) });
+                }
             }
         }
     }
@@ -162,13 +183,13 @@ mod tests {
     #[test]
     fn blas_counts_and_phase_activation_share_initialization_without_workspace_overlap() {
         let order = PhaseOrder::TARGET_THEN_DRAFT;
-        let target = BlasOwners { name: "target".into(), location: Location::coordinator(0),
+        let target = BlasOwners { name: "target".into(), process: "coordinator".into(), location: Location::coordinator(0),
             cublas_handles: 2, lt_handles: 2, lifetime: Lifetime::TARGET,
             activation: Activation::always() };
         let draft = BlasOwners { name: "draft".into(), cublas_handles: 1, lt_handles: 1,
             lifetime: Lifetime { first: Phase::Warmup, last: Phase::Ready },
             activation: Activation::choice(0, 1), ..target.clone() };
-        let lt = BlasOwners { name: "media Lt".into(), location: Location::coordinator(1),
+        let lt = BlasOwners { name: "media Lt".into(), process: "coordinator".into(), location: Location::coordinator(1),
             cublas_handles: 0, lt_handles: 4, lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
             activation: Activation::choice(0, 1) };
         let owners = [target.clone(), draft, lt];
@@ -195,9 +216,56 @@ mod tests {
             }
             assert!(facts.allocations.is_empty(), "explicit Lt scratch must not be invented");
         }
-        assert!(blas_components("sm_121", &owners, 1, order).is_err());
+        assert!(blas_components("sm_90", &owners, 1, order).is_err());
+        assert!(blas_components("sm_121", &owners, 1, order).is_err(), "coordinator locations cannot use Spark prices");
         assert!(blas_components("sm_120", &[target.clone(), target.clone()], 1, order).is_err());
         assert!(blas_components("sm_120", &[BlasOwners { cublas_handles: u64::MAX, ..target }], 1, order).is_err());
+    }
+
+    #[test]
+    fn spark_blas_separates_retained_storage_process_first_use_and_lt_first_plan() {
+        let order = PhaseOrder::DRAFT_THEN_TARGET;
+        let location = Location { device: Device::Spark(0), domain: Domain::Managed };
+        let media = BlasOwners { name: "vision".into(), process: "media worker".into(), location,
+            cublas_handles: 1, lt_handles: 0,
+            lifetime: Lifetime { first: Phase::Load, last: Phase::Load }, activation: Activation::always() };
+        let target = BlasOwners { name: "target".into(), process: "expert worker".into(), location,
+            cublas_handles: 2, lt_handles: 0, lifetime: Lifetime::TARGET, activation: Activation::always() };
+        let draft = BlasOwners { name: "draft head".into(), cublas_handles: 1, lt_handles: 1,
+            lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Ready },
+            activation: Activation::choice(0, 1), ..target.clone() };
+        let owners = [media.clone(), target.clone(), draft];
+        let empty = Facts { phase_order: order, allocations: vec![], deferred: vec![],
+            sequential: vec![], reservations: vec![], allowances: vec![],
+            resident_weights: vec![], driver_page_tables: vec![] };
+        let mut contract = Contract::fixed(64, 1, 1, empty);
+        contract.variables = vec![Variable::Encoder(vec![0, 1]),
+            Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+        contract.components = blas_components("sm_121", &owners, 1, order).unwrap();
+        for selected in [0, 1] {
+            let facts = contract.facts(&[selected, 0, 0], 1).unwrap();
+            for &phase in order.phases() {
+                let active: Vec<_> = facts.allowances.iter().filter(|owner| owner.lifetime.contains(phase, order)).collect();
+                let handles = active.iter().filter(|owner| owner.source.starts_with("cuBLAS handles:"))
+                    .map(|owner| owner.bytes).sum::<u64>();
+                let draft_used = selected == 1 && order.at_or_before(Phase::DraftLoad, phase);
+                let target_used = order.at_or_before(Phase::PostTargetKv, phase);
+                assert_eq!(handles, 67_508_224 * (u64::from(phase == Phase::Load)
+                    + 2 * u64::from(target_used) + u64::from(draft_used && phase != Phase::Growth)));
+                let first_use = active.iter().filter(|owner| owner.source.starts_with("cuBLAS first use"))
+                    .map(|owner| owner.bytes).sum::<u64>();
+                assert_eq!(first_use, 158_674_944 * (1 + u64::from(draft_used || target_used)),
+                    "one first-use owner per process, persisting after media handle destruction");
+                let first_plan = active.iter().filter(|owner| owner.source.starts_with("cuBLASLt first plan"))
+                    .map(|owner| owner.bytes).sum::<u64>();
+                assert_eq!(first_plan, if draft_used { 201_461_760 } else { 0 });
+                assert!(active.iter().all(|owner| !owner.assumed));
+            }
+            assert!(facts.allocations.is_empty(), "caller-owned Lt scratch stays disjoint");
+        }
+        let lt_only = BlasOwners { lt_handles: 1, cublas_handles: 0, ..media.clone() };
+        assert!(blas_components("sm_121", &[lt_only], 1, order).is_err());
+        assert!(blas_components("sm_121", &[BlasOwners { process: String::new(), ..media }], 1, order).is_err());
     }
 
     #[test]

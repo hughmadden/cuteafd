@@ -502,7 +502,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     // native/core head routes; prefill lanes share one Temporaries. Shared replay
     // constructs them before target KV, otherwise serving warm-up does.
     let mut blas = vec![p::serving::BlasOwners {
-        name: "GLM Flash target decode and shared prefill heads".into(),
+        name: "GLM Flash target decode and shared prefill heads".into(), process: "coordinator".into(),
         location: p::Location::coordinator(0), cublas_handles: 2, lt_handles: 2,
         lifetime: p::Lifetime { first: if i.shared_replay { p::Phase::PostTargetKv } else { p::Phase::Warmup },
             last: p::Phase::Growth }, activation: p::Activation::always(),
@@ -554,7 +554,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             let activation = p::Activation::choice(variable, option);
             for (copy, location) in locations.iter().copied().enumerate() {
                 if matches!(location.device, p::Device::Coordinator(_)) {
-                    blas.push(p::serving::BlasOwners { name: format!("GLM Flash vision {option}.{copy}"),
+                    blas.push(p::serving::BlasOwners { name: format!("GLM Flash vision {option}.{copy}"), process: "coordinator".into(),
                         location, cublas_handles: 1, lt_handles: 0, lifetime: p::Lifetime::RESIDENT,
                         activation: activation.clone() });
                 }
@@ -635,7 +635,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             let prefix = if rank == 0 { "glmf.draft" } else { "glmf.draft.peer" };
             let location = p::Location::coordinator(rank as u8);
             if layout.owners().iter().any(|owner| owner.id == "workspace.head") {
-                blas.push(p::serving::BlasOwners { name: "GLM Flash TP2 DFlash head".into(),
+                blas.push(p::serving::BlasOwners { name: "GLM Flash TP2 DFlash head".into(), process: "coordinator".into(),
                     location, cublas_handles: 1, lt_handles: 1,
                     lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
                     activation: p::Activation::always() });
@@ -736,7 +736,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         let (draft_variable, draft_homes) = (variable, homes.clone());
         for (option, gpu) in homes.into_iter().enumerate() {
             let activation = p::Activation::choice(variable, option);
-            blas.push(p::serving::BlasOwners { name: "GLM Flash drafter vocabulary head".into(),
+            blas.push(p::serving::BlasOwners { name: "GLM Flash drafter vocabulary head".into(), process: "coordinator".into(),
                 location: p::Location::coordinator(gpu), cublas_handles: 1, lt_handles: 1,
                 lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
                 activation: activation.clone() });
@@ -745,7 +745,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             add_demand(&mut contract, &Demand::new(gpu, Category::Workspace, "DFlash linear/attention scratch", i.drafter_scratch[usize::from(gpu)],
                 Basis::Formula), format!("glmf.draft.scratch.{gpu}"), activation.clone())?;
             if gpu != 0 {
-                blas.push(p::serving::BlasOwners { name: "GLM Flash remote drafter bridge head".into(),
+                blas.push(p::serving::BlasOwners { name: "GLM Flash remote drafter bridge head".into(), process: "coordinator".into(),
                     location: p::Location::coordinator(0), cublas_handles: 1, lt_handles: 1,
                     lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
                     activation: activation.clone() });
