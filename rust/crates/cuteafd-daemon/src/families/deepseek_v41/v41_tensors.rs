@@ -51,12 +51,16 @@ impl<'a> NativeRtxTensors<'a> {
     /// Target and dSpark borrow the same immutable table on both CED devices.
     pub fn load_embedding(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         placement: crate::shared::memory::EmbedPlacement) -> Result<Self> {
+        Self::load_embedding_in(library, catalog, placement, None)
+    }
+    pub fn load_embedding_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        placement: crate::shared::memory::EmbedPlacement, arena: Option<&DeviceWeightArena<'a>>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("embedding");
         let names = ["embed.weight".to_owned()];
         let bytes = Self::plan(catalog, &names)?;
         if placement == crate::shared::memory::EmbedPlacement::Gpu {
             tracing::info!(?placement, device_bytes=bytes, pinned_bytes=0, "V4.1 embedding placement (single residency, RTX0 only)");
-            return Self::load(library, catalog, &names, bytes, 16 << 20);
+            return Self::load_in(library, catalog, &names, bytes, 16 << 20, arena);
         }
         cuteafd_loader::plan::checkpoint::Checkpoint::open(catalog.snapshot())?
             .require_untied_embedding("embed.weight")?;
@@ -199,10 +203,17 @@ pub(crate) struct HeadScratch<'a> {
 /// drains quarantine both formats and the native module until process teardown.
 fn pack_fp8<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize)
     -> Result<(Option<DeviceAllocation<'a>>, crate::shared::fp8_linear::Fp8Weight<'a>)> {
+    pack_fp8_in(library, weight, rows, None)
+}
+fn pack_fp8_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize,
+    arena: Option<&DeviceWeightArena<'a>>)
+    -> Result<(Option<DeviceAllocation<'a>>, crate::shared::fp8_linear::Fp8Weight<'a>)> {
     ensure!(weight.buffer.bytes == rows * 10240, "FP8 head geometry differs from BF16");
     let stream = library.cuda_stream_create()?;
-    let packed = crate::shared::fp8_linear::Fp8Weight::pack(library, weight.buffer.ptr, rows, 5120,
-        crate::shared::fp8_linear::Fp8Scales::Best, stream);
+    let device = Device { library, id: library.cuda_get_device()? };
+    let packed = crate::shared::fp8_linear::Fp8Weight::pack_with(library, weight.buffer.ptr, rows, 5120,
+        crate::shared::fp8_linear::Fp8Scales::Best, stream, "head.fp8",
+        |name, bytes| weight_allocation(device, arena, name, bytes));
     // SAFETY: source and packed destinations remain owned until the pack drains.
     if let Err(error) = unsafe { library.cuda_stream_synchronize(stream) } {
         library.quarantine_module_after_failed_drain();
@@ -340,7 +351,11 @@ impl<'library> VocabularyHead<'library> {
         budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
-        Ok(Self { shard: VocabularyShard::load(library, catalog, 0..129280, budget, staging_bytes)? })
+        Self::load_in(library, catalog, budget, staging_bytes, None)
+    }
+    pub fn load_in(library: &'library NativeLibrary, catalog: &OfficialV41Catalog,
+        budget: usize, staging_bytes: usize, arena: Option<&DeviceWeightArena<'library>>) -> Result<Self> {
+        Ok(Self { shard: VocabularyShard::load_in(library, catalog, 0..129280, budget, staging_bytes, arena)? })
     }
     pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.shard.weight() }
     pub fn device_id(&self) -> i32 { self.shard.device_id() }
