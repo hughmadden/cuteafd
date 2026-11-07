@@ -179,6 +179,16 @@ pub(crate) struct Weights<'a> {
     matrices: [Matrix<'a>; 3],
 }
 impl<'a> Weights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (stem, matrix) in ["w1", "w3", "w2"].into_iter().zip(&self.matrices) {
+            let name = format!("layers.{}.ffn.shared_experts.{stem}.weight", self.layer);
+            matrix.weight.inventory(inventory, &name)?;
+            matrix.scales.inventory(inventory,
+                &crate::families::deepseek_v41::weight_layout::packed_scale_name(&name))?;
+            if let Some(raw) = &matrix.source_scales { raw.inventory(inventory, &format!("{name}.transient_scales"))?; }
+        }
+        Ok(())
+    }
     pub fn device(&self) -> Device<'a> { self.device }
     /// Frees raw scales kept for a recorded scale pack (after it ran).
     pub fn release_raw_scales(&mut self) { for m in &mut self.matrices { drop(m.source_scales.take()); } }

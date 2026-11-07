@@ -226,6 +226,12 @@ pub(crate) struct CacheProducerWeights<'a> {
     placement: Option<CachePlacement>,
 }
 impl<'a> CacheProducerWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for window in &self.windows { window.inventory(inventory)?; }
+        for source in &self.sources { source.inventory(inventory)?; }
+        for sinks in &self._sinks { sinks.inventory(inventory)?; }
+        Ok(())
+    }
     fn sinks() -> Vec<String> {
         (0..40)
             .map(|layer| format!("layers.{layer}.attn.attn_sink"))

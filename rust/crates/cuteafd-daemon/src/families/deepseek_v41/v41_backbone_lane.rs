@@ -37,6 +37,16 @@ pub(crate) struct BackboneLaneWeights<'a> {
     split_output_b: bool,
 }
 impl<'a> BackboneLaneWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for layer in &self.layers {
+            layer.hc.inventory(inventory)?;
+            layer.query.inventory(inventory)?;
+            layer.projection.inventory(inventory)?;
+            if let Some(shared) = &layer.shared { shared.inventory(inventory)?; }
+            layer.router.inventory(inventory)?;
+        }
+        Ok(())
+    }
     fn layer_bytes(
         library: &NativeLibrary,
         catalog: &OfficialV41Catalog,

@@ -10,6 +10,10 @@ pub(crate) struct PlacedEngramWeights<'a> {
     weights: [DeviceOwner<'a, EngramLayerWeights<'a>>; 2],
 }
 impl<'a> PlacedEngramWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for weights in &self.weights { weights.inventory(inventory)?; }
+        Ok(())
+    }
     pub fn device_bytes(
         library: &NativeLibrary,
         catalog: &OfficialV41Catalog,

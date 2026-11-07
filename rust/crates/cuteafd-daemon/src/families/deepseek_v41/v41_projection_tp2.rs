@@ -25,6 +25,11 @@ pub(crate) struct Weights<'a> {
     scales: Allocation<'a>,
 }
 impl<'a> Weights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        let name = format!("layers.{}.attn.{}.weight", self.layer, self.kind.name());
+        self.weight.inventory(inventory, &name)?;
+        self.scales.inventory(inventory, &super::weight_layout::packed_scale_name(&name))
+    }
     pub fn device_bytes(kind: Kind) -> usize {
         let (k,n)=kind.geometry(); k*(n/2) + k*(n/2)/32
     }

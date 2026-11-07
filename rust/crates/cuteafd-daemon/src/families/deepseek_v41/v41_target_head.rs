@@ -38,6 +38,9 @@ pub(crate) struct TargetHeadWeights<'a> {
     norm: NativeRtxTensors<'a>,
 }
 impl<'a> TargetHeadWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.norm.inventory(inventory)
+    }
     pub fn device_bytes(catalog: &OfficialV41Catalog) -> Result<usize> {
         let bytes = NativeRtxTensors::plan(catalog, &["norm.weight".into()])?;
         ensure!(bytes == 10240, "unexpected target norm geometry");

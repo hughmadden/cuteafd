@@ -21,6 +21,11 @@ pub(crate) struct EngramLayerWeights<'a> {
     names: [String; 4],
 }
 impl<'a> EngramLayerWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        self.packed_scales.inventory(inventory,
+            &crate::families::deepseek_v41::weight_layout::packed_scale_name(&self.names[0]))
+    }
     pub fn device_bytes(library:&NativeLibrary,catalog:&OfficialV41Catalog,layer_index:usize)->Result<usize> {
         let layer=*cuteafd_core::ENGRAM_LAYERS.get(layer_index).context("invalid engram layer index")?;
         let names=["wkv.weight","wkv.scale","q_weight","k_weight"].map(|suffix| format!("layers.{layer}.engram.{suffix}"));
