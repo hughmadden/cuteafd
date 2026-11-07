@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn gqa_final_arena_planes_match_standalone_mount_and_record_bytes() -> Result<()> {
         use crate::shared::memory::{weight_arena::{DeviceWeightArena, weight_allocation}, receipts::Inventory};
-        use cuteafd_loader::{serving_capacity::weight_storage::WeightArenaLayout,
+        use cuteafd_loader::{serving_capacity::WeightArenaLayout,
             families::glm5::draft_representation::GlmDraftRepresentation,
             placement::planner::{CoordinatorDevices, Lifetime, Phase}};
         use cuteafd_core::memory_layout::Category;
