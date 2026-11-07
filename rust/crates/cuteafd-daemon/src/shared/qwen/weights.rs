@@ -96,14 +96,27 @@ impl<'a> WeightReader<'a> {
     }
 
     pub(crate) fn upload(&self, bytes: &[u8]) -> Result<Allocation<'a>> {
+        self.upload_with("upload", bytes, |_, bytes| Allocation::new(
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+    }
+
+    pub(crate) fn upload_with(&self, name: &str, bytes: &[u8],
+        allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Allocation<'a>> {
         let device = Device { library: self.library, id: self.library.cuda_get_device()? };
-        let allocation = Allocation::new(device, bytes.len().max(256))?;
+        let allocation = crate::shared::memory::weight_arena::checked_weight_allocation(
+            device, name, bytes.len().max(256), allocate)?;
         self.library.copy_h2d(allocation.buffer, bytes)?;
         Ok(allocation)
     }
 
     /// Native checkpoint bytes, concatenated without changing element precision.
     pub(crate) fn native(&self, names: &[String], widen_bf16: bool) -> Result<Allocation<'a>> {
+        self.native_with(&names.join("+"), names, widen_bf16, |_, bytes| Allocation::new(
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+    }
+
+    pub(crate) fn native_with(&self, name: &str, names: &[String], widen_bf16: bool,
+        allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Allocation<'a>> {
         use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
         let device = Device { library: self.library, id: self.library.cuda_get_device()? };
         let mut bytes = 0usize;
@@ -129,7 +142,8 @@ impl<'a> WeightReader<'a> {
             Ok((rect, offset, widen))
         }).collect::<Result<Vec<_>>>()?;
         ensure!(bytes > 0, "empty Qwen native operand");
-        let out = Allocation::new(device, bytes.max(256))?;
+        let out = crate::shared::memory::weight_arena::checked_weight_allocation(
+            device, name, bytes.max(256), allocate)?;
         let load = DenseLoad::mount(self.library);
         for (rect, offset, widen) in sources {
             if !widen {
@@ -155,13 +169,25 @@ impl<'a> WeightReader<'a> {
     }
 
     pub(crate) fn bf16(&self, name: &str) -> Result<Allocation<'a>> {
+        self.bf16_with(name, name, |_, bytes| Allocation::new(
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+    }
+
+    pub(crate) fn bf16_with(&self, name: &str, source: &str,
+        allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Allocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-        ensure!(self.tensor(name)?.meta.dtype == DType::Bf16, "{name}: expected BF16");
-        self.native(&[name.into()], false)
+        ensure!(self.tensor(source)?.meta.dtype == DType::Bf16, "{source}: expected BF16");
+        self.native_with(name, &[source.into()], false, allocate)
     }
 
     /// Concatenate BF16 matrices in source order, retaining zero padded rows.
     pub(crate) fn rows(&self, names: &[String], pad_rows: usize) -> Result<Allocation<'a>> {
+        self.rows_with(&names.join("+"), names, pad_rows, |_, bytes| Allocation::new(
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+    }
+
+    pub(crate) fn rows_with(&self, name: &str, names: &[String], pad_rows: usize,
+        allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Allocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         use crate::shared::experts::rtx::dense::{DenseLoad, Operand, Rect};
         let mut cols = None;
@@ -185,7 +211,8 @@ impl<'a> WeightReader<'a> {
             .and_then(|n| n.checked_mul(2)).context("Qwen row padding overflow")?)
             .context("Qwen padded operand overflow")?;
         let device = Device { library: self.library, id: self.library.cuda_get_device()? };
-        let out = Allocation::new(device, padded)?;
+        let out = crate::shared::memory::weight_arena::checked_weight_allocation(
+            device, name, padded, allocate)?;
         self.library.cuda_zero_bytes(out.buffer, out.buffer.bytes)?;
         DenseLoad::mount(self.library).operand(Operand { device: device.id,
             buffer: out.buffer, lands, bytes: padded })?;
@@ -194,8 +221,14 @@ impl<'a> WeightReader<'a> {
 
     /// Native FP32 values stay byte-identical; BF16 values widen exactly.
     pub(crate) fn f32(&self, name: &str) -> Result<Allocation<'a>> {
+        self.f32_with(name, name, |_, bytes| Allocation::new(
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+    }
+
+    pub(crate) fn f32_with(&self, name: &str, source: &str,
+        allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Allocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("f32");
-        self.native(&[name.into()], true)
+        self.native_with(name, &[source.into()], true, allocate)
     }
 }
 
@@ -260,6 +293,71 @@ mod tests {
         widened.extend_from_slice(&raw_f32);
         assert_eq!(&read(&actual[2])?[..24], widened);
         assert_eq!(&read(&actual[4])?[24..36], [0; 12]);
+        Ok(())
+    }
+
+    #[test]
+    fn named_arena_hooks_preserve_qwen_mount_and_record_bytes() -> Result<()> {
+        use crate::shared::{experts::rtx::dense::{recording, testing, RankLayout},
+            memory::{weight_arena::DeviceWeightArena, receipts::Inventory}};
+        use cuteafd_loader::{plan::testing::{t, write_snapshot}, serving_capacity::WeightArenaLayout,
+            placement::planner::{CoordinatorDevices, Lifetime, Phase}};
+        use cuteafd_core::memory_layout::Category;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 1 };
+        let root = tempfile::tempdir_in(fixture.directory())?;
+        write_snapshot(root.path(), &serde_json::json!({}), &[t("bf16", "BF16", &[2, 3]),
+            t("fp8", "F8_E4M3", &[2, 3]), t("scale", "F32", &[1, 3])], None);
+        let checkpoint = Checkpoint::open(root.path())?;
+        for tensor in &checkpoint.tensors {
+            let data: Vec<_> = (0..tensor.meta.byte_length).map(|i| (i as u8).wrapping_mul(29).wrapping_add(7)).collect();
+            std::fs::File::options().write(true).open(root.path().join(&tensor.shard))?
+                .write_all_at(&data, tensor.meta.byte_offset)?;
+        }
+        let reader = WeightReader { library: &library, checkpoint: &checkpoint };
+        let expected = vec![("bf", 256), ("native", 256), ("float", 256), ("rows", 36), ("constant", 256)]
+            .into_iter().map(|(n,b)| (n.to_string(),b)).collect::<Vec<_>>();
+        fn load<'a>(reader: &WeightReader<'a>, arena: Option<&DeviceWeightArena<'a>>)
+            -> Result<Vec<Allocation<'a>>> {
+            let device = Device { library: reader.library, id: reader.library.cuda_get_device()? };
+            let mut allocate = |name: &str, bytes| crate::shared::memory::weight_arena::weight_allocation(device, arena, name, bytes);
+            Ok(vec![reader.bf16_with("bf", "bf16", &mut allocate)?,
+                reader.native_with("native", &["fp8".into()], false, &mut allocate)?,
+                reader.f32_with("float", "bf16", &mut allocate)?,
+                reader.rows_with("rows", &["bf16".into(), "bf16".into()], 2, &mut allocate)?,
+                reader.upload_with("constant", &[9, 8, 7, 6], &mut allocate)?])
+        }
+        let baseline = device.run(|| load(&reader, None))?;
+        for recorded in [false, true] {
+            let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/qwen", expected.clone())?)?;
+            let owners = device.run(|| {
+                if recorded {
+                    let (owners, records) = recording(|| load(&reader, Some(&arena)))?;
+                    testing::replay(device, RankLayout::new(records.operands, records.steps, 0)?, root.path(), 1, 0)?;
+                    Ok(owners)
+                } else { load(&reader, Some(&arena)) }
+            })?;
+            drop(arena);
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?, "qwen",
+                Lifetime { first: Phase::Load, last: Phase::Growth }, Category::Weights, "qwen weights");
+            for (index, owner) in owners.iter().enumerate() {
+                owner.inventory(&mut inventory, &expected[index].0)?;
+                let bytes = [12, 6, 24, 36, 4][index];
+                let mut actual = vec![0; bytes]; let mut wanted = vec![0; bytes];
+                device.run(|| { library.copy_d2h(&mut actual, CuteafdDeviceBuffer { bytes, ..owner.buffer })?;
+                    library.copy_d2h(&mut wanted, CuteafdDeviceBuffer { bytes, ..baseline[index].buffer }) })?;
+                assert_eq!(actual, wanted, "{} recorded={recorded}", expected[index].0);
+            }
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 5);
+        }
+        device.run(|| {
+            assert!(reader.upload_with("bad", &[1], |_, bytes| Allocation::new(device, bytes + 1)).is_err());
+            Ok(())
+        })?;
         Ok(())
     }
 

@@ -41,6 +41,19 @@ pub(crate) fn weight_allocation<'a>(device: Device<'a>, arena: Option<&DeviceWei
     }
 }
 
+/// Injection changes storage only, never device scope or the admitted extent.
+pub(crate) fn checked_weight_allocation<'a>(device: Device<'a>, name: &str, bytes: usize,
+    mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Allocation<'a>> {
+    ensure!(!name.is_empty() && bytes > 0, "empty named weight allocation");
+    let previous = device.library.cuda_get_device()?;
+    let owner = allocate(name, bytes)?;
+    ensure!(device.library.cuda_get_device()? == previous && owner.device.id == device.id
+        && owner.buffer.device_id == device.id && std::ptr::eq(owner.device.library, device.library)
+        && owner.buffer.bytes == bytes && !owner.buffer.ptr.is_null(),
+        "weight allocation differs from {}:{name}/{bytes}", device.id);
+    Ok(owner)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ArenaLayout {
     regions: Vec<Range<usize>>,

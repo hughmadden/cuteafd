@@ -409,6 +409,16 @@ int cuteafd_fp8_w8a16_pack(const void *source, void *packed, void *scale,
     return fixture_fp8_w8a16_pack(source, packed, scale, n, k, rule);
 }
 
+int fixture_packed_head_pack(const void *source, void *const *planes,
+                             int64_t capacity, int n, int k, void *status);
+int cuteafd_packed_head_pack(const void *source, void *const *planes,
+                             int64_t capacity, int n, int k, void *status, void *stream) {
+    (void)stream;
+    event('P');
+    if (pack_status || !immediate_copies || extent_only) return pack_status;
+    return fixture_packed_head_pack(source, planes, capacity, n, k, status);
+}
+
 struct upload { void *dst; const void *src; size_t bytes; void *stream; };
 struct upload_event { struct upload *copies; size_t count, fence; void *stream; };
 static pthread_mutex_t upload_mutex = PTHREAD_MUTEX_INITIALIZER;

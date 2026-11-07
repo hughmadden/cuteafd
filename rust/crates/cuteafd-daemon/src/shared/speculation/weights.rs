@@ -132,7 +132,7 @@ impl<'a, 'b> Load<'a, 'b> {
         self
     }
 
-    fn allocation(&self, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+    pub(crate) fn allocation(&self, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
         if let Some(allocate) = &self.allocate {
             checked_allocation(self.library, name, bytes, &mut **allocate.borrow_mut())
         } else {

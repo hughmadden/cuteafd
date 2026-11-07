@@ -238,3 +238,52 @@ extern "C" uint64_t cuteafd_glm_dflash_attention_workspace_d64(int32_t sequences
   return fixture_draft_attention(sequences, kv_heads, max_keys, 64);
 }
 extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) { return uint64_t(rows) * 64 * 16 * 8; }
+
+// Independent sequential implementation of the exact packed-head planes.
+extern "C" int fixture_packed_head_pack(const void* source, void* const* planes,
+                                         int64_t capacity, int n, int k, void* status) {
+  if (!source || !planes || !status || n <= 0 || n % 16 || k <= 0 || k % 128 || capacity < 0) return 1;
+  const auto* w = static_cast<const uint16_t*>(source);
+  auto* coarse = static_cast<uint8_t*>(planes[0]);
+  auto* fine = static_cast<uint32_t*>(planes[1]);
+  auto* bases = static_cast<uint8_t*>(planes[2]);
+  auto* row_ptr = static_cast<uint32_t*>(planes[3]);
+  auto* columns = static_cast<uint32_t*>(planes[4]);
+  auto* values = static_cast<uint16_t*>(planes[5]);
+  auto* words = static_cast<uint64_t*>(status);
+  memset(fine, 0, size_t(n) * k / 2);
+  words[0] = words[1] = words[3] = 0; words[2] = UINT64_MAX;
+  row_ptr[0] = 0;
+  for (int r = 0; r < n; ++r) {
+    int histogram[256] = {}, best = -1, base = 0;
+    for (int c = 0; c < k; ++c) ++histogram[(w[size_t(r) * k + c] >> 7) & 255];
+    for (int e = 0; e <= 240; ++e) {
+      int count = 0;
+      for (int i = 0; i < 16; ++i) count += histogram[e + i];
+      if (count > best) { best = count; base = e; }
+    }
+    bases[r] = uint8_t(base);
+    uint64_t row_exceptions = 0;
+    for (int c = 0; c < k; ++c) {
+      const uint16_t bits = w[size_t(r) * k + c];
+      const int exponent = (bits >> 7) & 255;
+      uint16_t coded = bits;
+      if (exponent < base || exponent >= base + 16) {
+        coded = uint16_t((bits & 0x8000) | (exponent < base ? base << 7 : ((base + 15) << 7) | 127));
+        if (words[0] < uint64_t(capacity)) { columns[words[0]] = uint32_t(c); values[words[0]] = bits; }
+        ++words[0]; ++row_exceptions;
+      }
+      const int within = c & 7, j = ((c >> 3) & 1) * 2 + ((r >> 3) & 1);
+      const size_t lane = (r & 7) * 4 + (within >> 1);
+      const size_t index = ((size_t(r >> 4) * (k / 32) + (c >> 5)) * 32 + lane);
+      const int step = (c >> 4) & 1, h = within & 1;
+      coarse[index * 16 + step * 8 + j * 2 + h] = uint8_t(((coded >> 8) & 128)
+          | ((((coded >> 7) & 255) - base) << 3) | ((coded >> 4) & 7));
+      fine[index * 2 + step] |= uint32_t(coded & 15) << (4 * j + 16 * h);
+    }
+    row_ptr[r + 1] = uint32_t(words[0]);
+    words[3] = std::max(words[3], row_exceptions);
+  }
+  if (words[0] > uint64_t(capacity)) { words[1] = uint64_t(n); words[2] = 0; }
+  return 0;
+}
