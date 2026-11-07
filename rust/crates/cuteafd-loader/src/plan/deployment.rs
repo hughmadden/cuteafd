@@ -609,8 +609,9 @@ mod tests {
         options.peers.clear();
         report.experts.as_mut().unwrap().package = "dsv4p:exl3-k2".into();
         report.family = Some("deepseek_v4".into());
-        report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = 6144;
-        assert!(DeploymentSpec::from_report(&report, &options).is_err());
+        report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = 3072;
+        let error = DeploymentSpec::from_report(&report, &options).unwrap_err().to_string();
+        assert!(error.contains("explicit Spark topology requires native experts"), "{error}");
         options.spark_tp = None; options.spark_ep = None;
         assert_eq!(DeploymentSpec::from_report(&report, &options).unwrap().topology.wire,
             SparkWire::Canonical);
