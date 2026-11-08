@@ -31,6 +31,7 @@ import math
 import functools
 import itertools
 import hashlib
+from http.client import HTTPException
 import importlib.util
 import json
 import os
@@ -1213,7 +1214,7 @@ def spark_memory_phase(url, diagnostics, timeout=.5):
             return 'decode'
         active = telemetry('/v1/bench/status').get('active')
         return 'panel:' + str(active['panel']) if active else 'ready-idle'
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as error:
+    except (OSError, HTTPException, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as error:
         diagnostics.append(dict(status='unavailable', source='phase-classification',
                                 exception_type=type(error).__name__, error=str(error)))
         return 'unavailable'

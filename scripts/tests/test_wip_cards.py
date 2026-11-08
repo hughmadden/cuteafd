@@ -1,4 +1,5 @@
 import importlib.util
+from http.client import IncompleteRead
 import json
 import os
 import re
@@ -3429,14 +3430,15 @@ def test_spark_memory_phase_timeout_diagnostics(monkeypatch, endpoint):
 
 @pytest.mark.parametrize('endpoint', ['/v1/console/snapshot', '/v1/bench/status'])
 @pytest.mark.parametrize('boundary', ['ready', 'post-sweep'])
-def test_spark_memory_boundary_preserves_ready_on_timeout(entry, tmp_path, monkeypatch, endpoint, boundary):
+@pytest.mark.parametrize('error', [TimeoutError('timed out'), IncompleteRead(b'{', 20)])
+def test_spark_memory_boundary_preserves_ready_on_telemetry_failure(entry, tmp_path, monkeypatch, endpoint, boundary, error):
     job = cards.generate(entry, 'probe', dict(instance='boundary', slot='s'), tmp_path,
                          tmp_path / 'key', {}, {'memory'}, None, 1)
     monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
     def http(url, path, **kwargs):
         assert kwargs['timeout'] == 3.
         if path == endpoint:
-            raise TimeoutError('timed out')
+            raise error
         return {'g': {}}
     monkeypatch.setattr(cards, 'http', http)
     sampled = []
@@ -3458,7 +3460,7 @@ def test_spark_memory_boundary_preserves_ready_on_timeout(entry, tmp_path, monke
     evidence = json.loads((Path(job['state']) / f'memory-phase-{boundary}.json').read_text())
     assert evidence['ready'] is True and evidence['boundary'] == boundary
     assert evidence['phase'] == 'unavailable'
-    assert any(row.get('endpoint') == endpoint and row['exception_type'] == 'TimeoutError'
+    assert any(row.get('endpoint') == endpoint and row['exception_type'] == type(error).__name__
                for row in evidence['telemetry'])
     for rank in range(len(sampled)):
         row = json.loads((Path(job['state']) / f'memory-spark-rank{rank}-{boundary}.jsonl').read_text())
