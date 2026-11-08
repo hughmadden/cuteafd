@@ -798,6 +798,13 @@ mod tests {
                 let mut report = crate::plan::empty_report(&input, &crate::plan::PlanOptions::default()).unwrap();
                 let (layout, placement) = native_layout_with_metadata(&checkpoint, &options, 4, &manifest,
                     "k4", Some(&metadata), Some(attention), Some(&mut report)).unwrap();
+                // Scoring runs a prefill before Ready, so its lane owners are
+                // resident at Ready. Serving allocates them on the first live
+                // prefill and charges them post-Ready; the two views together
+                // hold every prefill owner exactly once.
+                let scoring_options = LayoutOptions { full_prefill_logits: true, ..options.clone() };
+                let (scoring, _) = native_layout_with_metadata(&checkpoint, &scoring_options, 4, &manifest,
+                    "k4", Some(&metadata), Some(attention), None).unwrap();
                 assert_eq!(layout.pool_tokens, 131072);
                 assert_eq!(placement.onboard_layers, 0);
                 assert_eq!(placement.attention_placement, attention);
@@ -821,12 +828,20 @@ mod tests {
                     let dense = DensePlan::for_rank_owned(&backbone, gpus, rank, &owners).unwrap();
                     let scratch = crate::families::glm5::native::scratch_layouts(&cfg, &backbone, &dense,
                         64, 1024, false).unwrap();
-                    let hooks = device.items.iter().filter(|item| item.group == "GLM target hooks")
-                        .map(|item| item.bytes).sum::<u64>();
-                    assert_eq!(hooks, crate::families::glm5::native::scratch_bytes(&scratch).unwrap());
-                    let shared_arenas = device.items.iter().filter(|item| item.group == "EXLR8 expert workspace")
-                        .map(|item| item.bytes).sum::<u64>();
-                    assert_eq!(shared_arenas, 2 * workspace.bytes as u64);
+                    let group = |layout: &MemoryLayout, group: &str| layout.devices[rank].items.iter()
+                        .filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
+                    let hooks = group(&layout, "GLM target hooks");
+                    let scoring_hooks = group(&scoring, "GLM target hooks");
+                    let decode = u64::try_from(scratch[0].bytes().unwrap()).unwrap();
+                    assert_eq!(hooks, decode);
+                    assert_eq!(scoring_hooks, crate::families::glm5::native::scratch_bytes(&scratch).unwrap());
+                    assert_eq!(scoring_hooks - hooks,
+                        u64::try_from(scratch[1].bytes().unwrap()).unwrap());
+                    let shared_arenas = group(&layout, "EXLR8 expert workspace");
+                    let scoring_arenas = group(&scoring, "EXLR8 expert workspace");
+                    assert_eq!(shared_arenas, workspace.bytes as u64);
+                    assert_eq!(scoring_arenas, 2 * workspace.bytes as u64);
+                    assert_eq!(scoring_arenas - shared_arenas, workspace.bytes as u64);
                     assert_eq!(device.items, placement.items[rank]);
                     assert!(device.used_bytes() <= device.capacity_bytes);
                 }
@@ -1037,17 +1052,33 @@ mod tests {
         let records = DenseRecord::inventory(dir.path()).unwrap();
         for gpus in 1..=2 {
             let options = native_fixture_options(gpus);
-            let (a16, _) = native_layout(&checkpoint, &options, 4, &manifest, "k4").unwrap();
-            let (a8, _) = native_layout(&checkpoint, &LayoutOptions {
-                exlr8_prefill_activations: PrefillActivations::A8, ..options }, 4, &manifest, "k4").unwrap();
+            let input = crate::plan::PlanInput::open(dir.path()).unwrap();
+            let plan = |options: &LayoutOptions| {
+                let mut report = crate::plan::empty_report(&input, &crate::plan::PlanOptions::default()).unwrap();
+                let (layout, _) = native_layout_with_metadata(&checkpoint, options, 4, &manifest, "k4",
+                    None, None, Some(&mut report)).unwrap();
+                (layout.pool_tokens, report.phase_ledger.unwrap())
+            };
+            let (pool16, a16) = plan(&options);
+            let (pool8, a8) = plan(&LayoutOptions {
+                exlr8_prefill_activations: PrefillActivations::A8, ..options });
+            // Serving allocates its prefill lanes on the first live request, so
+            // the A8 records appear in the post-ready growth row, once per GPU.
+            let growth = |ledger: &crate::plan::SolvedPhaseLedger, rank: usize| {
+                let budget = ledger.budgets.iter().find(|budget| budget.locations.contains(
+                    &crate::placement::planner::Location::coordinator(rank as u8))).unwrap();
+                let row = ledger.phases.iter().find(|row| row.budget == budget.id
+                    && row.phase == crate::placement::planner::Phase::Growth).unwrap();
+                row.owned + row.opaque
+            };
             for rank in 0..gpus {
                 let plan = DensePlan::for_rank(&records, gpus, rank).unwrap();
                 let scratch = crate::families::glm5::native::scratch_layouts(&cfg, &records, &plan, 64, 1024, true).unwrap();
                 let records = scratch[1].linear.records.unwrap() as u64;
                 assert!(records > 0);
-                assert_eq!(a8.devices[rank].used_bytes() - a16.devices[rank].used_bytes(), records);
+                assert_eq!(growth(&a8, rank) - growth(&a16, rank), records);
             }
-            assert_eq!(a8.pool_tokens, a16.pool_tokens);
+            assert_eq!(pool16, pool8);
         }
     }
 
