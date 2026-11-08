@@ -170,7 +170,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             representation.kda_fp8 = false;
             representation.output_shard = false;
         }
-        if native { representation.head = resident::GlmfHeadFormat::Bf16; }
+        representation.head = representation.head.resolve(exlr8.is_some() || core.get_weight("lm_head").is_some(), ranks);
         let state = options.glmf_kda_state;
         anyhow::ensure!(!native || state == crate::serving_capacity::GlmfKdaState::F32,
             "native Flash requires F32 KDA state programs");

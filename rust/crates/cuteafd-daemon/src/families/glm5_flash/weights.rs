@@ -288,6 +288,25 @@ fn quantize_kda_part(bytes: &[u8], rows: usize, cols: usize, layout: super::fp8:
 }
 
 impl<'a> GlmfLoader<'a> {
+    /// Register the source in the same dense delivery group as the target body.
+    fn head(&self, inventory: &cuteafd_loader::families::glm5_flash::core::CoreInventory) -> Result<super::head::GlmfHead<'a>> {
+        Ok(if let Some(head) = inventory.get_weight("lm_head") {
+                super::head::GlmfHead::K6(self.core_weights(
+                    cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
+                        cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?)
+            } else if self.fp8_head {
+                let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
+                super::head::GlmfHead::Fp8 { values, scales }
+            } else if self.packed_head {
+                ensure!(self.tensor("lm_head.weight")?.meta.dtype == DType::Bf16, "--fp8-head packed packs a BF16 head");
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("staging/glmf.load.head.bf16");
+                let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+                super::head::GlmfHead::Bf16(self.whole_in(0, "lm_head.weight", false)?)
+            } else {
+                super::head::GlmfHead::Bf16(self.one("lm_head.weight")?)
+            })
+    }
+
     pub(super) fn allocate(&self, device: i32, name: &str, bytes: usize) -> Result<Allocation<'a>> {
         let arena = self.arenas.get(&device).context("Flash target arena absent")?;
         crate::shared::memory::weight_arena::weight_allocation(Device { library: self.library, id: device },
@@ -1484,21 +1503,7 @@ impl<'a> GlmfLoader<'a> {
         let weights = GlmfWeights {
             layers: shares.next().context("rank 0")?,
             norm: self.one(&format!("{PREFIX}norm.weight"))?,
-            head: if let Some(head) = inventory.get_weight("lm_head") {
-                super::head::GlmfHead::K6(self.core_weights(
-                    cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
-                        cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?)
-            } else if self.fp8_head {
-                let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
-                super::head::GlmfHead::Fp8 { values, scales }
-            } else if self.packed_head {
-                ensure!(self.tensor("lm_head.weight")?.meta.dtype == DType::Bf16, "--fp8-head packed packs a BF16 head");
-                let _memory_scope = cuteafd_ffi::memory_ledger::scope("staging/glmf.load.head.bf16");
-                let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-                super::head::GlmfHead::Bf16(self.whole_in(0, "lm_head.weight", false)?)
-            } else {
-                super::head::GlmfHead::Bf16(self.one("lm_head.weight")?)
-            },
+            head: self.head(&inventory)?,
         };
         crate::shared::memory::staging::release_staging();
         // The pinned GPU-quantization source and tables live only for the load.

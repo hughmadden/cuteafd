@@ -10,7 +10,7 @@ pub struct GlmfRepresentation {
     pub output_shard: bool,
 }
 impl Default for GlmfRepresentation {
-    fn default() -> Self { Self { kda_fp8: true, head: GlmfHeadFormat::Fp8, output_shard: true } }
+    fn default() -> Self { Self { kda_fp8: true, head: GlmfHeadFormat::Auto, output_shard: true } }
 }
 
 /// The one resident form of the vocabulary head `lm_head.weight` [vocab, hidden] that target
@@ -22,7 +22,9 @@ impl Default for GlmfRepresentation {
 /// sums); the drafter reads its coarse plane. A packed head serves one coordinator GPU.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GlmfHeadFormat {
+    /// Resolve after reading checkpoint headers and selecting the coordinator topology.
     #[default]
+    Auto,
     Bf16,
     Fp8,
     Packed,
@@ -32,28 +34,38 @@ impl std::str::FromStr for GlmfHeadFormat {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, String> {
         match value {
+            "auto" => Ok(Self::Auto),
             "false" | "bf16" | "off" => Ok(Self::Bf16),
             "true" | "fp8" | "on" => Ok(Self::Fp8),
             "packed" => Ok(Self::Packed),
-            _ => Err(format!("{value:?}: expected false (bf16), true (fp8) or packed")),
+            _ => Err(format!("{value:?}: expected auto, false (bf16), true (fp8) or packed")),
         }
     }
 }
 
 impl GlmfHeadFormat {
+    /// Native heads ignore conversion; BF16 auto uses packed on TP1 and FP8 on TP2.
+    pub fn resolve(self, native_head: bool, ranks: usize) -> Self {
+        if native_head { Self::Bf16 }
+        else if self == Self::Auto {
+            if ranks == 1 { Self::Packed } else { Self::Fp8 }
+        } else { self }
+    }
+
     /// The resolved `fp8-head` setting: the boolean spellings for BF16 and FP8, `packed`.
     pub fn setting(self) -> &'static str {
-        match self { Self::Bf16 => "false", Self::Fp8 => "true", Self::Packed => "packed" }
+        match self { Self::Auto => "auto", Self::Bf16 => "false", Self::Fp8 => "true", Self::Packed => "packed" }
     }
 
     /// The head's name in plans and logs.
     pub fn name(self) -> &'static str {
-        match self { Self::Bf16 => "BF16", Self::Fp8 => "FP8", Self::Packed => "exact 12-bit" }
+        match self { Self::Auto => "auto", Self::Bf16 => "BF16", Self::Fp8 => "FP8", Self::Packed => "exact 12-bit" }
     }
 
     /// Resident bytes of a `[vocab, hidden]` BF16 head in this form, as the loader allocates them.
     pub fn resident_bytes(self, vocab: u64, hidden: u64) -> u64 {
         match self {
+            Self::Auto => panic!("resolve GLM Flash head before sizing"),
             Self::Bf16 => (vocab * hidden * 2).max(256),
             Self::Fp8 => (vocab * hidden).max(256) + (vocab * hidden.div_ceil(128) * 4).max(256),
             Self::Packed => cuteafd_core::packed_head::PackedHeadLayout::bytes(vocab, hidden),
@@ -147,7 +159,8 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
         + if let Some(head) = core.get_weight("lm_head") {
             head.resident_bytes(1).map_err(|e| e.to_string())?
         } else {
-            match repr.head {
+            match repr.head.resolve(core.get_weight("lm_head").is_some(), ranks) {
+                GlmfHeadFormat::Auto => unreachable!("head resolved"),
                 GlmfHeadFormat::Fp8 => fp8(&["lm_head.weight".into()], false, true)?,
                 GlmfHeadFormat::Bf16 => tensor("lm_head.weight")?.meta.byte_length.max(256),
                 GlmfHeadFormat::Packed => {
@@ -296,8 +309,8 @@ mod tests {
         let single = resident_weights(&checkpoint, &cfg, 0, 1, Default::default()).unwrap();
         let split = resident_weights(&checkpoint, &cfg, 0, 2, Default::default()).unwrap();
         assert_eq!(single[0].embedding, 524_288);
-        assert_eq!(single[0].weights, 278_528); // norm BF16 + head FP8 values and row128 FP32 scales.
-        assert_eq!(split[0].weights, single[0].weights);
+        assert_eq!(single[0].weights, 403_968); // norm BF16 + packed head.
+        assert_eq!(split[0].weights, 278_528); // auto head split retains FP8.
         assert_eq!((split[1].embedding, split[1].weights), (0, 0));
         assert!(resident_weights(&checkpoint, &cfg, 2, 1, Default::default()).unwrap_err().contains("resident operand missing"));
         // Each head form charges its own allocation and nothing else; the exact 12-bit one is
@@ -328,8 +341,12 @@ mod tests {
         assert!("maybe".parse::<GlmfHeadFormat>().unwrap_err().contains("packed"));
         assert_eq!([Bf16, Fp8, Packed].map(GlmfHeadFormat::setting), ["false", "true", "packed"]);
         assert_eq!([Bf16, Fp8, Packed].map(GlmfHeadFormat::name), ["BF16", "FP8", "exact 12-bit"]);
-        assert_eq!(GlmfHeadFormat::default(), Bf16);
-        assert_eq!(GlmfRepresentation::default().head, Fp8);
+        assert_eq!("auto".parse::<GlmfHeadFormat>(), Ok(GlmfHeadFormat::Auto));
+        assert_eq!(GlmfHeadFormat::default(), GlmfHeadFormat::Auto);
+        assert_eq!(GlmfRepresentation::default().head, GlmfHeadFormat::Auto);
+        for (native, ranks, resolved) in [(false, 1, Packed), (false, 2, Fp8), (true, 1, Bf16), (true, 2, Bf16)] {
+            assert_eq!(GlmfHeadFormat::Auto.resolve(native, ranks), resolved);
+        }
         let (vocab, hidden) = (154_880, 4096);
         assert_eq!([Bf16, Fp8, Packed].map(|head| head.resident_bytes(vocab, hidden)),
             [1_268_776_960, 654_213_120, 956_074_752]);

@@ -347,7 +347,13 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     };
     let family = cuteafd_loader::plan::family::detect(checkpoint).map_or("", |family| family.id());
     args.attention.validate_view(&view)?;
-    validate_glmf_precision(&args, family)?;
+    let mut precision = args.clone();
+    if family == "glm5_flash" {
+        let cfg = cuteafd_loader::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config)?;
+        let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        precision.head_format = args.head_format.resolve(core.get_weight("lm_head").is_some(), args.rtx);
+    }
+    validate_glmf_precision(&precision, family)?;
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
     options.qwen_auto_mtp = family == "qwen4" && args.speculator == "auto";
@@ -2165,7 +2171,7 @@ mod tests {
         use crate::families::glm5_flash::head::GlmfHeadFormat;
         let defaults = parse(&[]);
         assert_eq!((defaults.kda_fp8, defaults.kda_state, defaults.head_format),
-            (KdaFp8::Row128, KdaState::F32, GlmfHeadFormat::Fp8));
+            (KdaFp8::Row128, KdaState::F32, GlmfHeadFormat::Auto));
         for state in ["f32", "bf16", "bf16-tile"] {
             for kda in ["off", "row128", "channel"] {
                 for (head, format) in [("true", GlmfHeadFormat::Fp8), ("false", GlmfHeadFormat::Bf16),

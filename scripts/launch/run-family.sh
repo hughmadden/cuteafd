@@ -2085,21 +2085,21 @@ if [[ $family == glm5_flash ]]; then
       echo "PREFILL_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
     fi
   fi
-  # GLM5_FLASH_FP8_HEAD: the one resident LM head the target and drafter share. auto (default) = on,
-  # an E4M3 copy; off keeps the checkpoint's BF16; packed keeps the exact 12-bit copy of the BF16
+  # GLM5_FLASH_FP8_HEAD: auto is resolved by the shared checkpoint/topology resolver: packed on one GPU,
+  # FP8 on two GPUs, native heads unchanged. on selects E4M3; off keeps BF16; packed keeps exact 12-bit BF16
   # (mirroring V41_FP8_HEAD=packed): target logits exact, drafts through its coarse plane, about
   # three quarters of the BF16 bytes. The daemon checks packed split support after normalizing
   # native K6/EXLR8 heads, which ignore this conversion setting.
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
-    ""|auto) fp8_head=on ;;
+    ""|auto) fp8_head=auto ;;
     on|off|packed) ;;
     *) echo "GLM5_FLASH_FP8_HEAD must be auto, on, off or packed" >&2; exit 2 ;;
   esac
   case "$fp8_head" in
     on) family_args+=(--fp8-head true) ;;
     off) family_args+=(--fp8-head false) ;;
-    packed) family_args+=(--fp8-head packed) ;;
+    auto|packed) family_args+=(--fp8-head "$fp8_head") ;;
   esac
   # GLM5_FLASH_DRAFT_LINEAR: w8a8 with an FP8 drafter; w8a16 runs the W8A16 GEMV in passes of
   # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3

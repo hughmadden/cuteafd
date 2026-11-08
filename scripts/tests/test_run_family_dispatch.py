@@ -2511,10 +2511,10 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--split-device" in launch) == split
-    # Both layouts default to row128 KDA and an FP8 head; the split adds
-    # token-row KDA output ownership.
+    # The shared Rust resolver selects the checkpoint/topology head; shell passes auto.
+    # The split adds token-row KDA output ownership.
     assert "--kda-fp8 row128" in launch
-    assert "--fp8-head true" in launch
+    assert "--fp8-head auto" in launch
     assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
     assert launch.count("--snapshot ") == 1
     assert ("--kda-output-shard --kda-prefill-expanded" in launch) == split
@@ -2548,9 +2548,9 @@ def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix,
 
 
 @pytest.mark.parametrize("layout,keys,kda,head", [
-    ("RTX_GPUS=1\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "true"),
+    ("RTX_GPUS=1\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "auto"),
     ("RTX_GPUS=1\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
-    ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "true"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "auto"),
     ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
 ])
 def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, head):
@@ -2695,7 +2695,7 @@ def test_glmf_fp8_head_launch_is_identical_with_and_without_the_target_head_key(
                                       "RTX_GPUS=1\n" + keys)
         assert result.returncode == 0, result.stderr
         launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-        assert "--fp8-head true" in launch and "--target-head" not in launch, launch
+        assert "--fp8-head auto" in launch and "--target-head" not in launch, launch
         lines.append(launch.replace(str(root), "ROOT"))
     assert lines[0] == lines[1], lines
 

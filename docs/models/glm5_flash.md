@@ -169,25 +169,29 @@ reserve unit 0 outside the admitted token count and enable
 
 ## Default precision (single residency)
 
-Every weight has one resident format. The launcher resolves precision after
-it chooses the serving layout: with one coordinator GPU,
-`GLM5_FLASH_KDA_FP8=auto` (including unset) selects `row128` and
-`GLM5_FLASH_FP8_HEAD=auto` selects `on`; with the two-GPU head split they
-select `off` (BF16 KDA and head). Explicit `off/row128/channel` KDA and
-`on/off` head settings always win, including the deprecated `GLMF_*` keys;
-current names take precedence over deprecated names. `GLM5_FLASH_FP8_HEAD=packed`
-(`--fp8-head packed`, as `V41_FP8_HEAD=packed`) applies only to checkpoints
-with a BF16 head, including the official FP8 and EXL3 K3.25-Core-FP8 releases.
-Native K6 and EXLR8 heads retain their checkpoint representation and ignore
-this conversion setting. Packed keeps an exact 12-bit copy, verified bit for
-bit at load before releasing the BF16 source. For the [154880, 4096] head,
-the payload is 911.784 MiB: 298.216 MiB less than BF16 but 287.878 MiB more
-than the default FP8 copy (arena allocation tails and scratch excluded).
-Target projection reconstructs the original BF16 operands; its reduction
-order need not produce cuBLAS-identical logits. The drafter reads the coarse
-plane. Packed requires one GPU; a head split refuses it for BF16-head
-checkpoints. The FP8 default is unchanged. The DFlash2 drafter defaults to
-FP8 on both layouts; `SPECULATOR_FP8=off` keeps it BF16.
+Every weight has one resident format. The launcher passes the head setting to
+one shared checkpoint/topology resolver used by plan and serve:
+`GLM5_FLASH_FP8_HEAD=auto` (including unset) selects `packed` for BF16-head
+checkpoints on one coordinator GPU and `on` (FP8) on a two-GPU head split.
+Native K6 and EXLR8 heads retain their checkpoint representation first and
+ignore conversion settings. KDA auto remains `row128` on both layouts.
+Explicit `on` (FP8), `off` (BF16), and `packed` head choices remain available.
+Existing `GLMF_*` aliases retain their precedence rules.
+
+The packed BF12 head uses the shared `V41_FP8_HEAD=packed` mechanism on
+BF16-head checkpoints, including official FP8 and EXL3 K3.25-Core-FP8 releases.
+Normal coordinator dense push delivers one BF16 source directly into transient
+`staging/glmf.load.head.bf16`, not a second checkpoint read. After the group
+commits, it packs into the target weight arena, verifies every operand bit for
+bit and releases the source before drafter load. Admission charges source
+staging only during Load, and the retained packed arena exactly once.
+For [154880, 4096], payload is 911.784 MiB: 298.216 MiB less than BF16 but
+287.878 MiB more than FP8 (arena tails and scratch excluded). Target projection
+reconstructs original BF16 operands; reduction order need not produce
+cuBLAS-identical logits. The drafter reads the coarse plane. Explicit packed
+on a two-GPU split is refused; auto falls back to FP8 so existing split layouts
+keep working. DFlash2 defaults to FP8 on both layouts;
+`SPECULATOR_FP8=off` keeps it BF16.
 
 Matched recheck, 2026-10-04: GLM 5.3 Flash EXL3 K3.25, RTX PRO 6000 at
 325 W, fixed code prompts/nonces, one warm batch per concurrency, 512

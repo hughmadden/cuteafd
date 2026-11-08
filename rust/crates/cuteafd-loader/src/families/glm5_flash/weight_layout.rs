@@ -60,7 +60,8 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
             ensure!(requests[0].insert(name.clone(), bytes).is_none(), "duplicate Flash K6 view {name}");
         }
     } else {
-        match head {
+        match head.resolve(core.get_weight("lm_head").is_some(), ranks) {
+            GlmfHeadFormat::Auto => unreachable!("head resolved"),
             GlmfHeadFormat::Fp8 => fp8(&mut requests[0], vec!["lm_head.weight".into()], 1, true)?,
             // The exact 12-bit copy (its BF16 source is transient, outside the arena).
             GlmfHeadFormat::Packed => {

@@ -29,6 +29,48 @@ fn target_arenas<'a>(loader: &GlmfLoader<'a>, cfg: &GlmNextConfig, selected: &[u
 }
 
 #[test]
+fn packed_head_push_delivers_one_transient_source_before_arena_pack() -> Result<()> {
+    use cuteafd_loader::plan::testing::{t, write_snapshot};
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 0, 1 << 30)?;
+    fixture.immediate_copies(&library)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (vocab, hidden) = (32, 128);
+    write_snapshot(root.path(), &serde_json::json!({}), &[t("lm_head.weight", "BF16", &[vocab, hidden])], None);
+    let checkpoint = Checkpoint::open(root.path())?;
+    let layout = cuteafd_core::packed_head::PackedHeadLayout::new(vocab, hidden)?;
+    let arena = DeviceWeightArena::new(Device { library: &library, id: 0 },
+        cuteafd_loader::serving_capacity::WeightArenaLayout::new("push/head", [("packed12".into(), layout.total_bytes())])?)?;
+    let load = std::rc::Rc::new(DenseLoad::push(&library));
+    let loader = GlmfLoader { arenas: std::rc::Rc::new([(0, arena)].into_iter().collect()),
+        library: &library, checkpoint: &checkpoint, stream: std::ptr::null_mut(),
+        kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Off, kda_output_shard: false,
+        fp8_head: false, packed_head: true, kda_nvfp4: None,
+        fp8_scales: crate::shared::fp8_linear::Fp8Scales::Pow2, device: 0, peers: vec![], dense: load.clone() };
+    // Registration must not open the checkpoint shard: only push delivery reads it.
+    let shard = root.path().join(&checkpoint.tensors[0].shard);
+    let saved = shard.with_extension("held");
+    std::fs::rename(&shard, &saved)?;
+    let source = loader.head(&Default::default())?;
+    std::fs::rename(&saved, &shard)?;
+    let records = load.sink.as_ref().context("push head sink")?.take_all();
+    assert_eq!(records.operands.len(), 1);
+    assert!(records.steps.is_empty());
+    assert_eq!(records.operands[0].buffer.ptr, source.allocations()[0].ptr);
+    assert_eq!(records.operands[0].bytes, vocab * hidden * 2);
+    assert_eq!(records.operands[0].lands.len(), 1);
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: 0 },
+        None, root.path(), sockets.path(), &records, None, 0, 0)?;
+    let packed = source.pack(&library, vocab, hidden, loader.arenas.get(&0))?;
+    assert_eq!(packed.format(), Some(crate::families::glm5_flash::head::GlmfHeadFormat::Packed));
+    assert_eq!(packed.bytes(), layout.total_bytes());
+    assert_eq!(packed.allocations()[0].ptr, loader.arenas[&0].view("packed12", layout.total_bytes())?.buffer.ptr);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn native_k6_core_and_head_records_match_host_pack() -> Result<()> {
     use cuteafd_loader::{formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook,

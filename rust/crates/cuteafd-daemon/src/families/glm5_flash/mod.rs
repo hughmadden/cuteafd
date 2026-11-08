@@ -215,14 +215,14 @@ pub(crate) struct EngineArgs {
     #[arg(long, env = "CUTEAFD_GLMF_KDA_PREFILL_EXPANDED", default_value_t = false)]
     pub kda_prefill_expanded: bool,
     /// The one resident LM head target logits and the drafter share. `false` (also `bf16`,
-    /// `off`; the default): the checkpoint's BF16 head. `true` (a bare `--fp8-head`; also `fp8`,
+    /// `off`): the checkpoint's BF16 head. `true` (a bare `--fp8-head`; also `fp8`,
     /// `on`): only an E4M3 copy (per row x 128-K scales, quantized at load); every logits call
     /// (target, verify, prefill, DFlash drafts) runs the FP8 head program in 16-row spans.
     /// `packed`: only the exact 12-bit copy of the BF16 values (`shared::packed_head`), packed
     /// and verified at load, then the BF16 released: target logits read it exactly on its
     /// tensor-core GEMV, the drafter through its coarse plane; one GPU (no --split-device).
-    /// Opt-in FP8 with the FP8 KDA projections above.
-    #[arg(long = "fp8-head", default_value = "false", num_args = 0..=1, default_missing_value = "true",
+    /// `auto` (default): packed on one GPU, FP8 on a head split; native heads stay native.
+    #[arg(long = "fp8-head", default_value = "auto", num_args = 0..=1, default_missing_value = "true",
         action = clap::ArgAction::Set)]
     pub head_format: head::GlmfHeadFormat,
     /// The target's logits through the BF16 head (the shared route, `crate::shared::target_head`):
@@ -613,6 +613,20 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn plan_and_serve_auto_share_checkpoint_topology_resolution() {
+        use clap::Parser;
+        use head::GlmfHeadFormat::{Bf16, Fp8, Packed};
+        for (native, ranks, expected) in [(false, 1, Packed), (false, 2, Fp8), (true, 1, Bf16), (true, 2, Bf16)] {
+            let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/checkpoint", "--layout", "--rtx", &ranks.to_string()]).unwrap();
+            let crate::cli::Commands::Plan(plan) = cli.command else { panic!("plan") };
+            let mut serve = if ranks == 2 { parse(&["--split-device", "1"]) } else { parse(&[]) };
+            native::normalize_head(&mut serve, native);
+            assert_eq!(plan.head_format.resolve(native, ranks), expected);
+            assert_eq!(serve.head_format, expected);
+        }
+    }
+
+    #[test]
     fn native_workspace_is_invariant_to_legacy_conversion_flags() -> Result<()> {
         use cuteafd_loader::serving_capacity::{glmf_core_step_scratch, GlmfScratchOptions,
             GlmfCoreScratch, GlmfStepShape};
@@ -816,7 +830,7 @@ mod draft_cli_tests {
         assert_eq!(fp8.target_head, None);
         check_options(&fp8).unwrap();
         assert_eq!(parse(&["--target-head", "exact"]).resolved_target_head(), Exact);
-        let tensor = parse(&["--target-head", "tensor"]);
+        let tensor = parse(&["--target-head", "tensor", "--fp8-head", "false"]);
         assert_eq!(tensor.resolved_target_head(), Tensor);
         check_options(&tensor).unwrap();
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
@@ -886,7 +900,7 @@ mod draft_cli_tests {
     fn kda_w8a8_prefill_needs_fp8_kda_weights() {
         let defaults = parse(&[]);
         assert_eq!((defaults.kda_fp8, defaults.head_format, defaults.draft_fp8),
-            (fp8::KdaFp8::Off, head::GlmfHeadFormat::Bf16, None));
+            (fp8::KdaFp8::Off, head::GlmfHeadFormat::Auto, None));
         check_options(&parse(&["--kda-fp8", "row128", "--fp8-prefill", "kda-in"])).unwrap();
         for extra in [&["--kda-fp8", "off", "--fp8-prefill", "kda-in"][..],
             &["--kda-fp8", "off", "--fp8-prefill", "mla,kda-o"][..], &["--kda-fp8", "off", "--fp8-prefill", "kda-o"][..]] {

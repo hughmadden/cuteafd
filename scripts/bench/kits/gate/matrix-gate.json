@@ -117,6 +117,7 @@
    ],
    "sparks": [],
    "set": {
+    "GLM5_FLASH_FP8_HEAD": "auto",
     "ADDR": "0.0.0.0:8716",
     "EXPERT_PORT": "19816",
     "EXPERT_BACKEND": "local",
@@ -428,6 +429,7 @@
     "dodo"
    ],
    "set": {
+    "GLM5_FLASH_FP8_HEAD": "auto",
     "ADDR": "0.0.0.0:8736",
     "EXPERT_PORT": "19836",
     "COORDINATOR_GPUS": "1",

@@ -507,9 +507,9 @@ pub(crate) struct PlanArgs {
     /// GLM Flash recurrent state storage for --layout.
     #[arg(long, value_enum, default_value = "f32")]
     pub(crate) kda_state: crate::families::glm5_flash::engine::KdaState,
-    /// GLM Flash shared target/draft head residency: `true` (FP8, the launcher's default; also
+    /// GLM Flash shared target/draft head residency: `auto` (packed TP1, FP8 TP2), `true` (also
     /// `fp8`), `false` (BF16; also `bf16`) or `packed` (the exact 12-bit copy, one GPU).
-    #[arg(long = "fp8-head", default_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long = "fp8-head", default_value = "auto", action = clap::ArgAction::Set)]
     pub(crate) head_format: crate::families::glm5_flash::head::GlmfHeadFormat,
     /// GLM Flash BF16 target head arithmetic; FP8 and packed heads use their own GEMVs.
     #[arg(long, value_enum)]
