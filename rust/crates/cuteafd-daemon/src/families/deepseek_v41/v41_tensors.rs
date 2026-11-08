@@ -317,7 +317,9 @@ pub(crate) fn fp8_scratch<'a>(library: &'a NativeLibrary, copy: Option<HeadCopy<
     let (n, k) = copy.shape();
     let allocation = match copy {
         HeadCopy::Fp8(_) => crate::shared::fp8_linear::scratch(library, rows, &[(k, n)])?,
-        HeadCopy::Packed(_) => crate::shared::packed_head::scratch(library, rows, &[(k, n)])?,
+        HeadCopy::Packed(_) => crate::shared::packed_head::scratch(library, rows, &[(k, n)],
+            if coarse { Tag::drafter_workspace("v41/draft-head-projection") }
+            else { Tag::workspace("v41/target-head-projection") })?,
     };
     Ok(Some(HeadScratch { allocation, coarse }))
 }

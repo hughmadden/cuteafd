@@ -547,7 +547,7 @@ impl<'a> GlmfLoader<'a> {
         self.on_rank(rank, || {
             let allocation = if arena { self.allocation(rank, name, bytes)? } else {
                 DeviceAllocation::from_allocation(Allocation::new(Device { library: self.library, id: device },
-                    bytes.max(256))?)
+                    bytes.max(256), crate::shared::memory::Tag::staging("glmf.load.head.bf16"))?)
             };
             let operand = crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer, lands, bytes };
             self.dense.operand(operand)?;

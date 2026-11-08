@@ -41,7 +41,8 @@ fn packed_head_push_delivers_one_transient_source_before_arena_pack() -> Result<
     let checkpoint = Checkpoint::open(root.path())?;
     let layout = cuteafd_core::packed_head::PackedHeadLayout::new(vocab, hidden)?;
     let arena = DeviceWeightArena::new(Device { library: &library, id: 0 },
-        cuteafd_loader::serving_capacity::WeightArenaLayout::new("push/head", [("packed12".into(), layout.total_bytes())])?)?;
+        cuteafd_loader::serving_capacity::WeightArenaLayout::new("push/head", [("packed12".into(), layout.total_bytes())])?,
+        ArenaTag::weights("glmf/target"))?;
     let load = std::rc::Rc::new(DenseLoad::push(&library));
     let loader = GlmfLoader { arenas: std::rc::Rc::new([(0, arena)].into_iter().collect()),
         library: &library, checkpoint: &checkpoint, stream: std::ptr::null_mut(),
@@ -53,6 +54,9 @@ fn packed_head_push_delivers_one_transient_source_before_arena_pack() -> Result<
     let saved = shard.with_extension("held");
     std::fs::rename(&shard, &saved)?;
     let source = loader.head(&Default::default())?;
+    let source_ptr = source.allocations()[0].ptr as usize;
+    assert_eq!(cuteafd_ffi::memory_ledger::tag_of(source_ptr),
+        Some(crate::shared::memory::Tag::staging("glmf.load.head.bf16")));
     std::fs::rename(&saved, &shard)?;
     let records = load.sink.as_ref().context("push head sink")?.take_all();
     assert_eq!(records.operands.len(), 1);
@@ -66,7 +70,10 @@ fn packed_head_push_delivers_one_transient_source_before_arena_pack() -> Result<
     let packed = source.pack(&library, vocab, hidden, loader.arenas.get(&0))?;
     assert_eq!(packed.format(), Some(crate::families::glm5_flash::head::GlmfHeadFormat::Packed));
     assert_eq!(packed.bytes(), layout.total_bytes());
-    assert_eq!(packed.allocations()[0].ptr, loader.arenas[&0].view("packed12", layout.total_bytes())?.buffer.ptr);
+    let destination = loader.arenas[&0].view("packed12", layout.total_bytes())?;
+    assert_eq!(packed.allocations()[0].ptr, destination.buffer.ptr);
+    assert_eq!(destination.tag(), Some(crate::shared::memory::Tag::weights("glmf/target")));
+    assert_eq!(cuteafd_ffi::memory_ledger::tag_of(source_ptr), None);
     Ok(())
 }
 

@@ -103,12 +103,12 @@ impl<'a> PackedHead<'a> {
 }
 
 /// GEMV scratch for up to `rows` rows of every `(k, n)` head shape.
-pub(crate) fn scratch<'a>(library: &'a NativeLibrary, rows: usize, shapes: &[(usize, usize)])
+pub(crate) fn scratch<'a>(library: &'a NativeLibrary, rows: usize, shapes: &[(usize, usize)], tag: Tag)
     -> Result<DeviceAllocation<'a>> {
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/packed-head");
     let bytes = shapes.iter().map(|&(k, n)| library.packed_head_workspace(rows, k, n))
         .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
-    DeviceAllocation::new(library, bytes.max(256), Tag::workspace("shared/packed-head"))
+    DeviceAllocation::new(library, bytes.max(256), tag)
 }
 
 #[cfg(test)]

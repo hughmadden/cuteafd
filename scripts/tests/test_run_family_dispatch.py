@@ -2515,6 +2515,8 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     # The split adds token-row KDA output ownership.
     assert "--kda-fp8 row128" in launch
     assert "--fp8-head auto" in launch
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans and all("--fp8-head auto" in plan and plan.count("--fp8-head") == 1 for plan in plans), plans
     assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
     assert launch.count("--snapshot ") == 1
     assert ("--kda-output-shard --kda-prefill-expanded" in launch) == split

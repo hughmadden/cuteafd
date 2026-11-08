@@ -138,7 +138,8 @@ impl<'a> GlmfHead<'a> {
         let stream = library.cuda_stream_create()?;
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
         let packed = match PackedHead::pack_with(library, weight.buffer.ptr, vocab, hidden, stream, |name, bytes|
-            crate::shared::memory::weight_arena::weight_allocation(device, arena, name, bytes)) {
+            crate::shared::memory::weight_arena::weight_allocation(device, arena, name, bytes,
+                cuteafd_core::memory_layout::ArenaTag::weights("glmf/target"))) {
             Err(error) if library.is_quarantined_after_failed_drain() => {
                 // The pack could not prove its reads of the source retired.
                 std::mem::forget(weight);
@@ -163,7 +164,8 @@ impl<'a> GlmfHead<'a> {
     pub fn bind_draft(&mut self, library: &'a NativeLibrary, rows: usize) -> Result<()> {
         if let Self::Packed { head, draft_scratch } = self {
             ensure!(draft_scratch.is_none(), "packed head drafter scratch bound twice");
-            *draft_scratch = Some(crate::shared::packed_head::scratch(library, rows, &[(head.k, head.n)])?);
+            *draft_scratch = Some(crate::shared::packed_head::scratch(library, rows, &[(head.k, head.n)],
+                crate::shared::memory::Tag::drafter_workspace("glmf/draft-head-projection"))?);
         }
         Ok(())
     }
@@ -256,7 +258,7 @@ mod tests {
         let [vocab, hidden] = tensor.info.shape[..] else { anyhow::bail!("lm_head.weight is not a matrix") };
         ensure!(tensor.info.dtype == cuteafd_core::DType::Bf16, "lm_head.weight is not BF16");
         let weights: Vec<u16> = tensor.bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-        let source = DeviceAllocation::new(&library, tensor.bytes.len())?;
+        let source = DeviceAllocation::new(&library, tensor.bytes.len(), crate::shared::memory::TEST)?;
         library.copy_h2d(source.buffer, &tensor.bytes)?;
         let mut head = GlmfHead::Bf16(source).pack(&library, vocab, hidden, None)?;
         assert_eq!(head.format(), Some(GlmfHeadFormat::Packed));
@@ -274,9 +276,9 @@ mod tests {
             ((((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0).to_bits() >> 16) as u16
         }).collect();
         let bf16 = |bits: u16| f32::from_bits(u32::from(bits) << 16) as f64;
-        let input = DeviceAllocation::new(&library, rows * hidden * 2)?;
+        let input = DeviceAllocation::new(&library, rows * hidden * 2, crate::shared::memory::TEST)?;
         library.copy_h2d(input.buffer, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
-        let scratch = crate::shared::packed_head::scratch(&library, rows, &[(hidden, vocab)])?;
+        let scratch = crate::shared::packed_head::scratch(&library, rows, &[(hidden, vocab)], crate::shared::memory::TEST)?;
         head.bind_draft(&library, rows)?;
         let stream = library.cuda_stream_create()?;
         let project = |coarse: bool, logits: &DeviceAllocation<'_>| -> Result<Vec<f32>> {
@@ -290,7 +292,7 @@ mod tests {
             library.copy_d2h(&mut bytes, logits.buffer)?;
             Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
         };
-        let logits = DeviceAllocation::new(&library, rows * vocab * 4)?;
+        let logits = DeviceAllocation::new(&library, rows * vocab * 4, crate::shared::memory::TEST)?;
         for coarse in [false, true] {
             let out = project(coarse, &logits)?;
             for token in (0..vocab).step_by(997).chain([vocab - 1]) {
@@ -312,7 +314,7 @@ mod tests {
         }
         // Decode graphs capture the target head: a replay of the captured exact GEMV is the launch.
         let direct = project(false, &logits)?;
-        let replayed = DeviceAllocation::new(&library, rows * vocab * 4)?;
+        let replayed = DeviceAllocation::new(&library, rows * vocab * 4, crate::shared::memory::TEST)?;
         // SAFETY: capture records launches over live buffers that outlive the executable's replay.
         let exec = unsafe {
             library.cuda_graph_begin_capture(stream)?;

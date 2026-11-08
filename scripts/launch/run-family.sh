@@ -2376,7 +2376,7 @@ audio_encoder_hash=""
     [[ -z "$chat_template_from" || "$vision" == off ]] || plan_draft_args+=(--chat-template-from "$chat_template_from")
   fi
   if [[ "$family" == glm5_flash ]]; then
-    case "$fp8_head" in on) plan_head=true ;; packed) plan_head=packed ;; *) plan_head=false ;; esac
+    case "$fp8_head" in on) plan_head=true ;; off) plan_head=false ;; auto|packed) plan_head="$fp8_head" ;; esac
     plan_draft_args+=(--kda-fp8 "$kda_fp8" --kda-state "${kda_state:-f32}" --fp8-head "$plan_head")
     [[ "${target_head:-auto}" == auto || -z "${target_head:-}" ]] || plan_draft_args+=(--target-head "$target_head")
     # Draft-head arithmetic borrows the same target weight, not a second resident head.
