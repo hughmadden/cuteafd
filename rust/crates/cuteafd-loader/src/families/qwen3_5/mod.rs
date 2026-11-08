@@ -1,5 +1,6 @@
 //! Dense Qwen checkpoint contract. Header-only; no runtime or weight conversion.
 pub mod config;
+pub mod weight_layout;
 pub use config::Qwen35Config;
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;

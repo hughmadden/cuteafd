@@ -360,6 +360,43 @@ impl BlockDsparkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_requests_follow_the_shared_recipe_for_both_representations() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        use crate::plan::testing::{t, write_safetensors};
+        let snapshot = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({"architectures":["DSparkDraftModel"], "speculators_model_type":"dspark",
+            "aux_hidden_state_layer_ids":[1,2], "block_size":2, "confidence_head_with_markov":true,
+            "draft_vocab_size":16, "enable_confidence_head":true, "markov_head_type":"vanilla", "markov_rank":256,
+            "mask_token_id":0, "sample_from_anchor":true, "sliding_window_non_causal":false,
+            "transformer_layer_config":{"attention_bias":false, "head_dim":128, "hidden_act":"silu",
+                "hidden_size":256, "intermediate_size":256, "layer_types":["full_attention"],
+                "max_position_embeddings":64, "model_type":"qwen3", "num_attention_heads":2, "num_hidden_layers":1,
+                "num_key_value_heads":1, "rms_norm_eps":1e-5, "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
+                "sliding_window":null, "vocab_size":16}});
+        std::fs::write(snapshot.path().join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+        let cfg = BlockDsparkConfig::read(snapshot.path()).unwrap();
+        let shapes = std::cell::RefCell::new(Vec::new());
+        block_dspark_weight_recipe(&cfg, |name, shape| { shapes.borrow_mut().push(t(name, "BF16", shape)); Ok::<_, ()>(()) },
+            |parts, cols| { for (name, rows) in parts { shapes.borrow_mut().push(t(*name, "BF16", &[*rows, cols])); } Ok(()) })
+            .unwrap();
+        write_safetensors(&snapshot.path().join("model.safetensors"), &shapes.into_inner());
+        let bf16 = block_dspark_arena_requests(snapshot.path(), GlmDraftRepresentation::Bf16Only).unwrap();
+        let qkv = "layers.0.self_attn.q_proj.weight+layers.0.self_attn.k_proj.weight+layers.0.self_attn.v_proj.weight";
+        assert_eq!(bf16.iter().find(|(n, _)| n == qkv).unwrap().1, (256 + 128 + 128) * 256 * 2);
+        assert_eq!(bf16.iter().find(|(n, _)| n == "layers.0.self_attn.q_norm.weight").unwrap().1, 256);
+        assert_eq!(bf16.iter().find(|(n, _)| n == "fc.weight").unwrap().1, 256 * 512 * 2);
+        assert_eq!(bf16[bf16.len() - 2], ("markov_norms".to_string(), 16 * 4));
+        assert_eq!(bf16.last().unwrap(), &("inv_freq".to_string(), 256));
+        let fp8 = block_dspark_arena_requests(snapshot.path(), GlmDraftRepresentation::Fp8Only).unwrap();
+        let payload = (256 + 128 + 128) * 256;
+        assert!(fp8.contains(&(format!("{qkv}.payload"), payload)) && fp8.contains(&(format!("{qkv}.scales"), payload / 128 * 4)));
+        // Every matrix splits into one payload and one scales plane; tensors keep their single request.
+        assert_eq!(fp8.len(), bf16.len() + 5);
+        let names = bf16.iter().map(|(name, _)| name).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), bf16.len(), "request names must be unique");
+    }
     use serde_json::json;
 
     fn qwen() -> Value {
@@ -632,4 +669,102 @@ mod tests {
         c["dflash_config"]["target_layer_ids"] = json!([4, 64]);
         assert!(BlockDsparkConfig::from_json(&c).is_err());
     }
+}
+
+/// One draft layer's checkpoint operands, in loader order.
+pub struct BlockDsparkLayer<T, M> {
+    pub input_norm: T, pub post_norm: T, pub qkv: M, pub q_norm: T, pub k_norm: T,
+    pub o: M, pub gate_up: M, pub down: M,
+}
+
+/// Every checkpoint-sourced drafter weight. `tensor` binds one tensor of a
+/// shape; `matrix` binds row-concatenated parts sharing `cols`.
+pub struct BlockDsparkWeights<T, M> {
+    pub layers: Vec<BlockDsparkLayer<T, M>>, pub fc: M, pub hidden_norm: T, pub norm: T,
+    pub markov_w1: T, pub markov_w2: T, pub confidence_w: T, pub confidence_b: T,
+}
+
+/// The single recipe for runtime loading and admission: names, shapes and the
+/// order in which the loader requests each owner.
+pub fn block_dspark_weight_recipe<T, M, E>(cfg: &BlockDsparkConfig,
+    mut tensor: impl FnMut(&str, &[usize]) -> Result<T, E>,
+    mut matrix: impl FnMut(&[(&str, usize)], usize) -> Result<M, E>) -> Result<BlockDsparkWeights<T, M>, E> {
+    let (h, inter) = (cfg.hidden, cfg.intermediate);
+    let (q, kv) = (cfg.heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim);
+    let layers = (0..cfg.layers).map(|l| -> Result<_, E> {
+        let p = format!("layers.{l}");
+        let a = format!("{p}.self_attn");
+        Ok(BlockDsparkLayer {
+            input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
+            post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
+            qkv: matrix(&[(&format!("{a}.q_proj.weight"), q), (&format!("{a}.k_proj.weight"), kv),
+                (&format!("{a}.v_proj.weight"), kv)], h)?,
+            q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
+            k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
+            o: matrix(&[(&format!("{a}.o_proj.weight"), h)], q)?,
+            gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
+                (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
+            down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], inter)?,
+        })
+    }).collect::<Result<Vec<_>, E>>()?;
+    let markov_w2 = tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?;
+    Ok(BlockDsparkWeights { layers, markov_w2,
+        fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?,
+        hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
+        markov_w1: tensor("markov_head.markov_w1.weight", &[cfg.vocab, cfg.rank])?,
+        confidence_w: tensor("confidence_head.proj.weight", &[1, h + cfg.rank])?,
+        confidence_b: tensor("confidence_head.proj.bias", &[1])?,
+    })
+}
+
+/// Final device owners the loader binds, in order, from checkpoint headers:
+/// one request per tensor, row-concatenated BF16 matrix, or FP8 payload/scales
+/// plane pair, plus the Markov norms and the RoPE table. A runtime arena and
+/// admission both size from exactly this list.
+pub fn block_dspark_arena_requests(snapshot: &Path,
+    representation: crate::families::glm5::draft_representation::GlmDraftRepresentation)
+    -> anyhow::Result<Vec<(String, usize)>> {
+    use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+    use anyhow::{ensure, Context};
+    let cfg = BlockDsparkConfig::read(snapshot)?;
+    let headers = crate::read_safetensors_metadata(&snapshot.join("model.safetensors"))?
+        .into_iter().map(|t| (t.name.clone(), t)).collect::<std::collections::HashMap<_, _>>();
+    let bf16 = |name: &str, shape: &[usize]| -> anyhow::Result<usize> {
+        let tensor = headers.get(name).with_context(|| format!("drafter checkpoint has no {name}"))?;
+        ensure!(tensor.dtype == cuteafd_core::DType::Bf16, "{name}: drafter weights must be BF16, found {:?}", tensor.dtype);
+        let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
+            .with_context(|| format!("{name}: BF16 tensor byte count overflow"))?;
+        ensure!(tensor.shape == shape && tensor.byte_length == bytes as u64,
+            "{name}: shape {:?}/{} bytes, expected BF16 {shape:?}/{bytes} bytes", tensor.shape, tensor.byte_length);
+        Ok(bytes)
+    };
+    let requests = std::cell::RefCell::new(Vec::new());
+    block_dspark_weight_recipe(&cfg, |name, shape| {
+        requests.borrow_mut().push((name.to_owned(), bf16(name, shape)?.max(256)));
+        Ok::<_, anyhow::Error>(())
+    }, |parts, cols| {
+        let bytes = parts.iter().try_fold(0usize, |n, (name, rows)| -> anyhow::Result<usize> {
+            n.checked_add(bf16(name, &[*rows, cols])?).context("block dSpark matrix extent overflow")
+        })?;
+        let name = parts.iter().map(|(name, _)| *name).collect::<Vec<_>>().join("+");
+        if representation == GlmDraftRepresentation::Bf16Only {
+            requests.borrow_mut().push((name, bytes.max(256)));
+        } else {
+            let rows = parts.iter().try_fold(0usize, |n, (_, rows)| n.checked_add(*rows))
+                .context("block dSpark matrix rows overflow")?;
+            ensure!(rows > 0 && rows % 16 == 0 && cols > 0 && cols % 128 == 0,
+                "block dSpark FP8 shape {rows}/{cols}");
+            let payload = bytes / 2;
+            requests.borrow_mut().extend([(format!("{name}.payload"), payload),
+                (format!("{name}.scales"), payload / 128 * 4)]);
+        }
+        Ok(())
+    })?;
+    let mut requests = requests.into_inner();
+    requests.push(("markov_norms".into(), cfg.vocab.checked_mul(4).context("block dSpark norms extent overflow")?));
+    if cfg.head_dim != 64 {
+        let plan = cfg.rope.plan(cfg.head_dim)?;
+        requests.push(("inv_freq".into(), std::mem::size_of_val(plan.inv_freq.as_slice()).max(256)));
+    }
+    Ok(requests)
 }

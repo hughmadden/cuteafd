@@ -101,12 +101,22 @@ impl<'a> Mtp<'a> {
         bindings[0] = Some(binding);
         let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim),
             hidden_bytes: cfg.hidden * 2 };
+        // Native MTP is its own retired scope: one arena, borrowing only the target embedding/head.
+        let arena = super::super::weights::ScopeArena::new(device,
+            super::super::weights::mtp_arena(reader.checkpoint, &cfg, format)?)?;
+        let mut allocate = |name: &str, bytes| arena.allocate(name, bytes);
+        let bf16 = |name: &str| reader.bf16_with(name, name, &mut |name: &str, bytes| arena.allocate(name, bytes));
+        let (fc, norm_hidden, norm_embedding, norm) = (bf16("mtp.fc.weight")?, bf16("mtp.pre_fc_norm_hidden.weight")?,
+            bf16("mtp.pre_fc_norm_embedding.weight")?, bf16("mtp.norm.weight")?);
+        let layer = reader.dense_layer("mtp.layers.0", HybridAttention::Full, format, &mut allocate)?;
+        arena.complete()?;
+        tracing::info!(arena = arena.layout().id(), bytes = arena.layout().bytes(),
+            views = arena.layout().views().len(), padding = arena.layout().padding_bytes(),
+            "dense Qwen native MTP weight arena allocated");
         let out = Self {
             library: device.library, stream: engine.stream.raw,
             projection: cuteafd_ffi::draft_projection::DraftProjections::load(engine.programs, &[(2 * cfg.hidden, cfg.hidden)], HEAD_ROWS)?,
-            layer: reader.dense_layer("mtp.layers.0", HybridAttention::Full, format)?,
-            fc: reader.bf16("mtp.fc.weight")?, norm_hidden: reader.bf16("mtp.pre_fc_norm_hidden.weight")?,
-            norm_embedding: reader.bf16("mtp.pre_fc_norm_embedding.weight")?, norm: reader.bf16("mtp.norm.weight")?,
+            layer, fc, norm_hidden, norm_embedding, norm,
             concat: Allocation::new(device, HEAD_ROWS * 2 * cfg.hidden * 2)?,
             hidden: Allocation::new(device, ROWS * cfg.hidden * 2)?,
             logits: Allocation::new(device, HEAD_ROWS * cfg.vocab * 4)?,
@@ -515,6 +525,30 @@ impl crate::shared::prefix::cuda_copy::SnapshotOwner for MtpCache<'_> {
     fn snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>> {
         let mtp = self.0.borrow();
         Ok(vec![mtp.kv.buffer, mtp.sidecars.buffer])
+    }
+}
+
+impl Mtp<'_> {
+    fn weight_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.layer.inventory(inventory, "layer.0")?;
+        for (name, owner) in [("fc", &self.fc), ("pre_fc_norm_hidden", &self.norm_hidden),
+            ("pre_fc_norm_embedding", &self.norm_embedding), ("norm", &self.norm)] {
+            owner.inventory(inventory, name)?;
+        }
+        Ok(())
+    }
+}
+
+impl MtpCache<'_> {
+    /// Native MTP arena receipts; its pages and planes are workspace, not weights.
+    pub(crate) fn weight_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        use cuteafd_loader::placement::planner::{Lifetime, Phase};
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "qwen3_5.mtp",
+            Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+            cuteafd_core::memory_layout::Category::Drafter, "native MTP weights");
+        self.0.borrow().weight_receipts(&mut inventory)?;
+        Ok(inventory.receipts)
     }
 }
 

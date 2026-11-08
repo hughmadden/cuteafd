@@ -58,6 +58,19 @@ pub(crate) struct DenseBackend<'e, 'a> {
 }
 
 impl<'e, 'a> DenseBackend<'e, 'a> {
+    /// Retained weight owners for the opt-in startup census: the target arena
+    /// (with its embedding and head) and the separately admitted drafter arena.
+    fn weight_census(&self, device: i32) -> Result<crate::shared::memory::receipts::Census> {
+        let physical = [device];
+        let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+        let mut census = crate::shared::memory::receipts::Census::default();
+        census.owners(self.engine.borrow().weight_receipts(devices)?);
+        if let Some(drafter) = &self.drafter { census.owners(super::dspark::weight_receipts(drafter, devices)?); }
+        if let Some(mtp) = &self.mtp { census.owners(mtp.weight_receipts(devices)?); }
+        census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        Ok(census)
+    }
+
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>, library: &'a NativeLibrary) -> Self {
         Self { engine, library, drafter: None, mtp: None, selector: RefCell::new(None),
             profile: RefCell::new([0.0; 2]), pending: RefCell::new(None),
@@ -621,8 +634,11 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 drafts, eos, engine_args.decode_share, &engine_args.prefix,
                 engine_args.loop_abort.config(), engine_args.token_io.token_select, &mut text_media(), None, || {
                     let history = startup_audit.map(|audit| audit.finish());
+                    let census = crate::shared::inventory::startup_probe_enabled()
+                        .then(|| backend.weight_census(engine_args.device)).transpose()?;
                     crate::shared::inventory::startup_probe(&library, &[engine_args.device], "qwen3_5/ready",
-                        crate::shared::inventory::StartupEvidence { history: history.as_ref(), ..Default::default() })?;
+                        crate::shared::inventory::StartupEvidence { history: history.as_ref(),
+                            census: census.as_ref(), ..Default::default() })?;
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(Ok(backend.geometry().max_context));
                     }

@@ -137,7 +137,7 @@ impl<'a> DenseEngine<'a> {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
         let reader = WeightReader { library, checkpoint };
-        let format = super::weights::DenseFormat::detect(&reader)?;
+        let format = super::weights::DenseFormat::detect(checkpoint)?;
         let admitted = DensePrograms::new(&cfg, programs, kv_format, format)?;
         let weight_bytes = NativeWeights::native(checkpoint, &cfg, admitted.norm_dtype.clone())?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
@@ -195,9 +195,19 @@ impl<'a> DenseEngine<'a> {
             "dense Qwen admitted before weight/state allocation");
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
+        // One preplanned backing holds every target layer, the final norm, head and embedding.
+        let arena = super::weights::ScopeArena::new(device,
+            super::weights::target_arena(checkpoint, &cfg, admitted.norm_dtype.clone(), format)?)?;
+        tracing::info!(arena = arena.layout().id(), bytes = arena.layout().bytes(),
+            views = arena.layout().views().len(), padding = arena.layout().padding_bytes(),
+            "dense Qwen target weight arena allocated");
         let (embedding, weights) = crate::shared::experts::rtx::push::load_alone(
-            &checkpoint.snapshot, &[device], || TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
-                || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format)))?;
+            &checkpoint.snapshot, &[device], || TokenEmbedding::load_with(library, source, EmbedPlacement::Gpu,
+                || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format,
+                    &mut |name: &str, bytes| arena.allocate(name, bytes)),
+                |name, bytes| arena.allocate(name, bytes)))?;
+        arena.complete()?;
+        drop(arena);
         let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
@@ -249,6 +259,18 @@ impl<'a> DenseEngine<'a> {
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, admitted_host_config: host_config, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
             prefix_arena, prefix_marks, healthy: true, verification })
+    }
+
+    /// Retained target weight owners: one arena backing plus a view per tensor.
+    pub(crate) fn weight_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "qwen3_5.target",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "dense weights");
+        self.weights.inventory(&mut inventory)?;
+        let mut receipts = inventory.receipts;
+        receipts.extend(self.embedding.allocation_receipts(devices, "qwen3_5.embedding")?);
+        Ok(receipts)
     }
 
     pub(crate) fn slot_count(&self) -> usize { self.slots.len() }
