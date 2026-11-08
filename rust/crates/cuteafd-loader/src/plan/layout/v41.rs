@@ -161,7 +161,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut reserves = Vec::new();
     let draft_rows = dspark.then(|| {
         let lanes = if shape.concurrency == 1 { 1 } else { 2 };
-        let live = shape.concurrency.div_ceil(lanes) * if options.dspark_draft_limit > 5 { 7 } else { 5 };
+        let live = shape.concurrency.div_ceil(lanes) * if options.v41_draft_width > 5 { 7 } else { 5 };
         [16, 40, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64,
             cuteafd_core::V41_DRAFT_WIDE_ROWS as u64].into_iter().find(|&rows| rows >= live).unwrap()
     });
