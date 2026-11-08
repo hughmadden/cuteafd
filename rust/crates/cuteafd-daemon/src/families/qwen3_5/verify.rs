@@ -55,9 +55,10 @@ impl<'a> Verification<'a> {
     pub(super) fn new(device: Device<'a>, cfg: &Qwen35Config, slots: usize) -> Result<Self> {
         let mut layout = Self::layout(cfg, slots)?;
         for owner in &mut layout.owners { owner.0 = device.id; }
-        let mark = Rc::new(Allocation::untagged(device, layout.bytes.max(256))?);
-        let logits = Allocation::untagged(device, REPLAY_ROWS * cfg.vocab * 4)?;
-        let hidden = Allocation::untagged(device, cfg.attention.len() * REPLAY_ROWS * cfg.hidden * 2)?;
+        let mark = Rc::new(Allocation::new(device, layout.bytes.max(256), Tag::kv("qwen35/verify-mark"))?);
+        let logits = Allocation::new(device, REPLAY_ROWS * cfg.vocab * 4, Tag::workspace("qwen35/verify-logits"))?;
+        let hidden = Allocation::new(device, cfg.attention.len() * REPLAY_ROWS * cfg.hidden * 2,
+            Tag::workspace("qwen35/verify-hidden"))?;
         let owner = NEXT_ENGINE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| anyhow::anyhow!("dense target identity exhausted"))?;
         Ok(Self { owner, generation: 0, mark, layout, logits, hidden, taps: Vec::new(), pending: None })
