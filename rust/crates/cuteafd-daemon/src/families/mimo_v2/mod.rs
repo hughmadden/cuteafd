@@ -1210,24 +1210,26 @@ impl Opened {
         }
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
-            let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
-                let allocation = crate::shared::memory::DeviceAllocation::untagged(&self.library, bytes.max(256))?;
+            let zeroed = |bytes: usize, tag: crate::shared::memory::Tag| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
+                let allocation = crate::shared::memory::DeviceAllocation::new(&self.library, bytes.max(256), tag)?;
                 self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                 Ok(allocation)
             };
+            let scratch = |bytes: usize| zeroed(bytes, crate::shared::memory::Tag::drafter_workspace("mimo/mtp-workspace"));
             let (h, record) = (self.cfg.hidden, self.cfg.record_bytes(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding,
                 args.kv_formats()));
             let stages = mtp_weights.into_iter().map(|weights| -> Result<mtp::MtpStage<'_>> {
                 let [eh, enorm, hnorm, final_norm] = weights.extras;
                 Ok(mtp::MtpStage { layer: weights.layer, eh, enorm, hnorm, final_norm,
-                    ring: zeroed(args.rings * engine::RING_ROWS * record)? })
+                    ring: zeroed(args.rings * engine::RING_ROWS * record, crate::shared::memory::Tag::drafter_kv("mimo/mtp-rings"))? })
             }).collect::<Result<Vec<_>>>()?;
             let rows = engine::DECODE_ROWS;
-            let drafter = mtp::MtpDrafter { projection: cuteafd_ffi::draft_projection::DraftProjections::load(&programs, &[(2 * h, h)], rows)?, stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
-                embed: zeroed(rows * h * 2)?, rows_h: zeroed(rows * h * 2)?, normed_e: zeroed(rows * h * 2)?,
-                normed_h: zeroed(rows * h * 2)?, cat: zeroed(rows * 2 * h * 2)?,
+            let drafter = mtp::MtpDrafter { projection: cuteafd_ffi::draft_projection::DraftProjections::load(&programs, &[(2 * h, h)], rows)?, stages,
+                hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2, crate::shared::memory::Tag::drafter_kv("mimo/mtp-hidden-rings"))?,
+                embed: scratch(rows * h * 2)?, rows_h: scratch(rows * h * 2)?, normed_e: scratch(rows * h * 2)?,
+                normed_h: scratch(rows * h * 2)?, cat: scratch(rows * 2 * h * 2)?,
                 ext: std::cell::RefCell::new(vec![vec![0; args.mtp]; args.rings]),
-                ids: zeroed((1 + args.mtp) * rows * 4)?, index: zeroed(rows * 4)? };
+                ids: scratch((1 + args.mtp) * rows * 4)?, index: scratch(rows * 4)? };
             tracing::info!(stages = args.mtp, elapsed_ms = started.elapsed().as_millis() as u64, "MTP drafter resident");
             Some(drafter)
         } else {

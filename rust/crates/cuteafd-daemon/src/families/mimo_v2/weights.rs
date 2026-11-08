@@ -21,7 +21,7 @@
 //! router weight (Flash) becomes `w_hilo = [bf16(w);
 //! bf16(w - bf16(w))]` for the router program's two FP32-accumulated BF16
 //! products, a BF16 one (V2.6 Pro) is `w_router` as stored.
-use crate::shared::memory::{DeviceAllocation, device::Device, weight_arena::{DeviceWeightArena, weight_allocation}};
+use crate::shared::memory::{DeviceAllocation, Tag, device::Device, weight_arena::{DeviceWeightArena, weight_allocation}};
 use cuteafd_loader::families::mimo_v2::weight_arena::{MimoArenaLayouts, operand_key};
 use super::head::MimoHead;
 use cuteafd_loader::families::mimo_v2::projection::{MimoProjectionLayout, MimoProjectionRepresentation, MIMO_PROJECTION_STAGING_ROWS};
@@ -268,7 +268,7 @@ impl<'a> MimoLoader<'a> {
     }
 
     fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
-        let allocation = DeviceAllocation::untagged(self.library, bytes.len().max(256))?;
+        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256), Tag::staging("mimo/load-staging"))?;
         self.library.copy_h2d(allocation.buffer, bytes)?;
         Ok(allocation)
     }
@@ -319,7 +319,8 @@ impl<'a> MimoLoader<'a> {
                 self.library.copy_h2d(scales.buffer, &f32_bytes(&row_scales))?;
                 row_scales
             } else {
-                let staging = DeviceAllocation::untagged(self.library, usize::try_from(layout.max_load_staging)?)?;
+                let staging = DeviceAllocation::new(self.library, usize::try_from(layout.max_load_staging)?,
+                    Tag::staging("mimo/load-staging"))?;
                 let queued = (|| -> Result<()> {
                     let mut block = vec![0u8; staging.buffer.bytes];
                     for first in (0..rows).step_by(MIMO_PROJECTION_STAGING_ROWS as usize) {
@@ -682,7 +683,7 @@ impl<'a> MimoLoader<'a> {
             let transient = lands.iter().all(|(rect, _)| rect.name.ends_with("_scale_inv"));
             let fp8 = !transient && lands.iter().all(|(rect, _)|
                 self.tensor(&rect.name).is_ok_and(|t| t.meta.dtype == DType::F8E4M3));
-            let allocation = if transient { DeviceAllocation::untagged(self.library, bytes.max(256))? }
+            let allocation = if transient { DeviceAllocation::new(self.library, bytes.max(256), Tag::staging("mimo/load-staging"))? }
                 else { self.allocation(&if fp8 { format!("{names}.fp8") } else { names }, bytes)? };
             for range in zero.iter().filter(|r| !r.is_empty()) {
                 // SAFETY (offset): the range lies inside the new allocation.
