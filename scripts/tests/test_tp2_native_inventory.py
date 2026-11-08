@@ -575,3 +575,40 @@ def test_every_family_measures_shared_native_preload_before_its_baseline():
     guard = spark.split("fn native_initialize_before_waits", 1)[1].split("impl<'a> Waves", 1)[0]
     assert guard.index("ensure!(library.native_modules_preloaded()?") < guard.index("library.tp2_native_initialize()")
     assert "native_initialize_before_waits(library)?;" in spark.split("pub(crate) fn start", 1)[1]
+
+
+def test_spark_wait_guard_callers_have_an_earlier_preweight_window():
+    daemon = ROOT / "rust/crates/cuteafd-daemon/src"
+    # Same-function ordering, with split-rank loops retained around inventory.
+    for path, end in [
+        ("families/deepseek_v4/mod.rs", "transports.push(SparkLink::"),
+        ("families/deepseek_v41/v41_native_serve.rs", "transport.bootstrap("),
+        ("families/deepseek_v41/v41_native_serve/distributed.rs", "transport.get_mut().bootstrap("),
+        ("families/glm5/mod.rs", "SparkLink::prepared("),
+        ("families/glm5_flash/mod.rs", "crate::shared::spark_intake::SparkLink::new_waves("),
+        ("families/qwen4/mod.rs", "crate::shared::spark_intake::SparkLink::new_waves("),
+        ("families/step5/serve.rs", "SparkLink::new_waves("),
+        ("families/muse_spark/serve.rs", "super::engine::MuseEngine::connect("),
+        ("families/kimi_k3/startup.rs", "Engine::load_admitted("),
+    ]:
+        source = (daemon / path).read_text()
+        assert source.index("InventoryPhase::PreWeight") < source.index(end), path
+    mimo = (daemon / "families/mimo_v2/mod.rs").read_text().split(
+        "// Load only selected modules, then measure the admission baseline before tensors.", 1)[1]
+    assert mimo.index("preload_native_modules(") < mimo.index("crate::shared::spark_intake::SparkLink::new(")
+    # EXLR8 and ML4 execute the same GLM engine body; no alternate Spark startup.
+    glm = (daemon / "families/glm5/mod.rs").read_text()
+    assert "fn with_resolved_engine_media" in glm
+    assert "CheckpointFormat::Exlr8" in glm and "ml4_draft" in glm
+    serve = (daemon / "families/glm5/serve.rs").read_text()
+    assert "opened.with_resolved_engine_media(" in serve
+    # The ordinary Spark workers (all native/FP8/EXL3/EXLR8 roles) are servers,
+    # not coordinator Wave consumers; they must never acquire this wait guard.
+    worker = daemon / "shared/experts/service"
+    for path in [daemon / "shared/experts/service.rs", *worker.rglob("*.rs")]:
+        source = path.read_text()
+        assert "SparkLink::" not in source and "Waves::start(" not in source, path
+    # Qualification-only coordinators explicitly enter the shared preload too.
+    for path in ["families/step5/golden.rs", "families/step5/chain.rs",
+                 "shared/experts/tp_gate.rs", "shared/experts/exlr8_decode_gate.rs"]:
+        assert "crate::shared::inventory::preload_native_modules(" in (daemon / path).read_text(), path

@@ -2010,18 +2010,18 @@ fn native_wait_guard_reuses_preweight_load_on_each_device() -> Result<()> {
     let library = fixture.load()?;
     for device in [0, 1] {
         library.cuda_set_device(device)?;
-        let before = fixture.events()?;
+        let before = fixture.native_initializations(&library)?;
         assert!(native_initialize_before_waits(&library).is_err());
-        assert_eq!(fixture.events()?, before, "guard must not be the first loader");
+        assert_eq!(fixture.native_initializations(&library)?, before, "guard must not be the first loader");
         crate::shared::inventory::preload_native_modules(&library)?;
-        let loaded = fixture.events()?;
-        assert_eq!(loaded.matches('N').count(), device as usize + 1);
+        let loaded = fixture.native_initializations(&library)?;
+        assert_eq!(loaded, device + 1);
         native_initialize_before_waits(&library)?;
         native_initialize_before_waits(&library)?;
-        assert_eq!(fixture.events()?, loaded, "Spark start must not load again");
+        assert_eq!(fixture.native_initializations(&library)?, loaded, "Spark start must not load again");
     }
     library.cuda_set_device(0)?;
     native_initialize_before_waits(&library)?;
-    assert_eq!(fixture.events()?.matches('N').count(), 2);
+    assert_eq!(fixture.native_initializations(&library)?, 2);
     Ok(())
 }
