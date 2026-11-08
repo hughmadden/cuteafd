@@ -227,8 +227,8 @@ static int32_t release_owner(Owner* o, uint32_t* released) {
 #endif
   o->window_attention=nullptr; o->attention=nullptr;
   if(o->blas) { cublasDestroy(o->blas); o->blas=nullptr; }
-  if(o->weights) { int rc=CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights)); if(rc==0){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;} else if(!first)first=rc; }
-  if(o->arena) { int rc=CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena)); if(rc==0){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;} else if(!first)first=rc; }
+  if(o->weights) { int rc=cudaFree(o->weights); if(rc==0){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;} else if(!first)first=rc; }
+  if(o->arena) { int rc=cudaFree(o->arena); if(rc==0){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;} else if(!first)first=rc; }
   if(o->stream) { int rc=cudaStreamDestroy(o->stream); if(!first)first=rc; o->stream=nullptr; }
   if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
   return first;

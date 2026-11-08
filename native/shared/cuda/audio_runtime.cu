@@ -258,8 +258,8 @@ static int32_t release_owner(Owner* o, uint32_t* released) {
   if(o->support) { int e=cuteafd_audio_support_destroy(o->support);if(!first)first=e;o->support=nullptr; }
   if(o->fft) { int e=fs(cufftDestroy(o->fft));if(!first)first=e;o->fft=0; }
   if(o->blas) { int e=bs(cublasDestroy(o->blas));if(!first)first=e;o->blas=nullptr; }
-  if(o->weights) { int e=CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;}if(!first)first=e; }
-  if(o->arena) { int e=CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;}if(!first)first=e; }
+  if(o->weights) { int e=cudaFree(o->weights);if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;}if(!first)first=e; }
+  if(o->arena) { int e=cudaFree(o->arena);if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;}if(!first)first=e; }
   if(o->stream) { int e=cudaStreamDestroy(o->stream);if(!first)first=e;o->stream=nullptr; }
   if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
   return first;

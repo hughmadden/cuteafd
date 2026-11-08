@@ -991,7 +991,8 @@ extern "C" int32_t cuteafd_media_allocate(void** ptr, size_t bytes, uint32_t kin
   *ptr = nullptr;
   if (check_tag(kind, owner) != CUTEAFD_STATUS_OK) return 1;
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  return static_cast<int32_t>(cudaMalloc(ptr, bytes));
+  // A failure reaches the memory-failure callback with this attempt's tag retained.
+  return static_cast<int32_t>(CUTEAFD_CHECK_MEMORY("cudaMalloc", "cuda", cudaMalloc(ptr, bytes), bytes, 1, nullptr));
 #else
   return 35;  // cudaErrorInsufficientDriver: no device allocations without CUDA
 #endif
@@ -2871,8 +2872,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
   out->sender_qp_num = sender_qp->qp_num;
   out->receiver_qp_num = receiver_qp->qp_num;
 
-  send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(bytes));
-  recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(bytes));
+  send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(bytes, CUTEAFD_MEMORY_KIND_TRANSPORT, "native/rdma-loopback-probe"));
+  recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(bytes, CUTEAFD_MEMORY_KIND_TRANSPORT, "native/rdma-loopback-probe"));
   if (send_buffer == nullptr || recv_buffer == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_ALLOCATION_FAILED,
@@ -3174,10 +3175,10 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
   out->client_qp_num = client_qp->qp_num;
   out->server_qp_num = server_qp->qp_num;
 
-  client_request_send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(request_bytes));
-  server_request_recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(request_bytes));
-  server_response_send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(response_bytes));
-  client_response_recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(response_bytes));
+  client_request_send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(request_bytes, CUTEAFD_MEMORY_KIND_TRANSPORT, "native/protocol-v2-loopback-probe"));
+  server_request_recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(request_bytes, CUTEAFD_MEMORY_KIND_TRANSPORT, "native/protocol-v2-loopback-probe"));
+  server_response_send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(response_bytes, CUTEAFD_MEMORY_KIND_TRANSPORT, "native/protocol-v2-loopback-probe"));
+  client_response_recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(response_bytes, CUTEAFD_MEMORY_KIND_TRANSPORT, "native/protocol-v2-loopback-probe"));
   if (client_request_send_buffer == nullptr || server_request_recv_buffer == nullptr ||
       server_response_send_buffer == nullptr || client_response_recv_buffer == nullptr) {
     cleanup();
@@ -3557,7 +3558,8 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
       return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
                        "cudaHostAlloc RDMA RC endpoint send buffer failed", cuda_status);
     }
-    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(send_buffer), send_registered_span_bytes, 0, __FILE__, __LINE__);
+    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(send_buffer), send_registered_span_bytes, 0, __FILE__, __LINE__,
+                         CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings");
     endpoint->send_buffer = static_cast<unsigned char*>(send_buffer);
     void* recv_buffer = nullptr;
     cuda_status = CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(
@@ -3567,12 +3569,13 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
       return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
                        "cudaHostAlloc RDMA RC endpoint recv buffer failed", cuda_status);
     }
-    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(recv_buffer), recv_registered_span_bytes, 0, __FILE__, __LINE__);
+    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(recv_buffer), recv_registered_span_bytes, 0, __FILE__, __LINE__,
+                         CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings");
     endpoint->recv_buffer = static_cast<unsigned char*>(recv_buffer);
 #endif
   } else {
-    endpoint->send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(send_registered_span_bytes));
-    endpoint->recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(recv_registered_span_bytes));
+    endpoint->send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(send_registered_span_bytes, CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings"));
+    endpoint->recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(recv_registered_span_bytes, CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings"));
   }
   if (endpoint->send_buffer == nullptr || endpoint->recv_buffer == nullptr) {
     destroy_rdma_rc_endpoint(endpoint);
