@@ -466,7 +466,7 @@ impl Owners {
             ByteCurve(vec![BytePiece { first: 1, last: self.maximum,
                 bytes_at_first: bytes_per_page.checked_add(fixed)
                     .ok_or(Refusal::Overflow("V4 paged extent"))?,
-                bytes_per_page, granularity }])
+                bytes_per_page, granularity, backings: 1 }])
         };
         let mut component = Component::allocation(
             Allocation::buffer(
