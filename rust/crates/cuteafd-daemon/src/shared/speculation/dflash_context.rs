@@ -36,7 +36,9 @@ impl<'a> ContextOwner<'a> {
                 if rank == 1 && buffer.name.starts_with("layer.") { continue; }
                 let allocation = streams[rank].device.run(|| {
                     let _scope = cuteafd_ffi::memory_ledger::scope("drafter/mla/context");
-                    Allocation::new(streams[rank].device, buffer.bytes, Tag::drafter_kv("shared/dflash-context"))
+                    // The recipe states each buffer's kind (MlaDraftBuffer::kind_of).
+                    Allocation::new(streams[rank].device, buffer.bytes,
+                        crate::shared::memory::tag(buffer.kind, &format!("shared/mla-context/{rank}/{}", buffer.name)))
                 })?;
                 buffers[rank].insert(buffer.name.clone(), allocation);
             }
@@ -429,7 +431,7 @@ mod tests {
                 assert_ne!(source_tail % 2, saved_tail % 2, "capture must cross physical owners");
                 let before = devices[1].run(|| draft.mla_readback(0, 0))?;
                 let marks = devices[1].run(|| draft.mla_window_buffers(0)?.iter()
-                    .map(|buffer| Allocation::new(devices[1], buffer.bytes, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>())?;
+                    .map(|buffer| Allocation::new(devices[1], buffer.bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>())?;
                 let mark_buffers = marks.iter().map(|owner| owner.buffer).collect::<Vec<_>>();
                 devices[1].run(|| draft.copy_mla_windows(0, &mark_buffers, true))?;
                 devices[1].run(|| draft.copy_mla_windows(1, &mark_buffers, false))?;

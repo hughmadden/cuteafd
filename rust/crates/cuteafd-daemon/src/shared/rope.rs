@@ -176,7 +176,7 @@ mod tests {
         let programs=library.programs()?;
         let mut called=false;
         assert!(RotaryTables::load_with(device,&programs,plan,"missing.",1<<30,&[],|_,bytes| {
-            called=true; Allocation::new(device,bytes, cuteafd_ffi::memory_ledger::TEST)
+            called=true; Allocation::new(device,bytes, crate::shared::memory::TEST)
         }).is_err());
         assert!(!called);
         Ok(())

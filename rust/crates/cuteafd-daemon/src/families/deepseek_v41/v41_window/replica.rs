@@ -210,7 +210,7 @@ mod tests {
                 }
                 drop(append);
                 assert!(unsafe { replica.copy_commit(&state,lease,402,producer.raw) }.is_err());
-                let storage=DeviceAllocation::new(&lib,WINDOW_PREFIX_BYTES, cuteafd_ffi::memory_ledger::TEST)?;
+                let storage=DeviceAllocation::new(&lib,WINDOW_PREFIX_BYTES, crate::shared::memory::TEST)?;
                 let (begin,end)=unsafe { state.retain_prefix(lease,storage.buffer,producer.raw)? };
                 producer.drain()?;
                 for restore_device in [owner,peer] {

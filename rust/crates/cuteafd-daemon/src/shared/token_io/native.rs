@@ -515,7 +515,7 @@ mod tests {
         let plan = DensePlan::for_rank(&[record], 1, 0)?;
         let slice = &plan.tensors[0];
         let requests = row_requests(slice)?;
-        let mut staging = HostAllocation::new(&library, plan.read_staging_bytes.max(256), cuteafd_ffi::memory_ledger::TEST)?;
+        let mut staging = HostAllocation::new(&library, plan.read_staging_bytes.max(256), crate::shared::memory::TEST)?;
         let weights = load_rows(&library, slice, &mut staging)?;
         let expected = requests.into_iter().map(|(_, bytes)| bytes).collect::<Vec<_>>();
         assert_eq!(expected, [weights.payload().bytes, weights.scales().bytes]);
@@ -1054,7 +1054,7 @@ mod tests {
             )?
             .is_none()
         );
-        let ids = DeviceAllocation::new(&library, 5 * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let ids = DeviceAllocation::new(&library, 5 * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(
             ids.buffer,
             &[0i32, (N - 1) as i32, 17, -1, N as i32]
@@ -1062,10 +1062,10 @@ mod tests {
                 .flat_map(i32::to_le_bytes)
                 .collect::<Vec<_>>(),
         )?;
-        let output = DeviceAllocation::new(&library, 5 * K * 2, cuteafd_ffi::memory_ledger::TEST)?;
-        let x = DeviceAllocation::new(&library, K * 2, cuteafd_ffi::memory_ledger::TEST)?;
+        let output = DeviceAllocation::new(&library, 5 * K * 2, crate::shared::memory::TEST)?;
+        let x = DeviceAllocation::new(&library, K * 2, crate::shared::memory::TEST)?;
         library.copy_h2d(x.buffer, &0x3f80u16.to_le_bytes().repeat(K))?;
-        let logits = DeviceAllocation::new(&library, N * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let logits = DeviceAllocation::new(&library, N * 4, crate::shared::memory::TEST)?;
         let mut embedding = vec![0; 5 * K * 2];
         let mut scores = vec![0; N * 4];
         // SAFETY: all operands match the validated ABI and survive the explicit device drain.
@@ -1115,7 +1115,7 @@ mod tests {
         drop(owner);
         let stream = crate::shared::memory::device::Stream::new(
             crate::shared::memory::device::Device { library: &library, id: 0 })?;
-        let expanded = DeviceAllocation::new(&library, 5 * 4 * K * 2, cuteafd_ffi::memory_ledger::TEST)?;
+        let expanded = DeviceAllocation::new(&library, 5 * 4 * K * 2, crate::shared::memory::TEST)?;
         for embedding_device in [0, 1] {
             if embedding_device == 1 {
                 stream.device.run(|| library.cuda_enable_peer(1))?;

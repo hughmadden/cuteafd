@@ -89,9 +89,9 @@ mod tests {
             for rows in [1usize,7,16] {
                 for (ranks,topk) in [(1usize,3usize),(2,3),(4,6)] {
                     let count=rows*5120;let plane_count=count*topk;
-                    let planes=(0..ranks).map(|_|Allocation::new(device,plane_count*4, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
-                    let shared=Allocation::new(device,count*2, cuteafd_ffi::memory_ledger::TEST)?;
-                    let output=Allocation::new(device,count*2, cuteafd_ffi::memory_ledger::TEST)?;
+                    let planes=(0..ranks).map(|_|Allocation::new(device,plane_count*4, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
+                    let shared=Allocation::new(device,count*2, crate::shared::memory::TEST)?;
+                    let output=Allocation::new(device,count*2, crate::shared::memory::TEST)?;
                     let pointers=std::array::from_fn(|rank|planes.get(rank).map_or(std::ptr::null(),|p|p.buffer.ptr.cast::<f32>()));
                     for with_shared in [false,true] {
                         let shared_ptr=if with_shared {shared.buffer.ptr.cast::<u16>()} else {std::ptr::null_mut()};

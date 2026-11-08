@@ -964,6 +964,11 @@ extern "C" cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* o
 }
 
 namespace {
+// The most recent tag this thread attempted, retained (owner copied) so a
+// failure report raised after the allocator returns can name what was asked for.
+thread_local uint32_t g_attempted_kind = 0;
+thread_local std::string g_attempted_owner;
+
 // The caller states what it allocates; an untagged request is a caller defect.
 cuteafd_status_t check_tag(uint32_t kind, const char* owner) {
   if (kind == 0 || kind > CUTEAFD_MEMORY_KIND_COUNT) {
@@ -972,9 +977,23 @@ cuteafd_status_t check_tag(uint32_t kind, const char* owner) {
   if (owner == nullptr || owner[0] == '\0') {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "allocation owner is unnamed");
   }
+  g_attempted_kind = kind;
+  g_attempted_owner = owner;
   return CUTEAFD_STATUS_OK;
 }
 }  // namespace
+
+extern "C" cuteafd_status_t cuteafd_last_allocation_tag(uint32_t* kind, char* owner, size_t owner_bytes) {
+  if (kind == nullptr || owner == nullptr || owner_bytes == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "allocation tag output is null");
+  }
+  *kind = g_attempted_kind;
+  if (g_attempted_owner.size() + 1 > owner_bytes) {
+    return fail(CUTEAFD_STATUS_BUFFER_TOO_SMALL, "allocation owner exceeds the output buffer");
+  }
+  std::memcpy(owner, g_attempted_owner.c_str(), g_attempted_owner.size() + 1);
+  return ok();
+}
 
 extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out,
                                                     uint32_t kind, const char* owner) {
@@ -1068,7 +1087,9 @@ extern "C" cuteafd_status_t cuteafd_cuda_b12x_quantize_bf16_nvfp4_row_payload_as
 }
 #endif
 
-extern "C" cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes) {
+extern "C" cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes, uint32_t kind,
+                                                      const char* owner) {
+  if (const cuteafd_status_t tagged = check_tag(kind, owner); tagged != CUTEAFD_STATUS_OK) return tagged;
   if (ptr == nullptr || bytes == 0) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "empty host mapping");
   }

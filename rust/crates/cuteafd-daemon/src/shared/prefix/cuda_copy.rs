@@ -392,7 +392,7 @@ mod cuda_tests {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
-        let owner = Allocation::new(Device { library: &library, id: 0 }, 256, cuteafd_ffi::memory_ledger::TEST)?;
+        let owner = Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?;
         let mut engine = CudaCopyEngine::registered(&library, &[owner.buffer])?;
         let physical = [0];
         let devices = CoordinatorDevices::new(&physical)?;
@@ -425,7 +425,7 @@ mod cuda_tests {
         }
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
-        let owner = Rc::new(Aggregate(Allocation::new(Device { library: &library, id: 1 }, 256, cuteafd_ffi::memory_ledger::TEST)?));
+        let owner = Rc::new(Aggregate(Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?));
         let weak = Rc::downgrade(&owner);
         let engine = CudaCopyEngine::registered_retained(&library, Vec::new(), vec![owner.clone()])?;
         drop(owner);
@@ -443,7 +443,7 @@ mod cuda_tests {
         // SAFETY: all CUDA owners are destroyed before the loaded library.
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
-        let allocations = devices.map(|device| Allocation::new(device, 4096, cuteafd_ffi::memory_ledger::TEST)).into_iter().collect::<Result<Vec<_>>>()?;
+        let allocations = devices.map(|device| Allocation::new(device, 4096, crate::shared::memory::TEST)).into_iter().collect::<Result<Vec<_>>>()?;
         let buffers: Vec<_> = allocations.iter().map(|allocation| allocation.buffer).collect();
         for round in 1..=2u8 {
             let originals: Vec<_> = (0..2).map(|rank| vec![round * 29 + rank * 47; 4096]).collect();
@@ -532,7 +532,7 @@ mod cuda_tests {
         use std::sync::atomic::Ordering;
         // SAFETY: every CUDA owner is destroyed before this loaded library.
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let owners = (0..2).map(|id| Allocation::new(Device { library: &lib, id }, 4096, cuteafd_ffi::memory_ledger::TEST).map(Rc::new))
+        let owners = (0..2).map(|id| Allocation::new(Device { library: &lib, id }, 4096, crate::shared::memory::TEST).map(Rc::new))
             .collect::<Result<Vec<_>>>()?;
         let weak: Vec<_> = owners.iter().map(Rc::downgrade).collect();
         lib.cuda_set_device(0)?;
@@ -575,8 +575,8 @@ mod cuda_tests {
         let mut allocations = Vec::new();
         for id in 0..2 {
             let device = Device { library: &lib, id };
-            allocations.push(Allocation::new(device, 4096, cuteafd_ffi::memory_ledger::TEST)?);
-            allocations.push(Allocation::new(device, 2048, cuteafd_ffi::memory_ledger::TEST)?);
+            allocations.push(Allocation::new(device, 4096, crate::shared::memory::TEST)?);
+            allocations.push(Allocation::new(device, 2048, crate::shared::memory::TEST)?);
         }
         let buffers: Vec<_> = allocations.iter().map(|allocation| allocation.buffer).collect();
         // No peer-access setup: every host copy must use its owning GPU.
@@ -633,7 +633,7 @@ mod cuda_tests {
         lib.cuda_set_device(0)?;
         let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
         for device in devices { device.run(|| lib.cuda_enable_peer(1-device.id))?; }
-        let buffers = devices.map(|device| Allocation::new(device, 4096, cuteafd_ffi::memory_ledger::TEST))
+        let buffers = devices.map(|device| Allocation::new(device, 4096, crate::shared::memory::TEST))
             .into_iter().collect::<Result<Vec<_>>>()?;
         let originals = [vec![17u8; 4096], vec![93u8; 4096]];
         let mut engine = CudaCopyEngine::new(&lib, buffers[0].buffer)?;

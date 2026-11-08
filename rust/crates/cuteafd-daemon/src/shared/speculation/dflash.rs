@@ -300,10 +300,8 @@ impl<'a> MlaDraftStorage<'a> {
             if immutable {
                 super::weights::checked_allocation(library, &b.name, b.bytes, allocate)
             } else {
-                // Paged and ring caches are the drafter's KV; every other mutable owner is step scratch.
-                let tag = if b.name.starts_with("layer.") && b.name.ends_with(".cache") {
-                    Tag::drafter_kv("shared/mla-draft-cache") } else { Tag::drafter_workspace("shared/mla-draft") };
-                DeviceAllocation::new(library, b.bytes, tag)
+                // The recipe states each buffer's kind (MlaDraftBuffer::kind_of).
+                DeviceAllocation::new(library, b.bytes, crate::shared::memory::tag(b.kind, &format!("shared/mla-draft/{}", b.name)))
             }
         }).collect::<Result<Vec<_>>>()?;
         Ok(Self { layout, buffers })
@@ -1252,7 +1250,7 @@ impl<'a> DflashDrafter<'a> {
             fused_norm: zeroed("fused_norm", Tag::drafter_workspace("shared/dflash-context-update"))?,
             context_positions: zeroed("context_positions", Tag::drafter_workspace("shared/dflash-context-update"))?,
             context: DraftContext::Gqa(GqaContext {
-                kv: zeroed("context.kv", Tag::drafter_kv("shared/dflash-context"))?, slots: zeroed("context.slots", Tag::drafter_kv("shared/dflash-context"))?,
+                kv: zeroed("context.kv", Tag::drafter_workspace("shared/dflash-context-update"))?, slots: zeroed("context.slots", Tag::drafter_workspace("shared/dflash-context-update"))?,
             }),
             mask_row,
             mask_rows: None,
@@ -3376,8 +3374,8 @@ mod checkpoint_header_tests {
         struct Owner(Rc<Cell<usize>>);
         impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
         let dropped = Rc::new(Cell::new(0));
-        let recipes = [MlaDraftBuffer { name: "h".into(), bytes: 256 },
-            MlaDraftBuffer { name: "native_scratch".into(), bytes: 1024 }];
+        let recipes = [MlaDraftBuffer { name: "h".into(), bytes: 256, kind: cuteafd_core::memory_layout::MemoryKind::DrafterWorkspace },
+            MlaDraftBuffer { name: "native_scratch".into(), bytes: 1024, kind: cuteafd_core::memory_layout::MemoryKind::DrafterWorkspace }];
         let make = || Owner(dropped.clone());
         let mut buffers = AdmittedBuffers::new(&recipes, vec![make(), make()]).unwrap();
         let common = buffers.take("h").unwrap();

@@ -290,8 +290,8 @@ fn successful_loaders_reclaim_storage_and_unload_normally() -> Result<()> {
         } else { checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])? };
         let formats = BTreeMap::new();
         let loader = loader(&library, &checkpoint, &formats);
-        let preceding_layer = DeviceAllocation::new(&library, 512, cuteafd_ffi::memory_ledger::TEST)?;
-        let preceding_pin = crate::shared::memory::HostAllocation::new(&library, 512, cuteafd_ffi::memory_ledger::TEST)?;
+        let preceding_layer = DeviceAllocation::new(&library, 512, crate::shared::memory::TEST)?;
+        let preceding_pin = crate::shared::memory::HostAllocation::new(&library, 512, crate::shared::memory::TEST)?;
         match path {
             0 => drop(loader.rows(&["weight".into()])?),
             _ => drop(loader.fp8_projection("weight", 1, false)?),

@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "cuteafd_media_backings.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -60,6 +61,11 @@ int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64_t rgb_byte
                              cuteafd_vision_observer observer, void* observer_context);
 int32_t cuteafd_vision_get_ledger(void* owner, cuteafd_vision_ledger*);
 int32_t cuteafd_vision_destroy(void* owner);
+// Passive: the owner's two device backings; no device change or synchronization.
+int32_t cuteafd_vision_get_backings(void* owner, cuteafd_media_backings* out);
+// Destroy, reporting which backings were freed (CUTEAFD_MEDIA_RELEASED_*). A
+// backing whose free failed stays live and its bit stays clear.
+int32_t cuteafd_vision_destroy_backings(void* owner, uint32_t* released);
 
 /* Shared toolkit. Inputs FP32, output BF16; bias may be null. Serialize calls
  * on a current-device stream and retain every extent through completion. */

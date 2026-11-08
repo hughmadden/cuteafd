@@ -805,7 +805,7 @@ mod tp2_tests {
                 Weights::load_peak_device_bytes(Kind::OutputB))?]];
             let mut projection=Wave::new([&halves[0],&halves[1]],capacity,owner,
                 Wave::device_bytes(&library,Kind::OutputB,capacity,owner)?)?;
-            let input=Allocation::new(device,capacity as usize*ROW_BYTES[0], cuteafd_ffi::memory_ledger::TEST)?;
+            let input=Allocation::new(device,capacity as usize*ROW_BYTES[0], crate::shared::memory::TEST)?;
             let read=|buffer:CuteafdDeviceBuffer|->Result<Vec<u8>> {
                 let mut bytes=vec![0;buffer.bytes];device.run(||library.copy_d2h(&mut bytes,buffer))?;Ok(bytes)
             };

@@ -322,7 +322,7 @@ cuteafd_status_t cuteafd_copy_device_rows_async(cuteafd_device_buffer_t dst,
     size_t dst_pitch, size_t src_pitch, void* cuda_stream);
 cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out, uint32_t kind, const char* owner);
 // Caller-owned shared mappings: unregister never frees the mapping.
-cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes);
+cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_unregister_host_mapping(void* ptr);
 cuteafd_status_t cuteafd_cuda_host_buffer_device_alias(cuteafd_host_buffer_t host,
                                                     cuteafd_device_buffer_t* out);
@@ -330,6 +330,9 @@ cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf);
 // Recommended allocation granularity for a whole device dma-buf SEND allocation.
 cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* out);
 cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
+// The tag (kind, NUL-terminated owner copy) this thread last asked an allocator
+// or host registration for, whether or not that allocation succeeded.
+cuteafd_status_t cuteafd_last_allocation_tag(uint32_t* kind, char* owner, size_t owner_bytes);
 cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf);
 cuteafd_status_t cuteafd_cuda_stream_create(void** out_cuda_stream);

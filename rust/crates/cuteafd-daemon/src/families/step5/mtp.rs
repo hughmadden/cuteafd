@@ -1032,8 +1032,8 @@ mod tests {
                 let probes = case["probes"].as_array().context("MTP probes")?.iter()
                     .map(|p| p.as_u64().context("MTP probe").map(|p| p as usize)).collect::<Result<Vec<_>>>()?;
                 let expected_logits = load("logits.bin", probes.len() * 128896 * 4)?;
-                let embedding = Allocation::new(device, 64 * H * 2, cuteafd_ffi::memory_ledger::TEST)?;
-                let hidden = Allocation::new(device, 64 * H * 4, cuteafd_ffi::memory_ledger::TEST)?;
+                let embedding = Allocation::new(device, 64 * H * 2, crate::shared::memory::TEST)?;
+                let hidden = Allocation::new(device, 64 * H * 4, crate::shared::memory::TEST)?;
                 let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
                 let weight_arena = DeviceWeightArena::new(device,
                     RankWeightLayout::mtp_stage_from_contract(&checkpoint, &contract, stage)?

@@ -110,8 +110,8 @@ mod tests {
         };
         // SAFETY: this fixture uses the task's native library and owns all buffers.
         let library = unsafe { NativeLibrary::load(path)? };
-        let input = DeviceAllocation::new(&library, 128 * 4, cuteafd_ffi::memory_ledger::TEST)?;
-        let output = DeviceAllocation::new(&library, 128 * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let input = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
+        let output = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
         let mut bank = RowGraphs::new(&library, "fixture", MAX_DECODE_ROWS as usize);
         let mut handles = BTreeMap::new();
@@ -159,9 +159,9 @@ mod tests {
             return Ok(());
         };
         let library = unsafe { NativeLibrary::load(path)? };
-        let weights = DeviceAllocation::new(&library, 128 * 4, cuteafd_ffi::memory_ledger::TEST)?;
-        let other = DeviceAllocation::new(&library, 128 * 4, cuteafd_ffi::memory_ledger::TEST)?;
-        let output = DeviceAllocation::new(&library, 128 * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let weights = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
+        let other = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
+        let output = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
         let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS);
         bank.enable_small_shapes();
@@ -219,8 +219,8 @@ mod tests {
         // SAFETY: the fixture pins its library, buffers and stream until drained.
         let library = unsafe { NativeLibrary::load(path)? };
         let bytes = 2752 * 4;
-        let weights = DeviceAllocation::new(&library, bytes, cuteafd_ffi::memory_ledger::TEST)?;
-        let output = DeviceAllocation::new(&library, bytes, cuteafd_ffi::memory_ledger::TEST)?;
+        let weights = DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?;
+        let output = DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
         let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS);
         bank.declare_startup(&[(0, 52), (0, 54)])?;
@@ -272,9 +272,9 @@ mod tests {
         let library = unsafe { NativeLibrary::load(path)? };
         // Real CUDA copies isolate graph ownership from SM120 FP8 arithmetic.
         let weights = (0..40)
-            .map(|_| DeviceAllocation::new(&library, 4096 * 4, cuteafd_ffi::memory_ledger::TEST))
+            .map(|_| DeviceAllocation::new(&library, 4096 * 4, crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
-        let replacement = DeviceAllocation::new(&library, 4096 * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let replacement = DeviceAllocation::new(&library, 4096 * 4, crate::shared::memory::TEST)?;
         let streams = (0..2)
             .map(|_| {
                 Ok(LoadStream {
@@ -284,7 +284,7 @@ mod tests {
             })
             .collect::<Result<Vec<_>>>()?;
         let outputs = (0..2)
-            .map(|_| DeviceAllocation::new(&library, 4096 * 4, cuteafd_ffi::memory_ledger::TEST))
+            .map(|_| DeviceAllocation::new(&library, 4096 * 4, crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
         let mut banks = [LayerGraphs::new(&library, MAX_DECODE_ROWS), LayerGraphs::new(&library, MAX_DECODE_ROWS)];
         let mut captures = 0;

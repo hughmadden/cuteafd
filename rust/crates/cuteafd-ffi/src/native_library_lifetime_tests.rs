@@ -386,3 +386,30 @@ fn event_waiters_retain_module_until_workers_join() -> Result<()> {
     assert!(fixture.events()?.ends_with("EU"));
     Ok(())
 }
+
+
+/// A failed allocation records nothing, but native still reports the tag it
+/// was asked for; an untagged request is refused before any allocation.
+#[test]
+fn failed_allocations_keep_the_attempted_tag_and_untagged_requests_are_refused() -> Result<()> {
+    let _ledger = memory_ledger::test_guard();
+    let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    let before = memory_ledger::snapshot().total(memory_ledger::Space::Device, 0);
+    let tag = memory_ledger::Tag::kv("test/oversized-kv");
+    assert!(library.alloc_device_buffer(usize::MAX / 2, tag).is_err());
+    assert_eq!(memory_ledger::snapshot().total(memory_ledger::Space::Device, 0), before);
+    assert_eq!(library.last_allocation_tag()?, Some(tag));
+    // SAFETY: fixture export with the native ABI; null owner is refused before allocation.
+    let allocate = unsafe { *library.lib.get::<unsafe extern "C" fn(usize, *mut CuteafdDeviceBuffer, u32, *const c_char) -> i32>(
+        b"cuteafd_alloc_device_buffer")? };
+    let mut buffer = CuteafdDeviceBuffer::default();
+    for (kind, owner) in [(0u32, c"test/x".as_ptr()), (13, c"test/x".as_ptr()), (9, c"".as_ptr()), (9, std::ptr::null())] {
+        assert_ne!(unsafe { allocate(64, &mut buffer, kind, owner) }, 0);
+        assert!(buffer.ptr.is_null());
+    }
+    let mut host = library.alloc_host_buffer(64, memory_ledger::Tag::staging("test/host"))?;
+    assert_eq!(memory_ledger::tag_of(host.ptr as usize), Some(memory_ledger::Tag::staging("test/host")));
+    library.free_host_buffer(&mut host)?;
+    Ok(())
+}

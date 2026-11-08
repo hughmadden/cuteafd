@@ -158,7 +158,7 @@ impl<'a> CoordinatorDevices<'a> {
     pub fn remap_weight_arenas(self, allocations: &[Allocation]) -> Result<Vec<Allocation>, Refusal> {
         let mut names = BTreeMap::new();
         for allocation in allocations.iter().filter(|a| a.view.is_none()
-            && a.category == Category::Weights && a.group == "weight arena"
+            && a.category == Category::Experts && a.group == "weight arena"
             && a.id.starts_with("experts.")) {
             let invalid = || Refusal::InvalidFact(format!("invalid logical expert arena {}", allocation.id));
             let (prefix, identity) = allocation.id.rsplit_once(".gpu.").ok_or_else(invalid)?;

@@ -458,7 +458,7 @@ mod cuda_tests {
                     let from = usize::from(hop.from);
                     let pattern: Vec<u8> = (0..bytes).map(|i| (i * 7 + lane * 13 + index * 31) as u8).collect();
                     let source = on_device(&library, from as i32, || {
-                        let source = DeviceAllocation::new(&library, bytes, cuteafd_ffi::memory_ledger::TEST)?;
+                        let source = DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?;
                         library.copy_h2d(source.buffer, &pattern)?;
                         Ok(source)
                     })?;

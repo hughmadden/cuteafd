@@ -498,7 +498,7 @@ mod shared_storage_tests {
                 let f = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
                 ((f.to_bits() >> 16) as u16).to_ne_bytes()
             }).collect();
-            let source = DeviceAllocation::new(&lib, hidden.len(), cuteafd_ffi::memory_ledger::TEST)?;
+            let source = DeviceAllocation::new(&lib, hidden.len(), crate::shared::memory::TEST)?;
             lib.copy_h2d(source.buffer, &hidden)?; Ok(source)
         }).into_iter().collect::<Result<Vec<_>>>()?;
         let read = |buffer| -> Result<Vec<u8>> {

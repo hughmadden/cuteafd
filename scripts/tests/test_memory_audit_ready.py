@@ -297,3 +297,20 @@ def test_raw_cuda_audit_labels_gb10_reclaimable_cache(capsys):
     output = capsys.readouterr().out
     assert scope in output
     assert "MemAvailable 45.00" in output
+
+
+def test_typed_reports_use_kinds_not_scope_names():
+    # A misleading scope name must not decide the category once allocations carry kinds.
+    device = {"device": 0, "tracked": 700, "peak": 700, "used": 800, "total": 1000, "untracked": 100,
+              "scopes": {"weights/misleading": 700},
+              "by_kind": {"kinds": {"kv": 400, "drafter_workspace": 200}, "untagged": 50},
+              "managed_by_kind": {"kinds": {"staging": 50}, "untagged": 0}}
+    summary = memory_audit.summarize({"stage": "ready", "devices": [device], "weights": []})
+    cats = summary["devices"][0]["categories"]
+    assert cats == {"kv": 400, "drafter": 200, "untagged": 50, "staging": 50, "runtime": 100}
+
+
+def test_kind_category_mirrors_every_memory_kind():
+    source = (Path(__file__).parents[2] / "rust/crates/cuteafd-core/src/memory_layout.rs").read_text()
+    labels = re.findall(r'Self::\w+ => "(\w+)",', source.split("pub const fn label(self)", 1)[1].split("}", 1)[0])
+    assert sorted(labels) == sorted(memory_audit.KIND_CATEGORY)

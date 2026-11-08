@@ -30,4 +30,5 @@ pub(crate) mod token_io;
 pub mod vision;
 pub mod audio;
 pub mod pcm_audio;
+pub(crate) mod media_backings;
 pub(crate) mod vocab_head;

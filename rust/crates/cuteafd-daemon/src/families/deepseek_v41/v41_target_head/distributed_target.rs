@@ -346,8 +346,8 @@ mod tests {
         let mut baseline = devices[1].own(|| norm.wave(&full, 6, TargetHeadWave::device_bytes(6)?))?;
         let mut head = DistributedTargetHead::new(devices, &norm, [&a, &b], 6,
             DistributedTargetHead::device_bytes(6, 64640)?)?;
-        let residual = Allocation::new(devices[1], 6 * 40960, cuteafd_ffi::memory_ledger::TEST)?;
-        let pre = Allocation::new(devices[1], 6 * 16, cuteafd_ffi::memory_ledger::TEST)?;
+        let residual = Allocation::new(devices[1], 6 * 40960, crate::shared::memory::TEST)?;
+        let pre = Allocation::new(devices[1], 6 * 16, crate::shared::memory::TEST)?;
         let data: Vec<u8> = (0..6 * 20480).flat_map(|i| {
             let x = ((i * 13 % 131) as f32 - 65.) / 64.;
             ((x.to_bits() >> 16) as u16).to_ne_bytes()

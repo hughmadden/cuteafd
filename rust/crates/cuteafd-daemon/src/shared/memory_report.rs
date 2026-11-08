@@ -83,6 +83,7 @@ fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
             "peak": snapshot.peak.get(&(Space::Device, device)).copied().unwrap_or(0),
             "scopes": scopes,
             "by_kind": kinds(snapshot, Space::Device, device),
+            "managed_by_kind": kinds(snapshot, Space::Managed, device),
         });
         if let Some((free, total)) = device_memory(device) {
             let used = total - free;
@@ -107,6 +108,11 @@ fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
             "peak": snapshot.peak.get(&(Space::Pinned, -1)).copied().unwrap_or(0),
             "scopes": snapshot.by_scope(Space::Pinned, -1),
             "by_kind": kinds(snapshot, Space::Pinned, -1),
+        },
+        // Native malloc backing registered for RDMA (not CUDA-pinned).
+        "host_registered": {
+            "tracked": snapshot.total(Space::Host, -1),
+            "by_kind": kinds(snapshot, Space::Host, -1),
         },
         "weights": weights,
         "dual_formats": dual,

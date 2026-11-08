@@ -107,8 +107,8 @@ mod tests {
             let owner=Device { library:&lib,id:gpu };let peer=Device { library:&lib,id:1-gpu };
             let replica=ProposalReplica::new(owner,peer,16,format)?;
             let (vw,sw)=format.widths();
-            let source_values=Allocation::new(owner,16*vw, cuteafd_ffi::memory_ledger::TEST)?;
-            let source_scales=Allocation::new(owner,16*sw, cuteafd_ffi::memory_ledger::TEST)?;
+            let source_values=Allocation::new(owner,16*vw, crate::shared::memory::TEST)?;
+            let source_scales=Allocation::new(owner,16*sw, crate::shared::memory::TEST)?;
             let producer=Stream::new(owner)?;
             let mut publication=PeerPublication::new(owner,peer)?;
             let (destination_values,destination_scales)=replica.buffers();

@@ -739,7 +739,7 @@ mod tests {
             Some(crate::shared::prefix::MarkRule { lanes: 2, entries: 2, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let mut mtp = Mtp::load(&engine.borrow(), &reader, format, admitted, fixed)?;
-        let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes, cuteafd_ffi::memory_ledger::TEST)?;
+        let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes, crate::shared::memory::TEST)?;
         let selector = RefCell::new(crate::shared::token_io::TokenSelector::new(&library,
             crate::shared::token_io::SelectPlacement::Device, cfg.vocab, 1)?);
         let family = prefix::DensePrefix::new(&engine)?;

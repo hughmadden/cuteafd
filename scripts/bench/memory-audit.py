@@ -33,6 +33,23 @@ GROUPS = [
 ]
 
 
+# MemoryKind label -> planner category (mirrors cuteafd_core::memory_layout::MemoryKind::category).
+KIND_CATEGORY = {"weights": "weights", "embedding": "embedding", "experts": "experts",
+                 "drafter_weights": "drafter", "drafter_kv": "drafter", "drafter_workspace": "drafter",
+                 "tables": "tables", "kv": "kv", "prefix": "prefix", "workspace": "workspace",
+                 "transport": "transport", "staging": "staging"}
+
+
+def kind_categories(by_kind):
+    """Planner categories from a typed ledger report; legacy untagged bytes stay their own bucket."""
+    cats = defaultdict(int)
+    for kind, nbytes in by_kind.get("kinds", {}).items():
+        cats[KIND_CATEGORY[kind]] += nbytes
+    if by_kind.get("untagged", 0):
+        cats["untagged"] += by_kind["untagged"]
+    return cats
+
+
 def category(scope):
     """Planner category of a ledger scope (mirrors cuteafd_core::memory_layout::Category::of_scope)."""
     root = scope.split("/")[0]
@@ -101,9 +118,16 @@ def summarize(report):
         weights[(space, device, group(tensor), fmt or "native")] += nbytes
     for dev in report.get("devices", []):
         entry = dict(dev)
-        cats = defaultdict(int)
-        for scope, nbytes in dev.get("scopes", {}).items():
-            cats[category(scope)] += nbytes
+        if "by_kind" in dev:
+            # Typed ledger: each allocation stated its kind; scopes are context only.
+            cats = kind_categories(dev["by_kind"])
+            for space in ("managed_by_kind",):
+                for name, nbytes in kind_categories(dev.get(space, {})).items():
+                    cats[name] += nbytes
+        else:
+            cats = defaultdict(int)
+            for scope, nbytes in dev.get("scopes", {}).items():
+                cats[category(scope)] += nbytes
         cats["runtime"] += max(dev.get("untracked", 0), 0)
         entry["categories"] = dict(cats)
         entry["weights"] = {f"{g}/{f}": b for (s, d, g, f), b in sorted(weights.items())

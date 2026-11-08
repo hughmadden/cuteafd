@@ -1439,10 +1439,10 @@ mod tests {
                 committed: 0,
             })?
             .placement;
-        let key = Allocation::new(device, 64 * KV * 2, cuteafd_ffi::memory_ledger::TEST)?;
-        let value = Allocation::new(device, 64 * KV * 2, cuteafd_ffi::memory_ledger::TEST)?;
-        let ik = Allocation::new(device, 64 * 512, cuteafd_ffi::memory_ledger::TEST)?;
-        let iz = Allocation::new(device, 64 * 512, cuteafd_ffi::memory_ledger::TEST)?;
+        let key = Allocation::new(device, 64 * KV * 2, crate::shared::memory::TEST)?;
+        let value = Allocation::new(device, 64 * KV * 2, crate::shared::memory::TEST)?;
+        let ik = Allocation::new(device, 64 * 512, crate::shared::memory::TEST)?;
+        let iz = Allocation::new(device, 64 * 512, crate::shared::memory::TEST)?;
         // Deliberately cross partial pages, the 512-token window, and the 576-row ring.
         for end in [
             7, 8, 63, 64, 128, 192, 256, 320, 384, 448, 511, 512, 575, 576, 640, 704, 768, total,

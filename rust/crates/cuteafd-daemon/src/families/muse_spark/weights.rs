@@ -536,8 +536,8 @@ mod tests {
                     for layout in layer.native.values() {
                         let actual = allocate_native(device, &arena, layout)?;
                         let expected = device.own(|| Ok(NativeAttentionWeights { layout: layout.clone(),
-                            values: DeviceAllocation::new(&library, actual.values.buffer.bytes, cuteafd_ffi::memory_ledger::TEST)?,
-                            scales: actual.scales.as_ref().map(|s| DeviceAllocation::new(&library, s.buffer.bytes, cuteafd_ffi::memory_ledger::TEST)).transpose()? }))?;
+                            values: DeviceAllocation::new(&library, actual.values.buffer.bytes, crate::shared::memory::TEST)?,
+                            scales: actual.scales.as_ref().map(|s| DeviceAllocation::new(&library, s.buffer.bytes, crate::shared::memory::TEST)).transpose()? }))?;
                         let selected = checkpoint.projection(&layout.stem)?;
                         let mode = if compact && layout.stem == bf16 { AttentionMode::Fp8Compact } else { AttentionMode::Hqa };
                         for owner in [&actual, &expected] {

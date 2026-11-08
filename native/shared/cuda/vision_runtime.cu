@@ -204,8 +204,19 @@ extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd
   size_t blas_bytes=(s->abi_version==2 && s->reserved==5) ? 0 : BLAS_BYTES;
   *out={s->weight_bytes,bytes-blas_bytes,blas_bytes,0,0}; return 0;
 }
+extern "C" int32_t cuteafd_vision_get_backings(void* owner, cuteafd_media_backings* out) {
+  if(!owner || !out)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(owner);
+  *out={o->weights, o->weights ? o->ledger.weights : 0, o->arena,
+    o->arena ? o->ledger.scratch+o->ledger.blas_workspace : 0};
+  return 0;
+}
 extern "C" int32_t cuteafd_vision_destroy(void* owner) {
-  if(!owner)return cudaErrorInvalidValue;
+  uint32_t released=0; return cuteafd_vision_destroy_backings(owner, &released);
+}
+extern "C" int32_t cuteafd_vision_destroy_backings(void* owner, uint32_t* released) {
+  if(!owner || !released)return cudaErrorInvalidValue;
+  *released=0;
   auto* o=static_cast<Owner*>(owner);
   // Restore the owning device before draining/releasing all storage.
   int previous=-1; cudaGetDevice(&previous); cudaSetDevice(o->device);
@@ -215,9 +226,9 @@ extern "C" int32_t cuteafd_vision_destroy(void* owner) {
   if(o->attention) { int rc=cuteafd_vision_attention_destroy(o->attention);if(!first)first=rc; }
 #endif
   if(o->blas)cublasDestroy(o->blas);
-  if(o->weights)CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));
-  if(o->arena)CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));
-  if(o->stream)cudaStreamDestroy(o->stream);
+  if(o->weights) { int rc=CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights)); if(rc==0)*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS; else if(!first)first=rc; }
+  if(o->arena) { int rc=CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena)); if(rc==0)*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE; else if(!first)first=rc; }
+  if(o->stream) { int rc=cudaStreamDestroy(o->stream); if(!first)first=rc; }
   if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
   delete o; return first;
 }

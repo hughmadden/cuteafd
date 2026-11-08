@@ -213,7 +213,7 @@ mod tests {
                 let payload = shape.slot_bytes().sum::<usize>() as u64;
                 let workspace = shape.workspace_bytes as u64;
                 let items = host_resident_items(std::collections::BTreeMap::from([
-                    ("mapped-table", (Category::Tables, payload as usize))]), &[]);
+                    ("mapped-table", (Category::Staging, payload as usize))]), &[]);
                 let demands = [("staging/mapped-table-worker", workspace)];
                 let ledger = host_admission((2 << 30, 1 << 30), items.clone(), 0, &demands, 0, 0)?;
                 assert_eq!((ledger.resident_bytes, ledger.deferred_bytes), (payload, workspace));

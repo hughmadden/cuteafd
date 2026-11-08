@@ -76,7 +76,7 @@ pub(crate) fn resident_expert_weights(
         if let Some(view) = &allocation.view {
             let root = owners.get(view.backing.as_str()).context("missing GLM expert weight backing")?;
             ensure!(root.view.is_none() && root.location == allocation.location
-                && (weight_name(&root.id) || (root.category == Category::Weights && root.group == "weight arena")),
+                && (weight_name(&root.id) || (root.category == Category::Experts && root.group == "weight arena")),
                 "invalid GLM expert weight backing {}", view.backing);
             weights.insert(root.id.clone());
         }

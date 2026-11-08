@@ -991,9 +991,9 @@ mod shared_storage_tests {
         let storage = SparseAttentionStorage::<HEADS>::new(&lib, 4, &[0,1])?;
         let mut slots = [LocalSparseAttentionWave::on_storage(storage.clone())?, LocalSparseAttentionWave::on_storage(storage.clone())?];
         for (i,slot) in slots.iter_mut().enumerate() { slot.select_window(crate::shared::memory::row_window::RowWindow::within(i*4..i*4+4,8)?)?; }
-        let scales=Allocation::new(device,128*16, cuteafd_ffi::memory_ledger::TEST)?; let end=Allocation::new(device,8, cuteafd_ffi::memory_ledger::TEST)?;
-        let sink=Allocation::new(device,HEADS*4, cuteafd_ffi::memory_ledger::TEST)?;
-        let sources=[Allocation::new(device,128*512, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(device,128*512, cuteafd_ffi::memory_ledger::TEST)?];
+        let scales=Allocation::new(device,128*16, crate::shared::memory::TEST)?; let end=Allocation::new(device,8, crate::shared::memory::TEST)?;
+        let sink=Allocation::new(device,HEADS*4, crate::shared::memory::TEST)?;
+        let sources=[Allocation::new(device,128*512, crate::shared::memory::TEST)?,Allocation::new(device,128*512, crate::shared::memory::TEST)?];
         lib.copy_h2d(sources[0].buffer,&vec![0x38;128*512])?;
         lib.copy_h2d(sources[1].buffer,&vec![0x40;128*512])?;
         lib.copy_h2d(scales.buffer,&vec![127;128*16])?;lib.copy_h2d(end.buffer,&[0;8])?;
@@ -1023,7 +1023,7 @@ mod shared_storage_tests {
             lib.cuda_stream_synchronize(private.stream.raw)?; }
         let mut want=vec![0;output_bytes];lib.copy_d2h(&mut want,private.output.buffer)?;
         for seed in 0..2 { enqueue(&slots[seed],seed)?; unsafe { lib.cuda_stream_synchronize(storage.stream.raw)?; } }
-        let reader=Stream::new(device)?;let saved=Allocation::new(device,output_bytes, cuteafd_ffi::memory_ledger::TEST)?;
+        let reader=Stream::new(device)?;let saved=Allocation::new(device,output_bytes, crate::shared::memory::TEST)?;
         unsafe { lib.copy_d2d_async(saved.buffer,storage.output.buffer,output_bytes,reader.raw)?; }
         reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];

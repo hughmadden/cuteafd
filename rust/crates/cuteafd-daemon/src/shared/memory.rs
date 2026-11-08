@@ -2,6 +2,9 @@
 use anyhow::Result;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 pub(crate) use cuteafd_ffi::memory_ledger::{tag, MemoryKind, Tag};
+/// Scratch allocated by this crate's tests; absent from every non-test build.
+#[cfg(test)]
+pub(crate) const TEST: Tag = Tag::workspace("test/scratch");
 use std::ffi::c_void;
 
 #[path = "memory/receipts.rs"]
@@ -432,8 +435,8 @@ mod load_stream_lifetime_tests {
             std::fs::write(std::env::var("CUTEAFD_FATAL_LOAD_STREAM_EVIDENCE")?,
                 fixture.directory().join("events").to_str().unwrap())?;
             let library = fixture.load()?;
-            let weights = [DeviceAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?, DeviceAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?];
-            let staging = [HostAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?, HostAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?];
+            let weights = [DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?, DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?];
+            let staging = [HostAllocation::new(&library, 256, crate::shared::memory::TEST)?, HostAllocation::new(&library, 256, crate::shared::memory::TEST)?];
             fixture.configure_pack(&library, 0, 1)?;
             match path.as_str() {
                 "drop" => drop(LoadStream { library: &library, raw: std::ptr::null_mut() }),

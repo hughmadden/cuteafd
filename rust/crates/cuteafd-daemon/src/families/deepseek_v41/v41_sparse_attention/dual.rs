@@ -357,10 +357,10 @@ mod tests {
             let mut wave=DualAttentionWave::new(devices,4,DualAttentionWave::device_bytes(4)?)?;
             let mut buffers=Vec::new();
             for (i,device) in devices.into_iter().enumerate() {
-                let values=Allocation::new(device,128*512, cuteafd_ffi::memory_ledger::TEST)?;
-                let scales=Allocation::new(device,128*16, cuteafd_ffi::memory_ledger::TEST)?;
-                let end=Allocation::new(device,8, cuteafd_ffi::memory_ledger::TEST)?;
-                let sink=Allocation::new(device,32*4, cuteafd_ffi::memory_ledger::TEST)?;
+                let values=Allocation::new(device,128*512, crate::shared::memory::TEST)?;
+                let scales=Allocation::new(device,128*16, crate::shared::memory::TEST)?;
+                let end=Allocation::new(device,8, crate::shared::memory::TEST)?;
+                let sink=Allocation::new(device,32*4, crate::shared::memory::TEST)?;
                 device.run(|| {
                     library.copy_h2d(scales.buffer,&vec![127;128*16])?;
                     library.copy_h2d(end.buffer,&[0;8])?;
@@ -421,9 +421,9 @@ mod shared_storage_tests {
         }
         let mut data=Vec::new();
         for device in devices {
-            let values=[Allocation::new(device,128*512, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(device,128*512, cuteafd_ffi::memory_ledger::TEST)?];
-            let scales=Allocation::new(device,128*16, cuteafd_ffi::memory_ledger::TEST)?;let end=Allocation::new(device,8, cuteafd_ffi::memory_ledger::TEST)?;
-            let sink=Allocation::new(device,128, cuteafd_ffi::memory_ledger::TEST)?;
+            let values=[Allocation::new(device,128*512, crate::shared::memory::TEST)?,Allocation::new(device,128*512, crate::shared::memory::TEST)?];
+            let scales=Allocation::new(device,128*16, crate::shared::memory::TEST)?;let end=Allocation::new(device,8, crate::shared::memory::TEST)?;
+            let sink=Allocation::new(device,128, crate::shared::memory::TEST)?;
             device.run(|| {
                 lib.copy_h2d(values[0].buffer,&vec![0x38;128*512])?;
                 lib.copy_h2d(values[1].buffer,&vec![0x40;128*512])?;
@@ -467,7 +467,7 @@ mod shared_storage_tests {
             enqueue(&mut slots[seed],seed)?;
             runtime.block_on(PendingDualAttention {wave:Some(&mut slots[seed]),cold:[false;2],rows:4,layer:0}.complete())?;
         }
-        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), cuteafd_ffi::memory_ledger::TEST)?;
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), crate::shared::memory::TEST)?;
         devices[1].run(||unsafe {lib.copy_peer_async(saved.buffer,storage.output.buffer,want.len(),reader.raw)})?;reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
         let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;

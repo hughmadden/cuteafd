@@ -292,8 +292,22 @@ int cuteafd_fp8moe_launch_segments_core(void *ctx, void **ptrs, int rows, void *
     return reply_core(ptrs, rows, 1);
 }
 
-/* Mirrors the native ABI: every allocation names a kind (1..12) and an owner. */
-static int valid_tag(uint32_t kind, const char *owner) { return kind >= 1 && kind <= 12 && owner && owner[0]; }
+/* Mirrors the native ABI: every allocation names a kind (1..12) and an owner,
+ * and the attempted tag is retained (owner copied) for failure reports. */
+static __thread uint32_t attempted_kind;
+static __thread char attempted_owner[256];
+static int valid_tag(uint32_t kind, const char *owner) {
+    if (!(kind >= 1 && kind <= 12 && owner && owner[0])) return 0;
+    attempted_kind = kind;
+    snprintf(attempted_owner, sizeof attempted_owner, "%s", owner);
+    return 1;
+}
+int cuteafd_last_allocation_tag(uint32_t *kind, char *owner, size_t owner_bytes) {
+    if (!kind || !owner || !owner_bytes || strlen(attempted_owner) + 1 > owner_bytes) return 1;
+    *kind = attempted_kind;
+    memcpy(owner, attempted_owner, strlen(attempted_owner) + 1);
+    return 0;
+}
 
 int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out, uint32_t kind, const char *owner) {
     if (!valid_tag(kind, owner)) return 1;
@@ -513,8 +527,8 @@ static void finish_uploads(struct upload_event *upload) {
     upload->copies = NULL;
     upload->count = 0;
 }
-int cuteafd_register_host_mapping(void *ptr, size_t bytes) {
-    if (!ptr || !bytes) return 1;
+int cuteafd_register_host_mapping(void *ptr, size_t bytes, uint32_t kind, const char *owner) {
+    if (!ptr || !bytes || !valid_tag(kind, owner)) return 1;
     event('G'); return 0;
 }
 int cuteafd_unregister_host_mapping(void *ptr) {

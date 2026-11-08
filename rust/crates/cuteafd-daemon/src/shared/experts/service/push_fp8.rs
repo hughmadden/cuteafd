@@ -2,6 +2,7 @@
 #[cfg(test)]
 #[path = "push_fp8/tests.rs"]
 mod tests;
+use crate::shared::memory::Tag;
 use super::{modules::Fp8Group, NativeExpertServiceConfig};
 use crate::shared::{
     experts::fp8::Fp8Layer,
@@ -104,7 +105,7 @@ fn receive<'a>(
         let started = std::time::Instant::now();
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
         let arena = LoadingArena::new(device, plan.layout.clone(), expected, ArenaTag::experts("experts/spark-fp8"))?;
-        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
+        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let allocated = started.elapsed();
         let rank = client.join(JoinArgs {
             group,

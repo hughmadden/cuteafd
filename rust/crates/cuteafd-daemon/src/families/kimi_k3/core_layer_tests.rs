@@ -100,7 +100,7 @@ impl<'a> OwnedProjection<'a> {
     }
 }
 fn upload<'a>(device:Device<'a>,bytes:&[u8])->Result<Allocation<'a>> {
-    let allocation=Allocation::new(device,bytes.len().max(16), cuteafd_ffi::memory_ledger::TEST)?;
+    let allocation=Allocation::new(device,bytes.len().max(16), crate::shared::memory::TEST)?;
     device.run(||device.library.copy_h2d(allocation.buffer,bytes))?;Ok(allocation)
 }
 fn zero<'a>(device:Device<'a>,bytes:usize)->Result<Allocation<'a>> {upload(device,&vec![0;bytes])}

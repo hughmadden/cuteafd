@@ -491,17 +491,17 @@ mod tests {
         let a = devices[0].own(|| VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?;
         let b = devices[1].own(|| VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?;
         let full = devices[1].own(|| VocabularyHead::load(&lib, &catalog, 2 << 30, 16 << 20))?;
-        let workspace = Allocation::new(devices[1], V41VocabularyProjection::WORKSPACE_BYTES, cuteafd_ffi::memory_ledger::TEST)?;
+        let workspace = Allocation::new(devices[1], V41VocabularyProjection::WORKSPACE_BYTES, crate::shared::memory::TEST)?;
         let projection = devices[1].own(|| unsafe { lib.v41_vocabulary_head(workspace.buffer) })?;
         let full_stream = Stream::new(devices[1])?;
-        let full_logits = Allocation::new(devices[1], 80 * 129280 * 4, cuteafd_ffi::memory_ledger::TEST)?;
-        let input = Allocation::new(devices[1], 80 * 10240, cuteafd_ffi::memory_ledger::TEST)?;
+        let full_logits = Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?;
+        let input = Allocation::new(devices[1], 80 * 10240, crate::shared::memory::TEST)?;
         let values: Vec<u8> = (0..80 * 5120).flat_map(|i| {
             let value = ((i * 17 % 127) as f32 - 63.) / 128.;
             ((value.to_bits() >> 16) as u16).to_ne_bytes()
         }).collect();
         devices[1].run(|| lib.copy_h2d(input.buffer, &values))?;
-        let other_input = Allocation::new(devices[1], 80 * 10240, cuteafd_ffi::memory_ledger::TEST)?;
+        let other_input = Allocation::new(devices[1], 80 * 10240, crate::shared::memory::TEST)?;
         let other_values: Vec<u8> = (0..80 * 5120).flat_map(|i| {
             let value = ((i * 19 % 127) as f32 - 61.) / 64.;
             ((value.to_bits() >> 16) as u16).to_ne_bytes()
@@ -510,8 +510,8 @@ mod tests {
         let budgets = DistributedVocabularyWave::device_bytes(80, 64640)?;
         let mut first = DistributedVocabularyWave::new(devices, [&a, &b], 80, budgets)?;
         let mut second = DistributedVocabularyWave::new(devices, [&a, &b], 80, budgets)?;
-        let assembled = [Allocation::new(devices[1], 80 * 129280 * 4, cuteafd_ffi::memory_ledger::TEST)?,
-            Allocation::new(devices[1], 80 * 129280 * 4, cuteafd_ffi::memory_ledger::TEST)?];
+        let assembled = [Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?,
+            Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?];
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         for rows in [1, 3, 16, 40, 80, 3] {
             let mut references = Vec::new();

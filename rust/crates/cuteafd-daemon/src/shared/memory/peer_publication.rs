@@ -82,8 +82,8 @@ mod tests {
             let owner=Device { library:&lib,id:gpu };
             let peer=Device { library:&lib,id:1-gpu };
             let copy=peer.run(|| lib.v41_peer_copy())?;
-            let source=[Allocation::new(owner,4096, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(owner,4096, cuteafd_ffi::memory_ledger::TEST)?];
-            let destination=[Allocation::new(peer,4096, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(peer,4096, cuteafd_ffi::memory_ledger::TEST)?];
+            let source=[Allocation::new(owner,4096, crate::shared::memory::TEST)?,Allocation::new(owner,4096, crate::shared::memory::TEST)?];
+            let destination=[Allocation::new(peer,4096, crate::shared::memory::TEST)?,Allocation::new(peer,4096, crate::shared::memory::TEST)?];
             let producers=[Stream::new(owner)?,Stream::new(owner)?];
             let mut publications=[Some(PeerPublication::new(owner,peer)?),Some(PeerPublication::new(owner,peer)?)];
             for lane in 0..2 {

@@ -5610,8 +5610,8 @@ mod tp2_tests {
             std::fs::write(std::env::var("CUTEAFD_GLMF_FATAL_RANK_EVIDENCE")?,
                 fixture.directory().join("events").to_str().context("fixture evidence path")?)?;
             let library = fixture.load()?;
-            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, cuteafd_ffi::memory_ledger::TEST)?,
-                Allocation::new(Device { library: &library, id: 1 }, 256, cuteafd_ffi::memory_ledger::TEST)?];
+            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?,
+                Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?];
             fixture.configure_pack(&library, 0, 1)?;
             fixture.configure_drain_after(&library, after.parse()?)?;
             let result = drain_ranks(2, |rank| Device { library: &library, id: rank as i32 }.run(|| {
@@ -5645,8 +5645,8 @@ mod tp2_tests {
         use crate::shared::memory::device::{Allocation, Device};
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
-        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, cuteafd_ffi::memory_ledger::TEST)?,
-            Allocation::new(Device { library: &library, id: 1 }, 256, cuteafd_ffi::memory_ledger::TEST)?];
+        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?,
+            Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?];
         fixture.configure_pack(&library, 0, 0)?;
         library.cuda_set_device(1)?;
         crate::shared::decode_graph::fatal_drain(drain_ranks(2, |rank|

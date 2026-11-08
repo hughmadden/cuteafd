@@ -126,7 +126,7 @@ impl<'a> Exl3Weights<'a> {
             if let Some(backing) = owner.backing.as_ref().and_then(|a| a.weight_backing()) {
                 for (index, buffer) in self.buffers.iter().enumerate() {
                     inventory.weight_view(&format!("{name}.{index}"), buffer.buffer,
-                        crate::shared::memory::device::WeightArenaBacking { id: backing.id, buffer: backing.buffer })?;
+                        crate::shared::memory::device::WeightArenaBacking { id: backing.id, buffer: backing.buffer, kind: backing.kind })?;
                 }
                 return Ok(());
             }
