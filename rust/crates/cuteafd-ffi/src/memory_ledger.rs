@@ -501,23 +501,34 @@ pub fn snapshot() -> Snapshot {
 pub struct FailureSnapshot {
     pub ledger: Snapshot,
     pub device_memory: BTreeMap<i32, (usize, usize)>,
-    source: anyhow::Error,
+    source: Option<anyhow::Error>,
+    message: String,
 }
 
 impl std::fmt::Display for FailureSnapshot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.source, formatter)
+        formatter.write_str(&self.message)
     }
 }
 
 impl std::error::Error for FailureSnapshot {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.source.as_ref()) }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source.as_ref())
+    }
 }
 
 impl FailureSnapshot {
     pub fn new(source: anyhow::Error, ledger: Snapshot,
         device_memory: BTreeMap<i32, (usize, usize)>) -> Self {
-        Self { ledger, device_memory, source }
+        let message = source.to_string();
+        Self { ledger, device_memory, source: Some(source), message }
+    }
+
+    fn into_error(mut self) -> anyhow::Error {
+        // Anyhow contexts preserve downcasts to both the evidence and the
+        // original typed error; an opaque Error wrapper only preserves sources.
+        let source = self.source.take().expect("new snapshots retain their source");
+        source.context(self)
     }
 }
 
@@ -528,7 +539,7 @@ pub(crate) fn capture_failure(error: anyhow::Error) -> anyhow::Error {
     let device_memory = std::thread::spawn(move || devices.into_iter()
         .filter_map(|device| device_memory(device).map(|memory| (device, memory))).collect())
         .join().unwrap_or_default();
-    anyhow::Error::new(FailureSnapshot::new(error, ledger, device_memory))
+    FailureSnapshot::new(error, ledger, device_memory).into_error()
 }
 
 fn loaded_cuda_runtime() -> Option<&'static libloading::os::unix::Library> {
@@ -636,6 +647,22 @@ mod tests {
         assert_eq!(saved.ledger.by_scope(Space::Device, 31)["workspace/failure-fixture"], 512);
         assert_eq!(snapshot().total(Space::Device, 31), 0);
         assert!(format!("{error:#}").contains("native fixture error"));
+    }
+
+    #[test]
+    fn failure_evidence_preserves_direct_typed_downcasts() {
+        let _ledger = test_guard();
+        let source = anyhow::Error::new(crate::NativeStatusError {
+            context: "snapshot fixture".into(), status: 98, detail: "native detail".into(),
+        }).context("startup context");
+        let error = capture_failure(source).context("family initialization");
+        let native = error.downcast_ref::<crate::NativeStatusError>().unwrap();
+        assert_eq!(native.status, 98);
+        assert_eq!(native.detail, "native detail");
+        assert!(error.downcast_ref::<FailureSnapshot>().is_some());
+        assert!(error.chain().any(|cause| cause.is::<FailureSnapshot>()));
+        assert!(error.chain().any(|cause| cause.is::<crate::NativeStatusError>()));
+        assert!(format!("{error:#}").contains("startup context"));
     }
 
     #[test]
