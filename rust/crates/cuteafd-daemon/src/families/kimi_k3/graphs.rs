@@ -162,7 +162,7 @@ pub(crate) struct Graphs<'a> { bank: GraphBank<Key, GraphOwner<'a, ()>>, replays
 impl<'a> Graphs<'a> {
     pub(crate) fn capture(stream: &Stream<'a>, keys: &[Key],
         mut arithmetic: impl FnMut(Key) -> Result<()>) -> Result<Self> {
-        let mut bank = GraphBank::with_policy(GraphPolicy::FixedStartup);
+        let mut bank = GraphBank::with_family(GraphPolicy::FixedStartup, "kimi_k3");
         bank.warm(keys, |&key| stream.device.run(|| {
             // SAFETY: startup is exclusive; arithmetic and initialized context
             // exchange kernels use this exact stream. LocalLane pins operands and drains
@@ -192,8 +192,8 @@ impl<'a> Graphs<'a> {
 
     pub(crate) fn replays(&self) -> u64 { self.replays }
 
-    pub(crate) fn launch(&mut self, key: Key, stream: &Stream<'a>) -> Result<bool> {
-        let (decision, owner) = self.bank.enqueue(&key);
+    pub(crate) fn launch(&mut self, key: Key, stream: &Stream<'a>, context: impl FnOnce() -> String) -> Result<bool> {
+        let (decision, owner) = self.bank.enqueue_with_context(&key, context);
         match decision {
             GraphDecision::Replay => {
                 let owner = owner.expect("replay has executable");

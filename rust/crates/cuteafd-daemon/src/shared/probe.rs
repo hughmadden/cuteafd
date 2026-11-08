@@ -92,6 +92,8 @@ pub(crate) fn image_spans(spec: &cuteafd_api::openai::probe::ProbeSpec, tokens: 
 
 /// Adds cumulative capture counts and site deltas since the last stats publication.
 /// Gate clients subtract the cumulative fields across their own warmed interval.
+/// Startup-miss variants are cumulative too: each distinct shape a sealed graph
+/// set lacked with its eager run count, so a client sees which one to add.
 pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
     static PREVIOUS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
     let mut previous = PREVIOUS.lock().unwrap_or_else(|p| p.into_inner());
@@ -99,6 +101,9 @@ pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
     if !tables.is_empty() { stats["mapped_tables"] = serde_json::json!(tables); }
     let sites = cuteafd_ffi::graph_capture_sites();
     record_graph_captures(stats, cuteafd_ffi::graph_captures(), sites, &mut previous);
+    stats["graph_missing_variants"] = serde_json::json!(crate::shared::decode_graph::missing_variants()
+        .into_iter().map(|miss| serde_json::json!({
+            "family": miss.family, "shape": miss.shape, "runs": miss.runs })).collect::<Vec<_>>());
 }
 
 fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(String, u64)>,
@@ -112,6 +117,27 @@ fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(
     stats["graph_capture_sites"] = serde_json::json!(sites);
     stats["graph_capture_site_deltas"] = serde_json::json!(deltas);
     *previous = sites;
+}
+
+#[cfg(test)]
+mod graph_stats_tests {
+    use super::*;
+
+    #[test]
+    fn stats_publish_each_startup_miss_variant_with_its_runs() {
+        use crate::shared::decode_graph::{GraphBank, GraphPolicy};
+        let mut bank = GraphBank::<u32, ()>::with_family(GraphPolicy::FixedStartup, "probe-test-miss");
+        bank.warm(&[1], |_| Ok(((), None))).unwrap();
+        bank.enqueue(&9);
+        bank.enqueue(&9);
+        let mut stats = serde_json::json!({});
+        graph_capture_stats(&mut stats);
+        let variants = stats["graph_missing_variants"].as_array().expect("variant array");
+        let ours: Vec<_> = variants.iter().filter(|variant| variant["family"] == "probe-test-miss").collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!((ours[0]["shape"].as_str(), ours[0]["runs"].as_u64()), (Some("9"), Some(2)));
+        assert!(stats["graph_captures"].is_u64());
+    }
 }
 
 #[cfg(test)]

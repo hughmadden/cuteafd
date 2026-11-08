@@ -879,7 +879,12 @@ impl<'a> LocalLane<'a> {
         let rank = self.rank;
         let key = super::graphs::Key { lane: self.lane_index, rank, rows, op };
         let stream = self.stream().clone();
-        self.graphs.as_mut().map_or(Ok(false), |graphs| graphs.launch(key, &stream))
+        // Only a startup-set miss builds this: rows, lane geometry and replay
+        // selection are outside the key, so they say which traffic needed it.
+        let (lane, window, replay_enabled) = (self.lane_index, self.lane.window.clone(), self.replay_enabled);
+        let attention = self.attention.as_ref().map(|shape| (shape.rows, shape.sequences));
+        self.graphs.as_mut().map_or(Ok(false), |graphs| graphs.launch(key, &stream,
+            || format!("lane={lane} window={window:?} replay_enabled={replay_enabled} attention={attention:?}")))
     }
 
     /// Enqueue only rank-local attention. KDA and head-split MLA return a TP2
