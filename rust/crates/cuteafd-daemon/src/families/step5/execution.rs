@@ -1786,7 +1786,12 @@ mod tests {
                         }
                         let reused = cuteafd_loader::plan::families::step5::native::rank_admission_for_layout(
                             &plan.contract, &cfg, &plan.layouts[rank], &ownership, rank, 64, 64, 1)?;
-                        assert!(reused.immutable > 0 && reused.workspace > 0);
+                        assert!(reused.workspace > 0);
+                        assert_eq!(reused.weight_arenas.len(), 1);
+                        assert!(reused.weight_arenas[0].0.bytes() > 0);
+                        if rank != usize::from(ownership.execution().spec().head_gpu) {
+                            assert_eq!(reused.immutable, 0);
+                        }
                     }
                 }
                 for stage in 0..3 {
