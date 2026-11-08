@@ -603,9 +603,28 @@ impl Recipe for MimoRecipe<'_> {
                 }),
             });
         }
-        // Checkpoint weights are retained for every phase; the expert arena's
-        // own retained weights join them for the selected prefix only.
+        // Immutable arenas replace every per-tensor payload and claim. Their
+        // separately retired lifetimes are independent of expert onboarding.
+        if self.spark_profile.weight_arenas != self.no_spark_profile.weight_arenas {
+            return Err(invalid("weight arenas differ with expert placement"));
+        }
+        let mut arena_names = std::collections::BTreeSet::new();
+        for (rank, arenas) in self.spark_profile.weight_arenas.iter().enumerate() {
+            for arena in arenas {
+                arena_names.insert(arena.layout.id().to_owned());
+                arena_names.insert(format!("{}.tail", arena.layout.id()));
+                contract.components.extend(crate::placement::planner::weight_arena_components(
+                    &arena.layout, Location::coordinator(rank as u8), arena.lifetime, maximum)?);
+            }
+        }
+        // Media towers already in the baseline and separately managed expert
+        // windows retain their old claims, excluding the arena claims above.
         for (rank, &weights) in self.resident_weights.iter().enumerate() {
+            let arena_bytes = self.spark_profile.weight_arenas.get(rank).into_iter().flatten()
+                .try_fold(0u64, |sum, arena| sum.checked_add(arena.layout.bytes() as u64))
+                .ok_or(Refusal::Overflow("MiMo arena weight claims"))?;
+            let weights = ResidentWeights(weights.0.checked_sub(arena_bytes)
+                .ok_or_else(|| invalid("arena weight claims exceed retained weights"))?);
             if weights.0 == 0 { continue; }
             let location = Location::coordinator(rank as u8);
             contract.components.push(Component::resident_weight(
@@ -634,6 +653,7 @@ impl Recipe for MimoRecipe<'_> {
                         if phase == Phase::DraftLoad { reservations.extend(self.draft_packing.get(rank).into_iter().flatten().cloned()); }
                     }
                     for reservation in reservations {
+                        if arena_names.contains(&reservation.name) { continue; }
                         let owner = Allocation::buffer(format!("rtx{rank}.{phase:?}.{}", reservation.name),
                             Location::coordinator(rank as u8), reservation.bytes, Lifetime { first: phase, last: phase },
                             super::reservation_category(&reservation.name), super::reservation_group(&reservation.name));
@@ -656,6 +676,7 @@ impl Recipe for MimoRecipe<'_> {
             for (rank, costs) in profile.devices.iter().enumerate() {
                 let location = Location::coordinator(rank as u8);
                 for reservation in &costs.reservations {
+                    if arena_names.contains(&reservation.name) { continue; }
                     let owner = Allocation::buffer(format!("rtx{rank}.{}", reservation.name),
                         location, reservation.bytes, Lifetime { first: Phase::Warmup, last: Phase::Growth },
                         super::reservation_category(&reservation.name),
