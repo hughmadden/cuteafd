@@ -51,7 +51,9 @@ impl ServerContext {
 
     pub fn draft_mode(&self) -> &str {
         self.settings.iter().find(|setting| setting.name == "draft-mode" && setting.source == "resolved")
-            .and_then(|setting| setting.value.as_deref()).unwrap_or("adaptive")
+            .and_then(|setting| setting.value.as_deref()).unwrap_or_else(||
+                if crate::server::speculator(self.family.as_deref(), &self.settings).is_some() { "adaptive" }
+                else { "no speculation" })
     }
 
     pub fn resolve(&mut self, name: &str, value: &str) {

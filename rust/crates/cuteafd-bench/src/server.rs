@@ -166,7 +166,7 @@ fn quant(snapshot: &Path, spark_ranks: usize) -> Vec<QuantGroup> {
 }
 
 /// The speculator the options select.
-fn speculator(_family: Option<&str>, settings: &[Setting]) -> Option<String> {
+pub(crate) fn speculator(_family: Option<&str>, settings: &[Setting]) -> Option<String> {
     let truthy = |names: &[&str]| setting(settings, names).is_some_and(|v| v == "true");
     let number = |names: &[&str]| setting(settings, names).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     if truthy(&["dspark"]) {
@@ -201,7 +201,8 @@ pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configurat
     let settings = context.report_settings();
     let quant = context.snapshot.as_deref().map(|s| quant(s, hardware.sparks.len())).unwrap_or_default();
     Configuration {
-        draft: context.draft_mode().into(),
+        draft: if speculator(context.family.as_deref(), &settings).is_none() { "no speculation" }
+            else { context.draft_mode() }.into(),
         supports_thinking_off: context.supports_thinking_off,
         snapshot: context.snapshot.as_ref().map(|p| p.display().to_string()),
         quant,
@@ -363,8 +364,10 @@ mod tests {
 
     #[test]
     fn configuration_reports_resolved_draft_mode_not_requested_length() {
-        let mut context = ServerContext { settings: vec![s("draft-length", "99", None, "cli")], ..Default::default() };
+        let mut context = ServerContext { settings: vec![s("draft-length", "99", None, "cli"), s("draft", "/drafter", None, "cli")], ..Default::default() };
         assert_eq!(configuration(&context, &Hardware::default()).draft, "adaptive");
+        let inactive = ServerContext { settings: vec![s("draft-length", "4", None, "cli")], ..Default::default() };
+        assert_eq!(configuration(&inactive, &Hardware::default()).draft, "no speculation");
         context.resolve("draft-mode", "fixed 7");
         let encoded = serde_json::to_value(configuration(&context, &Hardware::default())).unwrap();
         assert_eq!(encoded["draft"], "fixed 7");

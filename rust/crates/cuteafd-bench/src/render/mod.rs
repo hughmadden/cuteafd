@@ -85,6 +85,20 @@ mod tests {
     }
 
     #[test]
+    fn card_without_speculator_never_claims_adaptive_or_fixed_drafts() {
+        let mut report = crate::sample::full_report();
+        report.server.configuration.speculator = None;
+        for mode in ["adaptive", "fixed 4"] {
+            report.server.configuration.draft = mode.into();
+            let svg = super::card::card_svg(&report);
+            assert!(svg.contains("no speculation"));
+            assert!(!svg.contains("adaptive draft") && !svg.contains("fixed draft"));
+        }
+        report.server.configuration = serde_json::from_str("{}").unwrap();
+        assert!(super::card::card_svg(&report).contains("no speculation"));
+    }
+
+    #[test]
     fn wrap_breaks_a_word_longer_than_the_line() {
         let lines = super::bodies::wrap("dev · https://github.com/tpurtell/cuteafd @ 9db3e0b7", 12.0, 120.0);
         assert!(lines.iter().all(|l| l.chars().count() <= 16), "{lines:?}");

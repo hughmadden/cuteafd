@@ -85,6 +85,7 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.mtp > 0);
     cuteafd_core::concurrency::validate("qwen4", args.max_sequences as u64)?;
     args.prefix.resolve_entries(args.max_sequences as usize);
     let api = args.api.load()?;

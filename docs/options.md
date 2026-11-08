@@ -193,7 +193,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `SPECULATOR_MODEL_ID` | family default | HF repo id | External drafter checkpoint. |
 | `SPECULATOR_MODEL_REVISION` | empty | 40–64 lowercase hex | Drafter revision. |
 | `SPECULATOR_DEPTH` | 3 for local Qwen/Step-5, else 1 | positive int | Native MTP draft depth. |
-| `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. |
+| `DRAFT_LENGTH` | unset (adaptive) | positive int | Fixed verified draft tokens per step: min(value, native head width), further capped by the existing row budget at high concurrency. Overrides `DRAFT_POLICY`; statistics still recorded. Every family and speculator (DFlash2, dSpark, MTP, Markov). V4.1 adaptive maximum remains 5 when unset; fixed supports up to 7. Without a speculator it is ignored with one startup log; reports and cards say `no speculation`. |
 | `SPECULATOR_FP8` | `auto` | `auto`, `on`, `off` | GLM/Qwen/MiMo drafter precision: `on` converts to single-copy FP8. |
 | `DRAFT_POLICY` | unset | `shared`, `simple`, `simple-rc`, `simple-derived` | Drafter block policy diagnostic. |
 | `DRAFT_ROW_COST` | unset | `linear`, `power`, `log` | Drafter row cost model diagnostic. |

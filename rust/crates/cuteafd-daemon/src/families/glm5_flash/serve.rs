@@ -174,6 +174,7 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.draft.is_some());
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     cuteafd_core::concurrency::validate("glm5_flash", max_sequences as u64)?;
@@ -203,14 +204,14 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), max_sequences, args.decode_share);
     let policy = Policy { length: args.draft_length, batch: args.prefill_batch };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id, max_sequences));
+    let layout = console_layout(&args, &profile.id, max_sequences, None);
     let vision = args.vision;
     let remote = super::media::RemoteVision::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix, vision,
-            media_cache_bytes, remote, args.loop_abort.config()));
-    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+            media_cache_bytes, remote, layout, args.console.console_text, args.loop_abort.config()));
+    let (max_context, media, hub) = ready_rx.await.context("engine failed before it was ready")??;
     let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
@@ -234,7 +235,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
 }
 
 /// What the live console shows for GLM 5.3 Flash.
-fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result<console::Layout> {
+fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize, speculator: Option<console::Speculator>) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5_flash", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -242,14 +243,7 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = max_sequences;
-    layout.speculator = args.engine.draft.as_deref().map(|snapshot| {
-        let dspark = super::dspark::is_dspark(snapshot)?;
-        let native = if dspark { super::dspark::DsparkConfig::read(snapshot)?.drafts() }
-            else { crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts() };
-        Ok::<_, anyhow::Error>(console::Speculator {
-            name: if dspark { "dSpark" } else { "DFlash2" }.into(), positions: native,
-            policy: args.draft_length.label(native) })
-    }).transpose()?;
+    layout.speculator = speculator;
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "block draft", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -262,16 +256,17 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result
         StepGroup::admission(false),
     ];
     layout.layers = Some(console::Layers::host_clock());
-    Ok(layout)
+    layout
 }
 
 type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady, Arc<cuteafd_api::openai::ConsoleHub>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>,
+    mut layout: console::Layout, console_text: bool,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     args.serving_graph_policy = Some((max_sequences, args.draft.is_some()));
     let lanes = max_sequences;
@@ -315,6 +310,10 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     }, |engine| {
         let mut vision = prepared.borrow_mut().take();
         let media_push = vision.as_mut().map(|vision| std::mem::take(&mut vision.push)).unwrap_or_default();
+        layout.speculator = engine.drafter.as_ref().map(|draft| console::Speculator {
+            name: if matches!(draft, super::dspark::Drafter::Dspark(_)) { "dSpark" } else { "DFlash2" }.into(),
+            positions: draft.drafts(), policy: policy.length.label(draft.drafts()) });
+        let mut hub = Some(console::hub(console_text, || Ok(layout)));
         media_push.commit()?;
         let preparer = vision.as_ref().map(|vision| vision.preparer.clone());
         let encoder = vision.map_or(super::media::Encoder::Off, |vision| vision.encoder);
@@ -334,7 +333,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
                 // every start-up allocation.
                 crate::shared::memory_report::log("glm5_flash ready");
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())), hub.take().expect("console hub"))));
                 }
             })
     });

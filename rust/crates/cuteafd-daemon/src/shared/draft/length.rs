@@ -6,7 +6,7 @@ use cuteafd_core::{DraftPolicy, PolicyGeometry, PolicySeed};
 pub(crate) struct DraftLength {
     /// Verify this many drafts, capped by the native head and the step's row budget.
     /// Unset keeps adaptive selection.
-    #[arg(long, value_parser = parse)]
+    #[arg(long, env = "DRAFT_LENGTH", global = true, value_parser = parse)]
     pub draft_length: Option<usize>,
 }
 
@@ -16,6 +16,15 @@ fn parse(value: &str) -> Result<usize, String> {
 }
 
 impl DraftLength {
+    pub fn report_inactive(self, active: bool) {
+        if !active {
+            if let Some(length) = self.draft_length {
+                tracing::info!("DRAFT_LENGTH={length} ignored: no speculator");
+            }
+            cuteafd_bench::context::set_resolved("draft-mode", "no speculation");
+        }
+    }
+
     pub fn effective(self, native: usize) -> usize {
         self.draft_length.map_or(native, |n| n.min(native))
     }
@@ -73,6 +82,7 @@ mod tests {
             assert!(settings.0.iter().any(|(k, v)| k == "draft-mode" && v == &format!("fixed {effective}")));
             let mut context = cuteafd_bench::context::ServerContext::default();
             settings.apply(&mut context);
+            context.resolve("draft", "/drafter");
             assert_eq!(cuteafd_bench::server::configuration(&context, &Default::default()).draft,
                 format!("fixed {effective}"));
             let prior = vec![0.01; native];
@@ -84,6 +94,32 @@ mod tests {
         }
         assert!(parse("0").is_err());
         assert!(parse("-1").is_err());
+    }
+
+    #[test]
+    fn inactive_override_reports_no_speculation() {
+        #[derive(Clone)]
+        struct Output(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let output = Output(Default::default());
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        let (_, settings) = tracing::subscriber::with_default(subscriber, ||
+            cuteafd_bench::context::capture_resolved(||
+                DraftLength { draft_length: Some(4) }.report_inactive(false)));
+        let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("DRAFT_LENGTH=4 ignored: no speculator").count(), 1);
+        let mut context = cuteafd_bench::context::ServerContext::default();
+        settings.apply(&mut context);
+        assert_eq!(context.draft_mode(), "no speculation");
+        assert_eq!(cuteafd_bench::server::configuration(&context, &Default::default()).draft, "no speculation");
     }
 
     #[test] fn v41() { contract("serve-native", 7); assert_eq!(config("serve-native", None).effective(5), 5); }

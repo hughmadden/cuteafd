@@ -457,7 +457,7 @@ pub struct FabricPort {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Configuration {
-    /// Effective draft selection: adaptive, or fixed N before per-round row caps.
+    /// Effective selection: no speculation, adaptive, or fixed N before row caps.
     #[serde(default = "adaptive_draft")]
     pub draft: String,
     /// Renderer capability; absent preserves requests to older servers.
@@ -490,6 +490,10 @@ impl Default for Configuration {
 }
 
 impl Configuration {
+    pub fn draft_mode(&self) -> &str {
+        if self.speculator.is_none() { "no speculation" } else { &self.draft }
+    }
+
     pub fn supports_thinking_off(&self) -> bool { self.supports_thinking_off != Some(false) }
 
     pub fn thinking_label(&self) -> &'static str {

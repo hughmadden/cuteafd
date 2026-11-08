@@ -444,6 +444,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 }
 
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.draft.is_some());
     use cuteafd_api::openai::{chat::muse::MuseEncoding, ModelEncoding, ModelProfile};
     args.validate()?;
     let view = args.attention.selected_view.clone().map(Ok)

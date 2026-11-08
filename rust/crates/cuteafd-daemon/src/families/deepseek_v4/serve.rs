@@ -85,6 +85,7 @@ fn prefix_score_path(position: usize, input_rows: usize) -> probe::ScorePath {
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.dspark);
     cuteafd_core::concurrency::validate("deepseek_v4", args.engine.max_sequences as u64)?;
     args.prefix.resolve_entries(args.engine.max_sequences);
     let api = args.api.load()?;

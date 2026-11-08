@@ -562,6 +562,7 @@ pub(crate) struct ServeArgs {
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.draft.is_some() || args.mtp > 0);
     cuteafd_core::concurrency::validate("qwen3_5", args.max_sequences as u64)?;
     args.prefix.resolve_entries(args.max_sequences as usize);
     use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile};
@@ -824,8 +825,8 @@ mod tests {
             let args = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so",
                 "--draft", "external", "--draft-length", "3", "--max-sequences", &c.to_string()]).unwrap().serve;
             assert_eq!(usize::from(args.max_sequences), c);
-            assert_eq!(args.draft.is_some(), c <= block_dspark::MAX_SEQUENCES);
-            assert_eq!(args.draft_length.draft_length.is_some(), c <= block_dspark::MAX_SEQUENCES);
+            assert!(args.draft.is_some());
+            assert_eq!(args.draft_length.draft_length, Some(3));
         }
     }
 

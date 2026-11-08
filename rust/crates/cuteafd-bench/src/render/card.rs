@@ -58,9 +58,11 @@ pub fn card_svg(report: &Report) -> String {
     doc.nested(LOGO, pad, 36.0, 46.0 * LOGO_ASPECT, 46.0);
     doc.text(WIDTH - pad, 62.0, Font::new(13.0, t.muted).anchor(Anchor::End).spacing(1.5),
         &format!("{} · {}", crate::profiles::title_of(&r.profile).to_uppercase(), super::date(&r.created)));
-    let draft = &r.server.configuration.draft;
-    let draft = if draft.is_empty() { "adaptive" } else { draft.as_str() };
-    let label = draft.strip_prefix("fixed ").map_or_else(|| "adaptive draft".into(), |n| format!("fixed draft {n}"));
+    let draft = r.server.configuration.draft_mode();
+    let label = match draft {
+        "no speculation" => "no speculation".into(),
+        _ => draft.strip_prefix("fixed ").map_or_else(|| "adaptive draft".into(), |n| format!("fixed draft {n}")),
+    };
     if draft.starts_with("fixed ") {
         let width = text_width(&label, 15.0) + 28.0;
         doc.rect_attrs(WIDTH - pad - width, 83.0, width, 32.0, 8.0,

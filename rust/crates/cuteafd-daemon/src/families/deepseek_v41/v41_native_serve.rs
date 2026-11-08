@@ -38,6 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 
 
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.dspark);
     // Identify the checkpoint before loading it: an unidentifiable directory fails in seconds.
     let mut profile = served_profile(args.model_id.clone(), &args.snapshot)?;
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;

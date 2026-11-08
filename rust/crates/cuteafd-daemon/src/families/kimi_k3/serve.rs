@@ -125,6 +125,7 @@ fn load_target<'a, const RANKS: usize>(args: &ServeArgs,
 }
 
 pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.draft.is_some());
     cuteafd_core::concurrency::validate("kimi_k3", args.max_sequences as u64)?;
     args.prefix.resolve_entries(args.max_sequences as usize);
     args.validate()?;

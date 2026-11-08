@@ -118,7 +118,7 @@ pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
     layout.eos = vec![1];
     layout.speculator = args.dspark.then(|| Speculator {
         name: "dSpark".into(),
-        positions: args.draft_length.draft_length.unwrap_or(5).min(7).clamp(5, 7),
+        positions: if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 },
         policy: args.draft_length.label(7),
     });
     layout.steps = vec![

@@ -134,6 +134,7 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.draft.is_some() || args.engine.mtp > 0);
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     cuteafd_core::concurrency::validate("mimo_v2", max_sequences as u64)?;
@@ -164,7 +165,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s,
         snapshot_wait: args.mimo_snapshot_wait };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id, max_sequences));
+    let layout = console_layout(&args, &profile.id, max_sequences, 0);
     let vision = args.vision;
     let audio = args.audio;
     let remote = super::media::RemoteVision::from_args(&args)?;
@@ -172,8 +173,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio,
-            media_cache_bytes, remote, remote_audio, args.loop_abort.config()));
-    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+            media_cache_bytes, remote, remote_audio, layout, args.console.console_text, args.loop_abort.config()));
+    let (max_context, media, hub) = ready_rx.await.context("engine failed before it was ready")??;
     let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, audio_preparer, health, audio_health)) = media {
         if let Some(preparer) = preparer {
@@ -202,7 +203,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
 }
 
 /// What the live console shows for MiMo V2 (Flash and V2.6 Pro).
-fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result<console::Layout> {
+fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize, native: usize) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("mimo_v2", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -210,8 +211,6 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = max_sequences;
-    let native = args.engine.draft.as_deref().map(|snapshot| super::dflash::DflashConfig::read(snapshot)
-        .map(|cfg| cfg.drafts())).transpose()?.unwrap_or(args.engine.mtp);
     let policy = args.draft_length.label(native);
     let drafter = if args.engine.draft.is_some() { Some("DFlash") } else if args.engine.mtp > 0 { Some("MTP") } else { None };
     layout.speculator = drafter.map(|name| console::Speculator {
@@ -226,7 +225,7 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result
         StepGroup::admission(false),
     ];
     layout.layers = Some(console::Layers::host_clock());
-    Ok(layout)
+    layout
 }
 
 /// Neural draft settings and the shared resource-policy binding.
@@ -242,8 +241,9 @@ type VisionReady = Option<(Option<Arc<cuteafd_api::openai::media::MediaPreparer>
     Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady, Arc<cuteafd_api::openai::ConsoleHub>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>, remote_audio: Option<super::media::RemoteAudio>,
+    mut layout: console::Layout, console_text: bool,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
@@ -269,6 +269,11 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let result = opened.with_engine_reserved_media(&args, Some((&prefix, max_sequences)), media_push.records(),
         if args.full_prefill_logits { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::AllRows }
         else { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow }, |engine, host_config| {
+        layout.speculator = engine.drafter.as_ref().map(|draft| ("DFlash", draft.cfg.drafts()))
+            .or_else(|| engine.mtp.as_ref().map(|mtp| ("MTP", mtp.stages.len())))
+            .map(|(name, native)| console::Speculator { name: name.into(), positions: native,
+                policy: draft.length.label(native) });
+        let mut hub = Some(console::hub(console_text, || Ok(layout)));
         media_push.commit()?;
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
@@ -288,7 +293,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences, draft, &prefix,
             loop_abort, args.token_io.token_select, host_config, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
+                    let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())), hub.take().expect("console hub"))));
                 }
             })
     });
