@@ -32,7 +32,7 @@
 use super::engine::Engine;
 use super::metadata::{compressed_page_bytes, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES, SOURCE_PAGE_TOKENS, WINDOW};
 use super::pool::{Placement, PoolAllocator};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, Tag};
 use crate::shared::prefix::view;
 use crate::shared::spark_intake::SparkLink;
 use anyhow::{ensure, Context, Result};
@@ -50,6 +50,9 @@ const WINDOW_MARK_BYTES: usize = WINDOW * (PAYLOAD_BYTES + SCALE_BYTES);
 /// C4 index page: 64 rows of 128 FP8 keys, then 64 FP32 scales.
 const INDEX_ROWS: usize = 64;
 const INDEX_KEY_BYTES: usize = 128;
+
+/// Retained prefix-cache marks: each slot's per-layer window rows and compressor state.
+const PREFIX_MARKS: Tag = Tag::prefix("v4/prefix-marks");
 
 /// One layer's device buffers.
 struct LayerBuffers {
@@ -117,7 +120,7 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         let slots = slots(mark_bytes);
         let arenas = if slots > 0 {
             rank_mark_bytes.iter().enumerate().map(|(rank, &bytes)| {
-                engine.on(rank, || DeviceAllocation::untagged(engine.library, (slots * bytes).max(256)))
+                engine.on(rank, || DeviceAllocation::new(engine.library, (slots * bytes).max(256), PREFIX_MARKS))
             }).collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()

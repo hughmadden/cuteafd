@@ -14,7 +14,12 @@ use crate::shared::experts::exl3::{
     Exl3Weights,
 };
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, Tag};
+
+/// Expert kernel scratch bound per launch capacity.
+const EXPERT_SCRATCH: Tag = Tag::workspace("v4/local-experts/scratch");
+/// Expert output rows the local reducer and the exchange consume.
+const EXPERT_OUTPUT: Tag = Tag::workspace("v4/local-experts/output");
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs, V41LocalExpertReducer,
@@ -382,7 +387,7 @@ impl<'a> LocalExperts<'a> {
         if layers.is_empty() && stages.is_empty() {
             return Ok(None);
         }
-        let scratch = DeviceAllocation::untagged(library, scratch_bytes.max(256))?;
+        let scratch = DeviceAllocation::new(library, scratch_bytes.max(256), EXPERT_SCRATCH)?;
         for state in &mut states {
             // SAFETY: the arena is exclusively owned and sized for every variant.
             unsafe {
@@ -397,7 +402,7 @@ impl<'a> LocalExperts<'a> {
             resident_weights,
             backend: Backend::Native { ids: backbone[..layers.len()].to_vec(), layers, stages, states, reduction_plan, _scratch: scratch },
             reducer: library.v41_local_expert_reducer()?,
-            output: DeviceAllocation::untagged(library, max_rows * shape.hidden * 2)?,
+            output: DeviceAllocation::new(library, max_rows * shape.hidden * 2, EXPERT_OUTPUT)?,
             topk: shape.topk,
             device: library.cuda_get_device()?,
         }))
@@ -493,7 +498,7 @@ impl<'a> LocalExperts<'a> {
             resident_weights,
             backend: Backend::Exl3 { executions, row_policy, reduction_plan, stages, layers },
             reducer: library.v41_local_expert_reducer()?,
-            output: DeviceAllocation::untagged(library, output_bytes)?,
+            output: DeviceAllocation::new(library, output_bytes, EXPERT_OUTPUT)?,
             topk: shape.topk,
             device: library.cuda_get_device()?,
         }))
