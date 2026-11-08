@@ -7,6 +7,57 @@
 #include <cmath>
 #include <algorithm>
 
+// Mirror fp8_gemv.cu's per-row scales and 16x32 A-fragment packing.
+// Allocation-only and lifetime tests retain the C fixture's no-math mode.
+extern "C" int fixture_fp8_w8a16_pack(const void* source, void* packed, void* scales,
+                                       int n, int k, int rule) {
+  using namespace cuteafd_load_quant;
+  if (!source || !packed || !scales || n <= 0 || k <= 0 || n % 16 || k % 128 || rule < 0 || rule > 2) return 1;
+  const auto* w = static_cast<const uint16_t*>(source);
+  auto* q = static_cast<uint8_t*>(packed);
+  auto* scale = static_cast<float*>(scales);
+  for (int r = 0; r < n; ++r) for (int kb = 0; kb < k / 128; ++kb) {
+    float maximum = 0.0f;
+    for (int c = 0; c < 128; ++c) maximum = fmax32(maximum, fabs32(bf16(w[size_t(r) * k + kb * 128 + c])));
+    const float sa = amax_scale(maximum);
+    const uint32_t bits = f32_bits(maximum);
+    const int exponent = std::clamp(int(bits >> 23) - 135 + int((bits & 0x7FFFFFu) > 0x600000u), -126, 127);
+    const float sp = maximum > 0 ? bits_f32(uint32_t(exponent + 127) << 23) : 1.0f;
+    float chosen = rule == 1 ? sp : sa;
+    if (rule == 2) {
+      float ea[32] = {}, ep[32] = {};
+      for (int lane = 0; lane < 32; ++lane) for (int j = 0; j < 4; ++j) {
+        const float x = bf16(w[size_t(r) * k + kb * 128 + lane * 4 + j]);
+        const float da = fsub(fmul(e4m3_value(e4m3(fdiv(x, sa))), sa), x);
+        const float dp = fsub(fmul(e4m3_value(e4m3(fdiv(x, sp))), sp), x);
+        ea[lane] = fadd(ea[lane], fmul(da, da));
+        ep[lane] = fadd(ep[lane], fmul(dp, dp));
+      }
+      for (int offset = 16; offset; offset >>= 1) {
+        float next_a[32], next_p[32];
+        for (int lane = 0; lane < 32; ++lane) {
+          next_a[lane] = fadd(ea[lane], ea[lane ^ offset]);
+          next_p[lane] = fadd(ep[lane], ep[lane ^ offset]);
+        }
+        memcpy(ea, next_a, sizeof(ea)); memcpy(ep, next_p, sizeof(ep));
+      }
+      chosen = ep[0] < ea[0] ? sp : sa;
+    }
+    scale[size_t(r) * (k / 128) + kb] = chosen;
+  }
+  for (int rt = 0; rt < n / 16; ++rt) for (int kb = 0; kb < k / 128; ++kb)
+    for (int kt = 0; kt < 4; ++kt) for (int lane = 0; lane < 32; ++lane) {
+      const int g = lane / 4, c = lane % 4 * 2;
+      const size_t at = ((size_t(rt) * (k / 32) + kb * 4 + kt) * 32 + lane) * 16;
+      for (int step = 0; step < 2; ++step) for (int j = 0; j < 8; ++j) {
+        const int row = rt * 16 + g + ((j % 4 >= 2) ? 8 : 0);
+        const int col = kb * 128 + kt * 32 + step * 16 + c + (j >= 4 ? 8 : 0) + j % 2;
+        q[at + step * 8 + j] = e4m3(fdiv(bf16(w[size_t(row) * k + col]), scale[size_t(row) * (k / 128) + kb]));
+      }
+    }
+  return 0;
+}
+
 // Preserve the warp's accumulation/reduction order for deferred-load tests.
 static int32_t markov_norms(const void* source, void* output, int32_t rows, int32_t cols, bool slack) {
   if (!source || !output || rows < 1 || cols != (slack ? 512 : 256)) return 1;
@@ -187,3 +238,52 @@ extern "C" uint64_t cuteafd_glm_dflash_attention_workspace_d64(int32_t sequences
   return fixture_draft_attention(sequences, kv_heads, max_keys, 64);
 }
 extern "C" uint64_t cuteafd_glm_dflash_topk_workspace(int32_t rows) { return uint64_t(rows) * 64 * 16 * 8; }
+
+// Independent sequential implementation of the exact packed-head planes.
+extern "C" int fixture_packed_head_pack(const void* source, void* const* planes,
+                                         int64_t capacity, int n, int k, void* status) {
+  if (!source || !planes || !status || n <= 0 || n % 16 || k <= 0 || k % 128 || capacity < 0) return 1;
+  const auto* w = static_cast<const uint16_t*>(source);
+  auto* coarse = static_cast<uint8_t*>(planes[0]);
+  auto* fine = static_cast<uint32_t*>(planes[1]);
+  auto* bases = static_cast<uint8_t*>(planes[2]);
+  auto* row_ptr = static_cast<uint32_t*>(planes[3]);
+  auto* columns = static_cast<uint32_t*>(planes[4]);
+  auto* values = static_cast<uint16_t*>(planes[5]);
+  auto* words = static_cast<uint64_t*>(status);
+  memset(fine, 0, size_t(n) * k / 2);
+  words[0] = words[1] = words[3] = 0; words[2] = UINT64_MAX;
+  row_ptr[0] = 0;
+  for (int r = 0; r < n; ++r) {
+    int histogram[256] = {}, best = -1, base = 0;
+    for (int c = 0; c < k; ++c) ++histogram[(w[size_t(r) * k + c] >> 7) & 255];
+    for (int e = 0; e <= 240; ++e) {
+      int count = 0;
+      for (int i = 0; i < 16; ++i) count += histogram[e + i];
+      if (count > best) { best = count; base = e; }
+    }
+    bases[r] = uint8_t(base);
+    uint64_t row_exceptions = 0;
+    for (int c = 0; c < k; ++c) {
+      const uint16_t bits = w[size_t(r) * k + c];
+      const int exponent = (bits >> 7) & 255;
+      uint16_t coded = bits;
+      if (exponent < base || exponent >= base + 16) {
+        coded = uint16_t((bits & 0x8000) | (exponent < base ? base << 7 : ((base + 15) << 7) | 127));
+        if (words[0] < uint64_t(capacity)) { columns[words[0]] = uint32_t(c); values[words[0]] = bits; }
+        ++words[0]; ++row_exceptions;
+      }
+      const int within = c & 7, j = ((c >> 3) & 1) * 2 + ((r >> 3) & 1);
+      const size_t lane = (r & 7) * 4 + (within >> 1);
+      const size_t index = ((size_t(r >> 4) * (k / 32) + (c >> 5)) * 32 + lane);
+      const int step = (c >> 4) & 1, h = within & 1;
+      coarse[index * 16 + step * 8 + j * 2 + h] = uint8_t(((coded >> 8) & 128)
+          | ((((coded >> 7) & 255) - base) << 3) | ((coded >> 4) & 7));
+      fine[index * 2 + step] |= uint32_t(coded & 15) << (4 * j + 16 * h);
+    }
+    row_ptr[r + 1] = uint32_t(words[0]);
+    words[3] = std::max(words[3], row_exceptions);
+  }
+  if (words[0] > uint64_t(capacity)) { words[1] = uint64_t(n); words[2] = 0; }
+  return 0;
+}

@@ -89,6 +89,32 @@ impl Census {
     /// Exact repeated backing becomes a view. Partial overlap without an explicit
     /// backing relationship is an error, not evidence that one owner contains another.
     pub(crate) fn normalize(&mut self, order: PhaseOrder) -> Result<()> {
+        // Independent tensor inventories can name the same retained arena.
+        // Only an identical physical backing may repeat its stable ID.
+        let mut unique: Vec<Receipt> = Vec::with_capacity(self.receipts.len());
+        let mut by_id: BTreeMap<String, usize> = BTreeMap::new();
+        for receipt in self.receipts.drain(..) {
+            ensure!(order.at_or_before(receipt.allocation.lifetime.first, receipt.allocation.lifetime.last),
+                "invalid declared lifetime {}", receipt.allocation.id);
+            if let Some(&index) = by_id.get(&receipt.allocation.id) {
+                let retained: &mut Receipt = &mut unique[index];
+                ensure!(retained.allocation.view.is_none() && receipt.allocation.view.is_none()
+                    && retained.address == receipt.address
+                    && retained.allocation.location == receipt.allocation.location
+                    && retained.allocation.bytes == receipt.allocation.bytes
+                    && retained.allocation.category == Category::Weights && receipt.allocation.category == Category::Weights
+                    && retained.allocation.group == "weight arena" && receipt.allocation.group == "weight arena",
+                    "conflicting repeated backing {}", receipt.allocation.id);
+                let lifetime = receipt.allocation.lifetime;
+                let current = &mut retained.allocation.lifetime;
+                if order.at_or_before(lifetime.first, current.first) { current.first = lifetime.first; }
+                if order.at_or_before(current.last, lifetime.last) { current.last = lifetime.last; }
+            } else {
+                by_id.insert(receipt.allocation.id.clone(), unique.len());
+                unique.push(receipt);
+            }
+        }
+        self.receipts = unique;
         let mut ids = BTreeMap::new();
         for (index, receipt) in self.receipts.iter().enumerate() {
             let allocation = &receipt.allocation;
@@ -173,14 +199,19 @@ impl<'a> Inventory<'a> {
     }
     pub(crate) fn lifetime(&self) -> Lifetime { self.lifetime }
     pub(crate) fn extend(&mut self, receipts: Vec<Receipt>) -> Result<()> {
+        let arenas = receipts.iter().filter(|r| r.allocation.view.is_none()
+            && r.allocation.category == Category::Weights && r.allocation.group == "weight arena")
+            .map(|r| r.allocation.id.clone()).collect::<std::collections::BTreeSet<_>>();
         for mut receipt in receipts {
-            receipt.allocation.id = format!("{}.{}", self.prefix, receipt.allocation.id);
+            let arena = arenas.contains(&receipt.allocation.id);
+            if !arena { receipt.allocation.id = format!("{}.{}", self.prefix, receipt.allocation.id); }
             if let Some(view) = &mut receipt.allocation.view {
-                view.backing = format!("{}.{}", self.prefix, view.backing);
+                if !arenas.contains(&view.backing) { view.backing = format!("{}.{}", self.prefix, view.backing); }
             }
-            ensure!(!self.receipts.iter().any(|r| r.allocation.id == receipt.allocation.id),
-                "duplicate imported owner {}", receipt.allocation.id);
-            self.receipts.push(receipt);
+            if let Some(existing) = self.receipts.iter().find(|r| r.allocation.id == receipt.allocation.id) {
+                ensure!(arena && existing.address == receipt.address && existing.allocation == receipt.allocation,
+                    "duplicate imported owner {}", receipt.allocation.id);
+            } else { self.receipts.push(receipt); }
         }
         Ok(())
     }
@@ -194,6 +225,27 @@ impl<'a> Inventory<'a> {
     }
     pub(crate) fn device(&mut self, name: &str, buffer: CuteafdDeviceBuffer) -> Result<()> {
         self.add(name, self.devices.location(buffer.device_id)?, buffer.ptr as u64, buffer.bytes as u64)
+    }
+    pub(crate) fn weight_view(&mut self, name: &str, buffer: CuteafdDeviceBuffer,
+        backing: super::device::WeightArenaBacking<'_>) -> Result<()> {
+        let owner = backing.buffer;
+        let location = self.devices.location(owner.device_id)?;
+        let offset = (buffer.ptr as u64).checked_sub(owner.ptr as u64).context("weight view before backing")?;
+        ensure!(!backing.id.is_empty() && !owner.ptr.is_null() && owner.bytes > 0
+            && buffer.device_id == owner.device_id && buffer.bytes > 0
+            && offset.checked_add(buffer.bytes as u64).is_some_and(|end| end <= owner.bytes as u64),
+            "weight view {name} outside backing {}", backing.id);
+        if let Some(receipt) = self.receipts.iter().find(|r| r.allocation.id == backing.id) {
+            ensure!(receipt.allocation.view.is_none() && receipt.allocation.location == location
+                && receipt.address == owner.ptr as u64 && receipt.allocation.bytes == owner.bytes as u64,
+                "weight arena {} changed backing", backing.id);
+        } else {
+            self.receipts.push(Receipt { allocation: Allocation::buffer(backing.id, location,
+                owner.bytes as u64, self.lifetime, Category::Weights, "weight arena"), address: owner.ptr as u64 });
+        }
+        self.device(name, buffer)?;
+        self.receipts.last_mut().unwrap().allocation.view = Some(View { backing: backing.id.into(), offset });
+        Ok(())
     }
     pub(crate) fn backed_pinned(&mut self, name: &str, buffer: CuteafdHostBuffer,
         owner: CuteafdHostBuffer) -> Result<()> {
@@ -221,9 +273,14 @@ impl<'a> Inventory<'a> {
         use cuteafd_loader::placement::planner::{Device, Domain};
         let mut uploads = Vec::new();
         let mut observed = std::collections::BTreeSet::new();
+        let backings = self.receipts.iter().filter_map(|receipt|
+            receipt.allocation.view.as_ref().map(|view| view.backing.as_str())).collect::<std::collections::BTreeSet<_>>();
         for receipt in &self.receipts {
             let allocation = &receipt.allocation;
             if allocation.location.domain != Domain::Device { continue; }
+            // A physical root is not an upload destination. Its offset-zero
+            // alias can share its address, but owns the logical staging key.
+            if allocation.view.is_none() && backings.contains(allocation.id.as_str()) { continue; }
             let Device::Coordinator(rank) = allocation.location.device else {
                 anyhow::bail!("ordered upload destination is not coordinator-owned");
             };

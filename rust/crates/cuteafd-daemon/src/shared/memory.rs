@@ -52,8 +52,20 @@ pub(crate) mod push_native;
 pub(crate) struct DeviceAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) buffer: CuteafdDeviceBuffer,
+    pub(crate) backing: Option<device::Allocation<'a>>,
 }
 impl<'a> DeviceAllocation<'a> {
+    pub(crate) fn from_allocation(allocation: device::Allocation<'a>) -> Self {
+        Self { library: allocation.device.library, buffer: allocation.buffer, backing: Some(allocation) }
+    }
+
+    pub(crate) fn inventory(&self, inventory: &mut receipts::Inventory<'_>, name: &str) -> Result<()> {
+        match &self.backing {
+            Some(allocation) => allocation.inventory(inventory, name),
+            None => inventory.device(name, self.buffer),
+        }
+    }
+
     pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope(scope);
         Self::new(library, bytes)
@@ -74,11 +86,13 @@ impl<'a> DeviceAllocation<'a> {
         Ok(Self {
             library,
             buffer: library.alloc_device_buffer(bytes)?,
+            backing: None,
         })
     }
 }
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
+        if self.backing.is_some() { return; }
         if self.library.is_quarantined_after_failed_drain() {
             // cudaFree may synchronize with unproved work on another stream.
             // Retain this allocation until process teardown on that path.

@@ -26,7 +26,7 @@
 //! glm53f-afd (MIT, v1.1.0 16de2a6).
 use crate::shared::fp8_linear;
 use crate::shared::memory::DeviceAllocation;
-use crate::shared::memory::device::{Device, DeviceOwner};
+use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
 use crate::shared::peer_split::{PeerExchange, DIRECT};
 use std::rc::Rc;
 use crate::shared::token_io::TokenEmbedding;
@@ -51,7 +51,7 @@ mod allocation;
 pub(crate) mod context_split;
 #[cfg(test)]
 #[path = "dflash_physical_tests.rs"]
-mod physical_tests;
+pub(crate) mod physical_tests;
 
 /// The drafters' exact vocabulary head (`--draft-head exact`) of `rows` rows: 2..=24 rows on the
 /// few-row FP32 kernel (one read of the head per 8 rows), others on the pedantic cuBLAS head;
@@ -258,6 +258,13 @@ impl<'a> MlaDraftStorage<'a> {
     /// native programs. All native size queries finish before the first allocation.
     pub(crate) fn allocate(library: &'a NativeLibrary,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout) -> Result<Self> {
+        Self::allocate_with(library, layout,
+            &mut |device, name, bytes| super::weights::standalone(library, device, name, bytes))
+    }
+
+    pub(crate) fn allocate_with(library: &'a NativeLibrary,
+        layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+        allocate: &mut super::weights::WeightAllocator<'a, '_>) -> Result<Self> {
         ensure!(library.sm_count()? == layout.sm_count(), "MLA draft layout belongs to another SM count");
         let expected = |name: &str| -> Result<usize> {
             layout.buffers().iter().find(|b| b.name == name).map(|b| b.bytes)
@@ -285,8 +292,16 @@ impl<'a> MlaDraftStorage<'a> {
             }
             ensure!(bytes == expected("fp8_scratch")?, "MLA draft FP8 workspace disagrees with admission");
         }
-        let buffers = Self::recipes(&layout)?.iter().map(|b|
-            DeviceAllocation::named(library, b.bytes, "drafter/mla")).collect::<Result<Vec<_>>>()?;
+        let buffers = Self::recipes(&layout)?.iter().map(|b| {
+            let immutable = layout.weight_destinations().iter().any(|weight| weight.owner == b.name)
+                || (layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark
+                    && b.name == "markov_norms");
+            if immutable {
+                super::weights::checked_allocation(library, &b.name, b.bytes, allocate)
+            } else {
+                DeviceAllocation::named(library, b.bytes, "drafter/mla")
+            }
+        }).collect::<Result<Vec<_>>>()?;
         Ok(Self { layout, buffers })
     }
 
@@ -1061,8 +1076,45 @@ impl<'a> DflashDrafter<'a> {
     pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
+        Self::load_with(library, programs, snapshot, file, stream, slots, max_sequences, mask_row,
+            row_window, representation, scales, fp8_rows, kv_cache,
+            |device, name, bytes| super::weights::standalone(library, device, name, bytes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize, max_sequences: usize,
+        mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
+        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows,
+        kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        mut allocate: impl FnMut(i32, &str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
         Self::load_rank(library, programs, snapshot, Some(Rc::new(file)), stream, slots, max_sequences,
-            mask_row, row_window, representation, scales, fp8_rows, kv_cache, 0, 1)
+            mask_row, row_window, representation, scales, fp8_rows, kv_cache, 0, 1, &mut allocate)
+    }
+
+    /// Header-only requests use the same immutable-weight traversal as `load_with`.
+    /// `devices` are physical exchange devices; logical selector rank zero follows the head.
+    pub(crate) fn arena_requests(snapshot: &Path, representation: GlmDraftRepresentation,
+        devices: &[i32], head_rank: usize) -> Result<std::collections::BTreeMap<i32, Vec<(String, usize)>>> {
+        ensure!(matches!(devices.len(), 1 | 2) && head_rank < devices.len()
+            && devices.iter().all(|&id| id >= 0)
+            && (devices.len() == 1 || devices[0] != devices[1]), "invalid DFlash arena devices/head rank");
+        let mut requests = std::collections::BTreeMap::new();
+        for rank in 0..devices.len() {
+            let exchange_rank = if rank == 0 { head_rank } else { 1 - head_rank };
+            requests.insert(devices[exchange_rank],
+                super::weights::gqa_arena_requests(snapshot, representation, rank, devices.len())?);
+        }
+        Ok(requests)
+    }
+
+    /// Shared header-only MLA requests; all immutable weights live on the head
+    /// device even when the mutable context cache is split across two devices.
+    pub(crate) fn mla_arena_requests(snapshot: &Path, representation: GlmDraftRepresentation,
+        device: i32) -> Result<std::collections::BTreeMap<i32, Vec<(String, usize)>>> {
+        ensure!(device >= 0, "invalid MLA DFlash arena device");
+        Ok(std::collections::BTreeMap::from([(device,
+            super::weights::mla_arena_requests(snapshot, representation)?)]))
     }
 
     /// Reuses the target's peer exchange and cooperative streams; no extra transport owners.
@@ -1083,13 +1135,37 @@ impl<'a> DflashDrafter<'a> {
         row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         exchange: Rc<PeerExchange<'a>>, head_rank: usize) -> Result<Self> {
-        ensure!(head_rank < 2, "invalid DFlash head rank");
+        Self::load_tp2_on_with(library, programs, snapshot, file, slots, max_sequences, mask_row,
+            row_window, representation, scales, fp8_rows, kv_cache, exchange, head_rank,
+            |device, name, bytes| super::weights::standalone(library, device, name, bytes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_tp2_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        snapshot: &Path, file: Vec<u8>, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
+        row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
+        fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        exchange: Rc<PeerExchange<'a>>,
+        allocate: impl FnMut(i32, &str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
+        Self::load_tp2_on_with(library, programs, snapshot, file, slots, max_sequences, mask_row,
+            row_window, representation, scales, fp8_rows, kv_cache, exchange, 0, allocate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_tp2_on_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        snapshot: &Path, file: Vec<u8>, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
+        row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
+        fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+        exchange: Rc<PeerExchange<'a>>, head_rank: usize,
+        mut allocate: impl FnMut(i32, &str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
+        ensure!(head_rank < 2 && library.cuda_get_device()? == exchange.device(head_rank),
+            "invalid DFlash head rank or current device");
         let file = Rc::new(file);
         let mut lead = Self::load_rank(library, programs, snapshot, Some(file.clone()), exchange.stream(head_rank), slots,
-            max_sequences, mask_row.clone(), row_window, representation, scales, fp8_rows, kv_cache, 0, 2)?;
+            max_sequences, mask_row.clone(), row_window, representation, scales, fp8_rows, kv_cache, 0, 2, &mut allocate)?;
         let device = Device { library, id: exchange.device(1 - head_rank) };
         let peer = device.own(|| Self::load_rank(library, programs, snapshot, Some(file), exchange.stream(1 - head_rank), slots,
-            max_sequences, mask_row, row_window, representation, scales, fp8_rows, kv_cache, 1, 2).map(Box::new))?;
+            max_sequences, mask_row, row_window, representation, scales, fp8_rows, kv_cache, 1, 2, &mut allocate).map(Box::new))?;
         let bytes = max_sequences * lead.cfg.block * lead.cfg.hidden * 2;
         let reduced = DeviceAllocation::new(library, bytes)?;
         let peer_reduced = device.own(|| DeviceAllocation::new(library, bytes))?;
@@ -1102,7 +1178,7 @@ impl<'a> DflashDrafter<'a> {
         file: Option<Rc<Vec<u8>>>, stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
-        rank: usize, ranks: usize) -> Result<Self> {
+        rank: usize, ranks: usize, allocate: &mut super::weights::WeightAllocator<'a, '_>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let source_cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
         let cfg = source_cfg.for_tp(ranks)?;
@@ -1118,7 +1194,7 @@ impl<'a> DflashDrafter<'a> {
         let checkpoint = match file {
             Some(file) => super::weights::Load::with_shared_prefetched_file(library, &snapshot.join("model.safetensors"), file)?,
             None => super::weights::Load::open(library, snapshot)?,
-        };
+        }.with_allocator(allocate);
         checkpoint.validate(source_cfg.tensor_shapes())?;
         let zeroed = |id: &str| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, physical.owner_bytes(id)?)?;
@@ -1131,40 +1207,26 @@ impl<'a> DflashDrafter<'a> {
                 Ok((usize::try_from(shape.k)?, usize::try_from(shape.n)?))).collect::<Result<_>>()?;
             fp8_linear::scratch_rows(library, scratch.rows, &shapes, fp8_rows)
         }).transpose()?;
-        let tensor = |name: &str, shape: &[usize]| checkpoint.tensor(name, shape);
-        let matrix = |parts: &[(&str, usize)], cols| checkpoint.matrix(parts, cols,
-            representation == GlmDraftRepresentation::Fp8Only, scales, stream);
-        let sharded = |parts: &[(&str, usize)], cols, axis| checkpoint.matrix_shard(parts, cols,
-            axis, rank, ranks, representation == GlmDraftRepresentation::Fp8Only, scales, stream);
-        use super::weights::ShardAxis;
-        let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
-            let p = format!("layers.{l}");
-            let a = format!("{p}.self_attn");
+        let weights = super::weights::gqa_weight_recipe(&source_cfg, rank, ranks,
+            |name, shape| checkpoint.tensor(name, shape),
+            |parts, cols, axis| match axis {
+                Some(axis) => checkpoint.matrix_shard(parts, cols, axis, rank, ranks,
+                    representation == GlmDraftRepresentation::Fp8Only, scales, stream),
+                None => checkpoint.matrix(parts, cols,
+                    representation == GlmDraftRepresentation::Fp8Only, scales, stream),
+            })?;
+        let layers = weights.layers.into_iter().enumerate().map(|(l, weight)| -> Result<DraftLayer<'a>> {
             Ok(DraftLayer {
-                input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
-                post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                body: LayerBody::Dflash {
-                    attn_conv: matrix(&[(&format!("{p}.attention_conv.kernel_projection.weight"), cfg.conv_width())], h)?,
-                    attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-                    mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), cfg.conv_width())], h)?,
-                    mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-                },
-                attention: DraftAttention::Gqa(GqaAttention {
-                    qkv: sharded(&[(&format!("{a}.q_proj.weight"), source_cfg.heads * cfg.head_dim),
-                        (&format!("{a}.k_proj.weight"), source_cfg.kv_width()),
-                        (&format!("{a}.v_proj.weight"), source_cfg.kv_width())], h, ShardAxis::Rows)?,
-                    q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
-                    k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                    o: sharded(&[(&format!("{a}.o_proj.weight"), h)], source_cfg.heads * cfg.head_dim, ShardAxis::Columns)?,
+                input_norm: weight.input_norm, post_norm: weight.post_norm,
+                body: LayerBody::Dflash { attn_conv: weight.attn_conv, attn_base: weight.attn_base,
+                    mlp_conv: weight.mlp_conv, mlp_base: weight.mlp_base },
+                attention: DraftAttention::Gqa(GqaAttention { qkv: weight.qkv,
+                    q_norm: weight.q_norm, k_norm: weight.k_norm, o: weight.o,
                     k_ring: zeroed(&format!("layer.{l}.k_ring"))?,
                     v_ring: zeroed(&format!("layer.{l}.v_ring"))?,
-                }),
-                gate_up: sharded(&[(&format!("{p}.mlp.gate_proj.weight"), source_cfg.intermediate),
-                    (&format!("{p}.mlp.up_proj.weight"), source_cfg.intermediate)], h, ShardAxis::Rows)?,
-                down: sharded(&[(&format!("{p}.mlp.down_proj.weight"), h)], source_cfg.intermediate, ShardAxis::Columns)?,
+                }), gate_up: weight.gate_up, down: weight.down,
             })
         }).collect::<Result<Vec<_>>>()?;
-        let taps = cfg.taps.len() * h;
         tracing::info!(?representation, context_slots = slots, max_batch_sequences = max_sequences,
             own_weight_bytes = physical.resident_weights().0, max_load_staging = layout.weights.max_load_staging,
             "DFlash single-copy storage admitted; vocabulary head borrowed from target");
@@ -1174,14 +1236,12 @@ impl<'a> DflashDrafter<'a> {
             stream,
             slots,
             max_sequences,
-            fc: matrix(&[("fc.weight", h)], taps)?, context_fc: None, projections,
-            hidden_norm: tensor("hidden_norm.weight", &[h])?,
-            norm: tensor("norm.weight", &[h])?,
-            head_ops: if rank > 0 { DraftHeadOps::Peer } else { DraftHeadOps::Selector {
-                projection: matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h)?,
-                predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
-                successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
-            } },
+            fc: weights.fc, context_fc: None, projections,
+            hidden_norm: weights.hidden_norm, norm: weights.norm,
+            head_ops: match weights.selector {
+                Some((projection, predecessor, successor)) => DraftHeadOps::Selector { projection, predecessor, successor },
+                None => DraftHeadOps::Peer,
+            },
             layers,
             taps: zeroed("taps")?,
             fused: zeroed("fused")?,
@@ -1218,6 +1278,18 @@ impl<'a> DflashDrafter<'a> {
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows,
         split: Option<context_split::ContextOwner<'a>>) -> Result<Self> {
+        Self::load_mla_with(library, programs, program_namespace, snapshot, file, stream, layout,
+            representation, scales, fp8_rows, split,
+            |device, name, bytes| super::weights::standalone(library, device, name, bytes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_mla_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        program_namespace: &str, snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
+        layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
+        fp8_rows: fp8_linear::Fp8Rows, split: Option<context_split::ContextOwner<'a>>,
+        mut allocate: impl FnMut(i32, &str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
         use cuteafd_loader::formats::dflash::MlaDflashConfig;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
@@ -1228,7 +1300,7 @@ impl<'a> DflashDrafter<'a> {
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
         let projections = Self::load_projections(programs, &cfg, representation, true, false, layout.capacity().max_batch_sequences)?;
-        let load = super::weights::Load::with_prefetched(library, snapshot, file)?;
+        let load = super::weights::Load::with_prefetched(library, snapshot, file)?.with_allocator(&mut allocate);
         load.validate(native.tensor_shapes())?;
         let programs = native.windows.iter().map(|window| -> Result<_> {
             let program = MlaDraft::load(programs, program_namespace, if window.is_some() { MlaDraftWindow::Sliding4096 }
@@ -1240,39 +1312,23 @@ impl<'a> DflashDrafter<'a> {
             Ok(program)
         }).collect::<Result<Vec<_>>>()?;
         let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
-        let tensor = |name: &str, shape: &[usize]| load.tensor(name, shape);
-        let matrix = |parts: &[(&str, usize)], cols: usize| load.matrix(parts, cols,
-            representation == GlmDraftRepresentation::Fp8Only, scales, stream);
-        let (h, inter) = (cfg.hidden, cfg.intermediate);
+        let weights = super::weights::mla_weight_recipe(&native,
+            |parts| load.tensor_parts(parts),
+            |parts, cols| load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream),
+            |name| load.absorb(name, native.mla.heads, native.mla.nope, native.mla.value, native.mla.kv_rank, stream))?;
         let mut layers = Vec::with_capacity(cfg.layers);
-        for (index, program) in programs.into_iter().enumerate() {
-            let p = format!("layers.{index}");
-            let a = format!("{p}.self_attn");
-            let geometry = &native.mla;
-            let (uk, uv) = load.absorb(&format!("{a}.kv_b_proj.weight"), geometry.heads,
-                geometry.nope, geometry.value, geometry.kv_rank, stream)?;
+        for (index, (program, weight)) in programs.into_iter().zip(weights.layers).enumerate() {
             layers.push(DraftLayer {
-                input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
-                post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                body: LayerBody::Dflash {
-                    attn_conv: matrix(&[(&format!("{p}.attention_conv.kernel_projection.weight"), cfg.conv_width())], h)?,
-                    attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-                    mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), cfg.conv_width())], h)?,
-                    mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-                },
-                attention: DraftAttention::Mla(MlaAttention { program,
-                    qkv_a: load.concat(&[(&format!("{a}.q_a_proj.weight"), geometry.q_rank),
-                        (&format!("{a}.kv_a_proj_with_mqa.weight"), geometry.kv_rank + geometry.rope)], h)?,
-                    q_norm: tensor(&format!("{a}.q_a_layernorm.weight"), &[geometry.q_rank])?,
-                    kv_norm: tensor(&format!("{a}.kv_a_layernorm.weight"), &[geometry.kv_rank])?,
-                    q_b: tensor(&format!("{a}.q_b_proj.weight"), &[geometry.heads * (geometry.nope + geometry.rope), geometry.q_rank])?,
-                    uk, uv, output: tensor(&format!("{a}.o_proj.weight"), &[h, geometry.heads * geometry.value])?,
+                input_norm: weight.input_norm, post_norm: weight.post_norm,
+                body: LayerBody::Dflash { attn_conv: weight.attn_conv, attn_base: weight.attn_base,
+                    mlp_conv: weight.mlp_conv, mlp_base: weight.mlp_base },
+                attention: DraftAttention::Mla(MlaAttention { program, qkv_a: weight.qkv_a,
+                    q_norm: weight.q_norm, kv_norm: weight.kv_norm, q_b: weight.q_b,
+                    uk: weight.uk, uv: weight.uv, output: weight.output,
                     cache: owners.take(&format!("layer.{index}.cache"))?,
                     page_table: owners.take(&format!("layer.{index}.page_table"))?,
                 }),
-                gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), cfg.intermediate),
-                    (&format!("{p}.mlp.up_proj.weight"), cfg.intermediate)], h)?,
-                down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], cfg.intermediate)?,
+                gate_up: weight.gate_up, down: weight.down,
             });
         }
         let workspace = Workspace::admitted_mla(library, &cfg, layout.capacity().max_batch_sequences, &layout, &mut owners)?;
@@ -1281,13 +1337,10 @@ impl<'a> DflashDrafter<'a> {
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
         let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream, slots: layout.capacity().context_slots,
             max_sequences: layout.capacity().max_batch_sequences,
-            fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?, context_fc: None, physical: None, head_split: None, projections,
-            hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
-            head_ops: DraftHeadOps::Selector {
-                projection: matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h)?,
-                predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
-                successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
-            }, layers,
+            fc: weights.fc, context_fc: None, physical: None, head_split: None, projections,
+            hidden_norm: weights.hidden_norm, norm: weights.norm,
+            head_ops: DraftHeadOps::Selector { projection: weights.selector.0,
+                predecessor: weights.selector.1, successor: weights.selector.2 }, layers,
             taps: owners.take("taps")?, fused: owners.take("fused")?, fused_norm: owners.take("fused_norm")?,
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
@@ -1315,6 +1368,17 @@ impl<'a> DflashDrafter<'a> {
         target: &cuteafd_loader::families::mistral_large4::Ml4Config, softcap: f32, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         source: &dyn Fn(&str, &[usize]) -> Result<crate::shared::experts::rtx::dense::Rect>) -> Result<Self> {
+        Self::load_ml4_with(library, programs, native, target, softcap, stream, layout, source,
+            |device, name, bytes| super::weights::standalone(library, device, name, bytes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_ml4_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        native: cuteafd_loader::formats::dflash::MlaDflashConfig,
+        target: &cuteafd_loader::families::mistral_large4::Ml4Config, softcap: f32, stream: *mut c_void,
+        layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+        source: &dyn Fn(&str, &[usize]) -> Result<crate::shared::experts::rtx::dense::Rect>,
+        mut allocate: impl FnMut(i32, &str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
         use cuteafd_ffi::mla_draft::MlaDraft;
         use cuteafd_loader::formats::dflash::MlaDraftPacking;
         use crate::shared::experts::rtx::dense::{DenseLoad, Finish};
@@ -1328,7 +1392,7 @@ impl<'a> DflashDrafter<'a> {
         let projections = Self::load_projections(programs, &cfg, GlmDraftRepresentation::Bf16Only, true, true,
             layout.capacity().max_batch_sequences)?;
         let context_fc = cuteafd_ffi::mla_draft::Ml4ContextProjection::load(programs)?;
-        let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
+        let mut owners = MlaDraftStorage::allocate_with(library, layout.clone(), &mut allocate)?.into_owners()?;
         let dense = DenseLoad::mount(library);
         // Destination owners and source rectangles both come from the admitted recipe.
         for weight in layout.weight_destinations().iter().filter(|w| w.packing == MlaDraftPacking::UnitScale) {

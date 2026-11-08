@@ -58,23 +58,29 @@ impl CoreWeightLayout {
         Ok(loaded)
     }
 
-    /// The shared native K6 recipe, used unchanged by mount and push loads.
+    pub(crate) fn shared_layout(&self) -> cuteafd_loader::formats::trellis_core::CoreWeightLayout {
+        cuteafd_loader::formats::trellis_core::CoreWeightLayout {
+            stem: self.stem.clone(), side: self.side, rank: self.rank, ranks: self.ranks,
+            shape: self.shape, bytes: self.bytes, bits: self.bits, codebook: self.codebook,
+        }
+    }
+
+    /// Nonadopted families retain standalone requests until their arena migration.
     pub(crate) fn load_recorded<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
         dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void) -> Result<CoreWeights<'a>> {
+        self.load_recorded_with(device, checkpoint, dense, stream,
+            |name, bytes| crate::shared::memory::weight_arena::weight_allocation(device, None, name, bytes))
+    }
+
+    /// The shared mount/push recipe; only final named storage is injected.
+    pub(crate) fn load_recorded_with<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
+        dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void,
+        mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<CoreWeights<'a>> {
         use crate::shared::experts::rtx::dense::{Job, Operand, Rect, Step};
         let metadata = |name: &str| -> Result<&cuteafd_loader::SafetensorsTensorMetadata> {
             let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("checkpoint lacks {name}"))?;
             Ok(&checkpoint.tensors[at].meta)
-        };
-        let allocate = |bytes| {
-            let _scope = cuteafd_ffi::memory_ledger::scope("weights/native K6 core");
-            Allocation::new(device, bytes)
-        };
-        let landed = |r: Rect, bytes| -> Result<Allocation<'a>> {
-            let allocation = allocate(bytes)?;
-            dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(r, 0)], bytes })?;
-            Ok(allocation)
         };
         let stem = &self.stem;
         let suffixes = ["trellis", "suh", "svh", self.codebook.marker()];
@@ -96,18 +102,20 @@ impl CoreWeightLayout {
             TrellisSide::Input => local_n == n && local_k * self.ranks == k }
             && local_n % 128 == 0 && local_k % 128 == 0, "{stem}: K6 shard geometry");
         let tile_bytes = 32 * module.bits;
-        let payload = allocate(local_n * local_k * module.bits / 8)?;
+        let payload = allocate(&format!("{stem}.trellis"), local_n * local_k * module.bits / 8)?;
         let k16 = local_k / 16;
         for (kr, source) in self.payload_rects(checkpoint, n)? {
             let rows = source.rows.len();
             dense.step(Step { device: device.id, rects: vec![source], jobs: vec![Job::TrellisTiles { rows, k0: kr, tiles: local_n / 16, tile_bytes,
                 k16, input: self.side == TrellisSide::Input, dst: payload.buffer }] }, stream)?;
         }
-        let vector = |suffix: &str, start: usize, count: usize| -> Result<Allocation<'a>> {
+        let mut vector = |suffix: &str, start: usize, count: usize| -> Result<Allocation<'a>> {
             let name = format!("{stem}.{suffix}");
             let r = Rect::tensor(checkpoint, &name, None, Some(start * 2..(start + count) * 2))?;
             let bytes = r.bytes();
-            landed(r, bytes)
+            let allocation = allocate(&name, bytes)?;
+            dense.operand(Operand { device: device.id, buffer: allocation.buffer, lands: vec![(r, 0)], bytes })?;
+            Ok(allocation)
         };
         let suh = vector("suh", k0, local_k)?;
         let svh = vector("svh", n0, local_n)?;
@@ -153,18 +161,23 @@ impl CoreWeightLayout {
     }
     pub(crate) fn upload<'a>(&self,device:Device<'a>,loaded:cuteafd_loader::formats::dense_trellis::LoadedDenseTrellis)
         -> Result<CoreWeights<'a>> {
+        self.upload_with(device, loaded, |_, bytes| Allocation::new(device, bytes))
+    }
+    pub(crate) fn upload_with<'a>(&self,device:Device<'a>,loaded:LoadedDenseTrellis,
+        mut allocate:impl FnMut(&str,usize)->Result<Allocation<'a>>) -> Result<CoreWeights<'a>> {
         self.check(&loaded)?;
         let shard=loaded.shard;
         ensure!(loaded.codebook==self.codebook && shard.side==self.side && shard.shape==self.shape
             && shard.payload.len()+shard.suh.len()+shard.svh.len()==self.bytes,
             "native K6 upload differs from admitted shard");
-        let upload=|bytes:&[u8]|->Result<Allocation<'a>> {
+        let mut upload=|suffix:&str,bytes:&[u8]|->Result<Allocation<'a>> {
             let _scope=cuteafd_ffi::memory_ledger::scope("weights/native K6 core");
-            let owner=Allocation::new(device,bytes.len())?;
+            let owner=crate::shared::memory::weight_arena::checked_weight_allocation(
+                device,&format!("{}.{suffix}",self.stem),bytes.len(),&mut allocate)?;
             device.run(||device.library.copy_h2d(owner.buffer,bytes))?;
             Ok(owner)
         };
-        Ok(CoreWeights{payload:upload(&shard.payload)?,suh:upload(&shard.suh)?,svh:upload(&shard.svh)?,
+        Ok(CoreWeights{payload:upload("trellis",&shard.payload)?,suh:upload("suh",&shard.suh)?,svh:upload("svh",&shard.svh)?,
             shape:self.shape,side:self.side,bits:self.bits,codebook:self.codebook})
     }
 }
@@ -491,5 +504,50 @@ pub(crate) fn codebook(weights: &CoreWeights<'_>) -> &'static str {
     match weights.codebook {
         cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
         cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1",
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    #[test]
+    fn k4_and_k6_uploads_preserve_each_named_plane() -> Result<()> {
+        use crate::shared::memory::{weight_arena::DeviceWeightArena, receipts::Inventory};
+        use cuteafd_loader::{formats::{dense_trellis::NativeTrellisShard, exl3_storage::Exl3Codebook},
+            serving_capacity::WeightArenaLayout, placement::planner::{CoordinatorDevices, Lifetime, Phase}};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library,1,1<<30)?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library,id:1 };
+        for bits in [4,6] {
+            let layout = CoreWeightLayout { stem: format!("model.k{bits}"), side: TrellisSide::Output,
+                rank:0,ranks:1,shape:[256,128],bytes:256*128*bits/8+2*(256+128),bits,codebook:Exl3Codebook::Mcg };
+            let requests = layout.shared_layout().arena_tensors(&layout.stem)?;
+            let loaded = || LoadedDenseTrellis { codebook: layout.codebook, shard: NativeTrellisShard {
+                shape:layout.shape,side:layout.side,payload:(0..256*128*bits/8).map(|i| (i as u8).wrapping_mul(37)).collect(),
+                suh:(0..256).map(|i| (i as u8).wrapping_add(7)).collect(),
+                svh:(0..512).map(|i| (i as u8).wrapping_mul(17)).collect() } };
+            let baseline = layout.upload(device,loaded())?;
+            let arena = DeviceWeightArena::new(device,WeightArenaLayout::new(format!("test/k{bits}"),requests.clone())?)?;
+            let mut requested = Vec::new();
+            let actual = layout.upload_with(device,loaded(),|name,bytes| {
+                requested.push((name.to_owned(),bytes)); arena.view(name,bytes)
+            })?;
+            assert_eq!(requested,requests);
+            drop(arena);
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?,"core",
+                Lifetime { first:Phase::Load,last:Phase::Growth },Category::Weights,"core");
+            for (name,a,b) in [("trellis",&actual.payload,&baseline.payload),("suh",&actual.suh,&baseline.suh),
+                ("svh",&actual.svh,&baseline.svh)] {
+                a.inventory(&mut inventory,name)?;
+                let mut got=vec![0;a.buffer.bytes]; let mut expected=vec![0;b.buffer.bytes];
+                device.run(|| { library.copy_d2h(&mut got,a.buffer)?; library.copy_d2h(&mut expected,b.buffer) })?;
+                assert_eq!(got,expected,"K{bits} {name}");
+            }
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),1);
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),3);
+        }
+        Ok(())
     }
 }

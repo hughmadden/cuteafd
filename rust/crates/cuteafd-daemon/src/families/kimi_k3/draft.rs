@@ -132,7 +132,21 @@ pub(crate) struct NativeDraft<'a> {
     marks: usize,
 }
 
+// Kimi constructs this owner before loading target weights. Shared post-target
+// drafters retain their DraftLoad default instead of inheriting Kimi's chronology.
+fn common_draft_receipts(draft: &DflashDrafter<'_>,
+    devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+    -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+    draft.allocation_receipts_with_lifetime(devices, "kimi.draft",
+        cuteafd_loader::placement::planner::Lifetime::RESIDENT)
+}
+
 impl<'a> NativeDraft<'a> {
+    pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        self.owners.draft.device.run(|| common_draft_receipts(&self.owners.draft, devices))
+    }
+
     pub(crate) fn load(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: [Rc<Stream<'a>>; 2],
         layout: &MlaDraftRuntimeLayout) -> Result<Self> {
@@ -457,6 +471,34 @@ mod tests {
     use super::*;
     /// Fixed lane rows for these tap fixtures, independent of serving defaults.
     const TARGET_TAP_ROWS: usize = 4096;
+
+    #[test]
+    fn draft_arena_census_counts_load_and_matches_admitted_startup_without_double_charge() -> Result<()> {
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Location, Phase, PhaseOrder};
+        crate::shared::speculation::dflash::physical_tests::with_mla_arena_fixture(|draft, layout, planned| {
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(common_draft_receipts(draft, CoordinatorDevices::new(&[1])?)?);
+            census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+            let root = census.receipts.iter().find(|receipt| receipt.allocation.id == planned.id())
+                .context("Kimi retained draft arena root missing")?;
+            assert!(root.allocation.lifetime.contains(Phase::Load, PhaseOrder::DRAFT_THEN_TARGET));
+            assert_eq!(root.allocation.bytes, layout.weights().resident_bytes()?);
+            let load = census.receipts.iter().filter(|receipt| receipt.allocation.location == Location::coordinator(0)
+                && receipt.allocation.view.is_none()
+                && receipt.allocation.lifetime.contains(Phase::Load, PhaseOrder::DRAFT_THEN_TARGET))
+                .map(|receipt| receipt.allocation.bytes).sum::<u64>();
+            let aliases = census.receipts.iter().filter(|receipt| receipt.allocation.view.as_ref()
+                .is_some_and(|view| view.backing == planned.id())).map(|receipt| receipt.allocation.bytes).sum::<u64>();
+            assert_eq!(aliases, root.allocation.bytes);
+            let (admitted, startup) = layout.demands(0)?;
+            assert_eq!(load, admitted.owned.iter().map(|owner| owner.bytes).sum::<u64>());
+            assert_eq!(load, layout.resident_bytes()?);
+            // Immutable aliases contribute zero physical bytes; staging contributes once.
+            assert_eq!(load + layout.weights().max_load_staging, startup.bytes);
+            assert_eq!(admitted.owned.iter().filter(|owner| owner.group == "MLA DFlash owned weights").count(), 1);
+            Ok(())
+        })
+    }
 
     #[test]
     fn subwave_taps_match_full_chunk_bytes() -> Result<()> {

@@ -99,7 +99,7 @@ impl NativeDenseRecords {
 }
 
 use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, device::{Allocation, Device}};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 
 /// One checkpoint byte range as a single-row rectangle landing whole.
@@ -138,9 +138,19 @@ fn widen_steps(name: &str, component: &DenseComponent, device: i32, dst: Cuteafd
 /// landed unchanged or staged load-only for the existing lossless Widen job.
 pub(crate) fn landed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str, component: &DenseComponent,
     transform: DenseTransform, stream: *mut std::ffi::c_void) -> Result<DeviceAllocation<'a>> {
+    let device = Device { library, id: library.cuda_get_device()? };
+    landed_with(library, load, name, component, transform, stream,
+        |_, bytes| Allocation::new(device, bytes))
+}
+
+pub(crate) fn landed_with<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str,
+    component: &DenseComponent, transform: DenseTransform, stream: *mut std::ffi::c_void,
+    mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<DeviceAllocation<'a>> {
     let bytes = transform.allocation_bytes(component)?;
     let device = library.cuda_get_device()?;
-    let allocation = DeviceAllocation::new(library, bytes)?;
+    let allocation = allocate(name, bytes)?;
+    ensure!(std::ptr::eq(allocation.device.library, library), "native landing library mismatch");
+    let allocation = DeviceAllocation::from_allocation(allocation);
     ensure!(allocation.buffer.bytes == bytes && allocation.buffer.device_id == device && !allocation.buffer.ptr.is_null(),
         "{name}: native actual allocation differs from request");
     land_into(library, load, name, component, transform, allocation.buffer, stream)?;
@@ -256,13 +266,25 @@ pub(crate) fn layer_requests<'a>(records: &'a LayerRecords, packs: &'a [PlainPac
 
 pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
     packs: &[PlainPack], stream: *mut std::ffi::c_void) -> Result<HashMap<String, DeviceAllocation<'a>>> {
+    let device = Device { library, id: library.cuda_get_device()? };
+    load_layer_packed_with(library, load, records, packs, stream, |_, bytes| Allocation::new(device, bytes))
+}
+
+pub(crate) fn load_layer_packed_with<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
+    packs: &[PlainPack], stream: *mut std::ffi::c_void,
+    mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<HashMap<String, DeviceAllocation<'a>>> {
     let mut out = HashMap::new();
     let device = library.cuda_get_device()?;
     layer_requests(records, packs, |request| {
         let buffers = match request.operation {
-            LayerOperation::Land { name, component, transform } => vec![landed(library, load, &name, component, transform, stream)?],
+            LayerOperation::Land { name, component, transform } => vec![landed_with(library, load, &name, component,
+                transform, stream, |_, bytes| allocate(&format!("layers.{}.{}", records.layer, request.owners[0].0), bytes))?],
             LayerOperation::Pack { pack, offsets } => {
-                let allocation = DeviceAllocation::new(library, request.owners[0].1)?;
+                let allocation = allocate(&format!("layers.{}.{}", records.layer, request.owners[0].0), request.owners[0].1)?;
+                ensure!(std::ptr::eq(allocation.device.library, library) && allocation.buffer.device_id == device
+                    && allocation.device.id == device && allocation.buffer.bytes == request.owners[0].1
+                    && !allocation.buffer.ptr.is_null(), "native pack allocation differs from request");
+                let allocation = DeviceAllocation::from_allocation(allocation);
                 for (name, offset) in pack.components.iter().zip(offsets) {
                     let (component, transform) = &records.plain[name];
                     let extent = transform.resident_bytes(component)?;
@@ -276,7 +298,8 @@ pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad
                 }
                 vec![allocation]
             }
-            LayerOperation::Absorb { record, layout } => absorb(library, load, record, layout, stream)?.into_iter().collect(),
+            LayerOperation::Absorb { record, layout } => absorb_with(library, load, record, layout, stream,
+                |name, bytes| allocate(&format!("layers.{}.{name}", records.layer), bytes))?.into_iter().collect(),
         };
         ensure!(buffers.len() == request.owners.len(), "native request owner count differs");
         for ((name, bytes), buffer) in request.owners.into_iter().zip(buffers) {
@@ -289,8 +312,9 @@ pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad
     Ok(out)
 }
 
-fn absorb<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, kv_b: &DenseRecord,
-    layout: &KvBLayout, stream: *mut std::ffi::c_void) -> Result<[DeviceAllocation<'a>; 4]> {
+pub(crate) fn absorb_with<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, kv_b: &DenseRecord,
+    layout: &KvBLayout, stream: *mut std::ffi::c_void,
+    mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<[DeviceAllocation<'a>; 4]> {
     let geometry = layout.geometry;
     let (heads_total, nope, v, lat) = (geometry.heads, geometry.nope, geometry.values, geometry.latent);
     let (h0, heads) = (layout.first_head, layout.heads);
@@ -298,7 +322,13 @@ fn absorb<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, kv_b: &DenseReco
         && kv_b.components.len() == 2 && kv_b.components[0].suffix == "fp8" && kv_b.components[1].suffix == "scale",
         "{}: native kv_b layout", kv_b.tensor);
     let (values, grid) = (&kv_b.components[0].source, &kv_b.components[1].source);
-    let [uk, uk_scale, uv, uv_scale] = allocate_absorbed(layout, |bytes| DeviceAllocation::new(library, bytes))?;
+    let mut names = ["w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale"].into_iter();
+    let [uk, uk_scale, uv, uv_scale] = allocate_absorbed(layout, |bytes| {
+        let owner = allocate(names.next().expect("four absorption owners"), bytes)?;
+        ensure!(std::ptr::eq(owner.device.library, library) && owner.device.id == library.cuda_get_device()?
+            && owner.buffer.bytes == bytes && !owner.buffer.ptr.is_null(), "native absorption allocation differs from request");
+        Ok(DeviceAllocation::from_allocation(owner))
+    })?;
     ensure!(STEP_BYTES == cuteafd_loader::plan::exlr8::dense::DENSE_STEP_BYTES,
         "native dense plan/load staging bound mismatch");
     let per = ((STEP_BYTES - grid.bytes) / ((nope + v) * lat)).max(1);
@@ -477,10 +507,18 @@ pub(crate) mod tests {
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_in(&root)?;
         let library = fixture.load()?;
         fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
         let root = tempfile::tempdir_in(fixture.directory())?;
         let component = |name: &str, suffix: &str, dtype: &str, shape: Vec<usize>, bytes: usize| -> Result<DenseComponent> {
             let path = root.path().join(name);
-            std::fs::write(&path, vec![0u8; bytes])?;
+            let seed = name.bytes().fold(0u8, |value, byte| value.wrapping_add(byte));
+            let data = match dtype {
+                "BF16" => (0..bytes / 2).flat_map(|i| (0x3f00u16 + (i % 127) as u16).to_le_bytes()).collect(),
+                "F16" => (0..bytes / 2).flat_map(|i| (0x3800u16 + (i % 127) as u16).to_le_bytes()).collect(),
+                "F32" => (0..bytes / 4).flat_map(|i| (0.5f32 + i as f32 / 16.0).to_le_bytes()).collect(),
+                _ => (0..bytes).map(|i| 1 + ((i + usize::from(seed)) % 119) as u8).collect::<Vec<_>>(),
+            };
+            std::fs::write(&path, data)?;
             Ok(DenseComponent { suffix: suffix.into(), dtype: dtype.into(), shape,
                 source: cuteafd_loader::plan::exlr8::dense::DenseRange { path, offset: 0, bytes }, window: None })
         };
@@ -521,7 +559,58 @@ pub(crate) mod tests {
         layer_requests(&records, &packs, |r| { for (name, bytes) in r.owners { assert!(requests.insert(name, bytes).is_none()); } Ok(()) })?;
         let load = DenseLoad::mount(&library);
         let actual = load_layer_packed(&library, &load, &records, &packs, std::ptr::null_mut())?;
-        assert_eq!(requests, actual.into_iter().map(|(name, owner)| (name, owner.buffer.bytes)).collect());
+        assert_eq!(requests, actual.iter().map(|(name, owner)| (name.clone(), owner.buffer.bytes)).collect());
+        let read = |owner: &DeviceAllocation<'_>| -> Result<Vec<u8>> {
+            let mut data = vec![0; owner.buffer.bytes];
+            library.copy_d2h(&mut data, owner.buffer)?;
+            assert!(data.iter().any(|&byte| byte != 0));
+            Ok(data)
+        };
+        let expected = actual.iter().map(|(name, owner)| Ok((name.clone(), read(owner)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let named: BTreeMap<_, _> = requests.iter().map(|(name, bytes)| (format!("layers.0.{name}"), *bytes)).collect();
+        for recording in [false, true] {
+            use crate::shared::memory::{weight_arena::DeviceWeightArena, receipts::Inventory};
+            use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Phase};
+            let arena = DeviceWeightArena::new(Device { library: &library, id: 0 },
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/exlr8", named.clone())?)?;
+            let load = if recording { DenseLoad::push(&library) } else { DenseLoad::mount(&library) };
+            let mut called = BTreeMap::new();
+            let packed = load_layer_packed_with(&library, &load, &records, &packs, std::ptr::null_mut(), |name, bytes| {
+                assert!(called.insert(name.to_owned(), bytes).is_none());
+                arena.view(name, bytes)
+            })?;
+            assert_eq!(called, named);
+            if let Some(sink) = &load.sink {
+                let recorded = sink.take_all();
+                assert!(!recorded.operands.is_empty() && !recorded.steps.is_empty());
+                for buffer in recorded.operands.iter().map(|operand| operand.buffer)
+                    .chain(recorded.steps.iter().flat_map(|step| step.jobs.iter().flat_map(|job| match job {
+                        Job::Widen { dst, .. } => vec![*dst],
+                        Job::AbsorbFp8 { uk, uk_scale, uv, uv_scale, .. } => vec![*uk, *uk_scale, *uv, *uv_scale],
+                        _ => panic!("unexpected EXLR8 fixture transform"),
+                    }))) {
+                    assert!(packed.values().any(|owner| {
+                        let offset = (buffer.ptr as usize).checked_sub(owner.buffer.ptr as usize);
+                        offset.and_then(|at| at.checked_add(buffer.bytes)).is_some_and(|end| end <= owner.buffer.bytes)
+                    }));
+                }
+                crate::shared::experts::rtx::dense::fill_records_by_mount(&library, &recorded, |_| std::ptr::null_mut())?;
+            }
+            load.release();
+            drop(arena);
+            assert_eq!(expected, packed.iter().map(|(name, owner)| Ok((name.clone(), read(owner)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?);
+            let physical = [0];
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&physical)?, "dense",
+                Lifetime { first: Phase::Load, last: Phase::Growth },
+                cuteafd_core::memory_layout::Category::Weights, "dense weights");
+            for (name, owner) in &packed { owner.inventory(&mut inventory, name)?; }
+            assert_eq!(inventory.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count(), 1);
+            assert_eq!(inventory.receipts.iter().filter(|receipt| receipt.allocation.view.is_some()).count(), packed.len());
+            assert!(inventory.receipts.iter().filter_map(|receipt| receipt.allocation.view.as_ref())
+                .all(|view| view.backing == "test/exlr8"));
+        }
         Ok(())
     }
 

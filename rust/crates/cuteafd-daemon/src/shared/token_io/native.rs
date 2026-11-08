@@ -1,7 +1,7 @@
 //! Dormant checkpoint-native vocabulary ownership; the official token I/O is unchanged.
 use crate::shared::experts::exlr8::view;
 use crate::shared::experts::rtx::dense::{self, DenseLoad, Operand, Rect};
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, device::{Allocation, Device}};
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::native_dense::{DenseEmbedding, DenseLinear};
 use cuteafd_ffi::programs::Programs;
@@ -175,6 +175,12 @@ impl RowFp8Residency {
 }
 
 impl RowFp8Weights<'_> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        self.payload.inventory(inventory, &format!("{name}.payload"))?;
+        self.scales.inventory(inventory, &format!("{name}.scales"))
+    }
+
     pub(crate) fn residency(&self) -> RowFp8Residency {
         RowFp8Residency::from_buffers(self.payload(), self.scales())
     }
@@ -254,25 +260,38 @@ impl<'a> NativeVocabulary<'a> {
         host_available: usize, device_reserved: usize, host_reserved: usize, embedding_device: i32,
     ) -> Result<Option<Self>> {
         Self::load_inner(library, programs, plan, embedding_device,
-            Some((host_available, device_reserved, host_reserved)))
+            Some((host_available, device_reserved, host_reserved)), &mut |_, bytes| {
+                Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+            })
     }
 
     pub(crate) fn load_admitted(library: &'a NativeLibrary, programs: &'a Programs<'a>,
         plan: VocabularyPlan, admission: &cuteafd_loader::placement::families::glm5::admission::NativeLoad,
     ) -> Result<Option<Self>> {
         admission.validate_vocabulary(plan.staging_bytes() as u64)?;
-        Self::load_inner(library, programs, plan, library.cuda_get_device()?, None)
+        Self::load_inner(library, programs, plan, library.cuda_get_device()?, None, &mut |_, bytes| {
+            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+        })
     }
 
     /// Consume an already-admitted vocabulary owner without sampling memory.
     pub(crate) fn load_prepared(library: &'a NativeLibrary, programs: &'a Programs<'a>,
         plan: VocabularyPlan, staging_bytes: u64, embedding_device: i32) -> Result<Option<Self>> {
+        Self::load_prepared_with(library, programs, plan, staging_bytes, embedding_device, |_, bytes| {
+            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+        })
+    }
+
+    pub(crate) fn load_prepared_with(library: &'a NativeLibrary, programs: &'a Programs<'a>,
+        plan: VocabularyPlan, staging_bytes: u64, embedding_device: i32,
+        mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Option<Self>> {
         ensure!(plan.staging_bytes() as u64 == staging_bytes, "native vocabulary staging differs from admission");
-        Self::load_inner(library, programs, plan, embedding_device, None)
+        Self::load_inner(library, programs, plan, embedding_device, None, &mut allocate)
     }
 
     fn load_inner(library: &'a NativeLibrary, programs: &'a Programs<'a>, plan: VocabularyPlan,
-        embedding_device: i32, available: Option<(usize, usize, usize)>) -> Result<Option<Self>> {
+        embedding_device: i32, available: Option<(usize, usize, usize)>,
+        allocate: &mut impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<Option<Self>> {
         use crate::shared::memory::device::Device;
         ensure!(
             std::ptr::eq(library, programs.library()),
@@ -319,8 +338,8 @@ impl<'a> NativeVocabulary<'a> {
         let mut staging =
             HostAllocation::named(library, plan.staging_bytes(), "native-vocabulary-staging")?;
         let embedding = Device { library, id: embedding_device }
-            .run(|| load_rows(library, &plan.dense.tensors[0], &mut staging))?;
-        let head = load_rows(library, &plan.dense.tensors[1], &mut staging)?;
+            .run(|| load_rows_with(library, &plan.dense.tensors[0], &mut staging, "embedding", &mut *allocate))?;
+        let head = load_rows_with(library, &plan.dense.tensors[1], &mut staging, "head", allocate)?;
         Ok(Some(Self {
             embedding,
             head,
@@ -430,19 +449,23 @@ fn load_rows<'a>(
     slice: &DenseSlice,
     staging: &mut HostAllocation<'a>,
 ) -> Result<RowFp8Weights<'a>> {
+    load_rows_with(library, slice, staging, &slice.tensor, |_, bytes| {
+        Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+    })
+}
+
+fn load_rows_with<'a>(library: &'a NativeLibrary, slice: &DenseSlice, staging: &mut HostAllocation<'a>,
+    name: &str, mut allocate: impl FnMut(&str, usize) -> Result<Allocation<'a>>) -> Result<RowFp8Weights<'a>> {
     let requests = row_requests(slice)?;
     let device = library.cuda_get_device()?;
+    let mut plane = |suffix: &str, bytes| -> Result<DeviceAllocation<'a>> {
+        let owner = allocate(&format!("{name}.{suffix}"), bytes)?;
+        ensure!(std::ptr::eq(owner.device.library, library), "native vocabulary library mismatch");
+        Ok(DeviceAllocation::from_allocation(owner))
+    };
     let weights = RowFp8Weights {
-        payload: DeviceAllocation::named(
-            library,
-            requests[0].1,
-            "native-vocabulary-payload",
-        )?,
-        scales: DeviceAllocation::named(
-            library,
-            requests[1].1,
-            "native-vocabulary-scales",
-        )?,
+        payload: plane("payload", requests[0].1)?,
+        scales: plane("scales", requests[1].1)?,
         source: [slice.components[0].source.clone(), slice.components[1].source.clone()],
     };
     for ((name, bytes), buffer) in requests.iter().zip([weights.payload(), weights.scales()]) {
@@ -495,6 +518,78 @@ mod tests {
         let weights = load_rows(&library, slice, &mut staging)?;
         let expected = requests.into_iter().map(|(_, bytes)| bytes).collect::<Vec<_>>();
         assert_eq!(expected, [weights.payload().bytes, weights.scales().bytes]);
+        Ok(())
+    }
+
+    #[test]
+    fn vocabulary_and_placeholder_hooks_preserve_bytes_and_backing_receipts() -> Result<()> {
+        use crate::shared::{memory::{device::Device, weight_arena::DeviceWeightArena, receipts::Census},
+            token_io::{EmbedSource, TokenEmbedding}};
+        use cuteafd_loader::{serving_capacity::WeightArenaLayout, placement::planner::{CoordinatorDevices, PhaseOrder}};
+        use serde_json::json;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let records = [EMBEDDING, HEAD].map(|name| {
+            let mut item = record(dir.path(), name);
+            item.shape[1] = 128;
+            item.components[0].shape[1] = 128;
+            item.components[0].source.bytes = 256 * 128;
+            item.components[1].source.offset = (256 * 128) as u64;
+            let bytes = (0..256 * 132).map(|i| (i * 29 + 11) as u8).collect::<Vec<_>>();
+            std::fs::write(&item.components[0].source.path, bytes).unwrap();
+            item
+        });
+        let pointers = |items: &[(&str, &str, &str, &str)]| items.iter().map(|&(name, dtype, shape, role)|
+            json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>();
+        let entries = [
+            json!({"name":"exlr8_dense_fp8_row_embedding_k128_n256", "capacity_rows":4096,
+                "geometry":{"abi_version":1,"hidden":128,"vocabulary":256,"max_rows":4096,"ctas_per_sm":4},
+                "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}],
+                "pointers":pointers(&[("ids","int32","[rows]","in"),("payload","uint8","[256,128]","in"),
+                    ("scales","float32","[256]","in"),("output","bfloat16","[rows,128]","out")])}),
+            json!({"name":"exlr8_dense_fp8_row_k128_n256_s1", "capacity_rows":4096, "scratch_bytes_at_capacity":{"partial":0},
+                "geometry":{"abi_version":1,"input_features":128,"output_features":256,"sharded_side":1,
+                    "max_rows":4096,"ctas_per_sm":4,"splits":1,"split_k":128,"segments":1,"encoding":"fp8_row","core":"tile"},
+                "scalars":[{"name":"rows","type":"int32"},{"name":"cta_limit","type":"int32"}],
+                "pointers":pointers(&[("x","bfloat16","[rows,128]","in"),("payload","uint8","[32768]","in"),
+                    ("scales","float32","[256]","in"),("partial","float32","[0]","scratch"),("output","float32","[rows,256]","out")])}),
+        ];
+        fixture.register_programs(&library, &entries)?;
+        let manifest = dir.path().join("PROGRAMS.json");
+        std::fs::write(&manifest, serde_json::to_vec(&json!({"programs":entries}))?)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let plan = || VocabularyPlan::new(&records, &selection(false), 1, 0, 128, 256);
+        let plain = NativeVocabulary::load_prepared(&library, &programs, plan()?, plan()?.staging_bytes() as u64, 0)?
+            .context("standalone vocabulary")?;
+        let arena = DeviceWeightArena::new(Device { library: &library, id: 0 }, WeightArenaLayout::new("test/vocabulary",
+            [("embedding.payload".into(), 32768), ("embedding.scales".into(), 1024),
+                ("head.payload".into(), 32768), ("head.scales".into(), 1024), ("embedding.table".into(), 256)])?)?;
+        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared_with(&library, &programs, plan()?,
+            plan()?.staging_bytes() as u64, 0, |name, bytes| arena.view(name, bytes))?.context("packed vocabulary")?);
+        let embedding = TokenEmbedding::row_fp8_with(&library, EmbedSource {
+            path: records[0].components[0].source.path.clone(), offset: 0, vocab: 256, hidden: 128,
+            snapshot: None, tensor_name: EMBEDDING.into(),
+        }, vocabulary.clone(), |name, bytes| arena.view(name, bytes))?;
+        drop(arena);
+        for (one, two) in [(&plain.embedding, &vocabulary.embedding), (&plain.head, &vocabulary.head)] {
+            for (a, b) in [(one.payload(), two.payload()), (one.scales(), two.scales())] {
+                let (mut left, mut right) = (vec![0; a.bytes], vec![0; b.bytes]);
+                library.copy_d2h(&mut left, a)?;
+                library.copy_d2h(&mut right, b)?;
+                assert_eq!(left, right);
+                assert!(left.iter().any(|&v| v != 0));
+            }
+        }
+        let physical = [0];
+        let mut census = Census::default();
+        census.owners(embedding.allocation_receipts(CoordinatorDevices::new(&physical)?, "embedding")?);
+        census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+        assert_eq!(census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
+        assert_eq!(census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 3);
+        assert!(census.receipts.iter().filter_map(|r| r.allocation.view.as_ref()).all(|v| v.backing == "test/vocabulary"));
         Ok(())
     }
 

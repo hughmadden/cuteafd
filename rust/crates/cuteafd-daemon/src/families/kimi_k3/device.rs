@@ -2463,7 +2463,8 @@ mod tests {
                 layer_id: None, expert_id: None, is_quantization_metadata: false },
             source_path: "test".into(), bytes: vec![0; 64], elapsed_micros: 0, sha256: String::new(),
         }))?;
-        let weights = Rc::new(layout[0].upload(device, packed)?);
+        let weights = Rc::new(super::super::weights::coordinator_golden_tests::baseline_global(
+            device, &layout[0], packed)?);
         let weak = Rc::downgrade(&weights);
         let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
         let io = IoLayout { rank: 0, ranks: 2, rows: 16, hidden: 4, vocab: 8, core_head:false, full_prefill_logits: false }

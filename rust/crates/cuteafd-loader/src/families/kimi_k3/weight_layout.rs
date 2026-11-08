@@ -6,6 +6,17 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
 use std::collections::BTreeMap;
 
+/// One physical request per coordinator rank. Views are stable across mount
+/// and push loads and include ordinary operands, K6 planes and native attention.
+pub fn coordinator_arena(rank: usize, global: &GlobalLayout, layers: &[&LayerLayout])
+    -> Result<crate::serving_capacity::WeightArenaLayout> {
+    let mut tensors = global.arena_tensors()?;
+    for (layer, layout) in layers.iter().enumerate() {
+        tensors.extend(layout.arena_tensors(&format!("layers.{layer}"))?);
+    }
+    crate::serving_capacity::WeightArenaLayout::new(format!("kimi/coordinator/{rank}"), tensors)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightAttention { Absent, Whole, Split }
 impl WeightAttention {
@@ -37,6 +48,12 @@ pub struct GlobalLayout {
     pub operands: BTreeMap<&'static str, usize>, pub core_head: Option<CoreWeightLayout>,
 }
 impl GlobalLayout {
+    pub fn arena_tensors(&self) -> Result<Vec<(String, usize)>> {
+        let mut tensors = self.operands.iter().map(|(name, bytes)| (format!("global.{name}"), *bytes)).collect::<Vec<_>>();
+        if let Some(head) = &self.core_head { tensors.extend(head.arena_tensors("global.head")?); }
+        Ok(tensors)
+    }
+
     pub fn ranks_with_core(cfg: &KimiK3Config, inventory: &CoreInventory, ranks: usize) -> Result<Vec<Self>> {
         ensure!(matches!(ranks, 1 | 2), "Kimi global rank count");
         let [mut entry, terminal] = Self::pair_with_core(cfg, inventory)?;
@@ -92,6 +109,22 @@ pub struct LayerLayout {
     pub native: BTreeMap<&'static str, crate::formats::native_attention::NativeLayout>,
 }
 impl LayerLayout {
+    pub fn arena_tensors(&self, prefix: &str) -> Result<Vec<(String, usize)>> {
+        let mut tensors = self.operands.iter().map(|(name, bytes)| (format!("{prefix}.{name}"), *bytes)).collect::<Vec<_>>();
+        for (name, layout) in &self.core { tensors.extend(layout.arena_tensors(&format!("{prefix}.{name}"))?); }
+        for (name, layout) in &self.native {
+            let [n, k] = layout.shape;
+            let values = n.checked_mul(k).and_then(|v| v.checked_mul(if layout.fp8 { 1 } else { 2 }))
+                .context("Kimi native arena extent overflow")?.max(256);
+            tensors.push((format!("{prefix}.{name}.values"), values));
+            if layout.fp8 {
+                let scales = usize::try_from(layout.bytes()?)?.checked_sub(values).context("Kimi native arena scales")?;
+                tensors.push((format!("{prefix}.{name}.scales"), scales));
+            }
+        }
+        Ok(tensors)
+    }
+
     pub fn pair(cfg: &KimiK3Config, layer: usize, mode: LayerMode) -> Result<[Self; 2]> {
         Ok(Self::ranks(cfg, layer, mode, 2)?.try_into().expect("two rank layouts"))
     }
@@ -372,6 +405,44 @@ mod tests {
         assert!(globals[0].operands.contains_key("embedding") && globals[0].operands.contains_key("head"));
         assert!(LayerLayout::ranks(&cfg, 0, LayerMode::HeadSplit, 1).is_err());
         assert!(LayerLayout::ranks(&cfg, 0, mode, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_arenas_cover_final_tp1_and_tp2_operands_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        crate::plan::testing::write_kimi_core_snapshot(dir.path(), false);
+        let checkpoint = crate::plan::checkpoint::Checkpoint::open(dir.path())?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let core = crate::plan::families::kimi::core_inventory(&checkpoint)?;
+        for ranks in [1, 2] {
+            let global = GlobalLayout::ranks_with_core(&cfg, &core, ranks)?;
+            let layers = (0..cfg.layers).map(|layer| LayerLayout::ranks_with_core(&cfg, layer,
+                if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } } else { LayerMode::HeadSplit },
+                &core, ranks)).collect::<Result<Vec<_>>>()?;
+            for rank in 0..ranks {
+                let local = layers.iter().map(|ranks| &ranks[rank]).collect::<Vec<_>>();
+                let arena = coordinator_arena(rank, &global[rank], &local)?;
+                let expected = local.iter().try_fold(global[rank].bytes()?, |sum, layer|
+                    sum.checked_add(layer.bytes()?).context("fixture arena overflow"))?;
+                assert_eq!(arena.payload_bytes(), expected);
+                assert_eq!(arena.bytes(), expected + arena.padding_bytes());
+                let mut views = arena.views().values().copied().collect::<Vec<_>>();
+                views.sort_by_key(|view| view.offset());
+                let mut end = 0;
+                for view in views {
+                    assert_eq!(view.offset() % 256, 0);
+                    assert!(view.offset() >= end);
+                    end = view.offset() + view.bytes();
+                }
+                assert_eq!(end, arena.bytes());
+                assert!(arena.views().keys().all(|key| !key.contains("staging") && !key.contains("temporary")));
+                if global[rank].core_head.is_some() {
+                    assert!(arena.view("global.head.trellis").is_some());
+                    assert!(arena.view("global.head").is_none());
+                }
+            }
+        }
         Ok(())
     }
 
