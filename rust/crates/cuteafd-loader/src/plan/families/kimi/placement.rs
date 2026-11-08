@@ -442,11 +442,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             counts, rank_sets: if ranks > 0 { vec![(0..ranks as u8).collect()] } else { Vec::new() } }),
         arenas, spark, links, draft, fixed: fixed_owners, owners: Vec::new(),
     };
-    if let Err(error) = recipe.allocation_granularity(cfg, &model.core) {
-        report.refuse_placement(format!("Kimi physical allocation inventory refused: {error:#}"),
-            "Provide complete selected native weight extents.");
-        return memory;
-    }
     if let Err(error) = recipe.arena_padding(cfg, &model.core) {
         report.refuse_placement(format!("Kimi packed arena inventory refused: {error:#}"),
             "Provide complete selected native weight extents.");
