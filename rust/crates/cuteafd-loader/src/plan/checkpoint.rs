@@ -145,8 +145,14 @@ impl Checkpoint {
 
     /// Whether a payload or classification header is available, independent of index membership.
     pub fn has_header(&self, name: &str) -> bool {
-        self.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name)).is_ok()
-            || self.classification_headers().binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name)).is_ok()
+        self.header(name).is_some()
+    }
+
+    /// Validated metadata for classification, including native operands not owned by this role.
+    pub fn header(&self, name: &str) -> Option<&SafetensorsTensorMetadata> {
+        [self.tensors.as_slice(), self.classification_headers()].into_iter().find_map(|headers|
+            headers.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name))
+                .ok().map(|at| &headers[at].meta))
     }
 
     fn classification_headers(&self) -> &[CheckpointTensor] {
@@ -394,9 +400,7 @@ impl Checkpoint {
     pub fn module_numerics(&self, module: &str) -> Result<ModuleNumerics> {
         let stem = module.strip_suffix(".weight").unwrap_or(module);
         let weight = format!("{stem}.weight");
-        let dtype = [self.tensors.as_slice(), self.classification_headers()].into_iter().find_map(|headers|
-            headers.binary_search_by(|tensor| tensor.meta.name.cmp(&weight))
-                .ok().map(|at| headers[at].meta.dtype.clone()));
+        let dtype = self.header(&weight).map(|header| header.dtype.clone());
         match dtype {
             Some(dtype) => self.module_numerics_with_header(stem, dtype),
             None => self.declared_numerics(stem),

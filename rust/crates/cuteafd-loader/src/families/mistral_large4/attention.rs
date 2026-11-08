@@ -31,9 +31,9 @@ pub fn validate(checkpoint: &Checkpoint, cfg: &Ml4Config) -> Result<(), Attentio
                 let name = format!("{stem}.{suffix}");
                 let width = if dtype == DType::F32 { 4 } else { 1 };
                 let expected = shape.iter().try_fold(width, |bytes: usize, &n| bytes.checked_mul(n));
-                let valid = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name)
-                    .is_some_and(|tensor| tensor.meta.dtype == dtype && tensor.meta.shape == shape
-                        && expected == usize::try_from(tensor.meta.byte_length).ok());
+                let valid = checkpoint.header(&name)
+                    .is_some_and(|header| header.dtype == dtype && header.shape == shape
+                        && expected == usize::try_from(header.byte_length).ok());
                 if !valid {
                     return Err(AttentionError::NativeTensor {
                         tensor: name, expected: format!("{dtype:?} {shape:?}"),

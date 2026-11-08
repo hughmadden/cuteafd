@@ -427,10 +427,12 @@ mod tests {
                 _ => unreachable!(),
             };
             let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("config.json"))?)?;
-            let index_path = super::super::checkpoint::index_path(dir.path())?;
-            let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(&index_path)?)?;
+            let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                super::super::checkpoint::index_path(dir.path())?)?)?;
+            let index_path = dir.path().join("model.safetensors.index.json");
+            config.as_object_mut().unwrap().remove("transformers_weights");
             let declaration = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
-                "views":{"hqa":{"config":"config.json", "index":index_path.file_name().unwrap().to_str().unwrap(),
+                "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json",
                     "quantize":"quantize_config.json"}, "compact-attention":{"config":"config.compact-attention.json",
                     "index":"model.compact-attention.safetensors.index.json", "quantize":"quantize_config.compact-attention.json"}},
                 "native_modules":"quantize_config.json:native_attention"});
@@ -439,21 +441,35 @@ mod tests {
                 .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes)).transpose()?.unwrap_or(serde_json::json!({}));
             quant["attention_view"] = declaration;
             let stem = native.0.strip_suffix(".weight").unwrap();
-            let mut natives = vec![native.clone()];
-            let mut entry = serde_json::json!({"format":"bf16", "shard":"native.safetensors", "compact_attention_bits":6});
-            if native.1 == "F8_E4M3" {
-                let scale = format!("{stem}.qscale_weight");
-                natives.push(t(&scale, "F32", &[48, 64]));
-                entry["format"] = serde_json::json!("fp8_e4m3_block_scaled");
-                entry["scale"] = serde_json::json!({"tensor":scale,"dtype":"F32","block_size":[128,128],
-                    "semantics":"checkpoint-native: original FP8 block scale"});
+            let weights = if family == "mistral_large4" {
+                let cfg = crate::families::mistral_large4::Ml4Config::from_hf(&config)?;
+                (0..cfg.layers).flat_map(|layer| [
+                    t(format!("layers.{layer}.attention.wq.weight"), "F8_E4M3", &[cfg.heads * cfg.qk_head_dim(), cfg.hidden]),
+                    t(format!("layers.{layer}.attention.wo.weight"), "F8_E4M3", &[cfg.hidden, cfg.heads * cfg.v_head_dim]),
+                ]).collect::<Vec<_>>()
+            } else { vec![native.clone()] };
+            let mut natives = Vec::new();
+            let mut declarations = serde_json::Map::new();
+            for weight in weights {
+                let module = weight.0.strip_suffix(".weight").unwrap();
+                let mut tensors = vec![weight.clone()];
+                let mut entry = serde_json::json!({"format":"bf16", "shard":"native.safetensors", "compact_attention_bits":6});
+                if weight.1 == "F8_E4M3" {
+                    let scale = format!("{module}.qscale_weight");
+                    tensors.push(t(&scale, "F32", &weight.2.iter().map(|n| n.div_ceil(128)).collect::<Vec<_>>()));
+                    entry["format"] = serde_json::json!("fp8_e4m3_block_scaled");
+                    entry["scale"] = serde_json::json!({"tensor":scale,"dtype":"F32","block_size":[128,128],
+                        "semantics":"checkpoint-native: original FP8 weight with its original per-block FP32 scale"});
+                }
+                entry["tensors"] = serde_json::Value::Object(tensors.iter().map(|(name, dtype, shape)|
+                    (name.clone(), serde_json::json!({"dtype":dtype,"shape":shape}))).collect());
+                declarations.insert(module.to_owned(), entry);
+                // Replace any compact operand and stale native scales in the index.
+                index["weight_map"].as_object_mut().unwrap().retain(|name, _| !name.starts_with(&format!("{module}.")));
+                for (name, ..) in &tensors { index["weight_map"][name] = serde_json::json!("native.safetensors"); }
+                natives.extend(tensors);
             }
-            entry["tensors"] = serde_json::Value::Object(natives.iter().map(|(name, dtype, shape)|
-                (name.clone(), serde_json::json!({"dtype":dtype,"shape":shape}))).collect());
-            quant["native_attention"] = serde_json::json!({stem:entry});
-            // Replace any compact operand and stale native scales in the index.
-            index["weight_map"].as_object_mut().unwrap().retain(|name, _| !name.starts_with(&format!("{stem}.")));
-            for (name, ..) in &natives { index["weight_map"][name] = serde_json::json!("native.safetensors"); }
+            quant["native_attention"] = serde_json::Value::Object(declarations);
             write_safetensors(&dir.path().join("native.safetensors"), &natives);
             for (path, value) in [(dir.path().join("config.json"), config), (index_path, index),
                 (dir.path().join("quantize_config.json"), quant)] {
