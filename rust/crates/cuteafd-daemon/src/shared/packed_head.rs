@@ -169,7 +169,7 @@ mod tests {
         let packed = device.run(|| PackedHead::allocate_with(&library, n, k,
             |name, bytes| arena.view(name, bytes)))?;
         assert!(packed.status.get().is_none());
-        let scratch = device.run(|| super::scratch(&library, 1, &[(k,n)]))?;
+        let scratch = DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?;
         // SAFETY: initialization is checked before operands; this must reject without dereferencing them.
         assert!(unsafe { packed.apply(&library, std::ptr::null(), std::ptr::null_mut(), true, 1,
             false, &scratch, std::ptr::null_mut()) }.is_err());

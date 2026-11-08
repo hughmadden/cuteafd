@@ -212,7 +212,8 @@ pub(crate) mod tests {
         assert_eq!(head.bytes(), layout.total_bytes());
         // Projection borrowers can exist before delivery without exposing BF16.
         assert!(matches!(shard.copy(), Some(HeadCopy::Packed(_))));
-        let sockets = tempfile::tempdir_in(fixture.directory())?;
+        // Native fixture paths exceed the Unix socket limit under a task Cargo target.
+        let sockets = tempfile::tempdir()?;
         receive(Device { library: &library, id: 0 }, root.path(), sockets.path(), &records)?;
         shard.finish_push()?;
         assert!(shard.pending.borrow().is_none());
