@@ -465,7 +465,6 @@ fn worker(
         Some(world)
     } else { None };
     let start = Instant::now();
-    cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     admission::startup_phase(&lib, "v41/startup", device_total)?;
     use crate::shared::experts::rtx::{dense, push::PushPolicy};
     let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
@@ -490,7 +489,6 @@ fn worker(
         "native target backbone/index/embedding weights loaded in {:.3}s",
         start.elapsed().as_secs_f64()
     );
-    cuteafd_ffi::memory_ledger::relabel_other("v41/weights:backbone,cache-producers,index,embedding");
     admission::startup_phase(&lib, "v41/weights:backbone,cache-producers,index,embedding", device_total)?;
     let attention_plan = attention_plan(&args)?;
     let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots, &pool)?;
@@ -514,7 +512,6 @@ fn worker(
         vocabulary.inventory(inventory)?;
         head_weights.inventory(inventory)
     })?;
-    cuteafd_ffi::memory_ledger::relabel_other("v41/weights:head");
     admission::startup_phase(&lib, "v41/weights:head", device_total)?;
     use crate::families::deepseek_v41::v41_target_pass::TargetTapWave;
     let head = || head_weights.wave(&vocabulary, cuteafd_core::V41_VERIFY_ROWS,
@@ -598,7 +595,6 @@ fn worker(
             NativeTp4Wave::device_bytes_for(decode_rows, expert_world)?),
         None => NativeTp4Wave::unlinked(&lib, decode_rows),
     })?;
-    cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     // The one prefill link (endpoint after the lanes'), one return slot per
     // prefill slot, held by slot 0's FFN owner; the other slots' units send
@@ -611,7 +607,6 @@ fn worker(
     }).collect::<Result<Vec<_>>>()?;
     let mut prefill_slots = prefill_target::PrefillSlots { packed_suffix, prompt_suffixes,
         slots: slot_passes.drain(..).zip(slot_transports).collect() };
-    cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
     second.install_attention_plan(attention_plan)?;
@@ -647,7 +642,6 @@ fn worker(
     attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
     tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
-    cuteafd_ffi::memory_ledger::relabel_other("v41/drafter");
     admission::startup_phase(&lib, "v41/drafter", device_total)?;
     // A local tower records on its owner thread and joins the coordinator group.
     let (mut vision, vision_push) = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load_pushed(
@@ -656,7 +650,6 @@ fn worker(
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
-    cuteafd_ffi::memory_ledger::relabel_other("v41/vision");
     admission::startup_phase(&lib, "v41/vision", device_total)?;
     let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let prefix_arenas = prefix::Arenas::new(
@@ -664,7 +657,6 @@ fn worker(
         draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;
     let snapshot_bytes = prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
-    cuteafd_ffi::memory_ledger::relabel_other("v41/prefix-snapshots");
     admission::startup_phase(&lib, "v41/prefix-snapshots", device_total)?;
     // Verify native expert geometry against the pre-weight admission.
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
@@ -717,10 +709,8 @@ fn worker(
     drop(records);
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
-    cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     admission::startup_phase(&lib, "v41/kv", device_total)?;
     requests.use_engine_pages()?;
-    cuteafd_ffi::memory_ledger::relabel_other("v41/kv-prefix-install");
     admission::startup_phase(&lib, "v41/kv-prefix-install", device_total)?;
     if args.rtx_expert_layers != admission::LocalLayers::Count(0) {
         let local_started = Instant::now();
@@ -762,7 +752,6 @@ fn worker(
     }
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
-    cuteafd_ffi::memory_ledger::relabel_other("v41/local-experts");
     admission::startup_phase(&lib, "v41/local-experts", device_total)?;
     crate::shared::memory_report::release_load_staging(&lib)?;
     tracing::info!(rtx_layers=local_layers, first_remote_dispatch_layer=local_layers,

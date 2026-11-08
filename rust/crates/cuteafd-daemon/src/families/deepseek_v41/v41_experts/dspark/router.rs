@@ -1,5 +1,6 @@
 //! Per-stage router scratch; writes directly into the expert wave's stable inputs.
 use super::DsparkWeights;
+use crate::shared::memory::Tag;
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Router};
@@ -33,7 +34,7 @@ impl<'library> DsparkWeights<'library> {
             _weights: self,
             tensors,
             kernel: library.v41_router()?,
-            scores: DeviceAllocation::untagged(library, bytes)?,
+            scores: DeviceAllocation::new(library, bytes, Tag::drafter_workspace("v41/draft-router"))?,
             stage,
             capacity,
         })

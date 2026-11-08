@@ -24,6 +24,7 @@ use super::*;
 use super::scores::RetainedScores;
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneMark, CacheLease, UNIT_BYTES, UNIT_TOKENS};
 use crate::families::deepseek_v41::v41_requests::RequestMark;
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::prefix::{cuda_copy::range, CudaCopyEngine};
 use cuteafd_engine::prefix::{
@@ -81,10 +82,10 @@ pub(crate) struct Arenas<'a> {
 impl<'a> Arenas<'a> {
     pub fn new(target: Device<'a>, draft: Option<Device<'a>>, slots: usize) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
-        let target = (slots > 0).then(|| Allocation::untagged(target, slots * BackboneMark::BYTES).map(std::rc::Rc::new))
+        let target = (slots > 0).then(|| Allocation::new(target, slots * BackboneMark::BYTES, Tag::prefix("v41/prefix-snapshots")).map(std::rc::Rc::new))
             .transpose()?;
         let draft = match draft {
-            Some(device) if slots > 0 => Some(std::rc::Rc::new(Allocation::untagged(device, slots * super::speculative::DRAFT_MARK_BYTES)?)),
+            Some(device) if slots > 0 => Some(std::rc::Rc::new(Allocation::new(device, slots * super::speculative::DRAFT_MARK_BYTES, Tag::prefix("v41/prefix-snapshots"))?)),
             _ => None,
         };
         Ok(Self { target, draft, slots })
@@ -95,7 +96,7 @@ impl<'a> Arenas<'a> {
         ensure!(self.draft.is_none(), "draft mark arena already allocated");
         if self.slots > 0 {
             let _scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
-            self.draft = Some(std::rc::Rc::new(Allocation::untagged(draft, self.slots * super::speculative::DRAFT_MARK_BYTES)?));
+            self.draft = Some(std::rc::Rc::new(Allocation::new(draft, self.slots * super::speculative::DRAFT_MARK_BYTES, Tag::prefix("v41/prefix-snapshots"))?));
         }
         Ok(self)
     }

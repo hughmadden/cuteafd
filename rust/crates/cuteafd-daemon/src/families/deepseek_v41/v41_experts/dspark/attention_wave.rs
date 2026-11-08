@@ -2,6 +2,7 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkAttentionOutput, DsparkProjection, DsparkWeights, ProjectionKind};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowGeometry, WindowLease, WindowRead};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41DsparkAttention};
@@ -63,10 +64,10 @@ impl<'library> DsparkWeights<'library> {
             q_norm: self.tensor(&format!("mtp.{stage}.attn.q_norm.weight"))?,
             kv_norm: self.tensor(&format!("mtp.{stage}.attn.kv_norm.weight"))?,
             sink: self.tensor(&format!("mtp.{stage}.attn.attn_sink"))?,
-            draft: DeviceAllocation::untagged(library, rows as usize * 1024)?,
-            positions: DeviceAllocation::untagged(library, rows as usize * 8)?,
-            descriptors: DeviceAllocation::untagged(library, cuteafd_core::V41_READ_DESCRIPTOR_BYTES)?,
-            staging: HostAllocation::untagged(library, cuteafd_core::V41_READ_DESCRIPTOR_BYTES + rows as usize * 8)?,
+            draft: DeviceAllocation::new(library, rows as usize * 1024, Tag::drafter_workspace("v41/draft-attention"))?,
+            positions: DeviceAllocation::new(library, rows as usize * 8, Tag::drafter_workspace("v41/draft-attention"))?,
+            descriptors: DeviceAllocation::new(library, cuteafd_core::V41_READ_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-attention"))?,
+            staging: HostAllocation::new(library, cuteafd_core::V41_READ_DESCRIPTOR_BYTES + rows as usize * 8, Tag::staging("v41/draft-attention"))?,
             requests,
             width: self.draft_width,
             graph: BindingGraphs::new(library)?,

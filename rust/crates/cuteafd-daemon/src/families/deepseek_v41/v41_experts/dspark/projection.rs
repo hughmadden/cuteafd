@@ -1,6 +1,7 @@
 //! Native dSpark main/attention FP8 matrix ownership.
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -145,22 +146,22 @@ impl<'library> DsparkWeights<'library> {
         );
         let (index, name, k, n) = kind.binding()?;
         let kernel = library.v41_fp8_matrix_plan(capacity, k, n)?;
-        let owned_input = if external.is_none() { Some(DeviceAllocation::untagged(library, capacity as usize*k as usize*2)?) } else { None };
+        let owned_input = if external.is_none() { Some(DeviceAllocation::new(library, capacity as usize*k as usize*2, Tag::drafter_workspace("v41/draft-projection"))?) } else { None };
         let input = external.unwrap_or_else(|| owned_input.as_ref().unwrap().buffer);
         ensure!(!input.ptr.is_null() && input.bytes >= capacity as usize*k as usize*2
             && input.device_id == self.tensor(&format!("{name}.weight"))?.device_id,
             "projection input extent or device differs");
         let value = DsparkProjection {
             standalone: &self.standalone,
-            scratch: DeviceAllocation::untagged(library, kernel.info().scratch_bytes as usize)?,
+            scratch: DeviceAllocation::new(library, kernel.info().scratch_bytes as usize, Tag::drafter_workspace("v41/draft-projection"))?,
             kernel,
             _weights: self,
             weight: self.tensor(&format!("{name}.weight"))?,
             scales: self.projection_scales[index].buffer,
-            alpha: DeviceAllocation::untagged(library, 4)?,
+            alpha: DeviceAllocation::new(library, 4, Tag::drafter_workspace("v41/draft-projection"))?,
             input,
             _owned_input: owned_input,
-            output: DeviceAllocation::untagged(library, capacity as usize * n as usize * 2)?,
+            output: DeviceAllocation::new(library, capacity as usize * n as usize * 2, Tag::drafter_workspace("v41/draft-projection"))?,
             graph: BindingGraphs::new(library)?,
             ready: None,
         };

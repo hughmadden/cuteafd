@@ -1,4 +1,5 @@
 //! Shared native FP8 SwiGLU execution for backbone and dSpark weights.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Result};
@@ -46,14 +47,14 @@ impl<'library> SharedFfnStorage<'library> {
         let [up, down, alpha, gate, intermediate_up, intermediate] = Self::allocation_sizes(
             up_kernel.info().scratch_bytes as usize, down_kernel.info().scratch_bytes as usize, unit);
         let value = Self {
-            up_scratch: DeviceAllocation::untagged(library, up)?,
-            down_scratch: DeviceAllocation::untagged(library, down)?,
+            up_scratch: DeviceAllocation::new(library, up, Tag::workspace("v41/shared-ffn"))?,
+            down_scratch: DeviceAllocation::new(library, down, Tag::workspace("v41/shared-ffn"))?,
             up_kernel, down_kernel,
             activation: library.v41_shared_swiglu()?,
-            alpha: DeviceAllocation::untagged(library, alpha)?,
-            gate: DeviceAllocation::untagged(library, gate)?,
-            up: DeviceAllocation::untagged(library, intermediate_up)?,
-            intermediate: DeviceAllocation::untagged(library, intermediate)?,
+            alpha: DeviceAllocation::new(library, alpha, Tag::workspace("v41/shared-ffn"))?,
+            gate: DeviceAllocation::new(library, gate, Tag::workspace("v41/shared-ffn"))?,
+            up: DeviceAllocation::new(library, intermediate_up, Tag::workspace("v41/shared-ffn"))?,
+            intermediate: DeviceAllocation::new(library, intermediate, Tag::workspace("v41/shared-ffn"))?,
             capacity: unit,
         };
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };

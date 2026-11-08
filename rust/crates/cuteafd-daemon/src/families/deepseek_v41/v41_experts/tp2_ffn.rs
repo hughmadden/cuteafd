@@ -6,6 +6,7 @@ use crate::shared::experts::rtx::{
     native::NativeTp2,
     pair::{OwnerInputs, OwnerPair, OwnerPolicy, OwnerWeights},
 };
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add};
@@ -82,10 +83,10 @@ impl<'a> PeerInputs<'a> {
     fn new(device: Device<'a>, capacity: u32) -> Result<Self> {
         let [values, wire, ids, routing] = Self::allocation_sizes(capacity);
         Ok(Self {
-            values: Allocation::untagged(device, values)?,
-            wire: Allocation::untagged(device, wire)?,
-            ids: Allocation::untagged(device, ids)?,
-            routing: Allocation::untagged(device, routing)?,
+            values: Allocation::new(device, values, Tag::workspace("v41/tp2-experts"))?,
+            wire: Allocation::new(device, wire, Tag::workspace("v41/tp2-experts"))?,
+            ids: Allocation::new(device, ids, Tag::workspace("v41/tp2-experts"))?,
+            routing: Allocation::new(device, routing, Tag::workspace("v41/tp2-experts"))?,
         })
     }
     fn buffers(&self) -> [CuteafdDeviceBuffer; 4] {
@@ -297,8 +298,8 @@ impl<'a> Execution<'a> {
                 modules,
             )?,
             output: [
-                Allocation::untagged(devices[0], reserve as usize * 10240)?,
-                Allocation::untagged(devices[1], reserve as usize * 10240)?,
+                Allocation::new(devices[0], reserve as usize * 10240, Tag::workspace("v41/tp2-experts"))?,
+                Allocation::new(devices[1], reserve as usize * 10240, Tag::workspace("v41/tp2-experts"))?,
             ],
             add: devices[0].library.bf16_add()?,
             sm: [Some(devices[0].run(|| devices[0].library.v41_peer_copy())?),

@@ -1,5 +1,6 @@
 //! Per-slot head-half waves on shared, guarded unit-cap attention storage.
 use super::*;
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache,CacheAttention,peer_inputs::PeerAttentionInputs};
 
@@ -48,8 +49,8 @@ impl<'a> DualAttentionStorage<'a> {
             copies: [devices[0].run(|| devices[0].library.v41_peer_copy())?,
                 devices[1].run(|| devices[1].library.v41_peer_copy())?],
             peer_done: Event::new(devices[1])?,
-            output: Allocation::untagged(devices[0], unit*64*1024)?, inputs,
-            peer_sink: Allocation::untagged(devices[1], 128)?,
+            output: Allocation::new(devices[0], unit*64*1024, Tag::workspace("v41/dual-attention"))?, inputs,
+            peer_sink: Allocation::new(devices[1], 128, Tag::transport("v41/dual-attention"))?,
             guard: crate::shared::memory::row_window::ScratchGuard::new(devices[0].library, &readers)?,
             capacity: unit,
         }))

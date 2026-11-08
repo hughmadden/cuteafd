@@ -2,6 +2,7 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkProjection, DsparkWeights, ProjectionKind};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowChunk, WindowWrite};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
@@ -41,7 +42,7 @@ impl<'library> DsparkWeights<'library> {
             DsparkMainContext::device_bytes(library, capacity)? <= budget,
             "dSpark main context exceeds budget"
         );
-        let normalized = DeviceAllocation::untagged(library, capacity as usize * 10240)?;
+        let normalized = DeviceAllocation::new(library, capacity as usize * 10240, Tag::drafter_workspace("v41/draft-context"))?;
         let kv = |stage| unsafe {
             self.projection_from(ProjectionKind::Kv(stage), capacity, normalized.buffer,
                 DsparkProjection::external_input_bytes(library, ProjectionKind::Kv(stage), capacity)?)
@@ -65,19 +66,19 @@ impl<'library> DsparkWeights<'library> {
                 self.tensor("mtp.2.attn.kv_norm.weight")?,
             ],
             normalized,
-            positions: DeviceAllocation::untagged(library, capacity as usize * 8)?,
-            frequencies: DeviceAllocation::untagged(library, capacity as usize * 256)?,
+            positions: DeviceAllocation::new(library, capacity as usize * 8, Tag::drafter_workspace("v41/draft-context"))?,
+            frequencies: DeviceAllocation::new(library, capacity as usize * 256, Tag::drafter_workspace("v41/draft-context"))?,
             rotated: [
-                DeviceAllocation::untagged(library, capacity as usize * 1024)?,
-                DeviceAllocation::untagged(library, capacity as usize * 1024)?,
-                DeviceAllocation::untagged(library, capacity as usize * 1024)?,
+                DeviceAllocation::new(library, capacity as usize * 1024, Tag::drafter_workspace("v41/draft-context"))?,
+                DeviceAllocation::new(library, capacity as usize * 1024, Tag::drafter_workspace("v41/draft-context"))?,
+                DeviceAllocation::new(library, capacity as usize * 1024, Tag::drafter_workspace("v41/draft-context"))?,
             ],
             capacity,
             graph: BindingGraphs::new(library)?,
             ready: None,
             pending_writes: None,
-            commit_descriptors: [DeviceAllocation::untagged(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::untagged(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::untagged(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?],
-            commit_staging: HostAllocation::untagged(library, capacity as usize*8 + 3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
+            commit_descriptors: [DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?],
+            commit_staging: HostAllocation::new(library, capacity as usize*8 + 3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::staging("v41/draft-context"))?,
         })
     }
 }

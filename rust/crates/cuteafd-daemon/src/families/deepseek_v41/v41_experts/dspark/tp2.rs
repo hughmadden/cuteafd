@@ -9,6 +9,7 @@ mod checkpoint_tests;
 
 pub(super) use crate::shared::experts::rtx::draft::rank::Weights;
 use super::{DsparkRouter, DsparkSharedFfn, DsparkWeights};
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -33,8 +34,8 @@ impl<'w,'a> RoutedWave<'w,'a> {
         ensure!(stage<3 && owner.library.cuda_get_device()?==1,"draft TP2 transformer must reside on RTX1");
         let device=Device {library:owner.library,id:1};
         Ok(Self {pair:pair::Pair::new(weights,capacity,LAYOUT)?,
-            inputs:[Allocation::untagged(device,capacity as usize*10240)?,Allocation::untagged(device,capacity as usize*12)?,Allocation::untagged(device,capacity as usize*12)?],
-            shared:Allocation::untagged(device,capacity as usize*10240)?,owner,stage,capacity})
+            inputs:[Allocation::new(device,capacity as usize*10240,Tag::drafter_workspace("v41/draft-tp2"))?,Allocation::new(device,capacity as usize*12,Tag::drafter_workspace("v41/draft-tp2"))?,Allocation::new(device,capacity as usize*12,Tag::drafter_workspace("v41/draft-tp2"))?],
+            shared:Allocation::new(device,capacity as usize*10240,Tag::drafter_workspace("v41/draft-tp2"))?,owner,stage,capacity})
     }
     pub fn peer_stream(&self)->Rc<Stream<'a>> {self.pair.peer_stream()}
     pub fn synchronize(&self)->Result<()> {let root=self.owner.standalone.drain();let peer=self.pair.drain_peer();root.and(peer)}

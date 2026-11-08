@@ -1,6 +1,7 @@
 //! Real backbone low-rank query projection, normalization and rotary graphs.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -144,18 +145,18 @@ impl<'a> AttentionQueryWeights<'a> {
             .collect::<Result<Vec<_>>>()?;
         let scratch = kernels
             .iter()
-            .map(|k| DeviceAllocation::untagged(self.library, k.info().scratch_bytes as usize))
+            .map(|k| DeviceAllocation::new(self.library, k.info().scratch_bytes as usize, Tag::workspace("v41/attention-query")))
             .collect::<Result<Vec<_>>>()?;
         let storage = AttentionQueryStorage {
             stream,
             kernels,
             scratch,
-            alpha: DeviceAllocation::untagged(self.library, 4)?,
+            alpha: DeviceAllocation::new(self.library, 4, Tag::workspace("v41/attention-query"))?,
             buffers: ROW_BYTES
                 .into_iter().enumerate()
                 .map(|(i, n)| {
                     if i == 4 && !cfg!(test) { Ok(None) }
-                    else { DeviceAllocation::untagged(self.library, n * unit as usize).map(Some) }
+                    else { DeviceAllocation::new(self.library, n * unit as usize, Tag::workspace("v41/attention-query")).map(Some) }
                 })
                 .collect::<Result<Vec<_>>>()?,
             guard: crate::shared::memory::row_window::ScratchGuard::new(self.library, readers)?,
@@ -177,7 +178,7 @@ impl<'a> AttentionQueryWeights<'a> {
     pub fn on_storage(&self, storage: std::rc::Rc<AttentionQueryStorage<'a>>) -> Result<AttentionQueryWave<'_, 'a>> {
         ensure!(storage.kernels.len() == self.scales.len(), "attention query storage plans differ from the weights");
         let value = AttentionQueryWave {
-            position_staging: HostAllocation::untagged(self.library, storage.unit as usize * 8)?,
+            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8, Tag::staging("v41/attention-query"))?,
             norm: self.library.v41_attention_ops()?,
             weights: self,
             capacity: storage.unit,

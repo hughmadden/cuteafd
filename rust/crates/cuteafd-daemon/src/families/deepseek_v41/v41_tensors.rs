@@ -1,4 +1,5 @@
 //! Official coordinator tensors retain their native checkpoint representations.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, device::Device,
     weight_arena::{DeviceWeightArena, weight_allocation}};
 use anyhow::{ensure, Context, Result};
@@ -63,7 +64,6 @@ impl<'a> NativeRtxTensors<'a> {
     }
     pub fn load_embedding_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         placement: crate::shared::memory::EmbedPlacement, arena: Option<&DeviceWeightArena<'a>>) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("embedding");
         let names = ["embed.weight".to_owned()];
         let bytes = Self::plan(catalog, &names)?;
         if placement == crate::shared::memory::EmbedPlacement::Gpu {
@@ -72,7 +72,7 @@ impl<'a> NativeRtxTensors<'a> {
         }
         cuteafd_loader::plan::checkpoint::Checkpoint::open(catalog.snapshot())?
             .require_untied_embedding("embed.weight")?;
-        let mut storage = HostAllocation::untagged(library, bytes)?;
+        let mut storage = HostAllocation::new(library, bytes, Tag::embedding("v41/embedding"))?;
         catalog.coordinator_tensor_reader("embed.weight")?.read_into(0, storage.bytes_mut())?;
         let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
         tracing::info!(?placement, device_bytes=0, pinned_bytes=bytes, "V4.1 embedding placement (single residency, shared target/dSpark)");

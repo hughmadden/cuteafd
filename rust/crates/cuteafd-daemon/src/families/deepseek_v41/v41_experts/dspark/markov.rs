@@ -1,5 +1,6 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41VocabularyProjection};
@@ -34,15 +35,15 @@ impl<'library> DsparkWeights<'library> {
         let library = self.library;
         self.tensor("mtp.2.markov_head.embed.weight")?;
         self.tensor("mtp.2.markov_head.head.weight")?;
-        let workspace = DeviceAllocation::untagged(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::drafter_workspace("v41/draft-markov"))?;
         let kernel = unsafe { library.v41_dspark_markov(workspace.buffer)? };
         Ok(DsparkMarkov {
             kernel,
             _workspace: workspace,
             standalone: &self.standalone,
-            tokens: DeviceAllocation::untagged(library, capacity * 4)?,
-            embedding: DeviceAllocation::untagged(library, capacity * 512)?,
-            logits: DeviceAllocation::untagged(library, capacity * 129280 * 4)?,
+            tokens: DeviceAllocation::new(library, capacity * 4, Tag::drafter_workspace("v41/draft-markov"))?,
+            embedding: DeviceAllocation::new(library, capacity * 512, Tag::drafter_workspace("v41/draft-markov"))?,
+            logits: DeviceAllocation::new(library, capacity * 129280 * 4, Tag::drafter_workspace("v41/draft-markov"))?,
             weights: self,
             graph: BindingGraphs::new(library)?,
             capacity,

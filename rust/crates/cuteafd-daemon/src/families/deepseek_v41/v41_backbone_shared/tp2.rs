@@ -1,4 +1,5 @@
 //! Device-owned TP2 shared-expert weights and one rank's lane workspace.
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, Event, PeerTransfer, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add, V41Fp8Plan, V41SharedSwiGlu};
@@ -113,8 +114,8 @@ impl<'a> Execution<'a> {
         Ok(Self {
             transfers: [PeerTransfer::new(d1,d0)?, PeerTransfer::new(d0,d1)?],
             ready: [Event::new(d0)?, Event::new(d1)?],
-            staging: [Allocation::untagged(d0,bytes)?, Allocation::untagged(d1,bytes)?],
-            output: [Allocation::untagged(d0,rows as usize*10240)?, Allocation::untagged(d1,rows as usize*10240)?],
+            staging: [Allocation::new(d0,bytes,Tag::staging("v41/shared-tp2"))?, Allocation::new(d1,bytes,Tag::staging("v41/shared-tp2"))?],
+            output: [Allocation::new(d0,rows as usize*10240,Tag::workspace("v41/shared-tp2"))?, Allocation::new(d1,rows as usize*10240,Tag::workspace("v41/shared-tp2"))?],
             released: [crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?,
                 crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?],
             ranks, add: d0.library.bf16_add()?, capacity,
@@ -217,7 +218,7 @@ impl<'a> Weights<'a> {
             let scales = crate::shared::memory::weight_arena::weight_allocation(
                 device, arena, &crate::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),
                 (k*n/32) as usize, ArenaTag::weights("v41/target"))?;
-            let source_scales = Allocation::untagged(device, (k*n/1024) as usize)?;
+            let source_scales = Allocation::new(device, (k*n/1024) as usize, Tag::staging("v41/shared-tp2-load"))?;
             for (suffix, target) in [("weight", &weight), ("scale", &source_scales)] {
                 let rect = super::super::v41_tensors::half(catalog, &format!("{prefix}.{suffix}"), axis, device.id as usize)?;
                 ensure!(rect.bytes() == target.buffer.bytes, "shared TP2 tensor has unexpected size");
@@ -272,9 +273,9 @@ impl<'a> RankWave<'a> {
         let stream = Stream::new(device)?;
         let [up,down,a,gate,u,intermediate,output] = Self::allocation_sizes(
             up_kernel.info().scratch_bytes as usize, down_kernel.info().scratch_bytes as usize, capacity);
-        let up_scratch = Allocation::untagged(device, up)?;
-        let down_scratch = Allocation::untagged(device, down)?;
-        let alpha = Allocation::untagged(device, a)?;
+        let up_scratch = Allocation::new(device, up, Tag::workspace("v41/shared-tp2"))?;
+        let down_scratch = Allocation::new(device, down, Tag::workspace("v41/shared-tp2"))?;
+        let alpha = Allocation::new(device, a, Tag::workspace("v41/shared-tp2"))?;
         let initialized = device.run(|| unsafe {
             up_kernel.initialize_scratch(up_scratch.buffer, alpha.buffer, stream.raw)?;
             down_kernel.initialize_scratch(down_scratch.buffer, alpha.buffer, stream.raw)
@@ -283,10 +284,10 @@ impl<'a> RankWave<'a> {
         initialized.and(drained)?;
         Ok(Self { stream, ready: Event::new(device)?, weights, up_kernel, down_kernel,
             activation: device.library.v41_shared_tp2_swiglu()?, up_scratch, down_scratch, alpha,
-            gate: Allocation::untagged(device, gate)?,
-            up: Allocation::untagged(device, u)?,
-            intermediate: Allocation::untagged(device, intermediate)?,
-            output: Allocation::untagged(device, output)?, capacity })
+            gate: Allocation::new(device, gate, Tag::workspace("v41/shared-tp2"))?,
+            up: Allocation::new(device, u, Tag::workspace("v41/shared-tp2"))?,
+            intermediate: Allocation::new(device, intermediate, Tag::workspace("v41/shared-tp2"))?,
+            output: Allocation::new(device, output, Tag::workspace("v41/shared-tp2"))?, capacity })
     }
     /// # Safety
     /// Previous use has completed. Input writes are ordered on producer, and

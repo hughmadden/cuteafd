@@ -1,4 +1,5 @@
 //! Packed FP8 committed dSpark KV rings with generation-checked request slots.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
@@ -167,10 +168,10 @@ impl<'a> DsparkWindow<'a> {
                 raw: library.cuda_stream_create()?,
             },
             kernel: library.v41_dspark_cache()?,
-            source: DeviceAllocation::untagged(library, source_rows as usize * 1024)?,
-            ring: DeviceAllocation::untagged(library, slots * V41DsparkCache::SLOT_BYTES)?,
-            descriptors: DeviceAllocation::untagged(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
-            staging: HostAllocation::untagged(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
+            source: DeviceAllocation::new(library, source_rows as usize * 1024, Tag::drafter_kv("v41/draft-cache"))?,
+            ring: DeviceAllocation::new(library, slots * V41DsparkCache::SLOT_BYTES, Tag::drafter_kv("v41/draft-cache"))?,
+            descriptors: DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-cache"))?,
+            staging: HostAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::staging("v41/draft-cache"))?,
             graph: None,
             slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             access: SlotAccess::default(),

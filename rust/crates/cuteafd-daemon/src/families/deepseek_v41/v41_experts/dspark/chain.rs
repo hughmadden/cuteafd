@@ -2,6 +2,7 @@
 use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
 use super::{DsparkStage, DsparkTerminal, DsparkWeights};
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowGeometry, WindowLease, WindowRead};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::{ensure, Context, Result};
@@ -179,10 +180,10 @@ impl<'library> DsparkWeights<'library> {
             graphs: GraphBank::new(None),
             ready: None,
             pending: None,
-            download: HostAllocation::untagged(library, requests as usize * (2 * self.draft_width + 1) * 4)?,
+            download: HostAllocation::new(library, requests as usize * (2 * self.draft_width + 1) * 4, Tag::staging("v41/draft-chain"))?,
             embedding: None,
-            tokens: DeviceAllocation::untagged(library, requests as usize * 4)?,
-            token_staging: HostAllocation::untagged(library, requests as usize * 4)?,
+            tokens: DeviceAllocation::new(library, requests as usize * 4, Tag::drafter_workspace("v41/draft-chain"))?,
+            token_staging: HostAllocation::new(library, requests as usize * 4, Tag::staging("v41/draft-chain"))?,
             token_count: None,
             terminal: None,
             ops: library.v41_attention_ops_width(self.draft_width)?,

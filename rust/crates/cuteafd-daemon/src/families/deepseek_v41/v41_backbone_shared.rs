@@ -4,6 +4,7 @@ pub(crate) mod tp2;
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::FfnInput;
 use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_shared_ffn::{SharedFfn, SharedFfnStorage};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -43,8 +44,8 @@ impl<'a> BackboneSharedStorage<'a> {
         Ok(Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             inner: SharedFfnStorage::new(library, unit)?,
-            input: DeviceAllocation::untagged(library, input)?,
-            result: DeviceAllocation::untagged(library, result)?, rows, unit,
+            input: DeviceAllocation::new(library, input, Tag::workspace("v41/backbone-shared"))?,
+            result: DeviceAllocation::new(library, result, Tag::workspace("v41/backbone-shared"))?, rows, unit,
         }))
     }
 }
