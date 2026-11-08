@@ -1,6 +1,6 @@
 //! Exact TP2 KDA state owners. Replay is private to each independently queued
 //! lane; active recurrent slots and immutable prefix marks are shared by lanes.
-use crate::shared::{memory::device::{Allocation, Device, Stream}, prefix::view};
+use crate::shared::{memory::{device::{Allocation, Device, Stream}, Tag}, prefix::view};
 use anyhow::{ensure, Context, Result};
 
 use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaGeometry};
@@ -202,19 +202,18 @@ impl KdaLayout {
             .all(|previous| !Rc::ptr_eq(previous, stream))), "Kimi KDA lanes share a stream owner");
         let stream = Stream::new(device)?;
         let [state, conv, replay, marks] = self.extents()?;
-        let allocate = |bytes, category| -> Result<Rc<Allocation<'a>>> {
-            let _scope = cuteafd_ffi::memory_ledger::scope(category);
-            let allocation = Rc::new(Allocation::untagged(device, bytes)?);
+        let allocate = |bytes, tag| -> Result<Rc<Allocation<'a>>> {
+            let allocation = Rc::new(Allocation::new(device, bytes, tag)?);
             ensure!(allocation.buffer.device_id == device.id && allocation.buffer.bytes == bytes,
                 "Kimi KDA allocation differs from admitted device/extent");
             Ok(allocation)
         };
-        let state = allocate(state, "kv/kimi KDA state")?;
-        let conv = allocate(conv, "kv/kimi KDA convolution")?;
-        let marks = (marks > 0).then(|| allocate(marks, "prefix/kimi KDA marks")).transpose()?;
-        let replay = (0..self.lanes).map(|_| allocate(replay, "workspace/kimi KDA replay"))
+        let state = allocate(state, Tag::kv("kimi/kda-state"))?;
+        let conv = allocate(conv, Tag::kv("kimi/kda-conv"))?;
+        let marks = (marks > 0).then(|| allocate(marks, Tag::prefix("kimi/kda-marks"))).transpose()?;
+        let replay = (0..self.lanes).map(|_| allocate(replay, Tag::workspace("kimi/kda-replay")))
             .collect::<Result<Vec<_>>>()?;
-        let tables = (0..self.lanes).map(|_| allocate(self.slots * 3 * 4, "workspace/kimi KDA commit tables"))
+        let tables = (0..self.lanes).map(|_| allocate(self.slots * 3 * 4, Tag::workspace("kimi/kda-commit-tables")))
             .collect::<Result<Vec<_>>>()?;
         // Keep the initialized bank intact on error: its stream drains first.
         let bank = KdaBank { stream, readers, state, conv, marks, replay, tables, layout: self.clone() };

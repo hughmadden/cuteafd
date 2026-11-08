@@ -297,7 +297,8 @@ impl<'a> Admission<'a> {
     pub(crate) fn allocate_draft_marks(&mut self, device: Device<'a>) -> Result<Option<Rc<crate::shared::memory::device::Allocation<'a>>>> {
         let bytes = self.draft_mark_bytes(device.id)?;
         self.draft_marks_allocated = true;
-        (bytes > 0).then(|| crate::shared::memory::device::Allocation::untagged(device, bytes).map(Rc::new)).transpose()
+        (bytes > 0).then(|| crate::shared::memory::device::Allocation::new(device, bytes,
+            crate::shared::memory::Tag::prefix("kimi/draft-marks")).map(Rc::new)).transpose()
     }
     pub(crate) fn draft_layout(&self) -> Option<&MlaDraftRuntimeLayout> { self.draft.as_ref() }
 
@@ -486,7 +487,6 @@ impl<'a> Admission<'a> {
         -> Result<(Vec<GlobalWeights<'a>>, Vec<Vec<LayerWeights<'a>>>)> {
         ensure!(devices.len() == self.devices.len() && streams.len() == devices.len(),
             "Kimi dense records physical inventory differs from admission");
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
         let mut records = super::weights::records::KimiRecords::new(checkpoint, &self.cfg, &self.core,
             load, streams.to_vec());
         // Reconcile every rank before the first physical allocation.
