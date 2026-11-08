@@ -612,3 +612,13 @@ def test_spark_wait_guard_callers_have_an_earlier_preweight_window():
     for path in ["families/step5/golden.rs", "families/step5/chain.rs",
                  "shared/experts/tp_gate.rs", "shared/experts/exlr8_decode_gate.rs"]:
         assert "crate::shared::inventory::preload_native_modules(" in (daemon / path).read_text(), path
+
+
+def test_step5_qualification_preloads_on_the_selected_device():
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/step5/chain.rs").read_text()
+    # cache_test_device may select GPU1 while leaving GPU0 current.
+    windows = source.split("let device = crate::shared::memory::device::cache_test_device(&library)?;")[1:]
+    assert len(windows) == 2
+    for window in windows:
+        preload = window.split("let programs", 1)[0]
+        assert "device.run(|| crate::shared::inventory::preload_native_modules(&library))?;" in preload
