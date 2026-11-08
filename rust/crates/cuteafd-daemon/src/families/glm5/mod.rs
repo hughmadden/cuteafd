@@ -1848,7 +1848,8 @@ impl Opened {
             let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
                 cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
                     cuteafd_loader::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
-                        snapshot, representation, 0, 1)?)?)?;
+                        snapshot, representation, 0, 1)?)?,
+                cuteafd_core::memory_layout::ArenaTag::drafter_weights("glm/draft"))?;
             let drafter = dflash::DflashDrafter::load_with(&self.library, programs, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
                 mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache,
@@ -1883,7 +1884,8 @@ impl Opened {
                 id: self.library.cuda_get_device()? };
             let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
                 cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
-                    layout.immutable_arena_requests())?)?;
+                    layout.immutable_arena_requests())?,
+                cuteafd_core::memory_layout::ArenaTag::drafter_weights("glm/draft"))?;
             let drafter = dflash::DflashDrafter::load_ml4_with(&self.library, programs, native, ml4,
                 ml4.logit_softcap as f32, stream, layout, &source, |id, name, bytes| {
                     ensure!(id == device.id, "ML4 draft arena device differs from load binder");
