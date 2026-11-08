@@ -117,6 +117,7 @@ extern "C" int32_t cuteafd_v41_grouped_output_create(void* workspace, uint64_t b
   if (!h) return cudaErrorMemoryAllocation;
   auto status=cudaGetDevice(&h->device);
   if(status!=cudaSuccess) {delete h;return status;}
+  // Third-party residual: cuBLAS/cuBLASLt internal storage; handle ownership is unchanged.
   auto result=CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&h->blas), 0, 0, nullptr);
   if(result!=CUBLAS_STATUS_SUCCESS) {delete h;return blas_status(result);}
   // Prevent reduced-precision intermediate reductions before the final BF16 output.

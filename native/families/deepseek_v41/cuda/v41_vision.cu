@@ -128,6 +128,7 @@ extern "C" int32_t cuteafd_v41_vision_create(void* workspace,uint64_t bytes,void
   if(bytes<workspace_bytes || !valid(workspace,workspace_bytes,256))return cudaErrorInvalidValue;
   auto* h=new(std::nothrow)Handle{};if(!h)return cudaErrorMemoryAllocation;
   auto result=cudaGetDevice(&h->device);if(result){delete h;return result;}
+  // Third-party residual: cuBLAS/cuBLASLt internal storage; handle ownership is unchanged.
   auto s=CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&h->blas), 0, 0, nullptr);if(s){delete h;return status(s);}
   s=cublasSetMathMode(h->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
   if(s){cublasDestroy(h->blas);delete h;return status(s);}
