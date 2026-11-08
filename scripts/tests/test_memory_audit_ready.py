@@ -14,7 +14,8 @@ MIB = 1 << 20
 
 def report(used, tracked, scopes):
     value = {"stage": "coordinator", "devices": [{"device": 0, "tracked": tracked, "peak": tracked, "scopes": scopes,
-                                                  "used": used, "total": 96 << 30, "untracked": used - tracked}],
+                                                  "used": used, "total": 96 << 30, "untracked": used - tracked,
+                                                  "by_kind": {"kinds": scopes, "untagged": 0}}],
              "pinned": {"tracked": 0, "peak": 0, "scopes": {}}, "weights": [], "dual_formats": [], "host": {}}
     return "2026-10-10T00:00:00Z INFO cuteafd::memory: memory ledger report=" + json.dumps(value) + "\n"
 
@@ -263,7 +264,7 @@ def test_glmf_kda_only_pool_backing_uses_the_planners_prefix_scope():
     allocation = source.split("let pool_mark_backing = if pool_mark_unit_bytes > 0 {", 1)[1].split("} else { None };", 1)[0]
     assert 'scope("prefix/KDA-only pool marks")' in allocation.split("Some(zeroed(", 1)[0]
     assert 'pool_pages.checked_mul(pool_mark_unit_bytes)' in allocation
-    assert memory_audit.category("prefix/KDA-only pool marks") == "prefix"
+    assert memory_audit.kind_categories({"kinds": {"prefix": 1}}) == {"prefix": 1}
 
 
 def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
@@ -276,7 +277,7 @@ def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
         assert 'scope_owned(&label)' in parent.split("synchronized_load::load_pair", 1)[0]
         parallel = parent.split("synchronized_load::load_pair", 1)[1]
         assert 'scope_owned(&label)' in parallel.split("Ok(vec![", 1)[0]
-    assert memory_audit.category("experts/TP2 expert layer halves 0..36") == "experts"
+    assert memory_audit.kind_categories({"kinds": {"experts": 1}}) == {"experts": 1}
 
 
 def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
@@ -286,13 +287,13 @@ def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
     scope = 'scope("experts/TP2 FP8 expert layer halves")'
     assert scope in pair.split("Fp8Experts::load_pair", 1)[0]
     assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes,")
-    assert memory_audit.category("experts/TP2 FP8 expert layer halves") == "experts"
+    assert memory_audit.kind_categories({"kinds": {"experts": 1}}) == {"experts": 1}
 
 
 def test_raw_cuda_audit_labels_gb10_reclaimable_cache(capsys):
     scope = "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache; host MemAvailable is allocatable headroom"
     report = {"stage": "ready", "devices": [{"device": 0, "tracked": 0, "peak": 0,
-        "cuda_memory_scope": scope, "scopes": {}}], "host": {"MemAvailable": 45 * 2**30}}
+        "cuda_memory_scope": scope, "scopes": {}, "by_kind": {"kinds": {}, "untagged": 0}}], "host": {"MemAvailable": 45 * 2**30}}
     memory_audit.render("spark.log", memory_audit.summarize(report))
     output = capsys.readouterr().out
     assert scope in output

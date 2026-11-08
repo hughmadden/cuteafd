@@ -156,14 +156,6 @@ impl<'a> Allocation<'a> {
         Ok(Self { device, buffer, backing: None, weight_id: None, arena_registration: None })
     }
 
-    /// Legacy untagged constructor, deleted once every family states a tag.
-    #[track_caller]
-    pub fn untagged(device: Device<'a>, bytes: usize) -> Result<Self> {
-        let _site = cuteafd_ffi::memory_ledger::allocation_site(std::panic::Location::caller());
-        let buffer = device.run(|| device.library.alloc_device_buffer_untagged(bytes))?;
-        Ok(Self { device, buffer, backing: None, weight_id: None, arena_registration: None })
-    }
-
     /// Kind and owner of the physical backing (a view reports its arena's).
     pub fn tag(&self) -> Option<super::Tag> {
         match &self.backing {

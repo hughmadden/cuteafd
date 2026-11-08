@@ -125,7 +125,7 @@ fn pinned_by_label(snapshot: &cuteafd_ffi::memory_ledger::Snapshot)
     use cuteafd_core::memory_layout::Category;
     let mut out = std::collections::BTreeMap::new();
     for row in snapshot.rows.iter().filter(|r| r.key.space == cuteafd_ffi::memory_ledger::Space::Pinned) {
-        let category = row.key.tag.map_or_else(|| Category::of_scope(row.key.scope), |tag| tag.kind.category());
+        let category = row.key.tag.kind.category();
         let entry = out.entry(row.key.scope).or_insert((category, 0));
         entry.1 += row.bytes;
     }

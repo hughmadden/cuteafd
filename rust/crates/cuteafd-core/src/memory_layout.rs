@@ -1,15 +1,15 @@
 //! Per-device memory layout: what the placement planner predicts each
 //! coordinator GPU and Spark rank holds, by category, weight group and
 //! resident format. The same categories label the runtime allocation ledger
-//! (`cuteafd_ffi::memory_ledger` scopes), so a prediction can be checked
+//! (`cuteafd_ffi::memory_ledger` tags), so a prediction can be checked
 //! against what an engine actually allocated (`compare`).
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const GIB: f64 = (1u64 << 30) as f64;
 
-/// What a block of memory is for. Ledger scopes map onto these by their first
-/// path segment (`weights/fp8-pack` -> `Weights`, see [`Category::of_scope`]).
+/// What a block of memory is for. Allocation tags map onto planner categories
+/// through [`MemoryKind::category`]; ledger scopes add context only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
@@ -58,47 +58,7 @@ impl Category {
         }
     }
 
-    /// The planner category of a runtime ledger scope.
-    pub fn of_scope(scope: &str) -> Self {
-        let root = scope.split('/').next().unwrap_or(scope);
-        match root {
-            "weights" => Self::Weights,
-            "embedding" => Self::Embedding,
-            "experts" | "local-experts" => Self::Experts,
-            "drafter" => Self::Drafter,
-            "kv" => Self::Kv,
-            "prefix" => Self::Prefix,
-            "workspace" | "sampler" | "spark-intake" | "probe" => Self::Workspace,
-            "transport" | "peer-split" => Self::Transport,
-            "staging" => Self::Staging,
-            "mapped-table" | "ple" => Self::Tables,
-            "v41" => Self::of_v41_stage(scope),
-            _ => Self::Runtime,
-        }
-    }
 
-    fn of_v41_stage(scope: &str) -> Self {
-        let stage = scope.trim_start_matches("v41/");
-        if stage.starts_with("weights") || stage.contains("weights") && !stage.contains("draft") {
-            if stage.contains("Engram") { Self::Tables } else { Self::Weights }
-        } else if stage.contains("draft") || stage.contains("drafter") {
-            Self::Drafter
-        } else if stage.starts_with("kv") || stage.contains("KV cache") {
-            Self::Kv
-        } else if stage.contains("prefix") || stage.contains("snapshot") {
-            Self::Prefix
-        } else if stage.contains("expert") {
-            Self::Experts
-        } else if stage.contains("transport") || stage.contains("TP2") {
-            Self::Transport
-        } else if stage.contains("engram") {
-            Self::Tables
-        } else if stage.contains("workspace") || stage.contains("lane") || stage.contains("vision") {
-            Self::Workspace
-        } else {
-            Self::Runtime
-        }
-    }
 }
 
 /// What one allocation we make holds. Closed: every device, pinned and
@@ -732,18 +692,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_ledger_roots_have_real_categories() {
-        for (scope, expected) in [
-            ("weights/target", Category::Weights), ("embedding", Category::Embedding),
-            ("experts/onboard", Category::Experts), ("drafter/weights", Category::Drafter),
-            ("drafter/workspace", Category::Drafter), ("kv/pool", Category::Kv),
-            ("prefix/marks", Category::Prefix), ("workspace/lane", Category::Workspace),
-            ("transport/rdma", Category::Transport), ("staging/upload", Category::Staging),
-            ("mapped-table", Category::Tables),
-        ] { assert_eq!(Category::of_scope(scope), expected, "{scope}"); }
-    }
-
-    #[test]
     fn host_admission_charges_future_owners_but_not_resident_bytes_twice() {
         let resident = Item::new(Category::Transport, "transport/rdma-rings", "", 20, Basis::Exact);
         let future = Item::new(Category::Workspace, "scoring/full-logits", "", 10, Basis::Formula)
@@ -882,19 +830,6 @@ mod tests {
             assert_eq!(encoded["lifetime"], serde_json::to_value(lifetime).unwrap());
             assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
         }
-    }
-
-    #[test]
-    fn scopes_map_onto_categories() {
-        assert_eq!(Category::of_scope("weights/dense-nvfp4"), Category::Weights);
-        assert_eq!(Category::of_scope("drafter/workspace"), Category::Drafter);
-        assert_eq!(Category::of_scope("transport/rdma-rings"), Category::Transport);
-        assert_eq!(Category::of_scope("peer-split"), Category::Transport);
-        assert_eq!(Category::of_scope("staging/sync-h2d"), Category::Staging);
-        assert_eq!(Category::of_scope("other"), Category::Runtime);
-        assert_eq!(Category::of_scope("v41/kv"), Category::Kv);
-        assert_eq!(Category::of_scope("v41/draft weights"), Category::Drafter);
-        assert_eq!(Category::of_scope("v41/allocated KV cache"), Category::Kv);
     }
 
     #[test]

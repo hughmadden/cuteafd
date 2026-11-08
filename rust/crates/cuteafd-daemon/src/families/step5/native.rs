@@ -118,15 +118,16 @@ fn read_core<'a>(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoreWeigh
 pub(super) struct NativeScratch<'a> {
     pub(super) scratch: ProjectionScratch<'a>,
     pub(super) layout: ProjectionScratchLayout,
+    tag: crate::shared::memory::Tag,
 }
 impl<'a> NativeScratch<'a> {
-    pub(super) fn allocate(device: Device<'a>, layout: &ProjectionScratchLayout) -> Result<Self> {
+    pub(super) fn allocate(device: Device<'a>, layout: &ProjectionScratchLayout, tag: crate::shared::memory::Tag) -> Result<Self> {
         let owned = ProjectionLayout { extents: layout.extents.clone(), rows: layout.rows };
-        Ok(Self { scratch: owned.allocate(device)?, layout: layout.clone() })
+        Ok(Self { scratch: owned.allocate(device, tag)?, layout: layout.clone(), tag })
     }
     /// A private copy for another concurrently running lane.
     pub(super) fn sibling(&self, device: Device<'a>) -> Result<std::rc::Rc<Self>> {
-        Ok(std::rc::Rc::new(Self::allocate(device, &self.layout)?))
+        Ok(std::rc::Rc::new(Self::allocate(device, &self.layout, self.tag)?))
     }
 }
 

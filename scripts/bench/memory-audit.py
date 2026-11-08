@@ -41,7 +41,7 @@ KIND_CATEGORY = {"weights": "weights", "embedding": "embedding", "experts": "exp
 
 
 def kind_categories(by_kind):
-    """Planner categories from a typed ledger report; legacy untagged bytes stay their own bucket."""
+    """Planner categories from explicit allocation kinds."""
     cats = defaultdict(int)
     for kind, nbytes in by_kind.get("kinds", {}).items():
         cats[KIND_CATEGORY[kind]] += nbytes
@@ -49,36 +49,6 @@ def kind_categories(by_kind):
         cats["untagged"] += by_kind["untagged"]
     return cats
 
-
-def category(scope):
-    """Planner category of a ledger scope (mirrors cuteafd_core::memory_layout::Category::of_scope)."""
-    root = scope.split("/")[0]
-    simple = {"weights": "weights", "embedding": "embedding", "experts": "experts", "local-experts": "experts",
-              "drafter": "drafter", "kv": "kv", "prefix": "prefix", "workspace": "workspace", "sampler": "workspace",
-              "spark-intake": "workspace", "probe": "workspace", "transport": "transport", "peer-split": "transport",
-              "staging": "staging", "mapped-table": "tables", "ple": "tables"}
-    if root in simple:
-        return simple[root]
-    if root == "v41":
-        stage = scope[4:]
-        low = stage.lower()
-        if "draft" in low:
-            return "drafter"
-        if "engram" in low:
-            return "tables"
-        if "weights" in low:
-            return "weights"
-        if low.startswith("kv") or "kv cache" in low:
-            return "kv"
-        if "prefix" in low or "snapshot" in low:
-            return "prefix"
-        if "expert" in low:
-            return "experts"
-        if "transport" in low or "tp2" in low:
-            return "transport"
-        if "workspace" in low or "lane" in low or "vision" in low:
-            return "workspace"
-    return "runtime"
 
 
 def group(stem):
@@ -118,16 +88,10 @@ def summarize(report):
         weights[(space, device, group(tensor), fmt or "native")] += nbytes
     for dev in report.get("devices", []):
         entry = dict(dev)
-        if "by_kind" in dev:
-            # Typed ledger: each allocation stated its kind; scopes are context only.
-            cats = kind_categories(dev["by_kind"])
-            for space in ("managed_by_kind",):
-                for name, nbytes in kind_categories(dev.get(space, {})).items():
-                    cats[name] += nbytes
-        else:
-            cats = defaultdict(int)
-            for scope, nbytes in dev.get("scopes", {}).items():
-                cats[category(scope)] += nbytes
+        # Every current report carries kinds; scopes never determine a category.
+        cats = kind_categories(dev["by_kind"])
+        for name, nbytes in kind_categories(dev.get("managed_by_kind", {})).items():
+            cats[name] += nbytes
         cats["runtime"] += max(dev.get("untracked", 0), 0)
         entry["categories"] = dict(cats)
         entry["weights"] = {f"{g}/{f}": b for (s, d, g, f), b in sorted(weights.items())

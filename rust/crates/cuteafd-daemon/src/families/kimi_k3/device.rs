@@ -414,7 +414,7 @@ impl LaneLayout {
                     "Kimi allocated lane operand {name} differs from admitted extent/device");
                 Ok((*name, allocation))
             }).collect::<Result<BTreeMap<_, _>>>()?;
-        let core = self.core.as_ref().map(|layout| layout.allocate(device)).transpose()?;
+        let core = self.core.as_ref().map(|layout| layout.allocate(device, Tag::workspace("kimi/lane-projection"))).transpose()?;
         let lane = Lane { stream, operands, arena: Some(arena), layout: self.clone(), window: None, metadata_bank: 0, core };
         lane.prime_attention()?;
         Ok(lane)

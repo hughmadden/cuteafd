@@ -91,20 +91,7 @@ impl<'a> DeviceAllocation<'a> {
         Ok(Self { library, buffer: library.alloc_device_buffer(bytes, tag)?, backing: None })
     }
 
-    /// Legacy untagged constructor, deleted once every family states a tag.
-    #[track_caller]
-    pub(crate) fn untagged(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        Ok(Self { library, buffer: library.alloc_device_buffer_untagged(bytes)?, backing: None })
-    }
-
-    /// Legacy scope-labelled untagged constructor, deleted with [`Self::untagged`].
-    #[track_caller]
-    pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope(scope);
-        Self::untagged(library, bytes)
-    }
-
-    /// Kind and owner as the ledger recorded them (`None` for legacy owners).
+    /// Kind and owner as the ledger recorded them (`None` for empty backing).
     pub(crate) fn tag(&self) -> Option<Tag> {
         match &self.backing { Some(allocation) => allocation.tag(), None => self.tag_of_buffer() }
     }
@@ -135,19 +122,6 @@ impl<'a> HostAllocation<'a> {
     #[track_caller]
     pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, tag: Tag) -> Result<Self> {
         Self::zeroed(library, library.alloc_host_buffer(bytes, tag)?, bytes)
-    }
-
-    /// Legacy untagged constructor, deleted once every family states a tag.
-    #[track_caller]
-    pub(crate) fn untagged(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        Self::zeroed(library, library.alloc_host_buffer_untagged(bytes)?, bytes)
-    }
-
-    /// Legacy scope-labelled untagged constructor, deleted with [`Self::untagged`].
-    #[track_caller]
-    pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope(scope);
-        Self::untagged(library, bytes)
     }
 
     fn zeroed(library: &'a NativeLibrary, buffer: CuteafdHostBuffer, bytes: usize) -> Result<Self> {

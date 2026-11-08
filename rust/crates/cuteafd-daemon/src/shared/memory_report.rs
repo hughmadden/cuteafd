@@ -62,7 +62,7 @@ pub(crate) fn report(stage: &str) -> Value {
     report_snapshot(stage, &memory_ledger::snapshot(), &memory_ledger::fault::device_memory)
 }
 
-/// Bytes by memory kind, plus the legacy untagged bytes the census requires to be zero.
+/// Bytes by memory kind, plus the zero untagged counter required by the census.
 fn kinds(snapshot: &memory_ledger::Snapshot, space: Space, device: i32) -> Value {
     let (kinds, untagged) = snapshot.by_kind(space, device);
     json!({"kinds": kinds.into_iter().map(|(kind, bytes)| (kind.label(), bytes)).collect::<BTreeMap<_, _>>(),

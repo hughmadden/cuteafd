@@ -200,7 +200,7 @@ impl DenseFacts<'_> {
             Lifetime::TARGET, Category::Staging, "ordered GDN commit staging");
         for (index, bytes) in self.buffers.verify.into_iter().enumerate() {
             add(format!("verify.{index}"), gpu, bytes as u64, Lifetime::TARGET,
-                Category::Workspace, "block verify marks, logits and taps");
+                if index == 0 { Category::Kv } else { Category::Workspace }, "block verify marks, logits and taps");
         }
         let layers = self.cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
         let conv_slot = ((self.cfg.gdn.conv_kernel - 1) * self.cfg.gdn.conv_width() * 2) as u64;

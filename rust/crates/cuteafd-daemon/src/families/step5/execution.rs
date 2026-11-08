@@ -163,7 +163,7 @@ impl<'a> NativeOwners<'a> {
                 // The arena holds attention and FFN regions; the native scratch is its own admitted owner.
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes,
                     Tag::workspace("step5/target-scratch"))?;
-                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout)
+                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout, crate::shared::memory::Tag::workspace("step5/native-projection"))
                     .map(Rc::new)).transpose()?;
                 let rope = Rc::new(TargetTables::load_in(device, programs, &contract, super::weights::ROPE_PREFIX,
                     available[rank], &[], Some(&weight_arenas[rank]))?);

@@ -226,7 +226,7 @@ impl<'a> NativeDraft<'a> {
             let scratch = {
                 let _scope = cuteafd_ffi::memory_ledger::scope("drafter/kimi K6 head scratch");
                 crate::shared::dense_trellis::ProjectionLayout::new(&projection.program, rows)?
-                    .allocate(self.target_streams[head].device)?
+                    .allocate(self.target_streams[head].device, Tag::drafter_workspace("kimi/draft-head-projection"))?
             };
             self.k6_head = Some((projection, scratch));
         } else {

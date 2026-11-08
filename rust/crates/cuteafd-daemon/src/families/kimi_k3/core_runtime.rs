@@ -239,7 +239,7 @@ mod runtime_layout_tests {
         for rows in [1,16,63,64,4096] {
             let planned=ProjectionScratchLayout::new(128,256,rows)?;
             let layout=ProjectionLayout{extents:planned.extents.clone(),rows};
-            let scratch=layout.allocate(device)?;
+            let scratch=layout.allocate(device, crate::shared::memory::Tag::workspace("kimi/native-projection"))?;
             assert_eq!(layout.demand(0,"Kimi K6 projection scratch")?.bytes as usize,
                 scratch._owners.values().map(|owner|owner.buffer.bytes).sum::<usize>());
             assert_eq!(layout.bytes()?,planned.bytes()?);

@@ -197,7 +197,7 @@ pub(crate) fn install(library: &libloading::Library) {
     }
 }
 /// A native event names the tag native allocated under; the owner is copied
-/// (interned) here, never retained. Kind 0 or no owner is an untagged native site.
+/// (interned) here, never retained. Invalid tags violate the bundled native ABI.
 extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released: i32, file: *const c_char, line: i32,
     kind: u32, owner: *const c_char) {
     let _ = std::panic::catch_unwind(|| {
@@ -210,6 +210,12 @@ extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released:
         } }
         let tag = MemoryKind::from_raw(kind).zip((!owner.is_null()).then(|| native_text(owner)))
             .filter(|(_, owner)| !owner.is_empty()).map(|(kind, owner)| super::tag(kind, &owner));
+        let Some(tag) = tag else {
+            // A callback cannot return an error. Never hide owned backing by
+            // silently discarding a malformed native allocation event.
+            eprintln!("invalid native allocation tag at {}:{line}: kind={kind}", native_text(file));
+            std::process::abort();
+        };
         super::record_native_alloc(space, device, address, bytes, &format!("{}:{line}", native_text(file)), tag);
     });
 }
@@ -306,13 +312,13 @@ impl Serialize for LiveRows<'_> {
         for (address, live) in &self.0.live {
             #[derive(Serialize)]
             struct Row<'a> { address: Hex, bytes: usize, device: i32, space: &'a str, scope: &'a str,
-                kind: Option<MemoryKind>, component: Option<&'a str>,
+                kind: MemoryKind, component: &'a str,
                 category: Category, owner: Option<&'a str>, tensor: Option<&'a str>, tensor_stem: Option<&'a str>,
                 format: Option<&'a str>, site: DisplayValue<&'a std::panic::Location<'static>>, native_site: Option<&'a str> }
             seq.serialize_element(&Row { address: Hex(*address), bytes: live.bytes,
                 device: live.key.device, space: live.key.space.label(), scope: live.key.scope,
-                kind: live.key.tag.map(|tag| tag.kind), component: live.key.tag.map(|tag| tag.owner),
-                category: live.key.tag.map_or_else(|| Category::of_scope(live.key.scope), |tag| tag.kind.category()),
+                kind: live.key.tag.kind, component: live.key.tag.owner,
+                category: live.key.tag.kind.category(),
                 owner: live.key.owner, tensor: live.name,
                 tensor_stem: live.key.tensor, format: live.key.format, site: DisplayValue(live.site), native_site: live.native_site })?;
         }

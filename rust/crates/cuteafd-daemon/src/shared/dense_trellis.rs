@@ -221,12 +221,12 @@ impl ProjectionLayout {
     pub(crate) fn demand(&self,device:u8,name:&str)->Result<Demand> {
         Ok(Demand::new(device,Category::Workspace,name,self.bytes()? as u64,Basis::Exact))
     }
-    pub(crate) fn allocate<'a>(&self,device:Device<'a>)->Result<ProjectionScratch<'a>> {
+    pub(crate) fn allocate<'a>(&self,device:Device<'a>,tag:Tag)->Result<ProjectionScratch<'a>> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/native-projection");
         let storage=ProjectionScratchLayout {
             extents:self.extents.clone(),rows:self.rows }.storage()?;
         let mut owners=BTreeMap::new();
-        for (&name,&bytes) in &storage.owners {owners.insert(name,Allocation::new(device,bytes, Tag::workspace("shared/native-projection"))?);}
+        for (&name,&bytes) in &storage.owners {owners.insert(name,Allocation::new(device,bytes,tag)?);}
         let mut buffers=BTreeMap::new();
         for (&name,&bytes) in &self.extents {
             let buffer=if let Some(&offset)=storage.route_offsets.get(name) {

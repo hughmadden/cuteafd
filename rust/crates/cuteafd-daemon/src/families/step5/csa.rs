@@ -554,7 +554,7 @@ impl<'a> CsaLayer<'a> {
             (None, _) => None,
             (Some(_), Some(shared)) => Some(shared),
             (Some(native), None) => Some(std::rc::Rc::new(super::native::NativeScratch::allocate(device,
-                &native.scratch_layout(rows.min(4096))?)?)),
+                &native.scratch_layout(rows.min(4096))?, crate::shared::memory::Tag::workspace("step5/native-projection"))?)),
         };
         Ok(owner)
     }

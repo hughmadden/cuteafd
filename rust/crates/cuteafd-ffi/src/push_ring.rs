@@ -246,7 +246,7 @@ mod tests {
         let address = ring.payload(0, 0, 1)?.ptr as usize;
         assert_eq!(memory_ledger::tag_of(address), Some(tag));
         let host = |snapshot: &memory_ledger::Snapshot| snapshot.rows.iter()
-            .filter(|row| row.key.space == Space::Host && row.key.tag == Some(tag)).map(|row| row.bytes).sum::<usize>();
+            .filter(|row| row.key.space == Space::Host && row.key.tag == tag).map(|row| row.bytes).sum::<usize>();
         assert_eq!(host(&memory_ledger::snapshot()), 8192);
         drop(ring);
         assert_eq!(host(&memory_ledger::snapshot()), 0);

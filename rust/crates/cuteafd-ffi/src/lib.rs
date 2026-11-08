@@ -1170,11 +1170,6 @@ impl Default for CuteafdRdmaRcCompletionStats {
     }
 }
 
-/// Native validation needs a tag even on the legacy path; the ledger records
-/// these allocations as untagged (`Key::tag == None`), never as this tag.
-const LEGACY_UNTAGGED: memory_ledger::Tag =
-    memory_ledger::Tag::new(memory_ledger::MemoryKind::Workspace, "legacy/untagged");
-
 type VersionFn = unsafe extern "C" fn(out: *mut c_char, out_len: usize) -> CuteafdStatus;
 type AllocHostBufferFn = unsafe extern "C" fn(bytes: usize, out: *mut CuteafdHostBuffer,
     kind: u32, owner: *const c_char) -> CuteafdStatus;
@@ -2399,20 +2394,14 @@ impl NativeLibrary {
     /// Pinned, device-mapped host memory holding `tag`.
     #[track_caller]
     pub fn alloc_host_buffer(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdHostBuffer> {
-        self.alloc_host_buffer_with(bytes, Some(tag))
-    }
-
-    /// Legacy untagged entry point; removed once every caller states a tag.
-    #[track_caller]
-    pub fn alloc_host_buffer_untagged(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
-        self.alloc_host_buffer_with(bytes, None)
+        self.alloc_host_buffer_with(bytes, tag)
     }
 
     #[track_caller]
-    fn alloc_host_buffer_with(&self, bytes: usize, tag: Option<memory_ledger::Tag>) -> Result<CuteafdHostBuffer> {
+    fn alloc_host_buffer_with(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdHostBuffer> {
         let _failure_boundary = memory_ledger::fault::boundary();
         let alloc_fn: AllocHostBufferFn = self.cuteafd_alloc_host_buffer()?;
-        let (kind, owner) = native_tag(tag.unwrap_or(LEGACY_UNTAGGED))?;
+        let (kind, owner) = native_tag(tag)?;
         let mut buffer = CuteafdHostBuffer::default();
         // SAFETY: the output and owner string live through this synchronous call.
         let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
@@ -2631,7 +2620,7 @@ impl NativeLibrary {
     /// ```
     #[track_caller]
     pub fn alloc_device_buffer(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdDeviceBuffer> {
-        self.alloc_device_buffer_with(bytes, Some(tag))
+        self.alloc_device_buffer_with(bytes, tag)
     }
 
     /// The tag this thread last asked a native allocator for, whether or not
@@ -2657,18 +2646,12 @@ impl NativeLibrary {
         Ok(Some(memory_ledger::tag(kind, owner)))
     }
 
-    /// Legacy untagged entry point; removed once every caller states a tag.
     #[track_caller]
-    pub fn alloc_device_buffer_untagged(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
-        self.alloc_device_buffer_with(bytes, None)
-    }
-
-    #[track_caller]
-    fn alloc_device_buffer_with(&self, bytes: usize, tag: Option<memory_ledger::Tag>) -> Result<CuteafdDeviceBuffer> {
+    fn alloc_device_buffer_with(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdDeviceBuffer> {
         let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocDeviceBufferFn = self.cuteafd_alloc_device_buffer()?;
-        let (kind, owner) = native_tag(tag.unwrap_or(LEGACY_UNTAGGED))?;
+        let (kind, owner) = native_tag(tag)?;
         let mut buffer = CuteafdDeviceBuffer::default();
         // SAFETY: the output and owner string live through this synchronous call.
         let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
@@ -2688,7 +2671,7 @@ impl NativeLibrary {
         // SAFETY: the output and owner string live through this synchronous call.
         let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
         self.status_to_result("cuteafd_alloc_managed_device_buffer", status)?;
-        memory_ledger::record_alloc(memory_ledger::Space::Managed, buffer.device_id, buffer.ptr as usize, buffer.bytes, Some(tag));
+        memory_ledger::record_alloc(memory_ledger::Space::Managed, buffer.device_id, buffer.ptr as usize, buffer.bytes, tag);
         Ok(buffer)
     }
 

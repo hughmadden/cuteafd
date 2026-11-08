@@ -158,7 +158,7 @@ mod tests {
         for (rows, topk, lanes) in [(u64::MAX, 8, 3), (64, u64::MAX, 3), (64, 8, u64::MAX)] {
             assert!(route_exchange_bytes(rows, topk, lanes).is_err());
         }
-        assert_eq!(cuteafd_core::memory_layout::Category::of_scope("peer-split"), Category::Transport);
+        assert_eq!(cuteafd_core::memory_layout::Tag::transport("test/peer-split").kind.category(), Category::Transport);
     }
 
     #[test]

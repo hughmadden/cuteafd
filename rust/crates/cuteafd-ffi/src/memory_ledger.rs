@@ -12,7 +12,7 @@
 pub mod fault;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use cuteafd_core::memory_layout::{MemoryKind, Tag};
@@ -70,9 +70,8 @@ struct Live {
 pub struct Key {
     pub space: Space,
     pub device: i32,
-    /// What the allocation is, stated at its constructor. `None` only for the
-    /// legacy untagged constructors that the typed-tag fan-out is deleting.
-    pub tag: Option<Tag>,
+    /// What the allocation is, required at every constructor.
+    pub tag: Tag,
     /// Innermost context scope; the tag's owner when no scope is open.
     pub scope: &'static str,
     /// The enclosing accounting [`owner`] guard, if any: what plan == runtime
@@ -98,7 +97,6 @@ struct State {
     post_ready_bytes: usize,
     post_ready_sites: BTreeMap<&'static std::panic::Location<'static>, usize>,
     post_ready_native_sites: BTreeMap<&'static str, usize>,
-    untagged_sites: HashSet<&'static std::panic::Location<'static>>,
 }
 
 /// An actual native allocation, before aggregation removes pointer identity.
@@ -315,14 +313,14 @@ impl Drop for AllocationSite {
     }
 }
 
-fn current_key(space: Space, device: i32, tag: Option<Tag>) -> (Key, Option<&'static str>) {
+fn current_key(space: Space, device: i32, tag: Tag) -> (Key, Option<&'static str>) {
     CONTEXT.with(|context| {
         let context = context.borrow();
         (Key {
             space,
             device,
             tag,
-            scope: context.scopes.last().copied().or(tag.map(|tag| tag.owner)).unwrap_or("other"),
+            scope: context.scopes.last().copied().unwrap_or(tag.owner),
             owner: context.owner,
             tensor: context.tensor,
             format: context.format,
@@ -359,7 +357,7 @@ impl MediaTags {
 /// Retire it with [`record_released`] only after the native free succeeded.
 #[track_caller]
 pub fn record_tagged(space: Space, device: i32, ptr: usize, bytes: usize, tag: Tag) {
-    record_backing(space, device, ptr, bytes, None, None, Some(tag));
+    record_backing(space, device, ptr, bytes, None, None, tag);
 }
 
 /// Retires backing recorded by [`record_tagged`] after its native free succeeded.
@@ -368,26 +366,25 @@ pub fn record_released(ptr: usize) {
 }
 
 #[track_caller]
-pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize, tag: Option<Tag>) {
+pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize, tag: Tag) {
     record_backing(space, device, ptr, bytes, None, None, tag);
 }
 
 #[track_caller]
 pub(crate) fn record_endpoint_alloc(space: Space, ptr: usize, bytes: usize, endpoint: usize, tag: Tag) {
-    record_backing(space, -1, ptr, bytes, Some(endpoint), None, Some(tag));
+    record_backing(space, -1, ptr, bytes, Some(endpoint), None, tag);
 }
 
 /// A backing native allocated internally and reported through its event
-/// callback, with the tag native allocated it under (`None` only for a
-/// native site that has not yet been given one).
+/// callback, with the tag native allocated it under.
 #[track_caller]
-pub(crate) fn record_native_alloc(space: Space, device: i32, ptr: usize, bytes: usize, site: &str, tag: Option<Tag>) {
+pub(crate) fn record_native_alloc(space: Space, device: i32, ptr: usize, bytes: usize, site: &str, tag: Tag) {
     record_backing(space, device, ptr, bytes, None, Some(intern(site)), tag);
 }
 
 #[track_caller]
 fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint: Option<usize>,
-    native_site: Option<&'static str>, tag: Option<Tag>) {
+    native_site: Option<&'static str>, tag: Tag) {
     if ptr == 0 || bytes == 0 {
         return;
     }
@@ -408,8 +405,6 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
             return;
         }
     } }
-    let warn = key.tag.is_none() && matches!(space, Space::Device | Space::Pinned | Space::Managed)
-        && state.untagged_sites.insert(site);
     if let (Some(name), Some(format)) = (name, key.format) {
         if !format.ends_with("scale") {
             let formats = state.formats.entry((device, name)).or_default();
@@ -452,11 +447,6 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
         tracing::info!(target: "cuteafd::memory", %site, bytes, post_ready_bytes,
             native_site, scope = key.scope, "post-ready growth");
     }
-    if warn {
-        tracing::warn!(target: "cuteafd::memory", %site, owner = key.owner,
-            tensor = key.tensor, name, bytes, device, space = space.label(),
-            "untagged native allocation");
-    }
 }
 
 fn release(state: &mut State, live: Live) {
@@ -478,9 +468,9 @@ pub fn allocation_sites() -> BTreeMap<usize, &'static std::panic::Location<'stat
         .map(|(&address, live)| (address, live.site)).collect()
 }
 
-/// The tag a live backing was recorded with (`None`: not live, or legacy untagged).
+/// The tag a live backing was recorded with (`None`: not live).
 pub fn tag_of(ptr: usize) -> Option<Tag> {
-    state().lock().unwrap_or_else(|e| e.into_inner()).live.get(&ptr).and_then(|live| live.key.tag)
+    state().lock().unwrap_or_else(|e| e.into_inner()).live.get(&ptr).map(|live| live.key.tag)
 }
 
 /// Read one live-byte counter without cloning the allocation ledger.
@@ -512,26 +502,6 @@ pub(crate) fn record_endpoint_free(endpoint: usize) {
         audit_event(&mut state, AllocationEvent::Freed(AllocationRecord {
             address, key: live.key, bytes: live.bytes, endpoint: live.endpoint,
         }));
-    }
-}
-
-/// Moves every live allocation still labelled `other` to `label`: stage
-/// checkpoints use it to name everything allocated since the previous one
-/// without scoping each allocation site.
-pub fn relabel_other(label: &'static str) {
-    let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-    let moved: Vec<(usize, Live)> = state.live.iter().filter(|(_, live)| live.key.scope == "other")
-        .map(|(&ptr, &live)| (ptr, live)).collect();
-    for (ptr, live) in moved {
-        release(&mut state, live);
-        let key = Key { scope: label, ..live.key };
-        let total = state.totals.entry(key).or_default();
-        total.0 += live.bytes;
-        total.1 += 1;
-        if let Some(current) = state.current.get_mut(&(key.space, key.device)) {
-            *current += live.bytes;
-        }
-        state.live.insert(ptr, Live { key, ..live });
     }
 }
 
@@ -575,17 +545,14 @@ impl Snapshot {
         out
     }
 
-    /// Bytes by [`MemoryKind`] for one pool and device, plus the bytes of
-    /// legacy untagged allocations (zero once every constructor takes a tag).
+    /// Bytes by kind. The census's untagged counter is always zero: a live
+    /// backing cannot enter the ledger without a tag.
     pub fn by_kind(&self, space: Space, device: i32) -> (BTreeMap<MemoryKind, usize>, usize) {
-        let (mut kinds, mut untagged) = (BTreeMap::new(), 0);
+        let mut kinds = BTreeMap::new();
         for row in self.rows.iter().filter(|r| r.key.space == space && r.key.device == device) {
-            match row.key.tag {
-                Some(tag) => *kinds.entry(tag.kind).or_default() += row.bytes,
-                None => untagged += row.bytes,
-            }
+            *kinds.entry(row.key.tag.kind).or_default() += row.bytes;
         }
-        (kinds, untagged)
+        (kinds, 0)
     }
 
     /// Bytes by [`owner`] tag for one pool and device (untagged rows omitted).
@@ -758,7 +725,7 @@ mod tests {
         let _ledger = test_guard();
         let address = 0x7600_0000_0000usize;
         let _scope = scope("workspace/failure-fixture");
-        record_alloc(Space::Device, 31, address, 512, None);
+        record_alloc(Space::Device, 31, address, 512, TEST);
         let error = capture_failure(anyhow::anyhow!("native fixture error"));
         record_free(address);
         let saved = error.downcast_ref::<FailureSnapshot>().unwrap();
@@ -787,64 +754,11 @@ mod tests {
     }
 
     #[test]
-    fn untagged_allocations_report_distinct_sites_once() {
-        use tracing::{Event, Metadata, Subscriber, span::{Attributes, Id, Record}};
-        #[derive(Clone, Default)]
-        struct Warnings(Arc<Mutex<Vec<String>>>);
-        impl Subscriber for Warnings {
-            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
-            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
-            fn record(&self, _: &Id, _: &Record<'_>) {}
-            fn record_follows_from(&self, _: &Id, _: &Id) {}
-            fn enter(&self, _: &Id) {}
-            fn exit(&self, _: &Id) {}
-            fn event(&self, event: &Event<'_>) {
-                struct Fields(String);
-                impl tracing::field::Visit for Fields {
-                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                        self.0.push_str(&format!("{}={value:?};", field.name()));
-                    }
-                }
-                let mut fields = Fields(String::new());
-                event.record(&mut fields);
-                if event.metadata().level() == &tracing::Level::WARN {
-                    // A subscriber may inspect allocations while handling the warning.
-                    let ledger = state().try_lock().expect("warning emitted under the ledger lock");
-                    assert!(ledger.live.values().any(|live| live.key.owner == Some("unscoped-fixture")));
-                    drop(ledger);
-                    self.0.lock().unwrap().push(fields.0);
-                }
-            }
-        }
-        let _ledger = test_guard();
-        let warnings = Warnings::default();
-        let _owner = owner("unscoped-fixture");
-        tracing::subscriber::with_default(warnings.clone(), || {
-            for address in [0x7700_0000_0000, 0x7700_0000_0001] {
-                record_alloc(Space::Device, 32, address, 32, None);
-                record_free(address);
-            }
-            record_alloc(Space::Pinned, -1, 0x7700_0000_0002, 64, None);
-            record_free(0x7700_0000_0002);
-            let _scope = scope("workspace/fixture");
-            record_alloc(Space::Device, 32, 0x7700_0000_0003, 32, Some(Tag::new(MemoryKind::Workspace, "test/fixture")));
-            record_free(0x7700_0000_0003);
-        });
-        let warnings = warnings.0.lock().unwrap();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings.iter().all(|message| message.contains("untagged native allocation")
-            && message.contains("unscoped-fixture") && message.contains(file!())));
-        let sites = warnings.iter().map(|message| message.split("site=").nth(1).unwrap()
-            .split(';').next().unwrap()).collect::<std::collections::HashSet<_>>();
-        assert_eq!(sites.len(), 2, "warnings must identify distinct allocation sites");
-    }
-
-    #[test]
     fn endpoint_enrichment_preserves_native_site_growth_and_allocation_history() {
         let _guard = test_guard();
         let address = 0x7990_0000_0000;
         let audit = AllocationAudit::begin();
-        record_native_alloc(Space::Host, -1, address, 64, "native-ring.cc:99", None);
+        record_native_alloc(Space::Host, -1, address, 64, "native-ring.cc:99", TEST);
         let growth = state().lock().unwrap().post_ready_bytes;
         {
             let _scope = scope("transport/rdma-rings");
@@ -865,25 +779,24 @@ mod tests {
     }
 
     #[test]
-    fn tags_name_the_kind_and_untagged_bytes_are_counted_apart() {
+    fn tags_name_the_kind_independently_of_scope() {
         let _ledger = test_guard();
         let base = 0x7800_0000_0000usize;
         let kv = tag(MemoryKind::Kv, &format!("test/kv-{}", 3));
         {
             // Context scopes refine the label but never the kind.
             let _scope = scope("weights/misleading-context");
-            record_alloc(Space::Device, 41, base, 4096, Some(kv));
+            record_alloc(Space::Device, 41, base, 4096, kv);
         }
-        record_alloc(Space::Device, 41, base + 1, 512, Some(Tag::new(MemoryKind::Workspace, "test/lane")));
-        record_alloc(Space::Device, 41, base + 2, 7, None);
+        record_alloc(Space::Device, 41, base + 1, 512, Tag::new(MemoryKind::Workspace, "test/lane"));
         record_tagged(Space::Device, 41, base + 3, 256, Tag::new(MemoryKind::Weights, "test/media"));
         let snap = snapshot();
         let (kinds, untagged) = snap.by_kind(Space::Device, 41);
         assert_eq!(kinds.into_iter().collect::<Vec<_>>(),
             [(MemoryKind::Weights, 256), (MemoryKind::Kv, 4096), (MemoryKind::Workspace, 512)]);
-        assert_eq!(untagged, 7);
-        let row = snap.rows.iter().find(|r| r.key.device == 41 && r.key.tag == Some(kv)).unwrap();
-        assert_eq!((row.key.scope, row.key.tag.unwrap().owner), ("weights/misleading-context", "test/kv-3"));
+        assert_eq!(untagged, 0);
+        let row = snap.rows.iter().find(|r| r.key.device == 41 && r.key.tag == kv).unwrap();
+        assert_eq!((row.key.scope, row.key.tag.owner), ("weights/misleading-context", "test/kv-3"));
         let lane = snap.rows.iter().find(|r| r.key.device == 41 && r.bytes == 512).unwrap();
         assert_eq!(lane.key.scope, "test/lane", "an unscoped tagged allocation is labelled by its owner");
         for ptr in base..base + 3 { record_free(ptr); }
@@ -898,15 +811,15 @@ mod tests {
     fn tag_owner_is_not_an_accounting_owner() {
         let _ledger = test_guard();
         let base = 0x7900_0000_0000usize;
-        record_alloc(Space::Device, 42, base, 64, Some(Tag::workspace("test/component")));
+        record_alloc(Space::Device, 42, base, 64, Tag::workspace("test/component"));
         {
             let _owner = owner("test/accounting");
-            record_alloc(Space::Device, 42, base + 1, 128, Some(Tag::workspace("test/component")));
+            record_alloc(Space::Device, 42, base + 1, 128, Tag::workspace("test/component"));
         }
         let snap = snapshot();
         assert_eq!(snap.by_owner(Space::Device, 42).into_iter().collect::<Vec<_>>(), [("test/accounting", 128)]);
         let rows = snap.rows.iter().filter(|r| r.key.device == 42).collect::<Vec<_>>();
-        assert!(rows.iter().all(|r| r.key.tag.unwrap().owner == "test/component"));
+        assert!(rows.iter().all(|r| r.key.tag.owner == "test/component"));
         assert_eq!(rows.iter().filter(|r| r.key.owner.is_none()).map(|r| r.bytes).sum::<usize>(), 64);
         record_free(base);
         record_free(base + 1);
@@ -916,16 +829,16 @@ mod tests {
     fn startup_history_preserves_transients_reuse_and_initial_owners() {
         let _ledger = test_guard();
         let base = 0x7300_0000_0000usize;
-        record_alloc(Space::Pinned, -1, base, 64, None);
+        record_alloc(Space::Pinned, -1, base, 64, TEST);
         let audit = AllocationAudit::begin();
         let position = audit.checkpoint();
         let (sample_position, live) = audit.checkpoint_allocations();
         assert_eq!(sample_position, position);
         assert!(live.iter().any(|r| r.address == base && r.bytes == 64));
-        record_alloc(Space::Device, 17, base + 1, 128, None);
+        record_alloc(Space::Device, 17, base + 1, 128, TEST);
         record_free(base + 1);
-        record_alloc(Space::Device, 17, base + 1, 256, None);
-        record_alloc(Space::Device, 17, base + 1, 512, None);
+        record_alloc(Space::Device, 17, base + 1, 256, TEST);
+        record_alloc(Space::Device, 17, base + 1, 512, TEST);
         record_free(base + 1);
         let history = audit.finish();
         assert!(history.initial.iter().any(|r| r.address == base && r.bytes == 64));
@@ -936,7 +849,7 @@ mod tests {
                 | AllocationEvent::Enriched(r) | AllocationEvent::UnobservedRelease(r) => r.address == base + 1,
         }).copied().collect::<Vec<_>>();
         let record = |bytes| AllocationRecord { address: base + 1, bytes, endpoint: None,
-            key: Key { space: Space::Device, device: 17, tag: None, scope: "other",
+            key: Key { space: Space::Device, device: 17, tag: TEST, scope: TEST.owner,
                 owner: None, tensor: None, format: None } };
         assert_eq!(events, [AllocationEvent::Allocated(record(128)),
             AllocationEvent::Freed(record(128)), AllocationEvent::Allocated(record(256)),
@@ -953,7 +866,7 @@ mod tests {
         drop(audit);
         assert!(events.upgrade().is_none());
         let base = 0x7400_0000_0000usize;
-        record_alloc(Space::Managed, 18, base, 32, None);
+        record_alloc(Space::Managed, 18, base, 32, TEST);
         let live = allocations();
         assert!(live.iter().any(|r| r.address == base && r.key.space == Space::Managed
             && r.key.device == 18 && r.bytes == 32));
@@ -970,18 +883,18 @@ mod tests {
             tensor("model.layers.3.self_attn.o_proj.weight");
             {
                 let _fp8 = format("fp8");
-                record_alloc(Space::Device, 9, base, 1000, None);
+                record_alloc(Space::Device, 9, base, 1000, TEST);
                 let _scale = format("fp8-scale");
-                record_alloc(Space::Device, 9, base + 1, 10, None);
+                record_alloc(Space::Device, 9, base + 1, 10, TEST);
             }
             let _bf16 = format("bf16");
-            record_alloc(Space::Device, 9, base + 2, 2000, None);
+            record_alloc(Space::Device, 9, base + 2, 2000, TEST);
         }
-        record_alloc(Space::Device, 9, base + 3, 5, None);
+        record_alloc(Space::Device, 9, base + 3, 5, TEST);
         let snap = snapshot();
         let scopes = snap.by_scope(Space::Device, 9);
         assert_eq!(scopes["test/weights"], 3010);
-        assert_eq!(scopes["other"], 5);
+        assert_eq!(scopes[TEST.owner], 5);
         let dual = snap.dual_formats();
         assert_eq!(dual, vec![(9, "model.layers.3.self_attn.o_proj.weight", vec!["fp8", "bf16"])]);
         for ptr in base..base + 4 {
@@ -1000,13 +913,13 @@ mod tests {
         {
             let _owner = owner("test/lanes/head");
             let _outer = scope("test/lanes/head");
-            record_alloc(Space::Device, 11, base, 100, None);
+            record_alloc(Space::Device, 11, base, 100, TEST);
             {
                 let _inner = scope("test/sampler");
-                record_alloc(Space::Device, 11, base + 1, 20, None);
+                record_alloc(Space::Device, 11, base + 1, 20, TEST);
             }
         }
-        record_alloc(Space::Device, 11, base + 2, 3, None);
+        record_alloc(Space::Device, 11, base + 2, 3, TEST);
         let snap = snapshot();
         assert_eq!(snap.by_owner(Space::Device, 11).into_iter().collect::<Vec<_>>(), vec![("test/lanes/head", 120)]);
         assert_eq!(snap.by_scope(Space::Device, 11)["test/sampler"], 20);

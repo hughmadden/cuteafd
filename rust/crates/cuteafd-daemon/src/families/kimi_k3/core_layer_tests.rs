@@ -85,7 +85,7 @@ impl Source {
         let loaded=layout.pack(module,|name|read(&path,name))?;
         let weights=layout.upload(device,loaded)?;
         let program=device.run(||Projection::load(programs,shape,&self.book,rows,TrellisDType::Bf16))?;
-        let scratch=ProjectionLayout::new(&program.program,rows)?.allocate(device)?;
+        let scratch=ProjectionLayout::new(&program.program,rows)?.allocate(device, crate::shared::memory::TEST)?;
         Ok(OwnedProjection{program,weights,scratch})
     }
 }

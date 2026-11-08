@@ -332,10 +332,10 @@ fn arena_views_inherit_one_backing_tag() -> Result<()> {
     // The audit sees every thread; this test's owner is unique to it.
     let backings = history.events[start..].iter().filter_map(|event| match event {
         memory_ledger::AllocationEvent::Allocated(record)
-            if record.key.tag.is_some_and(|tag| tag.owner == "test/kv-arena") => Some(*record),
+            if record.key.tag.owner == "test/kv-arena" => Some(*record),
         _ => None }).collect::<Vec<_>>();
     assert_eq!(backings.len(), 1, "an arena records exactly one backing: {backings:?}");
-    assert_eq!(backings[0].key.tag, Some(memory_ledger::Tag::kv("test/kv-arena")));
+    assert_eq!(backings[0].key.tag, memory_ledger::Tag::kv("test/kv-arena"));
     assert_eq!(backings[0].bytes, arena.layout().bytes());
     for view in &views {
         assert_eq!(view.tag(), Some(arena.tag()));

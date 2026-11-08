@@ -128,7 +128,7 @@ impl<'a> InputOwner<'a> {
                 let layout = layer.scratch_layout(plan.rows)?.context("native eh scratch")?;
                 let linear = Rc::try_unwrap(layer.linears.remove(name).context("native eh")?)
                     .map_err(|_| anyhow::anyhow!("native eh aliased"))?;
-                Ok((linear, super::native::NativeScratch::allocate(device, &layout)?))
+                Ok((linear, super::native::NativeScratch::allocate(device, &layout, crate::shared::memory::Tag::drafter_workspace("step5/mtp-projection"))?))
             }).transpose()?;
             Ok(Rc::new(InputWeights { norm, eh, weights, epsilon: plan.epsilon, native }))
         })?;
