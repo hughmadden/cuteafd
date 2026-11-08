@@ -1198,6 +1198,7 @@ impl Opened {
             TargetFacts::native(&selection, layers, &native_dense_records.iter().map(|owned| owned.plan.clone()).collect::<Vec<_>>(),
                 &vocabulary, &shared, &native_scratch, &workspace, storage)?
         };
+        let arena_layouts = target.weights[0].1.coordinator_arenas()?;
         let native_load = target.native_load.clone();
         let reserved_weights = target.device_weight_bytes(if host_embedding { EmbeddingHome::HostPinned }
             else { EmbeddingHome::Device(0) })?;
@@ -1344,9 +1345,13 @@ impl Opened {
             let budgets = placement.tp2.context("TP2 budget")?.peak_bytes;
             Ok([usize::try_from(budgets[0])?, usize::try_from(budgets[1])?])
         };
+        let arenas = arena_layouts.into_iter().zip(&devices).map(|(layout, &id)| {
+            let device = crate::shared::memory::device::Device { library: &self.library, id };
+            Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?))
+        }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
-                .collect(), push: None };
+                .collect(), arenas: Some(std::rc::Rc::new(arenas)), allocation_prefix: String::new(), push: None };
         let mut coordinator_push = None;
         let mut native_push = None;
         let native_push_experts = || -> Result<_> {
@@ -1393,11 +1398,11 @@ impl Opened {
             let sink = std::rc::Rc::new(landing::PushSink::default());
             let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
             let ((embedding, model, drafter), mut records) = crate::shared::experts::rtx::dense::recording(|| {
-                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library,
+                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                         planning.model(&self.cfg, layers, owners.as_deref(), native)
-                    })?;
+                    }, |_, bytes| planning.allocate_owner("embedding", bytes))?;
                 let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home)?;
                 Ok((embedding, model, drafter))
             })?;
@@ -1547,11 +1552,11 @@ impl Opened {
                 planned_drafter = Some(drafter);
                 (embedding, model, pushed)
             } else {
-                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library,
+                let (embedding, model) = crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     self.embed_source()?, args.token_io.embed_placement, || {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                         loader.model(&self.cfg, layers, owners.as_deref(), native)
-                    })?;
+                    }, |_, bytes| loader.allocate_owner("embedding", bytes))?;
                 (embedding, model, None)
             };
             let tp2 = if let Some(range) = tp2_range.clone() {
@@ -1893,12 +1898,20 @@ impl Opened {
         let config = self.view.config()?;
         let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(push.is_some())?;
-        let vocabulary = NativeVocabulary::load_admitted(&self.library, programs,
-            VocabularyPlan::new(records, &selection, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, admitted)?
-            .context("rank 0 owns the native vocabulary")?;
+        let vocabulary_plan = VocabularyPlan::new(records, &selection, world, 0, self.cfg.hidden, self.cfg.vocab_size)?;
+        let staging_bytes = vocabulary_plan.staging_bytes() as u64;
+        admitted.validate_vocabulary(staging_bytes)?;
+        let vocabulary = NativeVocabulary::load_prepared_with(&self.library, programs,
+            vocabulary_plan, staging_bytes, devices[0], |name, bytes| {
+                let (table, suffix) = name.split_once('.').context("native vocabulary plane key")?;
+                let suffix = match suffix { "payload" => "fp8", "scales" => "scale",
+                    _ => anyhow::bail!("unexpected native vocabulary plane {name}") };
+                loader.allocate_owner(&format!("vocabulary.{table}.{suffix}"), bytes)
+            })?.context("rank 0 owns the native vocabulary")?;
         let vocabulary = std::rc::Rc::new(vocabulary);
         let source = self.native_embed_source()?;
-        let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&self.library, source, vocabulary.clone())?;
+        let embedding = crate::shared::token_io::TokenEmbedding::row_fp8_with(&self.library, source,
+            vocabulary.clone(), |_, bytes| loader.allocate_owner("embedding", bytes))?;
         let mut planned_drafter = None;
         let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {

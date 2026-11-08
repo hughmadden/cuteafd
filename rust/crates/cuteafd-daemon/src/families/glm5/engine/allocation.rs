@@ -396,27 +396,26 @@ impl GlmEngine<'_> {
         let physical = self.census_physical_devices()?;
         let devices = CoordinatorDevices::new(&physical)?;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "glm.weight",
-            Lifetime::TARGET, Category::Weights, "target checkpoint owners");
+            Lifetime::RESIDENT, Category::Weights, "target checkpoint owners");
         for rank in 0..self.ranks() {
             let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
             for (layer, weights) in layers.iter().enumerate() {
-                for (name, buffer) in weights.allocation_buffers() {
+                for (_, buffer) in weights.allocation_buffers() {
                     ensure!(devices.logical_rank(buffer.device_id)? as usize == rank, "weight on wrong logical rank");
-                    inventory.device(&format!("rank.{rank}.layer.{layer}.{name}"), buffer)?;
                 }
+                weights.allocation_receipts(&mut inventory, &format!("rank.{rank}.layer.{layer}"))?;
             }
         }
-        inventory.device("norm", self.weights.norm.buffer)?;
+        self.weights.norm.inventory(&mut inventory, "norm")?;
         match &self.weights.head {
-            super::super::weights::GlmHead::Bf16(owner) => inventory.device("head", owner.buffer)?,
+            super::super::weights::GlmHead::Bf16(owner) => owner.inventory(&mut inventory, "head")?,
             super::super::weights::GlmHead::RowFp8(owner) => {
                 ensure!(self.embedding.shares_vocabulary(owner), "head and embedding do not share vocabulary owner");
-                inventory.device("head.payload", owner.head.payload())?;
-                inventory.device("head.scales", owner.head.scales())?;
+                owner.head.inventory(&mut inventory, "head")?;
             }
             super::super::weights::GlmHead::K6(owner) => {
-                for (name, buffer) in [("payload", owner.payload.buffer), ("suh", owner.suh.buffer), ("svh", owner.svh.buffer)] {
-                    inventory.device(&format!("head.{name}"), buffer)?;
+                for (name, allocation) in [("payload", &owner.payload), ("suh", &owner.suh), ("svh", &owner.svh)] {
+                    allocation.inventory(&mut inventory, &format!("head.{name}"))?;
                 }
             }
         }

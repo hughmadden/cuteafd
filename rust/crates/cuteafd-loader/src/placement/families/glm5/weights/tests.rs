@@ -1,5 +1,49 @@
 use super::*;
 
+fn check_arenas(inventory: &WeightInventory) -> Result<()> {
+    let arenas = inventory.coordinator_arenas()?;
+    assert_eq!(arenas.len(), inventory.ranks);
+    for (rank, arena) in arenas.iter().enumerate() {
+        let owners = inventory.owners.iter().filter(|owner|
+            owner.allocation.location == Location::coordinator(rank as u8)
+                && !owner.allocation.id.contains(".shared.layer.")).collect::<Vec<_>>();
+        assert_eq!(arena.views().len(), owners.len());
+        let mut regions = arena.views().values().copied().collect::<Vec<_>>();
+        regions.sort_by_key(|view| view.offset());
+        let mut end = 0;
+        for view in regions {
+            assert_eq!(view.offset() % 256, 0);
+            assert!(view.offset() >= end);
+            end = view.offset() + view.bytes();
+        }
+        assert_eq!(end, arena.bytes());
+        for owner in owners {
+            assert_eq!(arena.view(&owner.allocation.id).unwrap().bytes() as u64, owner.allocation.bytes);
+            assert_eq!(owner.allocation.lifetime, Lifetime::RESIDENT);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn coordinator_arenas_preserve_selected_rank_operands_and_exclude_transients() -> Result<()> {
+    let (config, tensors) = testing::glm5_compact_weights();
+    let (core_config, core_tensors) = core_checkpoint(256, true);
+    for (config, tensors) in [(&config, &tensors), (&core_config, &core_tensors)] {
+        for ranks in [1, 2] {
+            for owners in [None, Some([1u8, 0].as_slice())] {
+                if ranks == 1 && owners.is_some() { continue; }
+                for bf16 in [false, true] {
+                    for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+                        check_arenas(&ordinary(config, tensors, ranks, owners, bf16, home))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn native_attention_mount_separates_native_and_converted_read_owners() -> Result<()> {
     use crate::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
@@ -103,6 +147,7 @@ fn selected_modes_own_distinct_native_residency_and_compact_needs_no_native_shar
         let checkpoint = Checkpoint::open_view(&view).with_context(|| format!("open {mode:?}"))?;
         let inventory = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None,
             false, false, EmbeddingHome::Device(0)).with_context(|| format!("inventory {mode:?}"))?;
+        check_arenas(&inventory)?;
         if mode != AttentionMode::Compact {
             assert_eq!(crate::plan::layout::glm5::resident_owned(&checkpoint, 2, cfg.layers, None)?,
                 inventory.resident_groups()?, "{mode:?} display must use Recipe weight owners");
@@ -751,6 +796,8 @@ fn native_owner_groups_compose_once_and_refuse_without_mutation() {
         separate.extend_native(&selection, 2, &vocabulary.iter().collect::<Vec<_>>()).unwrap();
         let expected = census(&whole);
         assert_eq!(census(&separate), expected);
+        check_arenas(&separate).unwrap();
+        assert_eq!(separate.coordinator_arenas().unwrap(), whole.coordinator_arenas().unwrap());
         assert_eq!(separate.resident_groups().unwrap(), whole.resident_groups().unwrap());
         assert_eq!(separate.owners.iter().filter(|owner|
             owner.allocation.id == "glm.weights.embedding").count(), 1);
