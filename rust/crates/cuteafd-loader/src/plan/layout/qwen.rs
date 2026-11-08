@@ -38,6 +38,11 @@ fn resident(checkpoint: &crate::plan::Checkpoint, mtp: bool,
     let cfg = Qwen4Config::from_hf(&checkpoint.config).ok()?;
     let mtp = mtp && cfg.mtp_layers > 0;
     let bytes = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp, representation).ok()?;
+    // The loader allocates its arenas from these same headers; a checkpoint
+    // missing any tensor they name cannot serve, so it does not describe the
+    // resident layout (refused below, never charged as a partial payload).
+    crate::families::qwen4::weight_layout::single_arena_bytes(checkpoint, &cfg, cfg.layers, mtp,
+        representation, 0).ok()?;
     Some(vec![vec![
         ("target incl PLE projections".into(), if representation.fp8_projections { "fp8+bf16+f32" } else { "bf16+f32" }.into(), bytes.target_bytes),
         ("embedding".into(), "bf16".into(), bytes.embedding_bytes),
@@ -262,13 +267,11 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
-    let resident = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp,
-        options.qwen_representation)?;
     let host_embedding = options.host_embedding && checkpoint.tensors.iter()
         .filter(|tensor| tensor.meta.name.ends_with("embed_tokens.weight")).count() == 1
         && checkpoint.require_untied_embedding("model.language_model.embed_tokens.weight").is_ok();
-    let mut loaded_weights = qwen4::single_owner_weights(&resident, host_embedding,
-        cfg.ple_layers.first().is_some_and(|&layer| layer < cfg.layers))?
+    let mut loaded_weights = qwen4::single_owner_weights(checkpoint, &cfg, cfg.layers, mtp,
+        options.qwen_representation, host_embedding, cfg.ple_layers.first().is_some_and(|&layer| layer < cfg.layers))?
         .checked_add(crate::placement::ResidentWeights(options.drafter_bytes))?;
     let all_onboarded = cfg.layers > 0
         && options.resolve_onboard(cfg.layers) == Some(Onboard::Layers(cfg.layers));
@@ -640,12 +643,17 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let packages = qwen4::dual_packages(&catalog, &lib)?;
     let workspace = qwen4::dual_expert_workspace(&catalog, packages.each_ref().map(|p| p.as_path()), rows.max(64))?;
     let host = options.host_embedding;
-    let mut fixed = qwen4::dual_owner0_weights(&resident, host);
+    // The loader's own arenas at the fixed cut; the head, entry mixer, MTP and
+    // a device embedding are views in them, not separate owner0 demands.
+    let embedding = if host { 0 } else { crate::families::qwen4::weight_layout::embedding_table_bytes(checkpoint)? };
+    let arenas = crate::families::qwen4::weight_layout::dual_arenas(checkpoint, &cfg,
+        &qwen4::dual_owners(cfg.layers), mtp, selected, embedding)?;
+    let mut fixed = Vec::new();
     if options.drafter_bytes > 0 {
         fixed.push(crate::placement::Demand::new(0, Category::Drafter, "drafter", options.drafter_bytes, Basis::Exact)
             .with_resident_weights(crate::placement::ResidentWeights(options.drafter_bytes)));
     }
-    fixed.extend(qwen4::dual_projection_load_staging(&cfg, cfg.layers, mtp, selected));
+    fixed.extend(qwen4::dual_projection_load_staging(selected));
     fixed.extend(qwen4::QwenTp2Rows::new(cfg.hidden as u64, cfg.topk as u64, rows.max(64),
         catalog.exl3().is_some())?.demands()?);
     fixed.extend(qwen4::dual_peer_diagnostics(
@@ -668,7 +676,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
             ple, future_expert_bytes: 0, headroom },
         gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: options.rtx_bytes[rank], reserve_bytes: headroom,
             baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: devices[rank].used_bytes() } }),
-        layer_weights: &resident.layer_bytes, layer_experts: &costs, layer_extra: &extra, fixed,
+        arenas: &arenas, layer_experts: &costs, layer_extra: &extra, fixed,
         tp2_workspace: workspace, pending_code_bytes: [0; 2], mark_slots: marks, max_context: context,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks: 0,
         onboard: options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto),

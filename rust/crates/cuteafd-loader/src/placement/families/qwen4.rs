@@ -8,6 +8,7 @@ use crate::placement::planner::{
     solve, Activation, Allocation, Allowance, Baseline as PlanBaseline, Budget, ByteCurve, Component,
     ComponentKind, Contract, Lifetime as PlanLifetime, Location, Operation, Phase, PhaseOrder, Pin,
     PrefillShape as PlanPrefill, Recipe, Refusal, Request, ResidentWeight, ResolvedPlan, Variable,
+    weight_arena_components,
 };
 use crate::placement::*;
 use crate::serving_capacity::qwen_graphs::{
@@ -364,14 +365,19 @@ pub fn admitted(inputs: &QwenInputs<'_>) -> anyhow::Result<(Placement, ResolvedP
     Ok((recipe.execution(&solved)?, solved))
 }
 
-/// Checkpoint owners on the single target owner; the mapped PLE backing and
-/// the target head borrowed by MTP are not separate device weight owners.
-pub fn single_owner_weights(resident: &crate::families::qwen4::resident::Qwen4CheckpointResident,
-    host_embedding: bool, ple: bool) -> Result<ResidentWeights, PlacementError> {
-    [resident.target_bytes, resident.head_bytes, resident.mtp_bytes,
-        if host_embedding { 0 } else { resident.embedding_bytes }, if ple { 256 } else { 0 }]
-        .into_iter().try_fold(ResidentWeights::default(), |sum, bytes|
-            sum.checked_add(ResidentWeights(bytes)))
+/// The single owner's physical weight backings: the target arena (globals,
+/// head and an optional device embedding as views) and the separate MTP
+/// arena, `layout.bytes()` once each, plus the standalone 256 B PLE scale.
+/// TP1 loads these before its free-memory sample, so the backings and their
+/// SM120 tails are already outside that baseline: this is a resident-weight
+/// declaration only, never a capacity charge (#1462 arena charges, option b).
+pub fn single_owner_weights(checkpoint: &crate::plan::Checkpoint, cfg: &crate::families::qwen4::Qwen4Config,
+    layers: usize, mtp: bool, selected: crate::families::qwen4::resident::Qwen4Representation,
+    host_embedding: bool, ple: bool) -> anyhow::Result<ResidentWeights> {
+    use crate::families::qwen4::weight_layout::{embedding_table_bytes, single_arena_bytes};
+    let embedding = if host_embedding { 0 } else { embedding_table_bytes(checkpoint)? };
+    let arenas = single_arena_bytes(checkpoint, cfg, layers, mtp, selected, embedding)?;
+    Ok(ResidentWeights(arenas).checked_add(ResidentWeights(if ple { 256 } else { 0 }))?)
 }
 
 /// Native TP1 arenas selected by the single-owner executor. Package scratch
@@ -632,31 +638,20 @@ impl QwenTp2Rows {
     }
 }
 
-/// Whole-width non-layer operands on the entry/head/MTP owner. Layer operands
-/// are passed to `dual_request` separately; PLE backing follows its layer owner,
-/// and draft expert arenas/workspaces must be supplied by their package plan.
-pub fn dual_owner0_weights(resident: &crate::families::qwen4::resident::Qwen4CheckpointResident,
-    host_embedding: bool) -> Vec<Demand> {
-    [
-        (Category::Weights, "owner0 head", resident.head_bytes),
-        (Category::Weights, "owner0 mixer", resident.entry_bytes),
-        (Category::Weights, "owner0 MTP weights", resident.mtp_bytes),
-        (Category::Embedding, "owner0 embedding", if host_embedding { 0 } else { resident.embedding_bytes }),
-    ].into_iter().filter(|(_, _, bytes)| *bytes > 0)
-        .map(|(category, group, bytes)| Demand::new(0, category, group, bytes, Basis::Exact)
-            .with_resident_weights(ResidentWeights(bytes))).collect()
-}
-
-/// Conservative load-only conversion peak on both nonempty owners, before the
-/// cutover is chosen. Kept as a steady-state reserve until load lifetimes are
-/// modeled; the paired group does not bias the owner-boundary objective.
-pub fn dual_projection_load_staging(cfg: &crate::families::qwen4::Qwen4Config, layers: usize, mtp: bool,
-    selected: crate::families::qwen4::resident::Qwen4Representation) -> Vec<Demand> {
-    let bytes = crate::families::qwen4::resident::resident_bytes(cfg, layers, mtp, selected)
-        .max_device_staging as u64;
-    if bytes == 0 { return Vec::new(); }
-    (0..2).map(|gpu| Demand::new(gpu, Category::Staging,
-        "FP8 projection load staging", bytes, Basis::Formula)).collect()
+/// The device conversion scratch each dual GPU allocates while loading FP8
+/// projections: exactly one `STEP_BYTES` buffer per GPU, reused for every step.
+/// Push gives each GPU one `DenseArena` with one `scratch` (daemon
+/// `shared/experts/rtx/dense.rs` `DenseArena::scratch`, run at `step.run`); the
+/// mount fallback keeps one per `step.device` (`dense/records.rs` `Mount::step`).
+/// Both allocate it in `Step::run_jobs` at `STEP_BYTES`, only for device-copy
+/// jobs: Qwen's `RowQuant` (FP8 projections). `Widen` and the head's `Quant`
+/// read pinned staging directly. Every step is bounded at `STEP_BYTES`, so no
+/// conversion needs more. Kept as a steady-state reserve until load lifetimes
+/// are modeled; the paired group does not bias the owner-boundary objective.
+pub fn dual_projection_load_staging(selected: crate::families::qwen4::resident::Qwen4Representation) -> Vec<Demand> {
+    if !selected.fp8_projections { return Vec::new(); }
+    (0..2).map(|gpu| Demand::new(gpu, Category::Staging, "FP8 projection load staging",
+        crate::shared::dense_read::STEP_BYTES as u64, Basis::Exact)).collect()
 }
 
 /// Only the scale follows the owning layer; tables stay mapped and step
@@ -710,7 +705,10 @@ pub struct QwenDualInputs<'a> {
     pub admission: QwenAdmissionInputs<'a>,
     pub owner_manifests: [Option<&'a serde_json::Value>; 2],
     pub gpus: [GpuBudget; 2],
-    pub layer_weights: &'a [u64],
+    /// The loader's own arena layouts at the fixed cut (`weight_layout::dual_arenas`):
+    /// each GPU's target arena and the entry rank's optional MTP arena. They are
+    /// future allocations, charged once each with their single SM120 tail.
+    pub arenas: &'a [(usize, crate::serving_capacity::WeightArenaLayout)],
     pub layer_experts: &'a [Option<ExpertCost>],
     /// Owner-local side allocations, such as the PLE scale.
     pub layer_extra: &'a [Vec<LayerExtraDemand>],
@@ -769,6 +767,38 @@ fn tp2_arena(inputs: &QwenDualInputs<'_>) -> Result<([u64; 2], [u64; 2]), Refusa
     Ok((peak, halves))
 }
 
+/// The dual arenas must be exactly the loader's: one target arena per GPU, the
+/// MTP arena on the entry rank iff MTP, each whole layer on its fixed owner,
+/// and no view in two backings (one physical owner per tensor).
+fn check_dual_arenas(arenas: &[(usize, crate::serving_capacity::WeightArenaLayout)], owners: &[usize],
+    mtp: bool) -> Result<(), Refusal> {
+    let invalid = |what: String| Refusal::InvalidFact(format!("Qwen dual arenas: {what}"));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut targets = [false; 2];
+    let mut draft = false;
+    for (rank, layout) in arenas {
+        let (is_draft, expected) = if layout.id().contains("/mtp/") { (true, "qwen4/mtp/rank0".to_string()) }
+            else { (false, format!("qwen4/target/rank{rank}")) };
+        if *rank >= 2 || layout.id() != expected || (is_draft && *rank != 0) {
+            return Err(invalid(format!("{} is not a dual arena on rank {rank}", layout.id())));
+        }
+        let slot = if is_draft { &mut draft } else { &mut targets[*rank] };
+        if std::mem::replace(slot, true) { return Err(invalid(format!("{} appears twice", layout.id()))); }
+        for name in layout.views().keys() {
+            if !seen.insert(name.clone()) { return Err(invalid(format!("{name} has two backings"))); }
+            let Some(layer) = name.strip_prefix("model.language_model.layers.")
+                .and_then(|rest| rest.split('.').next()).and_then(|n| n.parse::<usize>().ok()) else { continue };
+            if is_draft || owners.get(layer) != Some(rank) {
+                return Err(invalid(format!("{name} is outside its owner's target arena")));
+            }
+        }
+    }
+    if targets != [true, true] || draft != mtp {
+        return Err(invalid(format!("expected both target arenas and MTP={mtp}, found {targets:?}, MTP={draft}")));
+    }
+    Ok(())
+}
+
 /// The dual route prepared once: the balanced cut, per-owner pool units, both
 /// TP2 arenas and one flat graph reserve for each owner chain.
 pub struct QwenDual<'a> {
@@ -788,7 +818,6 @@ impl<'a> QwenDual<'a> {
         let a = &inputs.admission;
         let page = QWEN_UNIT_ROWS as u64;
         if a.layers <= 1 || a.layers > a.cfg.layers
-            || inputs.layer_weights.len() != a.layers
             || inputs.layer_experts.len() != a.layers
             || inputs.layer_extra.len() != a.layers
         {
@@ -814,6 +843,7 @@ impl<'a> QwenDual<'a> {
         }
         let owners = dual_owners(a.layers);
         check_dual_layer_owners(&owners).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        check_dual_arenas(inputs.arenas, &owners, a.mtp)?;
         let modes: Vec<_> = owners.iter().map(|&gpu|
             LayerMode::Whole { gpu: gpu as u8, ffn: FfnMode::Owner }).collect();
         let hop_spec = HopSpec { storage: HopStorage::ReceiveSlots,
@@ -945,13 +975,6 @@ impl Recipe for QwenDual<'_> {
                 .ok_or_else(|| Refusal::InvalidFact("Qwen per-layer records shrink".into()))?;
             previous = current;
             let location = Location::coordinator(gpu as u8);
-            if inputs.layer_weights[layer] > 0 {
-                let id = format!("qwen.layer.{layer}.weights");
-                components.push(owner(id.clone(), location, inputs.layer_weights[layer],
-                    Category::Weights, "layers", PlanLifetime::RESIDENT, self.maximum_pages));
-                components.push(weights(id, location, ResidentWeights(inputs.layer_weights[layer]),
-                    self.maximum_pages));
-            }
             components.push(owner(format!("qwen.layer.{layer}.state"), location, state,
                 Category::Kv, "layer state and marks", PlanLifetime::RESIDENT, self.maximum_pages));
             components.push(pooled(format!("qwen.layer.{layer}.records"), location, kv,
@@ -964,6 +987,14 @@ impl Recipe for QwenDual<'_> {
                     components.push(weights(id, location, demand.resident_weights, self.maximum_pages));
                 }
             }
+        }
+        // Coordinator weights are future allocations here: each arena's exact
+        // backing B, its resident-weight claim and one derived SM120 tail,
+        // replacing the per-layer and owner0 payload charges. The cut is fixed,
+        // so no placement choice gates them.
+        for (rank, layout) in inputs.arenas {
+            components.extend(weight_arena_components(layout, Location::coordinator(*rank as u8),
+                PlanLifetime::RESIDENT, self.maximum_pages)?);
         }
         let complete = compute(a.layers, a.mtp)?.ranks[0];
         // Both ranks allocate full-width page tables; owner0 alone owns pool
@@ -1086,25 +1117,6 @@ mod tests {
     use crate::families::qwen4::{Qwen4Config, Qwen4KvCache};
 
     #[test]
-    fn single_checkpoint_weights_are_independent_of_mapped_table_and_runtime_storage() {
-        use crate::families::qwen4::resident::Qwen4CheckpointResident;
-        let mut resident = Qwen4CheckpointResident { target_bytes: 700, layer_bytes: vec![200, 400],
-            entry_bytes: 100, mtp_bytes: 300, head_bytes: 500, embedding_bytes: 600,
-            ple_table_bytes: 900, ple_row_bytes: 160 };
-        assert_eq!(single_owner_weights(&resident, false, false).unwrap(), ResidentWeights(2100));
-        assert_eq!(single_owner_weights(&resident, true, false).unwrap(), ResidentWeights(1500));
-        assert_eq!(single_owner_weights(&resident, true, true).unwrap(), ResidentWeights(1756));
-        resident.ple_table_bytes = u64::MAX;
-        assert_eq!(single_owner_weights(&resident, true, true).unwrap(), ResidentWeights(1756));
-        let weights = single_owner_weights(&resident, false, true).unwrap();
-        assert!(weights.check(0, weights).is_ok());
-        assert_eq!(weights.check(0, ResidentWeights(weights.0 - 1)),
-            Err(PlacementError::ResidentWeightLimit { gpu: 0, required: 2356, limit: 2355 }));
-        resident.target_bytes = u64::MAX;
-        assert!(single_owner_weights(&resident, false, true).is_err());
-    }
-
-    #[test]
     fn single_expert_weights_use_native_whole_arenas_not_tp2_halves_or_workspace() {
         use crate::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
         let dir = tempfile::tempdir().unwrap();
@@ -1120,19 +1132,49 @@ mod tests {
         assert_eq!(cost.whole.staging, 0);
     }
 
+    /// A real fixture checkpoint (the loader's own source tensors) and its dual
+    /// arenas at the fixed cut: tests charge the layouts the loader allocates.
+    fn dual_fixture(cfg_json: &serde_json::Value, mtp: bool)
+        -> (tempfile::TempDir, Vec<(usize, crate::serving_capacity::WeightArenaLayout)>) {
+        use crate::families::qwen4::{resident::Qwen4Representation, weight_layout::dual_arenas};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Qwen4Config::from_hf(cfg_json).unwrap();
+        crate::plan::testing::write_snapshot(dir.path(), cfg_json,
+            &crate::plan::testing::qwen4_coordinator(cfg_json, mtp), None);
+        let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+        let arenas = dual_arenas(&checkpoint, &cfg, &dual_owners(cfg.layers), mtp,
+            Qwen4Representation::default(), 0).unwrap();
+        (dir, arenas)
+    }
+
     #[test]
-    fn qwen_dual_owner0_weights_exclude_layer_and_table_storage() {
-        use crate::families::qwen4::resident::Qwen4CheckpointResident;
-        let resident = Qwen4CheckpointResident { target_bytes: 700, layer_bytes: vec![200, 400], entry_bytes: 100,
-            mtp_bytes: 300, head_bytes: 500, embedding_bytes: 600, ple_table_bytes: 900, ple_row_bytes: 160 };
-        for (host, expected) in [(false, 1500), (true, 900)] {
-            let demands = dual_owner0_weights(&resident, host);
-            assert!(demands.iter().all(|d| d.gpu == 0 && d.basis == Basis::Exact));
-            assert_eq!(demands.iter().map(|d| d.bytes).sum::<u64>(), expected);
-            assert_eq!(demands.iter().filter(|d| d.category == Category::Embedding).count(), usize::from(!host));
-            assert!(!demands.iter().any(|d| d.category == Category::Tables || d.category == Category::Experts));
+    fn qwen_dual_arenas_charge_backing_and_one_tail_and_refuse_foreign_layouts() {
+        let config = crate::plan::testing::qwen4_config(4);
+        for mtp in [false, true] {
+            let mut config = config.clone();
+            config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(usize::from(mtp));
+            let (_dir, arenas) = dual_fixture(&config, mtp);
+            let owners = dual_owners(4);
+            check_dual_arenas(&arenas, &owners, mtp).unwrap();
+            assert_eq!(arenas.len(), 2 + usize::from(mtp));
+            for (rank, layout) in &arenas {
+                let components = weight_arena_components(layout, Location::coordinator(*rank as u8),
+                    PlanLifetime::RESIDENT, 64).unwrap();
+                // Root B (payload + padding, never the payload alone), its claim, one tail.
+                let ComponentKind::Allocation { template, .. } = &components[0].kind else { panic!("root") };
+                assert_eq!((template.id.as_str(), template.bytes), (layout.id(), layout.bytes() as u64));
+                assert_eq!(template.bytes, (layout.payload_bytes() + layout.padding_bytes()) as u64);
+                let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("tail") };
+                assert_eq!(tail.requests(), [layout.bytes() as u64]);
+            }
+            // The MTP arena and the head live on the entry rank only.
+            assert!(arenas.iter().filter(|(_, l)| l.id().contains("/mtp/")).all(|(r, _)| *r == 0));
+            assert!(arenas.iter().any(|(r, l)| *r == 0 && l.view("lm_head.weight").is_some()));
+            // Refusals: a missing target, a layer on the wrong owner, or a stale MTP choice.
+            assert!(check_dual_arenas(&arenas[..1], &owners, mtp).is_err());
+            assert!(check_dual_arenas(&arenas, &[1, 1, 0, 0], mtp).is_err());
+            assert!(check_dual_arenas(&arenas, &owners, !mtp).is_err());
         }
-        assert!(dual_owner0_weights(&Qwen4CheckpointResident::default(), false).is_empty());
     }
 
     #[test]
@@ -1159,13 +1201,15 @@ mod tests {
 
     #[test]
     fn qwen_dual_place_scale_follows_the_balanced_cut_and_hops_are_charged() {
-        let mut cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
-        cfg.ple_layers = vec![1];
-        cfg.ple_dim = 2560;
+        let mut config = crate::plan::testing::qwen4_config(4);
+        config["text_config"]["ple_layer_ids"] = serde_json::json!([2]);
+        config["text_config"]["ple_embed_dim"] = serde_json::json!(2560);
+        let cfg = Qwen4Config::from_hf(&config).unwrap();
+        assert_eq!((cfg.ple_layers.as_slice(), cfg.ple_dim), (&[1usize][..], 2560));
+        let (_dir, arenas) = dual_fixture(&config, false);
         let resident = crate::families::qwen4::resident::Qwen4CheckpointResident {
             ple_table_bytes: 1 << 30, ..Default::default() };
         let extra = dual_ple_demands(&cfg, 4, &resident).unwrap();
-        let weights = vec![1 << 20; 4];
         let experts = vec![Some(tp2_cost()); 4];
         let gib = 1u64 << 30;
         let inputs = QwenDualInputs {
@@ -1176,7 +1220,7 @@ mod tests {
             owner_manifests: [None; 2],
             gpus: [GpuBudget { capacity_bytes: 96 * gib, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: 96 * gib } }; 2],
-            layer_weights: &weights, layer_experts: &experts, layer_extra: &extra,
+            arenas: &arenas, layer_experts: &experts, layer_extra: &extra,
             fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
             max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard: Onboard::Auto,
             startup_graph_modes: None,
@@ -1204,22 +1248,24 @@ mod tests {
     #[test]
     fn qwen_dual_projection_staging_preserves_bf16_and_host_head_defaults() {
         use crate::families::qwen4::resident::Qwen4Representation;
-        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
-        for mtp in [false, true] {
-            for fp8_head in [false, true] {
-                let selected = Qwen4Representation { fp8_projections: false, fp8_head };
-                assert!(dual_projection_load_staging(&cfg, 48, mtp, selected).is_empty());
-                let demands = dual_projection_load_staging(&cfg, 48, mtp,
-                    Qwen4Representation { fp8_projections: true, fp8_head });
-                assert_eq!(demands.len(), 2);
-                for (gpu, demand) in demands.iter().enumerate() {
-                    assert_eq!(demand.gpu, gpu as u8);
-                    assert_eq!(demand.bytes, 84_377_600);
-                    assert_eq!(demand.category, Category::Staging);
-                    assert_eq!(demand.group, "FP8 projection load staging");
-                }
+        use crate::shared::dense_read::STEP_BYTES;
+        for fp8_head in [false, true] {
+            assert!(dual_projection_load_staging(Qwen4Representation { fp8_projections: false, fp8_head }).is_empty());
+            let demands = dual_projection_load_staging(Qwen4Representation { fp8_projections: true, fp8_head });
+            assert_eq!(demands.len(), 2);
+            for (gpu, demand) in demands.iter().enumerate() {
+                // The one STEP_BYTES device scratch each GPU allocates for RowQuant.
+                assert_eq!((demand.gpu, demand.bytes), (gpu as u8, STEP_BYTES as u64));
+                assert_eq!((demand.category, demand.basis), (Category::Staging, Basis::Exact));
+                assert_eq!(demand.group, "FP8 projection load staging");
             }
         }
+        // Each staged step is bounded at STEP_BYTES, so the largest real
+        // projection row window never needs more than that scratch.
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let rows = crate::families::qwen4::resident::resident_bytes(&cfg, 48, true,
+            Qwen4Representation { fp8_projections: true, fp8_head: true }).max_device_staging;
+        assert!(rows > STEP_BYTES, "fixture projection exceeds one step and must be windowed");
     }
 
     #[test]
@@ -1476,8 +1522,9 @@ mod tests {
     /// executor consumes them and never re-assigns an owner.
     #[test]
     fn dual_arenas_and_owner_graphs_come_from_the_prepared_facts() {
-        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
-        let weights = vec![1 << 20; 4];
+        let config = crate::plan::testing::qwen4_config(4);
+        let cfg = Qwen4Config::from_hf(&config).unwrap();
+        let (_dir, arenas) = dual_fixture(&config, false);
         let extra = vec![Vec::new(); 4];
         let costs = [Bytes2 { resident: 64 << 20, staging: 8 << 20 }; 2];
         let experts: Vec<_> = (0..4).map(|_| Some(ExpertCost { whole: Bytes2 { resident: 0, staging: 0 },
@@ -1491,7 +1538,7 @@ mod tests {
             owner_manifests: [None; 2],
             gpus: [GpuBudget { capacity_bytes: 96 * gib, reserve_bytes: 0,
                 baseline: Baseline::Measured { free_bytes: 96 * gib } }; 2],
-            layer_weights: &weights, layer_experts: &experts,
+            arenas: &arenas, layer_experts: &experts,
             layer_extra: &extra, fixed: Vec::new(),
             tp2_workspace: [1 << 20; 2], pending_code_bytes: [0; 2], mark_slots: 18,
             max_context: 131072, requested_pool: None, spark_ranks: 0, onboard: Onboard::Auto,

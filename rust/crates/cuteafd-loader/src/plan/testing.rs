@@ -116,7 +116,17 @@ fn width(dtype: &str) -> u64 {
 pub fn write_safetensors(path: &Path, tensors: &[Tensor]) {
     let mut header = serde_json::Map::new();
     let mut offset = 0u64;
+    // Fixtures composed from several generators may declare one tensor twice
+    // (e.g. a router both the coordinator and expert fixtures carry): write it
+    // once. A conflicting second declaration is a broken fixture, never merged.
+    let mut seen = std::collections::BTreeMap::<&str, (&str, &[usize])>::new();
     for (name, dtype, shape) in tensors {
+        if let Some(&(first_dtype, first_shape)) = seen.get(name.as_str()) {
+            assert!(first_dtype == *dtype && first_shape == shape.as_slice(),
+                "fixture declares {name} twice with different headers");
+            continue;
+        }
+        seen.insert(name.as_str(), (dtype, shape.as_slice()));
         let bytes = shape.iter().product::<usize>() as u64 * width(dtype);
         header.insert(name.clone(), json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]}));
         offset += bytes;
@@ -643,29 +653,88 @@ pub fn qwen4_config(layers: usize) -> Value {
 }
 
 /// Qwen's coordinator headers for `layers` target layers (and one native MTP
-/// layer with `mtp`): exactly what `checkpoint_resident_bytes` packs, so a
-/// fixture's plan charges the serve-qwen4 resident inventory.
+/// layer with `mtp`): the HF source tensors the serve-qwen4 loader reads, at
+/// their real shapes, so a fixture's plan charges the loader's own arena
+/// layouts (`weight_layout::coordinator_arenas`) and its resident inventory.
 pub fn qwen4_coordinator(config: &Value, mtp: bool) -> Vec<Tensor> {
-    use crate::families::qwen4::{resident::layer_projections, Qwen4Attention, Qwen4Config};
+    use crate::families::qwen4::{Qwen4Attention, Qwen4Config};
     let cfg = Qwen4Config::from_hf(config).unwrap();
     let h = cfg.hidden;
-    let mut out = vec![t("model.language_model.embed_tokens.weight", "BF16", &[cfg.vocab_size, h]),
+    // The stream width hyper-connections mix over, and their low rank.
+    let (stream, rank) = (cfg.hc_width(), cfg.hc_lowrank);
+    let lm = "model.language_model";
+    let mut out = vec![t(format!("{lm}.embed_tokens.weight"), "BF16", &[cfg.vocab_size, h]),
         t("lm_head.weight", "BF16", &[cfg.vocab_size, h])];
-    let layer = |out: &mut Vec<Tensor>, p: String, attention: Qwen4Attention| {
-        // Both selectable projections as one BF16 matrix each, at their packed shapes.
-        for projection in layer_projections(&cfg, attention, None) {
-            out.push(t(format!("{p}.self_attn.{}.weight", projection.operand), "BF16", &[projection.rows, projection.cols]));
+    // A hyper-connection site, at the installed checkpoint's shapes: norm over
+    // the stream, low-rank down (row-joined with the block injection), up.
+    let hyper = |out: &mut Vec<Tensor>, p: &str, inject: bool| {
+        out.extend([t(format!("{p}.hc_norm.weight"), "BF16", &[stream]),
+            t(format!("{p}.input_mix_weight_down.weight"), "BF16", &[rank, stream]),
+            t(format!("{p}.input_mix_weight_up.weight"), "BF16", &[stream, rank])]);
+        if inject { out.push(t(format!("{p}.block_inject_weight.weight"), "BF16", &[cfg.hc_count, stream])); }
+    };
+    let layer = |out: &mut Vec<Tensor>, p: String, attention: Qwen4Attention, ple: bool| {
+        hyper(out, &format!("{p}.attn_hyper_connection"), true);
+        hyper(out, &format!("{p}.mlp_hyper_connection"), true);
+        match attention {
+            Qwen4Attention::Gdn => {
+                let a = format!("{p}.linear_attn");
+                // [q; k; v] conv channels, then z, b and a: rows sum to layer_projections' w_in.
+                out.extend([t(format!("{a}.in_proj_qkv.weight"), "BF16", &[cfg.gdn_conv_width(), h]),
+                    t(format!("{a}.in_proj_z.weight"), "BF16", &[cfg.gdn_value_width(), h]),
+                    t(format!("{a}.in_proj_b.weight"), "BF16", &[cfg.gdn_value_heads, h]),
+                    t(format!("{a}.in_proj_a.weight"), "BF16", &[cfg.gdn_value_heads, h]),
+                    t(format!("{a}.out_proj.weight"), "BF16", &[h, cfg.gdn_value_width()]),
+                    t(format!("{a}.conv1d.weight"), "BF16", &[cfg.gdn_conv_width(), 1, cfg.conv_kernel]),
+                    t(format!("{a}.A_log"), "BF16", &[cfg.gdn_value_heads]),
+                    t(format!("{a}.dt_bias"), "BF16", &[cfg.gdn_value_heads]),
+                    t(format!("{a}.norm.weight"), "BF16", &[cfg.gdn_head_dim])]);
+            }
+            Qwen4Attention::Full => {
+                let a = format!("{p}.self_attn");
+                let (hd, ihd) = (cfg.head_dim, cfg.index_head_dim);
+                // Gated q, k, v and the indexer q/k: rows sum to layer_projections' w_in.
+                out.extend([t(format!("{a}.q_proj.weight"), "BF16", &[2 * cfg.heads * hd, h]),
+                    t(format!("{a}.k_proj.weight"), "BF16", &[cfg.kv_heads * hd, h]),
+                    t(format!("{a}.v_proj.weight"), "BF16", &[cfg.kv_heads * hd, h]),
+                    t(format!("{a}.indexer.index_qk_proj.weight"), "BF16", &[(cfg.index_heads + 1) * ihd, h]),
+                    t(format!("{a}.o_proj.weight"), "BF16", &[h, cfg.heads * hd]),
+                    t(format!("{a}.q_norm.weight"), "BF16", &[hd]),
+                    t(format!("{a}.k_norm.weight"), "BF16", &[hd]),
+                    t(format!("{a}.indexer.q_layernorm.weight"), "BF16", &[ihd]),
+                    t(format!("{a}.indexer.k_layernorm.weight"), "BF16", &[ihd])]);
+            }
         }
         let s = cfg.shared_intermediate;
-        out.extend([t(format!("{p}.mlp.shared_expert.gate_proj.weight"), "BF16", &[s, h]),
+        out.extend([t(format!("{p}.mlp.gate.weight"), "BF16", &[cfg.experts, h]),
+            t(format!("{p}.mlp.shared_expert.gate_proj.weight"), "BF16", &[s, h]),
             t(format!("{p}.mlp.shared_expert.up_proj.weight"), "BF16", &[s, h]),
             t(format!("{p}.mlp.shared_expert_gate.weight"), "BF16", &[1, h]),
             t(format!("{p}.mlp.shared_expert.down_proj.weight"), "BF16", &[h, s])]);
+        if ple {
+            // Installed shapes: key/norms/conv over the stream, value over hidden;
+            // key and value share columns, as their row concatenation requires.
+            let e = format!("{p}.ple");
+            out.extend([t(format!("{e}.key_proj.weight"), "BF16", &[stream, h]),
+                t(format!("{e}.value_proj.weight"), "BF16", &[h, h]),
+                t(format!("{e}.norm_key.weight"), "BF16", &[stream]),
+                t(format!("{e}.norm_query.weight"), "BF16", &[stream]),
+                t(format!("{e}.norm_conv.weight"), "BF16", &[stream]),
+                t(format!("{e}.conv1d.weight"), "BF16", &[stream, 1, cfg.conv_kernel])]);
+        }
     };
+    hyper(&mut out, &format!("{lm}.hyper_connection_mixer"), false);
     for l in 0..cfg.layers {
-        layer(&mut out, format!("model.language_model.layers.{l}"), cfg.attention[l]);
+        layer(&mut out, format!("{lm}.layers.{l}"), cfg.attention[l], cfg.ple_layers.contains(&l));
     }
-    if mtp { layer(&mut out, "mtp.layers.0".into(), Qwen4Attention::Full); }
+    if mtp {
+        layer(&mut out, "mtp.layers.0".into(), Qwen4Attention::Full, false);
+        hyper(&mut out, "mtp.hyper_connection_mixer", false);
+        out.extend([t("mtp.pre_fc_norm_hidden.weight", "BF16", &[cfg.hc_width()]),
+            t("mtp.pre_fc_norm_embedding.weight", "BF16", &[h]),
+            t("mtp.fc_hidden.weight", "BF16", &[h, h]),
+            t("mtp.fc_embedding.weight", "BF16", &[h, h])]);
+    }
     out
 }
 
