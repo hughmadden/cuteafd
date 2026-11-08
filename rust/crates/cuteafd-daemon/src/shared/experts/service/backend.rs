@@ -239,8 +239,8 @@ impl<'a> Weights<'a> {
                         + Fp8Worker::segment_io_bytes(&group.module, extent, group.bf16_module.is_some())?)
                         .context("expert group workspace overflow"))?;
                 ensure!(workspace <= remaining, "expert worker workspace exceeds the device budget");
-                let scratch = Rc::new(crate::shared::memory::DeviceAllocation::named(library,
-                    scratch_bytes, "experts/workspace/native_scratch")?);
+                let scratch = Rc::new(crate::shared::memory::DeviceAllocation::new(library,
+                    scratch_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/native_scratch"))?);
                 let mut workers = Vec::with_capacity(experts.len());
                 let mut bindings = Vec::new();
                 for (group, experts) in experts.iter().enumerate() {
@@ -713,7 +713,7 @@ pub(super) fn load_fp8<'a>(
             "physical expert arena startup peak exceeds configured device budget");
         admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
         resident = layout.bytes();
-        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
         for (owner, group) in owners.iter_mut().zip(&groups) {
             owner.load_mount_into(library, &group.tensors, &group.layers, group.slicing, &arena)?;
         }
@@ -789,7 +789,7 @@ pub(super) fn load_exl3<'a>(
         "physical expert arena startup peak exceeds configured device budget");
     admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
     let remaining = config.device_budget.checked_sub(layout.bytes()).context("EXL3 mount arena exceeds budget")?;
-    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {
         let plan = &plans[index];
         let started = std::time::Instant::now();

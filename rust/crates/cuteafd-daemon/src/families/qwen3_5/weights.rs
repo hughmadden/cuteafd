@@ -8,6 +8,7 @@ use cuteafd_loader::{families::qwen3_5::Qwen35Config, serving_capacity::WeightAr
 #[cfg(test)]
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::{collections::HashMap, ffi::c_void};
+use cuteafd_core::memory_layout::ArenaTag;
 
 const PREFIX: &str = "model.language_model.";
 
@@ -65,7 +66,7 @@ pub(crate) struct ScopeArena<'a> {
 
 impl<'a> ScopeArena<'a> {
     pub(crate) fn new(device: Device<'a>, layout: WeightArenaLayout) -> Result<Self> {
-        Ok(Self { arena: DeviceWeightArena::new(device, layout)?, taken: Default::default() })
+        Ok(Self { arena: DeviceWeightArena::new(device, layout, ArenaTag::weights("qwen35/target"))?, taken: Default::default() })
     }
 
     pub(crate) fn allocate(&self, name: &str, bytes: usize) -> Result<Allocation<'a>> {

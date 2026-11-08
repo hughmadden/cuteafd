@@ -35,6 +35,7 @@ use anyhow::{ensure, Context, Result};
 use std::path::Path;
 use std::ffi::c_void;
 use crate::shared::speculation::dflash::DraftHead;
+use cuteafd_core::memory_layout::ArenaTag;
 pub(crate) use crate::shared::speculation::block_dspark::{
     is_dspark, check_checkpoint, prefetch, DsparkConfig, DsparkDrafter, MAX_SEQUENCES,
 };
@@ -92,7 +93,7 @@ pub(super) fn dflash_arenas<'a>(library: &'a NativeLibrary, snapshot: &Path,
     crate::shared::speculation::dflash::DflashDrafter::arena_requests(snapshot, representation, devices, 0)?
         .into_iter().map(|(id, requests)| {
             let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm5_flash/draft/{id}"), requests)?;
-            Ok((id, DeviceWeightArena::new(Device { library, id }, layout)?))
+            Ok((id, DeviceWeightArena::new(Device { library, id }, layout, ArenaTag::drafter_weights("glmf/draft"))?))
         }).collect()
 }
 
@@ -100,7 +101,7 @@ pub(super) fn draft_allocation<'a>(library: &'a NativeLibrary,
     arenas: &std::collections::BTreeMap<i32, crate::shared::memory::weight_arena::DeviceWeightArena<'a>>,
     device: i32, name: &str, bytes: usize) -> Result<crate::shared::memory::device::Allocation<'a>> {
     crate::shared::memory::weight_arena::weight_allocation(crate::shared::memory::device::Device { library, id: device },
-        Some(arenas.get(&device).context("Flash draft arena absent")?), name, bytes)
+        Some(arenas.get(&device).context("Flash draft arena absent")?), name, bytes, ArenaTag::drafter_weights("glmf/draft"))
 }
 
 /// The GLM 5.3 Flash drafter: DFlash2 or dSpark, behind one interface the
@@ -190,7 +191,7 @@ impl<'a> Drafter<'a> {
                     let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
                         format!("glm5_flash/draft/{id}"), requests)?;
                     Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(
-                        crate::shared::memory::device::Device { library, id }, layout)?))
+                        crate::shared::memory::device::Device { library, id }, layout, ArenaTag::drafter_weights("glmf/draft"))?))
                 }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
             return Ok(Self::Dspark(DsparkDrafter::load_with(library, programs, snapshot, tensors, stream, slots,
                 sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache,

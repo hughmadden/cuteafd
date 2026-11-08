@@ -276,7 +276,7 @@ impl<'a> NativeVocabulary<'a> {
                 host_available, device_reserved, host_reserved)?;
         }
         let mut staging =
-            HostAllocation::named(library, plan.staging_bytes(), "native-vocabulary-staging")?;
+            HostAllocation::new(library, plan.staging_bytes(), crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "native-vocabulary-staging"))?;
         let embedding = Device { library, id: embedding_device }
             .run(|| load_rows_with(library, &plan.dense.tensors[0], &mut staging, "embedding", &mut *allocate))?;
         let head = load_rows_with(library, &plan.dense.tensors[1], &mut staging, "head", allocate)?;
@@ -730,7 +730,7 @@ mod tests {
         bytes.extend((0..256).flat_map(|i| [0.5f32, 1.00390625, -2.0][i % 3].to_le_bytes()));
         std::fs::write(&item.components[0].source.path, &bytes)?;
         let slice = item.slice(0, 256)?;
-        let mut staging = HostAllocation::named(&library, 1536, "mask-row-test")?;
+        let mut staging = HostAllocation::new(&library, 1536, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "mask-row-test"))?;
         let mounted = load_rows(&library, &slice, &mut staging)?;
         let ((recorded, rows), records) = dense::recording(|| {
             let recorded = load_rows(&library, &slice, &mut staging)?;

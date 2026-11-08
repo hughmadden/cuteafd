@@ -30,6 +30,7 @@ use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use crate::shared::peer_split::{slice_2d, Axis};
 use super::landing::{self, Land};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) struct GlmLayer<'a> {
     pub dense: bool,
@@ -289,7 +290,7 @@ impl<'a> GlmLoader<'a> {
         let rank = arena.map(|arena| arena.layout().id().rsplit('/').next().unwrap()).unwrap_or("0");
         let name = if name == "embedding" { "glm.weights.embedding".into() }
             else { format!("glm.weights.gpu.{}.{}{name}", rank, self.allocation_prefix) };
-        crate::shared::memory::weight_arena::weight_allocation(device, arena, &name, bytes)
+        crate::shared::memory::weight_arena::weight_allocation(device, arena, &name, bytes, ArenaTag::weights("glm/target"))
     }
 
     fn scoped(&self, prefix: String) -> Self { Self { allocation_prefix: prefix, ..self.clone() } }
@@ -311,7 +312,7 @@ impl<'a> GlmLoader<'a> {
                         let mut bytes = vec![0u8; source.bytes];
                         crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(&source.path)?
                             .read_exact_at(&mut bytes, source.offset))?;
-                        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+                        let allocation = DeviceAllocation::untagged(self.library, bytes.len().max(256))?;
                         self.library.copy_h2d(allocation.buffer, &bytes)?;
                         Ok(allocation)
                     } else { GlmLoader { arenas: None, ..self.clone() }.one(operand, &name) }
@@ -868,7 +869,7 @@ impl<'a> GlmLoader<'a> {
                 let suffix = name.rsplit('.').next().context("K6 member suffix")?;
                 let suffix = if suffix == "trellis" { "payload" } else { suffix };
                 crate::shared::memory::weight_arena::weight_allocation(device, arena,
-                    &format!("glm.weights.gpu.{rank}.{prefix}.{suffix}"), bytes)
+                    &format!("glm.weights.gpu.{rank}.{prefix}.{suffix}"), bytes, ArenaTag::weights("glm/target"))
             })
         })?;
         if let Some(push) = &self.push {

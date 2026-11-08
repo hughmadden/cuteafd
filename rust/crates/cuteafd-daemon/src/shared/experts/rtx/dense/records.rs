@@ -367,8 +367,7 @@ impl Step {
         let mut device_copy = |scratch: &mut Option<crate::shared::memory::DeviceAllocation<'l>>| -> Result<*const u8> {
             if let Some(ptr) = on_device { return Ok(ptr); }
             if scratch.is_none() {
-                *scratch = Some(crate::shared::memory::DeviceAllocation::named(library, STEP_BYTES,
-                    "staging/coordinator-dense-device")?);
+                *scratch = Some(crate::shared::memory::DeviceAllocation::new(library, STEP_BYTES, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense-device"))?);
             }
             let buffer = scratch.as_ref().context("dense device scratch")?.buffer;
             load_timing::upload(self.bytes(), || library.copy_h2d(buffer, &staged[..self.bytes()]))?;
@@ -411,7 +410,7 @@ impl Step {
                     let bytes = self.bytes();
                     ensure!(bytes > 0 && bytes % 8 == 0 && dst.bytes >= bytes / 2,
                         "I64 narrowing outside its operands");
-                    let status = HostAllocation::named(library, 4, "staging/coordinator-dense-status")?;
+                    let status = HostAllocation::new(library, 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense-status"))?;
                     let alias = library.cuda_host_buffer_device_alias(status.buffer)?;
                     // SAFETY: pinned staging, aligned status and I32 destination
                     // remain live through the drain before status is inspected.
@@ -919,7 +918,7 @@ impl<'a> Mount<'a> {
     fn grow(&mut self, bytes: usize) -> Result<()> {
         if self.staging.as_ref().is_none_or(|s| s.buffer.bytes < bytes) {
             drop(self.staging.take());
-            self.staging = Some(HostAllocation::named(self.library, bytes.max(PINNED_FLOOR_BYTES), "staging/coordinator-dense")?);
+            self.staging = Some(HostAllocation::new(self.library, bytes.max(PINNED_FLOOR_BYTES), crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense"))?);
         }
         Ok(())
     }

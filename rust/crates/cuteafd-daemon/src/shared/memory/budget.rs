@@ -107,7 +107,7 @@ pub(crate) fn admit_host_memory_with_resident_formulas(cache: u64, tables: &[(&s
     -> Result<cuteafd_core::memory_layout::HostLayout> {
     let memory = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let snapshot = cuteafd_ffi::memory_ledger::snapshot();
-    let mut resident = host_resident_items(snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1), formulas);
+    let mut resident = host_resident_items(pinned_by_label(&snapshot), formulas);
     // One singleton serves every mapped table and GPU owner in this process.
     // Its reusable buffers are lazy, so retain the full future reservation.
     append_table_reactor(&mut resident, usize::from(
@@ -116,6 +116,20 @@ pub(crate) fn admit_host_memory_with_resident_formulas(cache: u64, tables: &[(&s
     tracing::info!(host_budget_bytes = cache, host_ledger = %serde_json::to_string(&ledger)?,
         "coordinator host memory admitted");
     Ok(ledger)
+}
+
+/// Pinned bytes by ledger label, each with its kind's planner category: the
+/// recorded tag when there is one, else the legacy scope-root mapping.
+fn pinned_by_label(snapshot: &cuteafd_ffi::memory_ledger::Snapshot)
+    -> std::collections::BTreeMap<&'static str, (cuteafd_core::memory_layout::Category, usize)> {
+    use cuteafd_core::memory_layout::Category;
+    let mut out = std::collections::BTreeMap::new();
+    for row in snapshot.rows.iter().filter(|r| r.key.space == cuteafd_ffi::memory_ledger::Space::Pinned) {
+        let category = row.key.tag.map_or_else(|| Category::of_scope(row.key.scope), |tag| tag.kind.category());
+        let entry = out.entry(row.key.scope).or_insert((category, 0));
+        entry.1 += row.bytes;
+    }
+    out
 }
 
 fn append_table_reactor(items: &mut Vec<cuteafd_core::memory_layout::Item>, mapped_tables: usize) {
@@ -127,12 +141,12 @@ fn append_table_reactor(items: &mut Vec<cuteafd_core::memory_layout::Item>, mapp
     }
 }
 
-fn host_resident_items(pinned: std::collections::BTreeMap<&'static str, usize>, formulas: &[(&str, u64)])
-    -> Vec<cuteafd_core::memory_layout::Item> {
+fn host_resident_items(pinned: std::collections::BTreeMap<&'static str, (cuteafd_core::memory_layout::Category, usize)>,
+    formulas: &[(&str, u64)]) -> Vec<cuteafd_core::memory_layout::Item> {
     use cuteafd_core::memory_layout::{Basis, Category, Item};
     let mut items: Vec<_> = pinned.into_iter()
         .filter(|(scope, _)| !formulas.iter().any(|&(name, _)| name == *scope))
-        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
+        .map(|(scope, (category, bytes))| Item::new(category, scope, "pinned", bytes as u64, Basis::Exact))
         .collect();
     items.extend(formulas.iter().map(|&(name, bytes)| Item::new(Category::Staging, name,
         "pinned payload + pageable sort tuples", bytes, Basis::Formula)));
@@ -199,7 +213,7 @@ mod tests {
                 let payload = shape.slot_bytes().sum::<usize>() as u64;
                 let workspace = shape.workspace_bytes as u64;
                 let items = host_resident_items(std::collections::BTreeMap::from([
-                    ("mapped-table", payload as usize)]), &[]);
+                    ("mapped-table", (Category::Tables, payload as usize))]), &[]);
                 let demands = [("staging/mapped-table-worker", workspace)];
                 let ledger = host_admission((2 << 30, 1 << 30), items.clone(), 0, &demands, 0, 0)?;
                 assert_eq!((ledger.resident_bytes, ledger.deferred_bytes), (payload, workspace));
@@ -222,9 +236,9 @@ mod tests {
             let formulas = [("v41/engram-prefill", shape.host_resident_bytes() as u64),
                 ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)];
             let pinned = std::collections::BTreeMap::from([
-                ("v41/engram-prefill", shape.host_slots() * rows * 6337),
-                ("v41/engram-decode", shape.decode_slots() * shape.decode_rows() * 6337),
-                ("unrelated/pinned", 7)]);
+                ("v41/engram-prefill", (Category::Staging, shape.host_slots() * rows * 6337)),
+                ("v41/engram-decode", (Category::Staging, shape.decode_slots() * shape.decode_rows() * 6337)),
+                ("unrelated/pinned", (Category::Staging, 7))]);
             let items = host_resident_items(pinned, &formulas);
             assert_eq!(items.len(), 3);
             for &(name, bytes) in &formulas {

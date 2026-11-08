@@ -153,7 +153,7 @@ impl<'a> Exlr8Weights<'a> {
         available: usize,
     ) -> Result<Self> {
         layout.check_budget(available, &[])?;
-        let allocation = DeviceAllocation::named(library, layout.resident_bytes, "experts/weights/exlr8")?;
+        let allocation = DeviceAllocation::new(library, layout.resident_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Experts, "experts/weights/exlr8"))?;
         Self::load_into(library, layout, available, allocation)
     }
 
@@ -197,7 +197,7 @@ impl<'a> Exlr8Weights<'a> {
         }
         let per_bank = layout.staging_bytes.max(16);
         let mut hosts = (0..BANKS).map(|_| (0..EXPERT_READ_LANES)
-            .map(|_| HostAllocation::named(library, per_bank, "experts/load/exlr8"))
+            .map(|_| HostAllocation::new(library, per_bank, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "experts/load/exlr8")))
             .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
         // Declared after the banks so every exit drains before releasing pinned memory.
         let streams = (0..BANKS).map(|_| Ok(LoadStream {

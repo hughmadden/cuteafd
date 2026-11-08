@@ -11,6 +11,7 @@ use cuteafd_loader::{placement::{GpuBudget, Inventory, ProgramSet, SparkWorkingS
     plan::{checkpoint::Checkpoint, families::step5::Config, spec::DraftOwnership}};
 use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
 use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
+use cuteafd_core::memory_layout::ArenaTag;
 
 
 /// The solved arena an onboarded routed set loads into.
@@ -421,7 +422,7 @@ fn with_backend<T>(args: &ServeArgs,
     let weight_arenas = devices.iter().enumerate().map(|(rank, &device)|
         crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
             super::weights::target_arena(&native_plan.layouts[rank], Some(&native_plan.contract.rope_tables),
-                device.id, 92, rank == entry)?))
+                device.id, 92, rank == entry)?, ArenaTag::weights("step5/target")))
         .collect::<Result<Vec<_>>>()?;
     let load = || TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
         let native = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
@@ -430,7 +431,7 @@ fn with_backend<T>(args: &ServeArgs,
             &programs, &checkpoint, &caches[head_rank].borrow(), stages[head_rank].stream.clone(),
             usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
         Ok((native, mtp))
-    }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(devices[entry], Some(&weight_arenas[entry]), name, bytes));
+    }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(devices[entry], Some(&weight_arenas[entry]), name, bytes, ArenaTag::weights("step5/target")));
     let planned = policy.plan(|| -> Result<_> {
         ensure!(spark_admission.as_ref().is_none_or(|plan| plan.coordinator_pushes()), "Step-5 Spark admission did not select required push");
         let recorder = dense::Recorder::start(true)?.context("dense recorder")?;

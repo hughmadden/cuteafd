@@ -18,6 +18,7 @@ use cuteafd_loader::families::muse_spark::{core::PREFIX, weight_layout::LayerLay
 use cuteafd_loader::{families::muse_spark::reference::residual_gate_coefficients,
     formats::dense_trellis::LoadedDenseTrellis, LoadedTensor};
 use std::collections::BTreeMap;
+use cuteafd_core::memory_layout::ArenaTag;
 
 /// One rank's packed host operands of one layer.
 #[cfg(test)]
@@ -169,7 +170,7 @@ fn layer_rects(checkpoint: &cuteafd_loader::plan::Checkpoint, cfg: &MuseSparkCon
 }
 
 fn allocate<'a>(device: Device<'a>, arena: &DeviceWeightArena<'a>, name: &str, bytes: usize) -> Result<Allocation<'a>> {
-    crate::shared::memory::weight_arena::weight_allocation(device, Some(arena), name, bytes)
+    crate::shared::memory::weight_arena::weight_allocation(device, Some(arena), name, bytes, ArenaTag::weights("muse/target"))
 }
 
 fn land<'a>(device: Device<'a>, arena: &DeviceWeightArena<'a>, name: &str,
@@ -412,7 +413,7 @@ mod tests {
                 let device = Device { library: &library, id: rank as i32 };
                 let local = layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
                 let arena = DeviceWeightArena::new(device,
-                    cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &local)?)?;
+                    cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &local)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
                 let (embedding, weights) = if rank == 0 {
                     let tensor = checkpoint.tensors.iter().find(|tensor|
                         tensor.meta.name == "model.language_model.embed_tokens.weight").context("fixture embedding")?;
@@ -518,7 +519,7 @@ mod tests {
                         embedding: 512, final_norm: 512, head: Some(projection(head, CoreSplit::Whole,
                             TrellisSide::Output, 0, 1)?), head_bf16: 0 };
                     let arena = DeviceWeightArena::new(device,
-                        cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &[&layer])?)?;
+                        cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(rank, ranks, &global, &[&layer])?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
                     let dense = DenseLoad::mount(&library);
                     for shared in layer.core.values().chain((rank + 1 == ranks).then_some(global.head.as_ref().unwrap())) {
                         let layout = CoreWeightLayout::from_shared(shared.clone());
@@ -535,8 +536,8 @@ mod tests {
                     for layout in layer.native.values() {
                         let actual = allocate_native(device, &arena, layout)?;
                         let expected = device.own(|| Ok(NativeAttentionWeights { layout: layout.clone(),
-                            values: DeviceAllocation::new(&library, actual.values.buffer.bytes)?,
-                            scales: actual.scales.as_ref().map(|s| DeviceAllocation::new(&library, s.buffer.bytes)).transpose()? }))?;
+                            values: DeviceAllocation::new(&library, actual.values.buffer.bytes, cuteafd_ffi::memory_ledger::TEST)?,
+                            scales: actual.scales.as_ref().map(|s| DeviceAllocation::new(&library, s.buffer.bytes, cuteafd_ffi::memory_ledger::TEST)).transpose()? }))?;
                         let selected = checkpoint.projection(&layout.stem)?;
                         let mode = if compact && layout.stem == bf16 { AttentionMode::Fp8Compact } else { AttentionMode::Hqa };
                         for owner in [&actual, &expected] {
@@ -588,7 +589,7 @@ mod tests {
                 let mut tensors = vec![(format!("{}.values", layout.stem), 128 * 128 * if fp8 { 1 } else { 2 })];
                 if fp8 { tensors.push((format!("{}.scales", layout.stem), 4)); }
                 let arena = DeviceWeightArena::new(device,
-                    cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("muse-test/{rank}"), tensors)?)?;
+                    cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("muse-test/{rank}"), tensors)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
                 allocate_native(device, &arena, &layout)
             }).collect::<Result<Vec<_>>>()?;
             for owner in owners {

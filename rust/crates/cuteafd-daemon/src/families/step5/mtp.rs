@@ -10,6 +10,7 @@ use cuteafd_ffi::{programs::{Program, ProgramSpec, Programs, Scalar}, CuteafdDev
 use cuteafd_loader::plan::{checkpoint::Checkpoint,
     families::step5::{Config, coordinator::{RankWeightLayout, WeightOperand}}};
 use std::rc::Rc;
+use cuteafd_core::memory_layout::ArenaTag;
 
 const H: usize = 4096;
 const NORM_POINTERS: &[&str] = &["x", "weight", "bias", "cos", "sin", "positions", "out"];
@@ -664,7 +665,7 @@ impl<'a> Runtime<'a> {
             .context("Step-5 predictor runtime reservation overflow")?;
         ensure!(total <= available && cache.layout().ranks[cache.rank()].mtp_lengths.len() == depth,
             "Step-5 predictor runtime exceeds admitted owners/cache");
-        let weight_arena = DeviceWeightArena::new(cache.stream.device, packed)?;
+        let weight_arena = DeviceWeightArena::new(cache.stream.device, packed, ArenaTag::drafter_weights("step5/mtp"))?;
         let mut stages = Vec::with_capacity(depth);
         for stage in 0..depth {
             let owner = StageOwner::load(cache.stream.device, programs, checkpoint, stage,
@@ -1038,7 +1039,7 @@ mod tests {
                 let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
                 let weight_arena = DeviceWeightArena::new(device,
                     RankWeightLayout::mtp_stage_from_contract(&checkpoint, &contract, stage)?
-                        .arena_layout(format!("step5/mtp/gpu{}", device.id), |_| true)?)?;
+                        .arena_layout(format!("step5/mtp/gpu{}", device.id), |_| true)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
                 let mut owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
                     rope.clone(), u64::MAX, &[], &arena, Rc::new(Stream::new(device)?), kv_format, &contract,
                     &weight_arena)?;

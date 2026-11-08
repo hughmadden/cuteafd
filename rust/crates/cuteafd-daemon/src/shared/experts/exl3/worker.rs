@@ -281,16 +281,16 @@ impl<'a> Exl3Worker<'a> {
         }
         let topk = Self::topk();
         let weights_offset = capacity as usize * topk * 4;
-        let staging = (0..1).map(|_| HostAllocation::named(library,
-            weights_offset + capacity as usize * topk * 4, "experts/workspace/route_staging"))
+        let staging = (0..1).map(|_| HostAllocation::new(library,
+            weights_offset + capacity as usize * topk * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging")))
             .collect::<Result<Vec<_>>>()?;
         let host_path = HostPath::from_env()?;
         let executor_id = cuteafd_transport::expert::SparkWorld::canonical(first.layout.world)?.topology().executor_id(rank)?;
         let route_dump = RouteDump::from_env(executor_id)?;
         let inputs = [
-            DeviceAllocation::named(library, capacity as usize * Self::wire_row_bytes(), "experts/workspace/hidden")?,
-            DeviceAllocation::named(library, capacity as usize * topk * 4, "experts/workspace/routes")?,
-            DeviceAllocation::named(library, capacity as usize * topk * 4, "experts/workspace/routes")?,
+            DeviceAllocation::new(library, capacity as usize * Self::wire_row_bytes(), crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/hidden"))?,
+            DeviceAllocation::new(library, capacity as usize * topk * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/routes"))?,
+            DeviceAllocation::new(library, capacity as usize * topk * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/routes"))?,
         ];
         ensure!(
             executions
@@ -351,8 +351,8 @@ impl<'a> Exl3Worker<'a> {
             .context("EXL3 route staging overflow")?;
         self.staging.clear();
         for _ in 0..units {
-            self.staging.push(HostAllocation::named(self.library,
-                self.weights_offset * 2, "experts/workspace/route_staging")?);
+            self.staging.push(HostAllocation::new(self.library,
+                self.weights_offset * 2, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))?);
         }
         self.deferred = true;
         Ok(())

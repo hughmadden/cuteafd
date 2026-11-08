@@ -282,7 +282,7 @@ fn run_fanout_client(
         .checked_mul(args.row_width)
         .context("mapped RDMA fanout value count overflow")?;
     let local_values = vec![1.0_f32; values];
-    let mut local = native.alloc_device_buffer_untagged(values * std::mem::size_of::<f32>())?;
+    let mut local = native.alloc_device_buffer(values * std::mem::size_of::<f32>(), cuteafd_ffi::memory_ledger::Tag::workspace("bench/rdma-ring"))?;
     native.copy_h2d(local, f32_bytes(&local_values))?;
 
     let mut mapped_reduce_kernel_us = None;

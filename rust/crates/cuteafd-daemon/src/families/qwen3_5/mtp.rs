@@ -117,11 +117,11 @@ impl<'a> Mtp<'a> {
             library: device.library, stream: engine.stream.raw,
             projection: cuteafd_ffi::draft_projection::DraftProjections::load(engine.programs, &[(2 * cfg.hidden, cfg.hidden)], HEAD_ROWS)?,
             layer, fc, norm_hidden, norm_embedding, norm,
-            concat: Allocation::new(device, HEAD_ROWS * 2 * cfg.hidden * 2)?,
-            hidden: Allocation::new(device, ROWS * cfg.hidden * 2)?,
-            logits: Allocation::new(device, HEAD_ROWS * cfg.vocab * 4)?,
-            kv: Allocation::new(device, engine.pool_tokens * layout.record_bytes)?,
-            sidecars: Allocation::new(device, engine.pool_tokens.div_ceil(64) * layout.hidden_bytes)?,
+            concat: Allocation::untagged(device, HEAD_ROWS * 2 * cfg.hidden * 2)?,
+            hidden: Allocation::untagged(device, ROWS * cfg.hidden * 2)?,
+            logits: Allocation::untagged(device, HEAD_ROWS * cfg.vocab * 4)?,
+            kv: Allocation::untagged(device, engine.pool_tokens * layout.record_bytes)?,
+            sidecars: Allocation::untagged(device, engine.pool_tokens.div_ceil(64) * layout.hidden_bytes)?,
             layout, programs, cfg, homes, pool, binding, bindings,
         };
         let actual = out.layer.bytes() + [&out.fc, &out.norm_hidden, &out.norm_embedding, &out.norm, &out.concat,
@@ -621,7 +621,7 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
         Some(demand), 1, None, args.kv_cache, false, None, false)?;
     ensure!(engine.planes.scratch.bytes >= admitted.scratch_bytes, "MTP scratch exceeds shared target admission");
-    let input = Allocation::new(engine.stream.device, HEAD_ROWS * width)?;
+    let input = Allocation::untagged(engine.stream.device, HEAD_ROWS * width)?;
     let mut mtp = Mtp::load(&engine, &reader, format, admitted, fixed)?;
     mtp.pool.admit(mtp.binding, rows, HEAD_ROWS)?;
     let (mut hidden_cos, mut logit_cos, mut agree, mut nll) = (Vec::new(), Vec::new(), 0usize, 0.);
@@ -739,7 +739,7 @@ mod tests {
             Some(crate::shared::prefix::MarkRule { lanes: 2, entries: 2, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let mut mtp = Mtp::load(&engine.borrow(), &reader, format, admitted, fixed)?;
-        let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes)?;
+        let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes, cuteafd_ffi::memory_ledger::TEST)?;
         let selector = RefCell::new(crate::shared::token_io::TokenSelector::new(&library,
             crate::shared::token_io::SelectPlacement::Device, cfg.vocab, 1)?);
         let family = prefix::DensePrefix::new(&engine)?;

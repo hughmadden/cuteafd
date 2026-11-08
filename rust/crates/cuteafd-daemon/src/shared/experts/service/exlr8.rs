@@ -6,6 +6,7 @@ use cuteafd_ffi::{exlr8::KernelFamily, CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
 use cuteafd_transport::{ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
     ExpertV2Dtype, ProtocolV2RequestDevicePayload};
+use cuteafd_core::memory_layout::ArenaTag;
 
 const K1_ROWS: usize = cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS;
 
@@ -127,7 +128,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         "physical expert arena startup peak exceeds configured device budget");
     admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
     let remaining = config.device_budget.checked_sub(layout.bytes()).context("EXLR8 mount arena exceeds budget")?;
-    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, ArenaTag::experts("experts/spark-exlr8"))?;
     let mut plans: Vec<_> = plans.into_iter().map(Some).collect();
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, _| {
         let plan = plans[index].take().context("EXLR8 resident plan loaded twice")?;

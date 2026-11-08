@@ -208,15 +208,15 @@ impl<'a> DenseEngine<'a> {
                 |name, bytes| arena.allocate(name, bytes)))?;
         arena.complete()?;
         drop(arena);
-        let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
+        let mut allocated = sizes.into_iter().map(|bytes| Allocation::untagged(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
         let planes = Planes { residual: views[0], norm: views[1], delta: views[2], query: views[3],
             gate: views[4], attention: views[5], scratch: views[6], slots: views[7], seq_first: views[8],
             rope_positions: views[9], kv_slots: views[10], positions: views[11], page_table: views[12] };
-        let ids = Allocation::new(device, buffers.ids)?;
-        let logits = Allocation::new(device, logit_bytes)?;
-        let head_workspace = Allocation::new(device, buffers.head)?;
+        let ids = Allocation::untagged(device, buffers.ids)?;
+        let logits = Allocation::untagged(device, logit_bytes)?;
+        let head_workspace = Allocation::untagged(device, buffers.head)?;
         // SAFETY: owned workspace is retained after the head and stream, including error cleanup.
         let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr, cfg.hidden as u32,
             buffers.head_rows as u32, cfg.vocab as u32)? };
@@ -225,11 +225,11 @@ impl<'a> DenseEngine<'a> {
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;
         let kv: Vec<Option<std::rc::Rc<Allocation<'a>>>> = cfg.attention.iter().map(|&kind| -> Result<_> {
             if kind == HybridAttention::Gdn { return Ok(None); }
-            Ok(Some(std::rc::Rc::new(Allocation::new(device, pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim))?)))
+            Ok(Some(std::rc::Rc::new(Allocation::untagged(device, pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim))?)))
         }).collect::<Result<_>>()?;
         let verification = verify::Verification::new(device, &cfg, slots)?;
         let prefix_arena = if prefix_bytes == 0 { None } else {
-            Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes)?))
+            Some(std::rc::Rc::new(Allocation::untagged(device, prefix_bytes)?))
         };
         // Compare actual allocation owners, not a second evaluation of the
         // planner recipe. This gate also runs for every golden/serving startup.
