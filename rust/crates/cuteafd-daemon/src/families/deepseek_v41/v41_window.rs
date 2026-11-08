@@ -1027,7 +1027,7 @@ impl WindowWave<'_, '_> {
         let device = self.storage.input.buffer.device_id;
         // SAFETY: the wave pins weights/workspace; Drop drains before releasing fields.
         let graph = unsafe { GraphOwner::new(self.stream().library, device, raw, ())? };
-        crate::shared::decode_graph::census::capture_key("deepseek_v41", "window",
+        crate::shared::decode_graph::census::capture_device_key("deepseek_v41", "window",
             &self.graphs as *const _ as usize, device, None, &(rows, owner), raw);
         self.graphs.insert((rows, owner), graph, None);
         self.graph = Some((rows, owner));

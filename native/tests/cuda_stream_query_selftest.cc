@@ -21,8 +21,8 @@ static void CUDART_CB hold(void* state) {
 }
 int main() {
   const char* tmp = std::getenv("TMPDIR");
-  const auto profile = std::filesystem::path(tmp ? tmp : ".") /
-      ("graph-census-selftest-" + std::to_string(getpid()));
+  const auto profile = std::filesystem::absolute(std::filesystem::path(tmp ? tmp : ".") /
+      ("graph-census-selftest-" + std::to_string(getpid())));
   std::filesystem::create_directories(profile);
   check(setenv("CUTEAFD_GRAPH_CENSUS", "1", 1) == 0);
   check(setenv("CUTEAFD_PROFILE_DIR", profile.c_str(), 1) == 0);
@@ -84,7 +84,7 @@ int main() {
   const char* ptx = R"(.version 7.0
 .target sm_80
 .address_size 64
-.visible .entry census_store(.param .u64 dst, .param .u32 value) {
+.visible .entry census_store(.param .u32 value, .param .u64 dst) {
   .reg .u64 %rd;
   .reg .u32 %r;
   ld.param.u64 %rd, [dst];
@@ -98,7 +98,7 @@ int main() {
   check(cuModuleGetFunction(&function, module, "census_store") == CUDA_SUCCESS);
   CUdeviceptr dst = reinterpret_cast<CUdeviceptr>(buffer.ptr);
   unsigned value = 42;
-  void* args[] = {&dst, &value};
+  void* args[] = {&value, &dst};
   check(cuteafd_cuda_graph_begin_capture(pending) == CUTEAFD_STATUS_OK);
   check(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
       reinterpret_cast<CUstream>(pending), args, nullptr) == CUDA_SUCCESS);
@@ -113,7 +113,7 @@ int main() {
   const auto text = records.str();
   check(text.find("\"cuda_driver_version\":") != std::string::npos);
   check(text.find("\"kernel\":\"census_store\"") != std::string::npos);
-  check(text.find("\"param_count\":2,\"param_bytes\":12,\"param_payload_bytes\":12,\"param_status\":0") != std::string::npos);
+  check(text.find("\"param_count\":2,\"param_bytes\":16,\"param_payload_bytes\":12,\"param_status\":0") != std::string::npos);
   check(text.find("\"constant_status\":0") != std::string::npos);
   check(text.find("\"local_status\":0") != std::string::npos);
   check(cudaGetLastError() == cudaSuccess);

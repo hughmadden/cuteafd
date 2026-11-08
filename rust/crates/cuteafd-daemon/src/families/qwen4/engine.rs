@@ -3652,7 +3652,7 @@ impl<'a> Qwen4Engine<'a> {
         captured?;
         let exec = exec?;
         crate::shared::decode_graph::census::capture_key("qwen4", "decode",
-            self.graphs.as_ptr() as usize, device.id, Some(0), &key, exec.0);
+            self.graphs.as_ptr() as usize, 0, Some(0), &key, exec.0);
         // SAFETY: the new graph reads and writes persistent engine buffers.
         unsafe { self.library.cuda_graph_launch(exec.0, self.execution_stream())? };
         self.graphs.borrow_mut().insert(key, exec);

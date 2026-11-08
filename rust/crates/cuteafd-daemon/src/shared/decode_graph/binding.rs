@@ -7,13 +7,14 @@ use std::{ffi::c_void, hash::Hash};
 pub(crate) struct BindingGraphs<'a, K> {
     library: &'a NativeLibrary,
     device: i32,
+    site: &'static str,
     bank: GraphBank<K, GraphOwner<'a, ()>>,
     current: Option<K>,
 }
 
 impl<'a, K: Hash + Eq + Clone + std::fmt::Debug> BindingGraphs<'a, K> {
-    pub fn new(library: &'a NativeLibrary) -> Result<Self> {
-        Ok(Self { library, device: library.cuda_get_device()?, bank: GraphBank::new(None), current: None })
+    pub fn new(library: &'a NativeLibrary, site: &'static str) -> Result<Self> {
+        Ok(Self { library, site, device: library.cuda_get_device()?, bank: GraphBank::new(None), current: None })
     }
     pub fn is_none(&self) -> bool { self.current.is_none() }
     pub fn get(&self) -> Option<(*mut c_void, K)> {
@@ -26,7 +27,7 @@ impl<'a, K: Hash + Eq + Clone + std::fmt::Debug> BindingGraphs<'a, K> {
     pub unsafe fn insert(&mut self, key: K, raw: *mut c_void) -> Result<()> {
         // SAFETY: the containing wave retains weights, buffers and workspace.
         let owner = unsafe { GraphOwner::new(self.library, self.device, raw, ())? };
-        super::census::capture_key("deepseek_v41", std::any::type_name::<K>(),
+        super::census::capture_device_key("deepseek_v41", self.site,
             self as *const Self as usize, self.device, None, &key, raw);
         self.bank.insert(key.clone(), owner, None);
         self.current = Some(key.clone());

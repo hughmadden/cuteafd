@@ -162,7 +162,7 @@ impl<'library> DsparkWeights<'library> {
             input,
             _owned_input: owned_input,
             output: DeviceAllocation::new(library, capacity as usize * n as usize * 2, Tag::drafter_workspace("v41/draft-projection"))?,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_projection")?,
             ready: None,
         };
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };

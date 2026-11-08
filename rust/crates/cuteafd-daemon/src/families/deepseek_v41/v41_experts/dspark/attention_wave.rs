@@ -70,7 +70,7 @@ impl<'library> DsparkWeights<'library> {
             staging: HostAllocation::new(library, cuteafd_core::V41_READ_DESCRIPTOR_BYTES + rows as usize * 8, Tag::staging("v41/draft-attention"))?,
             requests,
             width: self.draft_width,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_attention_wave")?,
             ready: None,
         })
     }

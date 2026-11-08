@@ -192,7 +192,7 @@ impl<'a> DsparkWindow<'a> {
         let captured = unsafe { library.cuda_graph_end_capture(value.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                crate::shared::decode_graph::census::capture_key(
+                crate::shared::decode_graph::census::capture_device_key(
                     "deepseek_v41", "dspark_cache", owner as usize,
                     value.source.buffer.device_id, None, &(slots, source_rows), graph,
                 );

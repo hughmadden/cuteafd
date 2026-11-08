@@ -52,7 +52,7 @@ impl<'library> DsparkWeights<'library> {
             standalone: &self.standalone,
             device_bytes: bytes,
             library,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_ffn")?,
         })
     }
 }

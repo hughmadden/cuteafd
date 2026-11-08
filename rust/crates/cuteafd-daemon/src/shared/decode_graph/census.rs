@@ -10,11 +10,21 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// Capture identity is emitted only when explicitly collecting a census. A null
-/// lane means the bank does not carry a logical lane; its instance stays unique.
+/// lane means the bank has no logical lane. Instance addresses are diagnostic
+/// hints, not lifetime ids: join the nearest preceding native capture_ref for
+/// this exec in the same ordered process stderr stream, never on exec alone.
 pub(crate) fn capture_key<K: std::fmt::Debug>(family: &str, bank: &str, instance: usize,
     rank: i32, lane: Option<usize>, key: &K, exec: *mut std::ffi::c_void) {
     if !enabled() { return }
     tracing::info!(target: "cuteafd::graph_capture", family, bank, instance, rank, ?lane,
+        key = ?key, exec = ?exec, "graph census capture key");
+}
+
+/// Shared adapters know a physical CUDA device, not a logical rank.
+pub(crate) fn capture_device_key<K: std::fmt::Debug>(family: &str, bank: &str, instance: usize,
+    device: i32, lane: Option<usize>, key: &K, exec: *mut std::ffi::c_void) {
+    if !enabled() { return }
+    tracing::info!(target: "cuteafd::graph_capture", family, bank, instance, device, ?lane,
         key = ?key, exec = ?exec, "graph census capture key");
 }
 
@@ -269,6 +279,7 @@ mod tests {
             }
             assert!(!super::enabled());
             super::capture_key("test", "decode", 0, 0, None, &Unformattable, std::ptr::null_mut());
+            super::capture_device_key("test", "decode", 0, 0, None, &Unformattable, std::ptr::null_mut());
             return;
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())

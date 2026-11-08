@@ -100,7 +100,7 @@ impl<'library> DsparkWeights<'library> {
             tokens: DeviceAllocation::new(library, capacity * (self.draft_width + 1) * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
             capacity,
             width: self.draft_width,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_terminal")?,
             ready_requests: None,
         })
     }

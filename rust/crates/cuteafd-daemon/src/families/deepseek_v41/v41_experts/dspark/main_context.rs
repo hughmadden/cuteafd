@@ -74,7 +74,7 @@ impl<'library> DsparkWeights<'library> {
                 DeviceAllocation::new(library, capacity as usize * 1024, Tag::drafter_workspace("v41/draft-context"))?,
             ],
             capacity,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_main_context")?,
             ready: None,
             pending_writes: None,
             commit_descriptors: [DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, Tag::drafter_workspace("v41/draft-context"))?],
