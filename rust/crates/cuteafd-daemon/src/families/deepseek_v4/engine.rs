@@ -10,7 +10,7 @@ use super::pool::{Placement, PoolShape};
 use std::cell::{Cell, RefCell};
 use super::weights::{LayerWeights, ModelWeights};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, Tag};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
@@ -37,6 +37,21 @@ mod packed_check;
 pub(crate) use tp2::ExchangePolicy;
 use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
+
+/// Per-step and per-launch scratch: lanes, attention planes, router, sampler and expert wire rows.
+pub(super) const WORKSPACE: Tag = Tag::workspace("v4/workspace");
+/// Per-step table metadata: positions, destination slots, compact page tables.
+pub(super) const STEP_TABLES: Tag = Tag::workspace("v4/workspace/step");
+/// dSpark drafter per-step scratch: taps, main projection, draft ids and markov state.
+pub(super) const DRAFT_WORKSPACE: Tag = Tag::drafter_workspace("v4/draft/workspace");
+/// Target KV pools: window rings, C4/C128 page pools and compressor state.
+pub(super) const KV: Tag = Tag::kv("v4/kv");
+/// Pool-following page tables placement charges as KV records.
+pub(super) const KV_RECORDS: Tag = Tag::kv("v4/kv/records");
+/// Generated RoPE cos/sin tables.
+pub(super) const ROPE: Tag = Tag::weights("v4/rope");
+/// Peer/TP2 reply and reduce landings.
+pub(super) const REDUCE_LANDING: Tag = Tag::transport("v4/transport/reduce");
 
 #[derive(Clone)]
 pub(crate) struct Dev<'a> {
@@ -381,15 +396,15 @@ struct StepBuffers<'a> {
 }
 
 impl<'a> Engine<'a> {
-    fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
+    fn alloc(&self, bytes: usize, tag: Tag) -> Result<Dev<'a>> {
         {
-            let owner = std::rc::Rc::new(DeviceAllocation::untagged(self.library, bytes.max(256))?);
+            let owner = std::rc::Rc::new(DeviceAllocation::new(self.library, bytes.max(256), tag)?);
             Ok(Dev { buffer: owner.buffer, _owner: owner })
         }
     }
 
-    fn zeroed(&self, bytes: usize) -> Result<Dev<'a>> {
-        let allocation = self.alloc(bytes)?;
+    fn zeroed(&self, bytes: usize, tag: Tag) -> Result<Dev<'a>> {
+        let allocation = self.alloc(bytes, tag)?;
         self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
         Ok(allocation)
     }
@@ -469,7 +484,7 @@ impl<'a> Engine<'a> {
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let table = |compressed: bool| -> Result<Dev<'a>> {
                 let values = metadata::rope_table(&self.cfg, compressed, self.max_context.max(metadata::WINDOW));
-                let allocation = DeviceAllocation::untagged(self.library, values.len() * 4)?;
+                let allocation = DeviceAllocation::new(self.library, values.len() * 4, ROPE)?;
                 self.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
                 Ok(allocation.into())
             };
@@ -511,7 +526,7 @@ impl<'a> Engine<'a> {
         context: bool) -> Result<LayerCache<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::untagged(library, bytes.max(256))?;
+            let allocation = DeviceAllocation::new(library, bytes.max(256), KV)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation.into())
         };
@@ -551,7 +566,7 @@ impl<'a> Engine<'a> {
         let pools = (0..parts.cfg.n_layers + stages).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
         let table = |compressed: bool| -> Result<Dev<'a>> {
             let values = metadata::rope_table(&parts.cfg, compressed, parts.max_context.max(metadata::WINDOW));
-            let allocation = DeviceAllocation::untagged(parts.library, values.len() * 4)?;
+            let allocation = DeviceAllocation::new(parts.library, values.len() * 4, ROPE)?;
             parts.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
             Ok(allocation.into())
         };
@@ -694,12 +709,12 @@ impl<'a> Engine<'a> {
         // the unsplit dSpark stages.
         let heads = if rank == 1 { self.cfg.n_heads / 2 } else { self.cfg.n_heads };
         let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
-        let head_workspace = self.alloc(lead_only(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE))?;
+        let head_workspace = self.alloc(lead_only(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE), WORKSPACE)?;
         let route = if shared_page_list { format!("prefill_m{}", self.prefill_kernel_rows) }
             else { format!("decode_m{}", self.decode_rows) };
         let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
         let topk_scratch = usize::try_from(*spec.scratch.get("scratch").context("V4 top-k scratch geometry")?)?;
-        let plane = |bytes: usize| self.alloc(lanes * bytes);
+        let plane = |bytes: usize| self.alloc(lanes * bytes, WORKSPACE);
         let stream_a = plane(t * 4 * h * 2)?;
         let stream_b = plane(t * 4 * h * 2)?;
         let post = plane(t * 4 * 4)?;
@@ -714,41 +729,41 @@ impl<'a> Engine<'a> {
                 stream_b: stream_b.rows(index, t * 4 * h * 2),
                 post: post.rows(index, t * 4 * 4),
                 comb: comb.rows(index, t * 16 * 4),
-                tokens: self.alloc(t * 4)?,
+                tokens: self.alloc(t * 4, WORKSPACE)?,
                 shared: shared.rows(index, t * h * 2),
                 tables: self.step_buffers(t, if shared_page_list { cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS } else { t },
                     if shared_page_list { cuteafd_loader::serving_capacity::V4_PACKED_MEMBERS } else { 1 })?,
                 taps: self.alloc(draft_bytes(cuteafd_loader::serving_capacity::deepseek_v4_tap_rows(t, shared_page_list)
-                    * self.cfg.dspark_target_layer_ids.len() * h * 2))?,
+                    * self.cfg.dspark_target_layer_ids.len() * h * 2), DRAFT_WORKSPACE)?,
             };
             self.reserve_slot_uploads(&slot, lead)?;
             Ok(slot)
         };
         Ok(Workspace {
             slots: (0..lanes).map(lane).collect::<Result<_>>()?,
-            y: self.alloc(t * h * 2)?,
-            query: self.alloc(t * heads * 512 * 2)?,
-            q_rank: self.alloc(t * self.cfg.q_lora_rank * 2)?,
-            attn_out: self.alloc(t * heads * 512 * 2)?,
-            delta: self.alloc(t * h * 2)?,
-            index_query: self.alloc(t * self.cfg.index_n_heads * self.cfg.index_head_dim)?,
-            index_weights: self.alloc(t * self.cfg.index_n_heads * 4)?,
-            selected: self.alloc(t * self.cfg.index_topk * 4)?,
-            topk_scratch: self.zeroed(topk_scratch)?,
-            logits: self.alloc(t * experts * 4)?,
-            route_ids: self.alloc(t * topk * 4)?,
-            route_weights: self.alloc(t * topk * 4)?,
-            wire: self.alloc(t * (h + h / 32))?,
-            scratch: self.alloc(self.scratch_bytes(shared_page_list)?)?,
-            dummy: self.zeroed(4096)?,
-            vocab_logits: self.alloc(lead_only(t.min(LOGIT_ROWS) * self.cfg.vocab_size * 4))?,
-            main_x: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 2))?,
-            main_work: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 4))?,
-            first_tokens: self.alloc(draft_bytes(t * 4))?,
-            drafts: self.alloc(draft_bytes(t * 4))?,
-            markov: self.alloc(if draft { self.library.dsv4_markov_workspace(t)? } else { 0 })?,
-            draft_ids: self.alloc(draft_bytes(t * 4))?,
-            sum: self.alloc(if self.split_family.is_some() { t * h * 2 } else { 256 })?,
+            y: self.alloc(t * h * 2, WORKSPACE)?,
+            query: self.alloc(t * heads * 512 * 2, WORKSPACE)?,
+            q_rank: self.alloc(t * self.cfg.q_lora_rank * 2, WORKSPACE)?,
+            attn_out: self.alloc(t * heads * 512 * 2, WORKSPACE)?,
+            delta: self.alloc(t * h * 2, WORKSPACE)?,
+            index_query: self.alloc(t * self.cfg.index_n_heads * self.cfg.index_head_dim, WORKSPACE)?,
+            index_weights: self.alloc(t * self.cfg.index_n_heads * 4, WORKSPACE)?,
+            selected: self.alloc(t * self.cfg.index_topk * 4, WORKSPACE)?,
+            topk_scratch: self.zeroed(topk_scratch, WORKSPACE)?,
+            logits: self.alloc(t * experts * 4, WORKSPACE)?,
+            route_ids: self.alloc(t * topk * 4, WORKSPACE)?,
+            route_weights: self.alloc(t * topk * 4, WORKSPACE)?,
+            wire: self.alloc(t * (h + h / 32), WORKSPACE)?,
+            scratch: self.alloc(self.scratch_bytes(shared_page_list)?, WORKSPACE)?,
+            dummy: self.zeroed(4096, WORKSPACE)?,
+            vocab_logits: self.alloc(lead_only(t.min(LOGIT_ROWS) * self.cfg.vocab_size * 4), WORKSPACE)?,
+            main_x: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 2), DRAFT_WORKSPACE)?,
+            main_work: self.alloc(draft_bytes(t.min(TAP_ROWS) * h * 4), DRAFT_WORKSPACE)?,
+            first_tokens: self.alloc(draft_bytes(t * 4), DRAFT_WORKSPACE)?,
+            drafts: self.alloc(draft_bytes(t * 4), DRAFT_WORKSPACE)?,
+            markov: self.alloc(if draft { self.library.dsv4_markov_workspace(t)? } else { 0 }, DRAFT_WORKSPACE)?,
+            draft_ids: self.alloc(draft_bytes(t * 4), DRAFT_WORKSPACE)?,
+            sum: self.alloc(if self.split_family.is_some() { t * h * 2 } else { 256 }, REDUCE_LANDING)?,
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
             head: if lead {
@@ -763,15 +778,15 @@ impl<'a> Engine<'a> {
     /// Persistent table buffers for up to `rows` rows.
     fn step_buffers(&self, rows: usize, page_lists: usize, members: usize) -> Result<StepBuffers<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/step");
-        let ints = |count: usize| self.alloc(count * 4);
+        let ints = |count: usize| self.alloc(count * 4, STEP_TABLES);
         // Each member's compressor headers and 16-byte pointer alignment are private.
         let extra = if members > 1 { cuteafd_loader::serving_capacity::V4_PACKED_TABLE_EXTRA_ROWS } else { 0 };
         let storage_rows = rows + extra;
         let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..9).map(|_| ints(storage_rows + 2)).collect() };
         Ok(StepBuffers {
             rows,
-            positions: self.alloc(storage_rows * 8)?,
-            main_slots: self.alloc(storage_rows * 8)?,
+            positions: self.alloc(storage_rows * 8, STEP_TABLES)?,
+            main_slots: self.alloc(storage_rows * 8, STEP_TABLES)?,
             swa_indices: ints(storage_rows * metadata::WINDOW)?,
             swa_lengths: ints(storage_rows)?,
             c4: metadata(4)?,
@@ -780,7 +795,7 @@ impl<'a> Engine<'a> {
                 // Pool-following tables are KV records, matching placement::solve.
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv/records");
                 // Prefill retains a private, aligned page list per packed member.
-                ints(page_lists * (self.shape.units + if members > 1 { 3 } else { 0 }))?
+                self.alloc(page_lists * (self.shape.units + if members > 1 { 3 } else { 0 }) * 4, KV_RECORDS)?
             },
             c4_visible: ints(storage_rows)?,
             c4_indexed_lengths: ints(storage_rows)?,

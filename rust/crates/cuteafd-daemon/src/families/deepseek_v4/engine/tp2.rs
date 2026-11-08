@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use crate::shared::peer_split::order::{self, Schedule};
 
+/// Pinned host landings for the TP2 route diagnostic's device downloads.
+const ROUTE_CHECK: Tag = Tag::staging("v4/tp2/route-check");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExchangePolicy { Auto, Bf16, F32 }
 
@@ -407,8 +410,8 @@ impl<'a> Engine<'a> {
         for &layer in &tp2.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.n_activated_experts * 8;
-                let ranks = [Some(self.on(0, || HostAllocation::untagged(self.library, bytes))?),
-                    Some(self.on(1, || HostAllocation::untagged(self.library, bytes))?)];
+                let ranks = [Some(self.on(0, || HostAllocation::new(self.library, bytes, ROUTE_CHECK))?),
+                    Some(self.on(1, || HostAllocation::new(self.library, bytes, ROUTE_CHECK))?)];
                 checks.insert((layer, lane), PendingCheck { rows, ranks });
             }
         }
