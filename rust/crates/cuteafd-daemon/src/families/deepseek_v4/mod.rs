@@ -487,17 +487,20 @@ pub(crate) fn with_engine<T>(
         use cuteafd_loader::placement::Baseline;
         ensure!(args.max_sequences > 0, "--max-sequences must be positive");
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
-        // Each GPU's free bytes less the measured code still to load before ready (lazily loaded
-        // functions, cuBLAS: `placement::inventory::LOADED_CODE`), which the planner charges in its
-        // baseline. A GPU embedding is admitted inside rank 0's target arena, not here.
+        // Each GPU's raw pre-weight sample and the code still to load before
+        // ready (lazily loaded functions, cuBLAS). The sample's occupancy is
+        // charged as the named `context+modules` owner and the remainder as
+        // `loaded code`, so neither hides in the free baseline (#1614). A GPU
+        // embedding is admitted inside rank 0's target arena, not here.
+        let mut pending_code = Vec::with_capacity(devices.len());
         let gpus = devices.iter().enumerate().map(|(rank, &device)| {
-            let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
+            pending_code.push(crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
                 loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
                 &cuteafd_loader::placement::ProgramSet::from_manifest(&loaded.manifest,
-                    &[loaded.family, &format!("{}2", loaded.family)]))?;
+                    &[loaded.family, &format!("{}2", loaded.family)]))?);
             crate::shared::peer_split::on_device(&loaded.library, device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
-                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
+                Ok((total as u64, Baseline::Measured { free_bytes: free as u64 }))
             })
         }).collect::<Result<Vec<_>>>()?;
         // Physical capacity apart from the `--gpu-memory-cap` (`GPU_MEMORY_CAP`).
@@ -538,7 +541,7 @@ pub(crate) fn with_engine<T>(
         } else { None };
         let exchange_f32 = engine::ExchangePolicy::from_env()? == engine::ExchangePolicy::F32;
         let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
-            family: loaded.family, gpus, weights_resident: false, cache_stages,
+            family: loaded.family, gpus, pending_code, weights_resident: false, cache_stages,
             prefill_rows, decode_rows, max_context, prefix,
             expert_workspace, tp2_workspace, exchange_f32, physical,
             host_memory: cuteafd_loader::formats::mapped_preload::host_memory()? };

@@ -15,6 +15,10 @@ pub(crate) struct Inputs<'a> {
     pub family: &'a str,
     /// (total bytes, baseline) per GPU: `--device` then `--split-device`.
     pub gpus: Vec<(u64, Baseline)>,
+    /// Per GPU, selected-program code still to load by ready, measured from the
+    /// same pre-weight sample (`pending_code`). Charged as the named Runtime
+    /// `loaded code` owner, never subtracted from the free sample (#1614).
+    pub pending_code: Vec<u64>,
     /// False before uploads. After uploads, measured free bytes are rebased by
     /// the retained arenas (embedding included), which remain explicit demands.
     pub weights_resident: bool,
@@ -209,7 +213,7 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,
         requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         onboard: if args.skip_routed_experts { Onboard::Auto } else { onboard },
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(inputs.cfg.dim, v4::code_experts(inputs.catalog), gpus),
+        full_prefill_logits: 0, pending_code: inputs.pending_code.clone(),
         context, attention, extra: Vec::new(), physical_bytes: inputs.physical.clone(),
         host: Some(v4::V4Host { total: inputs.host_memory.0, available: inputs.host_memory.1,
             headroom: inputs.prefix.map_or(8 << 30, |p| p.host_cache_headroom_bytes).max(inputs.host_memory.0 / 10),

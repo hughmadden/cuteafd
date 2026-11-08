@@ -128,12 +128,6 @@ fn layout_for_experts(report: &mut PlanReport, model: &dyn super::super::FamilyM
     if workspace.is_none() {
         notes.push("V4 workspace allowance is estimated without a matching PROGRAMS.json; use --workspace-manifest for Flash/Pro allocation geometry".into());
     }
-    // V4's coordinator always holds dSpark (and any RTX layers) in the catalog's package.
-    let package = if report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) { "exl3" } else { "*" };
-    for (index, device) in devices.iter_mut().take(ranks).enumerate() {
-        device.items.push(runtime_item(shape.manifest.as_deref(), &program_families(id, split), package, split,
-            index, options.rtx_bytes[index]));
-    }
     let mut spark_working = crate::placement::SparkWorkingSet {
         rtx_layers: Vec::new(),
         spark_layers: if matches!(report.placement, ExpertPlacement::Sparks { .. }) {
@@ -318,9 +312,20 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
         else { crate::serving_capacity::deepseek_v4_native_workspace(routed.hidden as u64, routed.intermediate as u64,
             routed.experts as u64, routed.topk as u64, shape.prefill_rows.max(shape.decode_rows))? };
     let host = options.host_memory.map(Ok).unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
-    let gpus = devices.iter().zip(&options.rtx_bytes).map(|(device, &total)|
-        (total, Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect();
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
+    // Each coordinator GPU's CUDA context and selected-program code: the
+    // baseline's `context_bytes` and the matching `loaded code` remainder,
+    // both charged as named Runtime owners by `fixed_demands` (#1614).
+    let split = devices.len() == 2;
+    let mut gpus = Vec::with_capacity(devices.len());
+    let mut pending_code = Vec::with_capacity(devices.len());
+    for (rank, (device, &total)) in devices.iter().zip(&options.rtx_bytes).enumerate() {
+        let context = crate::placement::ArchContext::coordinator(total, None).context_bytes;
+        let runtime = runtime_item(shape.manifest.as_deref(), &program_families(id, split),
+            v4::code_experts(catalog), split, rank, total);
+        pending_code.push(runtime.bytes.saturating_sub(context));
+        gpus.push((total, Baseline::Planned { context_bytes: context, loaded_bytes: device.used_bytes() }));
+    }
     let context = shape.manifest.as_deref().and_then(|m| v4::manifest_context(m, id, cfg.n_heads, shape.decode_rows));
     let attention = report.requested_attention.unwrap_or(if devices.len() == 2 && context.is_some() {
         crate::placement::AttentionPlacement::Context
@@ -362,7 +367,7 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
         tp2_workspace: tp2_workspace.map_or([0; 2], |bytes| [bytes; 2]),
         exchange_f32: options.exchange_f32,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len()),
+        full_prefill_logits: 0, pending_code,
         context,
         attention: report.requested_attention, extra, physical_bytes: Vec::new(),
         host: Some(v4::V4Host { total: host.0, available: host.1, headroom: (8 << 30).max(host.0 / 10),

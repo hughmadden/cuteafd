@@ -202,25 +202,20 @@ fn budgets(inputs: &V4Inputs, reserves: &[u64]) -> Result<Vec<Budget>, Refusal> 
         .enumerate()
         .map(|(rank, (&(logical, baseline), &headroom))| {
             let physical = inputs.physical_bytes.get(rank).copied().unwrap_or(logical).max(logical);
+            // `fixed_demands` charges the baseline's occupancy as the named
+            // `context+modules` Runtime owner (the planned allowance offline,
+            // the pre-weight sample in serve), so the cap starts whole here and
+            // the ledger names the occupancy on every coordinator GPU (#1614).
             let baseline = match baseline {
-                crate::placement::Baseline::Planned {
-                    context_bytes,
-                    loaded_bytes,
-                } => Baseline::Forecast {
-                    occupied: context_bytes
-                        .checked_add(loaded_bytes)
-                        .ok_or(Refusal::Overflow("V4 planned baseline"))?,
-                    source: "planned context, modules and preloaded owners".into(),
+                crate::placement::Baseline::Planned { .. } => Baseline::Forecast {
+                    occupied: 0,
+                    source: "full cap; planned context and modules charged as named owners".into(),
                     assumed: false,
                 },
-                // The sample is relative to the logical ceiling; the budget's
-                // physical extent adds the memory above it back as free.
-                crate::placement::Baseline::Measured { free_bytes } => Baseline::Sampled {
-                    free: free_bytes
-                        .checked_add(physical - logical)
-                        .ok_or(Refusal::Overflow("V4 physical sample"))?,
-                    phase: Phase::Load,
-                    source: "measured free bytes after context and modules".into(),
+                crate::placement::Baseline::Measured { free_bytes } => Baseline::Forecast {
+                    occupied: 0,
+                    source: format!("full cap; pre-weight free sample {free_bytes} charged as context+modules"),
+                    assumed: false,
                 },
             };
             Ok(Budget {

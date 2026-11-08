@@ -50,6 +50,8 @@ pub struct V4Inputs {
     pub cache_stages: usize,
     /// Per-GPU cap and baseline; one or two entries. Each keeps the memory
     /// policy's named reserve (`placement::reserve::gpu("deepseek_v4")`) free.
+    /// The baseline's occupancy is charged once as the named Runtime
+    /// `context+modules` owner, so the cap starts whole on both sides (#1614).
     pub gpus: Vec<(u64, Baseline)>,
     pub spark_ranks: usize,
     pub sequences: u64,
@@ -82,10 +84,11 @@ pub struct V4Inputs {
     pub onboard: Onboard,
     /// Probe-only all-row logits on the lead GPU.
     pub full_prefill_logits: u64,
-    /// Per GPU, the calibrated or formula-based code it holds at ready. Part of the baseline on
-    /// both sides; on a PRO card the reserve envelope covers it
-    /// (it always did: the code loads after the runtime's sample), so it does not shrink the pool twice.
-    pub code_bytes: Vec<u64>,
+    /// Per GPU, selected-program code still to load by ready
+    /// (`CodeAllowance::pending`): the planner's allowance offline, the measured
+    /// remainder serve-dsv4 can still attribute. Charged as the named Runtime
+    /// `loaded code` owner, never folded into a free-memory sample (#1614).
+    pub pending_code: Vec<u64>,
     /// The build's C4 token-split programs (`manifest_context`), required for
     /// automatic or explicit context placement on two GPUs.
     pub context: Option<V4Context>,
@@ -280,6 +283,21 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
         let workspace = inputs.workspace.as_ref().and_then(|w| w.get(rank)).map(|w| w.fixed_device_bytes)
             .unwrap_or(WORKSPACE_BYTES[role] * inputs.prefill_rows / 4096) + intake + probe;
         reserves.push(crate::placement::reserve::gpu("deepseek_v4"));
+        // The pre-weight base (the planner's context and module allowance
+        // offline, the measured sample's occupancy in serve) and the code
+        // still to load are named Runtime owners, so the cap starts whole and
+        // every coordinator GPU, peer included, names them (#1614).
+        let (runtime_basis, code_basis) = match inputs.gpus[rank].1 {
+            Baseline::Planned { .. } => (Basis::Formula, Basis::Estimated),
+            Baseline::Measured { .. } => (Basis::Calibrated, Basis::Calibrated),
+        };
+        let runtime = runtime_occupancy(inputs, rank)?;
+        if runtime > 0 {
+            demands.push(Demand::new(gpu, Category::Runtime, "context+modules", runtime, runtime_basis));
+        }
+        if let Some(&code) = inputs.pending_code.get(rank).filter(|&&code| code > 0) {
+            demands.push(Demand::new(gpu, Category::Runtime, "loaded code", code, code_basis));
+        }
         let basis = if inputs.workspace.is_some() { Basis::Formula } else { Basis::Estimated };
         demands.push(Demand::new(gpu, Category::Kv, "state", state, Basis::Formula));
         demands.push(Demand::new(gpu, Category::Kv, "RoPE context tables", context, Basis::Formula));
@@ -309,14 +327,21 @@ pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
     if catalog.exl3().is_some() { "exl3" } else { "*" }
 }
 
-/// Selected-program module bytes per rank. BLAS handles, modules and driver
-/// storage are disjoint named owners charged by the admission contract; this
-/// no longer carries a mixed residency sample (#1579).
-pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
-    let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);
-    (0..gpus).map(|rank| crate::placement::inventory::loaded_code_allowance(
-        family, experts, gpus == 2, rank as u8, arch, None).bytes).collect()
+/// This rank's pre-weight occupancy: the CUDA context and every module the
+/// family loaded before the sample, which the budget's `Measured` baseline
+/// already excludes. Charged once as the Runtime `context+modules` owner so
+/// the ledger names it on every coordinator GPU instead of hiding it in a
+/// free sample (#1614).
+fn runtime_occupancy(inputs: &V4Inputs, rank: usize) -> Result<u64, PlacementError> {
+    let (logical, baseline) = inputs.gpus[rank];
+    let physical = inputs.physical_bytes.get(rank).copied().unwrap_or(logical).max(logical);
+    match baseline {
+        Baseline::Planned { context_bytes, loaded_bytes } => context_bytes
+            .checked_add(loaded_bytes).ok_or(PlacementError::Overflow("V4 planned runtime base")),
+        // The sample is effective under the logical ceiling, so the occupancy
+        // it implies is measured against that same smaller extent.
+        Baseline::Measured { free_bytes } => Ok(physical.min(logical).saturating_sub(free_bytes.min(logical))),
+    }
 }
 
 /// V4 defaults uniformly to pool-first placement. Explicit `max` remains
@@ -367,7 +392,7 @@ mod default_tests {
                     workspace: None, experts: Vec::new(), draft: Vec::new(), draft_half: Vec::new(), experts_half: Vec::new(),
                     tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
                     first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
-                    full_prefill_logits: 0, code_bytes: Vec::new(), context: None, attention: None,
+                    full_prefill_logits: 0, pending_code: Vec::new(), context: None, attention: None,
                     extra: Vec::new(), physical_bytes: Vec::new(), host: None,
                 };
                 let baseline = fixed_demands(&input).unwrap().0;
@@ -446,7 +471,7 @@ mod default_tests {
             workspace: None, experts: Vec::new(), draft: Vec::new(), draft_half: Vec::new(), experts_half: Vec::new(),
             tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0, first_routed: 0,
             requested_pool: Some(262144), onboard: Onboard::Layers(0), full_prefill_logits: 0,
-            code_bytes: Vec::new(), context: None, attention: None, extra: Vec::new(),
+            pending_code: Vec::new(), context: None, attention: None, extra: Vec::new(),
             physical_bytes: Vec::new(), host: None,
         }
     }
@@ -455,6 +480,47 @@ mod default_tests {
         let prepared = prepare(input)?;
         let request = production_request(input);
         prepared.admit(request).map(|admitted| admitted.placement)
+    }
+
+    /// The pre-weight base and the code still to load are named Runtime owners
+    /// on every coordinator GPU, lead and peer alike: the planned allowance
+    /// offline, the measured sample's occupancy in serve (#1614).
+    #[test]
+    fn runtime_base_is_a_named_owner_on_every_coordinator_gpu() {
+        use cuteafd_core::memory_layout::ItemLifetime;
+        let group = |items: &[Demand], rank: u8, name: &str| -> u64 {
+            items.iter().filter(|d| d.gpu == rank && d.group == name).map(|d| d.bytes).sum()
+        };
+        let mut input = plan_inputs(&context_cfg());
+        for (total, baseline) in input.gpus.iter_mut() {
+            *baseline = Baseline::Planned { context_bytes: 1_170_800_640, loaded_bytes: 42 << 20 };
+            *total = 96 << 30;
+        }
+        let planned = fixed_demands(&input).unwrap().0;
+        for rank in 0..2 {
+            // The planned allowance carries the context and the preloaded owners.
+            assert_eq!(group(&planned, rank, "context+modules"), 1_170_800_640 + (42 << 20));
+            // No measured remainder offline, and both names are ready-resident.
+            assert_eq!(group(&planned, rank, "loaded code"), 0);
+            assert!(planned.iter().filter(|d| d.gpu == rank && d.group == "context+modules")
+                .all(|d| d.category == Category::Runtime && d.lifetime == ItemLifetime::ReadyResident));
+        }
+        // Serve: the sample is effective under the logical ceiling, so the
+        // occupancy it implies is measured against that same extent, and pending
+        // code is charged beside it instead of being netted out of the sample.
+        let cap = 96u64 << 30;
+        input.physical_bytes = vec![100 << 30; 2];
+        input.pending_code = vec![967_770_976, 0];
+        for (total, baseline) in input.gpus.iter_mut() {
+            *total = cap;
+            *baseline = Baseline::Measured { free_bytes: cap - 854_189_872 };
+        }
+        let measured = fixed_demands(&input).unwrap().0;
+        for rank in 0..2 {
+            assert_eq!(group(&measured, rank, "context+modules"), 854_189_872);
+        }
+        assert_eq!(group(&measured, 0, "loaded code"), 967_770_976);
+        assert_eq!(group(&measured, 1, "loaded code"), 0);
     }
 
     #[test]
