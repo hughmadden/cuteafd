@@ -325,10 +325,12 @@ mod tests {
             sequential: vec![], reservations: vec![], allowances: vec![],
             resident_weights: vec![], allocation_granularity: vec![], driver_page_tables: vec![] };
         let mut contract = Contract::fixed(64, 1, 2, facts);
+        contract.variables = vec![Variable::Prefill(vec![PrefillShape { rows: 64, waves: 1 }]),
+            Variable::Lanes(vec![1])];
         contract.components.extend(blas_components("sm_120", &owners, 1, order).unwrap());
         contract.add_driver_page_tables();
         contract.add_driver_page_tables();
-        let facts = contract.facts(&[], 1).unwrap();
+        let facts = contract.facts(&[0, 0], 1).unwrap();
         for gpu in 0..2 {
             let location = Location::coordinator(gpu);
             let mappings = facts.driver_page_tables.iter().filter(|owner| owner.location == location)
