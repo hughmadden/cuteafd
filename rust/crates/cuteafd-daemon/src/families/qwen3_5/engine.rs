@@ -3,6 +3,7 @@
 use super::{block::{Blocks, Planes, Step}, programs::DensePrograms, weights::DenseWeights};
 use crate::shared::{memory::device::{Allocation, Device, Stream}, qwen::{GdnBank, GdnLayout, LayerStateMap},
     qwen::weights::WeightReader, target_head::TargetHead, token_io::{DeviceLogits, EmbedPlacement, EmbedSource, TokenEmbedding}};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::{Programs, Scalar, VocabularyHead}, CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{families::{qwen::HybridAttention, qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint,
@@ -197,7 +198,8 @@ impl<'a> DenseEngine<'a> {
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         // One preplanned backing holds every target layer, the final norm, head and embedding.
         let arena = super::weights::ScopeArena::new(device,
-            super::weights::target_arena(checkpoint, &cfg, admitted.norm_dtype.clone(), format)?)?;
+            super::weights::target_arena(checkpoint, &cfg, admitted.norm_dtype.clone(), format)?,
+            cuteafd_core::memory_layout::ArenaTag::weights("qwen35/target"))?;
         tracing::info!(arena = arena.layout().id(), bytes = arena.layout().bytes(),
             views = arena.layout().views().len(), padding = arena.layout().padding_bytes(),
             "dense Qwen target weight arena allocated");
@@ -208,15 +210,16 @@ impl<'a> DenseEngine<'a> {
                 |name, bytes| arena.allocate(name, bytes)))?;
         arena.complete()?;
         drop(arena);
-        let mut allocated = sizes.into_iter().map(|bytes| Allocation::untagged(device, alloc_bytes(bytes)))
+        let mut allocated = sizes.into_iter().map(|bytes|
+            Allocation::new(device, alloc_bytes(bytes), Tag::workspace("qwen35/planes")))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
         let planes = Planes { residual: views[0], norm: views[1], delta: views[2], query: views[3],
             gate: views[4], attention: views[5], scratch: views[6], slots: views[7], seq_first: views[8],
             rope_positions: views[9], kv_slots: views[10], positions: views[11], page_table: views[12] };
-        let ids = Allocation::untagged(device, buffers.ids)?;
-        let logits = Allocation::untagged(device, logit_bytes)?;
-        let head_workspace = Allocation::untagged(device, buffers.head)?;
+        let ids = Allocation::new(device, buffers.ids, Tag::workspace("qwen35/ids"))?;
+        let logits = Allocation::new(device, logit_bytes, Tag::workspace("qwen35/logits"))?;
+        let head_workspace = Allocation::new(device, buffers.head, Tag::workspace("qwen35/head-workspace"))?;
         // SAFETY: owned workspace is retained after the head and stream, including error cleanup.
         let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr, cfg.hidden as u32,
             buffers.head_rows as u32, cfg.vocab as u32)? };
@@ -225,11 +228,12 @@ impl<'a> DenseEngine<'a> {
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;
         let kv: Vec<Option<std::rc::Rc<Allocation<'a>>>> = cfg.attention.iter().map(|&kind| -> Result<_> {
             if kind == HybridAttention::Gdn { return Ok(None); }
-            Ok(Some(std::rc::Rc::new(Allocation::untagged(device, pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim))?)))
+            Ok(Some(std::rc::Rc::new(Allocation::new(device,
+                pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim), Tag::kv("qwen35/kv"))?)))
         }).collect::<Result<_>>()?;
         let verification = verify::Verification::new(device, &cfg, slots)?;
         let prefix_arena = if prefix_bytes == 0 { None } else {
-            Some(std::rc::Rc::new(Allocation::untagged(device, prefix_bytes)?))
+            Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes, Tag::prefix("qwen35/prefix"))?))
         };
         // Compare actual allocation owners, not a second evaluation of the
         // planner recipe. This gate also runs for every golden/serving startup.

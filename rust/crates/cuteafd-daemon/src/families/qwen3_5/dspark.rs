@@ -19,7 +19,8 @@ pub(super) fn load_drafter<'a>(engine: &DenseEngine<'a>, programs: &'a Programs<
     let mut requests = DsparkDrafter::arena_requests(snapshot, GlmDraftRepresentation::Bf16Only, device.id)?;
     let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("qwen3_5/dspark/gpu{}", device.id),
         requests.remove(&device.id).context("block dSpark arena lacks the target device")?)?;
-    let arena = super::weights::ScopeArena::new(device, layout)?;
+    let arena = super::weights::ScopeArena::new(device, layout,
+        cuteafd_core::memory_layout::ArenaTag::drafter_weights("qwen35/dspark"))?;
     tracing::info!(arena = arena.layout().id(), bytes = arena.layout().bytes(),
         views = arena.layout().views().len(), padding = arena.layout().padding_bytes(),
         "dense Qwen dSpark weight arena allocated");
