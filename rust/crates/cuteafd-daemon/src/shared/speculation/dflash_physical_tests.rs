@@ -502,6 +502,9 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
             std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
             let programs = library.programs()?.with_manifest(&manifest)?;
             let requests = DflashDrafter::mla_arena_requests(snapshot, representation, 1)?;
+            assert_eq!(layout.weight_arena_requests(), requests[&1]);
+            assert_eq!(cuteafd_loader::families::glm5::draft_physical::mla_arena_requests(
+                &cfg, representation)?, requests[&1]);
             let planned = WeightArenaLayout::new("kimi/draft/1", requests[&1].clone())?;
             assert_eq!(planned.payload_bytes() as u64, layout.weights().resident_bytes()?);
             assert_eq!(planned.padding_bytes(), 0);
@@ -528,6 +531,13 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
             assert_eq!(fixture.mapped_bytes(&library)?, 0);
         }
     }
+    let tensors = cfg.tensor_shapes();
+    write_safetensors(&snapshot.join("model.safetensors"), &tensors.iter().skip(1)
+        .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
+    assert!(DflashDrafter::mla_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only, 1).is_err());
+    write_safetensors(&snapshot.join("model.safetensors"), &tensors.iter()
+        .map(|(name, shape)| t(name, "F32", shape)).collect::<Vec<_>>());
+    assert!(DflashDrafter::mla_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only, 1).is_err());
     Ok(())
 }
 

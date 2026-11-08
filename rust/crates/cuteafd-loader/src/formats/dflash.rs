@@ -165,6 +165,7 @@ pub struct MlaDraftRuntimeLayout {
     buffers: Vec<MlaDraftBuffer>,
     owners: Vec<MlaDraftOwner>,
     weight_destinations: Vec<MlaDraftWeight>,
+    weight_arena_requests: Vec<(String, usize)>,
     context_split: bool,
 }
 
@@ -219,6 +220,14 @@ impl MlaDraftRuntimeLayout {
     pub fn immutable_arena_requests(&self) -> Vec<(String, usize)> {
         self.common_device_buffers().into_iter().filter(|buffer| self.is_immutable_buffer(&buffer.name))
             .map(|buffer| (buffer.name, buffer.bytes)).collect()
+    }
+    /// All immutable destinations, including DFlash2's separately loaded MLA weights.
+    pub fn weight_arena_requests(&self) -> Vec<(String, usize)> {
+        if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 {
+            self.weight_arena_requests.clone()
+        } else {
+            self.immutable_arena_requests()
+        }
     }
     pub fn device_buffers(&self) -> Vec<MlaDraftBuffer> {
         if self.owners.is_empty() { return self.buffers.clone(); }
@@ -1155,9 +1164,12 @@ impl MlaDflashConfig {
             add("fp8_scratch".into(), &[usize::try_from(bytes).map_err(|_| invalid())?])?;
             Some(GlmDraftFp8ScratchLayout { rows: scratch_rows, shapes })
         } else { None };
+        let weight_arena_requests = crate::families::glm5::draft_physical::mla_arena_requests(self, mode)
+            .map_err(|error| unsupported(&error.to_string()))?;
         let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
-            fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(), context_split: false };
+            fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(),
+            weight_arena_requests, context_split: false };
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -1270,7 +1282,8 @@ impl MlaDflashConfig {
             .ok_or_else(|| unsupported("mtp_dspark generated weight overflow"))?;
         let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
-            fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations, context_split: false };
+            fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations,
+            weight_arena_requests: Vec::new(), context_split: false };
         layout.resident_bytes()?;
         Ok(layout)
     }
