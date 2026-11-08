@@ -630,7 +630,7 @@ fn ml4_arena_requests_exactly_cover_real_loader_bindings() -> Result<()> {
     let programs = library.programs()?.with_manifest(&manifest)?;
     let requests = layout.immutable_arena_requests();
     let planned = WeightArenaLayout::new("glm/draft/1", requests.clone())?;
-    let arena = DeviceWeightArena::new(device, planned.clone())?;
+    let arena = DeviceWeightArena::new(device, planned.clone(), crate::shared::memory::TEST_ARENA)?;
     let base = arena.view(&requests[0].0, requests[0].1)?.buffer.ptr as usize;
     let stream = Stream::new(device)?;
     let mut bound = Vec::new();

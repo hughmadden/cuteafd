@@ -303,7 +303,7 @@ mod tests {
                 let reader = WeightReader { library: &library, checkpoint: &checkpoint };
                 for (layout, lifetime) in [(target, Lifetime::RESIDENT), (mtp,
                     Lifetime { first: Phase::DraftLoad, last: Phase::Growth })] {
-                    let arena = ScopeArena::new(device, layout)?;
+                    let arena = ScopeArena::new(device, layout, crate::shared::memory::TEST_ARENA)?;
                     let mut inventory = Inventory::new(CoordinatorDevices::new(&[0])?, "test", lifetime,
                         Category::Weights, "native weights");
                     if lifetime == Lifetime::RESIDENT {

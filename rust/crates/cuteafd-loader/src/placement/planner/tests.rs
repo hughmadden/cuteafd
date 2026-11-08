@@ -406,7 +406,7 @@ fn shared_draft_arena_reconciliation_maps_roots_views_and_derived_references() -
             if physical.len() == 2 { let mut peer = budget(16 << 20);
                 peer.id = "peer".into(); peer.locations = vec![Location::coordinator(1)]; budgets.push(peer); }
             let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
-            let plan = ResolvedPlan { encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+            let plan = ResolvedPlan { pool_page_rows: 64, encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
                 pool_tokens: 64, phases: evaluate(&facts, &budgets)?, budgets, facts };
             let original = plan.clone();
             let mapped = devices.remap_plan_weight_arenas(&plan)?;
