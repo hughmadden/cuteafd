@@ -312,11 +312,6 @@ cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf);
 // Recommended allocation granularity for a whole device dma-buf SEND allocation.
 cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* out);
 cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
-// The tag (kind, NUL-terminated owner copy) this thread last asked an allocator
-// or host registration for, whether or not that allocation succeeded.
-// *required is always the owner's size including its NUL; when it exceeds
-// owner_bytes the status is BUFFER_TOO_SMALL and the caller retries larger.
-cuteafd_status_t cuteafd_last_allocation_tag(uint32_t* kind, char* owner, size_t owner_bytes, size_t* required);
 cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf);
 cuteafd_status_t cuteafd_cuda_stream_create(void** out_cuda_stream);

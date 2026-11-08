@@ -30,6 +30,12 @@ typedef void (*cuteafd_memory_event_callback_t)(int32_t space, uintptr_t ptr, si
 void cuteafd_set_memory_event_callback_v3(cuteafd_memory_event_callback_t callback);
 void cuteafd_memory_event(int32_t space, uintptr_t ptr, size_t bytes, int32_t released, const char* file, int32_t line,
     uint32_t kind, const char* owner);
+// Validates a tag (kind 1..CUTEAFD_MEMORY_KIND_COUNT, nonempty owner) and
+// retains it as this thread's attempted tag; 0 refuses an untagged request.
+int32_t cuteafd_tag_check(uint32_t kind, const char* owner);
+// The tag this thread last attempted. *required is the owner's size with its
+// NUL; status 2 (BUFFER_TOO_SMALL) asks the caller to retry larger.
+int32_t cuteafd_last_allocation_tag(uint32_t* kind, char* owner, size_t owner_bytes, size_t* required);
 #ifdef __cplusplus
 }
 
