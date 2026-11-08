@@ -194,6 +194,14 @@ impl Fixture {
         Ok(())
     }
 
+    /// The fake media tower: every free fails, or scratch allocation fails after weights.
+    pub fn media_configure(&self, library: &NativeLibrary, free_fails: bool, fail_after_weights: bool) -> Result<()> {
+        // SAFETY: the private fixture export updates only its media controls.
+        unsafe { library.lib.get::<unsafe extern "C" fn(i32, i32)>(b"fixture_media_configure")?(
+            i32::from(free_fails), i32::from(fail_after_weights)); }
+        Ok(())
+    }
+
     /// Number of rejected frees and the last (owning device, current device).
     pub fn device_free_mismatch(&self, library: &NativeLibrary) -> Result<(usize, i32, i32)> {
         let (mut owner, mut current) = (-1, -1);

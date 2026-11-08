@@ -408,6 +408,12 @@ fn failed_allocations_keep_the_attempted_tag_and_untagged_requests_are_refused()
         assert_ne!(unsafe { allocate(64, &mut buffer, kind, owner) }, 0);
         assert!(buffer.ptr.is_null());
     }
+    // An owner of any length round-trips whole: the API sizes, then reads.
+    let long = format!("test/{}", "o".repeat(400));
+    let long_tag = memory_ledger::tag(memory_ledger::MemoryKind::Workspace, &long);
+    let mut buffer = library.alloc_device_buffer(64, long_tag)?;
+    assert_eq!(library.last_allocation_tag()?, Some(long_tag));
+    library.free_device_buffer(&mut buffer)?;
     let mut host = library.alloc_host_buffer(64, memory_ledger::Tag::staging("test/host"))?;
     assert_eq!(memory_ledger::tag_of(host.ptr as usize), Some(memory_ledger::Tag::staging("test/host")));
     library.free_host_buffer(&mut host)?;

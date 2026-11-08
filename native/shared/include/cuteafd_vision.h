@@ -47,7 +47,7 @@ typedef int32_t (*cuteafd_vision_observer)(void*, int32_t stage, const void* dat
  * lowest-priority nonblocking stream; no CUDA allocation/capture in encode. */
 int32_t cuteafd_vision_required(const cuteafd_vision_spec*, cuteafd_vision_ledger*);
 int32_t cuteafd_vision_create(const cuteafd_vision_spec*, int32_t device,
-                             uint64_t admitted_bytes, void** owner);
+                             uint64_t admitted_bytes, const cuteafd_media_tags* tags, void** owner);
 int32_t cuteafd_vision_upload(void* owner, uint64_t offset, const void*, uint64_t bytes);
 /* Deferred push exposes the existing admitted arena, zeroing its padding.
  * The caller drains external writes before commit; encode refuses until then. */

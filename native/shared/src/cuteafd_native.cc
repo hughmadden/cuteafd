@@ -983,12 +983,28 @@ cuteafd_status_t check_tag(uint32_t kind, const char* owner) {
 }
 }  // namespace
 
-extern "C" cuteafd_status_t cuteafd_last_allocation_tag(uint32_t* kind, char* owner, size_t owner_bytes) {
-  if (kind == nullptr || owner == nullptr || owner_bytes == 0) {
+// Media runtimes (vision, audio, PCM towers) allocate their two backings
+// through this: the tag is checked and retained exactly as for the public
+// allocators, so a failed tower allocation reports the tag it asked for.
+extern "C" int32_t cuteafd_media_allocate(void** ptr, size_t bytes, uint32_t kind, const char* owner) {
+  if (ptr == nullptr || bytes == 0) return 1;  // cudaErrorInvalidValue
+  *ptr = nullptr;
+  if (check_tag(kind, owner) != CUTEAFD_STATUS_OK) return 1;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  return static_cast<int32_t>(cudaMalloc(ptr, bytes));
+#else
+  return 35;  // cudaErrorInsufficientDriver: no device allocations without CUDA
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_last_allocation_tag(uint32_t* kind, char* owner, size_t owner_bytes,
+                                                     size_t* required) {
+  if (kind == nullptr || required == nullptr || (owner == nullptr && owner_bytes != 0)) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "allocation tag output is null");
   }
   *kind = g_attempted_kind;
-  if (g_attempted_owner.size() + 1 > owner_bytes) {
+  *required = g_attempted_owner.size() + 1;
+  if (*required > owner_bytes) {
     return fail(CUTEAFD_STATUS_BUFFER_TOO_SMALL, "allocation owner exceeds the output buffer");
   }
   std::memcpy(owner, g_attempted_owner.c_str(), g_attempted_owner.size() + 1);
