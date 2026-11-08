@@ -11,6 +11,23 @@ def _harness():
     return module
 
 
+def test_native_mimo_target_and_draft_heads_construct_no_generic_blas():
+    root = Path(__file__).resolve().parents[2]
+    family = root / "rust/crates/cuteafd-daemon/src/families/mimo_v2"
+    engine = (family / "engine.rs").read_text()
+    slots = engine.split("let slot_heads = Rc::new(if ", 1)[1].split("let workspace = Workspace", 1)[0]
+    guard, construct = slots.split("self.library.vocabulary_head_rows", 1)
+    assert "with_head && matches!(self.weights.head, super::head::MimoHead::Bf16(_))" in guard
+    assert "configured().native_mode()" in construct
+    draft = (family / "dflash.rs").read_text()
+    output = draft.split("Ok(DraftOutput {", 1)[1].split("_head_workspace:", 1)[0]
+    assert "head: self.bf16_head.then(" in output
+    assert "cuteafd_ffi::programs::HeadMode::Gemm" in output
+    launch = (family / "head.rs").read_text().split("MimoHead::Fp8 { values, scales } =>", 1)[1]
+    assert "program.launch(" in launch
+    assert "bf16.context(" not in launch
+
+
 def test_calibration_keeps_strict_fail_and_demands_native_mean_floor():
     gate = _harness()
     native = {

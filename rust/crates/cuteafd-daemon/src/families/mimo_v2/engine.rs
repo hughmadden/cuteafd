@@ -1420,7 +1420,7 @@ impl<'a> MimoEngine<'a> {
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
         let slot_count = if decode { 1 } else { self.prefill_waves() };
         let head_stride = head_workspace.buffer.bytes / slot_count;
-        let slot_heads = Rc::new(if with_head {
+        let slot_heads = Rc::new(if with_head && matches!(self.weights.head, super::head::MimoHead::Bf16(_)) {
             (0..slot_count).map(|slot| {
                 let buffer = head_workspace.view(slot * head_stride, head_stride)?;
                 // SAFETY: each handle has disjoint admitted scratch, retained by this workspace.
