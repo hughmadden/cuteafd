@@ -130,6 +130,32 @@ pub fn draft_layout_from_headers<'a>(tensors: impl IntoIterator<Item = &'a Safet
     WeightArenaLayout::new("v41/dspark/dense", requests)
 }
 
+/// The bundled vision tower's BF16 tensors, in the serving loader's order.
+pub fn vision_names() -> Vec<String> {
+    let mut names = ["vision.patch_embed.proj.weight", "vision.patch_embed.proj.bias", "vision.norm.weight",
+        "aligner.w1.weight", "aligner.w1.bias", "aligner.w2.weight", "aligner.w2.bias",
+        "image_start", "image_end", "image_newline"].map(String::from).to_vec();
+    for layer in 0..32 {
+        for suffix in ["norm1.weight", "attn.wqkv.weight", "attn.wqkv.bias", "attn.wo.weight",
+            "attn.wo.bias", "norm2.weight", "mlp.w1.weight", "mlp.w2.weight"] {
+            names.push(format!("vision.blocks.{layer}.{suffix}"));
+        }
+    }
+    names
+}
+
+/// The vision tower's one coordinator arena, from checkpoint headers only: the
+/// recipe the serving tower allocates and the planner charges.
+pub fn vision_layout_from_headers<'a>(tensors: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>)
+    -> Result<WeightArenaLayout> {
+    let tensors: BTreeMap<_, _> = tensors.into_iter().map(|tensor| (tensor.name.as_str(), tensor)).collect();
+    WeightArenaLayout::new("v41/vision", vision_names().into_iter().map(|name| {
+        let tensor = tensors.get(name.as_str()).with_context(|| format!("missing vision tensor {name}"))?;
+        ensure!(tensor.dtype == cuteafd_core::DType::Bf16, "vision tensor must retain BF16: {name}");
+        Ok((name, usize::try_from(tensor.byte_length)?))
+    }).collect::<Result<Vec<_>>>()?)
+}
+
 fn fp8_half_bytes(tensors: &BTreeMap<&str, &SafetensorsTensorMetadata>, name: &str,
     shape: [usize; 2]) -> Result<usize> {
     let tensor = tensors.get(name).with_context(|| format!("missing TP2 weight {name}"))?;

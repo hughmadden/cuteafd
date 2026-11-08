@@ -105,15 +105,42 @@ pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize,
     Ok(lanes + outputs + crate::serving_capacity::prefill_return_bytes_with_format(slots as u64, rows, ranks as u64, 5120, format)?)
 }
 
-/// Full vocabulary packing peak above the pre-weight sample: the resident
-/// weights (but the head being packed) and the packing staging. Every lane
-/// and slot owner, transport, draft, vision and mark allocates after it.
-pub fn vocabulary_load_phase(weights: &[Demand], target: &[Demand], packing: u64) -> Result<Demand> {
-    ensure!(weights.iter().chain(target).all(|d| d.gpu == 0),
-        "vocabulary startup phase requires the single-RTX owners");
-    let bytes = weights.iter().filter(|d| !matches!(d.group.as_str(), "lm_head" | "norm")).try_fold(packing, |sum, d|
-        sum.checked_add(d.bytes).context("V4.1 vocabulary phase overflow"))?;
+/// Single-RTX vocabulary packing peak above the pre-weight sample. The whole
+/// target arena (final head copy included) is allocated before any payload, so
+/// the peak is its extent B plus the head conversion's transient source, the
+/// same bound `TargetArenas::new` checks before allocating. Every lane and slot
+/// owner, transport, draft, vision and mark allocates after it.
+pub fn vocabulary_load_phase(arena: &crate::serving_capacity::WeightArenaLayout,
+    head: super::resident::Fp8Head) -> Result<Demand> {
+    let transient = super::weight_layout::TargetLayout::vocabulary_transient_bytes(head, 1)? as u64;
+    let bytes = (arena.bytes() as u64).checked_add(transient).context("V4.1 vocabulary phase overflow")?;
     Ok(Demand::new(0, Category::Staging, "vocabulary packing", bytes, Basis::Formula))
+}
+
+/// Retained device target weights as one demand per arena (extent B, resident
+/// B), replacing the per-tensor `resident_headers` device items. Load phases,
+/// the pre-draft sample and admission all see the arena exactly where the
+/// payload used to be; `ProductionInput::weight_arenas` carries the layouts.
+pub fn target_arena_demands(layout: &super::weight_layout::TargetLayout) -> Vec<Demand> {
+    layout.ranks.iter().enumerate().map(|(rank, arena)| arena_demand(rank as u8, arena)).collect()
+}
+
+/// One arena's placeholder demand (extent B, resident B): every load phase and
+/// sum sees it where the payload was. `ProductionInput` binds it by arena ID to
+/// its layout and charges the shared root, logical claim and tail.
+pub fn arena_demand(gpu: u8, arena: &crate::serving_capacity::WeightArenaLayout) -> Demand {
+    Demand::new(gpu, Category::Weights, format!("{WEIGHT_ARENA_PREFIX}{}", arena.id()),
+        arena.bytes() as u64, Basis::Exact)
+        .with_resident_weights(crate::placement::ResidentWeights(arena.bytes() as u64))
+}
+
+/// Arena demands are named `weight arena:<layout id>`.
+pub const WEIGHT_ARENA_PREFIX: &str = "weight arena:";
+
+/// The device weight items the arenas replace: everything `resident_headers`
+/// places on a coordinator GPU (a host-placed embedding stays a host owner).
+pub fn is_arena_weight(item: &cuteafd_core::memory_layout::Item) -> bool {
+    matches!(item.category, Category::Weights | Category::Embedding | Category::Tables)
 }
 
 /// Serving lanes allocated after the dual-RTX draft loader drains. Setup is
@@ -537,12 +564,17 @@ mod tests {
         let target = vec![demand("lane 0 backbone", 40), demand("lane 0 engram", 30),
             demand("lane 0 window batch table", 5), demand("lane 0 target head", 60),
             demand("lane 0 target taps", 70), demand("lane 1 backbone", 80)];
-        // Lanes and slots allocate after the head is packed.
-        let phase = vocabulary_load_phase(&weights, &target, 400)?;
-        assert_eq!(phase.bytes, 400 + 100 + 20 + 50);
-        assert_eq!(phase.category, Category::Staging);
-        assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
-        assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
+        let _ = (&weights, &target);
+        // The whole target arena exists before the head converts; only the
+        // mode's transient source sits beside it. Lanes and slots come after.
+        let arena = crate::serving_capacity::WeightArenaLayout::new("v41/target/gpu0",
+            [("head.fp8.payload".to_string(), 3 << 20), ("norm.weight".to_string(), 10)])?;
+        for (head, transient) in [(Fp8Head::All, 16 * 10240), (Fp8Head::Off, 0), (Fp8Head::Draft, 0),
+            (Fp8Head::Packed, 129280 * 10240)] {
+            let phase = vocabulary_load_phase(&arena, head)?;
+            assert_eq!(phase.bytes, arena.bytes() as u64 + transient, "{head:?}");
+            assert_eq!(phase.category, Category::Staging);
+        }
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             assert_eq!(transport_bytes(1024, ranks)?, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(1024 * 10240)?
                 + 2 * 1024 * 10240);
@@ -582,9 +614,11 @@ mod tests {
         let target = vec![demand(0, "lane 0 backbone", 40), demand(0, "lane 0 engram", 30),
             demand(0, "lane 0 window batch table", 5), demand(0, "lane 0 target head", 60),
             demand(0, "lane 0 target taps", 70), demand(0, "lane 1 backbone", 80)];
-        let vocabulary = vocabulary_load_phase(&weights, &target,
-            Fp8Head::All.load_bytes(1_323_827_200))?;
-        assert_eq!(vocabulary.bytes, 2_006_425_845 - 40 - 30 - 5);
+        let _ = (&weights, &target);
+        let arena = crate::serving_capacity::WeightArenaLayout::new("v41/target/gpu0",
+            [("weights".to_string(), 170), ("head.fp8.payload".to_string(), 682_598_400)])?;
+        let vocabulary = vocabulary_load_phase(&arena, Fp8Head::All)?;
+        assert_eq!(vocabulary.bytes, arena.bytes() as u64 + 16 * 10240);
         let draft = DraftInventory { resident: 600, loading_experts: [500, 0],
             staging: [200, 0], loader_peak: [600, 0], marks: 50,
             runtime: vec![demand(0, "draft runtime", 70)], ..Default::default() };

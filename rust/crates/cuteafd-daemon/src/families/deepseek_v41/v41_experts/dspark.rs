@@ -272,7 +272,8 @@ impl<'library> DsparkWeights<'library> {
             runtime: vec![cuteafd_loader::placement::Demand::new(0, Category::Drafter, "dSpark lanes/windows",
                 runtime as u64, Basis::Exact)],
             marks: 0, peer_half: 0, staging: [staging as u64, 0],
-            loading_experts: [budget.expert_resident_bytes as u64, 0], loader_peak: [peak as u64, 0] })
+            loading_experts: [budget.expert_resident_bytes as u64, 0], loader_peak: [peak as u64, 0],
+            dense: Some(cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(catalog)?) })
     }
 
     /// Every owner the distributed (two-RTX) drafter retains, before any
@@ -336,7 +337,8 @@ impl<'library> DsparkWeights<'library> {
         Ok(cuteafd_loader::placement::families::deepseek_v41::DraftInventory {
             resident: resident as u64, runtime: runtime.into_iter().filter(|d| d.bytes > 0).collect(),
             marks: mark_bytes as u64, peer_half: peer_half as u64, staging: staging.map(|b| b as u64),
-            loading_experts: loading_experts.map(|b| b as u64), loader_peak: loader_peak.map(|b| b as u64) })
+            loading_experts: loading_experts.map(|b| b as u64), loader_peak: loader_peak.map(|b| b as u64),
+            dense: Some(cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(catalog)?) })
     }
 
     /// Exact single-coordinator serving owners, before reading any payload.

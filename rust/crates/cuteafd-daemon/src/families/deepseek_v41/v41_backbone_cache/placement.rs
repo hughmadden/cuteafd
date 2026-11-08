@@ -61,7 +61,7 @@ mod tests {
                 onboard_minimum: 0, onboard_counts: None,
                 experts: vec![ExpertCost { whole: Bytes2::default(), half: [Bytes2::default(); 2],
                     tp2: ranks == 2, whole_supported: true, spark_ok: true }; 40],
-                workspace: 0, owners: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
+                workspace: 0, owners: Vec::new(), weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
                 draft: None, encoders: Vec::new(), media_cache_bytes: 0,
                 resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
                 operation: Operation::Serving,
