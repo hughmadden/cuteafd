@@ -38,6 +38,7 @@ impl Space {
 #[derive(Default)]
 struct Context {
     scopes: Vec<&'static str>,
+    site: Option<&'static std::panic::Location<'static>>,
     /// The owner tag ([`owner`]): survives nested category scopes.
     owner: Option<&'static str>,
     tensor: Option<&'static str>,
@@ -80,6 +81,7 @@ struct State {
     peak: BTreeMap<(Space, i32), usize>,
     current: BTreeMap<(Space, i32), usize>,
     audits: Vec<Weak<Mutex<AuditEvents>>>,
+    unscoped_sites: HashSet<&'static std::panic::Location<'static>>,
 }
 
 /// An actual native allocation, before aggregation removes pointer identity.
@@ -280,6 +282,20 @@ impl Drop for Format {
     }
 }
 
+/// Preserve an owning wrapper's caller through device-selection closures.
+#[must_use]
+pub struct AllocationSite(Option<&'static std::panic::Location<'static>>);
+
+pub fn allocation_site(site: &'static std::panic::Location<'static>) -> AllocationSite {
+    AllocationSite(CONTEXT.with(|context| context.borrow_mut().site.replace(site)))
+}
+
+impl Drop for AllocationSite {
+    fn drop(&mut self) {
+        CONTEXT.with(|context| context.borrow_mut().site = self.0);
+    }
+}
+
 fn current_key(space: Space, device: i32) -> (Key, Option<&'static str>) {
     CONTEXT.with(|context| {
         let context = context.borrow();
@@ -294,20 +310,27 @@ fn current_key(space: Space, device: i32) -> (Key, Option<&'static str>) {
     })
 }
 
+#[track_caller]
 pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize) {
     record_backing(space, device, ptr, bytes, None);
 }
 
+#[track_caller]
 pub(crate) fn record_endpoint_alloc(space: Space, ptr: usize, bytes: usize, endpoint: usize) {
     record_backing(space, -1, ptr, bytes, Some(endpoint));
 }
 
+#[track_caller]
 fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint: Option<usize>) {
     if ptr == 0 || bytes == 0 {
         return;
     }
     let (key, name) = current_key(space, device);
+    let caller = std::panic::Location::caller();
+    let site = CONTEXT.with(|context| context.borrow().site).unwrap_or(caller);
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+    let warn = key.scope == "other" && matches!(space, Space::Device | Space::Pinned | Space::Managed)
+        && state.unscoped_sites.insert(site);
     if let (Some(name), Some(format)) = (name, key.format) {
         if !format.ends_with("scale") {
             let formats = state.formats.entry((device, name)).or_default();
@@ -332,6 +355,12 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
         }));
     }
     audit_event(&mut state, AllocationEvent::Allocated(AllocationRecord { address: ptr, key, bytes, endpoint }));
+    drop(state);
+    if warn {
+        tracing::warn!(target: "cuteafd::memory", %site, owner = key.owner,
+            tensor = key.tensor, name, bytes, device, space = space.label(),
+            "unscoped native allocation");
+    }
 }
 
 fn release(state: &mut State, live: Live) {
@@ -467,6 +496,52 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+/// Allocation state captured before a native error unwinds owning buffers.
+#[derive(Debug)]
+pub struct FailureSnapshot {
+    pub ledger: Snapshot,
+    pub device_memory: BTreeMap<i32, (usize, usize)>,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for FailureSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for FailureSnapshot {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.source.as_ref()) }
+}
+
+impl FailureSnapshot {
+    pub fn new(source: anyhow::Error, ledger: Snapshot,
+        device_memory: BTreeMap<i32, (usize, usize)>) -> Self {
+        Self { ledger, device_memory, source }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        // Keep evidence in the source chain for typed startup wrappers, and
+        // expose the native tag through anyhow's direct context downcasts too.
+        let native = self.source.downcast_ref::<crate::NativeStatusError>().cloned();
+        let error = anyhow::Error::new(self);
+        match native {
+            Some(native) => error.context(native),
+            None => error,
+        }
+    }
+}
+
+pub(crate) fn capture_failure(error: anyhow::Error) -> anyhow::Error {
+    let ledger = snapshot();
+    // Error reporting must not change the failing thread's selected device.
+    let devices = ledger.devices();
+    let device_memory = std::thread::spawn(move || devices.into_iter()
+        .filter_map(|device| device_memory(device).map(|memory| (device, memory))).collect())
+        .join().unwrap_or_default();
+    FailureSnapshot::new(error, ledger, device_memory).into_error()
+}
+
 fn loaded_cuda_runtime() -> Option<&'static libloading::os::unix::Library> {
     use libloading::os::unix::Library;
     static RUNTIME: OnceLock<Library> = OnceLock::new();
@@ -559,6 +634,92 @@ pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_failure_retains_owners_before_unwind() {
+        let _ledger = test_guard();
+        let address = 0x7600_0000_0000usize;
+        let _scope = scope("workspace/failure-fixture");
+        record_alloc(Space::Device, 31, address, 512);
+        let error = capture_failure(anyhow::anyhow!("native fixture error"));
+        record_free(address);
+        let saved = error.downcast_ref::<FailureSnapshot>().unwrap();
+        assert_eq!(saved.ledger.by_scope(Space::Device, 31)["workspace/failure-fixture"], 512);
+        assert_eq!(snapshot().total(Space::Device, 31), 0);
+        assert!(format!("{error:#}").contains("native fixture error"));
+    }
+
+    #[test]
+    fn failure_evidence_preserves_direct_typed_downcasts() {
+        let _ledger = test_guard();
+        let source = anyhow::Error::new(crate::NativeStatusError {
+            context: "snapshot fixture".into(), status: 98, detail: "native detail".into(),
+        }).context("startup context");
+        let error = capture_failure(source).context("family initialization");
+        let native = error.downcast_ref::<crate::NativeStatusError>().unwrap();
+        assert_eq!(native.status, 98);
+        assert_eq!(native.detail, "native detail");
+        assert!(error.downcast_ref::<FailureSnapshot>().is_some());
+        assert!(error.chain().any(|cause| cause.is::<FailureSnapshot>()));
+        let original = error.chain().find_map(|cause| cause.downcast_ref::<crate::NativeStatusError>()).unwrap();
+        assert_eq!(native, original);
+        assert!(!std::ptr::eq(native, original));
+        assert_eq!(native.to_string(), original.to_string());
+        assert!(format!("{error:#}").contains("startup context"));
+    }
+
+    #[test]
+    fn unscoped_allocations_report_distinct_sites_once() {
+        use tracing::{Event, Metadata, Subscriber, span::{Attributes, Id, Record}};
+        #[derive(Clone, Default)]
+        struct Warnings(Arc<Mutex<Vec<String>>>);
+        impl Subscriber for Warnings {
+            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        self.0.push_str(&format!("{}={value:?};", field.name()));
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                if event.metadata().level() == &tracing::Level::WARN {
+                    // A subscriber may inspect allocations while handling the warning.
+                    let ledger = state().try_lock().expect("warning emitted under the ledger lock");
+                    assert!(ledger.live.values().any(|live| live.key.owner == Some("unscoped-fixture")));
+                    drop(ledger);
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+        }
+        let _ledger = test_guard();
+        let warnings = Warnings::default();
+        let _owner = owner("unscoped-fixture");
+        tracing::subscriber::with_default(warnings.clone(), || {
+            for address in [0x7700_0000_0000, 0x7700_0000_0001] {
+                record_alloc(Space::Device, 32, address, 32);
+                record_free(address);
+            }
+            record_alloc(Space::Pinned, -1, 0x7700_0000_0002, 64);
+            record_free(0x7700_0000_0002);
+            let _scope = scope("workspace/fixture");
+            record_alloc(Space::Device, 32, 0x7700_0000_0003, 32);
+            record_free(0x7700_0000_0003);
+        });
+        let warnings = warnings.0.lock().unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().all(|message| message.contains("unscoped native allocation")
+            && message.contains("unscoped-fixture") && message.contains(file!())));
+        let sites = warnings.iter().map(|message| message.split("site=").nth(1).unwrap()
+            .split(';').next().unwrap()).collect::<std::collections::HashSet<_>>();
+        assert_eq!(sites.len(), 2, "warnings must identify distinct allocation sites");
+    }
 
     #[test]
     fn startup_history_preserves_transients_reuse_and_initial_owners() {

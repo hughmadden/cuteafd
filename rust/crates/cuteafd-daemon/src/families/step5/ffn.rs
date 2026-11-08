@@ -450,7 +450,7 @@ impl<'a> DenseFfn<'a> {
 
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<DenseWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("step5_dense_workspace");
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-dense");
         let spans = cuteafd_loader::plan::families::step5::native::dense_layout(admission.rows, admission.span)?;
         ensure!(spans.iter().zip(&admission.planes).all(|(span, &bytes)| span.1 == bytes),
             "Step-5 dense region layout differs from admission");

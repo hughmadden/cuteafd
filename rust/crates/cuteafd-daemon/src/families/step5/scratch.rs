@@ -23,7 +23,7 @@ impl BufferOwner for Plane<'_> {
 pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<crate::shared::memory::StandaloneStream<'a>>);
 impl<'a> Arena<'a> {
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("step5_scratch_workspace");
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-scratch");
         Ok(Self(Rc::new(Allocation::new(device, bytes)?), Rc::new(crate::shared::memory::StandaloneStream::new(device))))
     }
 

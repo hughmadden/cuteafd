@@ -910,7 +910,10 @@ impl NativeLibrary {
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, &mut handle)
         };
-        ensure!(status == 0, "vocabulary head creation failed with {status}");
+        if status != 0 {
+            return Err(crate::memory_ledger::capture_failure(
+                anyhow::anyhow!("vocabulary head creation failed with {status}")));
+        }
         Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op, launch_tensor_invariant })
     }
 }
@@ -1309,7 +1312,10 @@ impl NativeLibrary {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?,
                 i32::try_from(vocab)?, &mut handle)
         };
-        ensure!(status == 0, "vocabulary head creation failed with {status}");
+        if status != 0 {
+            return Err(crate::memory_ledger::capture_failure(
+                anyhow::anyhow!("vocabulary head creation failed with {status}")));
+        }
         Ok(VocabularyHead { library: self, handle, launch, launch_tensor_op, launch_tensor_invariant })
     }
 }
