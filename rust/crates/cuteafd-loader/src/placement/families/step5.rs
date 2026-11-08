@@ -429,10 +429,14 @@ impl<'a> Step5Recipe<'a> {
             }
         }
         let heads = native.iter().enumerate().flat_map(|(rank, native)| native.vocabulary_heads.iter()
-            .map(move |head| serving::BlasOwners {
-                name: format!("step5/vocabulary-head-cublas/{head}"), process: "coordinator".into(),
-                location: Location::coordinator(rank as u8), cublas_handles: 1, lt_handles: 1,
-                lifetime: Lifetime::RESIDENT, activation: Activation::always(),
+            .map(move |head| {
+                let mode = if head == "target" { inputs.bf16_target_head } else { serving::BlasHead::Gemm };
+                serving::BlasOwners {
+                    name: format!("step5/vocabulary/{head}"), process: "coordinator".into(),
+                    thread: "step5/blas/serve".into(), location: Location::coordinator(rank as u8),
+                    gemm: mode.gemm(), lt: mode.lt(),
+                    lifetime: Lifetime::RESIDENT, activation: Activation::always(),
+                }
             })).collect::<Vec<_>>();
         let mut runtime = serving::blas_components("sm_120", &heads, maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?;
         let peak = crate::plan::families::step5::admission::startup_peak_live_streams();

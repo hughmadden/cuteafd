@@ -174,6 +174,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 #[derive(Clone)]
 pub struct RuntimeInputs {
     pub host: HostInputs,
+    pub bf16_target_head: crate::placement::planner::serving::BlasHead,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
@@ -587,7 +588,8 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+        RuntimeInputs { bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+            host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             full_prefill_logits: false, waves: 1, unit: 0,
             inventory: Inventory {
@@ -1094,31 +1096,36 @@ mod tests {
     }
 
     #[test]
-    fn only_bf16_vocabulary_heads_retain_named_blas_owners() -> Result<()> {
-        use crate::placement::planner::{Location, Phase};
+    fn bf16_predictors_share_one_named_gemm_pool_and_native_heads_have_none() -> Result<()> {
+        use crate::placement::planner::{Location, Phase, serving::BlasHead};
         for native in [false, true] {
             let fixture = if native { super::super::tests::exl3_snapshot() }
                 else { super::super::tests::snapshot("bf16") };
             let checkpoint = Checkpoint::open(fixture.path())?;
             let contract = super::super::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
             for ranks in [1, 2] {
-                let input = inputs(ranks);
-                for depth in [0, 3] {
-                    let admitted = admit_mtp_with_contract(&checkpoint, &input, depth, &contract)?;
-                    let facts = &admitted.solved.facts;
-                    let handles = facts.allowances.iter().filter(|owner|
-                        owner.source.contains("step5/vocabulary-head-cublas/")).collect::<Vec<_>>();
-                    assert_eq!(handles.len(), if native { 0 } else { depth + 1 });
-                    if !native {
-                        for name in ["target".to_owned()].into_iter().chain((0..depth).map(|i| format!("mtp-{i}"))) {
-                            assert!(handles.iter().any(|owner| owner.source.contains(
-                                &format!("step5/vocabulary-head-cublas/{name} "))));
+                for mode in [BlasHead::TensorLt, BlasHead::Gemm] {
+                    let mut input = inputs(ranks);
+                    input.bf16_target_head = mode;
+                    for depth in [0, 1, 3] {
+                        let admitted = admit_mtp_with_contract(&checkpoint, &input, depth, &contract)?;
+                        let facts = &admitted.solved.facts;
+                        for &phase in facts.phase_order.phases() {
+                            let handles = facts.allowances.iter().filter(|owner|
+                                owner.source.starts_with("cuBLAS handles: step5/blas/serve")
+                                    && owner.lifetime.contains(phase, facts.phase_order)).collect::<Vec<_>>();
+                            let expected = usize::from(!native && (depth > 0 || mode.gemm()));
+                            assert_eq!(handles.len(), expected, "one GEMM per host thread/device, not predictor");
+                            assert_eq!(handles.iter().map(|owner| owner.bytes).sum::<u64>(),
+                                expected as u64 * (64 << 20));
+                            assert!(handles.iter().all(|owner| owner.location == Location::coordinator(0)));
                         }
+                        let init = facts.allowances.iter().filter(|owner| owner.source.starts_with("BLAS device initialization")
+                            && owner.lifetime.contains(Phase::Growth, facts.phase_order)).collect::<Vec<_>>();
+                        assert_eq!(init.len(), usize::from(!native));
+                        assert_eq!(init.iter().map(|owner| owner.bytes).sum::<u64>(), u64::from(!native) * (2 << 20));
+                        assert!(init.iter().all(|owner| owner.location == Location::coordinator(0)));
                     }
-                    let init = facts.allowances.iter().filter(|owner| owner.source.starts_with("BLAS device initialization")
-                        && owner.lifetime.contains(Phase::Growth, facts.phase_order)).collect::<Vec<_>>();
-                    assert_eq!(init.len(), usize::from(!native));
-                    assert!(handles.iter().chain(&init).all(|owner| owner.location == Location::coordinator(0)));
                 }
             }
         }

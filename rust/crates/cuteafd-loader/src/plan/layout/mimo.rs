@@ -713,6 +713,8 @@ mod tests {
                             vec![Baseline::Forecast { occupied: 0, source: "empty fixture devices".into(), assumed: false }; ranks],
                             opts.host_memory.unwrap(), opts.spark_bytes, 4).unwrap();
                         let runtime = production::ProductionInput {
+                            blas_head: if pro { crate::placement::planner::serving::BlasHead::Native }
+                                else { opts.bf16_target_head }, draft_head: false,
                             expert_usage: opts.expert_usage, cfg: &cfg, layers: cfg.layers, kv,
                             mtp_stages: 0, context: 32768, maximum_pool_tokens: 32768, prefill,
                             lanes: lanes as u64, embedding: EmbeddingHome::Device(0), gpus: ranks, spark_ranks: 4,

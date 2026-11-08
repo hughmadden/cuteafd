@@ -198,7 +198,8 @@ impl<'a> TargetHeadOwner<'a> {
                 // SAFETY: private workspace survives the private handle on this device.
                 Some(unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
                     H as u32, rows as u32, V as u32,
-                    crate::shared::target_head::TargetHead::configured().native_mode())? })
+                    if immutable.predictor { cuteafd_ffi::programs::HeadMode::Gemm }
+                    else { crate::shared::target_head::TargetHead::configured().native_mode() })? })
             } else { None };
             crate::shared::inventory::startup_probe(device.library, &[device.id],
                 &format!("step5/{label}-head-after-cublas-handle"), Default::default())?;

@@ -1667,6 +1667,7 @@ mod tests {
                 let mut host = QwenHost::ample(&cfg, 2, 4096).unwrap();
                 host.host_embedding = bytes;
                 let inputs = QwenDualInputs {
+                    blas_head: crate::placement::planner::serving::BlasHead::Native,
                     resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                     admission: single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
                         0, None, None, ResidentWeights(0), None).admission,
