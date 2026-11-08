@@ -39,11 +39,11 @@ pub(crate) struct MissingVariant {
 static MISSING: std::sync::Mutex<Vec<MissingVariant>> = std::sync::Mutex::new(Vec::new());
 
 /// Counts one eager execution of `shape` and reports whether it is the first,
-/// which is the only occurrence that warns. A bank miss is a mismatch between
-/// the sealed startup inventory and real traffic, so it is rare by construction.
-/// A family that owns its decode graph holder directly (Qwen) calls this too, so
-/// every family's misses land in the same process-wide /v1/stats inventory.
-pub(crate) fn note_missing(family: &'static str, shape: &str) -> bool {
+/// which is the only occurrence that warns. Every caller goes through
+/// `note_eager`, so misses are recorded and warned about in one place; a miss is
+/// a mismatch between the sealed startup inventory and real traffic, so it is
+/// rare by construction.
+fn note_missing(family: &'static str, shape: &str) -> bool {
     let mut missing = MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match missing.iter_mut().find(|entry| entry.family == family && entry.shape == shape) {
         Some(entry) => { entry.runs += 1; false }
@@ -58,10 +58,10 @@ pub(crate) fn missing_variants() -> Vec<MissingVariant> {
 
 /// Counts one eager execution of `shape` outside a sealed startup set and
 /// reports whether it is the first for this family, which is the only one that
-/// warns. Owners that hold their own executable and decide eager themselves
-/// call this directly; `GraphBank::enqueue_with_context` calls it too, so both
-/// paths land in the same /v1/stats entry. The `context` is built only on a
-/// first miss.
+/// warns. This is the single entry point for eager work: owners that hold their
+/// own executable and decide eager themselves (Qwen) call it directly, and
+/// `GraphBank::enqueue_with_context` calls it too, so every path lands in the
+/// same /v1/stats entry. The `context` is built only on a first miss.
 pub(crate) fn note_eager(family: &'static str, shape: &str, context: impl FnOnce() -> String) -> bool {
     if !note_missing(family, shape) { return false; }
     // Built outside the macro so the description is produced even when the

@@ -3671,13 +3671,9 @@ impl<'a> Qwen4Engine<'a> {
     fn miss_graph(&self, key: GraphKey) {
         let variant = format!("rows={} spec={} long={} pool_width={} page_stride={} pool_stride={}",
             key.rows, key.spec, key.long, key.pool_width, key.page_stride, key.pool_stride);
-        if crate::shared::decode_graph::note_missing("qwen4", &variant) {
-            tracing::warn!(target: "cuteafd::graph_capture", family = "qwen4", shape = %variant,
-                segment = key.segment, max_context = self.max_context, slots = self.slots,
-                pages = self.pages,
-                "qwen4 decode shape is outside the startup graph set: running it ungraphed and allocating no \
-                 graph bytes; consider adding it to the startup graph set");
-        }
+        crate::shared::decode_graph::note_eager("qwen4", &variant, || format!(
+            "segment={} max_context={} slots={} pages={}",
+            key.segment, self.max_context, self.slots, self.pages));
     }
 
     fn site<'l>(layer: &'l Qwen4Layer<'_>, site: &str) -> Result<[*mut c_void; 3]> {

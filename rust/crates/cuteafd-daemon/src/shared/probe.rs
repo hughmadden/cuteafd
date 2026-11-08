@@ -139,19 +139,28 @@ mod graph_stats_tests {
         assert!(stats["graph_captures"].is_u64());
     }
 
-    /// An owner that holds its own executable reports the same way a bank does,
-    /// so a family with several graph owners has one /v1/stats entry per shape.
+    /// A bank miss and an owner that holds its own executable (Qwen4) report
+    /// through the same logger, so both land in one /v1/stats inventory and an
+    /// eager variant is described only on its first miss.
     #[test]
-    fn stats_publish_direct_eager_misses_through_the_bank_logger() {
-        crate::shared::decode_graph::note_eager("probe-test-direct", "(7, 52)", || "decode rows=52".into());
-        crate::shared::decode_graph::note_eager("probe-test-direct", "(7, 52)",
+    fn stats_publish_qwen4_and_bank_misses_together() {
+        use crate::shared::decode_graph::{GraphBank, GraphPolicy};
+        let mut bank = GraphBank::<u32, ()>::with_family(GraphPolicy::FixedStartup, "probe-test-bank");
+        bank.warm(&[1], |_| Ok(((), None))).unwrap();
+        bank.enqueue(&9);
+        let shape = "rows=6 spec=false long=false pool_width=64 page_stride=8192 pool_stride=524288";
+        crate::shared::decode_graph::note_eager("qwen4", shape, || "segment=11 max_context=4096 slots=8 pages=4".into());
+        crate::shared::decode_graph::note_eager("qwen4", shape,
             || panic!("only a variant's first miss describes its request"));
         let mut stats = serde_json::json!({});
         graph_capture_stats(&mut stats);
         let variants = stats["graph_missing_variants"].as_array().expect("variant array");
-        let ours: Vec<_> = variants.iter().filter(|variant| variant["family"] == "probe-test-direct").collect();
-        assert_eq!(ours.len(), 1);
-        assert_eq!((ours[0]["shape"].as_str(), ours[0]["runs"].as_u64()), (Some("(7, 52)"), Some(2)));
+        let bank: Vec<_> = variants.iter().filter(|variant| variant["family"] == "probe-test-bank").collect();
+        assert_eq!(bank.len(), 1);
+        assert_eq!((bank[0]["shape"].as_str(), bank[0]["runs"].as_u64()), (Some("9"), Some(1)));
+        let qwen4: Vec<_> = variants.iter().filter(|variant| variant["family"] == "qwen4").collect();
+        assert_eq!(qwen4.len(), 1);
+        assert_eq!((qwen4[0]["shape"].as_str(), qwen4[0]["runs"].as_u64()), (Some(shape), Some(2)));
     }
 }
 
