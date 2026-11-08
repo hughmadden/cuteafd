@@ -1,7 +1,7 @@
 //! Kimi's binding of the shared MLA DFlash executor to local or remote streams.
 use super::weights::GlobalWeights;
 use crate::shared::{draft::remote::{Prepared, RemoteBridge}, fp8_linear::{Fp8Rows, Fp8Scales},
-    memory::device::{Allocation, DeviceOwner, Stream}, peer_split::{RankDevice, TerminalState},
+    memory::{device::{Allocation, DeviceOwner, Stream}, Tag}, peer_split::{RankDevice, TerminalState},
     speculation::dflash::{ContextRow, DflashDrafter, Draft, DraftSeq, TargetHead, TAP_ROWS}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
@@ -182,7 +182,7 @@ impl<'a> NativeDraft<'a> {
         let device = streams[0].device;
         let allocate = |name| -> Result<Allocation<'a>> {
             let demand = demands.iter().find(|d| d.group == name).context("Kimi draft bridge inventory missing")?;
-            Allocation::untagged(device, usize::try_from(demand.bytes)?)
+            Allocation::new(device, usize::try_from(demand.bytes)?, Tag::drafter_workspace("kimi/draft-bridge"))
         };
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;

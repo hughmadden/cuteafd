@@ -6,7 +6,7 @@ use anyhow::{bail, ensure, Context, Result};
 use cuteafd_ffi::{programs::Programs, Bf16Add, KimiExpertInput, KimiFfn, KimiFfnBatch,
     KimiKda, KimiKdaCommit, KimiLatent, KimiMlaMode, KimiPrefixMode, KimiResidual,
     KimiResidualBatch, KimiResidualSite, KimiRmsNorm, KimiRouter};
-use crate::shared::{memory::device::{Allocation, Device, DeviceOwner, Stream}, prefix::view};
+use crate::shared::{memory::{device::{Allocation, Device, DeviceOwner, Stream}, Tag}, prefix::view};
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::VocabularyHead};
 use std::rc::Rc;
 use super::weights::GlobalWeights;
@@ -406,11 +406,10 @@ impl LaneLayout {
     pub(super) fn allocate_on<'a>(&self, device: Device<'a>, stream: Rc<Stream<'a>>) -> Result<Lane<'a>> {
         ensure!(stream.device.id == device.id && std::ptr::eq(stream.device.library, device.library),
             "Kimi admitted lane stream differs from device");
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi lane");
-        let arena = Allocation::untagged(device, self.arena_bytes)?;
+        let arena = Allocation::new(device, self.arena_bytes, Tag::workspace("kimi/lane"))?;
         let operands = self.operands.iter().filter(|(name, _)| !self.arena_offsets.contains_key(*name))
             .map(|(name, bytes)| {
-                let allocation = Allocation::untagged(device, *bytes)?;
+                let allocation = Allocation::new(device, *bytes, Tag::workspace("kimi/lane"))?;
                 ensure!(allocation.buffer.bytes == *bytes && allocation.buffer.device_id == device.id,
                     "Kimi allocated lane operand {name} differs from admitted extent/device");
                 Ok((*name, allocation))
@@ -1795,11 +1794,10 @@ impl IoLayout {
         ensure!(weights.core_head.is_some()==self.core_head,"Kimi head storage differs from admitted IO format");
         if self.rank == 0 { weights.buffer("embedding")?; }
         if self.rank == self.ranks - 1 && !self.core_head { weights.buffer("head")?; }
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi token IO");
         let [ids, logits, workspace] = self.extents();
         let allocate = |bytes| -> Result<Option<Allocation<'a>>> {
             if bytes == 0 { return Ok(None); }
-            let allocation = Allocation::untagged(device, bytes)?;
+            let allocation = Allocation::new(device, bytes, Tag::workspace("kimi/token-io"))?;
             ensure!(allocation.buffer.bytes == bytes && allocation.buffer.device_id == device.id,
                 "Kimi IO allocation differs from admitted extent/device");
             Ok(Some(allocation))
