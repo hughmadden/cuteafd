@@ -512,7 +512,8 @@ impl<'a> SwaLayer<'a> {
 
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<SwaWeights<'a>>, mut ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
-        let planes = scratch::planes(device, &admission.planes, arena)?;
+        let planes = scratch::planes(device, &admission.planes, arena,
+            crate::shared::memory::Tag::workspace("step5/target-scratch"))?;
         let stream = scratch::standalone(device, arena);
         if let Some(ffn) = &mut ffn { ffn.share_standalone(stream.clone()); }
         let rows = admission.rows;
@@ -1066,7 +1067,7 @@ mod tests {
         let dense = cuteafd_loader::plan::families::step5::native::dense_planes(513)?;
         let bytes = SwaLayer::workspace_bytes(513)?
             + cuteafd_loader::plan::families::step5::native::plane_bytes(&dense)?;
-        let arena = Arena::new(device, usize::try_from(bytes)?)?;
+        let arena = Arena::new(device, usize::try_from(bytes)?, crate::shared::memory::TEST)?;
         for &layer in layers {
             native_swa_component(device, &programs, &checkpoint, &arena, layer)?;
         }

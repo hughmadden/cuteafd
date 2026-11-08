@@ -574,7 +574,8 @@ impl<'a> CsaLayer<'a> {
 
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<CsaWeights<'a>>, mut ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
-        let planes = scratch::planes(device, &admission.planes, arena)?;
+        let planes = scratch::planes(device, &admission.planes, arena,
+            crate::shared::memory::Tag::workspace("step5/target-scratch"))?;
         let stream = scratch::standalone(device, arena);
         if let Some(ffn) = &mut ffn { ffn.share_standalone(stream.clone()); }
         let rows = admission.rows;

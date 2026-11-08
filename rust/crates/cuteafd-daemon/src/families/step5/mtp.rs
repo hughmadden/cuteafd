@@ -2,7 +2,7 @@
 use crate::shared::memory::weight_arena::DeviceWeightArena;
 use super::{weights::load_operand, scratch::{Arena, CompactKv, Plane}};
 use cuteafd_loader::plan::families::step5::native;
-use crate::shared::memory::device::{Allocation, Device, Event, Stream};
+use crate::shared::memory::{device::{Allocation, Device, Event, Stream}, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::families::qwen4::Qwen4KvCache;
@@ -270,7 +270,7 @@ impl<'a> StageOwner<'a> {
         // Shared device scratch aliases between stages; pinned upload sources
         // remain private and are reusable after their own H2D completion event.
         let uploads = sizes[..4].iter().copied().chain([sizes[2], 8])
-            .map(|bytes| crate::shared::memory::HostAllocation::untagged(device.library, bytes))
+            .map(|bytes| crate::shared::memory::HostAllocation::new(device.library, bytes, Tag::staging("step5/mtp-uploads")))
             .collect::<Result<Vec<_>>>()?;
         let upload_done = (0..uploads.len()).map(|_| Ok((Event::new(device)?, false)))
             .collect::<Result<Vec<_>>>()?;
@@ -282,7 +282,8 @@ impl<'a> StageOwner<'a> {
         let compact = if kv_format == Qwen4KvCache::Fp8 {
             Some(CompactKv::new(device, programs, rows, &[64],
                 native::mtp_compact_planes(rows, kv_format)?,
-                Some((arena, usize::try_from(native::mtp_compact_offset(rows)?)?)))?)
+                Some((arena, usize::try_from(native::mtp_compact_offset(rows)?)?)),
+                Tag::drafter_workspace("step5/mtp-stage"))?)
         } else { None };
         Ok(Self { stream, input, attention, head, metadata, uploads, upload_done, compact, kv_format, stage, rows,
             cache_owner: std::cell::Cell::new(None) })
@@ -671,7 +672,7 @@ impl<'a> Runtime<'a> {
             owner.bind_cache(cache)?;
             stages.push(owner);
         }
-        let selected = crate::shared::memory::HostAllocation::untagged(cache.stream.device.library, depth * 8)?;
+        let selected = crate::shared::memory::HostAllocation::new(cache.stream.device.library, depth * 8, Tag::staging("step5/mtp-selected"))?;
         Ok(Self { stages: std::cell::RefCell::new(stages),
             tokens: std::cell::RefCell::new(vec![Vec::new(); cache.sequences() as usize]),
             selected: std::cell::RefCell::new(selected), rank: cache.rank() })
@@ -885,7 +886,7 @@ mod tests {
         let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
         let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
-        let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
+        let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?, crate::shared::memory::TEST)?;
         let stream = Rc::new(Stream::new(device)?);
         let (runtime, records) = crate::shared::experts::rtx::dense::recording(||
             Runtime::load(&contract, rope.clone(), &arena, stream.clone(), &programs, &checkpoint,
@@ -1034,7 +1035,7 @@ mod tests {
                 let expected_logits = load("logits.bin", probes.len() * 128896 * 4)?;
                 let embedding = Allocation::new(device, 64 * H * 2, crate::shared::memory::TEST)?;
                 let hidden = Allocation::new(device, 64 * H * 4, crate::shared::memory::TEST)?;
-                let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
+                let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?, crate::shared::memory::TEST)?;
                 let weight_arena = DeviceWeightArena::new(device,
                     RankWeightLayout::mtp_stage_from_contract(&checkpoint, &contract, stage)?
                         .arena_layout(format!("step5/mtp/gpu{}", device.id), |_| true)?, crate::shared::memory::TEST_ARENA)?;
