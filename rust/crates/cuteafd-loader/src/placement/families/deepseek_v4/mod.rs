@@ -482,6 +482,47 @@ mod default_tests {
         prepared.admit(request).map(|admitted| admitted.placement)
     }
 
+    /// The pre-weight base and the code still to load are named Runtime owners
+    /// on every coordinator GPU, lead and peer alike: the planned allowance
+    /// offline, the measured sample's occupancy in serve (#1614).
+    #[test]
+    fn runtime_base_is_a_named_owner_on_every_coordinator_gpu() {
+        use cuteafd_core::memory_layout::ItemLifetime;
+        let group = |items: &[Demand], rank: u8, name: &str| -> u64 {
+            items.iter().filter(|d| d.gpu == rank && d.group == name).map(|d| d.bytes).sum()
+        };
+        let mut input = plan_inputs(&context_cfg());
+        for (total, baseline) in input.gpus.iter_mut() {
+            *baseline = Baseline::Planned { context_bytes: 1_170_800_640, loaded_bytes: 42 << 20 };
+            *total = 96 << 30;
+        }
+        let planned = fixed_demands(&input).unwrap().0;
+        for rank in 0..2 {
+            // The planned allowance carries the context and the preloaded owners.
+            assert_eq!(group(&planned, rank, "context+modules"), 1_170_800_640 + (42 << 20));
+            // No measured remainder offline, and both names are ready-resident.
+            assert_eq!(group(&planned, rank, "loaded code"), 0);
+            assert!(planned.iter().filter(|d| d.gpu == rank && d.group == "context+modules")
+                .all(|d| d.category == Category::Runtime && d.lifetime == ItemLifetime::ReadyResident));
+        }
+        // Serve: the sample is effective under the logical ceiling, so the
+        // occupancy it implies is measured against that same extent, and pending
+        // code is charged beside it instead of being netted out of the sample.
+        let cap = 96u64 << 30;
+        input.physical_bytes = vec![100 << 30; 2];
+        input.pending_code = vec![967_770_976, 0];
+        for (total, baseline) in input.gpus.iter_mut() {
+            *total = cap;
+            *baseline = Baseline::Measured { free_bytes: cap - 854_189_872 };
+        }
+        let measured = fixed_demands(&input).unwrap().0;
+        for rank in 0..2 {
+            assert_eq!(group(&measured, rank, "context+modules"), 854_189_872);
+        }
+        assert_eq!(group(&measured, 0, "loaded code"), 967_770_976);
+        assert_eq!(group(&measured, 1, "loaded code"), 0);
+    }
+
     #[test]
     fn tp2_draft_is_mandatory_at_zero_onboarding_and_shares_one_workspace() {
         let mut input = plan_inputs(&context_cfg());
