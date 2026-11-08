@@ -172,12 +172,14 @@ impl<'a> VocabularyShard<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::shared::memory::device::Device;
 
-    #[test]
-    fn packed_head_push_delivers_transient_source_before_arena_pack() -> Result<()> {
+    pub(crate) fn packed_head_push_delivers_transient_source_before_arena_pack(
+        receive: impl FnOnce(Device<'_>, &std::path::Path, &std::path::Path,
+            &crate::shared::experts::rtx::dense::Records) -> Result<()>,
+    ) -> Result<()> {
         use crate::shared::experts::rtx::dense::{Recorder, Rect};
         use cuteafd_loader::plan::testing::{t, write_snapshot};
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
@@ -211,8 +213,7 @@ mod tests {
         // Projection borrowers can exist before delivery without exposing BF16.
         assert!(matches!(shard.copy(), Some(HeadCopy::Packed(_))));
         let sockets = tempfile::tempdir_in(fixture.directory())?;
-        crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: 0 },
-            None, root.path(), sockets.path(), &records, None, 0, 0)?;
+        receive(Device { library: &library, id: 0 }, root.path(), sockets.path(), &records)?;
         shard.finish_push()?;
         assert!(shard.pending.borrow().is_none());
         assert_eq!(cuteafd_ffi::memory_ledger::tag_of(source.ptr as usize), None);

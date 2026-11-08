@@ -10,6 +10,8 @@ use cuteafd_core::memory_layout::ArenaTag;
 #[path = "v41_tensors/vocabulary_shard.rs"]
 mod vocabulary_shard;
 pub(crate) use vocabulary_shard::VocabularyShard;
+#[cfg(test)]
+pub(crate) use vocabulary_shard::tests::packed_head_push_delivers_transient_source_before_arena_pack;
 
 pub(crate) fn allocation<'a>(library: &'a NativeLibrary,
     arena: Option<&DeviceWeightArena<'a>>, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
