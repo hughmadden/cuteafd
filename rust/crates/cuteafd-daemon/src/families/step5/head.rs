@@ -96,7 +96,7 @@ impl HeadPlan {
         planes: &[usize; 4], kernel_rows: usize) -> Result<u64> {
         let native_bytes = native.map(|core| -> Result<u64> {
             (core.bytes as u64).checked_add(
-                cuteafd_loader::formats::head::native_private_scratch(core.shape, kernel_rows)?.bytes()? as u64)
+                cuteafd_loader::formats::head::native_private_scratch(core.shape, kernel_rows)?.packed_bytes()? as u64)
                 .context("Step-5 native head overflow")
         }).transpose()?.unwrap_or(0);
         weights.iter().map(|w| w.allocation_bytes)
@@ -117,7 +117,7 @@ impl HeadPlan {
     pub(super) fn private_scratch_bytes(&self) -> Result<u64> {
         self.native.as_ref().map(|name| -> Result<u64> {
             Ok(cuteafd_loader::formats::head::native_private_scratch(
-                self.layout.core[name].shape, self.kernel_rows)?.bytes()? as u64)
+                self.layout.core[name].shape, self.kernel_rows)?.packed_bytes()? as u64)
         }).transpose().map(|bytes| bytes.unwrap_or(0))
     }
 }
@@ -191,9 +191,14 @@ impl<'a> TargetHeadOwner<'a> {
         device.run(|| {
             let planes = scratch::planes(device, &HeadPlan::plane_bytes(rows)?, arena,
                 crate::shared::memory::Tag::workspace("step5/target-scratch"))?;
+            let label = if immutable.predictor { "mtp" } else { "target" };
+            crate::shared::inventory::startup_probe(device.library, &[device.id],
+                &format!("step5/{label}-head-before-cublas-handle"), Default::default())?;
             // SAFETY: private workspace survives the private handle on this device.
             let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
                 H as u32, rows as u32, V as u32)? };
+            crate::shared::inventory::startup_probe(device.library, &[device.id],
+                &format!("step5/{label}-head-after-cublas-handle"), Default::default())?;
             let stream = scratch::standalone(device, arena);
             Ok(Self { stream, head, planes, rows, immutable })
         })
@@ -334,7 +339,7 @@ pub(super) mod tests {
                 epsilon: 1e-5, bytes, predictor: false, kernel_rows: unit };
             let owner_layout = cuteafd_loader::formats::head::native_private_scratch(native.shape, unit)?;
             assert_eq!(owner_layout.rows, unit);
-            assert_eq!(owner_layout.bytes()? as u64, private_scratch);
+            assert_eq!(owner_layout.packed_bytes()? as u64, private_scratch);
             assert_eq!(plan.immutable_bytes(), (H * 4 + core_bytes) as u64 + private_scratch);
             assert_eq!(plan.workspace_bytes(), (logits * (H * 4 + V * 4) + (4 << 20)) as u64);
             assert_eq!(plan.bytes(), plan.immutable_bytes() + plan.workspace_bytes());

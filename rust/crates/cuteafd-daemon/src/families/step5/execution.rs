@@ -159,12 +159,12 @@ impl<'a> NativeOwners<'a> {
                 let device = devices[rank];
                 let (_, rank_layout) = plan.layer(rank, 0)?;
                 let native_layout = native_scratch_layout(rank_layout, rows, count)?;
-                let native_bytes = native_layout.as_ref().map(|l| l.bytes()).transpose()?.unwrap_or(0);
+                let native_bytes = native_layout.as_ref().map(|l| l.packed_bytes()).transpose()?.unwrap_or(0);
                 // The arena holds the sequential attention/FFN regions and, after they
                 // retire, the MTP stage scratch. One backing keeps one kind and charge.
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes,
                     Tag::workspace("step5/sequential-scratch"))?;
-                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout, crate::shared::memory::Tag::workspace("step5/native-projection"))
+                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout, crate::shared::memory::Tag::workspace("step5/target-layer-projection"))
                     .map(Rc::new)).transpose()?;
                 let rope = Rc::new(TargetTables::load_in(device, programs, &contract, super::weights::ROPE_PREFIX,
                     available[rank], &[], Some(&weight_arenas[rank]))?);
@@ -224,7 +224,7 @@ fn native_scratch_layout(layout: &RankWeightLayout, rows: usize, count: usize)
 }
 
 fn native_scratch_bytes(layout: &RankWeightLayout, rows: usize, count: usize) -> Result<u64> {
-    Ok(native_scratch_layout(layout, rows, count)?.map(|l| l.bytes()).transpose()?.unwrap_or(0) as u64)
+    Ok(native_scratch_layout(layout, rows, count)?.map(|l| l.packed_bytes()).transpose()?.unwrap_or(0) as u64)
 }
 
 /// The rank's FFN region starts after its largest loaded attention region.
@@ -1709,7 +1709,7 @@ mod tests {
                     &contract, &cfg, layout, &ownership, rank, 64, 64, 1)?;
                 let head = rank == usize::from(ownership.execution().spec().head_gpu);
                 let head_scratch = if head { layout.core.get("lm_head.weight").map(|core|
-                    cuteafd_loader::formats::head::native_private_scratch(core.shape, 64)?.bytes())
+                    cuteafd_loader::formats::head::native_private_scratch(core.shape, 64)?.packed_bytes())
                     .transpose()?.unwrap_or(0) as u64 } else { 0 };
                 assert_eq!(admitted.immutable, head_scratch);
                 assert_eq!(admitted.weight_arenas[0].0, served);

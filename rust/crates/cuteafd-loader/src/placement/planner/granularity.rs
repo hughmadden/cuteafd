@@ -3,7 +3,8 @@
 use super::*;
 
 pub const ALLOCATION_GRANULARITY_GROUP: &str = "allocation granularity";
-const PAGE: u64 = 2 << 20;
+pub const SM120_ALLOCATION_GRANULARITY_BYTES: u64 = 2 << 20;
+const PAGE: u64 = SM120_ALLOCATION_GRANULARITY_BYTES;
 const SMALL: u64 = 1 << 20;
 
 /// Explicit physical requests behind one logical owner, not its tensor views.

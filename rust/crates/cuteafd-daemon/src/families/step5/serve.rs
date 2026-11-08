@@ -397,6 +397,7 @@ fn with_backend<T>(args: &ServeArgs,
             .context("Step-5 solved predictor allocation overflow")?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
     } else { None };
+    crate::shared::inventory::startup_probe(&library, &ids, "step5/pre-weight", Default::default())?;
     let caches = devices.iter().enumerate().map(|(rank, &device)| Ok(RefCell::new(CacheRank::new(device,
         admission.cache.clone(), rank, inputs.sequences as u64, admission.marks as u64,
         admission.placement.pool_tokens / 64, admission.reservations[rank].total)?)))
@@ -407,6 +408,7 @@ fn with_backend<T>(args: &ServeArgs,
             Staging::bytes_for_sequences(&admission.cache, rank, inputs.sequences)?, inputs.sequences, inputs.unit_rows())
     }).collect::<Result<Vec<_>>>()?;
     let target_input = Inputs::allocate(devices[0], inputs.rows, Inputs::bytes(inputs.rows)?)?;
+    crate::shared::inventory::startup_probe(&library, &ids, "step5/cache-staging-inputs", Default::default())?;
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
         .context("Step-5 embedding header missing")?;
     let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
@@ -429,9 +431,11 @@ fn with_backend<T>(args: &ServeArgs,
     let load = || TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
         let native = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
             inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan, Some(&weight_arenas))?;
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/target-native-loaded", Default::default())?;
         let mtp = predictor_budget.map(|(available, reserved)| native.load_predictor(
             &programs, &checkpoint, &caches[head_rank].borrow(), stages[head_rank].stream.clone(),
             usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/mtp-loaded", Default::default())?;
         Ok((native, mtp))
     }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(devices[entry], Some(&weight_arenas[entry]), name, bytes, ArenaTag::weights("step5/target")));
     let planned = policy.plan(|| -> Result<_> {

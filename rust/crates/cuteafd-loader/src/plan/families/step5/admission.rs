@@ -109,8 +109,15 @@ fn retained_wave_rows(rows: usize, sequences: usize) -> Result<usize> {
     .context("Step-5 retained wave rows overflow")
 }
 pub fn staging_bytes(layout: &Step5CacheLayout, rank: usize, sequences: usize) -> Result<usize> {
-    let compact = layout.target_pack_planes(rank)?.into_iter().try_fold(0usize,
-        |sum, bytes| sum.checked_add(bytes)).context("Step-5 compact staging overflow")?;
+    Ok(staging_layout(layout, rank, sequences)?.bytes)
+}
+
+/// Transaction-local producer planes, including temporary compact K/V output.
+/// These are copied into independently owned cache storage before reuse.
+/// Order: metadata, optional compressor, raw region pairs, optional compact pair.
+pub fn staging_layout(layout: &Step5CacheLayout, rank: usize, sequences: usize)
+    -> Result<crate::serving_capacity::PackedWeightRegions> {
+    let compact = layout.target_pack_planes(rank)?;
     let layers = layout
         .ranks
         .get(rank)
@@ -132,21 +139,14 @@ pub fn staging_bytes(layout: &Step5CacheLayout, rank: usize, sequences: usize) -
         .checked_mul(4)
         .context("Step-5 attention table overflow")?
         .max(256);
-    rows.checked_mul(256 * 2 * 2)
-        .and_then(|n| n.checked_mul(layers))
-        .and_then(|n| {
-            n.checked_add(if layers == 0 {
-                0
-            } else {
-                metadata.checked_mul(2)?
-            })
-        })
-        .and_then(|n| n.checked_add(if layers == 0 { 0 } else { scratch }))
-        .and_then(|n| n.checked_add(step.checked_mul(8)?.max(256)))
-        .and_then(|n| n.checked_add(step.checked_mul(4)?.max(256)))
-        .and_then(|n| n.checked_add(table.checked_mul(sequences.checked_add(1)?)?))
-        .and_then(|n| n.checked_add(compact))
-        .context("Step-5 staging bytes overflow")
+    let mut sizes = vec![step.checked_mul(8).context("Step-5 positions overflow")?.max(256),
+        step.checked_mul(4).context("Step-5 requests overflow")?.max(256), table,
+        table.checked_mul(sequences).context("Step-5 page tables overflow")?];
+    if layers > 0 { sizes.extend([metadata, metadata, scratch]); }
+    let raw = rows.checked_mul(256 * 2).context("Step-5 raw staging overflow")?;
+    for _ in 0..layers { sizes.extend([raw, raw]); }
+    if compact[0] > 0 { sizes.extend(compact); }
+    crate::serving_capacity::PackedWeightRegions::new(sizes)
 }
 
 const FLOOR: u64 = 262_144;
@@ -248,14 +248,22 @@ pub fn push_host_envelope(contract: &super::coordinator::CoordinatorContract, cf
 /// exchanges never share storage) and the route broadcast scratch (packed
 /// top-8 routes plus the input rows). The daemon allocates exactly these.
 pub fn tp2_exchange_bytes(unit_rows: usize, lanes: usize, exchange: Tp2Exchange) -> Result<u64> {
+    checked_sum(tp2_exchange_requests(unit_rows, lanes, exchange)?)
+}
+
+pub fn tp2_exchange_requests(unit_rows: usize, lanes: usize, exchange: Tp2Exchange) -> Result<Vec<u64>> {
     const H: usize = 4096;
     ensure!((1..=4096).contains(&unit_rows) && (1..=4).contains(&lanes), "Step-5 TP2 exchange geometry");
-    let plane = |bytes: usize| bytes.max(256) as u64;
     let section = unit_rows * 8 * 4;
     let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
-    let per_lane = 3 * plane(unit_rows * H * exchange.partial_bytes())
-        + plane(routes + unit_rows * exchange.input_row_bytes(H));
-    (lanes as u64).checked_mul(per_lane).context("Step-5 TP2 exchange overflow")
+    let scratch = routes + unit_rows * exchange.input_row_bytes(H);
+    let mut requests = vec![(lanes * unit_rows * H * exchange.partial_bytes()).max(256) as u64; 3];
+    requests.push((lanes * scratch).max(256) as u64);
+    // Pair::new_with_wire retains two route/input slots per lane and controls.
+    requests.extend(vec![scratch.max(256) as u64; 2 * lanes]);
+    let storage = crate::serving_capacity::PeerStorageLayout::new(2 * lanes, scratch, false)?;
+    requests.extend([storage.control_bytes as u64, 256]);
+    Ok(requests)
 }
 
 /// Why NVFP4 Step plans onboard nothing (and refuse an explicit layer count).
@@ -286,6 +294,7 @@ pub struct OnboardInputs {
     pub workspace: u64,
     /// Two GPUs: each rank's TP2 arena.
     pub tp2_workspace: [u64; 2],
+    pub workspace_requests: Vec<Vec<u64>>,
     pub mode: Onboard,
 }
 
@@ -294,7 +303,7 @@ impl OnboardInputs {
     /// one GPU, TP2 halves over two, at the admitted unit rows.
     pub fn new(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, unit_rows: usize,
         gpus: usize, lanes: usize, mode: Onboard) -> Result<Option<Self>> {
-        use crate::placement::rtx_onboard::{expert_costs, expert_workspace};
+        use crate::placement::rtx_onboard::{expert_costs, expert_workspace_requests};
         ensure!(matches!(gpus, 1 | 2), "Step-5 RTX onboarding needs one or two GPUs");
         if mode == Onboard::Layers(0) { return Ok(None); }
         if let Some(reason) = onboarding_unavailable(catalog, gpus) {
@@ -302,13 +311,12 @@ impl OnboardInputs {
             return Ok(None);
         }
         let rows = unit_rows as u64;
-        let (workspace, tp2_workspace) = if gpus == 2 {
-            let half = expert_workspace(catalog, manifest, rows, 2, "step5")?
-                .checked_add(tp2_exchange_bytes(unit_rows, lanes, Tp2Exchange::of(catalog))?)
-                .context("Step-5 TP2 workspace overflow")?;
-            (0, [half; 2])
-        } else { (expert_workspace(catalog, manifest, rows, 1, "step5")?, [0; 2]) };
-        Ok(Some(Self { costs: expert_costs(catalog, gpus == 2)?, workspace, tp2_workspace, mode }))
+        let mut requests = expert_workspace_requests(catalog, manifest, rows, gpus, "step5")?;
+        if gpus == 2 { requests.extend(tp2_exchange_requests(unit_rows, lanes, Tp2Exchange::of(catalog))?); }
+        let bytes = checked_sum(requests.iter().copied())?;
+        let (workspace, tp2_workspace) = if gpus == 2 { (0, [bytes; 2]) } else { (bytes, [0; 2]) };
+        Ok(Some(Self { costs: expert_costs(catalog, gpus == 2)?, workspace, tp2_workspace,
+            workspace_requests: vec![requests; gpus], mode }))
     }
 }
 
@@ -470,7 +478,8 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
         "Step-5 predictor depth must fit checkpoint and row capacity");
     let predictor = super::coordinator::RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?;
     let weights = predictor.resident_bytes;
-    let immutable = super::native::mtp_native_scratch_from_contract(checkpoint, contract, depth, inputs.unit_rows())?;
+    let private_requests = super::native::mtp_native_scratch_requests(checkpoint, contract, depth, inputs.unit_rows())?;
+    let immutable = checked_sum(private_requests.iter().copied())?;
     let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
@@ -481,6 +490,7 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
                 native.weight_arenas.push((predictor.mtp_arena(rank as i32)?, ResidentWeights(weights), cuteafd_core::memory_layout::MemoryKind::DrafterWeights));
                 native.immutable = native.immutable.checked_add(immutable)
                     .context("Step-5 predictor weight forecast overflow")?;
+                native.drafter_requests.extend(private_requests.iter().copied());
                 native.workspace = native.workspace.max(workspace);
             }
             Ok(native)
@@ -594,6 +604,9 @@ mod tests {
                     resident_weights: ResidentWeights(0),
                     weight_arenas: vec![],
                     immutable: 1 << 30,
+                    private_requests: vec![1 << 30],
+                    drafter_requests: vec![],
+                    projection_bytes: 0,
                     workspace: 1 << 20
                 };
                 o.ranks()
@@ -756,6 +769,9 @@ mod tests {
                     resident_weights: ResidentWeights(0),
                     weight_arenas: vec![],
                     immutable: (1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 },
+                    private_requests: vec![(1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 }],
+                    drafter_requests: vec![],
+                    projection_bytes: 0,
                     workspace: if rank == 0 && predictor { 512 << 20 } else { 1 << 20 },
                 }).collect()
             };
@@ -1004,6 +1020,52 @@ mod tests {
     }
 
     #[test]
+    fn runtime_request_tails_reference_exact_payload_owners_once() -> Result<()> {
+        use crate::placement::planner::{allocation_granularity_forecast, Location};
+        let admitted = run(&inputs(2))?;
+        let facts = &admitted.solved.facts;
+        let mut seen = std::collections::BTreeSet::new();
+        for owner in &facts.allocation_granularity {
+            let requests = owner.requests();
+            assert_eq!(owner.bytes()?, allocation_granularity_forecast(&requests)?);
+            for backing in &owner.backings {
+                assert!(seen.insert(&backing.backing), "duplicate physical request charge");
+                let payload = facts.allocations.iter().chain(&facts.deferred)
+                    .find(|allocation| allocation.id == backing.backing).unwrap();
+                assert_eq!(payload.location, owner.location);
+                assert_eq!(payload.bytes, backing.requests.iter().sum::<u64>());
+                assert!(payload.view.is_none());
+                if payload.group == "Step-5 private transaction staging" {
+                    assert_eq!(payload.category, Category::Staging);
+                    assert_eq!(backing.requests, vec![payload.bytes]);
+                }
+            }
+        }
+        assert_eq!(facts.allocation_granularity.len(), 2);
+        for rank in 0..2 {
+            assert!(facts.allocation_granularity.iter().any(|owner| owner.location == Location::coordinator(rank)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_unaligned_pool_keeps_its_pin_and_charges_physical_records() -> Result<()> {
+        let mut input = inputs(1);
+        input.context = EXTENT;
+        input.serving_context = crate::placement::planner::Context::pinned(FLOOR);
+        input.requested_pool = Some(FLOOR + 64);
+        let admitted = run(&input)?;
+        assert_eq!(admitted.placement.pool_tokens, FLOOR + 64);
+        let payload = admitted.reservations[0].pages as u64;
+        let page = crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
+        let owner = admitted.solved.facts.allocations.iter()
+            .find(|owner| owner.id == "step5.records.0").unwrap();
+        assert_eq!(owner.bytes, payload.div_ceil(page) * page);
+        assert!(owner.bytes >= payload && owner.bytes - payload < page);
+        Ok(())
+    }
+
+    #[test]
     fn full_onboard_option_charges_its_expert_arena() -> Result<()> {
         let mut inputs = inputs(2);
         let routed = config().moe[..92].iter().filter(|&&moe| moe).count();
@@ -1011,7 +1073,8 @@ mod tests {
             costs: vec![ExpertCost { whole: Bytes2 { resident: 1024, staging: 0 },
                 half: [Bytes2 { resident: 512, staging: 0 }; 2], tp2: true,
                 whole_supported: true, spark_ok: true }; routed],
-            workspace: 12345, tp2_workspace: [23456, 34567], mode: Onboard::Layers(routed),
+            workspace: 12345, tp2_workspace: [23456, 34567],
+            workspace_requests: vec![vec![23456], vec![34567]], mode: Onboard::Layers(routed),
         });
         let admitted = run(&inputs)?;
         assert_eq!(admitted.placement.onboard_layers, routed);

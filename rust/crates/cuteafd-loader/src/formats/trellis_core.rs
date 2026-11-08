@@ -162,6 +162,13 @@ impl ProjectionScratchLayout {
         owners.insert("route arena", partial);
         Ok(ProjectionStorageLayout { owners, route_offsets })
     }
+    /// One backing with cudaMalloc-equivalent alignment for each live operand.
+    /// Separate from `storage`: families opt into packing without changing routes.
+    pub fn packed(&self) -> Result<crate::serving_capacity::PackedWeightRegions> {
+        crate::serving_capacity::PackedWeightRegions::new(self.extents.values().copied())
+    }
+    pub fn packed_bytes(&self) -> Result<usize> { Ok(self.packed()?.bytes) }
+
     pub fn bytes(&self) -> Result<usize> {
         self.storage()?.owners.values().try_fold(0usize, |a, b| a.checked_add(*b))
             .context("dense trellis scratch sum overflow")

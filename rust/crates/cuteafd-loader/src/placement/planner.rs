@@ -579,7 +579,7 @@ mod contract;
 mod search;
 mod granularity;
 pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence,
-    ALLOCATION_GRANULARITY_GROUP, allocation_granularity_forecast, allocation_granularity_component,
+    ALLOCATION_GRANULARITY_GROUP, SM120_ALLOCATION_GRANULARITY_BYTES, allocation_granularity_forecast, allocation_granularity_component,
     weight_arena_components, weight_arena_extent_components};
 pub mod native_attention;
 pub mod serving;

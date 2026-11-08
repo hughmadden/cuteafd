@@ -221,6 +221,18 @@ impl ProjectionLayout {
     pub(crate) fn demand(&self,device:u8,name:&str)->Result<Demand> {
         Ok(Demand::new(device,Category::Workspace,name,self.bytes()? as u64,Basis::Exact))
     }
+    pub(crate) fn allocate_packed<'a>(&self, device: Device<'a>, tag: Tag) -> Result<ProjectionScratch<'a>> {
+        let storage = ProjectionScratchLayout { extents: self.extents.clone(), rows: self.rows }.packed()?;
+        let backing = Allocation::new(device, storage.bytes, tag)?;
+        let buffers = self.extents.iter().zip(storage.regions).map(|((&name, &bytes), region)| {
+            Ok((name, crate::shared::prefix::view(backing.buffer, region.start, bytes)?))
+        }).collect::<Result<BTreeMap<_, _>>>()?;
+        let pointer = if self.extents["table"] >= GROUPS * 8 {
+            GroupedWorkspace::pointer_table(buffers["rotated"])?
+        } else { (buffers["rotated"].ptr as u64).to_le_bytes().to_vec() };
+        device.run(|| device.library.copy_h2d(buffers["table"], &pointer))?;
+        Ok(ProjectionScratch { _owners: BTreeMap::from([("projection arena", backing)]), buffers, rows: self.rows })
+    }
     pub(crate) fn allocate<'a>(&self,device:Device<'a>,tag:Tag)->Result<ProjectionScratch<'a>> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/native-projection");
         let storage=ProjectionScratchLayout {
@@ -337,6 +349,48 @@ mod retained_tests {
         }
         assert_eq!(library.cuda_get_device()?, 0);
         assert_eq!(fixture.events()?, before, "census must not allocate, switch, synchronize or reset");
+        Ok(())
+    }
+
+    #[test]
+    fn packed_projection_retains_one_backing_and_initializes_pointer_views() -> Result<()> {
+        use crate::shared::memory::receipts::Inventory;
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        for layout in [ProjectionScratchLayout::new(128, 256, 3)?,
+            ProjectionScratchLayout::grouped(128, 256, 3, 4)?] {
+            let projection = ProjectionLayout { extents: layout.extents.clone(), rows: layout.rows };
+            let before = fixture.events()?.matches('D').count();
+            let scratch = projection.allocate_packed(device, "workspace/step5/test-projection")?;
+            assert_eq!(fixture.events()?.matches('D').count() - before, 1);
+            assert_eq!(scratch._owners.len(), 1);
+            let storage = layout.packed()?;
+            let backing = scratch._owners["projection arena"].buffer;
+            assert_eq!(backing.bytes, layout.packed_bytes()?);
+            for ((&name, &bytes), region) in layout.extents.iter().zip(&storage.regions) {
+                let view = scratch.buffers[name];
+                assert_eq!(view.ptr as usize - backing.ptr as usize, region.start);
+                assert_eq!(view.bytes, bytes);
+                assert_eq!(view.ptr as usize % 256, 0);
+                assert!(region.end <= backing.bytes);
+            }
+            assert!(storage.regions.windows(2).all(|r| r[0].end <= r[1].start));
+            let expected = if layout.extents["table"] >= GROUPS * 8 {
+                GroupedWorkspace::pointer_table(scratch.buffers["rotated"])?
+            } else { (scratch.buffers["rotated"].ptr as u64).to_le_bytes().to_vec() };
+            let mut actual = vec![0; expected.len()];
+            device.run(|| library.copy_d2h(&mut actual, scratch.buffers["table"]))?;
+            assert_eq!(actual, expected);
+            let mut inventory = Inventory::new(CoordinatorDevices::new(&[0])?, "packed",
+                Lifetime::TARGET, Category::Workspace, "projection");
+            scratch.allocation_receipts(&mut inventory, "core")?;
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 5);
+            // Families that have not opted in still retain the original five owners.
+            assert_eq!(projection.allocate(device)?._owners.len(), 5);
+        }
         Ok(())
     }
 

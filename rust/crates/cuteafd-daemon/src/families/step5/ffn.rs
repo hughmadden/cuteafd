@@ -387,7 +387,7 @@ impl<'a> DenseFfn<'a> {
             activation,
             epsilon,
             native,
-            layer: _,
+            layer,
         } = plan;
         if let Some(names) = native {
             let definitions: [(&str, &[&str], &[u8]); 3] = [
@@ -403,7 +403,7 @@ impl<'a> DenseFfn<'a> {
             let scratch = match native_scratch {
                 Some(scratch) => scratch,
                 None => std::rc::Rc::new(super::native::NativeScratch::allocate(device,
-                    &core.scratch_layout(admission.rows)?.context("native dense scratch")?, crate::shared::memory::Tag::workspace("step5/native-projection"))?),
+                    &core.scratch_layout(admission.rows)?.context("native dense scratch")?, if layer >= Config::parse(checkpoint)?.layers { crate::shared::memory::Tag::drafter_workspace("step5/mtp-dense-projection") } else { crate::shared::memory::Tag::workspace("step5/dense-projection") })?),
             };
             ensure!(scratch.scratch.rows >= admission.rows, "Step-5 native dense scratch rows");
             let take = |core: &mut super::native::NativeLayer<'a>, name: &str| -> Result<super::native::NativeLinear<'a>> {

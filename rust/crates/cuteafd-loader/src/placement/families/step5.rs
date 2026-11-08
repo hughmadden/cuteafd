@@ -42,6 +42,8 @@ struct Figures {
     fixed: Vec<Demand>,
     /// One root and tail per physical weight arena, including the embedding.
     weights: Vec<Component>,
+    /// Physical requests behind fixed logical owners; weight arena tails are separate.
+    granularity: Vec<Component>,
     /// Residual receive slots, charged by the shared solver apart from `fixed`.
     hops: Vec<u64>,
 }
@@ -61,10 +63,8 @@ impl Figures {
             .get(usize::from(rank))
             .context("Step-5 pool geometry rank")?
             .persistent_unit_bytes;
-        let pool = unit
-            .checked_mul(pages)
-            .context("Step-5 pool record total overflow")?;
-        let weights = self.weights.iter().filter(|component| match &component.kind {
+        let pool = pool_curve(unit, pages, true)?.at(pages)?;
+        let weights = self.weights.iter().chain(&self.granularity).filter(|component| match &component.kind {
             ComponentKind::Allocation { template, .. } => template.location == Location::coordinator(rank),
             ComponentKind::AllocationGranularity(owner) => owner.location == Location::coordinator(rank),
             _ => false,
@@ -86,6 +86,101 @@ fn checked_sum(values: impl IntoIterator<Item = u64>) -> Result<u64> {
 
 fn exact(fixed: &mut Vec<Demand>, rank: usize, category: Category, group: &str, bytes: u64) {
     fixed.push(Demand::new(rank as u8, category, group, bytes, Basis::Exact));
+}
+
+fn owner_id(rank: u8, group: &str) -> String {
+    format!("step5.owner.{rank}.{}", group.replace(' ', "."))
+}
+
+fn physical(fixed: &mut Vec<Demand>, backings: &mut Vec<GranularityBacking>, rank: usize,
+    category: Category, group: &str, requests: Vec<u64>) -> Result<()> {
+    let requests = requests.into_iter().filter(|&bytes| bytes > 0).collect::<Vec<_>>();
+    let bytes = checked_sum(requests.iter().copied())?;
+    exact(fixed, rank, category, group, bytes);
+    if bytes > 0 {
+        backings.push(GranularityBacking { backing: owner_id(rank as u8, group), requests });
+    }
+    Ok(())
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 { (a, b) = (b, a % b); }
+    a
+}
+
+/// Records have no header/intercept: aligning page count makes every auto-pool
+/// backing exactly physical, and the alignment slack remains usable records.
+fn pool_page_multiple(units: impl IntoIterator<Item = u64>) -> Result<u64> {
+    units.into_iter().try_fold(1u64, |multiple, unit| {
+        let quantum = SM120_ALLOCATION_GRANULARITY_BYTES / gcd(unit, SM120_ALLOCATION_GRANULARITY_BYTES);
+        (multiple / gcd(multiple, quantum)).checked_mul(quantum)
+            .context("Step-5 pool alignment overflow")
+    })
+}
+
+/// Explicit pools retain their exact page count. Their single backing's
+/// physical cost is an exact piecewise-affine rounded curve, not a margin.
+fn pool_curve(unit: u64, maximum: u64, physical: bool) -> Result<ByteCurve, Refusal> {
+    if !physical || unit == 0 || unit % SM120_ALLOCATION_GRANULARITY_BYTES == 0 {
+        return Ok(ByteCurve::linear(unit, unit, maximum));
+    }
+    let at = |pages: u64| -> Result<u64, Refusal> {
+        unit.checked_mul(pages).and_then(|bytes| bytes.div_ceil(SM120_ALLOCATION_GRANULARITY_BYTES)
+            .checked_mul(SM120_ALLOCATION_GRANULARITY_BYTES))
+            .ok_or(Refusal::Overflow("Step-5 pool backing"))
+    };
+    let mut pieces = Vec::new();
+    let mut first = 1;
+    while first <= maximum {
+        let bytes_at_first = at(first)?;
+        let slope = if first < maximum { at(first + 1)? - bytes_at_first } else { 0 };
+        let mut last = first;
+        while last < maximum && at(last + 1)? - at(last)? == slope { last += 1; }
+        pieces.push(BytePiece { first, last, bytes_at_first, bytes_per_page: slope });
+        first = last + 1;
+    }
+    Ok(ByteCurve(pieces))
+}
+
+#[cfg(test)]
+mod physical_pool_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_pages_align_every_zero_intercept_records_backing() -> Result<()> {
+        let page = SM120_ALLOCATION_GRANULARITY_BYTES;
+        for units in [[384 * 64, 768 * 64], [3 * page / 8, 5 * page / 16], [0, page], [7, 33]] {
+            let quantum = pool_page_multiple(units)?;
+            for unit in units {
+                assert_eq!(unit * quantum % page, 0);
+                for pages in [quantum, 17 * quantum] {
+                    assert_eq!((unit * pages).div_ceil(page) * page, unit * pages);
+                }
+            }
+            let before = 123_457;
+            let after = before / quantum * quantum;
+            assert!(before - after < quantum);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_pool_curve_prices_exact_physical_backing_without_changing_pages() -> Result<()> {
+        let page = SM120_ALLOCATION_GRANULARITY_BYTES;
+        for unit in [0, 1, 7, page / 16, page / 2, page, page + 7, 13 * page / 8] {
+            let maximum = 259;
+            let curve = pool_curve(unit, maximum, true)?;
+            assert_eq!(curve.0.first().unwrap().first, 1);
+            assert_eq!(curve.0.last().unwrap().last, maximum);
+            assert!(curve.0.windows(2).all(|pair| pair[0].last + 1 == pair[1].first));
+            for pages in 1..=maximum {
+                assert_eq!(curve.at(pages)?, (unit * pages).div_ceil(page) * page);
+                assert_eq!(pool_curve(unit, maximum, false)?.at(pages)?, unit * pages);
+            }
+        }
+        assert!(pool_curve(u64::MAX, 2, true).is_err());
+        Ok(())
+    }
 }
 
 fn scaled(bytes: u64, count: usize) -> Result<u64> {
@@ -178,13 +273,20 @@ impl<'a> Step5Recipe<'a> {
         let routes = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
         let counts = (0..=routes.len()).collect::<Vec<_>>();
         let destination = if gpus == 2 { vec![0, 1] } else { vec![0] };
-        let arena = inputs.onboard.as_ref().map_or(vec![0; gpus], |onboard| {
+        let mut arena = inputs.onboard.as_ref().map_or(vec![0; gpus], |onboard| {
             if gpus == 2 {
                 onboard.tp2_workspace.to_vec()
             } else {
                 vec![onboard.workspace]
             }
         });
+        if gpus == 2 && inputs.peer_diagnostics && inputs.onboard.is_some() {
+            let progress = crate::serving_capacity::PeerStorageLayout::new(
+                2 * inputs.waves, 1, true)?.progress_bytes as u64;
+            for bytes in &mut arena {
+                *bytes = bytes.checked_add(progress).context("Step-5 expert diagnostic storage overflow")?;
+            }
+        }
         let expert = inputs
             .onboard
             .as_ref()
@@ -284,7 +386,9 @@ impl<'a> Step5Recipe<'a> {
         .context("Step-5 residual hop storage")?;
         let mut fixed = Vec::new();
         let mut weights = Vec::new();
+        let mut granularity = Vec::new();
         for rank in 0..ranks {
+            let mut backings = Vec::new();
             let reservation =
                 Reservation::new(&cache, rank, inputs.sequences as u64, marks, 1, usize::MAX)?;
             for (arena, logical, kind) in &native[rank].weight_arenas {
@@ -301,44 +405,65 @@ impl<'a> Step5Recipe<'a> {
                 components.push(resident);
                 weights.extend(components);
             }
-            exact(&mut fixed, rank, Category::Workspace, "Step-5 private native scratch", native[rank].immutable);
-            exact(&mut fixed, rank, Category::Workspace, "Step-5 native workspace", native[rank].workspace);
-            exact(&mut fixed, rank, Category::Kv, "Step-5 active sequence state", reservation.active as u64);
-            exact(&mut fixed, rank, Category::Prefix, "Step-5 exact retained marks", reservation.marks as u64);
-            exact(&mut fixed, rank, Category::Workspace, "Step-5 private transaction staging",
-                staging_bytes(&cache, rank, inputs.sequences)? as u64);
+            ensure!(checked_sum(native[rank].private_requests.iter().chain(&native[rank].drafter_requests).copied())? == native[rank].immutable,
+                "Step-5 private projection requests differ from admission");
+            physical(&mut fixed, &mut backings, rank, Category::Workspace, "Step-5 private native scratch",
+                native[rank].private_requests.clone())?;
+            physical(&mut fixed, &mut backings, rank, Category::Drafter, "Step-5 MTP native scratch",
+                native[rank].drafter_requests.clone())?;
+            physical(&mut fixed, &mut backings, rank, Category::Workspace, "Step-5 native workspace",
+                vec![native[rank].projection_bytes, native[rank].workspace.checked_sub(native[rank].projection_bytes)
+                    .context("Step-5 projection exceeds shared workspace")?])?;
+            physical(&mut fixed, &mut backings, rank, Category::Kv, "Step-5 active sequence state",
+                vec![reservation.active as u64])?;
+            physical(&mut fixed, &mut backings, rank, Category::Prefix, "Step-5 exact retained marks",
+                vec![reservation.marks as u64])?;
+            physical(&mut fixed, &mut backings, rank, Category::Staging, "Step-5 private transaction staging",
+                vec![staging_bytes(&cache, rank, inputs.sequences)? as u64])?;
             exact(&mut fixed, rank, Category::Runtime, "Step-5 pending code", inputs.pending_code[rank]);
             if rank == 0 {
-                exact(&mut fixed, rank, Category::Workspace, "Step-5 input", input_bytes(inputs.rows)?);
+                let rows = inputs.rows as u64;
+                let requests = vec![rows * 4, rows * 4096 * 2, rows * 4096 * 4];
+                ensure!(checked_sum(requests.iter().copied())? == input_bytes(inputs.rows)?, "Step-5 input request inventory");
+                physical(&mut fixed, &mut backings, rank, Category::Workspace, "Step-5 input", requests)?;
                 let capacity = inputs.rows.min(64);
-                exact(&mut fixed, rank, Category::Workspace, "Step-5 selector and device sampler",
-                    checked_sum([
-                        scaled(12, capacity)?,
-                        cuteafd_core::target_sampler_device_bytes(capacity, cfg.vocab) as u64,
-                    ])?);
+                let mut requests = cuteafd_core::target_sampler_allocations(capacity, cfg.vocab)
+                    .map_err(anyhow::Error::msg)?.into_iter().filter(|a| !a.pinned)
+                    .map(|a| a.bytes as u64).collect::<Vec<_>>();
+                requests.push(scaled(12, capacity)?);
+                physical(&mut fixed, &mut backings, rank, Category::Workspace,
+                    "Step-5 selector and device sampler", requests)?;
             }
             if rank == usize::from(ownership.execution().spec().entry_gpu) {
-                exact(&mut fixed, rank, Category::Transport, "Step-5 Spark intake planes",
-                    crate::serving_capacity::prefill_return_bytes_with_format(1, inputs.rows as u64,
-                        inputs.inventory.spark_ranks as u64, 4096, inputs.spark_reply_format)?
-                        .max(256 * inputs.inventory.spark_ranks as u64));
-                exact(&mut fixed, rank, Category::Workspace, "Step-5 routed reply", (inputs.rows as u64 * 4096 * 2).max(256));
+                let count = inputs.inventory.spark_ranks;
+                let bytes = crate::serving_capacity::prefill_return_bytes_with_format(1, inputs.rows as u64,
+                    count as u64, 4096, inputs.spark_reply_format)?.max(256 * count as u64);
+                physical(&mut fixed, &mut backings, rank, Category::Transport, "Step-5 Spark intake planes",
+                    if count == 0 { vec![] } else { vec![bytes / count as u64; count] })?;
+                physical(&mut fixed, &mut backings, rank, Category::Workspace, "Step-5 routed reply",
+                    vec![(inputs.rows as u64 * 4096 * 2).max(256)])?;
             }
             if ranks == 2 {
-                let progress = if inputs.peer_diagnostics { (9 * 48).max(256) as u64 } else { 0 };
-                // Eight peer receive slots, peer control, abort word and one
-                // private hop control plane; hop receives are charged apart.
-                exact(&mut fixed, rank, Category::Transport, "Step-5 private peer and hop control",
-                    checked_sum([
-                        8 * (inputs.unit_rows() as u64 * 4096 * 4).max(256),
-                        256,
-                        256,
-                        256,
-                        progress,
-                    ])?);
+                let mut requests = vec![(inputs.unit_rows() as u64 * 4096 * 4).max(256); 8];
+                requests.extend([256; 3]);
+                if inputs.peer_diagnostics { requests.push((9 * 48).max(256)); }
+                physical(&mut fixed, &mut backings, rank, Category::Transport,
+                    "Step-5 private peer and hop control", requests)?;
+                let slot = inputs.hops().rows * inputs.hops().row_bytes;
+                if hops[rank] > 0 {
+                    ensure!(slot > 0 && hops[rank] % slot == 0, "Step-5 hop request inventory");
+                    backings.push(GranularityBacking { backing: format!("step5.hops.{rank}"),
+                        requests: vec![slot; usize::try_from(hops[rank] / slot)?] });
+                }
+            }
+            if !backings.is_empty() {
+                granularity.push(allocation_granularity_component(AllocationGranularity {
+                    id: format!("step5.runtime.{rank}.tail"), location: Location::coordinator(rank as u8),
+                    lifetime: Lifetime::RESIDENT, backings, evidence: GranularityEvidence::Forecast,
+                }, maximum_pages)?);
             }
         }
-        Ok(Figures { cache, marks, fixed, weights, hops })
+        Ok(Figures { cache, marks, fixed, weights, granularity, hops })
     }
 
     /// The live/offline request: explicit CLI values stay strict, zero and
@@ -411,6 +536,15 @@ impl<'a> Step5Recipe<'a> {
                         ..component
                     });
                 }
+                contract.components.push(Component {
+                    activation: Activation::choice(onboard, position + 1),
+                    ..allocation_granularity_component(AllocationGranularity {
+                        id: format!("step5.expert.{layer}.{gpu}.tail"), location: Location::coordinator(gpu as u8),
+                        lifetime: Lifetime::RESIDENT,
+                        backings: vec![GranularityBacking { backing: format!("step5.expert.{layer}.{gpu}"),
+                            requests: vec![bytes] }], evidence: GranularityEvidence::Forecast,
+                    }, self.maximum_pages)?
+                });
             }
         }
         // The arena plane is held by every count option that onboards a layer.
@@ -430,15 +564,27 @@ impl<'a> Step5Recipe<'a> {
                 Category::Experts,
                 "Step-5 RTX expert arena",
             );
-            contract.components.push(Component {
-                activation: Activation { clauses: clauses.clone() },
-                ..Component::allocation(
-                    owner,
-                    ByteCurve::fixed(bytes, self.maximum_pages),
-                    false,
-                    self.maximum_pages,
-                )
-            });
+            let mut requests = self.inputs.onboard.as_ref().and_then(|o| o.workspace_requests.get(gpu))
+                .ok_or_else(|| Refusal::InvalidFact("Step-5 missing expert workspace requests".into()))?.clone();
+            if self.gpus == 2 && self.inputs.peer_diagnostics {
+                let progress = crate::serving_capacity::PeerStorageLayout::new(
+                    2 * self.inputs.waves, 1, true)
+                    .map_err(|e| Refusal::InvalidFact(e.to_string()))?.progress_bytes as u64;
+                requests.push(progress);
+            }
+            if requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes)) != Some(bytes) {
+                return Err(Refusal::InvalidFact("Step-5 expert workspace request total".into()));
+            }
+            let tail = allocation_granularity_component(AllocationGranularity {
+                id: format!("step5.expert.arena.{gpu}.tail"), location: owner.location,
+                lifetime: owner.lifetime, backings: vec![GranularityBacking {
+                    backing: owner.id.clone(), requests: requests.clone(),
+                }], evidence: GranularityEvidence::Forecast,
+            }, self.maximum_pages)?;
+            for component in [Component::allocation(owner,
+                ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages), tail] {
+                contract.components.push(Component { activation: Activation { clauses: clauses.clone() }, ..component });
+            }
         }
         Ok(())
     }
@@ -466,7 +612,10 @@ impl Recipe for Step5Recipe<'_> {
             spark_reply_formats: None,
             resident_weight_limit: request.resident_weight_limit,
             page_rows: self.page_rows,
-            pool_page_multiple: 1,
+            pool_page_multiple: if matches!(request.pool, Pin::Auto) {
+                pool_page_multiple(self.figures.cache.geometry.ranks.iter().map(|r| r.persistent_unit_bytes))
+                    .map_err(|error| Refusal::InvalidFact(error.to_string()))?
+            } else { 1 },
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,
             variables: vec![Variable::Prefill(vec![self.prefill])],
@@ -500,11 +649,11 @@ impl Recipe for Step5Recipe<'_> {
         } else {
             return Err(Refusal::Unsupported);
         }
-        contract.components.extend(self.figures.weights.iter().cloned());
+        contract.components.extend(self.figures.weights.iter().chain(&self.figures.granularity).cloned());
         for demand in &self.figures.fixed {
             let location = Location::coordinator(demand.gpu);
             let owner = Allocation::buffer(
-                format!("step5.owner.{}.{}", demand.gpu, demand.group.replace(' ', ".")),
+                owner_id(demand.gpu, &demand.group),
                 location,
                 demand.bytes,
                 Lifetime::RESIDENT,
@@ -532,7 +681,7 @@ impl Recipe for Step5Recipe<'_> {
             let owner = Allocation::buffer(format!("step5.records.{rank}"),
                 Location::coordinator(rank as u8), unit, Lifetime::RESIDENT, Category::Kv, "records");
             contract.components.push(Component::allocation(owner,
-                ByteCurve::linear(unit, unit, self.maximum_pages), false, self.maximum_pages));
+                pool_curve(unit, self.maximum_pages, matches!(request.pool, Pin::Exact(_)))?, false, self.maximum_pages));
         }
         for (rank, &bytes) in self.figures.hops.iter().enumerate() {
             if bytes == 0 {
