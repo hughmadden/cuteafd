@@ -169,6 +169,7 @@ fn gpu_reply_ce_current_event_depth_three() -> Result<()> {
     let path = library_path()?;
     // SAFETY: the opt-in path names the matching built native library.
     let library = Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     library.cuda_set_device(0)?;
     let device = Device { library: &library, id: 0 };
     let mut host = HostAllocation::new(&library, BYTES, crate::shared::memory::TEST)?;
@@ -934,6 +935,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
     let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     // The compact reducer sums rows of the process-wide expert hidden size
     // (5120 unless a family sets another; this test process never does), so
@@ -1090,6 +1092,7 @@ fn gpu_decode_reduction_captured_before_first_wave_reads_replay_format() -> Resu
     let path = library_path()?;
     // SAFETY: the opt-in path names the matching built native library.
     let library = Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     let (hidden, rows, ranks) = (5120usize, 8usize, 2usize);
     let row_bytes = hidden * 2;
     let planes = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
@@ -1144,6 +1147,7 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     let (hidden, topk, ranks, rows, waves, layers) = (5120usize, 6usize, 3usize,
         if compressed { 65usize } else { 4usize }, 2usize, 4usize);
@@ -1623,6 +1627,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
     let path = library_path()?;
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    crate::shared::inventory::preload_native_modules(&library)?;
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
     let (hidden, topk, ranks, rows) = (5120usize, 6usize, 2usize, 64usize);
     let row_bytes = hidden * 2;

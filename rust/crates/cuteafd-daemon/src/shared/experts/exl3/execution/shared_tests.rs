@@ -140,7 +140,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
     })?;
     assert_eq!(library.cuda_get_device()?, 0);
     assert_eq!(inventory.gpus[0].module_bytes, 2*(4096+1024+512));
-    assert_eq!(fixture.events()?, "KRWKRW", "inventory must retain every context");
+    assert_eq!(fixture.events()?, "KRWKRWN", "inventory must retain every context");
     library.cuda_set_device(1)?;
     let mut names: Vec<String> = ["descriptor_map", "global_to_combined", "intermediate_rotations", "gate_suh", "up_suh", "down_svh", "dummy_scales", "unit_scales"]
         .into_iter().map(str::to_owned).collect();

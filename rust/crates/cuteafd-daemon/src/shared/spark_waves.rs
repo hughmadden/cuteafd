@@ -46,8 +46,8 @@
 //! launch behind a pending wait stalls the engine thread until that wait is
 //! released, and for good when the release depends on the stalled thread
 //! (the first Engram dequantization of a cold-start request hung a
-//! 0-RTX-layer prefill this way). [`Waves::start`] loads every registered
-//! native kernel before any wait exists.
+//! 0-RTX-layer prefill this way). Shared pre-weight inventory loads every native
+//! kernel; [`Waves::start`] checks that it happened before any wait exists.
 //!
 //! The worker queues no GPU work at all. A stream memory wait stalls its
 //! hardware queue, and streams share queues, so a wait released by GPU work
