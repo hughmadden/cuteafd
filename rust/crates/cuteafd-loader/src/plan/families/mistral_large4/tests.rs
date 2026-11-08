@@ -189,11 +189,20 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
         // The explicit whole-layer layout avoids replicated KV.
         assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Layers }
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
-        let items = &memory.devices[0].items;
-        assert!(items.iter().any(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
-            && item.bytes > 0), "{ranks}+{gpus}: missing physical embedding owner");
-        assert!(items.iter().any(|item| item.group == "GLM target weights" && item.bytes > 0),
-            "{ranks}+{gpus}: missing admitted target owners");
+        let layer_owners = (gpus == 2).then(||
+            crate::placement::families::glm5::attention_owners(&cfg, cfg.layers).unwrap());
+        let weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
+            &checkpoint, gpus, cfg.layers, layer_owners.as_deref(),
+            crate::families::glm5::native_bf16(), false,
+            crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
+        let arenas = weights.coordinator_arenas().unwrap();
+        assert_eq!(arenas[0].view("glm.weights.embedding").unwrap().bytes() as u64,
+            checkpoint.tensors.iter().find(|tensor| tensor.meta.name == cfg.embedding()).unwrap().meta.byte_length);
+        for (device, arena) in memory.devices.iter().take(gpus).zip(&arenas) {
+            testing::assert_weight_arena_items(device, std::slice::from_ref(arena));
+            assert!(!device.items.iter().any(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
+                || item.group == "GLM target weights"), "{ranks}+{gpus}: retained old physical owner");
+        }
         println!("ml4 {ranks} Sparks + {gpus} RTX: pool {} tokens, onboard {:?}, fits {}",
             memory.pool_tokens, report.onboard_layers, report.fits);
         // Admitted Spark worlds use their own retained-manifest owner census.

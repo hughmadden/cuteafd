@@ -46,6 +46,33 @@ pub fn plan(snapshot: &Path, options: &super::PlanOptions) -> Result<super::Plan
     BudgetedPlanInput::open(snapshot)?.plan(options)
 }
 
+/// Rendered admission must retain exact arena extents and one tail per backing.
+#[track_caller]
+pub fn assert_weight_arena_items(
+    device: &cuteafd_core::memory_layout::DeviceLayout,
+    arenas: &[crate::serving_capacity::WeightArenaLayout],
+) {
+    use cuteafd_core::memory_layout::Category;
+    let roots = device.items.iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].category, Category::Weights);
+    let bytes = arenas.iter().map(|arena| arena.bytes() as u64).sum::<u64>();
+    assert_eq!(roots[0].bytes, bytes);
+    let mut tails = 0;
+    for arena in arenas {
+        let id = format!("{}.tail (", arena.id());
+        let owners = device.items.iter().filter(|item| item.group == "allocation granularity"
+            && item.format.starts_with(&id)).collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1, "{}", arena.id());
+        let extent = arena.bytes() as u64;
+        let tail = extent.div_ceil(2 << 20) * (2 << 20) - extent;
+        assert_eq!(owners[0].bytes, tail, "{}", arena.id());
+        tails += owners[0].bytes;
+    }
+    assert_eq!(roots[0].bytes + tails, arenas.iter().map(|arena|
+        (arena.bytes() as u64).div_ceil(2 << 20) * (2 << 20)).sum::<u64>());
+}
+
 /// Tiny native TikToken snapshot, deliberately without tokenizer.json.
 pub fn write_kimi_tokenizer(snapshot: &Path) {
     use base64::Engine;

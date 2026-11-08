@@ -5975,7 +5975,18 @@ fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
     assert!(report.placement_supported, "{:?}", report.hints);
     let memory = report.memory_layout.unwrap();
     assert!(memory.notes.iter().any(|note| note.contains("GPU residency retained")));
-    assert!(memory.devices[0].by_category()[&Category::Embedding] > 0);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
+        &checkpoint, 1, cfg.layers, None, crate::families::glm5::native_bf16(), false,
+        crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
+    let embedding = weights.owners.iter().find(|owner| owner.allocation.id == "glm.weights.embedding").unwrap();
+    assert_eq!(embedding.allocation.location, crate::placement::planner::Location::coordinator(0));
+    let arenas = weights.coordinator_arenas().unwrap();
+    assert_eq!(arenas[0].view(&embedding.allocation.id).unwrap().bytes() as u64, embedding.allocation.bytes);
+    testing::assert_weight_arena_items(&memory.devices[0], &arenas);
+    assert!(!memory.devices[0].items.iter().any(|item| item.category == Category::Embedding
+        || item.group == "GLM target weights"));
     assert!(report.host_ledger.is_none());
 }
 
