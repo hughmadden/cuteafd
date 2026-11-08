@@ -1054,14 +1054,6 @@ impl Recipe for PreparedV4<'_> {
             owners.components.extend(super::host::components(inputs, host, self.prefix.owners, self.page_rows,
                 self.attention == AttentionPlacement::Context, self.maximum_pages)?);
         }
-        if inputs.blas_head.bf16() {
-            owners.components.extend(serving::blas_components("sm_120", &[serving::BlasOwners {
-                name: "V4 lead target and dSpark vocabulary projections".into(),
-                process: "coordinator".into(), thread: "dsv4/blas/serve".into(),
-                location: Location::coordinator(0), gemm: inputs.blas_head.gemm(), lt: inputs.blas_head.lt(),
-                lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth }, activation: Activation::always(),
-            }], self.maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?);
-        }
         Ok(Contract { floor_fallback: None,
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: None,
