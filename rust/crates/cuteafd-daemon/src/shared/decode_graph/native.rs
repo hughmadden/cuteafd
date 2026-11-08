@@ -1,6 +1,6 @@
 //! Native graph adapters. The containing wave owns stable workspace/buffers and
 //! drains them before insert/clear; GraphOwner retains weight references.
-use super::{GraphBank, GraphOwner};
+use super::{GraphBank, GraphOwner, GraphPolicy};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
@@ -18,8 +18,9 @@ pub(crate) struct LayerGraphs<'w, 'a, W> {
 }
 
 impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
-    pub fn new(library: &'a NativeLibrary, decode_rows: u32) -> Self {
-        Self { library, bank: GraphBank::new(None), current: [None; 40], retain_small: false, decode_rows }
+    pub fn new(library: &'a NativeLibrary, decode_rows: u32, family: &'static str) -> Self {
+        Self { library, bank: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, family),
+            current: [None; 40], retain_small: false, decode_rows }
     }
     pub fn get(&self, layer: usize, weights: &W) -> Option<(*mut c_void, u32)> {
         self.get_shape(layer, weights, self.current.get(layer).copied().flatten()?)
@@ -102,8 +103,9 @@ pub(crate) struct RowGraphs<'a> {
     site: &'static str,
 }
 impl<'a> RowGraphs<'a> {
-    pub fn new(library: &'a NativeLibrary, site: &'static str, decode_rows: usize) -> Self {
-        Self { library, bank: GraphBank::new(None), decode_rows, site }
+    pub fn new(library: &'a NativeLibrary, site: &'static str, decode_rows: usize, family: &'static str) -> Self {
+        Self { library, bank: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, family),
+            decode_rows, site }
     }
     pub fn get(&self, rows: usize) -> Option<*mut c_void> { self.bank.get(&rows).map(|owner| owner.raw) }
     pub fn declare_startup(&mut self, rows: &[usize]) -> Result<()> {

@@ -167,7 +167,7 @@ impl<'a> AttentionOutputWeights<'a> {
             position_staging: HostAllocation::new(self.library, storage.unit as usize * 8, Tag::staging("v41/attention-output"))?,
             weights: self,
             capacity: storage.unit,
-            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
+            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41"),
             ready: None,
             origin: None,
             window: crate::shared::memory::row_window::RowWindow::NONE,

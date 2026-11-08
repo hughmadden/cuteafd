@@ -101,7 +101,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             ops: library.v41_attention_ops()?, table,
             staging: HostAllocation::new(library, capacity * 4, Tag::staging("v41/target-embedding"))?,
             image_staging: HostAllocation::new(library, capacity * (10240 + 4), Tag::staging("v41/target-embedding"))?, capacity,
-            graphs: RowGraphs::new(library, "target_embedding", cuteafd_core::V41_VERIFY_ROWS),
+            graphs: RowGraphs::new(library, "target_embedding", cuteafd_core::V41_VERIFY_ROWS, "deepseek_v41"),
             tokens: Vec::with_capacity(capacity), positions: Vec::with_capacity(capacity), ready: false, destinations: None,
         })
     }

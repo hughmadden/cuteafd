@@ -162,7 +162,7 @@ struct Tp2FfnGraphs<'w,'a> {
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32);
+        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
         bank.enable_small_shapes();Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,

@@ -56,6 +56,23 @@ pub(crate) fn missing_variants() -> Vec<MissingVariant> {
     MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
 }
 
+/// Counts one eager execution of `shape` outside a sealed startup set and
+/// reports whether it is the first for this family, which is the only one that
+/// warns. Owners that hold their own executable and decide eager themselves
+/// call this directly; `GraphBank::enqueue_with_context` calls it too, so both
+/// paths land in the same /v1/stats entry. The `context` is built only on a
+/// first miss.
+pub(crate) fn note_eager(family: &'static str, shape: &str, context: impl FnOnce() -> String) -> bool {
+    if !note_missing(family, shape) { return false; }
+    // Built outside the macro so the description is produced even when the
+    // current subscriber filters this target out.
+    let context = context();
+    tracing::warn!(target: "cuteafd::graph_capture", family = family, key = %shape,
+        context = %context,
+        "graph shape outside the startup set ran eagerly; consider adding it to the startup graph set");
+    true
+}
+
 struct Entry<E> {
     exec: E,
     launched: u64,
@@ -167,15 +184,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.stats.eager_runs += 1;
             // Eager requires a sealed (or declared) startup set, so every miss
             // is a shape the planner's inventory lacked.
-            let shape = format!("{key:?}");
-            if note_missing(self.family, &shape) {
-                // Built outside the macro so the description is produced even
-                // when the current subscriber filters this target out.
-                let context = context();
-                tracing::warn!(target: "cuteafd::graph_capture", family = self.family, key = %shape,
-                    context = %context, eager_runs = self.stats.eager_runs,
-                    "graph shape outside the startup set ran eagerly; consider adding it to the startup graph set");
-            }
+            note_eager(self.family, &format!("{key:?}"), context);
         }
         (decision, self.launch(key))
     }

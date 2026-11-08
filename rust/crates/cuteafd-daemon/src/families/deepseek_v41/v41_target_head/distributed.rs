@@ -44,7 +44,7 @@ impl<'w, 'a> Rank<'w, 'a> {
             projection, _workspace: workspace, input,
             logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4, Tag::workspace("v41/target-head"))?,
             candidates: DeviceAllocation::new(library, capacity * 8, Tag::workspace("v41/target-head"))?,
-            weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity)), fp8_scratch: native,
+            weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity, "deepseek_v41")), fp8_scratch: native,
             sm: Some(library.v41_peer_copy()?),
         })
     }
