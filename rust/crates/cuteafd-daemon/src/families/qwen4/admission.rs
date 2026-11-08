@@ -10,10 +10,9 @@ use cuteafd_loader::placement::{families::qwen4, Baseline, ResidentWeights};
 
 pub(super) fn single_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     cfg: &Qwen4Config, layers: usize, mtp: bool) -> Result<ResidentWeights> {
-    use cuteafd_loader::families::qwen4::resident::{checkpoint_resident_bytes, Qwen4Representation};
-    let resident = checkpoint_resident_bytes(checkpoint, cfg, layers, mtp,
-        Qwen4Representation { fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head })?;
-    let mut weights = qwen4::single_owner_weights(&resident,
+    use cuteafd_loader::families::qwen4::resident::Qwen4Representation;
+    let mut weights = qwen4::single_owner_weights(checkpoint, cfg, layers, mtp,
+        Qwen4Representation { fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
         args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host,
         cfg.ple_layers.first().is_some_and(|&layer| layer < layers))?;
     if let Some((gpu, media)) = args.planner_media_weights {
@@ -297,20 +296,25 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
 /// before allocations. PLE follows its layer; draft experts remain separate.
 pub(super) struct DualWeightPlan {
     pub resident: cuteafd_loader::families::qwen4::resident::Qwen4CheckpointResident,
+    /// The arenas `Qwen4Loader::with_arenas` allocates at this cut, from the
+    /// same headers, owners and representation: charged once each by the solver.
+    pub arenas: Vec<(usize, cuteafd_loader::serving_capacity::WeightArenaLayout)>,
     pub fixed: Vec<cuteafd_loader::placement::Demand>,
     pub layer_extra: Vec<Vec<cuteafd_loader::placement::LayerExtraDemand>>,
 }
 
 pub(super) fn dual_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     cfg: &Qwen4Config, layers: usize, mtp: bool) -> Result<DualWeightPlan> {
-    use cuteafd_loader::families::qwen4::resident::{checkpoint_resident_bytes, Qwen4Representation};
+    use cuteafd_loader::families::qwen4::{resident::{checkpoint_resident_bytes, Qwen4Representation},
+        weight_layout::{dual_arenas, embedding_table_bytes}};
     let selected = Qwen4Representation { fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head };
     let resident = checkpoint_resident_bytes(checkpoint, cfg, layers, mtp, selected)?;
-    let mut fixed = qwen4::dual_owner0_weights(&resident,
-        args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host);
-    fixed.extend(qwen4::dual_projection_load_staging(cfg, layers, mtp, selected));
+    let embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu {
+        embedding_table_bytes(checkpoint)? } else { 0 };
+    let arenas = dual_arenas(checkpoint, cfg, &qwen4::dual_owners(layers), mtp, selected, embedding)?;
+    let fixed = qwen4::dual_projection_load_staging(selected);
     let layer_extra = qwen4::dual_ple_demands(cfg, layers, &resident)?;
-    Ok(DualWeightPlan { resident, fixed, layer_extra })
+    Ok(DualWeightPlan { resident, arenas, fixed, layer_extra })
 }
 
 /// Header-only pinned staging of each dual owner's coordinator records: the
@@ -647,7 +651,13 @@ mod tests {
             ..Default::default()
         };
         let extra = qwen4::dual_ple_demands(&cfg, 48, &resident)?;
-        let weights = vec![100 << 20; 48];
+        // The loader's own arenas from a header-only fixture at the fixed cut.
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_snapshot(dir.path(), &config,
+            &cuteafd_loader::plan::testing::qwen4_coordinator(&config, false), None);
+        let arenas = cuteafd_loader::families::qwen4::weight_layout::dual_arenas(
+            &cuteafd_loader::plan::Checkpoint::open(dir.path())?, &cfg, &qwen4::dual_owners(48), false,
+            Default::default(), 0)?;
         let experts = vec![None; 48];
         // Even enough capacity for the full table must retain mapped residency.
         for capacity in [96u64 << 30, 192u64 << 30] {
@@ -662,7 +672,7 @@ mod tests {
                         ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30 },
                     gpus: [GpuBudget { capacity_bytes: capacity, reserve_bytes: 3 << 30,
                         baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }; 2],
-                    layer_weights: &weights, layer_experts: &experts, layer_extra: &extra,
+                    arenas: &arenas, layer_experts: &experts, layer_extra: &extra,
                     fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
                     max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard,
                     startup_graph_modes: None, host: qwen4::QwenHost::ample(&cfg, 2, 4096)?, encoders: Default::default(),
@@ -706,21 +716,10 @@ mod tests {
         config["text_config"]["ple_layer_ids"] = serde_json::json!([2]);
         config["text_config"]["ple_embed_dim"] = serde_json::json!(2560);
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(&config)?;
-        let mut tensors = Vec::new();
-        for layer in 0..2 {
-            let prefix = format!("model.language_model.layers.{layer}.linear_attn");
-            for (name, rows, cols) in [("in_proj_qkv", 10240, 2560), ("in_proj_z", 6144, 2560),
-                ("in_proj_b", 48, 2560), ("in_proj_a", 48, 2560), ("out_proj", 2560, 6144)] {
-                tensors.push(testing::t(format!("{prefix}.{name}.weight"), "BF16", &[rows, cols]));
-            }
-        }
-        tensors.extend([
-            testing::t("model.language_model.hyper_connection_mixer.hc_norm.weight", "BF16", &[2560]),
-            testing::t("model.language_model.embed_tokens.weight", "BF16", &[64, 2560]),
-            testing::t("lm_head.weight", "BF16", &[64, 2560]),
-            testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
-                "F8_E4M3", &[100, 160]),
-        ]);
+        // The loader's real coordinator source tensors, plus the mapped PLE table shard.
+        let mut tensors = testing::qwen4_coordinator(&config, false);
+        tensors.push(testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            "F8_E4M3", &[100, 160]));
         testing::write_snapshot(dir.path(), &config, &tensors, None);
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path())?;
         let mut args = Cli::try_parse_from(["serve", "--snapshot", dir.path().to_str().unwrap(),
@@ -734,10 +733,17 @@ mod tests {
                 assert_eq!(plan.resident.layer_bytes.len(), 2);
                 assert_eq!(plan.resident.target_bytes, plan.resident.entry_bytes
                     + plan.resident.layer_bytes.iter().sum::<u64>());
-                let staging = if projections { 84_377_600 } else { 0 };
-                assert_eq!(plan.fixed.iter().map(|d| d.bytes).sum::<u64>(), plan.resident.entry_bytes
-                    + plan.resident.head_bytes + if host { 0 } else { plan.resident.embedding_bytes }
-                    + 2 * staging);
+                let staging = if projections { cuteafd_loader::shared::dense_read::STEP_BYTES as u64 } else { 0 };
+                // Owner0's head, mixer and embedding are arena views now: only staging stays fixed.
+                assert_eq!(plan.fixed.iter().map(|d| d.bytes).sum::<u64>(), 2 * staging);
+                // The arenas hold exactly the selected payload plus their own padding.
+                let payload = plan.resident.target_bytes + plan.resident.head_bytes
+                    + if host { 0 } else { plan.resident.embedding_bytes };
+                assert_eq!(plan.arenas.iter().map(|(_, l)| l.payload_bytes() as u64).sum::<u64>(), payload);
+                assert_eq!(plan.arenas.iter().map(|(_, l)| l.bytes() as u64).sum::<u64>(),
+                    payload + plan.arenas.iter().map(|(_, l)| l.padding_bytes() as u64).sum::<u64>());
+                assert_eq!(plan.arenas.iter().map(|(r, l)| (*r, l.id().to_string())).collect::<Vec<_>>(),
+                    vec![(0, "qwen4/target/rank0".into()), (1, "qwen4/target/rank1".into())]);
                 let load = plan.fixed.iter().filter(|d| d.category == cuteafd_core::memory_layout::Category::Staging)
                     .collect::<Vec<_>>();
                 assert_eq!(load.len(), if projections { 2 } else { 0 });
@@ -769,26 +775,12 @@ mod tests {
         for mtp in [false, true] {
         let dir = tempfile::tempdir()?;
         let (mut tensors, mut metadata) = testing::qwen4_exl3(4, 4);
-        for layer in 0..4 {
-            let prefix = format!("model.language_model.layers.{layer}");
-            let projections = if layer == 3 {
-                vec![("self_attn.q_proj", 12288, 2560), ("self_attn.k_proj", 512, 2560),
-                    ("self_attn.v_proj", 512, 2560), ("self_attn.indexer.index_qk_proj", 640, 2560),
-                    ("self_attn.o_proj", 2560, 6144)]
-            } else {
-                vec![("linear_attn.in_proj_qkv", 10240, 2560), ("linear_attn.in_proj_z", 6144, 2560),
-                    ("linear_attn.in_proj_b", 48, 2560), ("linear_attn.in_proj_a", 48, 2560),
-                    ("linear_attn.out_proj", 2560, 6144)]
-            };
-            for (name, rows, cols) in projections {
-                tensors.push(testing::t(format!("{prefix}.{name}.weight"), "BF16", &[rows, cols]));
-            }
-        }
-        tensors.extend([testing::t("model.language_model.embed_tokens.weight", "BF16", &[64, 2560]),
-            testing::t("lm_head.weight", "BF16", &[64, 2560])]);
         let mut config = testing::qwen4_config(4);
+        if mtp { config["text_config"]["mtp_num_hidden_layers"] = 1.into(); }
+        // The loader's real coordinator source tensors (and, with MTP, the
+        // draft layer's coordinator set); routed experts stay EXL3 below.
+        tensors.extend(testing::qwen4_coordinator(&config, mtp));
         if mtp {
-            config["text_config"]["mtp_num_hidden_layers"] = 1.into();
             let (draft_tensors, draft_metadata) = testing::qwen4_exl3(1, 4);
             for (name, dtype, shape) in draft_tensors {
                 tensors.push((name.replace("model.language_model.layers.0", "mtp.layers.0"), dtype, shape));
@@ -800,10 +792,6 @@ mod tests {
                     (key.replace("model.language_model.layers.0", "mtp.layers.0"), value.clone())).collect();
                 storage["stored_tensors"] = serde_json::Value::Object(stored);
                 metadata["tensor_storage"][name] = storage;
-            }
-            for (name, rows, cols) in [("q_proj", 12288, 2560), ("k_proj", 512, 2560),
-                ("v_proj", 512, 2560), ("indexer.index_qk_proj", 640, 2560), ("o_proj", 2560, 6144)] {
-                tensors.push(testing::t(format!("mtp.layers.0.self_attn.{name}.weight"), "BF16", &[rows, cols]));
             }
         }
         testing::write_snapshot(dir.path(), &config, &tensors, None);
@@ -899,7 +887,7 @@ mod tests {
                     reserve_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
                         - layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
                             .map(|item| item.bytes).sum::<u64>() } }),
-                layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,
+                arenas: &weights.arenas, layer_experts: &experts.costs,
                 layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace,
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, onboard: Onboard::Auto, startup_graph_modes: args.planner_graph_modes,

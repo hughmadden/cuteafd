@@ -1096,6 +1096,34 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
     }
 }
 
+/// A checkpoint whose headers name the projections but not the coordinator
+/// tensors the loader allocates (here: no stream mixer or hyper-connections)
+/// cannot serve. `cuteafd plan` refuses it with the resident-layout hint and
+/// charges no partial payload sum as if it fit.
+#[test]
+fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payload() {
+    let config = qwen4_config(4);
+    let complete = qwen4_coordinator(&config, false);
+    let incomplete = complete.iter().filter(|(name, ..)| !name.contains("hyper_connection")).cloned()
+        .collect::<Vec<_>>();
+    assert!(incomplete.len() < complete.len());
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
+        context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
+        host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..sparks(4) };
+    let hint = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout";
+    let resident_item = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+        .flat_map(|d| &d.items).any(|item| item.group == "target incl PLE projections");
+    // The complete headers describe the layout: no such refusal, weights charged.
+    let complete = plan(snapshot(config.clone(), &complete).path(), &options).unwrap();
+    assert!(complete.fits && !complete.hints.iter().any(|h| h.what == hint), "{}", render(&complete));
+    assert!(resident_item(&complete), "{}", render(&complete));
+    let refused = plan(snapshot(config, &incomplete).path(), &options).unwrap();
+    assert!(!refused.placement_supported && !refused.executable(), "{}", render(&refused));
+    assert!(refused.hints.iter().any(|h| h.what == hint), "{}", render(&refused));
+    // No payload-sum weight item stands in for the missing arena.
+    assert!(!resident_item(&refused), "{}", render(&refused));
+}
+
 #[test]
 fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
     let config = qwen4_config(4);
@@ -3145,9 +3173,8 @@ fn observed_zero_ranks_panics() {
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
     let mtp = cfg.mtp_layers > 0;
-    let owners = crate::families::qwen4::resident::checkpoint_resident_bytes(&checkpoint, &cfg,
-        cfg.layers, mtp, layout::LayoutOptions::default().qwen_representation).unwrap();
-    let required = crate::placement::families::qwen4::single_owner_weights(&owners, false, false).unwrap()
+    let required = crate::placement::families::qwen4::single_owner_weights(&checkpoint, &cfg, cfg.layers, mtp,
+        layout::LayoutOptions::default().qwen_representation, false, false).unwrap()
         .checked_add(crate::placement::families::qwen4::single_expert_weights(
             &crate::read_expert_catalog(dir.path()).unwrap(), cfg.layers, true, mtp).unwrap()).unwrap().0;
     let report = plan(dir.path(), &tight).unwrap();
@@ -5243,17 +5270,25 @@ fn qwen_native_resident_admission_includes_padding_not_source_inventory() {
     let dir = qwen_snapshot(4);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
-    let owners = crate::families::qwen4::resident::checkpoint_resident_bytes(&checkpoint, &cfg,
-        cfg.layers, false, layout::LayoutOptions::default().qwen_representation).unwrap();
-    let required = crate::placement::families::qwen4::single_owner_weights(&owners, false, false).unwrap()
+    let required = crate::placement::families::qwen4::single_owner_weights(&checkpoint, &cfg, cfg.layers, false,
+        layout::LayoutOptions::default().qwen_representation, false, false).unwrap()
         .checked_add(crate::placement::families::qwen4::single_expert_weights(
             &crate::read_expert_catalog(dir.path()).unwrap(), cfg.layers, true, false).unwrap()).unwrap().0;
     let options = PlanOptions { coordinator_budget_bytes: required, ..sparks(0) };
     let report = plan(dir.path(), &options).unwrap();
     let source = report.components.iter().filter(|c| matches!(c.owner, Owner::Rtx | Owner::SparkSliced))
         .map(|c| c.bytes).sum::<u64>();
-    assert_eq!(source, 1_397_074_944);
-    assert_eq!(required, 1_408_128_000);
+    // Source inventory over the fixture's complete coordinator headers.
+    assert_eq!(source, 1_436_704_192);
+    // The TP1 target arena's backing B (target 168,080,128 + head 168,960 +
+    // device embedding 327,680, inter-view padding 0 at these shapes) plus the
+    // native expert arenas (1,279,262,720): `layout.bytes()`, not a payload sum.
+    let arena = crate::families::qwen4::weight_layout::single_arena_bytes(&checkpoint, &cfg, cfg.layers, false,
+        layout::LayoutOptions::default().qwen_representation,
+        crate::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint).unwrap()).unwrap();
+    assert_eq!(arena, 168_576_768);
+    assert_eq!(required, 1_447_839_488);
+    assert_eq!(required - arena, 1_279_262_720);
     assert!(report.executable(), "{}", render(&report));
     // Expert arena padding outweighs this fixture's small FP8-head saving.
     // A budget that fits the source inventory must still refuse native owners.

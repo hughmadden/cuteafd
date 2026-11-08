@@ -93,7 +93,7 @@ impl Opened {
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,
             gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: baselines[rank].0,
                 baseline: baselines[rank].1, reserve_bytes: cuteafd_loader::placement::reserve::gpu("qwen4") }),
-            layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,
+            arenas: &weights.arenas, layer_experts: &experts.costs,
             layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace, pending_code_bytes: pending,
             max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
             spark_ranks: 0,
@@ -113,6 +113,9 @@ impl Opened {
             LayerMode::Whole { gpu, .. } => Ok(gpu as usize), _ => anyhow::bail!("Qwen dual owner mode")
         }).collect::<Result<Vec<_>>>()?;
         qwen4::check_dual_layer_owners(&owners)?;
+        // The admitted arenas were planned at the fixed cut; allocate exactly those.
+        ensure!(owners == qwen4::dual_owners(layers),
+            "Qwen dual solved owners differ from the planned arena cut");
         let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream: streams[0].raw,

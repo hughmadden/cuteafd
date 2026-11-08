@@ -139,6 +139,36 @@ pub fn coordinator_arenas(checkpoint: &Checkpoint, cfg: &Qwen4Config, owners: &[
     Ok(out)
 }
 
+/// Physical backing bytes of the single-owner arenas (target plus optional
+/// MTP), `layout.bytes()` each: what TP1 declares once against its post-load
+/// sampled baseline. `embedding_bytes` is the device table's header extent, 0
+/// for a host embedding. Both the planner and the runtime call this.
+pub fn single_arena_bytes(checkpoint: &Checkpoint, cfg: &Qwen4Config, layers: usize, mtp: bool,
+    selected: resident::Qwen4Representation, embedding_bytes: usize) -> Result<u64> {
+    let layers = layers.min(cfg.layers);
+    coordinator_arenas(checkpoint, cfg, &vec![0; layers], 1, mtp, selected, embedding_bytes)?
+        .iter().try_fold(0u64, |sum, (_, layout)| sum.checked_add(layout.bytes() as u64)
+            .context("Qwen single arena bytes overflow"))
+}
+
+/// The dual route's arenas at its fixed contiguous cut (`dual_owners`): each
+/// GPU's target arena and the entry rank's MTP arena, the exact layouts the
+/// loader allocates. TP2 weights are future allocations, so the planner
+/// charges each layout's physical bytes and tail once, from these.
+pub fn dual_arenas(checkpoint: &Checkpoint, cfg: &Qwen4Config, owners: &[usize], mtp: bool,
+    selected: resident::Qwen4Representation, embedding_bytes: usize) -> Result<Vec<(usize, WeightArenaLayout)>> {
+    ensure!(owners.len() > 1 && owners.contains(&0) && owners.contains(&1),
+        "Qwen dual arenas need both owners");
+    coordinator_arenas(checkpoint, cfg, owners, 2, mtp, selected, embedding_bytes)
+}
+
+/// The device embedding table's header extent, as the loader allocates it.
+pub fn embedding_table_bytes(checkpoint: &Checkpoint) -> Result<usize> {
+    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}embed_tokens.weight"))
+        .context("Qwen arena lacks the token embedding")?;
+    Ok(usize::try_from(tensor.meta.byte_length)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,7 +181,8 @@ mod tests {
         config["text_config"]["ple_layer_ids"] = serde_json::json!([1]);
         config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
         let cfg = Qwen4Config::from_hf(&config).unwrap();
-        let mut tensors = vec![t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden])];
+        let mut tensors = vec![t("lm_head.weight", "BF16", &[cfg.vocab_size, cfg.hidden]),
+            t(format!("{PREFIX}embed_tokens.weight"), "BF16", &[cfg.vocab_size, cfg.hidden])];
         let mut hc = |p: &str, inject: bool| {
             tensors.extend([t(format!("{p}.hc_norm.weight"), "BF16", &[cfg.hidden]),
                 t(format!("{p}.input_mix_weight_down.weight"), "BF16", &[4, cfg.hidden]),
@@ -208,6 +239,35 @@ mod tests {
         (dir, checkpoint, cfg)
     }
 
+    /// TP1 declares each physical backing once: B = payload + inter-view
+    /// padding per arena, never the per-tensor payload sum alone, and the
+    /// device embedding adds exactly its header extent to the target arena.
+    #[test]
+    fn single_arena_bytes_are_the_physical_backings_once() -> Result<()> {
+        let (_dir, checkpoint, cfg) = checkpoint();
+        let embedding = embedding_table_bytes(&checkpoint)?;
+        assert_eq!(embedding, cfg.vocab_size * cfg.hidden * 2);
+        for fp8_projections in [false, true] { for fp8_head in [false, true] { for mtp in [false, true] {
+            let selected = resident::Qwen4Representation { fp8_projections, fp8_head };
+            for device_embedding in [0, embedding] {
+                let layouts = coordinator_arenas(&checkpoint, &cfg, &vec![0; cfg.layers], 1, mtp, selected, device_embedding)?;
+                assert_eq!(layouts.len(), 1 + usize::from(mtp));
+                let backings = layouts.iter().map(|(_, layout)| layout.bytes() as u64).sum::<u64>();
+                let payload = layouts.iter().map(|(_, layout)| layout.payload_bytes() as u64).sum::<u64>();
+                let padding = layouts.iter().map(|(_, layout)| layout.padding_bytes() as u64).sum::<u64>();
+                assert_eq!(backings, payload + padding);
+                assert_eq!(single_arena_bytes(&checkpoint, &cfg, cfg.layers, mtp, selected, device_embedding)?, backings);
+            }
+            let host = single_arena_bytes(&checkpoint, &cfg, cfg.layers, mtp, selected, 0)?;
+            let device = single_arena_bytes(&checkpoint, &cfg, cfg.layers, mtp, selected, embedding)?;
+            // The table is one 256-aligned view appended to the target arena.
+            assert!(device >= host + embedding as u64 && device < host + embedding as u64 + 256);
+            // A shorter backbone prefix plans fewer layers, never more.
+            assert!(single_arena_bytes(&checkpoint, &cfg, 1, mtp, selected, 0)? < host);
+        }}}
+        Ok(())
+    }
+
     #[test]
     fn named_layout_preserves_placement_head_scope_formats_and_padding() -> Result<()> {
         let (_dir, checkpoint, cfg) = checkpoint();
@@ -242,6 +302,50 @@ mod tests {
                 }
             }
         }}
+        Ok(())
+    }
+
+    /// #1519 charge table on the installed checkpoint: per shipped layout and
+    /// owner GPU, the old payload-only admission charge, the new arena B plus
+    /// its single SM120 tail, and the delta. Old Qwen admission charged per-
+    /// tensor payload with no granularity owner, so it included no rounding.
+    #[test]
+    fn installed_qwen_arena_charge_table() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_QWEN4") else { return Ok(()) };
+        let checkpoint = Checkpoint::open(std::path::Path::new(&snapshot))?;
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(checkpoint.snapshot.join("config.json"))?)?;
+        let cfg = Qwen4Config::from_hf(&config)?;
+        let tail = |bytes: u64| bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+        let embedding = embedding_table_bytes(&checkpoint)?;
+        for fp8_projections in [false, true] { for fp8_head in [false, true] { for device_embedding in [false, true] {
+            let selected = resident::Qwen4Representation { fp8_projections, fp8_head };
+            let r = resident::checkpoint_resident_bytes(&checkpoint, &cfg, cfg.layers, true, selected)?;
+            let table = if device_embedding { embedding } else { 0 };
+            let embed = if device_embedding { r.embedding_bytes } else { 0 };
+            // TP1: old = target + head + MTP + embedding payload (PLE scale unchanged, excluded).
+            let old = r.target_bytes + r.head_bytes + r.mtp_bytes + embed;
+            let arenas = coordinator_arenas(&checkpoint, &cfg, &vec![0; cfg.layers], 1, true, selected, table)?;
+            let new = arenas.iter().map(|(_, l)| l.bytes() as u64 + tail(l.bytes() as u64)).sum::<u64>();
+            assert_eq!(arenas.iter().map(|(_, l)| l.payload_bytes() as u64).sum::<u64>(), old, "TP1 payload");
+            eprintln!("QWEN_CHARGE layout=TP1 proj={} head={} embed={} gpu=0 old={old} new={new} delta={}",
+                if fp8_projections { "fp8" } else { "bf16" }, if fp8_head { "fp8" } else { "bf16" },
+                if device_embedding { "gpu" } else { "host" }, new as i64 - old as i64);
+            // TP2 at the fixed cut: old = owned layer payloads, plus owner0's
+            // head, entry mixer, MTP and embedding.
+            let owners = (0..cfg.layers).map(|l| usize::from(l >= cfg.layers / 2)).collect::<Vec<_>>();
+            let arenas = dual_arenas(&checkpoint, &cfg, &owners, true, selected, table)?;
+            for gpu in 0..2 {
+                let layers = owners.iter().enumerate().filter(|(_, &o)| o == gpu).map(|(l, _)| r.layer_bytes[l]).sum::<u64>();
+                let old = layers + if gpu == 0 { r.entry_bytes + r.head_bytes + r.mtp_bytes + embed } else { 0 };
+                let mine = arenas.iter().filter(|(rank, _)| *rank == gpu).map(|(_, l)| l);
+                let (payload, new) = mine.fold((0u64, 0u64), |(p, n), l|
+                    (p + l.payload_bytes() as u64, n + l.bytes() as u64 + tail(l.bytes() as u64)));
+                assert_eq!(payload, old, "TP2 payload gpu {gpu}");
+                eprintln!("QWEN_CHARGE layout=TP2 proj={} head={} embed={} gpu={gpu} old={old} new={new} delta={}",
+                    if fp8_projections { "fp8" } else { "bf16" }, if fp8_head { "fp8" } else { "bf16" },
+                    if device_embedding { "gpu" } else { "host" }, new as i64 - old as i64);
+            }
+        }}}
         Ok(())
     }
 
