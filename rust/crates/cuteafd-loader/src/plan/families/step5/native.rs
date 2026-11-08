@@ -359,7 +359,8 @@ pub fn mtp_metadata_planes(rows: usize) -> Result<[usize; 5]> {
     Ok([rows * 8, rows * 8, rows * 4, pages * 4, 8].map(|n| n.max(256)))
 }
 
-/// One sequential predictor scratch recipe, shared with the target arena.
+/// Predictor extent within the one Workspace sequential-scratch backing.
+/// Target and MTP reuse it in stream order; charge their maximum, not their sum.
 /// Only greedy token/status words survive across stages within a draft chain.
 pub fn mtp_forecast_workspace(rows: usize, depth: usize, kv_format: Qwen4KvCache) -> Result<u64> {
     ensure!(depth <= 3, "Step-5 predictor depth must be 0..=3");

@@ -19,6 +19,8 @@ impl BufferOwner for Plane<'_> {
     fn buffer(&self) -> CuteafdDeviceBuffer { self.buffer }
 }
 
+/// One Workspace backing: target and MTP per-step scratch reuse it in stream
+/// order, after live outputs have been copied to retained cache/history storage.
 #[derive(Clone)]
 pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<crate::shared::memory::StandaloneStream<'a>>);
 impl<'a> Arena<'a> {

@@ -222,8 +222,9 @@ impl Coordinates {
     }
 }
 
-/// Predictor weights and cache identity are private; sequential scratch aliases
-/// the target and all predictors on the admitted main stream.
+/// Predictor weights and cache identity are private. Per-step scratch, including
+/// compact K/V producers, reuses the target's Workspace sequential-scratch arena
+/// on the admitted main stream, after retained outputs have been copied out.
 pub(super) struct StageOwner<'a> {
     stream: Rc<Stream<'a>>,
     input: InputOwner<'a>,
