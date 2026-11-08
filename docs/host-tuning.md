@@ -16,6 +16,7 @@ should pass `--role coordinator|spark` explicitly. ARM64 is not proof of GB10.
 | cpuidle `disable` | Coordinator | `1` when exit `latency >= 50` microseconds | Avoid deep-idle wake latency between waves; retain shallow states. |
 | cpuidle `disable` | Spark | `1` when exit `latency >= 200` microseconds | Avoid deep GB10 wake latency; retain shallow states. |
 | `vm.compaction_proactiveness` | Both | `0` | TJ's 2026-10-23 Spark policy, extended to both roles: stop proactive background compaction competing with serving. This does not disable allocation-time compaction. |
+| `kernel.perf_event_paranoid` | Coordinator | `1` (`/etc/sysctl.d/91-cuteafd-perf.conf`) | TJ 2026-11-08: lets agents CPU-sample their own processes with nsys (`--sample=process-tree --cpuctxsw=process-tree`) to find host-side stalls. System-wide sampling stays off. Not yet applied by tune.sh. |
 
 The cutoffs are variables at the top of the script. Selection uses each
 state's measured sysfs `latency`, never its name. On raptor this excludes
