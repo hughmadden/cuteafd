@@ -474,11 +474,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             if let Some(ready) = ready.take() { let _ = ready.send(Ok(context)); }
             Ok(())
         });
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(anyhow::anyhow!("Muse Spark initialization failed: {:#}",
-                result.as_ref().err().context("worker exited before readiness")?)));
-        }
-        result
+        crate::shared::serve::forward_initialization(result, ready.is_some(), "Muse Spark initialization failed", |error| {
+            ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+        })
     });
     let ready = ready_rx.await.context("Muse Spark worker exited before readiness")??;
     let limits = args.prefix.reserve.limits(ready.context)?;

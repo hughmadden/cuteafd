@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "common.h"
 
 #include <cublas_v2.h>
@@ -961,7 +962,7 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out, cudaStream_t stream = nullpt
       return CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE;
     }
     cublasHandle_t handle = nullptr;
-    const cublasStatus_t status = cublasCreate(&handle);
+    const cublasStatus_t status = CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&handle), 0, 0, nullptr);
     if (status != CUBLAS_STATUS_SUCCESS) {
       return status_from_cublas(status);
     }

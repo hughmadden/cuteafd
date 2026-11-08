@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -192,7 +193,7 @@ extern "C" int32_t cuteafd_v41_compressor_create(void* workspace,uint64_t bytes,
   if(!h)return cudaErrorMemoryAllocation;
   auto cuda=cudaGetDevice(&h->device);
   if(cuda!=cudaSuccess){delete h;return cuda;}
-  auto status=cublasLtCreate(&h->blas);
+  auto status=CUTEAFD_CHECK_MEMORY("cublasLtCreate", "cublas", cublasLtCreate(&h->blas), 0, 0, nullptr);
   if(status!=CUBLAS_STATUS_SUCCESS){delete h;return bs(status);}
   const int n[]={512,512,128,32},k[]={5120,5120,512,5120};
   for(int i=0;i<4;++i) {

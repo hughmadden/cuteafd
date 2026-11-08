@@ -199,6 +199,17 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
         .map(|budget| budget.physical_bytes).min().unwrap_or(u64::MAX);
     let Ok(kv) = policy.kv(smallest, plan.request.context.maximum) else { return };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: plan.pool_tokens };
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "kv_geometry": {"pages": plan.pool_tokens.checked_div(plan.pool_page_rows),
+            "tokens_per_page": plan.pool_page_rows, "capacity_tokens": plan.pool_tokens,
+            "status": "admitted planner geometry; live pool occupancy not captured"},
+        "family": family, "context_tokens": plan.served_context(), "pool_tokens": plan.pool_tokens,
+        "kv_target_tokens": kv.target, "kv_min_tokens": kv.min, "kv_max_tokens": kv.max,
+        "prefill_rows": plan.decisions.prefill.rows, "prefill_waves": plan.decisions.prefill.waves,
+        "prefill_span_rows": plan.decisions.prefill.rows.saturating_mul(plan.decisions.prefill.waves),
+        "lanes": plan.decisions.lanes, "onboard_layers": plan.decisions.onboard_layers,
+        "spark_reply_formats": plan.decisions.spark_reply_formats,
+    }));
     for budget in &plan.budgets {
         let (kind, location) = match budget.locations.first().map(|location| location.device) {
             Some(Device::Coordinator(gpu)) => (DeviceKind::Gpu, Location::coordinator(gpu)),
@@ -214,7 +225,9 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
             .map(|allocation| cuteafd_core::memory_layout::Item::new(allocation.category, &allocation.group, "",
                 allocation.bytes, cuteafd_core::memory_layout::Basis::Exact)));
         let cap = budget.physical_bytes.min(budget.logical_bytes);
-        let line = cuteafd_core::memory_policy::render_line(&breakdown(budget.id.clone(), kind, cap, budget.headroom, &items), &pool);
+        let breakdown = breakdown(budget.id.clone(), kind, cap, budget.headroom, &items);
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({format!("device.{}", budget.id): breakdown}));
+        let line = cuteafd_core::memory_policy::render_line(&breakdown, &pool);
         tracing::info!(target: "cuteafd::memory_policy", "{line}");
     }
 }

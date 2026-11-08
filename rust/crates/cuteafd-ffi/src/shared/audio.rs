@@ -99,29 +99,38 @@ pub struct AudioTables<'a> {
 #[derive(Debug)]
 pub enum AudioError {
     Native(i32),
+    Failure(anyhow::Error),
     InvalidInput(&'static str),
     Library(libloading::Error),
 }
 impl fmt::Display for AudioError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Failure(error) => std::fmt::Display::fmt(error, f),
             Self::Native(code) => write!(f, "audio native status {code}"),
             Self::InvalidInput(reason) => f.write_str(reason),
             Self::Library(error) => write!(f, "audio library: {error}"),
         }
     }
 }
-impl std::error::Error for AudioError {}
+impl std::error::Error for AudioError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self { Self::Failure(error) => Some(error.as_ref()), _ => None }
+    }
+}
 impl From<libloading::Error> for AudioError {
     fn from(error: libloading::Error) -> Self {
         Self::Library(error)
     }
 }
+#[cfg(feature = "test-support")]
+pub fn check_for_test(code: i32) -> Result<(), AudioError> { check(code) }
 fn check(code: i32) -> Result<(), AudioError> {
     if code == 0 {
+        crate::memory_ledger::fault::clear_failure();
         Ok(())
     } else {
-        Err(AudioError::Native(code))
+        Err(AudioError::Failure(crate::memory_ledger::capture_failure(anyhow::Error::new(AudioError::Native(code)))))
     }
 }
 /// Geometry includes per-segment downsampling, not downsampling the concatenation.
@@ -201,6 +210,7 @@ impl NativeAudio {
         // SAFETY: trusted versioned native ABI, no CUDA context or payload read.
         unsafe {
             let library = Library::new(crate::host_isa::native_library(path))?;
+            crate::memory_ledger::fault::install(&library);
             let required = library.get::<Required>(b"cuteafd_audio_required")?;
             let mut ledger = AudioLedger::default();
             check(required(spec, &mut ledger))?;
@@ -213,6 +223,7 @@ impl NativeAudio {
         // SAFETY: exact backend symbol ABI and bounded caller-owned output.
         unsafe {
             let library = Library::new(crate::host_isa::native_library(path))?;
+            crate::memory_ledger::fault::install(&library);
             let backend = library.get::<Backend>(b"cuteafd_audio_backend")?;
             check(backend(buffer.as_mut_ptr(), buffer.len() as u64))?;
         }
@@ -291,6 +302,7 @@ impl NativeAudio {
         // retained until native owner destruction. Native create/upload drain errors.
         unsafe {
             let library = Library::new(crate::host_isa::native_library(path))?;
+            crate::memory_ledger::fault::install(&library);
             let required = *library.get::<Required>(b"cuteafd_audio_required")?;
             let create = *library.get::<Create>(b"cuteafd_audio_create")?;
             let upload = *library.get::<Upload>(b"cuteafd_audio_upload")?;

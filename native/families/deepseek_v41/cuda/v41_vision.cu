@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "cuteafd_v41_vision.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -127,7 +128,7 @@ extern "C" int32_t cuteafd_v41_vision_create(void* workspace,uint64_t bytes,void
   if(bytes<workspace_bytes || !valid(workspace,workspace_bytes,256))return cudaErrorInvalidValue;
   auto* h=new(std::nothrow)Handle{};if(!h)return cudaErrorMemoryAllocation;
   auto result=cudaGetDevice(&h->device);if(result){delete h;return result;}
-  auto s=cublasCreate(&h->blas);if(s){delete h;return status(s);}
+  auto s=CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&h->blas), 0, 0, nullptr);if(s){delete h;return status(s);}
   s=cublasSetMathMode(h->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
   if(s){cublasDestroy(h->blas);delete h;return status(s);}
   h->workspace=workspace;*output=h;return 0;

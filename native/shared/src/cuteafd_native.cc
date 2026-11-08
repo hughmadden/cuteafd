@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "cuteafd_native.h"
 #include "graph_census_path.h"
 #include "rdma_endpoint_destroy.h"
@@ -35,6 +36,18 @@
 #endif
 
 namespace {
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+inline ibv_mr* cuteafd_checked_registration(ibv_pd* pd, void* buffer, size_t bytes, int access, const char* file, int line) {
+  ibv_mr* result = ibv_reg_mr(pd, buffer, bytes, access);
+  if (!result) {
+    const int status = errno;
+    cuteafd_checked_memory_call("ibv_reg_mr", "libc", status, bytes, 1,
+        reinterpret_cast<uintptr_t>(buffer), file, line);
+    errno = status;
+  }
+  return result;
+}
+#endif
 
 thread_local std::string g_last_error;
 constexpr int kRdmaRcEndpointActiveEventPollTimeoutMs = 30000;
@@ -496,18 +509,18 @@ bool destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   if ((endpoint->host_buffer_flags & CUTEAFD_HOST_BUFFER_FLAG_PINNED) != 0) {
     if (endpoint->send_buffer != nullptr) {
-      cudaFreeHost(endpoint->send_buffer);
+      CUTEAFD_TRACK_FREE(endpoint->send_buffer, cudaFreeHost(endpoint->send_buffer));
     }
     if (endpoint->recv_buffer != nullptr) {
-      cudaFreeHost(endpoint->recv_buffer);
+      CUTEAFD_TRACK_FREE(endpoint->recv_buffer, cudaFreeHost(endpoint->recv_buffer));
     }
   } else {
-    std::free(endpoint->send_buffer);
-    std::free(endpoint->recv_buffer);
+    CUTEAFD_HOST_FREE(endpoint->send_buffer);
+    CUTEAFD_HOST_FREE(endpoint->recv_buffer);
   }
 #else
-  std::free(endpoint->send_buffer);
-  std::free(endpoint->recv_buffer);
+  CUTEAFD_HOST_FREE(endpoint->send_buffer);
+  CUTEAFD_HOST_FREE(endpoint->recv_buffer);
 #endif
   delete endpoint;
   });
@@ -960,12 +973,12 @@ extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_de
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   void* ptr = nullptr;
-  cudaError_t err = cudaMalloc(&ptr, bytes);
+  cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaMalloc", "cuda", cudaMalloc(&ptr, bytes), bytes, 1, nullptr);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaMalloc failed", err);
   }
 #else
-  void* ptr = std::malloc(bytes);
+  void* ptr = CUTEAFD_MALLOC(bytes);
   if (ptr == nullptr) {
     return fail(CUTEAFD_STATUS_ALLOCATION_FAILED, "host fallback allocation failed");
   }
@@ -996,7 +1009,7 @@ extern "C" cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes,
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   void* ptr = nullptr;
-  cudaError_t err = cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal);
+  cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaMallocManaged", "cuda", cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal), bytes, 1, nullptr);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaMallocManaged failed", err);
   }
@@ -1008,7 +1021,7 @@ extern "C" cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes,
   out->flags = CUTEAFD_DEVICE_BUFFER_FLAG_MANAGED;
   return ok();
 #else
-  void* ptr = std::malloc(bytes);
+  void* ptr = CUTEAFD_MALLOC(bytes);
   if (ptr == nullptr) {
     return fail(CUTEAFD_STATUS_ALLOCATION_FAILED,
                 "managed host fallback allocation failed");
@@ -1043,7 +1056,7 @@ extern "C" cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t byte
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "empty host mapping");
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  cudaError_t err = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
+  cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaHostRegister", "cuda", cudaHostRegister(ptr, bytes, cudaHostRegisterPortable), bytes, 1, nullptr);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaHostRegister failed", err);
   }
@@ -1077,7 +1090,7 @@ extern "C" cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   void* ptr = nullptr;
   cudaError_t err =
-      cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+      CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped), bytes, 1, nullptr);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaHostAlloc failed", err);
   }
@@ -1085,7 +1098,7 @@ extern "C" cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host
   out->bytes = bytes;
   out->flags = CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED;
 #else
-  void* ptr = std::malloc(bytes);
+  void* ptr = CUTEAFD_MALLOC(bytes);
   if (ptr == nullptr) {
     return fail(CUTEAFD_STATUS_ALLOCATION_FAILED, "host buffer fallback allocation failed");
   }
@@ -1137,7 +1150,7 @@ extern "C" cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf)
   }
   if (buf->ptr != nullptr) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-    cudaError_t err = cudaFreeHost(buf->ptr);
+    cudaError_t err = CUTEAFD_TRACK_FREE(buf->ptr, cudaFreeHost(buf->ptr));
     if (err != cudaSuccess) {
       return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaFreeHost failed", err);
     }
@@ -1157,7 +1170,7 @@ extern "C" cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* 
   }
   if (buf->ptr != nullptr) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-    cudaError_t err = cudaFree(buf->ptr);
+    cudaError_t err = CUTEAFD_TRACK_FREE(buf->ptr, cudaFree(buf->ptr));
     if (err != cudaSuccess) {
       return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaFree failed", err);
     }
@@ -1679,7 +1692,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
   size_t before_free = 0, after_free = 0, total = 0;
   const bool census = graph_census_enabled();
   const cudaError_t before_status = census ? cudaMemGetInfo(&before_free, &total) : cudaSuccess;
-  err = cudaGraphInstantiate(&graph_exec, graph, 0);
+  err = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&graph_exec, graph, 0), 0, 0, graph);
   const cudaError_t after_status = census ? cudaMemGetInfo(&after_free, &total) : cudaSuccess;
   if (err != cudaSuccess) {
     cudaGraphDestroy(graph);
@@ -2525,7 +2538,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_register_host_buffer_probe(
                 "ibv_alloc_pd failed for host-buffer registration probe");
   }
   const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-  ibv_mr* mr = ibv_reg_mr(pd, ptr, bytes, access);
+  ibv_mr* mr = cuteafd_checked_registration(pd, ptr, bytes, access, __FILE__, __LINE__);
   if (mr == nullptr) {
     ibv_dealloc_pd(pd);
     ibv_close_device(context);
@@ -2741,8 +2754,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
     if (devices != nullptr) {
       ibv_free_device_list(devices);
     }
-    std::free(send_buffer);
-    std::free(recv_buffer);
+    CUTEAFD_HOST_FREE(send_buffer);
+    CUTEAFD_HOST_FREE(recv_buffer);
   };
 
   ibv_device* device = find_rdma_device(devices, device_count, device_name);
@@ -2802,8 +2815,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
   out->sender_qp_num = sender_qp->qp_num;
   out->receiver_qp_num = receiver_qp->qp_num;
 
-  send_buffer = static_cast<unsigned char*>(std::malloc(bytes));
-  recv_buffer = static_cast<unsigned char*>(std::malloc(bytes));
+  send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(bytes));
+  recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(bytes));
   if (send_buffer == nullptr || recv_buffer == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_ALLOCATION_FAILED,
@@ -2814,12 +2827,12 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
     recv_buffer[idx] = 0;
   }
 
-  send_mr = ibv_reg_mr(pd, send_buffer, bytes, IBV_ACCESS_LOCAL_WRITE);
+  send_mr = cuteafd_checked_registration(pd, send_buffer, bytes, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (send_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr sender failed");
   }
-  recv_mr = ibv_reg_mr(pd, recv_buffer, bytes, IBV_ACCESS_LOCAL_WRITE);
+  recv_mr = cuteafd_checked_registration(pd, recv_buffer, bytes, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (recv_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr receiver failed");
@@ -3036,10 +3049,10 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
     if (devices != nullptr) {
       ibv_free_device_list(devices);
     }
-    std::free(client_request_send_buffer);
-    std::free(server_request_recv_buffer);
-    std::free(server_response_send_buffer);
-    std::free(client_response_recv_buffer);
+    CUTEAFD_HOST_FREE(client_request_send_buffer);
+    CUTEAFD_HOST_FREE(server_request_recv_buffer);
+    CUTEAFD_HOST_FREE(server_response_send_buffer);
+    CUTEAFD_HOST_FREE(client_response_recv_buffer);
   };
 
   ibv_device* device = find_rdma_device(devices, device_count, device_name);
@@ -3105,10 +3118,10 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
   out->client_qp_num = client_qp->qp_num;
   out->server_qp_num = server_qp->qp_num;
 
-  client_request_send_buffer = static_cast<unsigned char*>(std::malloc(request_bytes));
-  server_request_recv_buffer = static_cast<unsigned char*>(std::malloc(request_bytes));
-  server_response_send_buffer = static_cast<unsigned char*>(std::malloc(response_bytes));
-  client_response_recv_buffer = static_cast<unsigned char*>(std::malloc(response_bytes));
+  client_request_send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(request_bytes));
+  server_request_recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(request_bytes));
+  server_response_send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(response_bytes));
+  client_response_recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(response_bytes));
   if (client_request_send_buffer == nullptr || server_request_recv_buffer == nullptr ||
       server_response_send_buffer == nullptr || client_response_recv_buffer == nullptr) {
     cleanup();
@@ -3121,28 +3134,28 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
   std::memset(client_response_recv_buffer, 0, response_bytes);
 
   client_request_send_mr =
-      ibv_reg_mr(pd, client_request_send_buffer, request_bytes, IBV_ACCESS_LOCAL_WRITE);
+      cuteafd_checked_registration(pd, client_request_send_buffer, request_bytes, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (client_request_send_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_reg_mr client request send failed for ProtocolV2 loopback probe");
   }
   server_request_recv_mr =
-      ibv_reg_mr(pd, server_request_recv_buffer, request_bytes, IBV_ACCESS_LOCAL_WRITE);
+      cuteafd_checked_registration(pd, server_request_recv_buffer, request_bytes, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (server_request_recv_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_reg_mr server request recv failed for ProtocolV2 loopback probe");
   }
   server_response_send_mr =
-      ibv_reg_mr(pd, server_response_send_buffer, response_bytes, IBV_ACCESS_LOCAL_WRITE);
+      cuteafd_checked_registration(pd, server_response_send_buffer, response_bytes, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (server_response_send_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_reg_mr server response send failed for ProtocolV2 loopback probe");
   }
   client_response_recv_mr =
-      ibv_reg_mr(pd, client_response_recv_buffer, response_bytes, IBV_ACCESS_LOCAL_WRITE);
+      cuteafd_checked_registration(pd, client_response_recv_buffer, response_bytes, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (client_response_recv_mr == nullptr) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
@@ -3481,27 +3494,29 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
   if (host_buffer_flags == kMappedHostFlags) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
     void* send_buffer = nullptr;
-    cudaError_t cuda_status = cudaHostAlloc(
-        &send_buffer, send_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+    cudaError_t cuda_status = CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(
+        &send_buffer, send_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped), send_registered_span_bytes, 1, nullptr);
     if (cuda_status != cudaSuccess) {
       destroy_rdma_rc_endpoint(endpoint);
       return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
                        "cudaHostAlloc RDMA RC endpoint send buffer failed", cuda_status);
     }
+    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(send_buffer), send_registered_span_bytes, 0, __FILE__, __LINE__);
     endpoint->send_buffer = static_cast<unsigned char*>(send_buffer);
     void* recv_buffer = nullptr;
-    cuda_status = cudaHostAlloc(
-        &recv_buffer, recv_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+    cuda_status = CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(
+        &recv_buffer, recv_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped), recv_registered_span_bytes, 1, nullptr);
     if (cuda_status != cudaSuccess) {
       destroy_rdma_rc_endpoint(endpoint);
       return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
                        "cudaHostAlloc RDMA RC endpoint recv buffer failed", cuda_status);
     }
+    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(recv_buffer), recv_registered_span_bytes, 0, __FILE__, __LINE__);
     endpoint->recv_buffer = static_cast<unsigned char*>(recv_buffer);
 #endif
   } else {
-    endpoint->send_buffer = static_cast<unsigned char*>(std::malloc(send_registered_span_bytes));
-    endpoint->recv_buffer = static_cast<unsigned char*>(std::malloc(recv_registered_span_bytes));
+    endpoint->send_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(send_registered_span_bytes));
+    endpoint->recv_buffer = static_cast<unsigned char*>(CUTEAFD_TRACK_MALLOC(recv_registered_span_bytes));
   }
   if (endpoint->send_buffer == nullptr || endpoint->recv_buffer == nullptr) {
     destroy_rdma_rc_endpoint(endpoint);
@@ -3512,15 +3527,15 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
   std::memset(endpoint->recv_buffer, 0, recv_registered_span_bytes);
 
   endpoint->send_mr =
-      ibv_reg_mr(endpoint->pd, endpoint->send_buffer, send_registered_span_bytes,
-                 IBV_ACCESS_LOCAL_WRITE);
+      cuteafd_checked_registration(endpoint->pd, endpoint->send_buffer, send_registered_span_bytes,
+                 IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (endpoint->send_mr == nullptr) {
     destroy_rdma_rc_endpoint(endpoint);
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr send buffer failed for RC endpoint");
   }
   endpoint->recv_mr =
-      ibv_reg_mr(endpoint->pd, endpoint->recv_buffer, recv_registered_span_bytes,
-                 IBV_ACCESS_LOCAL_WRITE);
+      cuteafd_checked_registration(endpoint->pd, endpoint->recv_buffer, recv_registered_span_bytes,
+                 IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (endpoint->recv_mr == nullptr) {
     destroy_rdma_rc_endpoint(endpoint);
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr recv buffer failed for RC endpoint");
@@ -3675,8 +3690,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_send_read(void* hand
     ibv_dereg_mr(endpoint->read_mr);
     endpoint->read_mr = nullptr;
   }
-  endpoint->read_mr = ibv_reg_mr(endpoint->pd, endpoint->send_buffer, bytes,
-                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+  endpoint->read_mr = cuteafd_checked_registration(endpoint->pd, endpoint->send_buffer, bytes,
+                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ, __FILE__, __LINE__);
   if (endpoint->read_mr == nullptr) {
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_reg_mr failed for the RC endpoint read exposure");
@@ -4052,9 +4067,9 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
     if (cq != nullptr) ibv_destroy_cq(cq);
     if (pd != nullptr) ibv_dealloc_pd(pd);
     if (context != nullptr) ibv_close_device(context);
-    if (send != nullptr) cudaFreeHost(send);
-    if (recv != nullptr) cudaFreeHost(recv);
-    if (gpu != nullptr) cudaFree(gpu);
+    if (send != nullptr) CUTEAFD_TRACK_FREE(send, cudaFreeHost(send));
+    if (recv != nullptr) CUTEAFD_TRACK_FREE(recv, cudaFreeHost(recv));
+    if (gpu != nullptr) CUTEAFD_TRACK_FREE(gpu, cudaFree(gpu));
   };
   auto bail = [&](cuteafd_status_t status, const std::string& message) {
     cleanup();
@@ -4066,9 +4081,9 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
       (cq = ibv_create_cq(context, 16, nullptr, nullptr, 0)) == nullptr) {
     return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RDMA device setup failed for the landing probe");
   }
-  if (cudaMalloc(&gpu, bytes) != cudaSuccess ||
-      cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable) != cudaSuccess ||
-      cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable) != cudaSuccess) {
+  if (CUTEAFD_CHECK_MEMORY("cudaMalloc", "cuda", cudaMalloc(&gpu, bytes), bytes, 1, nullptr) != cudaSuccess ||
+      CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable), frame, 1, nullptr) != cudaSuccess ||
+      CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable), frame, 1, nullptr) != cudaSuccess) {
     return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, "GPU landing probe allocation failed");
   }
   const cuteafd_status_t registered = register_device_dmabuf(pd, gpu, bytes, &gpu_mr);
@@ -4080,8 +4095,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
   for (size_t index = 0; index < frame; ++index) {
     send[index] = static_cast<unsigned char>(index * 131 + 7);
   }
-  send_mr = ibv_reg_mr(pd, send, frame, IBV_ACCESS_LOCAL_WRITE);
-  recv_mr = ibv_reg_mr(pd, recv, frame, IBV_ACCESS_LOCAL_WRITE);
+  send_mr = cuteafd_checked_registration(pd, send, frame, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
+  recv_mr = cuteafd_checked_registration(pd, recv, frame, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   ibv_qp_init_attr qp_attr = {};
   qp_attr.send_cq = cq;
   qp_attr.recv_cq = cq;
@@ -4694,7 +4709,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handl
   if (endpoint->regions.size() >= 64) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint has 64 regions already");
   }
-  ibv_mr* mr = ibv_reg_mr(endpoint->pd, ptr, bytes, IBV_ACCESS_LOCAL_WRITE);
+  ibv_mr* mr = cuteafd_checked_registration(endpoint->pd, ptr, bytes, IBV_ACCESS_LOCAL_WRITE, __FILE__, __LINE__);
   if (mr == nullptr) {
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr failed for RC endpoint region");
   }

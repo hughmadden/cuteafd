@@ -594,11 +594,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             if let Some(ready) = ready.take() { let _ = ready.send(Ok(context)); }
             Ok(())
         });
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(anyhow::anyhow!("Step-5 initialization failed: {:#}",
-                result.as_ref().err().context("worker exited before readiness")?)));
-        }
-        result
+        crate::shared::serve::forward_initialization(result, ready.is_some(), "Step-5 initialization failed", |error| {
+            ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+        })
     });
     let context = ready_rx.await.context("Step-5 worker exited before readiness")??;
     let limits = args.prefix.reserve.limits(context)?;
