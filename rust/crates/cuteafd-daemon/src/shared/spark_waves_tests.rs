@@ -18,9 +18,9 @@ fn gpu_reply_copy_engine_bandwidth() -> Result<()> {
     let library = unsafe { NativeLibrary::load(&path)? };
     library.cuda_set_device(0)?;
     let device = Device { library: &library, id: 0 };
-    let mut host = HostAllocation::new(&library, BYTES)?;
+    let mut host = HostAllocation::new(&library, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
     for (i, byte) in host.bytes_mut().iter_mut().enumerate() { *byte = (i % 251) as u8; }
-    let output = DeviceAllocation::new(&library, BYTES)?;
+    let output = DeviceAllocation::new(&library, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
     let streams = (0..RANKS).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
     let mut start = Event::timing(device)?;
     let mut end = Event::timing(device)?;
@@ -86,8 +86,8 @@ fn gpu_reply_ce_land_before_arrival_pressure() -> Result<()> {
     let library = unsafe { NativeLibrary::load(&path)? };
     library.cuda_set_device(0)?;
     let device = Device { library: &library, id: 0 };
-    let host = HostAllocation::new(&library, 304_349_184)?;
-    let output = DeviceAllocation::new(&library, host.buffer.bytes)?;
+    let host = HostAllocation::new(&library, 304_349_184, cuteafd_ffi::memory_ledger::TEST)?;
+    let output = DeviceAllocation::new(&library, host.buffer.bytes, cuteafd_ffi::memory_ledger::TEST)?;
     struct ReleaseWords<'a>(&'a HostAllocation<'a>);
     impl Drop for ReleaseWords<'_> {
         fn drop(&mut self) {
@@ -98,8 +98,8 @@ fn gpu_reply_ce_land_before_arrival_pressure() -> Result<()> {
         }
     }
     for pressure in [0, 4, 16] {
-        let control = HostAllocation::new(&library, 128)?;
-        let pressure_outputs = (0..=pressure).map(|_| DeviceAllocation::new(&library, 65536)).collect::<Result<Vec<_>>>()?;
+        let control = HostAllocation::new(&library, 128, cuteafd_ffi::memory_ledger::TEST)?;
+        let pressure_outputs = (0..=pressure).map(|_| DeviceAllocation::new(&library, 65536, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
         let streams = (0..=pressure).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
         let copy_stream = Stream::new(device)?;
         let mut done = Event::new(device)?;
@@ -171,13 +171,13 @@ fn gpu_reply_ce_current_event_depth_three() -> Result<()> {
     let library = Arc::new(unsafe { NativeLibrary::load(&path)? });
     library.cuda_set_device(0)?;
     let device = Device { library: &library, id: 0 };
-    let mut host = HostAllocation::new(&library, BYTES)?;
+    let mut host = HostAllocation::new(&library, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
     for (i, byte) in host.bytes_mut().iter_mut().enumerate() { *byte = (i % 251) as u8; }
-    let output = DeviceAllocation::new(&library, SLOTS * BYTES)?;
-    let input = DeviceAllocation::new(&library, STAGING)?;
-    let staging = HostAllocation::new(&library, SLOTS * STAGING)?;
-    let table = DeviceAllocation::new(&library, SLOTS * TABLES)?;
-    let descriptors = HostAllocation::new(&library, Pulls::bytes(SLOTS))?;
+    let output = DeviceAllocation::new(&library, SLOTS * BYTES, cuteafd_ffi::memory_ledger::TEST)?;
+    let input = DeviceAllocation::new(&library, STAGING, cuteafd_ffi::memory_ledger::TEST)?;
+    let staging = HostAllocation::new(&library, SLOTS * STAGING, cuteafd_ffi::memory_ledger::TEST)?;
+    let table = DeviceAllocation::new(&library, SLOTS * TABLES, cuteafd_ffi::memory_ledger::TEST)?;
+    let descriptors = HostAllocation::new(&library, Pulls::bytes(SLOTS), cuteafd_ffi::memory_ledger::TEST)?;
     let pulls = Pulls { base: descriptors.buffer.ptr as usize };
     let stream = Stream::new(device)?;
     let copy = Stream::new(device)?;
@@ -209,7 +209,7 @@ fn gpu_reply_ce_current_event_depth_three() -> Result<()> {
     copy.drain()?;
     let mut results = Vec::new();
     for ce in [false, true] {
-        let control = HostAllocation::new(&library, Counter::words(SLOTS) * LINE)?;
+        let control = HostAllocation::new(&library, Counter::words(SLOTS) * LINE, cuteafd_ffi::memory_ledger::TEST)?;
         let words = Words { base: control.buffer.ptr as usize, slots: SLOTS };
         let stop = Arc::new(AtomicBool::new(false));
         let (send, receive) = std::sync::mpsc::channel::<(u32, usize)>();
@@ -822,7 +822,7 @@ impl EchoWorld {
             pools: (0..ranks).map(|_| Mutex::new(Vec::new())).collect(), released: AtomicUsize::new(0) });
         for rank in 0..ranks {
             for _ in 0..2 * depth {
-                let host = library.alloc_host_buffer(frame_bytes + 16)?;
+                let host = library.alloc_host_buffer(frame_bytes + 16, cuteafd_ffi::memory_ledger::TEST)?;
                 buffers.owned.lock().unwrap().push((host.ptr as usize, host.bytes));
                 buffers.pools[rank].lock().unwrap().push((host.ptr as usize + 4, frame_bytes));
             }
@@ -956,7 +956,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         let cuts = [(slots, max_rows)];
         let reserve = slots * max_rows;
         let total = layers as usize;
-        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes))
+        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, reserve * row_bytes, cuteafd_ffi::memory_ledger::TEST))
             .collect::<Result<Vec<_>>>()?;
         let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
         let max_layout = RouteStaging::new(max_rows, topk, row_bytes)?;
@@ -984,11 +984,11 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-        let ids = DeviceAllocation::new(&library, max_rows * topk * 4)?;
-        let weights = DeviceAllocation::new(&library, max_rows * topk * 4)?;
+        let ids = DeviceAllocation::new(&library, max_rows * topk * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let weights = DeviceAllocation::new(&library, max_rows * topk * 4, cuteafd_ffi::memory_ledger::TEST)?;
         // One input and one output per layer, all live until the end.
-        let inputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes)).collect::<Result<Vec<_>>>()?;
-        let outputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes)).collect::<Result<Vec<_>>>()?;
+        let inputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
+        let outputs = (0..total).map(|layer| DeviceAllocation::new(&library, widths[layer] * row_bytes, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
         let mut expected = Vec::new();
         for (layer, input) in inputs.iter().enumerate() {
             let host = &hosts[layer];
@@ -1092,7 +1092,7 @@ fn gpu_decode_reduction_captured_before_first_wave_reads_replay_format() -> Resu
     let library = Arc::new(unsafe { NativeLibrary::load(&path)? });
     let (hidden, rows, ranks) = (5120usize, 8usize, 2usize);
     let row_bytes = hidden * 2;
-    let planes = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
+    let planes = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
     let ranges = planes.iter().map(|plane| plane.buffer).collect::<Vec<_>>();
     let words = Arc::new(std::sync::OnceLock::new());
     let echo = EchoWorld::new(library.clone(), ranks, row_bytes, 3,
@@ -1106,7 +1106,7 @@ fn gpu_decode_reduction_captured_before_first_wave_reads_replay_format() -> Resu
     let binding = exchange.reduction(0);
     assert!(binding.fused.is_some(), "decode format is bound before any host-observed wave");
     let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-    let output = DeviceAllocation::new(&library, rows * row_bytes)?;
+    let output = DeviceAllocation::new(&library, rows * row_bytes, cuteafd_ffi::memory_ledger::TEST)?;
     // Warm module loading before capture. The mode defaults to BF16.
     for plane in &planes { library.copy_h2d(plane.buffer, &vec![0; rows * row_bytes])?; }
     // SAFETY: all planes, mode, output and stream survive the captured graph and drainage.
@@ -1184,9 +1184,9 @@ fn terminal_close_with_codec(compressed: bool) -> Result<()> {
     let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false, storage)?;
     let _ = words.set(exchange.words());
     let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-    let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
-    let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
-    let input = DeviceAllocation::new(&library, rows * row_bytes)?;
+    let ids = DeviceAllocation::new(&library, rows * topk * 4, cuteafd_ffi::memory_ledger::TEST)?;
+    let weights = DeviceAllocation::new(&library, rows * topk * 4, cuteafd_ffi::memory_ledger::TEST)?;
+    let input = DeviceAllocation::new(&library, rows * row_bytes, cuteafd_ffi::memory_ledger::TEST)?;
     let mut tickets = Vec::new();
     for layer in 0..waves {
         let h = hidden;
@@ -1627,7 +1627,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
     let (hidden, topk, ranks, rows) = (5120usize, 6usize, 2usize, 64usize);
     let row_bytes = hidden * 2;
     for control in [false, true] {
-        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes))
+        let ranges_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes, cuteafd_ffi::memory_ledger::TEST))
             .collect::<Result<Vec<_>>>()?;
         let ranges: Vec<CuteafdDeviceBuffer> = ranges_owned.iter().map(|range| range.buffer).collect();
         let layout = RouteStaging::new(rows, topk, row_bytes)?;
@@ -1658,10 +1658,10 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
             arenas, false, storage.clone())?;
         let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
-        let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
-        let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
-        let inputs = (0..2).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
-        let outputs = (0..2).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
+        let ids = DeviceAllocation::new(&library, rows * topk * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let weights = DeviceAllocation::new(&library, rows * topk * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let inputs = (0..2).map(|_| DeviceAllocation::new(&library, rows * row_bytes, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
+        let outputs = (0..2).map(|_| DeviceAllocation::new(&library, rows * row_bytes, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
         for (input, host) in inputs.iter().zip(&inputs_host) { library.copy_h2d(input.buffer, host)?; }
         let done = library.cuda_event_create()?;
         for layer in 0..2usize {

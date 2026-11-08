@@ -34,15 +34,15 @@ impl<'library> DsparkWeights<'library> {
         let library = self.library;
         self.tensor("mtp.2.markov_head.embed.weight")?;
         self.tensor("mtp.2.markov_head.head.weight")?;
-        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::untagged(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
         let kernel = unsafe { library.v41_dspark_markov(workspace.buffer)? };
         Ok(DsparkMarkov {
             kernel,
             _workspace: workspace,
             standalone: &self.standalone,
-            tokens: DeviceAllocation::new(library, capacity * 4)?,
-            embedding: DeviceAllocation::new(library, capacity * 512)?,
-            logits: DeviceAllocation::new(library, capacity * 129280 * 4)?,
+            tokens: DeviceAllocation::untagged(library, capacity * 4)?,
+            embedding: DeviceAllocation::untagged(library, capacity * 512)?,
+            logits: DeviceAllocation::untagged(library, capacity * 129280 * 4)?,
             weights: self,
             graph: BindingGraphs::new(library)?,
             capacity,

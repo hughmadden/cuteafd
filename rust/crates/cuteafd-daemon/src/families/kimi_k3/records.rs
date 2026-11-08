@@ -15,6 +15,7 @@ use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
 use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, TRANSFORM_BYTES};
 use cuteafd_loader::plan::Checkpoint;
 use crate::shared::memory::weight_arena::DeviceWeightArena;
+use cuteafd_core::memory_layout::ArenaTag;
 
 /// One coordinator GPU's records target.
 pub(crate) struct KimiRecords<'l, 'a> {
@@ -75,7 +76,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
             devices.iter().zip(tensors).map(|(&device, tensors)| {
                 let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
                     format!("kimi/{prefix}/{}", device.id), tensors)?;
-                Ok((device.id, DeviceWeightArena::new(device, layout)?))
+                Ok((device.id, DeviceWeightArena::new(device, layout, ArenaTag::weights("kimi/coordinator"))?))
             }).collect::<Result<BTreeMap<_, _>>>()?.into()
         } else { self.arenas.clone() };
         Ok(Self { checkpoint: self.checkpoint, cfg: self.cfg, core: self.core, dense: self.dense,
@@ -85,7 +86,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
     fn allocate(&self, device: Device<'a>, name: &str, bytes: usize) -> Result<Allocation<'a>> {
         let arena = self.arenas.get(&device.id).context("Kimi device weight arena absent")?;
         crate::shared::memory::weight_arena::weight_allocation(device, Some(arena),
-            &format!("{}.{name}", self.prefix), bytes)
+            &format!("{}.{name}", self.prefix), bytes, ArenaTag::weights("kimi/coordinator"))
     }
 
     /// An allocation of exactly `bytes` whose `lands` fill it unchanged.

@@ -1373,10 +1373,10 @@ mod tests {
                 committed: 0,
             })?
             .placement;
-        let key = Allocation::new(device, 64 * KV * 2)?;
-        let value = Allocation::new(device, 64 * KV * 2)?;
-        let ik = Allocation::new(device, 64 * 512)?;
-        let iz = Allocation::new(device, 64 * 512)?;
+        let key = Allocation::new(device, 64 * KV * 2, cuteafd_ffi::memory_ledger::TEST)?;
+        let value = Allocation::new(device, 64 * KV * 2, cuteafd_ffi::memory_ledger::TEST)?;
+        let ik = Allocation::new(device, 64 * 512, cuteafd_ffi::memory_ledger::TEST)?;
+        let iz = Allocation::new(device, 64 * 512, cuteafd_ffi::memory_ledger::TEST)?;
         for end in [
             7, 8, 9, 63, 64, 128, 192, 256, 320, 384, 448, 511, 512, total,
         ] {

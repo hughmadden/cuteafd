@@ -107,8 +107,8 @@ impl<'a> MuseDraft<'a> {
         let probe = cfg.layers * cuteafd_loader::families::muse_spark::lane::HEAD_ROWS * cfg.topk * 4;
         ensure!(admitted.runtime == (rows * 4 + probe) as u64, "Muse drafter runtime buffers differ from their admission");
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter/head");
-        Ok(Self { drafter, stored: Allocation::new(device, rows * stored_width * 4)?,
-            trimmed: Allocation::new(device, rows * cfg.vocab_size * 4)?, ids: Allocation::new(device, rows * 4)?,
+        Ok(Self { drafter, stored: Allocation::untagged(device, rows * stored_width * 4)?,
+            trimmed: Allocation::untagged(device, rows * cfg.vocab_size * 4)?, ids: Allocation::untagged(device, rows * 4)?,
             stream, device, block: admitted.block, rows })
     }
 

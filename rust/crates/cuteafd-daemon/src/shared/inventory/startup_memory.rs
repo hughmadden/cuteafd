@@ -328,7 +328,7 @@ mod tests {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::{Allocation, Lifetime, Location, Receipt};
         let native = AllocationRecord { address: 0x123000, bytes: 512, endpoint: None,
-            key: cuteafd_ffi::memory_ledger::Key { space: Space::Device, device: 7, scope: "test",
+            key: cuteafd_ffi::memory_ledger::Key { tag: None, space: Space::Device, device: 7, scope: "test",
                 owner: None, tensor: None, format: None } };
         let mut named = Census::default();
         named.receipts.push(Receipt { address: native.address as u64,
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn pinned_page_union_preserves_requested_extents_without_double_charge() -> Result<()> {
         let make = |address, bytes| AllocationRecord { address, bytes, endpoint: None,
-            key: cuteafd_ffi::memory_ledger::Key { space: Space::Pinned, device: -1, scope: "test",
+            key: cuteafd_ffi::memory_ledger::Key { tag: None, space: Space::Pinned, device: -1, scope: "test",
                 owner: None, tensor: None, format: None } };
         let (requested, covered) = intervals(&[make(0x1001, 7), make(0x1ff0, 32)], 4096)?;
         assert_eq!(requested, 39);

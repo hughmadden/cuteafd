@@ -11,6 +11,7 @@
 //! waits on either stream. Callers pick slots by layer parity (and lane), so a
 //! push never lands on rows the other GPU may still read. One extra flag
 //! (`DIRECT`) serves pushes into buffers outside the slots.
+use crate::shared::memory::Tag;
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 
@@ -273,7 +274,7 @@ impl<'a> PeerExchange<'a> {
                 library.peer_exchange_initialize()?;
                 if diagnostics { library.peer_diagnostic_initialize()?; }
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
-                    let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+                    let allocation = DeviceAllocation::new(library, bytes.max(256), Tag::transport("shared/peer-split"))?;
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                     Ok(allocation)
                 };
@@ -321,7 +322,7 @@ impl<'a> PeerExchange<'a> {
                 probe("peer-abort-before-preload")?;
                 library.peer_abort_initialize()?;
                 probe("peer-abort-after-preload")?;
-                let word = DeviceAllocation::new(library, 256)?;
+                let word = DeviceAllocation::new(library, 256, Tag::transport("shared/peer-abort-word"))?;
                 library.cuda_zero_bytes(word.buffer, word.buffer.bytes)?;
                 probe("peer-abort-after-word")?;
                 let stream = library.cuda_stream_create()?;
@@ -826,7 +827,7 @@ mod tests {
                 }
             }
         }
-        let source = DeviceAllocation::new(&library, 1024)?;
+        let source = DeviceAllocation::new(&library, 1024, cuteafd_ffi::memory_ledger::TEST)?;
         assert!(exchange.push(0, 0, source.buffer.ptr, 272).is_err());
         assert!(exchange.push(0, sizes.len(), source.buffer.ptr, 16).is_err());
         assert!(PeerExchange::new_sized(&library, ranks, &[0], 256).is_err());

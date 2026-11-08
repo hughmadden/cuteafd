@@ -58,11 +58,11 @@ impl<'a> RankKv<'a> {
             extents.ring_bytes());
         let pool = {
             let _scope = cuteafd_ffi::memory_ledger::scope("kv/muse records");
-            std::rc::Rc::new(Allocation::new(device, extents.pool_bytes().max(256))?)
+            std::rc::Rc::new(Allocation::untagged(device, extents.pool_bytes().max(256))?)
         };
         let rings = {
             let _scope = cuteafd_ffi::memory_ledger::scope("kv/muse sliding rings");
-            Allocation::new(device, extents.ring_bytes().max(256))?
+            Allocation::untagged(device, extents.ring_bytes().max(256))?
         };
         let (mut full, mut sliding) = (0usize, 0usize);
         let layers = cfg.attention.iter().map(|kind| match kind {

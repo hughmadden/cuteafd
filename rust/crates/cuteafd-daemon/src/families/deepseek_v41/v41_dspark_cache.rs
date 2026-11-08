@@ -167,10 +167,10 @@ impl<'a> DsparkWindow<'a> {
                 raw: library.cuda_stream_create()?,
             },
             kernel: library.v41_dspark_cache()?,
-            source: DeviceAllocation::new(library, source_rows as usize * 1024)?,
-            ring: DeviceAllocation::new(library, slots * V41DsparkCache::SLOT_BYTES)?,
-            descriptors: DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
-            staging: HostAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
+            source: DeviceAllocation::untagged(library, source_rows as usize * 1024)?,
+            ring: DeviceAllocation::untagged(library, slots * V41DsparkCache::SLOT_BYTES)?,
+            descriptors: DeviceAllocation::untagged(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
+            staging: HostAllocation::untagged(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
             graph: None,
             slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             access: SlotAccess::default(),
@@ -490,11 +490,11 @@ mod reservation_tests {
         let first_write = window.prepare_async_write(&[chunk(first, 2)], 2)?;
         let second_write = window.prepare_async_write(&[chunk(second, 2)], 2)?;
         assert!(window.attention_read(&[(first, 2)]).is_err());
-        let ring = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES)?;
+        let ring = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES, cuteafd_ffi::memory_ledger::TEST)?;
         assert!(window.capture_ring(first, ring.buffer).is_err());
         assert!(window.release(first).is_err());
         assert_eq!(window.committed_end(first)?, Some(2));
-        let descriptors = [DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?];
+        let descriptors = [DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, cuteafd_ffi::memory_ledger::TEST)?, DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, cuteafd_ffi::memory_ledger::TEST)?];
         lib.copy_h2d(descriptors[0].buffer, first_write.descriptor_bytes())?;
         lib.copy_h2d(descriptors[1].buffer, second_write.descriptor_bytes())?;
         // Declare streams last: error unwinding drains them before tickets/buffers.

@@ -1012,7 +1012,7 @@ impl<'a> QwenTp2<'a> {
         let layout = Tp2Rows::new(hidden, topk, max_rows, wire, experts[0].partial())?;
         let devices = ranks.map(|rank| Device { library, id: rank.device });
         let zero = |rank: usize, bytes| -> Result<Allocation<'a>> {
-            let allocation = Allocation::new(devices[rank], bytes)?;
+            let allocation = Allocation::untagged(devices[rank], bytes)?;
             devices[rank].run(|| library.cuda_zero_bytes(allocation.buffer, bytes))?;
             Ok(allocation)
         };
@@ -1361,7 +1361,7 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
+            let allocation = Rc::new(Allocation::untagged(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -2136,7 +2136,7 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        Ok(Rc::new(Allocation::new(Device { library: self.library, id: self.library.cuda_get_device()? }, bytes.max(256))?))
+        Ok(Rc::new(Allocation::untagged(Device { library: self.library, id: self.library.cuda_get_device()? }, bytes.max(256))?))
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -2243,7 +2243,7 @@ impl<'a> Qwen4Engine<'a> {
             argmax: self.alloc(logit_rows * 8)?,
             ids: self.alloc(tables.ids)?,
             select: self.alloc(logit_rows * 8)?,
-            logits_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(host.logits)?)?),
+            logits_host: RefCell::new(HostAllocation::untagged(self.library, usize::try_from(host.logits)?)?),
             staging: RefCell::new(crate::shared::token_table::RetainedUploads::new(
                 Device { library: self.library, id: self.library.cuda_get_device()? }, host.uploads)?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.

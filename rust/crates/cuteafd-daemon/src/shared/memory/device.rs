@@ -137,24 +137,42 @@ pub(crate) struct WeightArenaBacking<'b> {
 }
 
 impl<'a> Allocation<'a> {
-    pub fn attention_plane(device: Device<'a>, rows: usize, stride: usize, name: &str) -> Result<Self> {
+    pub fn attention_plane(device: Device<'a>, rows: usize, stride: usize, name: &str, tag: super::Tag) -> Result<Self> {
         let bytes = rows.checked_mul(stride).ok_or_else(|| anyhow::anyhow!("attention plane size overflow"))?;
-        let allocation = Self::new(device, bytes)?;
+        let allocation = Self::new(device, bytes, tag)?;
         anyhow::ensure!(allocation.buffer.ptr as usize % 16 == 0 && stride % 16 == 0,
             "V4.1 BF16 AOT attention load: {name} shape=[{rows},{stride}] on GPU {} requires 16-byte aligned base and row stride",
             device.id);
         Ok(allocation)
     }
 
+    /// Device memory on `device` holding `tag`.
     #[track_caller]
-    pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
+    pub fn new(device: Device<'a>, bytes: usize, tag: super::Tag) -> Result<Self> {
         let _site = cuteafd_ffi::memory_ledger::allocation_site(std::panic::Location::caller());
-        let buffer = device.run(|| device.library.alloc_device_buffer(bytes))?;
+        let buffer = device.run(|| device.library.alloc_device_buffer(bytes, tag))?;
         Ok(Self { device, buffer, backing: None, weight_id: None, arena_registration: None })
     }
 
-    pub(super) fn weight_arena(device: Device<'a>, bytes: usize, id: &str) -> Result<Self> {
-        let mut allocation = Self::new(device, bytes)?;
+    /// Legacy untagged constructor, deleted once every family states a tag.
+    #[track_caller]
+    pub fn untagged(device: Device<'a>, bytes: usize) -> Result<Self> {
+        let _site = cuteafd_ffi::memory_ledger::allocation_site(std::panic::Location::caller());
+        let buffer = device.run(|| device.library.alloc_device_buffer_untagged(bytes))?;
+        Ok(Self { device, buffer, backing: None, weight_id: None, arena_registration: None })
+    }
+
+    /// Kind and owner of the physical backing (a view reports its arena's).
+    pub fn tag(&self) -> Option<super::Tag> {
+        match &self.backing {
+            Some(backing) => backing.tag(),
+            None => cuteafd_ffi::memory_ledger::tag_of(self.buffer.ptr as usize),
+        }
+    }
+
+    #[track_caller]
+    pub(super) fn weight_arena(device: Device<'a>, bytes: usize, id: &str, tag: super::Tag) -> Result<Self> {
+        let mut allocation = Self::new(device, bytes, tag)?;
         allocation.weight_id = Some(id.into());
         Ok(allocation)
     }
@@ -224,7 +242,7 @@ mod allocation_lifetime_tests {
             std::fs::write(std::env::var("CUTEAFD_FATAL_SYNC_EVIDENCE")?, fixture.directory().join("events").to_str().unwrap())?;
             let library = fixture.load()?;
             let device = Device { library: &library, id: 0 };
-            let allocation = Allocation::new(device, 256)?;
+            let allocation = Allocation::new(device, 256, cuteafd_ffi::memory_ledger::TEST)?;
             let stream = Stream { device, raw: std::ptr::null_mut() };
             fixture.configure_pack(&library, 0, 1)?;
             match path {
@@ -289,7 +307,7 @@ mod allocation_lifetime_tests {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
-        let allocation = Allocation::new(device, 256)?;
+        let allocation = Allocation::new(device, 256, cuteafd_ffi::memory_ledger::TEST)?;
         let stream = Stream { device, raw: std::ptr::null_mut() };
         fixture.configure_pack(&library, 0, 1)?;
         assert!(stream.drain().is_err());
@@ -308,7 +326,7 @@ mod allocation_lifetime_tests {
         for quarantined in [false, true] {
             let fixture = Fixture::build()?;
             let library = fixture.load()?;
-            let allocation = Allocation::new(Device { library: &library, id: 1 }, 256)?;
+            let allocation = Allocation::new(Device { library: &library, id: 1 }, 256, cuteafd_ffi::memory_ledger::TEST)?;
             assert_eq!(library.cuda_get_device()?, 0, "allocation must restore the current device");
             if quarantined { library.quarantine_module_after_failed_drain(); }
             drop(allocation);
@@ -676,9 +694,9 @@ mod tests {
         lib.cuda_set_device(0)?;
         let d0 = Device { library: &lib, id: 0 };
         let d1 = Device { library: &lib, id: 1 };
-        let source = Allocation::new(d0, 4096)?;
-        let mut destination = Allocation::new(d1, 4096)?;
-        let output = Allocation::new(d1, 4096)?;
+        let source = Allocation::new(d0, 4096, cuteafd_ffi::memory_ledger::TEST)?;
+        let mut destination = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
+        let output = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
         let producer = Stream::new(d0)?;
         let independent = Stream::new(d1)?;
         let mut transfer = PeerTransfer::new(d0, d1)?;
@@ -729,10 +747,10 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(lib.cuda_get_device()?, 0);
         const BYTES: usize = 1024 * 1024;
-        let source_a = Allocation::new(a, BYTES)?;
-        let source_b = Allocation::new(b, BYTES)?;
-        let mut target_a = Allocation::new(a, BYTES)?;
-        let mut target_b = Allocation::new(b, BYTES)?;
+        let source_a = Allocation::new(a, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
+        let source_b = Allocation::new(b, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
+        let mut target_a = Allocation::new(a, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
+        let mut target_b = Allocation::new(b, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
         let producer_a = Stream::new(a)?;
         let producer_b = Stream::new(b)?;
         let mut ab = PeerTransfer::new(a, b)?;
@@ -772,10 +790,10 @@ mod tests {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         lib.cuda_set_device(0)?;
         let (d0, d1) = (Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 });
-        let source = Allocation::new(d0, 4096)?;
-        let mut staging = Allocation::new(d1, 4096)?;
-        let out = Allocation::new(d1, 4096)?;
-        let check = Allocation::new(d1, 4096)?;
+        let source = Allocation::new(d0, 4096, cuteafd_ffi::memory_ledger::TEST)?;
+        let mut staging = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
+        let out = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
+        let check = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
         let (producer, reader) = (Stream::new(d0)?, Stream::new(d1)?);
         let mut transfer = PeerTransfer::new(d0, d1)?;
         let guard = ScratchGuard::new(&lib, &[0, 1])?;

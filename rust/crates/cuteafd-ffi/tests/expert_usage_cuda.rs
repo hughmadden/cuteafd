@@ -18,7 +18,7 @@ impl Fixture<'_> {
     fn upload(&mut self, data: &[u32]) -> Result<CuteafdDeviceBuffer> {
         self.library.cuda_set_device(self.device)?;
         let bytes: Vec<u8> = data.iter().flat_map(|n| n.to_ne_bytes()).collect();
-        let buffer = self.library.alloc_device_buffer(bytes.len())?;
+        let buffer = self.library.alloc_device_buffer(bytes.len(), cuteafd_ffi::memory_ledger::TEST)?;
         self.buffers.push(buffer);
         self.library.copy_h2d(buffer, &bytes)?;
         Ok(buffer)

@@ -86,7 +86,7 @@ impl<'a> Rank<'a> {
         ensure!(streams.iter().all(|s| s.device.id == device.id
             && std::ptr::eq(s.device.library, device.library)), "Kimi context stream device mismatch");
         let workspace = layout.workspace().into_iter().map(|(name, bytes)| -> Result<_> {
-            let allocation = Allocation::new(device, bytes)?;
+            let allocation = Allocation::untagged(device, bytes)?;
             ensure!(allocation.buffer.bytes == bytes && allocation.buffer.device_id == device.id,
                 "Kimi context {name} allocation differs from admission");
             Ok((name, allocation))
@@ -94,7 +94,7 @@ impl<'a> Rank<'a> {
         let buffers = layout.buffers();
         let bytes = usize::try_from(buffers.compiled_extent.div_ceil(buffers.staging_unit_rows)
             .checked_mul(buffers.staging_unit_bytes).context("Kimi context staging overflow")?)?;
-        let staging = [Allocation::new(device, bytes)?, Allocation::new(device, bytes)?];
+        let staging = [Allocation::untagged(device, bytes)?, Allocation::untagged(device, bytes)?];
         let owner = Self { streams, workspace, staging, layout: layout.clone() };
         let (_, stride) = owner.layout.metadata_extent("context slots", 0)?;
         let banks = owner.buffer("context slots")?.bytes / stride;

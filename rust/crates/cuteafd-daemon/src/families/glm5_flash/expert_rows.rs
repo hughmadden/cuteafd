@@ -37,10 +37,10 @@ pub(super) fn check(args: &EngineArgs, opened: &Opened, max_rows: usize) -> Resu
     .context("no local expert package for this checkpoint")?;
     let (hidden, topk, count) = (shape.hidden, shape.topk, shape.experts);
     let stride = hidden + hidden / 32;
-    let wire = DeviceAllocation::new(library, max_rows * stride)?;
-    let ids = DeviceAllocation::new(library, max_rows * topk * 4)?;
-    let weights = DeviceAllocation::new(library, max_rows * topk * 4)?;
-    let shared = DeviceAllocation::new(library, max_rows * hidden * 2)?;
+    let wire = DeviceAllocation::untagged(library, max_rows * stride)?;
+    let ids = DeviceAllocation::untagged(library, max_rows * topk * 4)?;
+    let weights = DeviceAllocation::untagged(library, max_rows * topk * 4)?;
+    let shared = DeviceAllocation::untagged(library, max_rows * hidden * 2)?;
     library.copy_h2d(shared.buffer, &vec![0; shared.buffer.bytes])?;
     library.copy_h2d(
         weights.buffer,

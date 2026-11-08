@@ -205,9 +205,9 @@ fn partial_reply_screen() -> Result<()> {
     let pitch = WIDTH + WIDTH / 32;
     let mut screen = Screen { library: &library, execution, weighted_execution,
         epilogue: PartialEpilogue::load(&library, &programs, capacity)?,
-        inputs: [DeviceAllocation::new(&library, capacity * pitch)?, DeviceAllocation::new(&library, capacity * TOPK * 4)?,
-            DeviceAllocation::new(&library, capacity * TOPK * 4)?],
-        slot: DeviceAllocation::new(&library, capacity * TOPK * WIDTH * 2 + 4096)?,
+        inputs: [DeviceAllocation::new(&library, capacity * pitch, cuteafd_ffi::memory_ledger::TEST)?, DeviceAllocation::new(&library, capacity * TOPK * 4, cuteafd_ffi::memory_ledger::TEST)?,
+            DeviceAllocation::new(&library, capacity * TOPK * 4, cuteafd_ffi::memory_ledger::TEST)?],
+        slot: DeviceAllocation::new(&library, capacity * TOPK * WIDTH * 2 + 4096, cuteafd_ffi::memory_ledger::TEST)?,
         stream: LoadStream { library: &library, raw: library.cuda_stream_create()? } };
 
     // Gate 5 needs the weighted reply before and after the epilogue first ran.

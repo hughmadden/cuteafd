@@ -9,6 +9,7 @@ use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41ExpertInputQuantizer, V41PeerCopy, V41RouteReducer,
 };
 use std::{ffi::c_void, rc::Rc};
+use crate::shared::memory::Tag;
 
 pub(crate) struct Pair<'a> {
     // External root stream and its graphs must be drained/destroyed by caller
@@ -70,14 +71,14 @@ impl<'a> Pair<'a> {
             ready: Event::new(owner)?,
             done: Event::new(peer)?,
             ranks,
-            wire: Allocation::new(owner, rows * widths[0])?,
+            wire: Allocation::new(owner, rows * widths[0], Tag::drafter_workspace("experts/draft-pair"))?,
             peer_inputs: [
-                Allocation::new(peer, rows * widths[0])?,
-                Allocation::new(peer, rows * widths[1])?,
-                Allocation::new(peer, rows * widths[2])?,
+                Allocation::new(peer, rows * widths[0], Tag::transport("experts/draft-pair"))?,
+                Allocation::new(peer, rows * widths[1], Tag::transport("experts/draft-pair"))?,
+                Allocation::new(peer, rows * widths[2], Tag::transport("experts/draft-pair"))?,
             ],
-            peer_output: Allocation::new(owner, rows * layout.route_bytes())?,
-            output: Allocation::new(owner, rows * layout.geometry.row_bytes() as usize)?,
+            peer_output: Allocation::new(owner, rows * layout.route_bytes(), Tag::transport("experts/draft-pair"))?,
+            output: Allocation::new(owner, rows * layout.geometry.row_bytes() as usize, Tag::drafter_workspace("experts/draft-pair"))?,
             copy,
             quantizer,
             reducer,

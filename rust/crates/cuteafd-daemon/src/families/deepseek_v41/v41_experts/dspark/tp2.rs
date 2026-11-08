@@ -33,8 +33,8 @@ impl<'w,'a> RoutedWave<'w,'a> {
         ensure!(stage<3 && owner.library.cuda_get_device()?==1,"draft TP2 transformer must reside on RTX1");
         let device=Device {library:owner.library,id:1};
         Ok(Self {pair:pair::Pair::new(weights,capacity,LAYOUT)?,
-            inputs:[Allocation::new(device,capacity as usize*10240)?,Allocation::new(device,capacity as usize*12)?,Allocation::new(device,capacity as usize*12)?],
-            shared:Allocation::new(device,capacity as usize*10240)?,owner,stage,capacity})
+            inputs:[Allocation::untagged(device,capacity as usize*10240)?,Allocation::untagged(device,capacity as usize*12)?,Allocation::untagged(device,capacity as usize*12)?],
+            shared:Allocation::untagged(device,capacity as usize*10240)?,owner,stage,capacity})
     }
     pub fn peer_stream(&self)->Rc<Stream<'a>> {self.pair.peer_stream()}
     pub fn synchronize(&self)->Result<()> {let root=self.owner.standalone.drain();let peer=self.pair.drain_peer();root.and(peer)}
@@ -89,9 +89,9 @@ mod tests {
             for rows in [1usize,7,16] {
                 for (ranks,topk) in [(1usize,3usize),(2,3),(4,6)] {
                     let count=rows*5120;let plane_count=count*topk;
-                    let planes=(0..ranks).map(|_|Allocation::new(device,plane_count*4)).collect::<Result<Vec<_>>>()?;
-                    let shared=Allocation::new(device,count*2)?;
-                    let output=Allocation::new(device,count*2)?;
+                    let planes=(0..ranks).map(|_|Allocation::new(device,plane_count*4, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
+                    let shared=Allocation::new(device,count*2, cuteafd_ffi::memory_ledger::TEST)?;
+                    let output=Allocation::new(device,count*2, cuteafd_ffi::memory_ledger::TEST)?;
                     let pointers=std::array::from_fn(|rank|planes.get(rank).map_or(std::ptr::null(),|p|p.buffer.ptr.cast::<f32>()));
                     for with_shared in [false,true] {
                         let shared_ptr=if with_shared {shared.buffer.ptr.cast::<u16>()} else {std::ptr::null_mut()};

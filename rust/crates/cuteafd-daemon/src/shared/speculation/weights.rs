@@ -6,6 +6,7 @@ use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use std::{borrow::Cow, collections::HashMap, ffi::c_void, path::{Path, PathBuf}};
+use crate::shared::memory::Tag;
 
 pub(crate) use cuteafd_loader::families::glm5::draft_physical::{
     ShardAxis, gqa_weight_recipe, gqa_checkpoint_arena_requests as gqa_arena_requests,
@@ -95,7 +96,7 @@ impl Weight<'_> {
 pub(crate) type WeightAllocator<'a, 'b> = dyn FnMut(i32, &str, usize) -> Result<Allocation<'a>> + 'b;
 
 pub(crate) fn standalone<'a>(library: &'a NativeLibrary, device: i32, _: &str, bytes: usize) -> Result<Allocation<'a>> {
-    Allocation::new(Device { library, id: device }, bytes)
+    Allocation::new(Device { library, id: device }, bytes, Tag::drafter_weights("shared/drafter"))
 }
 
 pub(crate) fn checked_allocation<'a>(library: &'a NativeLibrary, name: &str, bytes: usize,
@@ -131,7 +132,7 @@ impl<'a, 'b> Load<'a, 'b> {
         if let Some(allocate) = &self.allocate {
             checked_allocation(self.library, name, bytes, &mut **allocate.borrow_mut())
         } else {
-            DeviceAllocation::new(self.library, bytes)
+            DeviceAllocation::new(self.library, bytes, Tag::drafter_weights("shared/drafter"))
         }
     }
     pub fn open(library: &'a NativeLibrary, snapshot: &Path) -> Result<Self> {
@@ -265,7 +266,7 @@ impl<'a, 'b> Load<'a, 'b> {
         if self.prefetched.is_some() {
             let bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(2)).context("drafter source extent overflow")?;
             // Conversion sources retire after packing and never belong to the immutable arena.
-            let source = self.land_operand(rects, DeviceAllocation::new(self.library, bytes.max(256))?)?;
+            let source = self.land_operand(rects, DeviceAllocation::new(self.library, bytes.max(256), Tag::staging("shared/drafter-source"))?)?;
             let packed = Fp8Weight::pack_with(self.library, source.buffer.ptr, rows, cols, scales, stream, &name, &mut plane);
             // SAFETY: source and pack destinations remain owned until this load stream drains.
             if let Err(error) = unsafe { self.library.cuda_stream_synchronize(stream) } {
@@ -478,7 +479,7 @@ mod tests {
                     let mut allocate = |id, name: &str, bytes| {
                         assert_eq!(id, device.id);
                         requested.borrow_mut().push((name.to_owned(), bytes));
-                        let owner = weight_allocation(device, arena, name, bytes)?;
+                        let owner = weight_allocation(device, arena, name, bytes, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
                         if let Some(arena) = arena {
                             let offset = end.div_ceil(256) * 256;
                             let root = *base.get_or_insert(owner.buffer.ptr as usize);
@@ -534,7 +535,7 @@ mod tests {
                 });
                 let baseline_bytes = digest(&baseline)?;
                 for recorded in [false, true] {
-                    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/draft", expected.clone())?)?;
+                    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/draft", expected.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
                     let owners = if recorded {
                         let (owners, records) = dense::recording(|| run(device, &snapshot, &cfg, rank, ranks, representation, &expected, Some(&arena)))?;
                         assert!(!records.operands.is_empty());
@@ -735,15 +736,15 @@ mod tests {
         let device = Device { library: &library, id: 1 };
         let load = || device.run(|| {
             let dense = DenseLoad::mount(&library);
-            let uk = DeviceAllocation::new(&library, heads * uk_head)?;
-            let uv = DeviceAllocation::new(&library, heads * uv_head)?;
+            let uk = DeviceAllocation::new(&library, heads * uk_head, cuteafd_ffi::memory_ledger::TEST)?;
+            let uv = DeviceAllocation::new(&library, heads * uv_head, cuteafd_ffi::memory_ledger::TEST)?;
             absorb_into(&dense, Rect { name: "kv_b".into(), path: path.clone(), base: 0,
                 row_bytes: latent * 2, rows: 0..heads * rows, cols: 0..latent * 2 },
                 heads, nope, value, latent, uk.buffer, uv.buffer, std::ptr::null_mut())?;
             let mut owners = vec![uk, uv];
             for rect in &norms {
-                let values = DeviceAllocation::new(&library, rect.bytes())?;
-                let output = DeviceAllocation::new(&library, 3 * 4)?;
+                let values = DeviceAllocation::new(&library, rect.bytes(), cuteafd_ffi::memory_ledger::TEST)?;
+                let output = DeviceAllocation::new(&library, 3 * 4, cuteafd_ffi::memory_ledger::TEST)?;
                 // Poison output to prove recording does not run a Finish early.
                 library.copy_h2d(output.buffer, &[0xff; 12])?;
                 dense.operand(Operand { device: 1, bytes: rect.bytes(), buffer: values.buffer,
@@ -834,7 +835,7 @@ mod tests {
             let dense = DenseLoad::mount(&library);
             let mut owners = std::collections::BTreeMap::new();
             for weight in layout.weight_destinations() {
-                let owner = DeviceAllocation::new(&library, (weight.shape.iter().product::<usize>() * 2).max(256))?;
+                let owner = DeviceAllocation::new(&library, (weight.shape.iter().product::<usize>() * 2).max(256), cuteafd_ffi::memory_ledger::TEST)?;
                 if weight.packing == cuteafd_loader::formats::dflash::MlaDraftPacking::UnitScale {
                     library.copy_h2d(owner.buffer, &weight.pack(&mut |_, _| unreachable!())?)?;
                 }
@@ -843,11 +844,11 @@ mod tests {
             mla_weights_into(&dense, layout.weight_destinations(), &cfg.mla,
                 |name| Ok(owners.get(name).context("fixture destination")?.buffer),
                 &|name, shape| source.rect(name, shape), std::ptr::null_mut())?;
-            let norms = DeviceAllocation::new(&library, cfg.vocab * 4)?;
+            let norms = DeviceAllocation::new(&library, cfg.vocab * 4, cuteafd_ffi::memory_ledger::TEST)?;
             dense.finish(Finish::RowNorms { source: owners["weight.autoregressive_head.output.weight"].buffer,
                 norms: norms.buffer, rows: cfg.vocab, cols: cfg.markov_rank }, std::ptr::null_mut())?;
             owners.insert("markov_norms".into(), norms);
-            let target = DeviceAllocation::new(&library, 256)?;
+            let target = DeviceAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?;
             dense.operand(Operand { device: 1, buffer: target.buffer, bytes: 256,
                 lands: vec![(source.rect("model.norm.weight", &[128])?, 0)] })?;
             owners.insert("target.norm".into(), target);

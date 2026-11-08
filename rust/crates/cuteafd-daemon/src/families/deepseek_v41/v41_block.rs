@@ -936,7 +936,7 @@ mod input_storage_tests {
         for seed in 0..2 {
             private_uploads[seed].upload(&gathered(seed))?;
             let output = embeddings[seed].execute(&tokens[seed], &positions[seed])?;
-            let allocation = DeviceAllocation::new(&library, output.residual.bytes)?;
+            let allocation = DeviceAllocation::new(&library, output.residual.bytes, cuteafd_ffi::memory_ledger::TEST)?;
             library.copy_d2d(allocation.buffer, output.residual, output.residual.bytes)?;
             residuals.push(allocation);
             let window = RowWindow::rows(seed * unit..seed * unit + widths[seed]);
@@ -947,7 +947,7 @@ mod input_storage_tests {
         let reader = Stream::new(Device { library: &library, id: library.cuda_get_device()? })?;
         let stride = if kind == 1 { 24 * 512 } else { 40960 };
         let bytes = widths[0] * stride;
-        let copy = DeviceAllocation::new(&library, bytes)?;
+        let copy = DeviceAllocation::new(&library, bytes, cuteafd_ffi::memory_ledger::TEST)?;
         let produce = |seed: usize, embeddings: &mut [TargetEmbeddingWave<'_, '_>; 2],
             uploads: &mut [EngramDeviceRows<'_>; 2], gates: &mut [EngramGate<'_, '_>; 2]|
             -> Result<CuteafdDeviceBuffer> {

@@ -12,6 +12,7 @@ use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs, V41LocalExpertReducer,
 };
 use std::{ffi::c_void, path::Path, rc::Rc};
+use crate::shared::memory::Tag;
 
 /// Activation contract of the resident kernel, independent of remote wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,7 +196,7 @@ impl<'a> LocalExpertWave<'a> {
         };
         let scratch = DeviceAllocation::new(
             library,
-            workspace - capacity as usize * geometry.row_bytes() as usize,
+            workspace - capacity as usize * geometry.row_bytes() as usize, Tag::workspace("experts/local-scratch")
         )?;
         let mut states = Vec::new();
         for c in if nvfp4 { library.nvfp4_expert_exports(2)? } else { library.native_expert_exports(2)? }
@@ -236,7 +237,7 @@ impl<'a> LocalExpertWave<'a> {
             input_format: LocalInputFormat::for_nvfp4(nvfp4),
             output: DeviceAllocation::new(
                 library,
-                capacity as usize * geometry.row_bytes() as usize,
+                capacity as usize * geometry.row_bytes() as usize, Tag::workspace("experts/local-output")
             )?,
             reducer: library.v41_local_expert_reducer()?,
             capacity,
@@ -348,7 +349,7 @@ impl<'a> LocalExpertWave<'a> {
             input_format: LocalInputFormat::Fp8K32,
             output: DeviceAllocation::new(
                 library,
-                capacity as usize * geometry.row_bytes() as usize,
+                capacity as usize * geometry.row_bytes() as usize, Tag::workspace("experts/local-output")
             )?,
             reducer: library.v41_local_expert_reducer()?,
             capacity,

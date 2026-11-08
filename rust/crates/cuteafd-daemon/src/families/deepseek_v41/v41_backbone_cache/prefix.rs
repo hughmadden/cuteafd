@@ -35,7 +35,7 @@ impl<'a> BackboneCache<'a> {
         use crate::shared::memory::device::{Allocation, Device};
         let library = self.prefix_stream.library;
         let device = Device { library, id: library.cuda_get_device()? };
-        let mark = Allocation::new(device, BackboneMark::BYTES)?;
+        let mark = Allocation::untagged(device, BackboneMark::BYTES)?;
         let meta = self.capture_mark(lease, mark.buffer)?;
         let mut bytes = Vec::new();
         let mut read = |buffer: CuteafdDeviceBuffer| -> Result<()> {
@@ -421,13 +421,13 @@ impl<'a> BackboneCache<'a> {
     }
     pub fn retain_prefix(&mut self, lease: CacheLease, budget: usize) -> Result<TestSnapshot<'a>> {
         ensure!(budget >= BackboneMark::BYTES, "retained backbone tail exceeds budget");
-        let mark = crate::shared::memory::DeviceAllocation::new(self.prefix_stream.library, BackboneMark::BYTES)?;
+        let mark = crate::shared::memory::DeviceAllocation::untagged(self.prefix_stream.library, BackboneMark::BYTES)?;
         let meta = self.capture_mark(lease, mark.buffer)?;
         self.test_snapshot(lease, mark, meta)
     }
     pub fn queue_prefix(&mut self, lane: usize, lease: CacheLease, budget: usize) -> Result<()> {
         ensure!(budget >= BackboneMark::BYTES, "retained backbone tail exceeds budget");
-        let mark = crate::shared::memory::DeviceAllocation::new(self.prefix_stream.library, BackboneMark::BYTES)?;
+        let mark = crate::shared::memory::DeviceAllocation::untagged(self.prefix_stream.library, BackboneMark::BYTES)?;
         let meta = self.queue_mark(lane, lease, mark.buffer)?;
         self.test_queued[lane] = Some((lease, mark, meta));
         Ok(())

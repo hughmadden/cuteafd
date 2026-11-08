@@ -547,7 +547,7 @@ mod shared_storage_tests {
         }
         let reader = Stream::new(reader_device)?;
         let copies = expected[0][0].iter().map(|bytes|
-            reader_device.own(|| DeviceAllocation::new(&library, bytes.len())))
+            reader_device.own(|| DeviceAllocation::new(&library, bytes.len(), cuteafd_ffi::memory_ledger::TEST)))
             .collect::<Result<Vec<_>>>()?;
         let copy_outputs = |buffers: Vec<CuteafdDeviceBuffer>| -> Result<()> {
             reader_device.run(|| {

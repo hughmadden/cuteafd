@@ -124,9 +124,9 @@ impl<'a> Inputs<'a> {
     pub(super) fn allocate(device: Device<'a>, rows: usize, available: u64) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-input");
         ensure!(Self::bytes(rows)? <= available, "Step-5 input storage exceeds admission");
-        Ok(Self { ids: Allocation::new(device, rows * 4)?,
-            bf16: Allocation::new(device, rows * H * 2)?,
-            residual: Allocation::new(device, rows * H * 4)?, rows })
+        Ok(Self { ids: Allocation::untagged(device, rows * 4)?,
+            bf16: Allocation::untagged(device, rows * H * 2)?,
+            residual: Allocation::untagged(device, rows * H * 4)?, rows })
     }
 }
 

@@ -1415,9 +1415,9 @@ mod tests {
         // Nonuniform rows, columns, routes and ranks catch prefix-only copies,
         // dtype reinterpretation, wrong strides and omitted top-k reduction.
         let capacity = 80usize;
-        let mut rank0 = library.alloc_device_buffer(capacity * 6 * 5120 * 2)?;
-        let mut rank1 = library.alloc_device_buffer(capacity * 6 * 5120 * 2)?;
-        let mut output = library.alloc_device_buffer(capacity * 5120 * 2)?;
+        let mut rank0 = library.alloc_device_buffer(capacity * 6 * 5120 * 2, crate::memory_ledger::TEST)?;
+        let mut rank1 = library.alloc_device_buffer(capacity * 6 * 5120 * 2, crate::memory_ledger::TEST)?;
+        let mut output = library.alloc_device_buffer(capacity * 5120 * 2, crate::memory_ledger::TEST)?;
         let result = (|| -> Result<()> {
             for rows in [1usize, 16, 80, 3, 1] {
                 let mut sources = [Vec::new(), Vec::new()];
@@ -1472,10 +1472,10 @@ mod tests {
         library.cuda_set_device(0)?;
         let reducer = library.v41_local_expert_reducer()?;
         let capacity = 80usize;
-        let mut routes = library.alloc_device_buffer(capacity * 6 * 5120 * 2)?;
-        let mut fp32_routes = library.alloc_device_buffer(capacity * 6 * 5120 * 4)?;
-        let mut shared = library.alloc_device_buffer(capacity * 5120 * 2)?;
-        let mut output = library.alloc_device_buffer(capacity * 5120 * 2)?;
+        let mut routes = library.alloc_device_buffer(capacity * 6 * 5120 * 2, crate::memory_ledger::TEST)?;
+        let mut fp32_routes = library.alloc_device_buffer(capacity * 6 * 5120 * 4, crate::memory_ledger::TEST)?;
+        let mut shared = library.alloc_device_buffer(capacity * 5120 * 2, crate::memory_ledger::TEST)?;
+        let mut output = library.alloc_device_buffer(capacity * 5120 * 2, crate::memory_ledger::TEST)?;
         let bf16 = |value: f32| {
             let bits = value.to_bits();
             ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
@@ -1549,10 +1549,10 @@ mod tests {
         library.cuda_set_device(0)?;
         let reducer = library.v41_compact_reducer()?;
         let capacity = 80usize;
-        let mut planes = (0..4).map(|_| library.alloc_device_buffer(capacity * 10240))
+        let mut planes = (0..4).map(|_| library.alloc_device_buffer(capacity * 10240, crate::memory_ledger::TEST))
             .collect::<Result<Vec<_>>>()?;
-        let mut shared = library.alloc_device_buffer(capacity * 10240)?;
-        let mut output = library.alloc_device_buffer(capacity * 10240)?;
+        let mut shared = library.alloc_device_buffer(capacity * 10240, crate::memory_ledger::TEST)?;
+        let mut output = library.alloc_device_buffer(capacity * 10240, crate::memory_ledger::TEST)?;
         let bf16 = |value: f32| {
             let bits = value.to_bits();
             ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16

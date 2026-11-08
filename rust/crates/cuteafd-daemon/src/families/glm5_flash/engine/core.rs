@@ -96,7 +96,7 @@ impl<'a> Rank<'a> {
             ensure!(admission.stages.as_ref().context("Flash K6 stages not admitted")?[index] == actual_stage,
                 "Flash K6 loaded/admitted stage extents mismatch");
             let stages = actual_stage.extents.iter()
-                .map(|(&n, &b)| Ok((n, Allocation::new(device, b)?))).collect::<Result<_>>()?;
+                .map(|(&n, &b)| Ok((n, Allocation::untagged(device, b)?))).collect::<Result<_>>()?;
             Ok(Some(Rc::new(Scratch { projection, stages })))
         };
         let shapes = layers.iter().flat_map(|l| l.attention_native.values())
@@ -111,7 +111,7 @@ impl<'a> Rank<'a> {
         let device = Device { library: engine.library, id: if rank == 0 { engine.device } else { engine.peer()?.device } };
         ensure!(rows == scratch.projection.rows, "Flash K6 retained slot capacity differs from scratch");
         let bytes = retained_bytes(rows, engine.cfg.hidden)?;
-        let allocate = |width| Allocation::new(device, bytes * width);
+        let allocate = |width| Allocation::untagged(device, bytes * width);
         Ok(Some(Slot { scratch: scratch.clone(), retained: [allocate(1)?, allocate(1)?, allocate(2)?], lane }))
     }
 }

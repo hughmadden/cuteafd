@@ -33,7 +33,7 @@ impl<'library> DsparkWeights<'library> {
             _weights: self,
             tensors,
             kernel: library.v41_router()?,
-            scores: DeviceAllocation::new(library, bytes)?,
+            scores: DeviceAllocation::untagged(library, bytes)?,
             stage,
             capacity,
         })

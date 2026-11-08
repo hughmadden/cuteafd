@@ -157,7 +157,7 @@ fn installed_coordinator_tp2_scale_codes_equal_cpu_pack() -> Result<()> {
         cols: 0..tensor.metadata.shape[1] };
     let mut dense_expected = vec![0; rect.bytes()];
     rect.read(&mut dense_expected)?;
-    let allocations = [DeviceAllocation::new(&library, 256)?, DeviceAllocation::new(&library, 256)?];
+    let allocations = [DeviceAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?, DeviceAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?];
     let mut records = Records::default();
     records.operands.push(Operand { device: 0, buffer: allocations[0].buffer,
         lands: vec![(rect.clone(), 0)], bytes: rect.bytes() });

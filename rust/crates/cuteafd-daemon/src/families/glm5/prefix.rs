@@ -142,14 +142,14 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
                     .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
                 // Marks snapshot the drafter's rings and live on its admitted GPU.
                 let storage = match drafter.device() {
-                    Some(device) => device.run(|| DeviceAllocation::new(engine.library, bytes.max(256)))?,
-                    None => DeviceAllocation::new(engine.library, bytes.max(256))?,
+                    Some(device) => device.run(|| DeviceAllocation::untagged(engine.library, bytes.max(256)))?,
+                    None => DeviceAllocation::untagged(engine.library, bytes.max(256))?,
                 };
                 Some(DraftMarks { storage, windows, slots: mark_slots })
             }
             _ => None,
         };
-        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)?, copies, draft_marks })
+        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::untagged(engine.library, 256)?, copies, draft_marks })
     }
 
     pub(crate) fn allocation_receipts(&self,

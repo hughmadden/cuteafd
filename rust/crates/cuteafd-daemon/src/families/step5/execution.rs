@@ -688,7 +688,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             ensure!(link.device.id == devices[entry].id, "Step-5 main intake must be on the entry GPU");
             link.installed_grouping()?;
         }
-        let routed_reply = Allocation::new(devices[entry], rows * H * 2)?;
+        let routed_reply = Allocation::untagged(devices[entry], rows * H * 2)?;
         let mut native = native;
         let tp2 = match native.onboarded_tp2.take() {
             None => None,
@@ -709,7 +709,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 let streams = std::array::from_fn(|rank| RankDevice { device: devices[rank].id, stream: stages[rank].stream.raw });
                 let pair = devices[0].run(|| Pair::new_with_wire(devices[0].library, streams, ranks, H, 8, unit, rows.min(64), lanes,
                     exchange_dtype, true))?;
-                let plane = |rank: usize, bytes: usize| Allocation::new(devices[rank], bytes.max(256));
+                let plane = |rank: usize, bytes: usize| Allocation::untagged(devices[rank], bytes.max(256));
                 let section = unit * 8 * 4;
                 let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
                 let scratch = routes + unit * kind.input_row_bytes(H);

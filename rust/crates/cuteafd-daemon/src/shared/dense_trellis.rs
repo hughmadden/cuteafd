@@ -9,6 +9,8 @@ use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, programs::Programs, Bf16F32Add,
     dense_trellis::{DenseTrellisBuffers, DenseTrellisDispatch, DenseTrellisPolicy,
         TrellisDType, GroupedWorkspace, GROUPS}};
 use std::{collections::BTreeMap, ffi::c_void};
+use crate::shared::memory::Tag;
+use cuteafd_core::memory_layout::ArenaTag;
 
 /// Native bytes remain compressed on device; admission precedes allocation.
 /// The caller selects ownership from the shared layer placement before packing.
@@ -69,7 +71,7 @@ impl CoreWeightLayout {
     pub(crate) fn load_recorded<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
         dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void) -> Result<CoreWeights<'a>> {
         self.load_recorded_with(device, checkpoint, dense, stream,
-            |name, bytes| crate::shared::memory::weight_arena::weight_allocation(device, None, name, bytes))
+            |name, bytes| crate::shared::memory::weight_arena::weight_allocation(device, None, name, bytes, ArenaTag::weights("shared/k6-core")))
     }
 
     /// The shared mount/push recipe; only final named storage is injected.
@@ -161,7 +163,7 @@ impl CoreWeightLayout {
     }
     pub(crate) fn upload<'a>(&self,device:Device<'a>,loaded:cuteafd_loader::formats::dense_trellis::LoadedDenseTrellis)
         -> Result<CoreWeights<'a>> {
-        self.upload_with(device, loaded, |_, bytes| Allocation::new(device, bytes))
+        self.upload_with(device, loaded, |_, bytes| Allocation::new(device, bytes, Tag::weights("shared/k6-core")))
     }
     pub(crate) fn upload_with<'a>(&self,device:Device<'a>,loaded:LoadedDenseTrellis,
         mut allocate:impl FnMut(&str,usize)->Result<Allocation<'a>>) -> Result<CoreWeights<'a>> {
@@ -224,7 +226,7 @@ impl ProjectionLayout {
         let storage=ProjectionScratchLayout {
             extents:self.extents.clone(),rows:self.rows }.storage()?;
         let mut owners=BTreeMap::new();
-        for (&name,&bytes) in &storage.owners {owners.insert(name,Allocation::new(device,bytes)?);}
+        for (&name,&bytes) in &storage.owners {owners.insert(name,Allocation::new(device,bytes, Tag::workspace("shared/native-projection"))?);}
         let mut buffers=BTreeMap::new();
         for (&name,&bytes) in &self.extents {
             let buffer=if let Some(&offset)=storage.route_offsets.get(name) {
@@ -309,7 +311,7 @@ mod retained_tests {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
-        let allocation = Allocation::new(Device { library: &library, id: 1 }, 1024)?;
+        let allocation = Allocation::new(Device { library: &library, id: 1 }, 1024, cuteafd_ffi::memory_ledger::TEST)?;
         let owner = allocation.buffer;
         let view = Buffer { ptr: (owner.ptr as usize + 128) as *mut c_void, bytes: 256, ..owner };
         let mut scratch = ProjectionScratch { _owners: BTreeMap::from([("workspace", allocation)]),
@@ -530,7 +532,7 @@ mod upload_tests {
                 suh:(0..256).map(|i| (i as u8).wrapping_add(7)).collect(),
                 svh:(0..512).map(|i| (i as u8).wrapping_mul(17)).collect() } };
             let baseline = layout.upload(device,loaded())?;
-            let arena = DeviceWeightArena::new(device,WeightArenaLayout::new(format!("test/k{bits}"),requests.clone())?)?;
+            let arena = DeviceWeightArena::new(device,WeightArenaLayout::new(format!("test/k{bits}"),requests.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
             let mut requested = Vec::new();
             let actual = layout.upload_with(device,loaded(),|name,bytes| {
                 requested.push((name.to_owned(),bytes)); arena.view(name,bytes)

@@ -383,7 +383,7 @@ struct StepBuffers<'a> {
 impl<'a> Engine<'a> {
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
         {
-            let owner = std::rc::Rc::new(DeviceAllocation::new(self.library, bytes.max(256))?);
+            let owner = std::rc::Rc::new(DeviceAllocation::untagged(self.library, bytes.max(256))?);
             Ok(Dev { buffer: owner.buffer, _owner: owner })
         }
     }
@@ -469,7 +469,7 @@ impl<'a> Engine<'a> {
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let table = |compressed: bool| -> Result<Dev<'a>> {
                 let values = metadata::rope_table(&self.cfg, compressed, self.max_context.max(metadata::WINDOW));
-                let allocation = DeviceAllocation::new(self.library, values.len() * 4)?;
+                let allocation = DeviceAllocation::untagged(self.library, values.len() * 4)?;
                 self.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
                 Ok(allocation.into())
             };
@@ -511,7 +511,7 @@ impl<'a> Engine<'a> {
         context: bool) -> Result<LayerCache<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            let allocation = DeviceAllocation::untagged(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation.into())
         };
@@ -551,7 +551,7 @@ impl<'a> Engine<'a> {
         let pools = (0..parts.cfg.n_layers + stages).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
         let table = |compressed: bool| -> Result<Dev<'a>> {
             let values = metadata::rope_table(&parts.cfg, compressed, parts.max_context.max(metadata::WINDOW));
-            let allocation = DeviceAllocation::new(parts.library, values.len() * 4)?;
+            let allocation = DeviceAllocation::untagged(parts.library, values.len() * 4)?;
             parts.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
             Ok(allocation.into())
         };

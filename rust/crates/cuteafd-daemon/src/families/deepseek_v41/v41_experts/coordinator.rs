@@ -196,7 +196,7 @@ impl<'a> NativeTp4Wave<'a> {
         Ok(Self {
             link: None,
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            output: DeviceAllocation::new(library, capacity as usize * 5120 * 2)?,
+            output: DeviceAllocation::untagged(library, capacity as usize * 5120 * 2)?,
             library,
             ready_rows: None,
             local: None,

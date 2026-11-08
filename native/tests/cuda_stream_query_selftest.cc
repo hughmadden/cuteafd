@@ -35,7 +35,7 @@ int main() {
   void* end = nullptr;
   void* graph = nullptr;
   cuteafd_device_buffer_t buffer{};
-  check(cuteafd_alloc_device_buffer(1 << 20, &buffer) == CUTEAFD_STATUS_OK);
+  check(cuteafd_alloc_device_buffer(1 << 20, &buffer, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_event_create(&start) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_event_create(&end) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_event_record_external(nullptr, pending) == CUTEAFD_STATUS_INVALID_ARGUMENT);

@@ -388,8 +388,8 @@ impl<'a> WindowBatch<'a> {
         Ok(Self {
             library,
             stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
-            staging: crate::shared::memory::HostAllocation::new(library, bytes)?,
-            table: crate::shared::memory::DeviceAllocation::new(library, bytes)?,
+            staging: crate::shared::memory::HostAllocation::untagged(library, bytes)?,
+            table: crate::shared::memory::DeviceAllocation::untagged(library, bytes)?,
             kernel: library.v41_kv_store_layers()?,
             capacity,
         })

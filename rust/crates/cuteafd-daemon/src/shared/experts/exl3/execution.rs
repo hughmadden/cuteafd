@@ -2,6 +2,7 @@
 //! each launch only substitutes live inputs/row bounds and enqueues GPU work.
 use super::Exl3Weights;
 use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::Tag;
 pub(crate) use cuteafd_loader::serving_capacity::Exl3Epilogue;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Exl3Kernel, V41Exl3Routes};
@@ -345,7 +346,7 @@ impl<'a> Exl3Workspace<'a> {
         let mut allocations = BTreeMap::new();
         let mut dtypes = BTreeMap::new();
         for (name, (bytes, dtype)) in Self::layout(directories, epilogue)? {
-            allocations.insert(name.clone(), DeviceAllocation::new(library, bytes)?);
+            allocations.insert(name.clone(), DeviceAllocation::new(library, bytes, Tag::workspace("experts/exl3-shared-scratch"))?);
             dtypes.insert(name, dtype);
         }
         Ok(Rc::new(Self { allocations, dtypes }))
@@ -725,7 +726,7 @@ impl<'a> Exl3Execution<'a> {
                 pointers.insert(name.clone(), buffer);
                 continue;
             }
-            let allocation = DeviceAllocation::new(library, spec.bytes.max(16))?;
+            let allocation = DeviceAllocation::new(library, spec.bytes.max(16), Tag::workspace("experts/exl3-scratch"))?;
             if spec.zero_on_create {
                 library.copy_h2d(allocation.buffer, &vec![0; spec.bytes])?;
             }
@@ -752,7 +753,7 @@ impl<'a> Exl3Execution<'a> {
                 && format!("{:x}", Sha256::digest(&lut)) == meta.trellis_lut.sha256,
             "EXL3 LUT artifact mismatch"
         );
-        let lut_buffer = DeviceAllocation::new(library, lut.len())?;
+        let lut_buffer = DeviceAllocation::new(library, lut.len(), Tag::weights("experts/exl3-lut"))?;
         library.copy_h2d(lut_buffer.buffer, &lut)?;
         pointers.insert("trellis_lut_ptr".into(), lut_buffer.buffer);
         storage.push(lut_buffer);
@@ -871,7 +872,7 @@ impl<'a> Exl3Execution<'a> {
             }
         }
         let wire = if modules.owner.wire.is_some() {
-            Some(DeviceAllocation::new(library, meta.capacity * meta.hidden * 2)?)
+            Some(DeviceAllocation::new(library, meta.capacity * meta.hidden * 2, Tag::workspace("experts/exl3-wire"))?)
         } else { None };
         Ok(Self {
             wire,

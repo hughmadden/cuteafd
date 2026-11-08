@@ -42,7 +42,7 @@ int main() {
     return 77;
   }
   cuteafd_host_buffer_t words{};
-  check(cuteafd_alloc_host_buffer(4096, &words) == CUTEAFD_STATUS_OK, "mapped pinned words");
+  check(cuteafd_alloc_host_buffer(4096, &words, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK, "mapped pinned words");
   std::memset(words.ptr, 0, words.bytes);
   auto* flag = static_cast<uint32_t*>(words.ptr);       // host -> GPU
   auto* published = flag + 16;                           // GPU -> host
@@ -52,7 +52,7 @@ int main() {
   check(cuteafd_cuda_stream_create(&stream) == CUTEAFD_STATUS_OK, "stream");
   check(cuteafd_cuda_stream_create(&other) == CUTEAFD_STATUS_OK, "second stream");
   cuteafd_device_buffer_t device{};
-  check(cuteafd_alloc_device_buffer(1 << 20, &device) == CUTEAFD_STATUS_OK, "device buffer");
+  check(cuteafd_alloc_device_buffer(1 << 20, &device, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK, "device buffer");
 
   // Arguments are validated before any enqueue.
   check(cuteafd_cuda_stream_wait_value32(nullptr, flag, 1) == CUTEAFD_STATUS_INVALID_ARGUMENT, "null stream");
@@ -146,12 +146,12 @@ int main() {
   {
     const size_t row = 4096;
     cuteafd_device_buffer_t rows_device{};
-    check(cuteafd_alloc_device_buffer(80 * row, &rows_device) == CUTEAFD_STATUS_OK, "rows buffer");
+    check(cuteafd_alloc_device_buffer(80 * row, &rows_device, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK, "rows buffer");
     std::vector<unsigned char> rows_host(80 * row);
     for (size_t i = 0; i < rows_host.size(); ++i) rows_host[i] = static_cast<unsigned char>((i / row) * 3 + 1);
     check(cudaMemcpy(rows_device.ptr, rows_host.data(), rows_host.size(), cudaMemcpyHostToDevice) == cudaSuccess, "rows");
     cuteafd_host_buffer_t target_buffer{};
-    check(cuteafd_alloc_host_buffer(row, &target_buffer) == CUTEAFD_STATUS_OK, "mapped target");
+    check(cuteafd_alloc_host_buffer(row, &target_buffer, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK, "mapped target");
     auto* target = static_cast<volatile unsigned char*>(target_buffer.ptr);
     void* target_alias = nullptr;
     check(cudaHostGetDevicePointer(&target_alias, target_buffer.ptr, 0) == cudaSuccess, "target alias");

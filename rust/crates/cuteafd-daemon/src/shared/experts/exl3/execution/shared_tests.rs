@@ -42,8 +42,8 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
         let old = directories.iter().map(|p| Exl3Execution::plan(p, format, Exl3Epilogue::Sum)).collect::<Result<Vec<_>>>()?
             .into_iter().sum::<usize>();
         ensure!(planned < old, "workspace sharing did not reduce storage");
-        let inputs = [DeviceAllocation::new(&library, 4096*pitch)?,
-            DeviceAllocation::new(&library, 4096*k*4)?, DeviceAllocation::new(&library, 4096*k*4)?];
+        let inputs = [DeviceAllocation::new(&library, 4096*pitch, cuteafd_ffi::memory_ledger::TEST)?,
+            DeviceAllocation::new(&library, 4096*k*4, cuteafd_ffi::memory_ledger::TEST)?, DeviceAllocation::new(&library, 4096*k*4, cuteafd_ffi::memory_ledger::TEST)?];
         let mut wire = vec![0;4096*pitch];
         for (row, bytes) in wire.chunks_exact_mut(pitch).enumerate() {
             for (col, value) in bytes[..h].iter_mut().enumerate() { *value = 0x30 + ((row+col)%16) as u8; }
@@ -152,7 +152,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         V41Exl3ResidentBuffer { bytes: if descriptor {3*6*2*4} else {16},
             initial_words: if descriptor { vec![0; 3*6*2] } else { vec![] }, name }
     }).collect();
-    let arena = DeviceAllocation::new(&library, 1024)?;
+    let arena = DeviceAllocation::new(&library, 1024, cuteafd_ffi::memory_ledger::TEST)?;
     let weights = Rc::new(vec![Exl3Weights {
         buffers: specs.iter().map(|s| WeightBuffer { buffer: CuteafdDeviceBuffer { bytes:s.bytes, ..arena.buffer } }).collect(),
         _arena: crate::shared::experts::exl3::ArenaOwner::Mount(arena),

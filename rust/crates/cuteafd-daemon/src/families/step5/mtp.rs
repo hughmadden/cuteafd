@@ -269,7 +269,7 @@ impl<'a> StageOwner<'a> {
         // Shared device scratch aliases between stages; pinned upload sources
         // remain private and are reusable after their own H2D completion event.
         let uploads = sizes[..4].iter().copied().chain([sizes[2], 8])
-            .map(|bytes| crate::shared::memory::HostAllocation::new(device.library, bytes))
+            .map(|bytes| crate::shared::memory::HostAllocation::untagged(device.library, bytes))
             .collect::<Result<Vec<_>>>()?;
         let upload_done = (0..uploads.len()).map(|_| Ok((Event::new(device)?, false)))
             .collect::<Result<Vec<_>>>()?;
@@ -672,7 +672,7 @@ impl<'a> Runtime<'a> {
             owner.bind_cache(cache)?;
             stages.push(owner);
         }
-        let selected = crate::shared::memory::HostAllocation::new(cache.stream.device.library, depth * 8)?;
+        let selected = crate::shared::memory::HostAllocation::untagged(cache.stream.device.library, depth * 8)?;
         Ok(Self { stages: std::cell::RefCell::new(stages),
             tokens: std::cell::RefCell::new(vec![Vec::new(); cache.sequences() as usize]),
             selected: std::cell::RefCell::new(selected), rank: cache.rank() })
@@ -1033,8 +1033,8 @@ mod tests {
                 let probes = case["probes"].as_array().context("MTP probes")?.iter()
                     .map(|p| p.as_u64().context("MTP probe").map(|p| p as usize)).collect::<Result<Vec<_>>>()?;
                 let expected_logits = load("logits.bin", probes.len() * 128896 * 4)?;
-                let embedding = Allocation::new(device, 64 * H * 2)?;
-                let hidden = Allocation::new(device, 64 * H * 4)?;
+                let embedding = Allocation::new(device, 64 * H * 2, cuteafd_ffi::memory_ledger::TEST)?;
+                let hidden = Allocation::new(device, 64 * H * 4, cuteafd_ffi::memory_ledger::TEST)?;
                 let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
                 let weight_arena = DeviceWeightArena::new(device,
                     RankWeightLayout::mtp_stage_from_contract(&checkpoint, &contract, stage)?

@@ -10,6 +10,7 @@ use cuteafd_loader::{OfficialV41Catalog, V41ExpertSelection,
 use cuteafd_transport::worker_selection::push::{Offer, Placement};
 use sha2::{Digest, Sha256};
 use std::{ops::Range, path::Path};
+use cuteafd_core::memory_layout::ArenaTag;
 
 /// Device-free description of bounded scale sources and their generated planes.
 #[derive(Default)]
@@ -111,7 +112,7 @@ impl ScalePlan {
         use crate::shared::experts::rtx::dense::{DenseArena, Job, RankLayout, Step};
         let base = self.base(&layout);
         let (resident_expected, staged_expected) = expected.split_at(base)?;
-        let resident = super::weight_arena::LoadingArena::new(device, layout, resident_expected)?;
+        let resident = super::weight_arena::LoadingArena::new(device, layout, resident_expected, ArenaTag::experts("experts/spark-native"))?;
         let staged = if self.steps.is_empty() { None } else {
             let mut steps = Vec::new();
             for (_, template) in &self.steps {

@@ -55,7 +55,7 @@ impl<'a> NativePrograms<'a> {
         let fp8_f32 = load_fp8(ProjectionOutput::F32, Output::F32)?;
         ensure!(u64::try_from(required)? == admitted.native_programs.fp8_scratch_bytes,
             "Muse native scratch differs from exact admission");
-        let scratch = if required == 0 { None } else { Some(Allocation::new(device, required)?) };
+        let scratch = if required == 0 { None } else { Some(Allocation::untagged(device, required)?) };
         Ok(Self { bf16, bf16_f32, fp8, fp8_f32, scratch, rows })
     }
 
@@ -266,13 +266,13 @@ mod tests {
                 let weight = device.own(|| {
                     use crate::shared::{memory::DeviceAllocation, native_attention::NativeAttentionWeights};
                     Ok(NativeAttentionWeights { layout: owner.layout.clone(),
-                        values: DeviceAllocation::new(&library, 128 * 128 * if owner.layout.fp8 {1} else {2})?,
-                        scales: owner.layout.fp8.then(|| DeviceAllocation::new(&library, 4)).transpose()? })
+                        values: DeviceAllocation::new(&library, 128 * 128 * if owner.layout.fp8 {1} else {2}, cuteafd_ffi::memory_ledger::TEST)?,
+                        scales: owner.layout.fp8.then(|| DeviceAllocation::new(&library, 4, cuteafd_ffi::memory_ledger::TEST)).transpose()? })
                 })?;
-                let input = Allocation::new(device, (ceiling + 1) * 128 * 2)?;
+                let input = Allocation::new(device, (ceiling + 1) * 128 * 2, cuteafd_ffi::memory_ledger::TEST)?;
                 device.run(|| library.copy_h2d(input.buffer, &7u32.to_ne_bytes()))?;
                 let output_bytes = if owner.output == ProjectionOutput::F32 {4} else {2};
-                let output = Allocation::new(device, (ceiling + 1) * 128 * output_bytes)?;
+                let output = Allocation::new(device, (ceiling + 1) * 128 * output_bytes, cuteafd_ffi::memory_ledger::TEST)?;
                 let before = fixture.events()?.bytes().filter(|&event| event == b'P').count();
                 for rows in [1, 4, 64, ceiling] {
                     device.run(|| registry.launch(rows, input.buffer, &weight, output.buffer, std::ptr::null_mut()))?;

@@ -83,11 +83,11 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         Ok(Rc::new(TargetEmbeddingStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             guard: ScratchGuard::new(library, &[library.cuda_get_device()?])?,
-            ids: DeviceAllocation::new(library, unit * 4)?,
-            residual: DeviceAllocation::new(library, unit * 40960)?,
-            pre: DeviceAllocation::new(library, unit * 16)?,
-            image_features: DeviceAllocation::new(library, unit * 10240)?,
-            image_indices: DeviceAllocation::new(library, unit * 4)?, rows, unit,
+            ids: DeviceAllocation::untagged(library, unit * 4)?,
+            residual: DeviceAllocation::untagged(library, unit * 40960)?,
+            pre: DeviceAllocation::untagged(library, unit * 16)?,
+            image_features: DeviceAllocation::untagged(library, unit * 10240)?,
+            image_indices: DeviceAllocation::untagged(library, unit * 4)?, rows, unit,
         }))
     }
     pub(crate) fn on_storage(library: &'a NativeLibrary, table: &'w NativeRtxTensors<'a>,
@@ -98,8 +98,8 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         let capacity = storage.unit;
         Ok(Self { storage, window: RowWindow::NONE,
             ops: library.v41_attention_ops()?, table,
-            staging: HostAllocation::new(library, capacity * 4)?,
-            image_staging: HostAllocation::new(library, capacity * (10240 + 4))?, capacity,
+            staging: HostAllocation::untagged(library, capacity * 4)?,
+            image_staging: HostAllocation::untagged(library, capacity * (10240 + 4))?, capacity,
             graphs: RowGraphs::new(library, "target_embedding", cuteafd_core::V41_VERIFY_ROWS),
             tokens: Vec::with_capacity(capacity), positions: Vec::with_capacity(capacity), ready: false, destinations: None,
         })

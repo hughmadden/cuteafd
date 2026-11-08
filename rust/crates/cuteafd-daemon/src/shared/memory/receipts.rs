@@ -424,7 +424,7 @@ mod tests {
     fn mapped_pinned_census_uses_whole_backing_without_native_work() -> Result<()> {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
-        let owner = crate::shared::memory::HostAllocation::new(&library, 1024)?;
+        let owner = crate::shared::memory::HostAllocation::new(&library, 1024, cuteafd_ffi::memory_ledger::TEST)?;
         library.cuda_set_device(1)?;
         let devices = [1, 0];
         let devices = CoordinatorDevices::new(&devices)?;
@@ -453,7 +453,7 @@ mod tests {
     fn ordered_upload_census_is_absent_until_reserved_and_never_resizes() -> Result<()> {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
-        let mut buffer = library.alloc_device_buffer(1024)?;
+        let mut buffer = library.alloc_device_buffer(1024, cuteafd_ffi::memory_ledger::TEST)?;
         let physical = [1, 0];
         let devices = CoordinatorDevices::new(&physical)?;
         let stream = 17;

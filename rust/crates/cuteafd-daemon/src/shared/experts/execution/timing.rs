@@ -354,7 +354,7 @@ mod worker_tests {
         fixture.configure_memory(&library, 7, 1 << 20)?;
         fixture.queued_experts(&library)?;
         let stream = crate::shared::memory::LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let allocation = crate::shared::memory::DeviceAllocation::new(&library, 1)?;
+        let allocation = crate::shared::memory::DeviceAllocation::new(&library, 1, cuteafd_ffi::memory_ledger::TEST)?;
         let input = [13u8; 1];
         let mut pending = PendingUnits::for_owner(&library, 1, ExecutionOwner::Decode(1))?;
         assert!(matches!(&pending.completion, Completion::SingleFlight(_)));
@@ -408,7 +408,7 @@ mod worker_tests {
         fixture.configure_memory(&library, 7, 1 << 20)?;
         fixture.queued_experts(&library)?;
         let stream = crate::shared::memory::LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let allocation = crate::shared::memory::DeviceAllocation::new(&library, 1)?;
+        let allocation = crate::shared::memory::DeviceAllocation::new(&library, 1, cuteafd_ffi::memory_ledger::TEST)?;
         let mut pending = PendingUnits::new(&library, 2)?;
         let first = pending.reserve()?;
         let cancelled = pending.reserve()?;
@@ -464,7 +464,7 @@ mod worker_tests {
         let output = std::io::BufWriter::new(std::fs::File::create(&path)?);
         let mut timing = WorkerTiming::new(&library, 0, "fixture".into(), Some(output))?;
         let input = [13u8; 1];
-        let allocation = crate::shared::memory::DeviceAllocation::new(&library, 1)?;
+        let allocation = crate::shared::memory::DeviceAllocation::new(&library, 1, cuteafd_ffi::memory_ledger::TEST)?;
         let stream = crate::shared::memory::LoadStream { library: &library, raw: library.cuda_stream_create()? };
         let mut pending = PendingUnits::new(&library, 4)?;
         for round in 0..3 {

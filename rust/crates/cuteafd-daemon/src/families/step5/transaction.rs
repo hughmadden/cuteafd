@@ -158,9 +158,9 @@ impl<'a> Staging<'a> {
             let compress = device.run(|| programs.program("step5_region_compress",
                 &["keys", "logits", "starts", "counts", "output", "unrounded"]))?;
             Some(RegionScratch {
-                starts: Allocation::new(device, (regions * 4).max(256))?,
-                counts: Allocation::new(device, (regions * 4).max(256))?,
-                unrounded: Allocation::new(device, (regions * 256 * 4).max(256))?,
+                starts: Allocation::untagged(device, (regions * 4).max(256))?,
+                counts: Allocation::untagged(device, (regions * 4).max(256))?,
+                unrounded: Allocation::untagged(device, (regions * 256 * 4).max(256))?,
                 compress,
             })
         };
@@ -169,8 +169,8 @@ impl<'a> Staging<'a> {
             .iter()
             .map(|_| {
                 Ok((
-                    Allocation::new(device, retained * 256 * 2)?,
-                    Allocation::new(device, retained * 256 * 2)?,
+                    Allocation::untagged(device, retained * 256 * 2)?,
+                    Allocation::untagged(device, retained * 256 * 2)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -190,10 +190,10 @@ impl<'a> Staging<'a> {
             raw,
             sparse,
             compact,
-            positions: Allocation::new(device, (rows * 8).max(256))?,
-            requests: Allocation::new(device, (rows * 4).max(256))?,
-            ring_table: Allocation::new(device, (table_width * 4).max(256))?,
-            page_table: Allocation::new(device, (table_width * 4).max(256) * sequences)?,
+            positions: Allocation::untagged(device, (rows * 8).max(256))?,
+            requests: Allocation::untagged(device, (rows * 4).max(256))?,
+            ring_table: Allocation::untagged(device, (table_width * 4).max(256))?,
+            page_table: Allocation::untagged(device, (table_width * 4).max(256) * sequences)?,
             table_width,
             sequences,
             rows,
@@ -1556,7 +1556,7 @@ pub(super) mod tests {
         for (pass, (counts, accepted)) in [([7usize, 3], [7usize, 3]), ([17, 5], [9, 4])].into_iter().enumerate() {
             let total: usize = counts.iter().sum();
             let make = |stride: usize, start: usize, rows: usize, salt: usize| -> Result<Allocation<'_>> {
-                let allocation = Allocation::new(device, (rows * stride).max(256))?;
+                let allocation = Allocation::untagged(device, (rows * stride).max(256))?;
                 let bytes: Vec<u8> = (start..start + rows).flat_map(|row|
                     std::iter::repeat_n(((row + pass * 13 + salt) % 31 + 1) as u8, stride)).collect();
                 device.run(|| library.copy_h2d(allocation.buffer, &bytes))?;
@@ -1674,7 +1674,7 @@ pub(super) mod tests {
             None,
         )?);
         let input = |bytes| -> Result<Allocation<'_>> {
-            let allocation = Allocation::new(device, bytes)?;
+            let allocation = Allocation::untagged(device, bytes)?;
             // BF16 1.0, valid for both raw projections and compressor logits.
             let data: Vec<u8> = [0x80, 0x3f].into_iter().cycle().take(bytes).collect();
             device.run(|| library.copy_h2d(allocation.buffer, &data))?;

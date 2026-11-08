@@ -10,6 +10,7 @@ use std::{
     ffi::c_void,
     sync::atomic::{AtomicU64, Ordering},
 };
+use crate::shared::memory::Tag;
 mod source_cache;
 mod commit;
 use commit::PendingCommit;
@@ -112,8 +113,8 @@ impl<'a> CompressorState<'a> {
             index: SourceCache::new(library, index_pages, slots)?,
             pending: if ratio(layer)? == 2 {
                 Some([
-                    DeviceAllocation::new(library, slots * 2048)?,
-                    DeviceAllocation::new(library, slots * 2048)?,
+                    DeviceAllocation::untagged(library, slots * 2048)?,
+                    DeviceAllocation::untagged(library, slots * 2048)?,
                 ])
             } else {
                 None
@@ -359,7 +360,7 @@ impl<'a> CompressorWeights<'a> {
             kv: self.library.v41_compressed_kv()?,
             norm: self.library.v41_attention_ops()?,
             weights: self,
-            staging: HostAllocation::new(self.library, unit * if self.ratio == 2 { 16 } else { 8 })?,
+            staging: HostAllocation::untagged(self.library, unit * if self.ratio == 2 { 16 } else { 8 })?,
             capacity: unit,
             graph: None,
             retained_graphs: GraphBank::new(None),
@@ -368,8 +369,8 @@ impl<'a> CompressorWeights<'a> {
             pending_commit: None,
             unsettled: Vec::new(),
             replica: None,
-            commit_staging: HostAllocation::new(self.library, source_cache::commit_staging_bytes(unit))?,
-            commit_destinations: HostAllocation::new(self.library, unit * 8)?,
+            commit_staging: HostAllocation::untagged(self.library, source_cache::commit_staging_bytes(unit))?,
+            commit_destinations: HostAllocation::untagged(self.library, unit * 8)?,
         })
     }
 }
@@ -454,31 +455,31 @@ impl<'a> CompressorStorage<'a> {
         ensure!(rows <= crate::shared::memory::row_window::MAX_RESERVE_ROWS.max(4096),
             "compressor storage of {rows} rows exceeds the reserve");
         let paired = layers.iter().any(|&l| ratio(l).is_ok_and(|r| r == 2));
-        let workspace = DeviceAllocation::new(library, V41Compressor::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::untagged(library, V41Compressor::WORKSPACE_BYTES)?;
         let kernel = unsafe { library.v41_compressor(workspace.buffer)? };
         Ok(std::rc::Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             kernel,
             _workspace: workspace,
-            input: DeviceAllocation::new(library, unit * 10240)?,
-            descriptors: paired.then(|| DeviceAllocation::new(library, unit * 8)).transpose()?,
-            positions: DeviceAllocation::new(library, unit * 8)?,
-            frequencies: DeviceAllocation::new(library, unit * 256)?,
-            index_projected: DeviceAllocation::new(library, unit * 256)?,
-            index_key: DeviceAllocation::new(library, unit * 256)?,
-            output: DeviceAllocation::new(library, unit * 1024)?,
+            input: DeviceAllocation::untagged(library, unit * 10240)?,
+            descriptors: paired.then(|| DeviceAllocation::untagged(library, unit * 8)).transpose()?,
+            positions: DeviceAllocation::untagged(library, unit * 8)?,
+            frequencies: DeviceAllocation::untagged(library, unit * 256)?,
+            index_projected: DeviceAllocation::untagged(library, unit * 256)?,
+            index_key: DeviceAllocation::untagged(library, unit * 256)?,
+            output: DeviceAllocation::untagged(library, unit * 1024)?,
             planes: layers.iter().map(|&layer| {
                 let ratio = ratio(layer)?;
                 Ok(CompressorPlanes {
                     layer,
                     ratio,
-                    kv_values: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_VALUE_BYTES, "compressed proposal values")?,
-                    kv_scales: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_SCALE_BYTES, "compressed proposal scales")?,
-                    index_packed: DeviceAllocation::new(library, rows * 64)?,
-                    index_scales: DeviceAllocation::new(library, rows * 4)?,
-                    cache_destinations: DeviceAllocation::new(library, rows * 8)?,
-                    projected: DeviceAllocation::new(library, unit * 512 * if ratio == 2 { 4 } else { 2 })?,
-                    scores: (ratio == 2).then(|| DeviceAllocation::new(library, unit * 2048)).transpose()?,
+                    kv_values: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_VALUE_BYTES, "compressed proposal values", Tag::workspace("v41/compressor-proposal"))?,
+                    kv_scales: DeviceAllocation::attention_plane(library, rows, V41Kv::COMPRESSED_SCALE_BYTES, "compressed proposal scales", Tag::workspace("v41/compressor-proposal"))?,
+                    index_packed: DeviceAllocation::untagged(library, rows * 64)?,
+                    index_scales: DeviceAllocation::untagged(library, rows * 4)?,
+                    cache_destinations: DeviceAllocation::untagged(library, rows * 8)?,
+                    projected: DeviceAllocation::untagged(library, unit * 512 * if ratio == 2 { 4 } else { 2 })?,
+                    scores: (ratio == 2).then(|| DeviceAllocation::untagged(library, unit * 2048)).transpose()?,
                     epoch: std::cell::Cell::new(0),
                 })
             }).collect::<Result<Vec<_>>>()?,

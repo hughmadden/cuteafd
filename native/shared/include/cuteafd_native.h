@@ -65,6 +65,26 @@ typedef enum cuteafd_host_buffer_flags_t {
   CUTEAFD_HOST_BUFFER_FLAG_MAPPED = 4,
 } cuteafd_host_buffer_flags_t;
 
+// What one allocation holds (Rust cuteafd_core::memory_layout::MemoryKind).
+// Every allocation entry point takes a kind and a nonempty owner name; 0 is
+// never a kind. CUDA context, modules and library workspaces are a measured
+// residual, not a kind.
+typedef enum cuteafd_memory_kind_t {
+  CUTEAFD_MEMORY_KIND_WEIGHTS = 1,
+  CUTEAFD_MEMORY_KIND_EMBEDDING = 2,
+  CUTEAFD_MEMORY_KIND_EXPERTS = 3,
+  CUTEAFD_MEMORY_KIND_DRAFTER_WEIGHTS = 4,
+  CUTEAFD_MEMORY_KIND_TABLES = 5,
+  CUTEAFD_MEMORY_KIND_KV = 6,
+  CUTEAFD_MEMORY_KIND_DRAFTER_KV = 7,
+  CUTEAFD_MEMORY_KIND_PREFIX = 8,
+  CUTEAFD_MEMORY_KIND_WORKSPACE = 9,
+  CUTEAFD_MEMORY_KIND_DRAFTER_WORKSPACE = 10,
+  CUTEAFD_MEMORY_KIND_TRANSPORT = 11,
+  CUTEAFD_MEMORY_KIND_STAGING = 12,
+  CUTEAFD_MEMORY_KIND_COUNT = 12,
+} cuteafd_memory_kind_t;
+
 typedef struct cuteafd_cuda_device_info_t {
   int device_id;
   int cuda_available;
@@ -300,7 +320,7 @@ cuteafd_status_t cuteafd_copy_peer_async(cuteafd_device_buffer_t dst,
 cuteafd_status_t cuteafd_copy_device_rows_async(cuteafd_device_buffer_t dst,
     cuteafd_device_buffer_t src, size_t width, size_t rows,
     size_t dst_pitch, size_t src_pitch, void* cuda_stream);
-cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out);
+cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out, uint32_t kind, const char* owner);
 // Caller-owned shared mappings: unregister never frees the mapping.
 cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes);
 cuteafd_status_t cuteafd_unregister_host_mapping(void* ptr);
@@ -309,8 +329,8 @@ cuteafd_status_t cuteafd_cuda_host_buffer_device_alias(cuteafd_host_buffer_t hos
 cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf);
 // Recommended allocation granularity for a whole device dma-buf SEND allocation.
 cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* out);
-cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out);
-cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out);
+cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
+cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out, uint32_t kind, const char* owner);
 cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf);
 cuteafd_status_t cuteafd_cuda_stream_create(void** out_cuda_stream);
 cuteafd_status_t cuteafd_cuda_stream_destroy(void* cuda_stream);

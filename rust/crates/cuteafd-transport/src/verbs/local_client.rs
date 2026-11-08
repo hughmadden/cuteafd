@@ -938,7 +938,7 @@ mod tests {
                     if registered { client.enable_egress(plane_bytes)?; }
                     let mut plane = None;
                     if landing {
-                        let buffer = library.alloc_device_buffer(plane_bytes * waves)?;
+                        let buffer = library.alloc_device_buffer(plane_bytes * waves, cuteafd_ffi::memory_ledger::TEST)?;
                         client.set_landing(vec![Some(match placed {
                             true => DeviceLanding::placed(buffer)?,
                             false => DeviceLanding::with_slots(buffer, waves)?,
@@ -1056,7 +1056,7 @@ mod tests {
                 timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 }, 0);
             if registered { client.enable_egress(plane_bytes)?; }
             let plane = if gpu {
-                let buffer = library.alloc_device_buffer(plane_bytes)?;
+                let buffer = library.alloc_device_buffer(plane_bytes, cuteafd_ffi::memory_ledger::TEST)?;
                 client.set_landing(vec![Some(DeviceLanding::new(buffer))])?;
                 Some(buffer)
             } else { None };

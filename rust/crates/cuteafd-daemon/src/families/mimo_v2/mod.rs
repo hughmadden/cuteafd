@@ -1211,7 +1211,7 @@ impl Opened {
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
-                let allocation = crate::shared::memory::DeviceAllocation::new(&self.library, bytes.max(256))?;
+                let allocation = crate::shared::memory::DeviceAllocation::untagged(&self.library, bytes.max(256))?;
                 self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                 Ok(allocation)
             };

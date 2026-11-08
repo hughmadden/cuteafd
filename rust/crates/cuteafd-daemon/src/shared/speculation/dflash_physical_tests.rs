@@ -74,7 +74,7 @@ fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     let representation = GlmDraftRepresentation::Bf16Only;
     let requests = DflashDrafter::arena_requests(snapshot, representation, &[1], 0)?;
     // Deliberately outside the logical receipt prefix, as shared arena IDs are.
-    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("glm/draft/1", requests[&1].clone())?)?;
+    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("glm/draft/1", requests[&1].clone())?, cuteafd_core::memory_layout::ArenaTag::drafter_weights("test/arena"))?;
     let first = arena.view(&requests[&1][0].0, requests[&1][0].1)?.buffer;
     let stream = Stream::new(device)?;
     let mut bound = Vec::new();
@@ -532,7 +532,7 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
             let planned = WeightArenaLayout::new("kimi/draft/1", requests[&1].clone())?;
             assert_eq!(planned.payload_bytes() as u64, layout.weights().resident_bytes()?);
             assert_eq!(planned.padding_bytes(), 0);
-            let arena = DeviceWeightArena::new(device, planned.clone())?;
+            let arena = DeviceWeightArena::new(device, planned.clone(), cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
             let base = arena.view(&requests[&1][0].0, requests[&1][0].1)?.buffer.ptr as usize;
             let stream = Stream::new(device)?;
             let mut bound = Vec::new();

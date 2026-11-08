@@ -27,7 +27,7 @@ void test_allocate_copy_free_roundtrip() {
   std::vector<unsigned char> output(input.size(), 0);
 
   cuteafd_device_buffer_t buffer = {};
-  assert(cuteafd_alloc_device_buffer(input.size(), &buffer) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_alloc_device_buffer(input.size(), &buffer, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
   assert(buffer.ptr != nullptr);
   assert(buffer.bytes == input.size());
 
@@ -46,8 +46,8 @@ void test_device_to_device_copy_roundtrip() {
 
   cuteafd_device_buffer_t src = {};
   cuteafd_device_buffer_t dst = {};
-  assert(cuteafd_alloc_device_buffer(input.size(), &src) == CUTEAFD_STATUS_OK);
-  assert(cuteafd_alloc_device_buffer(input.size(), &dst) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_alloc_device_buffer(input.size(), &src, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
+  assert(cuteafd_alloc_device_buffer(input.size(), &dst, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
 
   assert(cuteafd_copy_h2d(src, input.data(), input.size()) == CUTEAFD_STATUS_OK);
   assert(cuteafd_copy_d2d(dst, src, input.size()) == CUTEAFD_STATUS_OK);
@@ -63,14 +63,14 @@ void test_host_buffer_copy_roundtrip() {
   std::vector<unsigned char> output(input.size(), 0);
 
   cuteafd_host_buffer_t host = {};
-  assert(cuteafd_alloc_host_buffer(input.size(), &host) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_alloc_host_buffer(input.size(), &host, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
   assert(host.ptr != nullptr);
   assert(host.bytes == input.size());
   assert(host.flags != CUTEAFD_HOST_BUFFER_FLAG_NONE);
   std::memcpy(host.ptr, input.data(), input.size());
 
   cuteafd_device_buffer_t device = {};
-  assert(cuteafd_alloc_device_buffer(input.size(), &device) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_alloc_device_buffer(input.size(), &device, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
   assert(cuteafd_copy_h2d(device, host.ptr, input.size()) == CUTEAFD_STATUS_OK);
   assert(cuteafd_copy_d2h(output.data(), device, output.size()) == CUTEAFD_STATUS_OK);
   assert(output == input);
@@ -90,9 +90,19 @@ void test_error_propagation() {
   assert(cuteafd_last_error(error, sizeof(error)) == CUTEAFD_STATUS_OK);
   assert(std::strstr(error, "too small") != nullptr);
 
-  assert(cuteafd_alloc_device_buffer(0, nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_alloc_device_buffer(0, nullptr, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_INVALID_ARGUMENT);
   assert(cuteafd_last_error(error, sizeof(error)) == CUTEAFD_STATUS_OK);
   assert(std::strstr(error, "null") != nullptr);
+
+  cuteafd_device_buffer_t untagged{};
+  assert(cuteafd_alloc_device_buffer(64, &untagged, 0, "selftest") == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_last_error(error, sizeof(error)) == CUTEAFD_STATUS_OK);
+  assert(std::strstr(error, "kind") != nullptr);
+  assert(cuteafd_alloc_device_buffer(64, &untagged, CUTEAFD_MEMORY_KIND_COUNT + 1, "selftest") == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_alloc_device_buffer(64, &untagged, CUTEAFD_MEMORY_KIND_WORKSPACE, "") == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  cuteafd_host_buffer_t host{};
+  assert(cuteafd_alloc_host_buffer(64, &host, CUTEAFD_MEMORY_KIND_STAGING, nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(untagged.ptr == nullptr && host.ptr == nullptr);
 }
 
 void test_nccl_abi() {

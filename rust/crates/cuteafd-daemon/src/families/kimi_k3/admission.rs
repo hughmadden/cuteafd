@@ -10,6 +10,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_ffi::{MLA_PAGE_ROWS, MLA_RECORD_BYTES};
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, placement::*};
+use cuteafd_core::memory_layout::ArenaTag;
 
 const EXECUTOR: ExecutorModes = families::KIMI_K3;
 const MODES: &[LayerMode] = EXECUTOR.modes;
@@ -237,7 +238,7 @@ impl<'a> Admission<'a> {
                 format!("kimi/draft/{rank}"), layout.weight_arena_requests())?;
             ensure!(arena_layout.bytes() == admitted.bytes() && arena_layout.views() == admitted.views(),
                 "Kimi draft binder differs from admitted immutable arena");
-            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, arena_layout)?;
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, arena_layout, ArenaTag::drafter_weights("kimi/draft"))?;
             DflashDrafter::load_mla_with(device.library, programs, "kimik3", snapshot, file, stream, layout,
                 representation, scales, rows, split, |physical, name, bytes| {
                     ensure!(physical == device.id, "Kimi draft arena physical owner changed");
@@ -296,7 +297,7 @@ impl<'a> Admission<'a> {
     pub(crate) fn allocate_draft_marks(&mut self, device: Device<'a>) -> Result<Option<Rc<crate::shared::memory::device::Allocation<'a>>>> {
         let bytes = self.draft_mark_bytes(device.id)?;
         self.draft_marks_allocated = true;
-        (bytes > 0).then(|| crate::shared::memory::device::Allocation::new(device, bytes).map(Rc::new)).transpose()
+        (bytes > 0).then(|| crate::shared::memory::device::Allocation::untagged(device, bytes).map(Rc::new)).transpose()
     }
     pub(crate) fn draft_layout(&self) -> Option<&MlaDraftRuntimeLayout> { self.draft.as_ref() }
 
@@ -498,7 +499,7 @@ impl<'a> Admission<'a> {
             Ok(layout)
         }).collect::<Result<Vec<_>>>()?;
         records.arenas = Rc::new(devices.iter().zip(layouts).map(|(&device, layout)|
-            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?)))
+            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, ArenaTag::weights("kimi/coordinator"))?)))
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?);
         memory.sample("weights-coordinator-arenas-allocated")?;
         let global = devices.iter().zip(&self.global_layouts).map(|(&device, layout)| records.global(device, layout))

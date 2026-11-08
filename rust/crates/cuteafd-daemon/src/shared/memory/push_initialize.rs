@@ -9,6 +9,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::{push_load::native::NativePlanes, V41Exl3Residency};
 use std::{ffi::c_void, ops::Range};
+use crate::shared::memory::Tag;
 
 fn sub(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(
@@ -200,7 +201,7 @@ impl<'a> Transforms<'a> {
             required <= admitted && required > 0,
             "push transform scratch exceeds admission"
         );
-        let scratch = Allocation::new(device, required)?;
+        let scratch = Allocation::new(device, required, Tag::workspace("experts/push-transforms"))?;
         let stream = device.run(|| device.library.cuda_stream_create())?;
         Ok(Self {
             device,

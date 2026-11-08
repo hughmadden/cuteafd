@@ -115,7 +115,7 @@ fn staging_census_getters_preserve_absence_backing_and_native_history() -> Resul
     let _ledger = memory_ledger::test_guard();
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
-    let mut dst = library.alloc_device_buffer(32)?;
+    let mut dst = library.alloc_device_buffer(32, crate::memory_ledger::TEST)?;
     let stream = 1usize as *mut c_void;
     let audit = memory_ledger::AllocationAudit::begin();
     let before = fixture.events()?;
@@ -153,8 +153,8 @@ fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
     let _ledger = memory_ledger::test_guard();
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
-    let mut a = library.alloc_device_buffer(4)?;
-    let mut b = library.alloc_device_buffer(4)?;
+    let mut a = library.alloc_device_buffer(4, crate::memory_ledger::TEST)?;
+    let mut b = library.alloc_device_buffer(4, crate::memory_ledger::TEST)?;
     let stream = 1usize as *mut c_void;
     // SAFETY: the CPU fixture owns both buffers and accepts a synthetic stream.
     unsafe {
@@ -185,8 +185,8 @@ fn ordered_upload_sizes_staging_once_and_refuses_growth() -> Result<()> {
     // synchronize the device while a peer wait may be queued (slot reuse).
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
-    let mut a = library.alloc_device_buffer(16)?;
-    let mut b = library.alloc_device_buffer(16)?;
+    let mut a = library.alloc_device_buffer(16, crate::memory_ledger::TEST)?;
+    let mut b = library.alloc_device_buffer(16, crate::memory_ledger::TEST)?;
     let stream = 1usize as *mut c_void;
     let allocations = |events: &str| events.matches('A').count();
     // SAFETY: the CPU fixture owns both buffers and accepts a synthetic stream.
@@ -205,7 +205,7 @@ fn ordered_upload_sizes_staging_once_and_refuses_growth() -> Result<()> {
         assert!(error.contains("exceeds the 4-byte staging"), "{error}");
         assert_eq!(fixture.events()?, events, "a refused grow neither frees nor allocates host memory");
         // Reservation before readiness sizes the staging with no copy.
-        let mut c = library.alloc_device_buffer(32)?;
+        let mut c = library.alloc_device_buffer(32, crate::memory_ledger::TEST)?;
         library.reserve_h2d_ordered(c, stream)?;
         let reserved = fixture.events()?;
         library.reserve_h2d_ordered(c, stream)?;
@@ -228,7 +228,7 @@ fn ordered_upload_failed_fence_retains_sources_and_module() -> Result<()> {
     let _ledger = memory_ledger::test_guard();
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
-    let a = library.alloc_device_buffer(4)?;
+    let a = library.alloc_device_buffer(4, crate::memory_ledger::TEST)?;
     // SAFETY: fixture-owned buffer and synthetic stream stay live for this test.
     unsafe { library.copy_h2d_ordered(a, &[1, 2, 3, 4], 1usize as *mut c_void)?; }
     fixture.configure_pack(&library, 0, 1)?;
@@ -272,12 +272,12 @@ fn coordinator_budget_refuses_before_allocating_and_checks_untracked_graphs() ->
     assert!(fixture.events()?.is_empty(), "installing a ceiling allocates no physical guard");
     assert_eq!(library.cuda_physical_memory_info()?, (3996, 4096));
     assert_eq!(library.cuda_memory_info()?, (924, 1024));
-    let mut weights = library.alloc_device_buffer(300)?;
-    let mut draft = library.alloc_managed_device_buffer(200)?;
+    let mut weights = library.alloc_device_buffer(300, crate::memory_ledger::TEST)?;
+    let mut draft = library.alloc_managed_device_buffer(200, crate::memory_ledger::TEST)?;
     assert_eq!(library.cuda_physical_memory_info()?, (3696, 4096), "managed fixture pages stay on host");
     assert_eq!(library.cuda_memory_info()?, (424, 1024));
     let events = fixture.events()?;
-    let error = library.alloc_device_buffer(425).unwrap_err().to_string();
+    let error = library.alloc_device_buffer(425, crate::memory_ledger::TEST).unwrap_err().to_string();
     assert!(error.contains("shortfall 1 bytes"), "{error}");
     assert_eq!(fixture.events()?, events, "refused before the native allocator");
     // SAFETY: the CPU graph fixture accepts a null stream and returns an
@@ -294,7 +294,7 @@ fn coordinator_budget_refuses_before_allocating_and_checks_untracked_graphs() ->
     library.free_device_buffer(&mut weights)?;
     library.cuda_set_device(1)?;
     assert_eq!(library.cuda_memory_info()?, (412, 512), "budget never enlarges a physical device");
-    let error = library.alloc_device_buffer(413).unwrap_err().to_string();
+    let error = library.alloc_device_buffer(413, crate::memory_ledger::TEST).unwrap_err().to_string();
     assert!(error.contains("GPU 1") && error.contains("shortfall 1 bytes"), "{error}");
     Ok(())
 }

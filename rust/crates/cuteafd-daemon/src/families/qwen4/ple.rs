@@ -94,7 +94,7 @@ impl<'a> PleTable<'a> {
         } else {
             1.0
         };
-        let scale_dev = DeviceAllocation::new(library, 256)?;
+        let scale_dev = DeviceAllocation::untagged(library, 256)?;
         library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: 4, ..scale_dev.buffer }, &scale.to_le_bytes())?;
         let started = Instant::now();
         let tensors: Vec<_> = shards.iter().map(|s| (s.shard.as_str(), &s.meta)).collect();

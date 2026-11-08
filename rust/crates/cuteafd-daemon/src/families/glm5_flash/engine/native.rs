@@ -34,7 +34,7 @@ impl<'a> Scratch<'a> {
     fn new(device: Device<'a>, linear: &cuteafd_loader::plan::exlr8::dense::scratch::LinearScratchLayout,
         stages: &FlashStageLayout) -> Result<Self> {
         Ok(Self { linear: ScratchOwner::new(device, linear)?, stages: stages.extents.iter()
-            .map(|(&name, &bytes)| Ok((name, Allocation::new(device, bytes)?))).collect::<Result<_>>()? })
+            .map(|(&name, &bytes)| Ok((name, Allocation::untagged(device, bytes)?))).collect::<Result<_>>()? })
     }
     fn stage(&self, name: &str) -> Result<Buffer> {
         Ok(self.stages.get(name).with_context(|| format!("native Flash stage {name}"))?.buffer)

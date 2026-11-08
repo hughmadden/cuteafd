@@ -194,8 +194,8 @@ mod tests {
                     .own(|| w.wave(16, AttentionQueryWave::device_bytes(&lib, 16)?))
             })
             .collect::<Result<Vec<_>>>()?;
-        let residual = Allocation::new(devices[0], 16 * 40960)?;
-        let pre = Allocation::new(devices[0], 16 * 16)?;
+        let residual = Allocation::new(devices[0], 16 * 40960, cuteafd_ffi::memory_ledger::TEST)?;
+        let pre = Allocation::new(devices[0], 16 * 16, cuteafd_ffi::memory_ledger::TEST)?;
         let spec = cuteafd_loader::placement::families::deepseek_v41::execution_hops(2);
         let modes = [0, 1].map(|gpu| cuteafd_loader::placement::LayerMode::Whole {
             gpu, ffn: cuteafd_loader::placement::FfnMode::Owner,

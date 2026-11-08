@@ -30,7 +30,7 @@ impl EgressBuffer {
         let bytes = slot_bytes.checked_mul(slots).context("egress slot extent overflow")?;
         anyhow::ensure!(bytes > 0, "empty egress buffer");
         let library = load_verbs_host_native_library()?;
-        let host = library.alloc_host_buffer(bytes)?;
+        let host = library.alloc_host_buffer(bytes, cuteafd_ffi::memory_ledger::Tag::new(cuteafd_ffi::memory_ledger::MemoryKind::Transport, "transport/egress"))?;
         Ok(Arc::new(Self { library, host, views: (0..slots).map(|_| Arc::new(())).collect(), slot_bytes }))
     }
 

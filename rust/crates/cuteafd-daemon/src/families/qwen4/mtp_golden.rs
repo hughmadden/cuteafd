@@ -36,7 +36,7 @@ pub(super) fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engin
     let streams = std::fs::read(args.golden.join(format!("layer{last:02}.bin")))?;
     let row = 4 * h * 2;
     ensure!(streams.len() == t * row, "golden layer {last} streams do not match the tokens");
-    let source = DeviceAllocation::new(&opened.library, streams.len())?;
+    let source = DeviceAllocation::untagged(&opened.library, streams.len())?;
     opened.library.copy_h2d(source.buffer, &streams)?;
     let ref_streams = std::fs::read(dir.join("mtp_streams.bin"))?;
     let ref_argmax = words(&dir.join("mtp_argmax.bin"))?;

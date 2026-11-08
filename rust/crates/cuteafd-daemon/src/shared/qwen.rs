@@ -8,6 +8,7 @@ use cuteafd_ffi::programs::{Programs, Scalar};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::qwen::{GdnGeometry, HybridAttention};
 use std::{ffi::c_void, rc::Rc};
+use crate::shared::memory::Tag;
 
 pub(crate) enum Encoder {
     Local(crate::shared::vision::local::LocalEncoder),
@@ -208,7 +209,7 @@ impl<'a> GdnBank<'a> {
         let layout = GdnLayout::new(geometry)?;
         let [conv_bytes, state_bytes, replay_bytes] = layout.pool_bytes(layers, slots)?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
+            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256), Tag::kv("shared/gdn-bank"))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };

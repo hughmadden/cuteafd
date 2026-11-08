@@ -111,7 +111,7 @@ mod tests {
     fn compressed_prefix_restore_requires_complete_groups_and_bounds_views() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&lib)?;
-        let saved = DeviceAllocation::new(&lib, COMPRESSOR_PREFIX_BYTES)?;
+        let saved = DeviceAllocation::new(&lib, COMPRESSOR_PREFIX_BYTES, cuteafd_ffi::memory_ledger::TEST)?;
         let stream = LoadStream {
             library: &lib,
             raw: lib.cuda_stream_create()?,
@@ -179,7 +179,7 @@ mod tests {
         let device = crate::shared::memory::device::cache_test_device(&lib)?;
         let mut state = device.own(|| CompressorState::new(&lib, 2, 2, 4, usize::MAX))?;
         assert_eq!(state.index.kv_values.buffer.device_id,device.id);
-        let saved = DeviceAllocation::new(&lib, COMPRESSOR_PREFIX_BYTES)?;
+        let saved = DeviceAllocation::new(&lib, COMPRESSOR_PREFIX_BYTES, cuteafd_ffi::memory_ledger::TEST)?;
         let stream = LoadStream {
             library: &lib,
             raw: lib.cuda_stream_create()?,

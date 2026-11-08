@@ -6,6 +6,7 @@ use crate::shared::memory::{DeviceAllocation, device::{Allocation, Device}};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "fp8_linear_lifetime_tests.rs"]
@@ -77,7 +78,7 @@ impl<'a> Fp8Weight<'a> {
     pub fn pack(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, scales: Fp8Scales,
         stream: *mut c_void) -> Result<Self> {
         Self::pack_with(library, w, n, k, scales, stream, "weight", |_, bytes| {
-            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes, Tag::weights("shared/fp8-linear"))
         })
     }
 
@@ -112,7 +113,7 @@ impl<'a> Fp8Weight<'a> {
     /// Unfilled storage for an `[n, k]` copy (filled by W8A16 pack jobs).
     pub fn allocate(library: &'a NativeLibrary, n: usize, k: usize) -> Result<Self> {
         Self::allocate_with(library, n, k, "weight", |_, bytes| {
-            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes, Tag::weights("shared/fp8-linear"))
         })
     }
 
@@ -208,7 +209,7 @@ pub(crate) fn scratch<'a>(library: &'a NativeLibrary, rows: usize, shapes: &[(us
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/fp8-linear");
     let bytes = shapes.iter().map(|&(k, n)| library.fp8_w8a16_workspace(rows, k, n))
         .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
-    DeviceAllocation::new(library, bytes.max(256))
+    DeviceAllocation::new(library, bytes.max(256), Tag::workspace("shared/fp8-linear"))
 }
 
 /// [`scratch`] for `mode` ([`Fp8Rows::W8a16`] is [`scratch`]).
@@ -221,7 +222,7 @@ pub(crate) fn scratch_rows<'a>(library: &'a NativeLibrary, rows: usize, shapes: 
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/fp8-linear");
     let bytes = shapes.iter().map(|&(k, n)| library.fp8_linear_workspace(rows, k, n, mode.code()))
         .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
-    DeviceAllocation::new(library, bytes.max(256))
+    DeviceAllocation::new(library, bytes.max(256), Tag::workspace("shared/fp8-linear"))
 }
 
 #[cfg(test)]

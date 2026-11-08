@@ -746,7 +746,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let execution = Execution::load_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
             vec![&stages[0], &stages[1]], rows, available.to_vec(), reservations.to_vec(), None, 1, 17)?;
-        let input = Allocation::new(devices[0], rows * H * 4)?;
+        let input = Allocation::untagged(devices[0], rows * H * 4)?;
         devices[0].run(|| library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?))?;
         let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
         execution.enqueue_layer0(&mut step, &input, directory)?;
@@ -771,7 +771,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), config, None)?);
         let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1, |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         let mut chain = TargetChain::load(device, &programs, checkpoint, 1, rows, available, &[reserved], args.kv_cache)?;
-        let input = Allocation::new(device, rows * H * 4)?;
+        let input = Allocation::untagged(device, rows * H * 4)?;
         library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?)?;
         let mut step = Step::begin(vec![&cache], vec![&staging], &pool, &mut placement, rows)?;
         chain.enqueue_step(&mut step, 0, &input, None)?;
@@ -911,7 +911,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         .collect::<Vec<_>>();
     execution.retain_diagnostic_outputs(&retained_layers)?;
     let embeddings = embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?;
-    let input = Allocation::new(devices[0], rows * H * 4)?;
+    let input = Allocation::untagged(devices[0], rows * H * 4)?;
     devices[0].run(|| library.copy_h2d(input.buffer, &embeddings))?;
     tracing::info!(seconds=started.elapsed().as_secs_f64(), "Step-5 shared readiness");
     let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
@@ -1127,7 +1127,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         &[head_bytes, cache_bytes, staging_bytes, input_bytes, reserve], args.kv_cache)?;
     let head = head_plan.map(|plan| TargetHeadOwner::load(device, &programs, &checkpoint, plan,
         available, &[chain_bytes, cache_bytes, staging_bytes, input_bytes, reserve])).transpose()?;
-    let input = Allocation::new(device, rows * H * 4)?;
+    let input = Allocation::untagged(device, rows * H * 4)?;
     library.copy_h2d(
         input.buffer,
         &embedding_rows(&checkpoint, &tokens, cfg.vocab)?,

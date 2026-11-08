@@ -1169,16 +1169,26 @@ impl Default for CuteafdRdmaRcCompletionStats {
     }
 }
 
+/// Native validation needs a tag even on the legacy path; the ledger records
+/// these allocations as untagged (`Key::tag == None`), never as this tag.
+const LEGACY_UNTAGGED: memory_ledger::Tag =
+    memory_ledger::Tag::new(memory_ledger::MemoryKind::Workspace, "legacy/untagged");
+
 type VersionFn = unsafe extern "C" fn(out: *mut c_char, out_len: usize) -> CuteafdStatus;
-type AllocHostBufferFn =
-    unsafe extern "C" fn(bytes: usize, out: *mut CuteafdHostBuffer) -> CuteafdStatus;
+type AllocHostBufferFn = unsafe extern "C" fn(bytes: usize, out: *mut CuteafdHostBuffer,
+    kind: u32, owner: *const c_char) -> CuteafdStatus;
 type CudaHostBufferDeviceAliasFn =
     unsafe extern "C" fn(host: CuteafdHostBuffer, out: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
 type FreeHostBufferFn = unsafe extern "C" fn(buf: *mut CuteafdHostBuffer) -> CuteafdStatus;
-type AllocDeviceBufferFn =
-    unsafe extern "C" fn(bytes: usize, out: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
-type AllocManagedDeviceBufferFn =
-    unsafe extern "C" fn(bytes: usize, out: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
+type AllocDeviceBufferFn = unsafe extern "C" fn(bytes: usize, out: *mut CuteafdDeviceBuffer,
+    kind: u32, owner: *const c_char) -> CuteafdStatus;
+type AllocManagedDeviceBufferFn = unsafe extern "C" fn(bytes: usize, out: *mut CuteafdDeviceBuffer,
+    kind: u32, owner: *const c_char) -> CuteafdStatus;
+
+/// The tag as the native allocators take it: kind integer plus a NUL-terminated owner.
+fn native_tag(tag: memory_ledger::Tag) -> Result<(u32, CString)> {
+    Ok((tag.kind.as_raw(), CString::new(tag.owner).context("allocation owner contains NUL")?))
+}
 type FreeDeviceBufferFn = unsafe extern "C" fn(buf: *mut CuteafdDeviceBuffer) -> CuteafdStatus;
 type CudaStreamCreateFn = unsafe extern "C" fn(out: *mut *mut c_void) -> CuteafdStatus;
 type CudaStreamDestroyFn = unsafe extern "C" fn(cuda_stream: *mut c_void) -> CuteafdStatus;
@@ -1897,7 +1907,7 @@ impl Drop for PinnedBytes {
     }
 }
 impl NativeLibrary {
-    pub fn pinned_bytes(&self, bytes: usize) -> Result<PinnedBytes> {
+    pub fn pinned_bytes(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<PinnedBytes> {
         let free = self.cuteafd_free_host_buffer()?;
         let record = self.cuteafd_cuda_event_record()?;
         let query = self.cuteafd_cuda_event_query()?;
@@ -1905,7 +1915,7 @@ impl NativeLibrary {
         let destroy = self.cuteafd_cuda_event_destroy()?;
         let create = self.cuteafd_cuda_event_create_ordering()?;
         let get_device = self.cuteafd_cuda_get_device()?;
-        let buffer = self.alloc_host_buffer(bytes)?;
+        let buffer = self.alloc_host_buffer(bytes, tag)?;
         // SAFETY: newly allocated, exclusive storage must be initialized before
         // safe byte slices expose it (including unused capacity padding).
         unsafe { std::ptr::write_bytes(buffer.ptr.cast::<u8>(), 0, bytes); }
@@ -2200,12 +2210,12 @@ fn record_rdma_rings(handle: *mut c_void, views: [CuteafdRdmaRcEndpointBufferVie
     extents.sort_unstable();
     anyhow::ensure!(extents[0].0 + extents[0].1 <= extents[1].0,
         "overlapping RDMA endpoint backing");
-    let _scope = memory_ledger::scope("transport/rdma-rings");
     for view in views {
         let space = if view.host_flags & CUTEAFD_HOST_BUFFER_FLAG_PINNED != 0 {
             memory_ledger::Space::Pinned
         } else { memory_ledger::Space::Host };
-        memory_ledger::record_endpoint_alloc(space, view.host_ptr as usize, view.bytes, handle as usize);
+        memory_ledger::record_endpoint_alloc(space, view.host_ptr as usize, view.bytes, handle as usize,
+            memory_ledger::Tag::new(memory_ledger::MemoryKind::Transport, "transport/rdma-rings"));
     }
     Ok(())
 }
@@ -2246,9 +2256,8 @@ impl SyncH2DStagingBuffer {
                     .context("freeing undersized synchronous H2D pinned staging buffer")?;
                 self.buffer = CuteafdHostBuffer::default();
             }
-            let _scope = memory_ledger::scope("staging/sync-h2d");
             self.buffer = library
-                .alloc_host_buffer(bytes)
+                .alloc_host_buffer(bytes, memory_ledger::Tag::new(memory_ledger::MemoryKind::Staging, "staging/sync-h2d"))
                 .context("allocating reusable synchronous H2D pinned staging buffer")?;
             if self.buffer.ptr.is_null() {
                 anyhow::bail!("reusable synchronous H2D pinned staging buffer is null");
@@ -2386,14 +2395,28 @@ impl NativeLibrary {
 
 
 
+    /// Pinned, device-mapped host memory holding `tag`.
     #[track_caller]
-    pub fn alloc_host_buffer(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
+    pub fn alloc_host_buffer(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdHostBuffer> {
+        self.alloc_host_buffer_with(bytes, Some(tag))
+    }
+
+    /// Legacy untagged entry point; removed once every caller states a tag.
+    #[track_caller]
+    pub fn alloc_host_buffer_untagged(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
+        self.alloc_host_buffer_with(bytes, None)
+    }
+
+    #[track_caller]
+    fn alloc_host_buffer_with(&self, bytes: usize, tag: Option<memory_ledger::Tag>) -> Result<CuteafdHostBuffer> {
         let _failure_boundary = memory_ledger::fault::boundary();
         let alloc_fn: AllocHostBufferFn = self.cuteafd_alloc_host_buffer()?;
+        let (kind, owner) = native_tag(tag.unwrap_or(LEGACY_UNTAGGED))?;
         let mut buffer = CuteafdHostBuffer::default();
-        let status = unsafe { alloc_fn(bytes, &mut buffer) };
+        // SAFETY: the output and owner string live through this synchronous call.
+        let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
         self.status_to_result("cuteafd_alloc_host_buffer", status)?;
-        memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, buffer.ptr as usize, buffer.bytes);
+        memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, buffer.ptr as usize, buffer.bytes, tag);
         Ok(buffer)
     }
 
@@ -2584,27 +2607,64 @@ impl NativeLibrary {
         Ok(bytes)
     }
 
+    /// Device memory on the current device holding `tag`. The tag is not
+    /// optional: an allocation that does not say what it holds does not compile.
+    ///
+    /// ```compile_fail
+    /// # fn untagged(library: &cuteafd_ffi::NativeLibrary) -> anyhow::Result<()> {
+    /// library.alloc_device_buffer(4096)?; // missing the Tag argument
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # fn stringly(library: &cuteafd_ffi::NativeLibrary) -> anyhow::Result<()> {
+    /// library.alloc_device_buffer(4096, "kv/pages")?; // a string is not a Tag
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// ```no_run
+    /// # fn tagged(library: &cuteafd_ffi::NativeLibrary) -> anyhow::Result<()> {
+    /// use cuteafd_ffi::memory_ledger::{MemoryKind, Tag};
+    /// library.alloc_device_buffer(4096, Tag::new(MemoryKind::Kv, "doc/kv-pages"))?;
+    /// # Ok(()) }
+    /// ```
     #[track_caller]
-    pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
-        let _failure_boundary = memory_ledger::fault::boundary();
-        let _budget_guard = self.admit_gpu_allocation(bytes)?;
-        let alloc_fn: AllocDeviceBufferFn = self.cuteafd_alloc_device_buffer()?;
-        let mut buffer = CuteafdDeviceBuffer::default();
-        let status = unsafe { alloc_fn(bytes, &mut buffer) };
-        self.status_to_result("cuteafd_alloc_device_buffer", status)?;
-        memory_ledger::record_alloc(memory_ledger::Space::Device, buffer.device_id, buffer.ptr as usize, buffer.bytes);
-        Ok(buffer)
+    pub fn alloc_device_buffer(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdDeviceBuffer> {
+        self.alloc_device_buffer_with(bytes, Some(tag))
+    }
+
+    /// Legacy untagged entry point; removed once every caller states a tag.
+    #[track_caller]
+    pub fn alloc_device_buffer_untagged(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+        self.alloc_device_buffer_with(bytes, None)
     }
 
     #[track_caller]
-    pub fn alloc_managed_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+    fn alloc_device_buffer_with(&self, bytes: usize, tag: Option<memory_ledger::Tag>) -> Result<CuteafdDeviceBuffer> {
+        let _failure_boundary = memory_ledger::fault::boundary();
+        let _budget_guard = self.admit_gpu_allocation(bytes)?;
+        let alloc_fn: AllocDeviceBufferFn = self.cuteafd_alloc_device_buffer()?;
+        let (kind, owner) = native_tag(tag.unwrap_or(LEGACY_UNTAGGED))?;
+        let mut buffer = CuteafdDeviceBuffer::default();
+        // SAFETY: the output and owner string live through this synchronous call.
+        let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
+        self.status_to_result("cuteafd_alloc_device_buffer", status)?;
+        memory_ledger::record_alloc(memory_ledger::Space::Device, buffer.device_id, buffer.ptr as usize, buffer.bytes, tag);
+        Ok(buffer)
+    }
+
+    /// Managed memory holding `tag`.
+    #[track_caller]
+    pub fn alloc_managed_device_buffer(&self, bytes: usize, tag: memory_ledger::Tag) -> Result<CuteafdDeviceBuffer> {
         let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocManagedDeviceBufferFn = self.cuteafd_alloc_managed_device_buffer()?;
+        let (kind, owner) = native_tag(tag)?;
         let mut buffer = CuteafdDeviceBuffer::default();
-        let status = unsafe { alloc_fn(bytes, &mut buffer) };
+        // SAFETY: the output and owner string live through this synchronous call.
+        let status = unsafe { alloc_fn(bytes, &mut buffer, kind, owner.as_ptr()) };
         self.status_to_result("cuteafd_alloc_managed_device_buffer", status)?;
-        memory_ledger::record_alloc(memory_ledger::Space::Managed, buffer.device_id, buffer.ptr as usize, buffer.bytes);
+        memory_ledger::record_alloc(memory_ledger::Space::Managed, buffer.device_id, buffer.ptr as usize, buffer.bytes, Some(tag));
         Ok(buffer)
     }
 
@@ -6444,17 +6504,17 @@ mod tests {
         params[4].flags |= CUTEAFD_V41_SAMPLER_FLAG_NO_MASK;
         params[4].mask_row = CUTEAFD_V41_SAMPLER_NO_MASK_ROW;
 
-        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4)?;
+        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::memory_ledger::TEST)?;
         // K1 dereferences the parameter block on device, so upload it: this is
         // the residency requirement the ABI documents, and the launch below
         // must use this buffer rather than the host slice.
-        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES)?;
-        let mask_buffer = library.alloc_device_buffer(rows * words * 4)?;
-        let ids = library.alloc_device_buffer(rows * 4)?;
-        let status = library.alloc_device_buffer(rows * 4)?;
-        let detail = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
-        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES)?;
+        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES, crate::memory_ledger::TEST)?;
+        let mask_buffer = library.alloc_device_buffer(rows * words * 4, crate::memory_ledger::TEST)?;
+        let ids = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let status = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let detail = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, crate::memory_ledger::TEST)?;
 
         let result = (|| -> Result<Vec<u32>> {
             // A kernel that never ran would leave these sentinels in place, so
@@ -6598,18 +6658,18 @@ mod tests {
             assert_eq!(mask.len(), rows * words);
             assert_eq!(mask_words_per_row, words);
         }
-        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4)?;
-        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES)?;
+        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::memory_ledger::TEST)?;
+        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES, crate::memory_ledger::TEST)?;
         let mask_buffer = match mask {
-            Some(_) => Some(library.alloc_device_buffer(rows * words * 4)?),
+            Some(_) => Some(library.alloc_device_buffer(rows * words * 4, crate::memory_ledger::TEST)?),
             None => None,
         };
-        let ids = library.alloc_device_buffer(rows * 4)?;
-        let status = library.alloc_device_buffer(rows * 4)?;
-        let detail = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
-        let total = library.alloc_device_buffer(rows * 4)?;
-        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES)?;
+        let ids = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let status = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let detail = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let total = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, crate::memory_ledger::TEST)?;
 
         let result = (|| -> Result<(Vec<u32>, Vec<u32>, Vec<f32>)> {
             let sentinel: Vec<u8> = (0..rows).flat_map(|_| 0xDEAD_BEEFu32.to_ne_bytes()).collect();
@@ -7081,26 +7141,26 @@ mod tests {
         if let Some(mask) = mask {
             assert_eq!(mask.len(), rows * words);
         }
-        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4)?;
-        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES)?;
+        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::memory_ledger::TEST)?;
+        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES, crate::memory_ledger::TEST)?;
         let mask_buffer = match mask {
-            Some(_) => Some(library.alloc_device_buffer(rows * words * 4)?),
+            Some(_) => Some(library.alloc_device_buffer(rows * words * 4, crate::memory_ledger::TEST)?),
             None => None,
         };
-        let ids = library.alloc_device_buffer(rows * 4)?;
-        let status = library.alloc_device_buffer(rows * 4)?;
-        let detail = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
-        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES)?;
-        let retained = library.alloc_device_buffer(rows * 4)?;
-        let passes = library.alloc_device_buffer(rows * 4)?;
+        let ids = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let status = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let detail = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, crate::memory_ledger::TEST)?;
+        let retained = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let passes = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
         let rank_ids = match capacity {
             0 => None,
-            _ => Some(library.alloc_device_buffer(rows * capacity * 4)?),
+            _ => Some(library.alloc_device_buffer(rows * capacity * 4, crate::memory_ledger::TEST)?),
         };
         let rank_scratch = match capacity {
             0 => None,
-            _ => Some(library.alloc_device_buffer(rows * capacity * 8)?),
+            _ => Some(library.alloc_device_buffer(rows * capacity * 8, crate::memory_ledger::TEST)?),
         };
 
         let result = (|| -> Result<TopkRun> {
@@ -7525,7 +7585,7 @@ mod tests {
         };
         let input = b"cuteafd native ffi roundtrip".to_vec();
         let mut output = vec![0_u8; input.len()];
-        let mut buffer = library.alloc_device_buffer(input.len())?;
+        let mut buffer = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
 
         library.copy_h2d(buffer, &input)?;
         library.copy_d2h(&mut output, buffer)?;
@@ -7545,7 +7605,7 @@ mod tests {
         };
         let input = b"cuteafd managed native ffi roundtrip".to_vec();
         let mut output = vec![0_u8; input.len()];
-        let mut buffer = library.alloc_managed_device_buffer(input.len())?;
+        let mut buffer = library.alloc_managed_device_buffer(input.len(), crate::memory_ledger::TEST)?;
 
         assert!(!buffer.ptr.is_null());
         assert!(buffer.bytes >= input.len());
@@ -7569,7 +7629,7 @@ mod tests {
         let first = b"cuteafd native ffi reusable sync h2d staging".to_vec();
         let second = b"shorter sync h2d payload".to_vec();
         let mut output = vec![0_u8; first.len()];
-        let mut buffer = library.alloc_device_buffer(first.len())?;
+        let mut buffer = library.alloc_device_buffer(first.len(), crate::memory_ledger::TEST)?;
 
         library.copy_h2d(buffer, &first)?;
         let first_staging = library
@@ -7601,8 +7661,8 @@ mod tests {
         };
         let input = b"cuteafd native ffi d2d roundtrip".to_vec();
         let mut output = vec![0_u8; input.len()];
-        let mut src = library.alloc_device_buffer(input.len())?;
-        let mut dst = library.alloc_device_buffer(input.len())?;
+        let mut src = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
+        let mut dst = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
 
         library.copy_h2d(src, &input)?;
         library.copy_d2d(dst, src, input.len())?;
@@ -7622,7 +7682,7 @@ mod tests {
         };
         let input = b"cuteafd pinned staging ffi roundtrip".to_vec();
         let mut output = vec![0_u8; input.len()];
-        let mut host = library.alloc_host_buffer(input.len())?;
+        let mut host = library.alloc_host_buffer(input.len(), crate::memory_ledger::TEST)?;
         assert!(!host.ptr.is_null());
         assert_eq!(host.bytes, input.len());
         assert_ne!(host.flags, CUTEAFD_HOST_BUFFER_FLAG_NONE);
@@ -7632,7 +7692,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(input.as_ptr(), host.ptr.cast::<u8>(), input.len());
         }
 
-        let mut device = library.alloc_device_buffer(input.len())?;
+        let mut device = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
         library.copy_host_buffer_h2d(device, host, input.len())?;
         library.copy_d2h(&mut output, device)?;
         assert_eq!(output, input);
@@ -7662,8 +7722,8 @@ mod tests {
 
         let pitched_source = [1_u8, 2, 3, 90, 91, 4, 5, 6, 92, 93, 7, 8, 9, 94, 95];
         let pitched_expected = [1_u8, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0];
-        let mut pitched_host = library.alloc_host_buffer(pitched_source.len())?;
-        let mut pitched_device = library.alloc_device_buffer(pitched_expected.len())?;
+        let mut pitched_host = library.alloc_host_buffer(pitched_source.len(), crate::memory_ledger::TEST)?;
+        let mut pitched_device = library.alloc_device_buffer(pitched_expected.len(), crate::memory_ledger::TEST)?;
         library.copy_h2d(pitched_device, &[0_u8; 12])?;
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -7771,11 +7831,11 @@ mod tests {
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
-        let err = library.alloc_device_buffer(0).unwrap_err().to_string();
+        let err = library.alloc_device_buffer(0, crate::memory_ledger::TEST).unwrap_err().to_string();
         assert!(err.contains("status 1"));
         assert!(err.contains("size is zero"));
         let err = library
-            .alloc_managed_device_buffer(0)
+            .alloc_managed_device_buffer(0, crate::memory_ledger::TEST)
             .unwrap_err()
             .to_string();
         assert!(err.contains("status 1"));
@@ -8154,29 +8214,29 @@ mod tests {
         if let Some(mask) = mask {
             assert_eq!(mask.len(), rows * words);
         }
-        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4)?;
-        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES)?;
+        let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::memory_ledger::TEST)?;
+        let params_buffer = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_PARAM_BYTES, crate::memory_ledger::TEST)?;
         let mask_buffer = match mask {
-            Some(_) => Some(library.alloc_device_buffer(rows * words * 4)?),
+            Some(_) => Some(library.alloc_device_buffer(rows * words * 4, crate::memory_ledger::TEST)?),
             None => None,
         };
-        let ids = library.alloc_device_buffer(rows * 4)?;
-        let status = library.alloc_device_buffer(rows * 4)?;
-        let detail = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
-        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES)?;
-        let retained = library.alloc_device_buffer(rows * 4)?;
-        let passes = library.alloc_device_buffer(rows * 4)?;
+        let ids = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let status = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let detail = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let scratch = library.alloc_device_buffer(rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES, crate::memory_ledger::TEST)?;
+        let retained = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let passes = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
         let rank_ids = match capacity {
             0 => None,
-            _ => Some(library.alloc_device_buffer(rows * capacity * 4)?),
+            _ => Some(library.alloc_device_buffer(rows * capacity * 4, crate::memory_ledger::TEST)?),
         };
         let rank_scratch = match capacity {
             0 => None,
-            _ => Some(library.alloc_device_buffer(rows * capacity * 8)?),
+            _ => Some(library.alloc_device_buffer(rows * capacity * 8, crate::memory_ledger::TEST)?),
         };
-        let out_total = library.alloc_device_buffer(rows * 4)?;
-        let out_nucleus = library.alloc_device_buffer(rows * 4)?;
+        let out_total = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
+        let out_nucleus = library.alloc_device_buffer(rows * 4, crate::memory_ledger::TEST)?;
 
         let result = (|| -> Result<NucleusRun> {
             let sentinel: Vec<u8> = (0..rows).flat_map(|_| 0xDEAD_BEEFu32.to_ne_bytes()).collect();
