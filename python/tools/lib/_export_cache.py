@@ -52,7 +52,7 @@ CUTEAFD_EXPORT_JOBS CUTEAFD_EXPORT_SLOT_DIR CUTEAFD_EXPORT_HOST_SLOT_DIR
 CUTEAFD_EXPORT_GPU_SLOT_DIR CUTEAFD_EXPORT_GPU_BUDGET_MIB CUTEAFD_EXPORT_WORKER_GPU_MIB
 CUTEAFD_EXPORT_WORKER_RAM_MIB CUTEAFD_EXPORT_CONTEXT_SPACING_S CUTEAFD_EXPORT_GPU
 CUTEAFD_EXPORT_CACHE CUTEAFD_EXPORT_CACHE_READS CUTEAFD_EXPORT_CACHE_SOURCE_ROOT
-CUTEAFD_EXPORT_CACHE_BUILD_DIR CUTEAFD_EXPORT_CACHE_STATS CUTEAFD_EXPORT_CACHE_REQUIRE_HIT CUTEAFD_EXPORT_CACHE_OUTPUTS
+CUTEAFD_EXPORT_CACHE_BUILD_DIR CUTEAFD_EXPORT_CACHE_STATS CUTEAFD_EXPORT_CACHE_REQUIRE_HIT CUTEAFD_EXPORT_CACHE_OUTPUTS CUTEAFD_EXPORT_CACHE_TRACE
 CUTEAFD_EXPORT_IMAGE_ID CUTEAFD_SOURCE_ROOT CUTEAFD_SPARKINFER_SOURCE_DIR CUTEAFD_SPARKINFER_LOCK_FILE
 B12X_COMPILE_DISK_CACHE B12X_COMPILE_MEMORY_CACHE B12X_COMPILE_CACHE_DIR B12X_LOG_CUTE_COMPILES
 B12X_PRINT_COMPILE_PROGRESS TRITON_CACHE_DIR CUTE_DSL_CACHE_DIR
@@ -910,6 +910,7 @@ class Executed:
                 self.tool = tool
                 break
         self.files: set[str] = set()
+        self.last_files: set[str] = set()
         self.closures: dict[str, frozenset] = {}
         self.loaded: set[str] = set()
 
@@ -938,6 +939,7 @@ class Executed:
                     if isinstance(getattr(module, "__file__", None), str) and module.__file__.startswith(self.fork)}
         sys.monitoring.set_events(self.tool, 0)
         result = set(self.files)
+        self.last_files = set(self.files)
         for name, module in list(sys.modules.items()):
             filename = getattr(module, "__file__", None)
             if name not in self.loaded and isinstance(filename, str) and filename.startswith(self.fork):
@@ -1091,6 +1093,11 @@ class ProgramCache:
     def store_program(self, identity: dict, scope, files, metadata) -> None:
         if not self.enabled or scope is None:
             return
+        trace = os.environ.get("CUTEAFD_EXPORT_CACHE_TRACE")
+        if trace:  # diagnostics: which fork sources key each program
+            with open(trace, "a") as handle:
+                handle.write(json.dumps({"label": identity.get("label"), "executed": sorted(self.executed.last_files),
+                                         "keyed": sorted(name for name in scope.checks if is_fork_module(name))}) + "\n")
         if scope.unknown:
             self.uncacheable += 1
             return
