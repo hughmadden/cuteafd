@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 // Resident owner and preallocated MiMo driver. Pointwise/attention arithmetic
 // is donated from Hugh Madden's mimo26f-afd v1.3.0 (see vision.cu).
 #include "vision.cu"
@@ -214,8 +215,8 @@ extern "C" int32_t cuteafd_vision_destroy(void* owner) {
   if(o->attention) { int rc=cuteafd_vision_attention_destroy(o->attention);if(!first)first=rc; }
 #endif
   if(o->blas)cublasDestroy(o->blas);
-  if(o->weights)cudaFree(o->weights);
-  if(o->arena)cudaFree(o->arena);
+  if(o->weights)CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));
+  if(o->arena)CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));
   if(o->stream)cudaStreamDestroy(o->stream);
   if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
   delete o; return first;
@@ -233,8 +234,8 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   auto fail=[&](int rc){cuteafd_vision_destroy(o);return rc;};
   int low,high; e=cudaDeviceGetStreamPriorityRange(&low,&high);if(e)return fail(e);
   e=cudaStreamCreateWithPriority(&o->stream,cudaStreamNonBlocking,low);if(e)return fail(e);
-  e=cudaMalloc(reinterpret_cast<void**>(&o->weights),s->weight_bytes);if(e)return fail(e);++o->ledger.device_allocations;
-  e=cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+ledger.blas_workspace);if(e)return fail(e);++o->ledger.device_allocations;
+  e=CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&o->weights), s->weight_bytes, 0, cudaMalloc(reinterpret_cast<void**>(&o->weights),s->weight_bytes));if(e)return fail(e);++o->ledger.device_allocations;
+  e=CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&o->arena), ledger.scratch+ledger.blas_workspace, 0, cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+ledger.blas_workspace));if(e)return fail(e);++o->ledger.device_allocations;
   scratch_tower(o);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s->abi_version==2) {
@@ -251,7 +252,7 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   }
 #endif
   if(ledger.blas_workspace) {
-    e=blas_status(cublasCreate(&o->blas));if(e)return fail(e);
+    e=blas_status(CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&o->blas), 0, 0, nullptr));if(e)return fail(e);
     e=blas_status(cublasSetMathMode(o->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));if(e)return fail(e);
     e=blas_status(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);
     e=blas_status(cublasSetStream(o->blas,o->stream));if(e)return fail(e);

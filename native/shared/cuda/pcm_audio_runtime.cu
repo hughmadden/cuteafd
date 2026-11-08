@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 // Shared BF16 causal PCM pyramid. Tower arithmetic uses pinned AOT programs;
 // the owner handles streaming/lifetimes and the public feature RMSNorm egress.
 #include "cuteafd_pcm_audio.h"
@@ -83,7 +84,7 @@ extern "C" int32_t cuteafd_pcm_destroy(void* p){
   auto save=[&](int e){if(!first)first=e;};
   if(o->stream)save(cudaStreamSynchronize(o->stream));
   if(o->modules)save(cuteafd_pcm_support_destroy(o->modules));
-  if(o->arena)save(cudaFree(o->arena));if(o->weights)save(cudaFree(o->weights));
+  if(o->arena)save(CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena)));if(o->weights)save(CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights)));
   if(o->stream)save(cudaStreamDestroy(o->stream));delete o;return first;
 }
 extern "C" int32_t cuteafd_pcm_create(const cuteafd_pcm_spec* spec,int32_t device,uint64_t admitted,void** out){
@@ -95,8 +96,8 @@ extern "C" int32_t cuteafd_pcm_create(const cuteafd_pcm_spec* spec,int32_t devic
   o->s=*spec;o->ledger=ledger;o->device=device;
   int least=0,greatest=0;e=cudaDeviceGetStreamPriorityRange(&least,&greatest);
   if(!e)e=cudaStreamCreateWithPriority(&o->stream,cudaStreamNonBlocking,least);
-  if(!e)e=cudaMalloc(&o->weights,ledger.weights);
-  if(!e)e=cudaMalloc(&o->arena,ledger.scratch);
+  if(!e)e=CUTEAFD_TRACK_ALLOC("cudaMalloc", &o->weights, ledger.weights, 0, cudaMalloc(&o->weights,ledger.weights));
+  if(!e)e=CUTEAFD_TRACK_ALLOC("cudaMalloc", &o->arena, ledger.scratch, 0, cudaMalloc(&o->arena,ledger.scratch));
   if(!e){scratch(o);e=cuteafd_pcm_support_create(&o->modules);}
   if(e){cuteafd_pcm_destroy(o);return e;}*out=o;return 0;
 }

@@ -532,6 +532,7 @@ pub struct NativeStatusError {
 }
 
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
+pub const CUTEAFD_STATUS_ALLOCATION_FAILED: CuteafdStatus = 4;
 pub const CUTEAFD_STATUS_CUDA_UNAVAILABLE: CuteafdStatus = 3;
 pub const CUTEAFD_STATUS_RDMA_UNAVAILABLE: CuteafdStatus = 7;
 pub const CUTEAFD_STATUS_NCCL_UNAVAILABLE: CuteafdStatus = 8;
@@ -2333,6 +2334,7 @@ impl NativeLibrary {
         let rdma_rc_endpoint_try_poll_fn =
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;
+        memory_ledger::fault::install(&lib);
         Ok(Self {
             artifact_root,
             loaded_path: path,
@@ -2386,6 +2388,7 @@ impl NativeLibrary {
 
     #[track_caller]
     pub fn alloc_host_buffer(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let alloc_fn: AllocHostBufferFn = self.cuteafd_alloc_host_buffer()?;
         let mut buffer = CuteafdHostBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
@@ -2410,9 +2413,11 @@ impl NativeLibrary {
 
     pub fn free_host_buffer(&self, buffer: &mut CuteafdHostBuffer) -> Result<()> {
         let free_fn: FreeHostBufferFn = self.cuteafd_free_host_buffer()?;
-        memory_ledger::record_free(buffer.ptr as usize);
+        let address = buffer.ptr as usize;
         let status = unsafe { free_fn(buffer) };
-        self.status_to_result("cuteafd_free_host_buffer", status)
+        self.status_to_result("cuteafd_free_host_buffer", status)?;
+        memory_ledger::record_free(address);
+        Ok(())
     }
 
     /// Physical free and total bytes, including other processes and CUDA's
@@ -2481,7 +2486,7 @@ impl NativeLibrary {
         budget.admit(cuteafd_core::serving_capacity::DeviceMemory {
             device: u32::try_from(self.cuda_get_device()?)?, total_bytes: total as u64,
             baseline_free_bytes: free as u64,
-        }, bytes as u64)?;
+        }, bytes as u64).map_err(|error| memory_ledger::capture_failure(error.into()))?;
         Ok(Some(guard))
     }
 
@@ -2581,6 +2586,7 @@ impl NativeLibrary {
 
     #[track_caller]
     pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocDeviceBufferFn = self.cuteafd_alloc_device_buffer()?;
         let mut buffer = CuteafdDeviceBuffer::default();
@@ -2592,6 +2598,7 @@ impl NativeLibrary {
 
     #[track_caller]
     pub fn alloc_managed_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocManagedDeviceBufferFn = self.cuteafd_alloc_managed_device_buffer()?;
         let mut buffer = CuteafdDeviceBuffer::default();
@@ -2603,12 +2610,15 @@ impl NativeLibrary {
 
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
         let free_fn: FreeDeviceBufferFn = self.cuteafd_free_device_buffer()?;
-        memory_ledger::record_free(buffer.ptr as usize);
+        let address = buffer.ptr as usize;
         let status = unsafe { free_fn(buffer) };
-        self.status_to_result("cuteafd_free_device_buffer", status)
+        self.status_to_result("cuteafd_free_device_buffer", status)?;
+        memory_ledger::record_free(address);
+        Ok(())
     }
 
     pub fn cuda_stream_create(&self) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let create_fn: CudaStreamCreateFn = self.cuteafd_cuda_stream_create()?;
         let mut cuda_stream = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_stream) };
@@ -2658,6 +2668,7 @@ impl NativeLibrary {
     }
 
     pub fn cuda_event_create(&self) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create()?;
         let mut cuda_event = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_event) };
@@ -2667,6 +2678,7 @@ impl NativeLibrary {
 
     /// Timing-disabled event for stream ordering only.
     pub fn cuda_event_create_ordering(&self) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create_ordering()?;
         let mut cuda_event = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_event) };
@@ -2677,6 +2689,7 @@ impl NativeLibrary {
     /// An ordering event whose [`Self::cuda_event_synchronize`] sleeps until
     /// the device signals it instead of spinning: per-step host waits.
     pub fn cuda_event_create_blocking(&self) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create_blocking()?;
         let mut cuda_event = std::ptr::null_mut();
         // SAFETY: the output is a valid local; native writes it only on success.
@@ -2849,6 +2862,7 @@ impl NativeLibrary {
 
     #[track_caller]
     pub unsafe fn cuda_graph_end_capture(&self, cuda_stream: *mut c_void) -> Result<*mut c_void> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
             .unwrap_or_else(|e| e.into_inner()));
         let end_capture_fn: CudaGraphEndCaptureFn = self.cuteafd_cuda_graph_end_capture()?;
@@ -4537,6 +4551,7 @@ impl NativeLibrary {
         &self,
         buffer: &mut [u8],
     ) -> Result<CuteafdRdmaRegisterProbe> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let register_fn: RdmaRegisterHostBufferProbeFn = self.cuteafd_rdma_register_host_buffer_probe()?;
         let mut probe = CuteafdRdmaRegisterProbe::default();
         let status = unsafe { register_fn(buffer.as_mut_ptr().cast(), buffer.len(), &mut probe) };
@@ -4567,6 +4582,7 @@ impl NativeLibrary {
         gid_index: u32,
         bytes: usize,
     ) -> Result<CuteafdRdmaRcSendRecvProbe> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let probe_fn: RdmaRcSendRecvLoopbackProbeFn = self.cuteafd_rdma_rc_send_recv_loopback_probe()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut probe = CuteafdRdmaRcSendRecvProbe::default();
@@ -4586,6 +4602,7 @@ impl NativeLibrary {
         request_frame: &[u8],
         response_frame: &[u8],
     ) -> Result<CuteafdRdmaRcProtocolV2LoopbackProbe> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let probe_fn: RdmaRcProtocolV2LoopbackProbeFn = self.cuteafd_rdma_rc_protocol_v2_loopback_probe()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut probe = CuteafdRdmaRcProtocolV2LoopbackProbe::default();
@@ -4622,6 +4639,7 @@ impl NativeLibrary {
         max_sge: u32,
         host_buffer_flags: u64,
     ) -> Result<CuteafdRdmaRcEndpointInfo> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         // SAFETY: the symbol has the declared C ABI; all argument buffers live through the call.
         let create_fn: RdmaRcEndpointCreateOnGidWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags()?;
         let _: RdmaRcEndpointBufferViewFn = self.cuteafd_rdma_rc_endpoint_buffer_view()?;
@@ -4729,6 +4747,7 @@ impl NativeLibrary {
     /// Registers the first `bytes` of the endpoint's send buffer for remote
     /// reads and returns its (address, rkey).
     pub fn rdma_rc_endpoint_expose_send_read(&self, handle: *mut c_void, bytes: usize) -> Result<(u64, u32)> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         type ExposeReadFn = unsafe extern "C" fn(*mut c_void, usize, *mut u64, *mut u32) -> CuteafdStatus;
         // SAFETY: resolving the symbol does not call it.
         let expose: ExposeReadFn = self.cuteafd_rdma_rc_endpoint_expose_send_read()?;
@@ -4833,6 +4852,7 @@ impl NativeLibrary {
     /// struct is returned even when landing is unavailable (see `status`).
     pub fn rdma_gpu_landing_probe(&self, device_name: &str, port_num: u32, gid_index: u32, bytes: usize,
         iterations: u32) -> Result<(CuteafdRdmaGpuLandingProbe, Option<String>)> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let probe_fn: RdmaGpuLandingProbeFn = self.cuteafd_rdma_gpu_landing_probe()?;
         let name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut out = CuteafdRdmaGpuLandingProbe::default();
@@ -5007,6 +5027,7 @@ impl NativeLibrary {
         ptr: *mut c_void,
         bytes: usize,
     ) -> Result<u32> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         type RegisterFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
         let register: RegisterFn = self.cuteafd_rdma_rc_endpoint_register_region()?;
         let mut region = 0;
@@ -5022,6 +5043,7 @@ impl NativeLibrary {
     pub unsafe fn rdma_rc_endpoint_register_device_region(
         &self, handle: *mut c_void, ptr: *mut c_void, bytes: usize,
     ) -> Result<u32> {
+        let _failure_boundary = memory_ledger::fault::boundary();
         let register = self.cuteafd_rdma_rc_endpoint_register_device_region()?;
         let mut region = 0;
         // SAFETY: the caller retains the allocation for the endpoint's lifetime.

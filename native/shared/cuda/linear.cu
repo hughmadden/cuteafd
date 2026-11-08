@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "common.h"
 
 #include <cublas_v2.h>
@@ -961,8 +962,17 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out, cudaStream_t stream = nullpt
       return CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE;
     }
     cublasHandle_t handle = nullptr;
-    const cublasStatus_t status = cublasCreate(&handle);
+    cublasStatus_t status = CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&handle), 0, 0, nullptr);
     if (status != CUBLAS_STATUS_SUCCESS) {
+      return status_from_cublas(status);
+    }
+    // FP32 accumulation end to end, as the V4.1 attention and vision handles already ask:
+    // without this, cuBLAS may reduce a split-K BF16 GEMM's partials in BF16, which at 17..128
+    // rows over K = 4096 left outputs up to 82x past their FP64 bound
+    // (tests/cuda_bf16_gemm_precision_selftest.cc).
+    status = cublasSetMathMode(handle, CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      cublasDestroy(handle);
       return status_from_cublas(status);
     }
     found = handles.emplace(device, handle).first;

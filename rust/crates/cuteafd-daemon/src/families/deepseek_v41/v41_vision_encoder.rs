@@ -150,6 +150,7 @@ impl LocalEncoder {
             .name("v41-vision-owner".into())
             .spawn(move || {
                 let _health = Health(health.clone());
+                let mut initialized = false;
                 let run = (|| -> Result<()> {
                     // SAFETY: selected architecture-matching native library; all CUDA owners live on this thread.
                     let lib = unsafe { cuteafd_ffi::NativeLibrary::load(&library) }?;
@@ -195,6 +196,7 @@ impl LocalEncoder {
                         "V4.1 vision owner admitted and allocated"
                     );
                     if !defer { health.store(true, Ordering::Release); }
+                    initialized = true;
                     if ready.send(Ok((admitted, records))).is_err() { return Ok(()); }
                     if defer {
                         // Bytes land in this owner's allocations only through the
@@ -241,9 +243,9 @@ impl LocalEncoder {
                     }
                     Ok(())
                 })();
-                if let Err(error) = run {
-                    let _ = ready.send(Err(format!("{error:#}")));
-                }
+                let _ = crate::shared::serve::forward_initialization(run, !initialized, "V4.1 vision initialization failed", |error| {
+                    ready.send(Err(error)).map_err(|result| match result.0 { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+                });
             })?;
         match readiness.recv() {
             Ok(Ok((bytes, records))) => {
@@ -260,7 +262,11 @@ impl LocalEncoder {
             failed => {
                 drop(queue);
                 let _ = owner.join();
-                anyhow::bail!("V4.1 vision owner startup failed: {:?}", failed.map(|r| r.map(|(bytes, _)| bytes)))
+                return match failed {
+                    Ok(Err(error)) => Err(error.context("V4.1 vision owner startup failed")),
+                    Err(error) => Err(anyhow::Error::new(error).context("V4.1 vision owner startup stopped")),
+                    Ok(Ok(_)) => unreachable!(),
+                };
             }
         }
     }

@@ -1025,6 +1025,7 @@ pub fn solve(
         }
     }
     Ok(ResolvedPlan {
+        pool_page_rows: page,
         encoder_diagnostics,
         request,
         decisions,

@@ -224,6 +224,7 @@ pub(super) fn event(event: &AllocationEvent) -> Value {
     let (kind, allocation) = match event {
         AllocationEvent::Allocated(r) => ("allocated", r),
         AllocationEvent::Freed(r) => ("freed", r),
+        AllocationEvent::Enriched(r) => ("enriched", r),
         AllocationEvent::UnobservedRelease(r) => ("unobserved-release", r),
     };
     json!({"kind": kind, "allocation": record(allocation)})

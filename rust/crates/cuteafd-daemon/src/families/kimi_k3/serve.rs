@@ -212,12 +212,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     Ok(())
                 })
         })();
-        if let Some(ready) = ready.take() {
-            let error = result.as_ref().err().map(|error| format!("{error:#}"))
-                .unwrap_or_else(|| "scheduler exited before readiness".into());
-            let _ = ready.send(Err(anyhow::anyhow!("Kimi initialization failed: {error}")));
-        }
-        result
+        crate::shared::serve::forward_initialization(result, ready.is_some(), "Kimi initialization failed", |error| {
+            ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+        })
     });
     let compiled_context = ready_rx.await.context("Kimi worker exited before readiness")??;
     let limits = args.api_limits(compiled_context)?;

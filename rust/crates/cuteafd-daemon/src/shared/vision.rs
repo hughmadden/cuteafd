@@ -496,9 +496,14 @@ impl Drop for OwnerHealth {
 }
 
 fn terminal_encode_failure(result: &Result<Vec<u16>>) -> bool {
-    matches!(result, Err(VisionError::Unavailable | VisionError::Native(
-        cuteafd_ffi::vision::VisionError::Native(_) | cuteafd_ffi::vision::VisionError::Runtime(_))
-        | VisionError::AudioNative(cuteafd_ffi::audio::AudioError::Native(_))))
+    let Err(error) = result else { return false };
+    anyhow::Chain::new(error).any(|cause| {
+        matches!(cause.downcast_ref::<VisionError>(), Some(VisionError::Unavailable))
+            || matches!(cause.downcast_ref::<cuteafd_ffi::vision::VisionError>(),
+                Some(cuteafd_ffi::vision::VisionError::Native(_) | cuteafd_ffi::vision::VisionError::Runtime(_)))
+            || matches!(cause.downcast_ref::<cuteafd_ffi::audio::AudioError>(),
+                Some(cuteafd_ffi::audio::AudioError::Native(_)))
+    })
 }
 
 fn reply_encode(healthy: &AtomicBool, reply: &mpsc::SyncSender<Result<Vec<u16>>>, result: Result<Vec<u16>>) -> bool {
@@ -833,9 +838,10 @@ mod tests {
             assert!(!terminal_encode_failure(&Err(error)));
         }
         for error in [VisionError::Unavailable,
-            VisionError::Native(cuteafd_ffi::vision::VisionError::Native(1)),
+            VisionError::Native(cuteafd_ffi::vision::check_for_test(1).unwrap_err()),
             VisionError::Native(cuteafd_ffi::vision::VisionError::Runtime("CUDA failure".into())),
-            VisionError::AudioNative(cuteafd_ffi::audio::AudioError::Native(1))] {
+            VisionError::AudioNative(cuteafd_ffi::audio::check_for_test(1).unwrap_err()),
+            VisionError::AudioNative(cuteafd_ffi::pcm_audio::check_for_test(1).unwrap_err())] {
             assert!(terminal_encode_failure(&Err(error)));
         }
     }
@@ -848,7 +854,7 @@ mod tests {
         let owner = thread::spawn(move || {
             let _health = OwnerHealth(owner_health.clone());
             assert!(reply_encode(&owner_health, &reply, Err(VisionError::Native(
-                cuteafd_ffi::vision::VisionError::Native(1)))));
+                cuteafd_ffi::vision::check_for_test(1).unwrap_err()))));
             drop(queued_reply);
         });
         assert!(matches!(result.recv().unwrap(), Err(VisionError::Native(_))));

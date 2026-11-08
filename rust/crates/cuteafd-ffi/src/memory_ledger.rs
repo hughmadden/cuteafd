@@ -10,6 +10,8 @@
 //! (context, modules, cuBLAS, graph executables) is the gap between the ledger
 //! and `cudaMemGetInfo`.
 
+pub mod fault;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -56,6 +58,9 @@ struct Live {
     key: Key,
     bytes: usize,
     endpoint: Option<usize>,
+    name: Option<&'static str>,
+    site: &'static std::panic::Location<'static>,
+    native_site: Option<&'static str>,
 }
 
 /// Aggregation key: pool, device (-1 for host memory), category, tensor stem
@@ -81,6 +86,10 @@ struct State {
     peak: BTreeMap<(Space, i32), usize>,
     current: BTreeMap<(Space, i32), usize>,
     audits: Vec<Weak<Mutex<AuditEvents>>>,
+    ready: bool,
+    post_ready_bytes: usize,
+    post_ready_sites: BTreeMap<&'static std::panic::Location<'static>, usize>,
+    post_ready_native_sites: BTreeMap<&'static str, usize>,
     unscoped_sites: HashSet<&'static std::panic::Location<'static>>,
 }
 
@@ -98,6 +107,8 @@ pub struct AllocationRecord {
 pub enum AllocationEvent {
     Allocated(AllocationRecord),
     Freed(AllocationRecord),
+    /// Ownership metadata changed without a new physical allocation.
+    Enriched(AllocationRecord),
     /// The allocator reused an address whose release bypassed this ledger.
     /// This is not evidence of a free at the time the reuse was observed.
     UnobservedRelease(AllocationRecord),
@@ -312,16 +323,21 @@ fn current_key(space: Space, device: i32) -> (Key, Option<&'static str>) {
 
 #[track_caller]
 pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize) {
-    record_backing(space, device, ptr, bytes, None);
+    record_backing(space, device, ptr, bytes, None, None);
 }
 
 #[track_caller]
 pub(crate) fn record_endpoint_alloc(space: Space, ptr: usize, bytes: usize, endpoint: usize) {
-    record_backing(space, -1, ptr, bytes, Some(endpoint));
+    record_backing(space, -1, ptr, bytes, Some(endpoint), None);
 }
 
 #[track_caller]
-fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint: Option<usize>) {
+pub(crate) fn record_native_alloc(space: Space, device: i32, ptr: usize, bytes: usize, site: &str) {
+    record_backing(space, device, ptr, bytes, None, Some(intern(site)));
+}
+
+#[track_caller]
+fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint: Option<usize>, native_site: Option<&'static str>) {
     if ptr == 0 || bytes == 0 {
         return;
     }
@@ -329,6 +345,19 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
     let caller = std::panic::Location::caller();
     let site = CONTEXT.with(|context| context.borrow().site).unwrap_or(caller);
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+    if endpoint.is_some() { if let Some(existing) = state.live.get(&ptr).copied() {
+        if existing.endpoint.is_none() && existing.bytes == bytes && existing.key.space == space {
+            // Adopt the authoritative transport label, retaining physical lifetime,
+            // native site and cumulative growth rather than inventing a reuse.
+            release(&mut state, existing);
+            let total = state.totals.entry(key).or_default();
+            total.0 += bytes; total.1 += 1;
+            *state.current.entry((space, device)).or_default() += bytes;
+            state.live.insert(ptr, Live { key, endpoint, ..existing });
+            audit_event(&mut state, AllocationEvent::Enriched(AllocationRecord { address: ptr, key, bytes, endpoint }));
+            return;
+        }
+    } }
     let warn = key.scope == "other" && matches!(space, Space::Device | Space::Pinned | Space::Managed)
         && state.unscoped_sites.insert(site);
     if let (Some(name), Some(format)) = (name, key.format) {
@@ -347,7 +376,7 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
     let now = *current;
     let peak = state.peak.entry((space, device)).or_default();
     *peak = (*peak).max(now);
-    if let Some(previous) = state.live.insert(ptr, Live { key, bytes, endpoint }) {
+    if let Some(previous) = state.live.insert(ptr, Live { key, bytes, endpoint, name, site, native_site }) {
         // A pointer reused without a recorded free (freed outside the library).
         release(&mut state, previous);
         audit_event(&mut state, AllocationEvent::UnobservedRelease(AllocationRecord {
@@ -355,7 +384,24 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
         }));
     }
     audit_event(&mut state, AllocationEvent::Allocated(AllocationRecord { address: ptr, key, bytes, endpoint }));
+    let growth = state.ready && matches!(space, Space::Device | Space::Pinned | Space::Managed);
+    let new_site = growth && match native_site {
+        Some(site) => !state.post_ready_native_sites.contains_key(site),
+        None => !state.post_ready_sites.contains_key(site),
+    };
+    if growth {
+        state.post_ready_bytes = state.post_ready_bytes.saturating_add(bytes);
+        match native_site {
+            Some(site) => *state.post_ready_native_sites.entry(site).or_default() += bytes,
+            None => *state.post_ready_sites.entry(site).or_default() += bytes,
+        }
+    }
+    let post_ready_bytes = state.post_ready_bytes;
     drop(state);
+    if new_site {
+        tracing::info!(target: "cuteafd::memory", %site, bytes, post_ready_bytes,
+            native_site, scope = key.scope, "post-ready growth");
+    }
     if warn {
         tracing::warn!(target: "cuteafd::memory", %site, owner = key.owner,
             tensor = key.tensor, name, bytes, device, space = space.label(),
@@ -374,6 +420,12 @@ fn release(state: &mut State, live: Live) {
     if let Some(current) = state.current.get_mut(&(live.key.space, live.key.device)) {
         *current = current.saturating_sub(live.bytes);
     }
+}
+
+/// Read-only source locations keyed by live physical backing address.
+pub fn allocation_sites() -> BTreeMap<usize, &'static std::panic::Location<'static>> {
+    state().lock().unwrap_or_else(|e| e.into_inner()).live.iter()
+        .map(|(&address, live)| (address, live.site)).collect()
 }
 
 /// Read one live-byte counter without cloning the allocation ledger.
@@ -501,6 +553,7 @@ pub fn snapshot() -> Snapshot {
 pub struct FailureSnapshot {
     pub ledger: Snapshot,
     pub device_memory: BTreeMap<i32, (usize, usize)>,
+    pub report: Option<Arc<fault::FailureReport>>,
     source: anyhow::Error,
 }
 
@@ -517,7 +570,7 @@ impl std::error::Error for FailureSnapshot {
 impl FailureSnapshot {
     pub fn new(source: anyhow::Error, ledger: Snapshot,
         device_memory: BTreeMap<i32, (usize, usize)>) -> Self {
-        Self { ledger, device_memory, source }
+        Self { ledger, device_memory, source, report: None }
     }
 
     fn into_error(self) -> anyhow::Error {
@@ -533,13 +586,26 @@ impl FailureSnapshot {
 }
 
 pub(crate) fn capture_failure(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| cause.is::<FailureSnapshot>()) {
+        fault::clear_failure();
+        return error;
+    }
+    let report = fault::take_failure().or_else(|| {
+        let memory = error.downcast_ref::<crate::NativeStatusError>()
+            .is_some_and(|status| status.status == crate::CUTEAFD_STATUS_ALLOCATION_FAILED)
+            || error.downcast_ref::<cuteafd_core::serving_capacity::CapacityError>()
+                .is_some_and(|error| matches!(error, cuteafd_core::serving_capacity::CapacityError::GpuBudgetExceeded { .. }));
+        memory.then(fault::fallback).flatten()
+    });
     let ledger = snapshot();
-    // Error reporting must not change the failing thread's selected device.
-    let devices = ledger.devices();
-    let device_memory = std::thread::spawn(move || devices.into_iter()
-        .filter_map(|device| device_memory(device).map(|memory| (device, memory))).collect())
-        .join().unwrap_or_default();
-    FailureSnapshot::new(error, ledger, device_memory).into_error()
+    // A native callback has already sampled before cleanup. Do not replace it
+    // with post-cleanup telemetry or change the failing thread's device.
+    let device_memory = if report.is_none() {
+        ledger.devices().into_iter().filter_map(|device| fault::device_memory(device).map(|value| (device, value))).collect()
+    } else { BTreeMap::new() };
+    let mut failure = FailureSnapshot::new(error, ledger, device_memory);
+    failure.report = report;
+    failure.into_error()
 }
 
 fn loaded_cuda_runtime() -> Option<&'static libloading::os::unix::Library> {
@@ -598,28 +664,6 @@ pub fn current_cuda_memory_snapshot() -> Option<serde_json::Value> {
         Some(serde_json::json!({"device": device, "physical_free_bytes": free,
             "physical_total_bytes": total, "cuda_current_pool": pool_data,
             "scope": "raw cudaMemGetInfo under-reports reclaimable page cache on GB10; use host MemAvailable for allocatable headroom; current process/device CUDA runtime queries; no synchronization or pool trimming; CUDA pool bytes are physical telemetry, not additional tracked allocations"}))
-    }
-}
-
-/// Free and total bytes of `device` from the CUDA runtime already in the
-/// process image (never loads a second runtime), queried on the calling
-/// thread: callers that use the device themselves must restore their device.
-/// `None` before the native library has loaded the runtime.
-pub fn device_memory(device: i32) -> Option<(usize, usize)> {
-    use libloading::os::unix::Symbol;
-    type SetDevice = unsafe extern "C" fn(i32) -> i32;
-    type MemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
-    let runtime = loaded_cuda_runtime()?;
-    // SAFETY: symbol types match the CUDA runtime API; both calls only touch
-    // this thread's device selection and write two integers.
-    unsafe {
-        let set: Symbol<SetDevice> = runtime.get(b"cudaSetDevice").ok()?;
-        let info: Symbol<MemGetInfo> = runtime.get(b"cudaMemGetInfo").ok()?;
-        if set(device) != 0 {
-            return None;
-        }
-        let (mut free, mut total) = (0usize, 0usize);
-        (info(&mut free, &mut total) == 0).then_some((free, total))
     }
 }
 
@@ -722,6 +766,31 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_enrichment_preserves_native_site_growth_and_allocation_history() {
+        let _guard = test_guard();
+        let address = 0x7990_0000_0000;
+        let audit = AllocationAudit::begin();
+        record_native_alloc(Space::Host, -1, address, 64, "native-ring.cc:99");
+        let growth = state().lock().unwrap().post_ready_bytes;
+        {
+            let _scope = scope("transport/rdma-rings");
+            record_endpoint_alloc(Space::Host, address, 64, 123);
+        }
+        {
+            let state = state().lock().unwrap();
+            assert_eq!(state.post_ready_bytes, growth);
+            let live = state.live.get(&address).unwrap();
+            assert_eq!(live.native_site, Some("native-ring.cc:99"));
+            assert_eq!(live.key.scope, "transport/rdma-rings");
+        }
+        record_endpoint_free(123);
+        let history = audit.finish();
+        assert_eq!(history.events.iter().filter(|e| matches!(e, AllocationEvent::Allocated(r) if r.address == address)).count(), 1);
+        assert!(history.events.iter().any(|e| matches!(e, AllocationEvent::Enriched(r) if r.address == address)));
+        assert!(!history.events.iter().any(|e| matches!(e, AllocationEvent::UnobservedRelease(r) if r.address == address)));
+    }
+
+    #[test]
     fn startup_history_preserves_transients_reuse_and_initial_owners() {
         let _ledger = test_guard();
         let base = 0x7300_0000_0000usize;
@@ -742,7 +811,7 @@ mod tests {
         assert!(!history.final_allocations.iter().any(|r| r.address == base + 1));
         let events = history.events[position..].iter().filter(|event| match event {
             AllocationEvent::Allocated(r) | AllocationEvent::Freed(r)
-                | AllocationEvent::UnobservedRelease(r) => r.address == base + 1,
+                | AllocationEvent::Enriched(r) | AllocationEvent::UnobservedRelease(r) => r.address == base + 1,
         }).copied().collect::<Vec<_>>();
         let record = |bytes| AllocationRecord { address: base + 1, bytes, endpoint: None,
             key: Key { space: Space::Device, device: 17, scope: "other",

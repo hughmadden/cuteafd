@@ -128,6 +128,7 @@ pub(crate) struct Allocation<'a> {
     pub buffer: CuteafdDeviceBuffer,
     backing: Option<std::rc::Rc<Allocation<'a>>>,
     weight_id: Option<String>,
+    arena_registration: Option<cuteafd_ffi::memory_ledger::fault::ArenaRegistration>,
 }
 
 pub(crate) struct WeightArenaBacking<'b> {
@@ -149,13 +150,17 @@ impl<'a> Allocation<'a> {
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
         let _site = cuteafd_ffi::memory_ledger::allocation_site(std::panic::Location::caller());
         let buffer = device.run(|| device.library.alloc_device_buffer(bytes))?;
-        Ok(Self { device, buffer, backing: None, weight_id: None })
+        Ok(Self { device, buffer, backing: None, weight_id: None, arena_registration: None })
     }
 
     pub(super) fn weight_arena(device: Device<'a>, bytes: usize, id: &str) -> Result<Self> {
         let mut allocation = Self::new(device, bytes)?;
         allocation.weight_id = Some(id.into());
         Ok(allocation)
+    }
+
+    pub(super) fn register_weight_arena(&mut self, registration: cuteafd_ffi::memory_ledger::fault::ArenaRegistration) {
+        self.arena_registration = Some(registration);
     }
 
     pub(crate) fn weight_backing(&self) -> Option<WeightArenaBacking<'_>> {
@@ -178,7 +183,7 @@ impl<'a> Allocation<'a> {
             .ok_or_else(|| anyhow::anyhow!("device allocation view address overflow"))?;
         ensure!(address % 256 == 0, "weight arena view requires 256-byte alignment");
         Ok(Self { device: owner.device, buffer: CuteafdDeviceBuffer {
-            ptr: address as *mut std::ffi::c_void, bytes, ..owner.buffer }, backing: Some(owner.clone()), weight_id: None })
+            ptr: address as *mut std::ffi::c_void, bytes, ..owner.buffer }, backing: Some(owner.clone()), weight_id: None, arena_registration: None })
     }
 }
 impl Drop for Allocation<'_> {

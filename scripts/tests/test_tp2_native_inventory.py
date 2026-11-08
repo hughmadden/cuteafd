@@ -7,6 +7,8 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+FAILURE_HEADER = '#include "' + str(ROOT / "native/shared/include/memory_failure.h") + '"\n'
+CALLBACK_SOURCE = ROOT / "native/shared/src/memory_failure.cc"
 SOURCE = ROOT / "native/shared/src/tp2_kernel_inventory.cc"
 ABI = """#pragma once
 #include <cstdint>
@@ -326,6 +328,14 @@ int cublasCreate(cublasHandle_t* out) {
   *out = &owners[creates];
   return 0;
 }
+constexpr int CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16;
+static int modes[8], mode_error = 0, destroys = 0;
+int cublasSetMathMode(cublasHandle_t handle, int mode) {
+  if (mode_error) return mode_error;
+  modes[handle - owners] = mode;
+  return 0;
+}
+int cublasDestroy(cublasHandle_t) { ++destroys; return 0; }
 int status_from_cuda(int status) { return status; }
 int status_from_cublas(int status) { return status; }
 void log_blas_handle_created(const char*) { ++logs; }
@@ -347,13 +357,20 @@ int main() {
   device_error = 19;
   assert(cublas_handle(&again) == 19 && again == second);
   assert(creates == 3 && logs == 2);
+  // Every shared handle keeps FP32 reductions; one whose mode cannot be set is destroyed, not cached.
+  assert(modes[1] == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+  assert(modes[3] == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+  device_error = 0; device = 2; mode_error = 5;
+  assert(cublas_handle(&again) == 5 && destroys == 1 && logs == 2);
+  mode_error = 0;
+  assert(cublas_handle(&again) == 0 && *again == 2 && logs == 3);
 }
 '''
     fixture = tmp_path / "blas_handles.cc"
-    fixture.write_text(mock + "cuteafd_status_t cublas_handle(" + helper + main)
+    fixture.write_text(FAILURE_HEADER + mock + "cuteafd_status_t cublas_handle(" + helper + main)
     executable = tmp_path / "blas_handles"
     subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                    str(fixture), "-o", str(executable)], check=True, capture_output=True)
+                    str(fixture), str(CALLBACK_SOURCE), "-I", str(ROOT / "native/shared/include"), "-o", str(executable)], check=True, capture_output=True)
     subprocess.run([str(executable)], check=True, capture_output=True)
 
 
@@ -420,6 +437,11 @@ int cublasSetStream(cublasHandle_t handle, void* stream) {
   assert(handle->device == device && handle->thread == std::this_thread::get_id());
   ++bindings; handle->stream = stream; return 0;
 }
+constexpr int CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16;
+int cublasSetMathMode(cublasHandle_t, int mode) {
+  assert(!capturing && mode == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION); return 0;
+}
+int cublasDestroy(cublasHandle_t) { return 0; }
 template<class... Args> int cublasGemmEx(cublasHandle_t handle, Args...) {
   ++gemms; last_gemm = handle; return 0;
 }
@@ -499,10 +521,10 @@ int main() {
 }
 '''
     fixture = tmp_path / "capture_blas.cc"
-    fixture.write_text(mock + helper + prepare + capture + launch + main)
+    fixture.write_text(FAILURE_HEADER + mock + helper + prepare + capture + launch + main)
     executable = tmp_path / "capture_blas"
     built = subprocess.run([compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
-                            str(fixture), "-o", str(executable)], capture_output=True, text=True)
+                            str(fixture), str(CALLBACK_SOURCE), "-I", str(ROOT / "native/shared/include"), "-o", str(executable)], capture_output=True, text=True)
     assert built.returncode == 0, built.stderr
     ran = subprocess.run([str(executable)], capture_output=True, text=True)
     assert ran.returncode == 0, ran.stderr
