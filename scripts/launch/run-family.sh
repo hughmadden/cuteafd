@@ -2495,8 +2495,18 @@ audio_encoder_hash=""
   # Keep checkpoint paths unchanged inside the full namespace mount. The plan
   # admits under the same instrumentation the server will launch with, so a
   # profiled run (e.g. PROFILE=census) plans what that server actually charges.
-  shared_profile_args
-  plan_json="$(docker run --rm --network none "${profile_args[@]}" "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
+  # Only the environment switches are forwarded: the plan writes no reports, so
+  # it neither needs nor creates PROFILE_DIR (shared_profile_args owns that, and
+  # it still runs after the Spark profile validation below).
+  plan_profile_env=()
+  release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" "$(get PROFILE_SPARK)"
+  plan_profile_mount=0
+  for arg in ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"}; do
+    if ((plan_profile_mount)); then plan_profile_mount=0; continue; fi
+    [[ "$arg" != -v ]] || { plan_profile_mount=1; continue; }
+    plan_profile_env+=("$arg")
+  done
+  plan_json="$(docker run --rm --network none ${plan_profile_env[@]+"${plan_profile_env[@]}"} "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}" "${plan_memory_args[@]}" \
     --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --coordinator-weight-budget-gib "$(release_gib "$plan_cap")" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -2861,6 +2871,7 @@ peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")
 shared_api_state "$coordinator_image" "${instance:-default}"
 family_args+=("${api_args[@]}")
+shared_profile_args
 shared_graph_census_args
 shared_bench_nonce_args
 tp2_env_args=()
