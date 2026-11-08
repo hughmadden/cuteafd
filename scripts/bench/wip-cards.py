@@ -1187,26 +1187,50 @@ subprocess.run(['docker','stop','-t','1',info['Id']],check=True,timeout=3)
          shlex.join(['python3', '-I', '-c', program, name, layout])], timeout=6)
 
 
-def spark_memory_phase(url):
-    snapshot = http(url, '/v1/console/snapshot', timeout=.5)
-    if snapshot.get('starting'):
-        return 'loading'
-    gauges = snapshot.get('g', {})
-    if gauges.get('prefilling_n', 0):
-        return 'prefill'
-    if gauges.get('active', 0):
-        return 'decode'
-    active = http(url, '/v1/bench/status', timeout=.5).get('active')
-    return 'panel:' + str(active['panel']) if active else 'ready-idle'
+def spark_memory_phase(url, diagnostics, timeout=.5):
+    def telemetry(endpoint):
+        began = time.monotonic()
+        record = dict(endpoint=endpoint, timeout_s=timeout, exception_type=None)
+        try:
+            result = http(url, endpoint, timeout=timeout)
+            record['status'] = 'ok'
+            return result
+        except Exception as error:
+            record.update(status='unavailable', exception_type=type(error).__name__, error=str(error))
+            raise
+        finally:
+            record['elapsed_s'] = time.monotonic() - began
+            diagnostics.append(record)
+
+    try:
+        snapshot = telemetry('/v1/console/snapshot')
+        if snapshot.get('starting'):
+            return 'loading'
+        gauges = snapshot.get('g', {})
+        if gauges.get('prefilling_n', 0):
+            return 'prefill'
+        if gauges.get('active', 0):
+            return 'decode'
+        active = telemetry('/v1/bench/status').get('active')
+        return 'panel:' + str(active['panel']) if active else 'ready-idle'
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as error:
+        diagnostics.append(dict(status='unavailable', source='phase-classification',
+                                exception_type=type(error).__name__, error=str(error)))
+        return 'unavailable'
 
 
 def spark_memory_boundary(job, boundary):
     """Capture real host state at readiness/sweep completion, even for subsecond sweeps."""
-    phase = spark_memory_phase(os.environ['CUTEAFD_SMOKE_URL'])
+    diagnostics = []
+    # Boundary hooks can tolerate busy-server latency. Continuous observation
+    # keeps its short timeout so telemetry cannot starve Spark heartbeats.
+    phase = spark_memory_phase(os.environ['CUTEAFD_SMOKE_URL'], diagnostics, timeout=3.)
     # Both hooks run after smoke has confirmed health; an older starting
     # snapshot cannot make this known-ready boundary a loading sample.
     if phase == 'loading':
         phase = 'ready-idle'
+    evidence = dict(phase=phase, boundary=boundary, ready=True, telemetry=diagnostics)
+    save(Path(job['state']) / f'memory-phase-{boundary}.json', evidence)
     hosts = job['entry'].get('sparks', [])
     def sample(item):
         rank, host = item
@@ -1216,7 +1240,7 @@ def spark_memory_boundary(job, boundary):
         row = json.loads(result.stdout)
         if row['rank'] != rank or row['host'] != host:
             raise ValueError('Spark boundary sampler identity mismatch')
-        row.update(phase=phase, boundary=boundary)
+        row.update(evidence)
         path = Path(job['state']) / f'memory-spark-rank{rank}-{boundary}.jsonl'
         with path.open('w') as output:
             output.write(json.dumps(row) + '\n')
@@ -1361,10 +1385,11 @@ def observe(job):
                 raise RuntimeError('Spark memory sampler: ' + '; '.join(spark_errors))
             if spark_samplers:
                 if time.monotonic() >= phase_sample_at:
-                    try:
-                        memory_phase = spark_memory_phase(os.environ['CUTEAFD_SMOKE_URL'])
-                    except (OSError, RuntimeError, ValueError):
-                        memory_phase = 'loading-or-unavailable'
+                    diagnostics = []
+                    memory_phase = spark_memory_phase(os.environ['CUTEAFD_SMOKE_URL'], diagnostics)
+                    with (dest / 'memory-phase.jsonl').open('a') as output:
+                        output.write(json.dumps(dict(time=time.time(), phase=memory_phase,
+                                                     telemetry=diagnostics)) + '\n')
                     phase_sample_at = time.monotonic() + 1
                 for child, _, _, _ in spark_samplers:
                     if child.poll() is not None:
