@@ -199,7 +199,7 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
         assert_eq!(arenas[0].view("glm.weights.embedding").unwrap().bytes() as u64,
             checkpoint.tensors.iter().find(|tensor| tensor.meta.name == cfg.embedding()).unwrap().meta.byte_length);
         for (device, arena) in memory.devices.iter().take(gpus).zip(&arenas) {
-            testing::assert_weight_arena_items(device, std::slice::from_ref(arena));
+            testing::assert_weight_arena_items(device, &[(arena, cuteafd_core::memory_layout::MemoryKind::Weights)]);
             assert!(!device.items.iter().any(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
                 || item.group == "GLM target weights"), "{ranks}+{gpus}: retained old physical owner");
         }

@@ -1,7 +1,7 @@
 //! Installed-header replay and compact real uploads share production dispatch.
 use super::*;
 use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
-use cuteafd_core::memory_layout::Category;
+use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
 use cuteafd_loader::placement::families::glm5::weights::WeightInventory;
 use cuteafd_loader::placement::planner::{Allocation, CoordinatorDevices, EmbeddingHome, Lifetime};
@@ -153,7 +153,8 @@ fn installed_variant_weight_inventory_equals_production_requests() -> Result<()>
 }
 
 fn arena_charge(components: &[cuteafd_loader::placement::planner::Component], id: &str,
-    location: cuteafd_loader::placement::planner::Location, bytes: u64, logical: u64) -> Result<u64> {
+    location: cuteafd_loader::placement::planner::Location, bytes: u64, logical: u64,
+    kind: MemoryKind) -> Result<u64> {
     use cuteafd_loader::placement::planner::{Activation, ComponentKind};
     let roots = components.iter().filter_map(|component| match &component.kind {
         ComponentKind::Allocation { template, deferred, .. } if template.id == id => {
@@ -168,7 +169,7 @@ fn arena_charge(components: &[cuteafd_loader::placement::planner::Component], id
     let root = roots[0];
     assert_eq!((root.location, root.bytes, root.lifetime), (location, bytes, Lifetime::RESIDENT));
     assert!(root.view.is_none());
-    assert_eq!((root.category, root.group.as_str()), (Category::Weights, "weight arena"));
+    assert_eq!((root.category, root.group.as_str()), (kind.category(), "weight arena"));
     let claims = components.iter().filter_map(|component| match &component.kind {
         ComponentKind::ResidentWeight(owner) if owner.id == id => {
             assert_eq!(component.activation, Activation::always());
@@ -218,7 +219,7 @@ fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
             end = view.offset() + view.bytes();
         }
         assert_eq!(end, arena.bytes());
-        let mut tail = arena_charge(&components, arena.id(), location, arena.bytes() as u64, payload)?;
+        let mut tail = arena_charge(&components, arena.id(), location, arena.bytes() as u64, payload, MemoryKind::Weights)?;
         let mut backing = arena.bytes() as u64;
         let mut old = payload;
         let mut roots = 1;
@@ -235,7 +236,7 @@ fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
         for shared in inventory.owners.iter().filter(|owner| owner.allocation.location == location
             && owner.allocation.id.contains(".shared.layer.")) {
             let owner = &shared.allocation;
-            tail += arena_charge(&components, &owner.id, location, owner.bytes, owner.bytes)?;
+            tail += arena_charge(&components, &owner.id, location, owner.bytes, owner.bytes, MemoryKind::Weights)?;
             backing += owner.bytes;
             old += owner.bytes;
             roots += 1;
@@ -325,7 +326,7 @@ fn installed_glm_and_ml4_draft_arena_charges_equal_shared_load_recipes() -> Resu
         for home in facts.homes(2) {
             let components = facts.components(home, 1)?;
             let id = format!("glm/draft/{home}");
-            let tail = arena_charge(&components, &id, Location::coordinator(home), arena.bytes() as u64, logical)?;
+            let tail = arena_charge(&components, &id, Location::coordinator(home), arena.bytes() as u64, logical, MemoryKind::DrafterWeights)?;
             assert_eq!(components.iter().filter(|component| matches!(&component.kind,
                 ComponentKind::ResidentWeight(_))).count(), 1);
             eprintln!("ARENA_CHARGE GLM-draft-{} home={home} old={logical} B={} tail={tail} new={} delta={} old_rounding=no",
@@ -348,7 +349,7 @@ fn installed_glm_and_ml4_draft_arena_charges_equal_shared_load_recipes() -> Resu
     for home in facts.homes(2) {
         let components = facts.components(home, 1)?;
         let id = format!("glm/draft/{home}");
-        let tail = arena_charge(&components, &id, Location::coordinator(home), arena.bytes() as u64, logical)?;
+        let tail = arena_charge(&components, &id, Location::coordinator(home), arena.bytes() as u64, logical, MemoryKind::DrafterWeights)?;
         assert_eq!(components.iter().filter(|component| matches!(&component.kind,
             ComponentKind::ResidentWeight(_))).count(), 1);
         eprintln!("ARENA_CHARGE ML4-bundled-draft home={home} old={old} logical={logical} B={} tail={tail} new={} delta={} old_rounding=no",

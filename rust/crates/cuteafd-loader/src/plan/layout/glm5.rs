@@ -808,7 +808,8 @@ mod tests {
                     // TokenEmbedding::row_fp8 retains its 256-byte table placeholder on rank 0.
                     let expected = physical.resident_bytes as u64 + shared.resident_bytes as u64
                         + if rank == 0 { 256 } else { 0 };
-                    assert_eq!(device.items.iter().filter(|item| matches!(item.category, Category::Weights | Category::Embedding))
+                    assert_eq!(device.items.iter().filter(|item| matches!(item.category, Category::Weights | Category::Embedding)
+                        && item.group != crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
                         .map(|item| item.bytes).sum::<u64>(), expected);
                     let backbone = selection.backbone(&records, cfg.layers).unwrap();
                     let dense = DensePlan::for_rank_owned(&backbone, gpus, rank, &owners).unwrap();

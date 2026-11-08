@@ -539,8 +539,9 @@ mod tests {
                     .map(|item| item.bytes).sum::<u64>() == bytes
             })).expect("one exact target embedding home");
             for (rank, target) in expected.into_iter().enumerate() {
-                let mut arenas = vec![target];
-                if rank == draft_home { arenas.push(draft_owners.draft_arenas[rank].clone()); }
+                use cuteafd_core::memory_layout::MemoryKind;
+                let mut arenas = vec![(&target, MemoryKind::Weights)];
+                if rank == draft_home { arenas.push((&draft_owners.draft_arenas[rank], MemoryKind::DrafterWeights)); }
                 testing::assert_weight_arena_items(&layout.devices[rank], &arenas);
                 assert!(!layout.devices[rank].items.iter().any(|item| item.group == "target weights"));
                 for alias in layout.devices[rank].items.iter().filter(|item| item.group == "embedding") {
