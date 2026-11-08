@@ -115,8 +115,11 @@ fn global_gpu_storage_flag_reaches_inventory_and_full_layout_admission() {
     let snapshot = tempfile::tempdir().unwrap();
     testing::write_snapshot(snapshot.path(), &testing::mimo_flash_config(),
         &testing::mimo_flash_tensors(), Some(1));
+    // The refused arm only has to sit below the fixture's accounted footprint;
+    // MiMo charges named owners instead of a post-Ready allowance, so the old
+    // 2 GiB boundary now fits.
     for layout in [false, true] {
-        for (gib, accepted) in [("95.5", true), ("2", false)] {
+        for (gib, accepted) in [("95.5", true), ("1", false)] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
             command.args(["--gpu-memory-cap", &format!("{gib}GiB"),
                 "--coordinator-weight-budget-gib", "80", "plan"]).arg(snapshot.path())
