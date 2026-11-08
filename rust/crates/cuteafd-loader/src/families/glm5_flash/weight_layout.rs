@@ -1,15 +1,21 @@
 //! Final, header-derived requests for the independently retired target weight set.
-use super::{weights::PREFIX, fp8::KdaFp8};
+//! The daemon binds exactly these views and admission charges exactly these layouts.
+use super::{core::CoreInventory, GlmNextAttention, GlmNextConfig};
+use crate::{placement::LayerMode, plan::Checkpoint, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
-use cuteafd_loader::{families::glm5_flash::{GlmNextAttention, GlmNextConfig, core::CoreInventory},
-    placement::LayerMode, plan::Checkpoint, serving_capacity::WeightArenaLayout};
 use std::collections::BTreeMap;
 
-pub(super) fn joined(names: &[String]) -> String { names.join("+") }
+/// Checkpoint tensor-name prefix of the text model.
+pub const PREFIX: &str = "model.language_model.";
 
-pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
-    ranks: usize, kda_fp8: KdaFp8, output_shard: bool, fp8_head: bool,
+pub fn joined(names: &[String]) -> String { names.join("+") }
+
+/// `kda_fp8` selects FP8 KDA input/output projections; the FP8 scale layout
+/// (row128 or channel) does not change any extent.
+#[allow(clippy::too_many_arguments)]
+pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
+    ranks: usize, kda_fp8: bool, output_shard: bool, fp8_head: bool,
     embedding: Option<(usize, usize)>) -> Result<Vec<WeightArenaLayout>> {
     ensure!(matches!(ranks, 1 | 2) && modes.len() <= cfg.layers, "Flash arena rank/layer extent");
     let core = CoreInventory::from_checkpoint(cfg, checkpoint)?;
@@ -48,8 +54,8 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
     }
     one(&mut requests[0], format!("{PREFIX}norm.weight"))?;
     if let Some(head) = core.get_weight("lm_head") {
-        let layout = cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
-            cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
+        let layout = crate::formats::trellis_core::CoreWeightLayout::new(head,
+            crate::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
         for (name, bytes) in layout.arena_tensors(&layout.stem)? {
             ensure!(requests[0].insert(name.clone(), bytes).is_none(), "duplicate Flash K6 view {name}");
         }
@@ -87,7 +93,7 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
                         let values = inputs.iter().enumerate().map(|(i, name)| elements(name)
                             .map(|bytes| bytes / if matches!(i, 3 | 4) { 1 } else { ranks })).collect::<Result<Vec<_>>>()?
                             .into_iter().sum::<usize>();
-                        if kda_fp8 != KdaFp8::Off {
+                        if kda_fp8 {
                             let key = joined(&inputs);
                             insert(out, format!("{key}.payload"), values)?;
                             insert(out, format!("{key}.scales"), values/128*4)?;
@@ -166,17 +172,17 @@ mod tests {
 
     #[test]
     fn final_requests_match_residency_for_tp_and_selected_representations() -> Result<()> {
-        use cuteafd_loader::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
-        use cuteafd_loader::families::glm5_flash::resident::{resident_weights, GlmfRepresentation};
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        use super::super::resident::{resident_weights, GlmfRepresentation};
         let root = tempfile::tempdir()?;
         let config = glm5_flash_config(6);
         write_snapshot(root.path(), &config, &glm5_flash_tensors(&config), None);
         let checkpoint = Checkpoint::open(root.path())?;
         let cfg = GlmNextConfig::from_hf(&config)?;
-        for ranks in [1, 2] { for kda_fp8 in [KdaFp8::Off, KdaFp8::Row128, KdaFp8::Channel] {
+        for ranks in [1, 2] { for kda_fp8 in [false, true] {
             for fp8_head in [false, true] { for output_shard in [false, true] {
-                if output_shard && (ranks == 1 || kda_fp8 == KdaFp8::Off) { continue; }
-                let repr = GlmfRepresentation { kda_fp8: kda_fp8 != KdaFp8::Off, fp8_head, output_shard };
+                if output_shard && (ranks == 1 || !kda_fp8) { continue; }
+                let repr = GlmfRepresentation { kda_fp8, fp8_head, output_shard };
                 let old = resident_weights(&checkpoint, &cfg, cfg.layers, ranks, repr).map_err(anyhow::Error::msg)?;
                 let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
                     kda_fp8, output_shard, fp8_head, Some((0, old[0].embedding as usize)))?;
@@ -192,9 +198,9 @@ mod tests {
 
     #[test]
     fn whole_mla_and_k6_keep_rank_local_views() -> Result<()> {
-        use cuteafd_loader::{plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot, t},
-            placement::{AttentionPlacement, FfnMode},
-            families::glm5_flash::{core, resident::{resident_weights_placed, GlmfRepresentation}}};
+        use crate::{plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot, t},
+            placement::{AttentionPlacement, FfnMode}};
+        use super::super::{core, resident::{resident_weights_placed, GlmfRepresentation}};
         let root = tempfile::tempdir()?;
         let mut config = glm5_flash_config(4);
         config["text_config"]["vocab_size"] = serde_json::json!(256);
@@ -226,7 +232,7 @@ mod tests {
             }).collect::<Vec<_>>();
             let old = resident_weights_placed(&checkpoint, &cfg, cfg.layers, ranks,
                 GlmfRepresentation::default(), attention, first_owner).map_err(anyhow::Error::msg)?;
-            let layouts = target(&checkpoint, &cfg, &modes, ranks, KdaFp8::Row128, false, true, None)?;
+            let layouts = target(&checkpoint, &cfg, &modes, ranks, true, false, true, None)?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 assert_eq!(layout.payload_bytes() as u64, old[rank].weights, "native rank {rank}/{ranks}");
@@ -249,7 +255,7 @@ mod tests {
             let embedding = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}embed_tokens.weight"))
                 .context("installed embedding header")?.meta.byte_length as usize;
             let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
-                KdaFp8::Row128, ranks == 2, true, Some((0, embedding)))?;
+                true, ranks == 2, true, Some((0, embedding)))?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();

@@ -20,7 +20,7 @@ pub(crate) mod head;
 mod precision;
 mod native;
 pub(crate) mod weights;
-mod weight_layout;
+use cuteafd_loader::families::glm5_flash::weight_layout;
 
 /// Whether this launch's coordinator operands can join a push group: every
 /// representation the push path records (BF16 operands, GPU FP8 copies,
@@ -2384,7 +2384,7 @@ impl Opened {
                 .then(|| embed.as_ref().context("Flash embedding source").and_then(|source|
                     source.allocation_request("embedding.table", cuteafd_loader::placement::planner::EmbeddingHome::Device(embedding_rank as u8))))
                 .transpose()?.map(|request| (embedding_rank, request.bytes as usize));
-            weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8,
+            weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8 != fp8::KdaFp8::Off,
                 args.kda_output_shard, args.fp8_head, embedding)?
         };
         let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {

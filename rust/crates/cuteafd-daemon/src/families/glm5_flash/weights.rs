@@ -31,7 +31,7 @@
 use crate::shared::experts::rtx::dense::{Job, Rect};
 use crate::shared::fp8_load_quant::Target;
 use crate::shared::memory::{DeviceAllocation, device::{Allocation, Device}, weight_arena::DeviceWeightArena};
-use super::weight_layout::joined;
+use cuteafd_loader::families::glm5_flash::weight_layout::joined;
 use crate::shared::peer_split::{Axis, RankDevice};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -46,7 +46,7 @@ use std::os::unix::fs::FileExt;
 use crate::shared::placement::layers::AttentionShare;
 use cuteafd_loader::placement::{FfnMode, LayerExecutionPlan, LayerMode};
 
-pub(crate) const PREFIX: &str = "model.language_model.";
+pub(crate) use cuteafd_loader::families::glm5_flash::weight_layout::PREFIX;
 
 pub(crate) struct GlmfLayer<'a> {
     pub attention: GlmNextAttention,
