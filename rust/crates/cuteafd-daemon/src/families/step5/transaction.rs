@@ -130,6 +130,7 @@ impl<'a> Staging<'a> {
         device: Device<'a>, programs: &'a Programs<'a>, cache: &CacheRank<'a>,
         available: usize, sequences: usize, unit_rows: usize,
     ) -> Result<Self> {
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-transaction");
         ensure!((1..=4096).contains(&unit_rows) && unit_rows as u64 <= cache.layout().ring.step,
             "Step-5 staging unit capacity");
         ensure!(sequences <= usize::try_from(cache.sequences())?,

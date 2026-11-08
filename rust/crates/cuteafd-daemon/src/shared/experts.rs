@@ -6,6 +6,7 @@
 pub(crate) mod execution;
 pub(crate) mod reply;
 pub(crate) mod exl3;
+pub(crate) mod weight_layout;
 pub(crate) mod exlr8;
 #[cfg(test)]
 mod exlr8_decode_gate;
@@ -517,3 +518,7 @@ mod reduction_tests {
         assert!(ExpertReductionPlan::new(&changed, 80).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "experts/weight_layout_tests.rs"]
+mod weight_layout_tests;

@@ -574,6 +574,7 @@ impl SparkAssignment {
         if !working.selected_ranks().contains(&rank) { return Ok(assignment); }
         ensure!(working.spark_layers.windows(2).all(|pair| pair[0] < pair[1]),
             "Spark layers must be sorted and unique");
+        let mut regions = Vec::new();
         for &layer in &working.spark_layers {
             ensure!(layer >= catalog.routed_experts().first_layer && layer < geometry.layers as usize,
                 "Spark layer {layer} is outside routed checkpoint headers");
@@ -590,7 +591,7 @@ impl SparkAssignment {
                     slice.projection_counts = plan.projection_counts.iter().map(|counts| {
                         Ok([u32::try_from(counts[0])?, u32::try_from(counts[1])?, u32::try_from(counts[2])?])
                     }).collect::<Result<_, std::num::TryFromIntError>>()?;
-                    plan.device_arena_layout()?.1 as u64
+                    vec![plan.device_arena_layout()?.1]
                 }
                 SparkResidentLayout::Fp8 { world, rank, slicing } => {
                     let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?
@@ -609,8 +610,15 @@ impl SparkAssignment {
                     slice.first = u32::try_from(first)?;
                     slice.width = u32::try_from(width)?;
                     slice.stored_width = u32::try_from(tensors.rank_width(world, rank, slicing)?)?;
-                    (tensors.weight_read_bytes_with(world, rank, slicing)? as u64)
-                        .checked_mul(tensors.shape().experts as u64).context("Spark FP8 resident overflow")?
+                    let mut planes = Vec::new();
+                    for projection in crate::formats::fp8_experts::Fp8Projection::ALL {
+                        let (weights, _) = tensors.slice_bytes_with(projection, world, rank, slicing)?;
+                        planes.push(weights.checked_mul(tensors.shape().experts)
+                            .context("Spark FP8 resident overflow")?);
+                        let scales = tensors.scale_region_bytes_with(projection, world, rank, slicing)?;
+                        if scales > 0 { planes.push(scales); }
+                    }
+                    planes
                 }
                 SparkResidentLayout::Native { world, rank }
                 | SparkResidentLayout::Nvfp4 { world, rank, .. } => {
@@ -653,19 +661,18 @@ impl SparkAssignment {
                     slice.first = u32::try_from(shard.first_intermediate())?;
                     slice.width = u32::try_from(width)?;
                     slice.stored_width = u32::try_from(stored_width)?;
-                    if catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes() {
-                        crate::formats::scale_codes::expert_bytes(geometry.experts as u64,
-                            geometry.hidden as u64, width as u64).context("coded Spark residency overflow")?
-                    } else {
-                        super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
-                            slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
-                    }
+                    let planes = crate::push_load::native::NativePlanes::with_scale_codes(
+                        geometry.hidden as usize, width, stored_width, geometry.experts as usize,
+                        catalog.nvfp4().is_some(), catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes())?;
+                    planes.planes.into_iter().chain(planes.vectors)
+                        .filter_map(|(_, bytes)| (bytes > 0).then_some(bytes)).collect()
                 }
             };
-            assignment.resident_bytes = assignment.resident_bytes.checked_add(resident)
-                .context("Spark resident sum overflow")?;
+            regions.extend(resident);
             assignment.slices.push(slice);
         }
+        assignment.resident_bytes = u64::try_from(
+            crate::serving_capacity::PackedWeightRegions::new(regions)?.bytes)?;
         Ok(assignment)
     }
 

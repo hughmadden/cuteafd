@@ -28,6 +28,16 @@ fn i64s(bytes: &[u8]) -> Vec<i64> {
 }
 
 impl<'a> PleTable<'a> {
+    pub(crate) fn allocation_receipts(&self,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "qwen4.ple",
+            cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "mapped PLE table");
+        self.scale.inventory(&mut inventory, "scale")?;
+        Ok(inventory.receipts)
+    }
+
     pub fn mapped(&self) -> &MappedTableDevice<'a> {
         &self.mapped
     }
@@ -38,7 +48,7 @@ impl<'a> PleTable<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("ple");
         let loader = super::weights::Qwen4Loader { library, checkpoint, fp8_decode: false,
             fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
-            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)) };
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), arenas: None };
         let prefix = format!("{}layers.{layer}.ple.ple_embedding.", super::weights::PREFIX);
         let multipliers = i64s(&loader.raw(&format!("{prefix}layer_multipliers"))?.0);
         let sizes = i64s(&loader.raw(&format!("{prefix}ngram_heads_vocab_sizes"))?.0);

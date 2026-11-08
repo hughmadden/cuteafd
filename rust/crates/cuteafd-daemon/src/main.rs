@@ -362,7 +362,8 @@ fn main() -> Result<()> {
         .init();
     tracing::info!("{host_isa}");
     tracing::info!("{malloc}");
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
+    shared::memory_report::finish(
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run()))
 }
 
 async fn run() -> Result<()> {

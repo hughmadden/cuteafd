@@ -642,7 +642,7 @@ impl Opened {
         let started = Instant::now();
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream,
-            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)), arenas: None };
         let source = self.embed_source()?;
         let with_mtp = args.mtp > 0 && layers == self.cfg.layers;
         cuteafd_bench::context::set_resolved("mtp", &if with_mtp { args.mtp.min(engine::DECODE_ROWS - 1) } else { 0 }.to_string());
@@ -653,6 +653,8 @@ impl Opened {
         // and Required planning or delivery failures refuse startup.
         let push_policy = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&args.snapshot)?;
         let device = crate::shared::memory::device::Device { library: &self.library, id: self.library.cuda_get_device()? };
+        let loader = loader.with_arenas(&self.cfg, &vec![0; layers], &[(device, stream)],
+            with_mtp, args.mtp_fp8_head, args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu)?;
         let planned = push_policy.plan(|| {
             let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
             let planning = weights::Qwen4Loader { dense: load.clone(), ..loader.clone() };
@@ -673,8 +675,8 @@ impl Opened {
             Some((push, model, records, dense)) => {
                 let split = crate::shared::memory::load_timing::Split::start();
                 let (pushed, embedding) = push.receive_with(vec![device], None, 0, Some(Ok(dense)), ||
-                    crate::shared::token_io::TokenEmbedding::load(&self.library, source, args.token_io.embed_placement,
-                        || Ok(())));
+                    crate::shared::token_io::TokenEmbedding::load_with(&self.library, source, args.token_io.embed_placement,
+                        || Ok(()), |name, bytes| loader.embedding_allocation(name, bytes)));
                 let pushed = push_policy.committed(pushed).context("Qwen coordinator dense push delivery")?;
                 let (embedding, ()) = embedding?;
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(),
@@ -682,9 +684,10 @@ impl Opened {
                 split.log("qwen4 dense push");
                 (embedding, model)
             }
-            None => crate::shared::token_io::TokenEmbedding::load(&self.library, source, args.token_io.embed_placement,
+            None => crate::shared::token_io::TokenEmbedding::load_with(&self.library, source, args.token_io.embed_placement,
                 || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                    loader.model(&self.cfg, layers, with_mtp, args.mtp_fp8_head) })?,
+                    loader.model(&self.cfg, layers, with_mtp, args.mtp_fp8_head) },
+                |name, bytes| loader.embedding_allocation(name, bytes))?,
         };
         let attention_plan = attention_plan(args, model.mtp.is_some())?;
         let programs = programs.with_attention_plan(attention_plan, |name| selected.contains(name))?;
@@ -723,6 +726,7 @@ impl Opened {
                 engine::DECODE_ROWS)?),
             _ => None,
         };
+        weights::arena::probe(&self.library, &[device.id], &model, &embedding, ple.as_ref())?;
         use cuteafd_loader::placement::ResidentWeights;
         let mut loaded_weights = ResidentWeights(resident as u64)
             .checked_add(ResidentWeights(embedding.device_bytes() as u64))?
@@ -816,6 +820,9 @@ impl Opened {
         engine.admit_host_memory(args)?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.prepare_prefill_units()?;
+        // Weights and experts are resident: the load's pinned upload high-water
+        // is transient (serving's small table uploads regrow only what they use).
+        crate::shared::memory_report::release_load_staging(&self.library)?;
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.

@@ -21,6 +21,7 @@ mod shared {
     pub(crate) mod target_head;
     pub(crate) mod experts {
         pub(crate) mod layer;
+        pub(crate) mod weight_layout;
         pub(crate) mod paired_load;
         pub(crate) mod rtx {
             pub(crate) mod dense;

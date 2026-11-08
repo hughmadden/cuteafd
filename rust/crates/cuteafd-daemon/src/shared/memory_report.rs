@@ -30,7 +30,11 @@ fn meminfo() -> Value {
 /// nothing: call it from a thread that does not launch work, or restore the
 /// device afterwards (see [`log`]).
 pub(crate) fn report(stage: &str) -> Value {
-    let snapshot = memory_ledger::snapshot();
+    report_snapshot(stage, &memory_ledger::snapshot(), &memory_ledger::device_memory)
+}
+
+fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
+    device_memory: &impl Fn(i32) -> Option<(usize, usize)>) -> Value {
     let mut per_device = Vec::new();
     // Only devices this process allocated on: querying another would create a context there.
     for device in snapshot.devices() {
@@ -43,7 +47,7 @@ pub(crate) fn report(stage: &str) -> Value {
             "peak": snapshot.peak.get(&(Space::Device, device)).copied().unwrap_or(0),
             "scopes": scopes,
         });
-        if let Some((free, total)) = memory_ledger::device_memory(device) {
+        if let Some((free, total)) = device_memory(device) {
             let used = total - free;
             entry["used"] = json!(used);
             entry["total"] = json!(total);
@@ -79,6 +83,23 @@ pub(crate) fn log(stage: &str) {
     if let Ok(value) = value {
         tracing::info!(target: "cuteafd::memory", report = %value, "memory ledger");
     }
+}
+
+/// One final error-boundary report for every command/family. Native failures
+/// retain the pre-unwind sample; other errors report the remaining live owners.
+pub(crate) fn finish<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    if let Err(error) = &result {
+        let retained = error.chain().find_map(|cause| cause.downcast_ref::<memory_ledger::FailureSnapshot>());
+        let mut value = match retained {
+            Some(failure) => report_snapshot("failure", &failure.ledger,
+                &|device| failure.device_memory.get(&device).copied()),
+            None => report("failure"),
+        };
+        value["error"] = json!(format!("{error:#}"));
+        value["pre_unwind"] = json!(retained.is_some());
+        tracing::error!(target: "cuteafd::memory", report = %value, error = %error, "memory ledger");
+    }
+    result
 }
 
 /// Logs a report now and again whenever device use or the ledger moves by at
@@ -150,6 +171,37 @@ pub(crate) fn kv_shortfall(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn command_error_emits_one_final_failure_report() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let output = Output(Arc::new(Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(finish(Ok(7)).unwrap(), 7);
+            let failure = memory_ledger::FailureSnapshot::new(
+                anyhow::anyhow!("startup fixture failure"), memory_ledger::Snapshot::default(), BTreeMap::new());
+            let wrapped = anyhow::Error::new(crate::shared::experts::rtx::push::PushStartupError::Planning(
+                anyhow::Error::new(failure))).context("family initialization");
+            assert!(finish::<()>(Err(wrapped)).is_err());
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("memory ledger").count(), 1, "{text}");
+        assert!(text.contains(r#""stage":"failure""#), "{text}");
+        assert!(text.contains("startup fixture failure"), "{text}");
+        assert!(text.contains(r#""pre_unwind":true"#), "{text}");
+    }
 
     #[test]
     fn only_memory_refusals_are_kv_shortfalls() {

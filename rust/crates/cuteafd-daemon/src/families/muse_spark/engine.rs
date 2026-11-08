@@ -17,7 +17,8 @@ use cuteafd_loader::placement::{families::muse_spark::{self as shared, AdmittedM
 use std::{ffi::c_void, rc::Rc};
 
 /// What one rank's load needs from startup.
-pub(crate) struct RankLoad<'c> {
+pub(crate) struct RankLoad<'c, 'a> {
+    pub arena: &'c crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
     pub cfg: &'c MuseSparkConfig,
     pub checkpoint: &'c cuteafd_loader::plan::Checkpoint,
     pub built: &'c AdmittedMuse,
@@ -113,8 +114,8 @@ impl<'a> StepStorage<'a> {
 }
 
 impl<'a> RankResources<'a> {
-    pub(crate) fn load(device: Device<'a>, programs: &'a Programs<'a>, load: RankLoad<'_>) -> Result<Self> {
-        let RankLoad { cfg, checkpoint, built, placement, rank, slots, unit_rows, waves, context } = load;
+    pub(crate) fn load(device: Device<'a>, programs: &'a Programs<'a>, load: RankLoad<'_, 'a>) -> Result<Self> {
+        let RankLoad { cfg, checkpoint, built, placement, rank, slots, unit_rows, waves, context, arena } = load;
         let tables = shared::step_tables(unit_rows, usize::try_from(slots)?, context, waves)?;
         let ranks = built.layouts.first().map_or(0, Vec::len);
         ensure!(rank < ranks && placement.items.len() == ranks, "Muse rank {rank} of {ranks} placement ranks");
@@ -130,7 +131,7 @@ impl<'a> RankResources<'a> {
         // Programs before any allocation: a missing export refuses here.
         let bound = device.run(|| RankPrograms::bind(programs, ranks))?;
         let core = CorePrograms::load(programs, device, built.projections.get(rank).context("Muse rank projections")?)?;
-        let layers = load_rank(device, cfg, checkpoint, &built.layouts, rank)?;
+        let layers = load_rank(device, cfg, checkpoint, &built.layouts, rank, arena)?;
         let kv = RankKv::allocate(device, cfg, &MuseCacheLayout::new(cfg, ranks)?, placement, rank, slots)?;
         let plan = shared::rope_tables(cfg, context)?;
         let recipe = *plan.recipes.first().context("Muse rotary plan has no recipe")?;
@@ -142,7 +143,7 @@ impl<'a> RankResources<'a> {
         }).transpose()?;
         let step = StepStorage::allocate(device, tables)?;
         let global_layout = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(cfg, &actual_core)?;
-        let globals = GlobalWeights::load(device, checkpoint, &global_layout, rank, ranks)?;
+        let globals = GlobalWeights::load(device, checkpoint, &global_layout, rank, ranks, arena)?;
         let head = match &globals.head {
             Some(weights) => {
                 let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(weights.shape[0],

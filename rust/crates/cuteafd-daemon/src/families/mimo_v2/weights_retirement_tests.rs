@@ -27,7 +27,7 @@ fn loader<'a>(library: &'a NativeLibrary, checkpoint: &'a Checkpoint,
     MimoLoader { library, checkpoint, stream: std::ptr::null_mut(), checkpoint_tp: 1,
         fp8_head: false, output_formats: formats, fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax,
         device: 0, peers: vec![RankDevice { device: 1, stream: std::ptr::null_mut() }],
-        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), transient: Default::default() }
+        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), transient: Default::default(), arenas: Default::default() }
 }
 
 fn count(events: &str, tag: char) -> usize { events.chars().filter(|&c| c == tag).count() }

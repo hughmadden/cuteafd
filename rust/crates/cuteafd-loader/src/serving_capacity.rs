@@ -19,6 +19,42 @@ mod fp8moe_workspace;
 pub use fp8moe_workspace::fp8moe_tp2_workspace;
 mod weight_storage;
 pub use weight_storage::{PackedWeightRegions, WeightArenaLayout, WeightArenaView};
+
+/// Stable physical owner ID for one independently retired expert selection.
+/// Both admission planners and runtime loaders pass the same ordered final views.
+pub fn expert_weight_arena_id(format: &str, device: i32,
+    regions: &[(String, usize)]) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(!format.is_empty() && device >= 0, "invalid expert arena identity");
+    let selection = format!("{:x}", Sha256::digest(serde_json::to_vec(regions)?));
+    Ok(format!("experts.{format}.gpu.{device}.{selection}"))
+}
+
+#[cfg(test)]
+mod expert_weight_arena_id_tests {
+    use super::*;
+
+    #[test]
+    fn planner_runtime_ids_match_tp1_tp2_and_independent_draft() -> anyhow::Result<()> {
+        for device in 0..2 {
+            for shard in ["BackboneFull", "BackboneTp2"] {
+                let target = vec![(format!("{shard}.layer.3.0"), 4097),
+                    (format!("{shard}.layer.7.0"), 8193)];
+                let draft = vec![("Dspark.stage.0.0".into(), 2049)];
+                let planner = expert_weight_arena_id("exl3", device, &target)?;
+                let runtime = WeightArenaLayout::new(
+                    expert_weight_arena_id("exl3", device, &target)?, target.clone())?;
+                assert_eq!(planner, runtime.id());
+                assert_ne!(planner, expert_weight_arena_id("exl3", device, &draft)?);
+                assert_ne!(planner, expert_weight_arena_id("exl3", 1 - device, &target)?);
+                let combined = target.into_iter().chain(draft).collect::<Vec<_>>();
+                assert_ne!(planner, expert_weight_arena_id("exl3", device, &combined)?);
+            }
+        }
+        Ok(())
+    }
+}
+
 mod peer_storage;
 pub use peer_storage::PeerStorageLayout;
 pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format, spark_intake_bytes, PrefillShape};

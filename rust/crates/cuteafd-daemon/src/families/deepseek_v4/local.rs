@@ -315,12 +315,46 @@ impl<'a> LocalExperts<'a> {
         ensure!(budget > workspace, "local experts need {workspace} workspace bytes, budget is {budget}");
         let mut remaining = budget - workspace;
         tracing::info!(budget, workspace, scratch_bytes, "loading coordinator expert layers");
+        let mut selected_backbone = backbone.len();
+        let arena = if pushed.is_none() {
+            let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+            let mut selections = Vec::new();
+            let mut staging = 0;
+            for stage in 0..draft_stages {
+                let layer = ExpertLayer::BackboneFull { layer: shape.layers + stage };
+                let plan = ExpertWeights::plan(library, catalog, layer)?;
+                staging = staging.max(plan.device_staging_bytes);
+                selections.push(layer);
+                let layout = ExpertWeights::arena_layout(device, catalog, selections.iter().copied())?;
+                crate::shared::experts::weight_layout::admit(&layout, staging, workspace, budget)
+                    .with_context(|| format!("dSpark stage {stage} experts exceed local budget"))?;
+            }
+            selected_backbone = 0;
+            for &layer in backbone {
+                let selection = ExpertLayer::BackboneFull { layer };
+                let plan = ExpertWeights::plan(library, catalog, selection)?;
+                selections.push(selection);
+                let candidate_staging = staging.max(plan.device_staging_bytes);
+                let layout = ExpertWeights::arena_layout(device, catalog, selections.iter().copied())?;
+                if !crate::shared::experts::weight_layout::fits(&layout, candidate_staging, workspace, budget)? {
+                    selections.pop();
+                    break;
+                }
+                staging = candidate_staging;
+                selected_backbone += 1;
+            }
+            if selections.is_empty() { return Ok(None); }
+            let layout = ExpertWeights::arena_layout(device, catalog, selections.iter().copied())?;
+            crate::shared::experts::weight_layout::admit(&layout, staging, workspace, budget)?;
+            Some(ExpertWeights::arena(device, catalog, selections)?)
+        } else { None };
         let mut stages = Vec::new();
         for stage in 0..draft_stages {
             let layer = ExpertLayer::BackboneFull { layer: shape.layers + stage };
             let weights = match &mut pushed {
                 Some(weights) => weights.next().context("committed dSpark stage absent")?,
-                None => ExpertWeights::load(library, catalog, layer, remaining)
+                None => ExpertWeights::load_into(library, catalog, layer, remaining,
+                    arena.as_ref().context("mounted dSpark transaction arena absent")?)
                     .with_context(|| format!("dSpark stage {stage} experts with {remaining} bytes left"))?,
             };
             ensure!(weights.budget().resident_bytes == ExpertWeights::plan(library, catalog, layer)?.resident_bytes,
@@ -330,12 +364,12 @@ impl<'a> LocalExperts<'a> {
             stages.push(weights);
         }
         let mut layers = Vec::new();
-        for &layer in backbone {
+        for &layer in &backbone[..selected_backbone] {
             let plan = ExpertWeights::plan(library, catalog, ExpertLayer::BackboneFull { layer })?;
-            if pushed.is_none() && plan.peak_device_bytes()? > remaining { break; }
             let weights = match &mut pushed {
                 Some(weights) => weights.next().context("committed backbone layer absent")?,
-                None => ExpertWeights::load(library, catalog, ExpertLayer::BackboneFull { layer }, remaining)
+                None => ExpertWeights::load_into(library, catalog, ExpertLayer::BackboneFull { layer }, remaining,
+                    arena.as_ref().context("mounted backbone transaction arena absent")?)
                     .with_context(|| format!("coordinator expert layer {layer} with {remaining} bytes left"))?,
             };
             ensure!(weights.budget().resident_bytes == plan.resident_bytes,
@@ -474,10 +508,18 @@ impl<'a> LocalExperts<'a> {
             max_rows, budget)? else { return Ok(None) };
         let directory = catalog.exl3().map(|m| aot_layout_directory(native_lib, m.decoder_tiers(), "rtx-tp1"));
         tracing::info!(budget, package = ?directory, layers = selections.len(), "loading coordinator EXL3 expert layers");
+        if selections.is_empty() { return Ok(None); }
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let layout = crate::shared::experts::weight_layout::layout(device.id, "exl3",
+            crate::shared::experts::exl3::regions(catalog, selections.iter().copied())?)?;
+        let staging = selections.iter().map(|&selection| Exl3Weights::plan(catalog, selection))
+            .collect::<Result<Vec<_>>>()?.iter().map(|plan| plan.device_staging_bytes).max().unwrap_or(0);
+        crate::shared::experts::weight_layout::admit(&layout, staging, 0, weights_budget)?;
+        let arena = crate::shared::experts::exl3::arena(device, catalog, selections.iter().copied())?;
         let mut remaining = weights_budget;
         let mut weights = Vec::with_capacity(selections.len());
         for &selection in &selections {
-            let weight = Exl3Weights::load(library, catalog, selection, remaining)
+            let weight = Exl3Weights::load_into(library, catalog, selection, remaining, &arena)
                 .with_context(|| format!("coordinator EXL3 {selection:?} with {remaining} bytes left"))?;
             remaining -= weight.budget.resident_bytes;
             tracing::debug!(?selection, resident = weight.budget.resident_bytes, remaining, "coordinator EXL3 layer resident");

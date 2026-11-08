@@ -523,7 +523,7 @@ pub type CuteafdStatus = c_int;
 /// A native-library call returned a non-OK status. This is a device/driver
 /// failure (CUDA, RDMA or NCCL), not a host-side invariant failure: callers
 /// that keep device state alive across calls must treat it as terminal.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{context} returned status {status}: {detail}")]
 pub struct NativeStatusError {
     pub context: String,
@@ -2384,6 +2384,7 @@ impl NativeLibrary {
 
 
 
+    #[track_caller]
     pub fn alloc_host_buffer(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
         let alloc_fn: AllocHostBufferFn = self.cuteafd_alloc_host_buffer()?;
         let mut buffer = CuteafdHostBuffer::default();
@@ -2578,6 +2579,7 @@ impl NativeLibrary {
         Ok(bytes)
     }
 
+    #[track_caller]
     pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocDeviceBufferFn = self.cuteafd_alloc_device_buffer()?;
@@ -2588,6 +2590,7 @@ impl NativeLibrary {
         Ok(buffer)
     }
 
+    #[track_caller]
     pub fn alloc_managed_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocManagedDeviceBufferFn = self.cuteafd_alloc_managed_device_buffer()?;
@@ -5089,11 +5092,11 @@ impl NativeLibrary {
         let last_error = self
             .last_error()
             .unwrap_or_else(|err| format!("last error unavailable: {err}"));
-        Err(anyhow::Error::new(NativeStatusError {
+        Err(memory_ledger::capture_failure(anyhow::Error::new(NativeStatusError {
             context: context.to_string(),
             status,
             detail: last_error,
-        }))
+        })))
     }
 }
 

@@ -509,11 +509,10 @@ impl<'a> From<DeviceAllocation<'a>> for ResidentPlane<'a> {
 impl<'a> ResidentPlane<'a> {
     pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         name: &str) -> Result<()> {
-        let owner = match &self._owner {
-            PlaneOwner::Mount { _allocation } => _allocation.buffer,
-            PlaneOwner::Push { _rank } => _rank.allocation_buffer(),
-        };
-        inventory.backed_device(name, self.buffer, owner)
+        match &self._owner {
+            PlaneOwner::Mount { _allocation } => _allocation.inventory(inventory, name),
+            PlaneOwner::Push { _rank } => inventory.backed_device(name, self.buffer, _rank.allocation_buffer()),
+        }
     }
 
     fn pushed(library: &'a NativeLibrary,
@@ -645,6 +644,32 @@ impl<'a> ExpertWeights<'a> {
         Ok(Self::layout(library, catalog, layer)?.0)
     }
 
+    pub(crate) fn arena<'b>(device: crate::shared::memory::device::Device<'b>,
+        catalog: &OfficialV41Catalog, layers: impl IntoIterator<Item = ExpertLayer>)
+        -> Result<crate::shared::memory::weight_arena::DeviceWeightArena<'b>> {
+        let layout = Self::arena_layout(device, catalog, layers)?;
+        crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)
+    }
+
+    pub(crate) fn arena_layout(device: crate::shared::memory::device::Device<'_>,
+        catalog: &OfficialV41Catalog, layers: impl IntoIterator<Item = ExpertLayer>)
+        -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
+        let mut regions = Vec::new();
+        for layer in layers {
+            let (_, mut sizes, _, experts) = device.run(|| Self::layout(device.library, catalog, layer))?;
+            if layer.is_quantized_nvfp4(catalog) {
+                for bytes in &mut sizes { *bytes = bytes.checked_mul(experts).context("NVFP4 slab overflow")?; }
+            }
+            for (index, bytes) in sizes.into_iter().enumerate() {
+                regions.push((super::weight_layout::name(layer, index), bytes));
+            }
+            if layer.is_quantized_nvfp4(catalog) {
+                for index in 4..8 { regions.push((super::weight_layout::name(layer, index), experts * 4)); }
+            }
+        }
+        super::weight_layout::layout(device.id, "native", regions)
+    }
+
     /// W4A4 layout: the four per-expert planes replace the packed W4A8 slabs.
     fn nvfp4_layout(
         library: &NativeLibrary,
@@ -672,8 +697,19 @@ impl<'a> ExpertWeights<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<Self> {
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let layout = Self::arena_layout(device, catalog, [layer])?;
+        let staging = Self::plan(library, catalog, layer)?.device_staging_bytes;
+        super::weight_layout::admit(&layout, staging, 0, available_device_bytes)?;
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
+        Self::load_into(library, catalog, layer, available_device_bytes, &arena)
+    }
+
+    pub(crate) fn load_into(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        layer: ExpertLayer, available_device_bytes: usize,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>) -> Result<Self> {
         if layer.is_quantized_nvfp4(catalog) {
-            return Self::load_nvfp4(library, catalog, layer, available_device_bytes);
+            return Self::load_nvfp4(library, catalog, layer, available_device_bytes, arena);
         }
         let (budget, sizes, intermediate, experts) = Self::layout(library, catalog, layer)?;
         let packer = library.v41_expert_packer(intermediate)?;
@@ -689,8 +725,8 @@ impl<'a> ExpertWeights<'a> {
         };
         let load_started = std::time::Instant::now();
         let mut owned = Vec::with_capacity(4);
-        for size in sizes {
-            owned.push(DeviceAllocation::new(library, size)?);
+        for (index, size) in sizes.into_iter().enumerate() {
+            owned.push(DeviceAllocation::from_allocation(arena.view(&super::weight_layout::name(layer, index), size)?));
         }
         let buffers: [DeviceAllocation<'a>; 4] =
             owned.try_into().ok().expect("four packed buffers");
@@ -941,6 +977,18 @@ impl<'a> ExpertWeights<'a> {
         let started = std::time::Instant::now();
         let lanes = EXPERT_READ_LANES / 2;
         let mut weights = [devices[0].own(|| Ok(Vec::new()))?, devices[1].own(|| Ok(Vec::new()))?];
+        let layouts = (0..2).map(|rank| {
+            let layout = Self::arena_layout(devices[rank], catalog,
+                layers.iter().map(|&layer| ExpertLayer::BackboneTp2 { layer, rank }))?;
+            let staging = layers.iter().map(|&layer| devices[rank].run(||
+                Self::plan(devices[rank].library, catalog, ExpertLayer::BackboneTp2 { layer, rank })))
+                .collect::<Result<Vec<_>>>()?.iter().map(|p| p.device_staging_bytes).max().unwrap_or(0);
+            super::weight_layout::admit(&layout, staging, 0, available[rank])?;
+            Ok(layout)
+        }).collect::<Result<Vec<_>>>()?;
+        let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout))
+            .collect::<Result<Vec<_>>>()?;
         let mut staging_bytes = [0; 2];
         let mut pinned_admitted = 0;
         let mut full_bytes = 0;
@@ -958,7 +1006,9 @@ impl<'a> ExpertWeights<'a> {
                 remaining[rank] -= budget.resident_bytes;
                 devices[rank].run(|| {
                     let mut owned = Vec::with_capacity(4);
-                    for bytes in sizes { owned.push(DeviceAllocation::new(devices[rank].library, bytes)?); }
+                    for (index, bytes) in sizes.into_iter().enumerate() {
+                        owned.push(DeviceAllocation::from_allocation(arenas[rank].view(&super::weight_layout::name(selection, index), bytes)?));
+                    }
                     weights[rank].push(Self { buffers: <[DeviceAllocation<'a>; 4]>::try_from(owned).ok().expect("four native slabs").map(Into::into),
                         layer: selection, experts, budget, nvfp4: None, format: ExpertFormat::Native, raw_scales: RawScales::none() });
                     Ok(())
@@ -1115,8 +1165,9 @@ impl<'a> ExpertWeights<'a> {
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,
         available_device_bytes: usize,
+        arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
     ) -> Result<Self> {
-        let (buffers, side) = nvfp4::Nvfp4Side::load(library, catalog, layer, available_device_bytes)?;
+        let (buffers, side) = nvfp4::Nvfp4Side::load(library, catalog, layer, available_device_bytes, arena)?;
         let budget = nvfp4::Nvfp4Side::plan(library, catalog, layer)?;
         let (_, experts) = nvfp4::Nvfp4Side::rank_planes(layer, catalog)?;
         Ok(Self {

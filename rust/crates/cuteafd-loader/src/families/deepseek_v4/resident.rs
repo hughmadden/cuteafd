@@ -340,6 +340,65 @@ mod tests {
     }
 
     #[test]
+    fn arenas_cover_selected_tp1_tp2_modes_and_final_formats() -> Result<()> {
+        use super::super::weight_arena::{coordinator_arena, operand_name};
+        let (cfg, tensors) = fixture();
+        for ranks in [1, 2] {
+            for owner in 0..ranks {
+                let mut modes = vec![if ranks == 1 {
+                    LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }
+                } else { LayerMode::HeadSplit }; cfg.n_layers];
+                if ranks == 2 { modes[1] = LayerMode::Whole { gpu: owner as u8, ffn: FfnMode::Split }; }
+                for draft in [false, true] {
+                    let operands = resident_operands(&cfg, &modes, ranks, draft, &tensors)?;
+                    for rank in 0..ranks {
+                        for scope in [false, true] {
+                            let arena = coordinator_arena(&operands, rank, scope, true)?;
+                            let items = operands.iter().filter(|i| i.rank == rank && (i.group == "speculator") == scope)
+                                .collect::<Vec<_>>();
+                            assert_eq!(arena.is_some(), !items.is_empty());
+                            if let Some(arena) = arena {
+                                assert_eq!(arena.views().len(), items.len());
+                                for item in items {
+                                    assert_eq!(arena.view(&operand_name(item)).unwrap().bytes() as u64, item.bytes);
+                                }
+                                assert!(!arena.views().keys().any(|k| k.contains("confidence_head")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "header-only installed V4 CPU allocation inventory; set CUTEAFD_V4_ARENA_SNAPSHOT"]
+    fn installed_v4_arena_cpu_inventory() -> Result<()> {
+        use super::super::weight_arena::coordinator_arena;
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_V4_ARENA_SNAPSHOT")?);
+        let cfg = DeepseekV4Config::read(&snapshot, 1)?;
+        let catalog = crate::read_expert_catalog(&snapshot)?;
+        for ranks in [1, 2] {
+            let modes = vec![if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } }
+                else { LayerMode::HeadSplit }; cfg.n_layers];
+            let operands = resident_operands(&cfg, &modes, ranks, true, catalog.tensors().iter().map(|t| &t.metadata))?;
+            for rank in 0..ranks {
+                for draft in [false, true] {
+                    let Some(arena) = coordinator_arena(&operands, rank, draft, true)? else { continue; };
+                    let extents = arena.views().values().map(|v| v.bytes()).collect::<Vec<_>>();
+                    let large = extents.iter().copied().filter(|&b| b > 1 << 20).collect::<Vec<_>>();
+                    let tail = |bytes: usize| if bytes > 1 << 20 { bytes.next_multiple_of(2 << 20) - bytes } else { 0 };
+                    println!("V4_ARENA ranks={ranks} rank={rank} draft={draft} count={} payload={} large_count={} large_bytes={} old_tail={} arena={} padding={} final_tail={}",
+                        extents.len(), arena.payload_bytes(), large.len(), large.iter().sum::<usize>(),
+                        large.iter().map(|&b| tail(b)).sum::<usize>(), arena.bytes(), arena.padding_bytes(), tail(arena.bytes()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn whole_c4_keeps_ffn_halves_and_removes_every_nonowner_attention_operand() -> Result<()> {
         let (cfg, tensors) = fixture();
         let split_modes = vec![LayerMode::HeadSplit; cfg.n_layers];
