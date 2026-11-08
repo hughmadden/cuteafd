@@ -112,8 +112,8 @@ mod tests {
     /// charge priced (so B+tail replaces, never stacks on, the payload).
     #[test]
     fn installed_arena_charges_replace_per_tensor_weights() -> Result<()> {
-        use cuteafd_loader::placement::families::deepseek_v41::{admission, owners, resident,
-            Bytes2, DraftInventory, ExpertCost};
+        use cuteafd_loader::placement::families::deepseek_v41::{admission, owners, resident, DraftInventory};
+        use cuteafd_loader::placement::{Bytes2, ExpertCost};
         use cuteafd_loader::placement::planner::{allocation_granularity_forecast,
             ComponentKind, Lifetime, Operation, PrefillShape};
         let Some(snapshot) = super::super::coordinator_golden_tests::snapshot() else { return Ok(()) };

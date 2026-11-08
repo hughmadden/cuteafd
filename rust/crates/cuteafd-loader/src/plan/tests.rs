@@ -4681,13 +4681,25 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     assert!(!auto.devices[0].by_category().contains_key(&Category::Embedding));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;
     let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert!(gpu.devices[0].by_category()[&Category::Embedding] > 0);
+    assert!(!gpu.devices[0].by_category().contains_key(&Category::Embedding));
     let embedding = component(&plan(dir.path(), &options).unwrap(), Component::Embedding).bytes;
-    assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(), embedding);
+    let target = |embedding| crate::placement::families::deepseek_v41::weight_layout::TargetLayout::from_headers(
+        checkpoint.tensors.iter().map(|tensor| &tensor.meta), None, embedding,
+        crate::placement::families::deepseek_v41::resident::Fp8Head::configured(), false, false).unwrap();
+    let host_target = target(false);
+    let gpu_target = target(true);
+    assert_eq!(gpu_target.ranks[0].payload_bytes() - host_target.ranks[0].payload_bytes(), embedding as usize);
+    let charged = |layout: &crate::serving_capacity::WeightArenaLayout| {
+        let b = layout.bytes() as u64;
+        b + crate::placement::planner::allocation_granularity_forecast(&[b]).unwrap()
+    };
+    assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(),
+        charged(&gpu_target.ranks[0]) - charged(&host_target.ranks[0]));
     options.layout.as_mut().unwrap().force_gpu_embedding = false;
     options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30];
     let pro = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert!(pro.devices[0].by_category()[&Category::Embedding] > 0);
+    assert_eq!(pro.devices[0].items.iter().filter(|item| item.group == "weight arena")
+        .map(|item| item.bytes).sum::<u64>(), gpu_target.ranks[0].bytes() as u64);
 }
 
 #[test]
