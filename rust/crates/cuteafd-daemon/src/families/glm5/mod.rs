@@ -1771,9 +1771,16 @@ impl Opened {
                 cuteafd_loader::placement::inventory::CapturedGraphRank::measure(capture.rank as u8,
                     &declared[capture.rank], &capture.keys, capture.before, capture.after)
                     .map_err(anyhow::Error::msg)).collect::<Result<Vec<_>>>()?;
+            // The KV pool is already allocated and the captured graphs bake in its
+            // pointers, so a capture above its charge has only the growth phase to
+            // grow into; a census placeholder that undercharges needs that slack.
             let reconciled = cuteafd_loader::placement::planner::serving::reconcile_startup_graphs(
                 &mut admitted.solved, "glm.graphs", &admitted.graphs.set(),
-                admitted.graphs.fingerprints(), &measured).map_err(anyhow::Error::msg)?;
+                admitted.graphs.fingerprints(), &measured).map_err(|error| anyhow::anyhow!(
+                    "{error}; the KV pool was sized before capture and cannot be resized after it, so a \
+                     census of an unmeasured startup-graph fingerprint is a measurement run and must leave \
+                     headroom: set KV_TARGET_TOKENS below KV_MAX_TOKENS; its measured row then serves at \
+                     maxed KV"))?;
             for (rank, (row, live)) in admitted.graphs.ranks().iter().zip(&reconciled.ranks).enumerate() {
                 tracing::info!(rank, executables = live.executables, measured = live.bytes,
                     plan = row.bytes, "GLM startup graph capture reconciled");

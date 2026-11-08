@@ -1274,18 +1274,23 @@ fn graph_row(fingerprint: &str, keys: usize) -> Option<GraphRow> {
         //
         // The pool is sized from this placeholder, so a census of a fingerprint
         // whose live capture exceeds it only reconciles if the growth phase has
-        // slack. With `KV_TARGET_TOKENS == KV_MAX_TOKENS` the pool fills the
-        // budget and there is none: reconcile then refuses (`during post-ready
-        // growth`) instead of shrinking the pool. A census run therefore either
-        // carries a measured row for its fingerprint or leaves the pool target
-        // below the maximum.
+        // slack. The KV pool is allocated before capture (`GlmEngine::new`) and
+        // the captured graphs bake in its pointers, so reconcile can neither
+        // shrink the pool in place (one `Tag::kv` allocation releases nothing to
+        // CUDA) nor reallocate it (graph pointer lifetimes). A census run that
+        // produces a new measured row is a measurement run: with
+        // `KV_TARGET_TOKENS == KV_MAX_TOKENS` the pool fills the budget, there is
+        // no growth slack and reconcile refuses (`during post-ready growth`).
+        // Leave headroom (`KV_TARGET_TOKENS` below `KV_MAX_TOKENS`); the
+        // verification run then serves the measured row at maxed KV.
         if std::env::var("CUTEAFD_GRAPH_CENSUS").is_ok_and(|value| value == "1") {
             let bytes = MEASURED_GLM_GRAPHS.iter().filter(|row| row.keys == keys)
                 .map(|row| row.bytes).max()
                 .unwrap_or_else(|| keys as u64 * (2 << 20));
             tracing::warn!(fingerprint, keys, bytes,
                 "GLM startup graph fingerprint has no measured row; this census run charges the largest \
-                 measured row for {keys} keys until the live capture reconciles it");
+                 measured row for {keys} keys until the live capture reconciles it; a measurement census \
+                 needs KV_TARGET_TOKENS below KV_MAX_TOKENS so the growth phase has room");
             return Some(GraphRow { bytes, basis: Basis::Estimated, stale_pin: None,
                 figure: MemoryFigure { attribution: FigureAttribution::Estimated {
                         derivation: "unmeasured declared fingerprint; census run placeholder, reconciled from the live capture" },
