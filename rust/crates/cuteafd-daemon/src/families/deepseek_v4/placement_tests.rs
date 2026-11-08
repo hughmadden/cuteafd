@@ -145,8 +145,8 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
     let gpus = layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
         .enumerate().map(|(gpu, device)| {
-            let loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
-                Category::Embedding) || i.group == "context+modules")
+            // The GPU embedding is admitted inside rank 0's target arena, not sampled as loaded.
+            let loaded: u64 = device.items.iter().filter(|i| i.group == "context+modules")
                 .map(|i| i.bytes).sum();
             let budget = if gpu == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget };
             (budget, Baseline::Measured { free_bytes: budget - loaded })
@@ -156,7 +156,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     let max_rows = prefill.unit_rows.max(manifest["capacities"]["decode_rows"].as_u64().unwrap());
     let expert_workspace = layout_expert_workspace(case, &catalog, max_rows)?;
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
-        loaded_modes: None, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
+        weights_resident: false, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
@@ -170,17 +170,14 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     assert!(placement.hops.iter().all(|hop| hop.row_bytes == 4 * cfg.dim as u64 * 2),
         "V4 hop plan: every point carries the admitted row geometry");
     if check_upload {
-        // The loaded-mode rebase is the inverse of the uploads it credits back.
-        let modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
-        let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
-            &cfg, case.rtx, case.dspark, catalog.tensors().iter().map(|t| &t.metadata))?;
-        let loaded = weights.loaded_bytes(&modes, case.rtx)?;
+        // The post-upload rebase is the inverse of the arenas it credits back.
+        let loaded = facts.weights.loaded_bytes()?;
         let measured = inputs.gpus.iter().zip(&loaded).map(|(&(total, baseline), &bytes)| {
             let Baseline::Measured { free_bytes } = baseline else { unreachable!() };
             Ok((total, Baseline::Measured { free_bytes: free_bytes.checked_sub(bytes)
                 .ok_or_else(|| anyhow::anyhow!("fixture weight uploads exceed free memory"))? }))
         }).collect::<anyhow::Result<Vec<_>>>()?;
-        let after = admission::Inputs { gpus: measured, loaded_modes: Some(&modes), ..inputs };
+        let after = admission::Inputs { gpus: measured, weights_resident: true, ..inputs };
         let rebased = admission::inputs(&cli.engine, &after)?;
         assert_eq!(rebased.gpus, facts.gpus, "loaded weights rebase to the pre-upload sample");
     }
@@ -891,11 +888,8 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
     let prefill = cli.engine.prefill_shape(manifest["capacities"]["prefill_rows"].as_u64().unwrap(), None)?;
     let max_rows = prefill.unit_rows.max(manifest["capacities"]["decode_rows"].as_u64().unwrap());
     let expert_workspace = layout_expert_workspace(case, &catalog, max_rows)?;
-    let loaded_modes = vec![if case.rtx == 2 { cuteafd_loader::placement::LayerMode::HeadSplit }
-        else { cuteafd_loader::placement::LayerMode::Whole { gpu: 0,
-            ffn: cuteafd_loader::placement::FfnMode::Owner } }; cfg.n_layers];
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
-        loaded_modes: Some(&loaded_modes), cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
+        weights_resident: true, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(

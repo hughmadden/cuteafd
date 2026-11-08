@@ -74,20 +74,6 @@ fn layer_unit_on(inputs: &V4Inputs, layer: usize, mode: LayerMode, gpu: usize) -
     }
 }
 
-fn layer_weights(inputs: &V4Inputs, layer: usize, mode: LayerMode, gpu: usize) -> u64 {
-    let weights = inputs.weights.c4_attention[layer];
-    match mode {
-        LayerMode::HeadSplit | LayerMode::ContextSplit => weights.split[gpu],
-        LayerMode::Whole { gpu: owner, .. } => {
-            if usize::from(owner) == gpu {
-                weights.whole
-            } else {
-                0
-            }
-        }
-    }
-}
-
 /// Running arena peak: the workspace, then each part's resident bytes plus its
 /// transient staging. Equal to the legacy `Arena` peak, and zero when nothing
 /// ever opens the arena.
@@ -197,8 +183,8 @@ fn modes(inputs: &V4Inputs) -> Result<(Vec<LayerMode>, AttentionPlacement), Refu
             )));
         }
     }
-    if inputs.weights.c4_attention.len() != inputs.cfg.n_layers {
-        return Err(invalid("V4 attention weight inventory per layer"));
+    if inputs.weights.target.len() != gpus {
+        return Err(invalid("V4 target weight arena per GPU"));
     }
     if inputs.cfg.compress_ratios.len() != inputs.cfg.n_layers {
         return Err(invalid("V4 compress ratio per layer"));
@@ -869,7 +855,7 @@ impl Recipe for PreparedV4<'_> {
             owners.components.extend(crate::placement::expert_usage::components(geometry, &[0], self.maximum_pages)?);
         }
         let (fixed, overhead, _) = fixed_demands(inputs).map_err(invalid)?;
-        for (index, demand) in fixed.iter().chain(&inputs.weights.fixed).enumerate() {
+        for (index, demand) in fixed.iter().enumerate() {
             let id = format!("v4.fixed.{index}");
             let activation = Activation::always();
             owners.owner(
@@ -927,25 +913,16 @@ impl Recipe for PreparedV4<'_> {
                 Activation::always(),
             )?;
         }
-        // Attention weights follow the selected mode on each GPU.
-        for gpu in 0..gpus {
-            for (layer, &mode) in self.modes.iter().enumerate() {
-                let bytes = layer_weights(inputs, layer, mode, gpu);
-                if bytes == 0 {
-                    continue;
-                }
-                let id = format!("v4.layer.{gpu}.{layer}");
-                let activation = Activation::always();
-                owners.owner(
-                    id.clone(),
-                    gpu as u8,
-                    bytes,
-                    Category::Weights,
-                    "layers",
-                    activation.clone(),
-                );
-                owners.weights(id, gpu as u8, bytes, activation);
-            }
+        // Retained target and dSpark weights: each arena's exact extent B,
+        // charged once with its single SM120 allocation tail. They exist from
+        // Load (allocated before KV) until Growth, like the runtime receipts.
+        for (gpu, arena) in inputs.weights.target.iter().enumerate() {
+            owners.components.extend(weight_arena_components(arena, Location::coordinator(gpu as u8),
+                Lifetime::RESIDENT, self.maximum_pages)?);
+        }
+        if let Some(arena) = &inputs.weights.draft {
+            owners.components.extend(weight_arena_components(arena, Location::coordinator(0),
+                Lifetime::RESIDENT, self.maximum_pages)?);
         }
         // Context staging, exchange and workspace exist only under a split.
         if self.attention == AttentionPlacement::Context {

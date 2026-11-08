@@ -2793,15 +2793,17 @@ fn v4_snapshot() -> tempfile::TempDir {
 
 #[test]
 fn v4_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_layout() {
-    use crate::placement::{FfnMode, LayerMode, OnboardSetting};
+    use crate::placement::OnboardSetting;
     let dir = v4_snapshot();
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
-    let modes = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.n_layers];
-    let required = crate::families::deepseek_v4::resident::resident_operands(&cfg, &modes, 1,
-        false, checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap()
-        .iter().map(|owner| owner.bytes).sum::<u64>();
-    assert!(required > 0);
+    // The admitted claim is rank 0's whole target arena B (embedding and
+    // inter-view padding included), not the operand payload sum.
+    let weights = crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg, 1,
+        false, true, checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap();
+    assert!(weights.draft.is_none());
+    let required = weights.target[0].bytes() as u64;
+    assert!(required > weights.target[0].payload_bytes() as u64);
     for full_layout in [false, true] {
         let options = PlanOptions { coordinator_budget_bytes: required,
             layout: full_layout.then(|| layout::LayoutOptions {

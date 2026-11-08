@@ -489,10 +489,7 @@ pub(crate) fn with_engine<T>(
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         // Each GPU's free bytes less the measured code still to load before ready (lazily loaded
         // functions, cuBLAS: `placement::inventory::LOADED_CODE`), which the planner charges in its
-        // baseline.
-        let embedding_bytes = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu {
-            loaded.catalog.tensor("embed.weight")?.metadata.byte_length
-        } else { 0 };
+        // baseline. A GPU embedding is admitted inside rank 0's target arena, not here.
         let gpus = devices.iter().enumerate().map(|(rank, &device)| {
             let pending = crate::shared::inventory::pending_code(&loaded.library, device, rank, devices.len() == 2,
                 loaded.family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&loaded.catalog),
@@ -500,8 +497,7 @@ pub(crate) fn with_engine<T>(
                     &[loaded.family, &format!("{}2", loaded.family)]))?;
             crate::shared::peer_split::on_device(&loaded.library, device, || {
                 let (free, total) = loaded.library.cuda_memory_info()?;
-                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending)
-                    .saturating_sub(if rank == 0 { embedding_bytes } else { 0 }) }))
+                Ok((total as u64, Baseline::Measured { free_bytes: (free as u64).saturating_sub(pending) }))
             })
         }).collect::<Result<Vec<_>>>()?;
         // Physical capacity apart from the `--gpu-memory-cap` (`GPU_MEMORY_CAP`).
@@ -542,7 +538,7 @@ pub(crate) fn with_engine<T>(
         } else { None };
         let exchange_f32 = engine::ExchangePolicy::from_env()? == engine::ExchangePolicy::F32;
         let inputs = admission::Inputs { cfg: &loaded.cfg, catalog: &loaded.catalog, manifest: &loaded.manifest,
-            family: loaded.family, gpus, loaded_modes: None, cache_stages,
+            family: loaded.family, gpus, weights_resident: false, cache_stages,
             prefill_rows, decode_rows, max_context, prefix,
             expert_workspace, tp2_workspace, exchange_f32, physical,
             host_memory: cuteafd_loader::formats::mapped_preload::host_memory()? };
@@ -571,8 +567,7 @@ pub(crate) fn with_engine<T>(
         if crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&loaded.snapshot)?
             != crate::shared::experts::rtx::push::PushPolicy::Mount {
             use crate::shared::{experts::rtx::dense::HostStaging, memory::push_coordinator::CoordinatorExpertPlan};
-            let mut startup = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
-                &loaded.cfg, devices.len(), args.dspark, loaded.catalog.tensors().iter().map(|t| &t.metadata))?.startup;
+            let mut startup = facts.weights.startup.clone();
             let host = (0..devices.len()).map(|rank| {
                 let bytes = |name| startup.host.iter().find(|item| item.rank == rank && item.name == name)
                     .map_or(0, |item| item.bytes);
@@ -595,15 +590,20 @@ pub(crate) fn with_engine<T>(
         let operands = cuteafd_loader::families::deepseek_v4::resident::resident_operands(
             &loaded.cfg, &loaded_modes, devices.len(), args.dspark,
             loaded.catalog.tensors().iter().map(|t| &t.metadata))?;
-        let target_arenas = devices.iter().enumerate().map(|(rank, &id)| {
-            let layout = cuteafd_loader::families::deepseek_v4::weight_arena::coordinator_arena(
-                &operands, rank, false, args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu)?
-                .context("V4 target weight arena absent")?;
+        // Allocate exactly the arenas admission charged: the selected modes
+        // must slice the same final operands the admitted layouts describe.
+        let device_embedding = args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu;
+        let target_layouts = (0..devices.len()).map(|rank|
+            cuteafd_loader::families::deepseek_v4::weight_arena::coordinator_arena(&operands, rank, false, device_embedding)?
+                .context("V4 target weight arena absent")).collect::<Result<Vec<_>>>()?;
+        let draft_layout = cuteafd_loader::families::deepseek_v4::weight_arena::coordinator_arena(&operands, 0, true, false)?;
+        ensure!(target_layouts == facts.weights.target && draft_layout == facts.weights.draft,
+            "V4 selected weight arenas differ from the admitted layouts");
+        let target_arenas = devices.iter().zip(target_layouts).map(|(&id, layout)|
             crate::shared::memory::weight_arena::DeviceWeightArena::new(
-                crate::shared::memory::device::Device { library: &loaded.library, id }, layout)
-        }).collect::<Result<Vec<_>>>()?;
-        let draft_arena = cuteafd_loader::families::deepseek_v4::weight_arena::coordinator_arena(
-            &operands, 0, true, false)?.map(|layout|
+                crate::shared::memory::device::Device { library: &loaded.library, id }, layout))
+            .collect::<Result<Vec<_>>>()?;
+        let draft_arena = draft_layout.map(|layout|
             crate::shared::memory::weight_arena::DeviceWeightArena::new(
                 crate::shared::memory::device::Device { library: &loaded.library, id: args.device }, layout)).transpose()?;
         let loader = weights::WeightLoader {
