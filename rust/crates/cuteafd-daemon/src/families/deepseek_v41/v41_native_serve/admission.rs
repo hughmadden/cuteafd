@@ -317,11 +317,17 @@ pub(super) fn admit_startup(
         startup.extend(target_owners.draft_load_phases(&draft)?);
         Some(draft)
     } else { None };
+    let mut weight_arenas = target_layout.ranks.clone();
     if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
-        target_owners.add_vision(Demand::new(0, Category::Workspace, "vision weights/scratch",
-            crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)? as u64,
-            Basis::Formula).with_resident_weights(ResidentWeights(
-                crate::families::deepseek_v41::v41_vision::VisionRuntime::weight_bytes(catalog)? as u64)))?;
+        // The tower's arena (root, logical claim, tail) and its execution
+        // buffers are separate owners allocated together on its thread.
+        let arena = cuteafd_loader::placement::families::deepseek_v41::weight_layout::vision_layout_from_headers(
+            catalog.tensors().iter().map(|tensor| &tensor.metadata))?;
+        let device = crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(catalog, 9216)? as u64;
+        let scratch = device.checked_sub(arena.bytes() as u64).context("vision scratch underflow")?;
+        target_owners.add_vision(owners::arena_demand(0, &arena))?;
+        target_owners.add_vision(Demand::new(0, Category::Workspace, "vision scratch", scratch, Basis::Formula))?;
+        weight_arenas.push(arena);
     }
     let fixed_demands = target_owners.fixed;
     let fixed = fixed_demands.iter().try_fold(0u64, |n, d|
@@ -342,7 +348,7 @@ pub(super) fn admit_startup(
     }
     lib.cuda_set_device(0)?;
     let pool = resolve_with_owners(args, &memory, experts, workspace, &vec![0; ranks], usize::from(ranks == 2),
-        &fixed_demands, &target_layout.ranks, &startup, draft.as_ref())
+        &fixed_demands, &weight_arenas, &startup, draft.as_ref())
         .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}"))?;
     tracing::info!(fixed_owner_bytes=fixed, admitted_cache_bytes=?pool.cache_bytes,
         host_ledger=?pool.host_ledger, "V4.1 single allocation-owner startup admission before weight loads");

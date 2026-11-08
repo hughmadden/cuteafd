@@ -254,6 +254,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         budgets,
     }.prepare()?;
     prepared.recipe.encoders = encoders.clone();
+    prepared.recipe.vision_arena = (vision_weights > 0).then(|| v41::weight_layout::vision_layout_from_headers(
+        checkpoint.tensors.iter().map(|tensor| &tensor.meta))).transpose()?;
     prepared.recipe.media_cache_bytes = media_cache_bytes;
     let admitted = prepared.admit(request)?;
     report.host_ledger = Some(admitted.host_ledger(host_facts.prefix_bytes)?);

@@ -40,33 +40,7 @@ pub(crate) struct VisionRuntime<'a> {
 }
 impl<'a> VisionRuntime<'a> {
     pub(super) fn names() -> Vec<String> {
-        let mut names = vec![
-            "vision.patch_embed.proj.weight".into(),
-            "vision.patch_embed.proj.bias".into(),
-            "vision.norm.weight".into(),
-            "aligner.w1.weight".into(),
-            "aligner.w1.bias".into(),
-            "aligner.w2.weight".into(),
-            "aligner.w2.bias".into(),
-            "image_start".into(),
-            "image_end".into(),
-            "image_newline".into(),
-        ];
-        for layer in 0..32 {
-            for suffix in [
-                "norm1.weight",
-                "attn.wqkv.weight",
-                "attn.wqkv.bias",
-                "attn.wo.weight",
-                "attn.wo.bias",
-                "norm2.weight",
-                "mlp.w1.weight",
-                "mlp.w2.weight",
-            ] {
-                names.push(format!("vision.blocks.{layer}.{suffix}"));
-            }
-        }
-        names
+        cuteafd_loader::placement::families::deepseek_v41::weight_layout::vision_names()
     }
     fn buffer_sizes(capacity: usize) -> Result<Vec<usize>> {
         ensure!(
@@ -105,11 +79,9 @@ impl<'a> VisionRuntime<'a> {
         Ok(Self::weight_layout(catalog)?.bytes())
     }
     fn weight_layout(catalog: &OfficialV41Catalog) -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
-        cuteafd_loader::serving_capacity::WeightArenaLayout::new("v41/vision",
-            Self::names().into_iter().map(|name| {
-                let bytes = usize::try_from(catalog.device_tensor_bytes(&name, None)?)?;
-                Ok((name, bytes))
-            }).collect::<Result<Vec<_>>>()?)
+        // One header recipe for the tower's arena and for admission.
+        cuteafd_loader::placement::families::deepseek_v41::weight_layout::vision_layout_from_headers(
+            catalog.tensors().iter().map(|tensor| &tensor.metadata))
     }
     pub fn device_bytes(catalog: &OfficialV41Catalog, capacity: usize) -> Result<usize> {
         Ok(Self::weight_bytes(catalog)?

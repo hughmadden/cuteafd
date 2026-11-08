@@ -122,14 +122,20 @@ pub fn vocabulary_load_phase(arena: &crate::serving_capacity::WeightArenaLayout,
 /// the pre-draft sample and admission all see the arena exactly where the
 /// payload used to be; `ProductionInput::weight_arenas` carries the layouts.
 pub fn target_arena_demands(layout: &super::weight_layout::TargetLayout) -> Vec<Demand> {
-    layout.ranks.iter().enumerate().map(|(rank, arena)| Demand::new(rank as u8, Category::Weights,
-        WEIGHT_ARENA_GROUP, arena.bytes() as u64, Basis::Exact)
-        .with_resident_weights(crate::placement::ResidentWeights(arena.bytes() as u64))).collect()
+    layout.ranks.iter().enumerate().map(|(rank, arena)| arena_demand(rank as u8, arena)).collect()
 }
 
-/// The group every arena demand carries; `ProductionInput` replaces these
-/// demands with the shared arena components.
-pub const WEIGHT_ARENA_GROUP: &str = "weight arena";
+/// One arena's placeholder demand (extent B, resident B): every load phase and
+/// sum sees it where the payload was. `ProductionInput` binds it by arena ID to
+/// its layout and charges the shared root, logical claim and tail.
+pub fn arena_demand(gpu: u8, arena: &crate::serving_capacity::WeightArenaLayout) -> Demand {
+    Demand::new(gpu, Category::Weights, format!("{WEIGHT_ARENA_PREFIX}{}", arena.id()),
+        arena.bytes() as u64, Basis::Exact)
+        .with_resident_weights(crate::placement::ResidentWeights(arena.bytes() as u64))
+}
+
+/// Arena demands are named `weight arena:<layout id>`.
+pub const WEIGHT_ARENA_PREFIX: &str = "weight arena:";
 
 /// The device weight items the arenas replace: everything `resident_headers`
 /// places on a coordinator GPU (a host-placed embedding stays a host owner).
