@@ -37,6 +37,16 @@ pub fn reconcile_startup_graphs(plan: &mut ResolvedPlan, prefix: &str,
             || owner.lifetime != (Lifetime { first: Phase::Warmup, last: Phase::Growth }) {
             return Err(Refusal::InvalidFact("startup graph owner location or lifetime differs".into()));
         }
+        let modeled = estimated.ranks[rank];
+        crate::placement::graph_nodes::reconcile(prefix, rank, modeled.bytes, graph.bytes);
+        if let Some(charge) = modeled.node_charge {
+            let value = serde_json::json!({"nodes": charge.nodes, "rate_bytes": charge.rate_bytes,
+                "padding_bytes": charge.padding_bytes, "padding_per_node": charge.padding_per_node,
+                "modeled_bytes": charge.packed_bytes, "measured_bytes": graph.bytes});
+            cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+                format!("graph_memory.{prefix}.{rank}"): {"value": value,
+                    "source": "graph nodes + GRAPH_NODE_PADDING, packed once per device; included in graph owner"}}));
+        }
         owner.bytes = graph.bytes;
         owner.assumed = false;
     }

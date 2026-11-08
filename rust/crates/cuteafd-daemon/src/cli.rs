@@ -65,6 +65,9 @@ pub(crate) struct MemoryArgs {
     /// Per-GPU release allowance inside the cap (default 100MiB); GPU_RESERVE replaces it.
     #[arg(long, global = true, value_parser = parse_size)]
     pub(crate) memory_padding: Option<u64>,
+    /// Bytes per graph kernel node: N or rtx=N,spark=M; independent of GPU_RESERVE.
+    #[arg(long, global = true)]
+    pub(crate) graph_node_padding: Option<cuteafd_core::memory_policy::GraphNodePadding>,
     /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).
     #[arg(long, global = true)]
     pub(crate) kv_target_tokens: Option<u64>,
@@ -86,6 +89,7 @@ impl MemoryArgs {
             spark_reserve: self.spark_reserve.or(outer.spark_reserve),
             family_reserve: self.family_reserve.or(outer.family_reserve),
             memory_padding: self.memory_padding.or(outer.memory_padding),
+            graph_node_padding: self.graph_node_padding.or(outer.graph_node_padding),
             kv_target_tokens: self.kv_target_tokens.or(outer.kv_target_tokens),
             kv_min_tokens: self.kv_min_tokens.or(outer.kv_min_tokens),
             kv_max_tokens: self.kv_max_tokens.or(outer.kv_max_tokens),
@@ -98,11 +102,12 @@ impl MemoryArgs {
             gpu_reserve: self.gpu_reserve, spark_reserve: self.spark_reserve,
             family_reserve: self.family_reserve, memory_padding: self.memory_padding, kv_target: self.kv_target_tokens,
             kv_min: self.kv_min_tokens, kv_max: self.kv_max_tokens,
+            graph_node_padding: self.graph_node_padding.unwrap_or_default(),
         }
     }
 
     pub(crate) fn any_gpu(self) -> bool {
-        self.gpu_memory_cap.is_some() || self.gpu_reserve.is_some() || self.family_reserve.is_some() || self.memory_padding.is_some()
+        self.gpu_memory_cap.is_some() || self.gpu_reserve.is_some() || self.family_reserve.is_some() || self.memory_padding.is_some() || self.graph_node_padding.is_some()
     }
 }
 
@@ -839,7 +844,7 @@ mod tests {
         let policy = cli.memory.policy();
         assert_eq!(policy, cuteafd_core::memory_policy::MemoryPolicy { gpu_cap: Some(32 << 30), spark_cap: Some(100 << 30),
             gpu_reserve: Some(3 << 30), spark_reserve: Some(512 << 20), family_reserve: Some(2_000_000_000), memory_padding: Some(100 << 20),
-            kv_target: Some(1 << 20), kv_min: Some(65_536), kv_max: Some(4 << 20) });
+            graph_node_padding: Default::default(), kv_target: Some(1 << 20), kv_min: Some(65_536), kv_max: Some(4 << 20) });
         assert!(policy.validate().is_ok());
         assert_eq!(super::Cli::try_parse_from(["cuteafd", "plan", "/model"]).unwrap().memory.policy(), Default::default());
         for (flag, value) in [("--gpu-memory-cap", "50%"), ("--gpu-reserve", "10%"), ("--spark-memory-cap", "1TB"),

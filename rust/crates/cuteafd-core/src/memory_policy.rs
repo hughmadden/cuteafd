@@ -28,6 +28,47 @@ pub const AGENTIC_FLOOR_TOKENS: u64 = 262_144;
 /// the remaining owners are attributed. Per coordinator GPU, inside its cap.
 pub const DEFAULT_MEMORY_PADDING: u64 = 100 << 20;
 
+/// Bytes per retained graph kernel node, independent of all reserve overrides.
+/// RTX's 1 B covers observed integer-fit truncation (<0.31 B/node), not
+/// unmeasured driver drift. Spark has no calibration yet; no RTX rate is reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNodePadding {
+    pub rtx: u64,
+    pub spark: u64,
+}
+
+impl Default for GraphNodePadding {
+    fn default() -> Self { Self { rtx: 1, spark: 0 } }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("GRAPH_NODE_PADDING must be integer bytes/node or rtx=N,spark=M")]
+pub struct GraphNodePaddingError;
+
+impl FromStr for GraphNodePadding {
+    type Err = GraphNodePaddingError;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let number = |s: &str| if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+            s.parse::<u64>().map_err(|_| GraphNodePaddingError)
+        } else { Err(GraphNodePaddingError) };
+        if !text.contains('=') {
+            let value = number(text)?;
+            return Ok(Self { rtx: value, spark: value });
+        }
+        let (mut rtx, mut spark) = (None, None);
+        for entry in text.split(',') {
+            let (key, value) = entry.split_once('=').ok_or(GraphNodePaddingError)?;
+            let slot = match key { "rtx" => &mut rtx, "spark" => &mut spark, _ => return Err(GraphNodePaddingError) };
+            if slot.replace(number(value)?).is_some() { return Err(GraphNodePaddingError); }
+        }
+        Ok(Self { rtx: rtx.ok_or(GraphNodePaddingError)?, spark: spark.ok_or(GraphNodePaddingError)? })
+    }
+}
+
+impl fmt::Display for GraphNodePadding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "rtx={},spark={}", self.rtx, self.spark) }
+}
+
 /// A byte size with an explicit unit: `B`, `MB`, `GB`, `MiB` or `GiB`. No
 /// percentages. A bare number is bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -98,6 +139,8 @@ pub struct MemoryPolicy {
     /// Per-GPU release padding (`MEMORY_PADDING`); `None` uses the release default.
     #[serde(default)]
     pub memory_padding: Option<u64>,
+    #[serde(default)]
+    pub graph_node_padding: GraphNodePadding,
     pub kv_target: Option<u64>,
     pub kv_min: Option<u64>,
     pub kv_max: Option<u64>,
@@ -267,6 +310,20 @@ pub fn render_line(device: &DeviceBreakdown, pool: &PoolBreakdown) -> String {
 mod tests {
     use super::*;
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn graph_padding_has_explicit_architectures_and_no_reserve_dependency() {
+        for (text, expected) in [("0", GraphNodePadding { rtx: 0, spark: 0 }),
+            ("350", GraphNodePadding { rtx: 350, spark: 350 }),
+            ("rtx=1,spark=20", GraphNodePadding { rtx: 1, spark: 20 }),
+            ("spark=20,rtx=1", GraphNodePadding { rtx: 1, spark: 20 })] {
+            assert_eq!(text.parse::<GraphNodePadding>(), Ok(expected));
+            assert_eq!(expected.to_string().parse::<GraphNodePadding>(), Ok(expected));
+        }
+        for text in ["", "rtx=1", "rtx=1,rtx=2", "rtx=1,spark=2,", "-1", "1MiB", "5%", "+1", "18446744073709551616"] {
+            assert!(text.parse::<GraphNodePadding>().is_err(), "{text}");
+        }
+    }
 
     #[test]
     fn sizes_take_every_unit_and_reject_percentages() {

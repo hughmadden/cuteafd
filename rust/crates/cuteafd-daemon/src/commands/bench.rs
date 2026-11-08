@@ -266,7 +266,7 @@ fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
     for arg in definition.get_arguments() {
         let id = arg.get_id().as_str();
         if matches!(id, "help" | "version" | "gpu_memory_cap" | "spark_memory_cap" | "gpu_reserve" | "spark_reserve"
-            | "family_reserve" | "memory_padding" | "kv_target_tokens" | "kv_min_tokens" | "kv_max_tokens") {
+            | "family_reserve" | "memory_padding" | "graph_node_padding" | "kv_target_tokens" | "kv_min_tokens" | "kv_max_tokens") {
             continue;
         }
         let value = sub.get_raw(id).map(|values| values.map(|v| v.to_string_lossy().into_owned())
@@ -300,6 +300,9 @@ fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
     // Global options are not in the unbuilt family definition. Pass the
     // resolved memory policy explicitly so generic serve's reparse retains it too.
     if let Some(memory) = memory {
+        if let Some(value) = memory.graph_node_padding {
+            settings.push(Setting { name: "graph-node-padding".into(), value: Some(value.to_string()), default: None, source: "cli".into() });
+        }
         for (name, value) in [("gpu-memory-cap", memory.gpu_memory_cap), ("spark-memory-cap", memory.spark_memory_cap),
             ("gpu-reserve", memory.gpu_reserve), ("spark-reserve", memory.spark_reserve),
             ("family-reserve", memory.family_reserve), ("memory-padding", memory.memory_padding), ("kv-target-tokens", memory.kv_target_tokens),

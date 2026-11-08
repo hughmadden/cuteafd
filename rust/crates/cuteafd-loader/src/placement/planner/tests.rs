@@ -513,6 +513,11 @@ fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
         assert!(serving::reconcile_startup_graphs(&mut plan, "test", &graphs, &declared, &[bad]).is_err());
         assert_eq!(plan, good);
     }
+    let mut over = good.clone();
+    serving::reconcile_startup_graphs(&mut over, "test", &graphs, &declared,
+        &[CapturedGraphRank { bytes: 1000, ..capture.clone() }]).unwrap();
+    assert_eq!(over.facts.allowances[0].bytes, 1000);
+    assert!(over.phases.iter().any(|p| p.owned + p.opaque > p.available));
     let mut duplicate = good.clone();
     duplicate.facts.allowances.push(duplicate.facts.allowances[0].clone());
     let unchanged = duplicate.clone();

@@ -937,6 +937,7 @@ if ((dry_run)); then
   echo "  Spark TP: $spark_tp"
   [[ -z "$spark_tp_roles_required" ]] ||
     echo "  Spark image must advertise V41 expert role: $spark_tp_roles_required (selected rank advertises: ${spark_advertised_roles:-<unreadable>})"
+  echo "  graph node padding: ${GRAPH_NODE_PADDING:-rtx=1,spark=0} B/node (independent of GPU_RESERVE)"
   echo "  memory policy: ${memory_policy_args[*]:-defaults (full GPU cap, family reserves, 2M KV target)}"
   echo "  prefill batch tokens: $PREFILL_BATCH_TOKENS; expert capacity: $expert_capacity"
   echo "  dSpark draft: ${draft_length:+fixed }${draft_length:-adaptive (maximum 5)}"

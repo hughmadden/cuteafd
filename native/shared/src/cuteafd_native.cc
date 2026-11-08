@@ -20,6 +20,7 @@
 #include <vector>
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
+#include <dlfcn.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -602,10 +603,33 @@ std::string census_json_string(const char* value) {
   return out + "\"";
 }
 
+// NVML remains optional: census provenance must never make serving depend on it.
+std::string census_driver_identity() {
+  int version = 0;
+  const auto status = cudaDriverGetVersion(&version);
+  std::string nvml = "null";
+  if (void* library = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL)) {
+    using Init = int (*)();
+    using Version = int (*)(char*, unsigned int);
+    auto init = reinterpret_cast<Init>(dlsym(library, "nvmlInit_v2"));
+    auto shutdown = reinterpret_cast<Init>(dlsym(library, "nvmlShutdown"));
+    auto get_version = reinterpret_cast<Version>(dlsym(library, "nvmlSystemGetDriverVersion"));
+    if (init && shutdown && get_version && init() == 0) {
+      char value[128] = {};
+      if (get_version(value, sizeof(value)) == 0) { nvml = census_json_string(value); }
+      shutdown();
+    }
+    dlclose(library);
+  }
+  return "\"cuda_driver_version\":" + (status == cudaSuccess ? std::to_string(version) : "null")
+      + ",\"nvml_driver_version\":" + nvml;
+}
+
 void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
                          cudaError_t before_status, size_t before_free,
                          cudaError_t after_status, size_t after_free) {
   static std::atomic<uint64_t> serial{0};
+  static const std::string driver = census_driver_identity();
   int device = -1;
   cudaGetDevice(&device);
   size_t count = 0;
@@ -669,9 +693,9 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
   flockfile(captures);
   const int written = std::fprintf(captures,
       "CUTEAFD_GRAPH_CENSUS {\"event\":\"capture\",\"id\":%llu,\"exec\":\"%p\",\"device\":%d,"
-      "\"nodes\":%zu,\"node_status\":%d,\"instantiate_bytes\":%lld,\"bytes_valid\":%s,\"details\":%s}\n",
+      "\"nodes\":%zu,\"node_status\":%d,\"instantiate_bytes\":%lld,\"bytes_valid\":%s,%s,\"details\":%s}\n",
       static_cast<unsigned long long>(id), reinterpret_cast<void*>(exec), device,
-      count, static_cast<int>(status), static_cast<long long>(delta), bytes_valid ? "true" : "false", details.c_str());
+      count, static_cast<int>(status), static_cast<long long>(delta), bytes_valid ? "true" : "false", driver.c_str(), details.c_str());
   const bool saved = std::fflush(captures) == 0 && written >= 0;
   funlockfile(captures);
   std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"%s\",\"id\":%llu,\"exec\":\"%p\"}\n",
@@ -1719,7 +1743,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
   const cudaError_t after_status = census ? cudaMemGetInfo(&after_free, &total) : cudaSuccess;
   if (err != cudaSuccess) {
     cudaGraphDestroy(graph);
-    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphInstantiate failed", err);
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "graph memory allocation/instantiation failed; increase GRAPH_NODE_PADDING for driver drift, lower GPU_MEMORY_CAP or increase GPU_RESERVE to leave graph headroom", err);
   }
   if (graph_exec == nullptr) {
     cudaGraphDestroy(graph);

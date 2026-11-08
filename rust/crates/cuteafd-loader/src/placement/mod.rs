@@ -22,6 +22,7 @@ pub mod expert_usage;
 pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;
+pub mod graph_nodes;
 pub mod planner;
 pub mod runtime_memory;
 mod pool;

@@ -230,6 +230,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
         "kv_geometry": {"pages": plan.pool_tokens.checked_div(plan.pool_page_rows),
             "tokens_per_page": plan.pool_page_rows, "capacity_tokens": plan.pool_tokens,
             "status": "admitted planner geometry; live pool occupancy not captured"},
+        "graph_node_padding": {"value": policy.graph_node_padding, "source": "GRAPH_NODE_PADDING bytes/node; independent of GPU_RESERVE"},
         "memory_padding": {"bytes_per_gpu": policy.release_padding(),
             "source": if policy.gpu_reserve.is_some() { "GPU_RESERVE override" }
                 else if policy.memory_padding.is_some() { "MEMORY_PADDING / --memory-padding" }
@@ -259,7 +260,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
         let breakdown = breakdown(budget.id.clone(), kind, cap, budget.headroom, &items);
         cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({format!("device.{}", budget.id): breakdown}));
         let line = cuteafd_core::memory_policy::render_line(&breakdown, &pool);
-        tracing::info!(target: "cuteafd::memory_policy", "{line}");
+        tracing::info!(target: "cuteafd::memory_policy", "{line}; GRAPH_NODE_PADDING {} B/node (included in graph owner)", policy.graph_node_padding);
     }
 }
 
