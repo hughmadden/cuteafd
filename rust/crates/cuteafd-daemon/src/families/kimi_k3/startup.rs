@@ -338,22 +338,29 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         engine.warm_graphs(&set.keys)?;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
         let after = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
+        let census_table = if RANKS == 2 { "GRAPH_CENSUS_TP2" } else { "GRAPH_CENSUS_BYTES" };
+        let mut measured = [0u64; RANKS];
         for rank in 0..RANKS {
             let bytes = before.gpus[rank].free_bytes.saturating_sub(after.gpus[rank].free_bytes);
             let count = set.inventory.ranks[rank].executables;
             let reserved = set.inventory.bytes(rank);
+            measured[rank] = bytes;
             tracing::info!(rank, executables = count, measured_bytes = bytes, capture_elapsed_ms,
                 bytes_per_executable = bytes.div_ceil(count.max(1)),
                 reserved_bytes = reserved, reserve = "estimated",
                 "Kimi startup graph census");
             if bytes > reserved {
-                let per_executable = bytes.div_ceil(count.max(1));
                 tracing::warn!(rank, executables = count, measured_bytes = bytes, reserved_bytes = reserved,
-                    bytes_per_executable = per_executable,
+                    bytes_per_executable = bytes.div_ceil(count.max(1)), census = census_table,
                     "Kimi startup capture exceeds its calibrated estimate; update \
-                     cuteafd_loader::families::kimi_k3::allocation::GRAPH_CENSUS_BYTES with this capture");
+                     cuteafd_loader::families::kimi_k3::allocation::{census_table} with this capture");
             }
-            ensure!(bytes <= reserved, "Kimi startup graphs exceed admitted reserve");
+        }
+        // Every rank's capture is logged before any rank refuses, so a failing
+        // launch still reports the complete census.
+        for rank in 0..RANKS {
+            ensure!(measured[rank] <= set.inventory.bytes(rank),
+                "Kimi startup graphs on rank {rank} exceed admitted reserve");
         }
     }
     Ok(Loaded { engine, admission_free, admitted_bytes, ownership })
