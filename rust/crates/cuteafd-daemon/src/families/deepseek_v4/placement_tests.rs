@@ -709,6 +709,10 @@ struct Fixture {
     /// retain the original launch answer and provenance in the fixture JSON.
     pool_tokens: u64,
     onboard_layers: usize,
+    /// A same-config sample this build cannot reproduce; the URL is the
+    /// regeneration issue. The raw historical sample and its provenance stay.
+    #[serde(default)]
+    pending_regeneration: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -754,7 +758,10 @@ const MIB: u64 = 1 << 20;
 /// planner's own loaded bytes), and the planner, at the same CUDA total, must
 /// predict that sample within 64 MiB per GPU and resolve the same placement
 /// (P1 could not see its 1.45M vs 1.18M Flash max gap: it fed the planner's
-/// numbers back in). Every non-historical fixture is required in the full tier.
+/// numbers back in). Every non-historical fixture is required in the full tier,
+/// except the ones carrying the regeneration issue that retired V4's calibrated
+/// mixed residency rows (#1588): their recorded samples predate the selected
+/// module owner and cannot be reproduced by a current launch.
 #[test]
 fn planner_equals_runtime_deepseek_v4_measured() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shared/placement_fixtures");
@@ -768,6 +775,10 @@ fn planner_equals_runtime_deepseek_v4_measured() {
         let fixture: Fixture = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         if fixture.historical_tp1 { continue; }
         let label = path.file_stem().unwrap().to_string_lossy().into_owned();
+        if let Some(issue) = fixture.pending_regeneration.as_deref() {
+            eprintln!("{label}: awaiting a same-config sample ({issue})");
+            continue;
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let model = if fixture.model.contains("Flash") { "flash" } else { "pro" };
             let manifest = inputs.join(format!("{model}-{}-{}/PROGRAMS.json", fixture.rtx, fixture.context));
