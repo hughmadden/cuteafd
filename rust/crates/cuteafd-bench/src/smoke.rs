@@ -1344,7 +1344,7 @@ fn check_cleanup_markers(root: &Path) -> Result<()> {
     for instance in std::fs::read_dir(root)? {
         let marker = instance?.path().join("unconfirmed-containers.json");
         if marker.exists() {
-            bail!("refusing launch: unconfirmed container teardown in {}: {}", marker.display(), std::fs::read_to_string(marker)?);
+            bail!("refusing launch: unconfirmed container teardown in {}: {}", marker.display(), std::fs::read_to_string(&marker)?);
         }
     }
     Ok(())
