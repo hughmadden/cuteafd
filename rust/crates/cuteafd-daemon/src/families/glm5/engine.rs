@@ -3538,7 +3538,7 @@ mod prefill_unit_tests {
             .split("fn ").next().unwrap();
         assert!(shared.contains("router_host: Rc::new(RefCell::new(None))"));
         let stage = source.split("fn moe_stage(").nth(1).unwrap().split("fn moe_wave(").next().unwrap();
-        assert!(stage.contains("HostAllocation::new(w.x._owner.library, layout.bytes)?"));
+        assert!(stage.contains("HostAllocation::untagged(w.x._owner.library, layout.bytes)?"));
     }
 
     #[test]

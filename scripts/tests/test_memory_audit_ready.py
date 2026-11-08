@@ -285,7 +285,7 @@ def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
     pair = source.split("pub(crate) fn load_pair(", 1)[1].split("fn log_pair_load", 1)[0]
     scope = 'scope("experts/TP2 FP8 expert layer halves")'
     assert scope in pair.split("Fp8Experts::load_pair", 1)[0]
-    assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes)")
+    assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes,")
     assert memory_audit.category("experts/TP2 FP8 expert layer halves") == "experts"
 
 
