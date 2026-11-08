@@ -2,7 +2,7 @@
 //! per physical device (combine all banks before calling `charge`). Fingerprints
 //! validate capture coverage; they never select a memory price.
 use std::collections::BTreeMap;
-use cuteafd_core::memory_policy::GraphNodePadding;
+use cuteafd_core::memory_policy::{GraphNodePadding, GraphPaddingValue};
 use serde::{Deserialize, Serialize};
 use super::inventory::{DeclaredGraphSet, GraphRank};
 
@@ -72,7 +72,7 @@ impl GraphNodeCounts {
 pub struct GraphNodeCharge {
     pub nodes: u64,
     pub rate_bytes: u64,
-    pub padding_per_node: u64,
+    pub padding: GraphPaddingValue,
     pub padding_bytes: u64,
     pub packed_bytes: u64,
 }
@@ -87,12 +87,12 @@ pub fn charge(family: &str, architecture: &str, counts: &GraphNodeCounts,
     rates: &[GraphNodeRate], padding: GraphNodePadding) -> Result<GraphNodeCharge, GraphNodeError> {
     let missing = |class: &str| GraphNodeError::MissingRate { family: family.into(),
         architecture: architecture.into(), class: class.into() };
-    let padding_per_node = match architecture {
+    let padding = match architecture {
         "sm120" => padding.rtx,
         "sm121" => padding.spark,
         _ => return Err(missing("architecture")),
     };
-    let (mut nodes, mut rate_bytes) = (0u64, 0u64);
+    let (mut nodes, mut rate_bytes, mut padding_bytes) = (0u64, 0u64, 0u64);
     for (&class, &count) in &counts.0 {
         if count == 0 { continue; }
         let mut matching = rates.iter().filter(|rate| rate.architecture == architecture && rate.class == class);
@@ -102,15 +102,17 @@ pub fn charge(family: &str, architecture: &str, counts: &GraphNodeCounts,
             || rate.provenance.evidence.is_empty() {
             return Err(GraphNodeError::InvalidRate(format!("{family}/{architecture}/{class}")));
         }
+        let per_node = padding.bytes_per_node(rate.bytes_per_node).ok_or(GraphNodeError::Overflow("padding rate"))?;
+        padding_bytes = count.checked_mul(per_node).and_then(|bytes| padding_bytes.checked_add(bytes))
+            .ok_or(GraphNodeError::Overflow("padding bytes"))?;
         nodes = nodes.checked_add(count).ok_or(GraphNodeError::Overflow("total nodes"))?;
         rate_bytes = count.checked_mul(rate.bytes_per_node).and_then(|bytes| rate_bytes.checked_add(bytes))
             .ok_or(GraphNodeError::Overflow("rate bytes"))?;
     }
-    let padding_bytes = nodes.checked_mul(padding_per_node).ok_or(GraphNodeError::Overflow("padding bytes"))?;
     let raw = rate_bytes.checked_add(padding_bytes).ok_or(GraphNodeError::Overflow("combined bytes"))?;
     let packed_bytes = raw.div_ceil(DRIVER_CHUNK).checked_mul(DRIVER_CHUNK)
         .ok_or(GraphNodeError::Overflow("driver chunks"))?;
-    Ok(GraphNodeCharge { nodes, rate_bytes, padding_per_node, padding_bytes, packed_bytes })
+    Ok(GraphNodeCharge { nodes, rate_bytes, padding, padding_bytes, packed_bytes })
 }
 
 /// Emit a discrepancy without rejecting successfully instantiated CUDA graphs.
@@ -145,7 +147,7 @@ mod tests {
             ("glm5", rates(6680, 2792), counts(434790, 28560), counts(392064, 12096), 2984247296, 2652897280),
             ("glm5_flash", rates(7143, 2456), counts(321180, 7700), counts(288996, 4620), 2313158656, 2076180480),
         ] {
-            let zero = GraphNodePadding { rtx: 0, spark: 0 };
+            let zero = "0".parse().unwrap();
             let full = charge(family, "sm120", &full, &rates, zero).unwrap();
             let small = charge(family, "sm120", &small, &rates, zero).unwrap();
             assert_eq!(full.packed_bytes, bytes);
@@ -157,7 +159,7 @@ mod tests {
     fn padding_is_per_node_per_device_and_independent_of_reserve() {
         use cuteafd_core::memory_policy::MemoryPolicy;
         let rates = rates(6680, 2792);
-        let policy = MemoryPolicy { graph_node_padding: GraphNodePadding { rtx: 350, spark: 22 }, ..Default::default() };
+        let policy = MemoryPolicy { graph_node_padding: "rtx=350,spark=22".parse().unwrap(), ..Default::default() };
         let calculate = || charge("glm5", "sm120", &counts(434790, 28560), &rates,
             MemoryPolicy::current().graph_node_padding).unwrap();
         let expected = policy.scoped(calculate);
@@ -169,6 +171,17 @@ mod tests {
         assert_eq!(spark.padding_bytes, 5 * 22);
         assert_eq!(spark.packed_bytes, DRIVER_CHUNK); // not one chunk per class
     }
+    #[test]
+    fn percentage_padding_uses_each_class_rate_and_architecture() {
+        let glm = charge("glm5", "sm120", &counts(434790, 28560), &rates(6680, 2792), Default::default()).unwrap();
+        assert_eq!(glm.padding_bytes, 434790 * 167 + 28560 * 70);
+        let flash = charge("glm5_flash", "sm120", &counts(321180, 7700), &rates(7143, 2456), Default::default()).unwrap();
+        assert_eq!(flash.padding_bytes, 321180 * 179 + 7700 * 61);
+        let spark_rates = rates(1000, 2000).map(|r| GraphNodeRate { architecture: "sm121", ..r });
+        let spark = charge("fixture", "sm121", &counts(2, 3), &spark_rates, Default::default()).unwrap();
+        assert_eq!(spark.padding_bytes, 2 * 25 + 3 * 50);
+    }
+
     #[test]
     fn unknown_rates_and_overflow_are_typed() {
         for arch in ["sm121", "sm999"] {

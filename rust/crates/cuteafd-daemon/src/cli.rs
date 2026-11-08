@@ -65,7 +65,7 @@ pub(crate) struct MemoryArgs {
     /// Per-GPU release allowance inside the cap (default 100MiB); GPU_RESERVE replaces it.
     #[arg(long, global = true, value_parser = parse_size)]
     pub(crate) memory_padding: Option<u64>,
-    /// Bytes per graph kernel node: N or rtx=N,spark=M; independent of GPU_RESERVE.
+    /// Graph node padding: percentage (default 2.5%), bytes/node, or rtx=VALUE,spark=VALUE; independent of GPU_RESERVE.
     #[arg(long, global = true)]
     pub(crate) graph_node_padding: Option<cuteafd_core::memory_policy::GraphNodePadding>,
     /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).
@@ -839,12 +839,12 @@ mod tests {
     fn memory_policy_flags_parse_sizes_and_reject_percentages() {
         use clap::Parser;
         let cli = super::Cli::try_parse_from(["cuteafd", "--gpu-memory-cap", "32GiB", "--spark-memory-cap", "100GiB",
-            "--gpu-reserve", "3GiB", "--spark-reserve", "512MiB", "--family-reserve", "2GB", "--memory-padding", "100MiB", "--kv-target-tokens", "1048576",
+            "--gpu-reserve", "3GiB", "--spark-reserve", "512MiB", "--family-reserve", "2GB", "--memory-padding", "100MiB", "--graph-node-padding", "rtx=2.5%,spark=100", "--kv-target-tokens", "1048576",
             "--kv-min-tokens", "65536", "--kv-max-tokens", "4194304", "plan", "/model"]).unwrap();
         let policy = cli.memory.policy();
         assert_eq!(policy, cuteafd_core::memory_policy::MemoryPolicy { gpu_cap: Some(32 << 30), spark_cap: Some(100 << 30),
             gpu_reserve: Some(3 << 30), spark_reserve: Some(512 << 20), family_reserve: Some(2_000_000_000), memory_padding: Some(100 << 20),
-            graph_node_padding: Default::default(), kv_target: Some(1 << 20), kv_min: Some(65_536), kv_max: Some(4 << 20) });
+            graph_node_padding: "rtx=2.5%,spark=100".parse().unwrap(), kv_target: Some(1 << 20), kv_min: Some(65_536), kv_max: Some(4 << 20) });
         assert!(policy.validate().is_ok());
         assert_eq!(super::Cli::try_parse_from(["cuteafd", "plan", "/model"]).unwrap().memory.policy(), Default::default());
         for (flag, value) in [("--gpu-memory-cap", "50%"), ("--gpu-reserve", "10%"), ("--spark-memory-cap", "1TB"),

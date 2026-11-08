@@ -230,7 +230,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
         "kv_geometry": {"pages": plan.pool_tokens.checked_div(plan.pool_page_rows),
             "tokens_per_page": plan.pool_page_rows, "capacity_tokens": plan.pool_tokens,
             "status": "admitted planner geometry; live pool occupancy not captured"},
-        "graph_node_padding": {"value": policy.graph_node_padding, "source": "GRAPH_NODE_PADDING bytes/node; independent of GPU_RESERVE"},
+        "graph_node_padding": {"value": policy.graph_node_padding, "source": "GRAPH_NODE_PADDING percentage/bytes per node; independent of GPU_RESERVE"},
         "memory_padding": {"bytes_per_gpu": policy.release_padding(),
             "source": if policy.gpu_reserve.is_some() { "GPU_RESERVE override" }
                 else if policy.memory_padding.is_some() { "MEMORY_PADDING / --memory-padding" }
@@ -248,6 +248,11 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
             Some(Device::Spark(rank)) => (DeviceKind::Spark, Location { device: Device::Spark(rank), domain: Domain::Managed }),
             _ => continue,
         };
+        for graph in plan.facts.allowances.iter().filter(|owner| owner.location == location
+            && owner.source.starts_with("startup graphs: ") && owner.source.contains("GRAPH_NODE_PADDING=")) {
+            tracing::info!(target: "cuteafd::memory_policy", device = %budget.id,
+                graph_bytes = graph.bytes, "{} (padding included, not a reserve)", graph.source);
+        }
         let Ok(mut items) = plan.items(location) else { continue };
         // Growth-only reserve allowances (lazy graphs, runtime growth) are reserve too.
         items.extend(plan.facts.allocations.iter().filter(|allocation| allocation.location == location
@@ -260,7 +265,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
         let breakdown = breakdown(budget.id.clone(), kind, cap, budget.headroom, &items);
         cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({format!("device.{}", budget.id): breakdown}));
         let line = cuteafd_core::memory_policy::render_line(&breakdown, &pool);
-        tracing::info!(target: "cuteafd::memory_policy", "{line}; GRAPH_NODE_PADDING {} B/node (included in graph owner)", policy.graph_node_padding);
+        tracing::info!(target: "cuteafd::memory_policy", "{line}; GRAPH_NODE_PADDING {} (included in graph owner)", policy.graph_node_padding);
     }
 }
 

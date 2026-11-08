@@ -122,7 +122,7 @@ release_memory_flag() {
 # release_validate_memory_value KEY VALUE: sizes take B, MB, GB, MiB or GiB (a
 # bare number is bytes, no percentages); token counts are positive integers.
 release_validate_memory_value() {
-  local key="$1" value="$2"
+  local key="$1" value="$2" graph_value='[0-9]+([.][0-9]{1,2})?%|[0-9]+'
   [[ -z "$value" ]] && return 0
   case "$key" in
     KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS)
@@ -131,8 +131,8 @@ release_validate_memory_value() {
       [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ && "$value" =~ [1-9] ]] ||
         release_die "$key must be a positive size in B, MB, GB, MiB or GiB" ;;
     GRAPH_NODE_PADDING)
-      [[ "$value" =~ ^[0-9]+$ || "$value" =~ ^rtx=[0-9]+,spark=[0-9]+$ || "$value" =~ ^spark=[0-9]+,rtx=[0-9]+$ ]] ||
-        release_die "$key must be integer bytes/node or rtx=N,spark=M" ;;
+      [[ "$value" =~ ^($graph_value)$ || "$value" =~ ^rtx=($graph_value),spark=($graph_value)$ || "$value" =~ ^spark=($graph_value),rtx=($graph_value)$ ]] ||
+        release_die "$key must be a percentage, integer bytes/node or rtx=VALUE,spark=VALUE" ;;
     GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING)
       [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] ||
         release_die "$key must be a size in B, MB, GB, MiB or GiB" ;;

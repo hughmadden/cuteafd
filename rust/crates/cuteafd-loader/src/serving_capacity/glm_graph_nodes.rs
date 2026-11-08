@@ -64,7 +64,6 @@ mod tests {
     use super::*;
     use crate::placement::{attention::AttentionPlacement, graph_nodes::charge};
     use crate::serving_capacity::glm_graphs::{glm_declared_graphs, glm_graph_shapes, GlmGraphLayer};
-    use cuteafd_core::memory_policy::GraphNodePadding;
 
     #[test]
     fn declared_keys_reproduce_archived_node_totals_and_context_subsets() {
@@ -85,7 +84,7 @@ mod tests {
             assert_eq!(counts.0[ORDINARY], ordinary);
             assert_eq!(counts.0[DSA_PAGED], dsa);
             assert_eq!(charge("glm5", "sm120", &counts, &GLM_SM120_NODE_RATES,
-                GraphNodePadding { rtx: 0, spark: 0 }).unwrap().packed_bytes, bytes);
+                "0".parse().unwrap()).unwrap().packed_bytes, bytes);
         }
     }
 

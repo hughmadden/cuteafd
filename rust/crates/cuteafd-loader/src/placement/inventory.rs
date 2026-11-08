@@ -875,7 +875,7 @@ mod tests {
         let estimated = GraphSet { ranks: vec![GraphRank::estimated(2, 10)], shapes: 1, lifetime: Lifetime::Startup };
         let fingerprints = [declared.fingerprint(0).unwrap()];
         let measured = estimated.captured(&fingerprints, &[captured.clone()]).unwrap();
-        assert_eq!(measured.ranks[0], GraphRank { executables: 2, bytes: 100, margin: 0, basis: Basis::Calibrated, node_charge: rank.node_charge });
+        assert_eq!(measured.ranks[0], GraphRank { executables: 2, bytes: 100, margin: 0, basis: Basis::Calibrated, node_charge: None });
         assert!(estimated.captured(&["other keys".into()], &[captured.clone()]).is_err());
         assert!(estimated.captured(&fingerprints, &[]).is_err());
         assert!(GraphSet::budget(&[10]).captured(&fingerprints, &[captured]).is_err());

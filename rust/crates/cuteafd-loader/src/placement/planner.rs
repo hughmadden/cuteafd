@@ -668,7 +668,7 @@ impl ResolvedPlan {
         self.phases
             .iter()
             .find(|row| row.budget == budget && row.phase == phase)
-            .map(|row| row.available - row.owned - row.opaque)
+            .map(|row| row.available.saturating_sub(row.owned).saturating_sub(row.opaque))
     }
 }
 

@@ -147,14 +147,20 @@ from measured owners and `FAMILY_RESERVE`. `MEMORY_PADDING=0` removes only paddi
 `GPU_RESERVE` replaces the whole reserve including padding, even when set to zero.
 Sparks are unchanged and use `SPARK_RESERVE`, not `MEMORY_PADDING`.
 
-`GRAPH_NODE_PADDING` is separate: it adds bytes per retained graph kernel node
-for families using the node model, even when a reserve override is set. RTX's
-provisional 1 B/node covers the observed integer-rate truncation (<0.31 B/node),
-not driver-version drift. Spark's default 0 does not reuse RTX measurements;
-missing architecture rates require a census. A successful startup capture that
-exceeds the prediction warns and continues. Only an actual allocation failure
-stops capture. This shared model is staged; family adoption follows the memory
-campaigns, so existing whole-capture families do not yet charge this padding.
+`GRAPH_NODE_PADDING` is separate: by default it adds **2.5% of each measured
+per-node class rate**, rounded to the nearest whole byte/node, before one 2 MiB
+packing step per physical device. It applies even with `GPU_RESERVE` or
+`SPARK_RESERVE`. An integer overrides it in absolute bytes/node; per-architecture
+values may mix forms, e.g. `rtx=2.5%,spark=100`. Architecture rates remain separate;
+missing Spark rates require a Spark census, never an RTX substitution.
+
+For the archived GLM 5.3 count this adds 74,609,130 B (about 71 MiB) before chunk
+rounding; Flash adds 57,960,920 B (about 55 MiB). Together with `MEMORY_PADDING`'s
+100 MiB default this is explicit driver-drift headroom, not a second graph charge.
+Successful captures above the prediction warn and continue; actual allocation
+failures stop. This shared model is staged: existing whole-capture families do
+not charge the node padding until their admission is migrated.
+
 Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`, ...).
 
 | Key | Default | Values | Notes |
@@ -167,7 +173,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables stay charged. Still inside the cap. |
 | `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
 | `MEMORY_PADDING` | `100MiB` | size | Explicit per-coordinator-GPU release padding, inside the cap; `0` disables only padding. `GPU_RESERVE` replaces it. Global flag: `--memory-padding`. |
-| `GRAPH_NODE_PADDING` | `rtx=1,spark=0` | integer bytes/node or `rtx=N,spark=M` | Added to measured graph-node rates, packed once per device into 2 MiB chunks. Independent of `GPU_RESERVE`, `SPARK_RESERVE` and `MEMORY_PADDING`; included once in the graph owner, not a reserve. Global flag: `--graph-node-padding`. |
+| `GRAPH_NODE_PADDING` | `2.5%` | percentage, integer bytes/node or `rtx=VALUE,spark=VALUE` | Added to measured graph-node rates, packed once per device into 2 MiB chunks. Independent of `GPU_RESERVE`, `SPARK_RESERVE` and `MEMORY_PADDING`; included once in the graph owner, not a reserve. Global flag: `--graph-node-padding`. |
 | `FAMILY_RESERVE` | per-family constant (0; GLM 5.3 Flash 2 GiB until #1442) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |

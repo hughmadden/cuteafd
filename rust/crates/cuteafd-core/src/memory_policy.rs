@@ -28,38 +28,71 @@ pub const AGENTIC_FLOOR_TOKENS: u64 = 262_144;
 /// the remaining owners are attributed. Per coordinator GPU, inside its cap.
 pub const DEFAULT_MEMORY_PADDING: u64 = 100 << 20;
 
-/// Bytes per retained graph kernel node, independent of all reserve overrides.
-/// RTX's 1 B covers observed integer-fit truncation (<0.31 B/node), not
-/// unmeasured driver drift. Spark has no calibration yet; no RTX rate is reused.
+/// A percentage of each measured class rate, or absolute bytes per node.
+/// Percentage padding rounds each class to the nearest whole byte per node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphNodePadding {
-    pub rtx: u64,
-    pub spark: u64,
+pub enum GraphPaddingValue { BasisPoints(u64), Bytes(u64) }
+
+impl GraphPaddingValue {
+    pub fn bytes_per_node(self, rate: u64) -> Option<u64> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::BasisPoints(points) => ((u128::from(rate) * u128::from(points) + 5000) / 10000).try_into().ok(),
+        }
+    }
 }
 
-impl Default for GraphNodePadding {
-    fn default() -> Self { Self { rtx: 1, spark: 0 } }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("GRAPH_NODE_PADDING must be integer bytes/node or rtx=N,spark=M")]
-pub struct GraphNodePaddingError;
-
-impl FromStr for GraphNodePadding {
+impl FromStr for GraphPaddingValue {
     type Err = GraphNodePaddingError;
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let number = |s: &str| if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
             s.parse::<u64>().map_err(|_| GraphNodePaddingError)
         } else { Err(GraphNodePaddingError) };
+        if let Some(percent) = text.strip_suffix('%') {
+            let (whole, fraction) = percent.split_once('.').unwrap_or((percent, "0"));
+            if fraction.len() > 2 { return Err(GraphNodePaddingError); }
+            let fraction = number(fraction)? * if fraction.len() == 1 { 10 } else { 1 };
+            let points = number(whole)?.checked_mul(100).and_then(|v| v.checked_add(fraction))
+                .ok_or(GraphNodePaddingError)?;
+            Ok(Self::BasisPoints(points))
+        } else { Ok(Self::Bytes(number(text)?)) }
+    }
+}
+
+impl fmt::Display for GraphPaddingValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self { Self::Bytes(bytes) => write!(f, "{bytes}"),
+            Self::BasisPoints(points) => write!(f, "{}.{:02}%", points / 100, points % 100) }
+    }
+}
+
+/// Graph padding is independent of GPU_RESERVE, SPARK_RESERVE and MEMORY_PADDING.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNodePadding {
+    pub rtx: GraphPaddingValue,
+    pub spark: GraphPaddingValue,
+}
+
+impl Default for GraphNodePadding {
+    fn default() -> Self { Self { rtx: GraphPaddingValue::BasisPoints(250), spark: GraphPaddingValue::BasisPoints(250) } }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("GRAPH_NODE_PADDING must be a percentage (up to two decimals), integer bytes/node, or rtx=VALUE,spark=VALUE")]
+pub struct GraphNodePaddingError;
+
+impl FromStr for GraphNodePadding {
+    type Err = GraphNodePaddingError;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
         if !text.contains('=') {
-            let value = number(text)?;
+            let value = text.parse()?;
             return Ok(Self { rtx: value, spark: value });
         }
         let (mut rtx, mut spark) = (None, None);
         for entry in text.split(',') {
             let (key, value) = entry.split_once('=').ok_or(GraphNodePaddingError)?;
             let slot = match key { "rtx" => &mut rtx, "spark" => &mut spark, _ => return Err(GraphNodePaddingError) };
-            if slot.replace(number(value)?).is_some() { return Err(GraphNodePaddingError); }
+            if slot.replace(value.parse()?).is_some() { return Err(GraphNodePaddingError); }
         }
         Ok(Self { rtx: rtx.ok_or(GraphNodePaddingError)?, spark: spark.ok_or(GraphNodePaddingError)? })
     }
@@ -313,14 +346,17 @@ mod tests {
 
     #[test]
     fn graph_padding_has_explicit_architectures_and_no_reserve_dependency() {
-        for (text, expected) in [("0", GraphNodePadding { rtx: 0, spark: 0 }),
-            ("350", GraphNodePadding { rtx: 350, spark: 350 }),
-            ("rtx=1,spark=20", GraphNodePadding { rtx: 1, spark: 20 }),
-            ("spark=20,rtx=1", GraphNodePadding { rtx: 1, spark: 20 })] {
+        for (text, expected) in [("0", GraphNodePadding { rtx: GraphPaddingValue::Bytes(0), spark: GraphPaddingValue::Bytes(0) }),
+            ("350", GraphNodePadding { rtx: GraphPaddingValue::Bytes(350), spark: GraphPaddingValue::Bytes(350) }),
+            ("rtx=1,spark=20", GraphNodePadding { rtx: GraphPaddingValue::Bytes(1), spark: GraphPaddingValue::Bytes(20) }),
+            ("spark=20,rtx=1", GraphNodePadding { rtx: GraphPaddingValue::Bytes(1), spark: GraphPaddingValue::Bytes(20) })] {
             assert_eq!(text.parse::<GraphNodePadding>(), Ok(expected));
             assert_eq!(expected.to_string().parse::<GraphNodePadding>(), Ok(expected));
         }
-        for text in ["", "rtx=1", "rtx=1,rtx=2", "rtx=1,spark=2,", "-1", "1MiB", "5%", "+1", "18446744073709551616"] {
+        assert_eq!("2.5%".parse::<GraphNodePadding>(), Ok(GraphNodePadding::default()));
+        assert_eq!(GraphPaddingValue::BasisPoints(250).bytes_per_node(7143), Some(179));
+        assert_eq!(GraphPaddingValue::BasisPoints(250).bytes_per_node(2456), Some(61));
+        for text in ["", "rtx=1", "rtx=1,rtx=2", "rtx=1,spark=2,", "-1", "1MiB", "2.501%", "+1", "18446744073709551616"] {
             assert!(text.parse::<GraphNodePadding>().is_err(), "{text}");
         }
     }
