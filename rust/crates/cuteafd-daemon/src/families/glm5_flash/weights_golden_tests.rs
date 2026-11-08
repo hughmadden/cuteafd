@@ -68,7 +68,13 @@ fn packed_head_push_delivers_one_transient_source_before_arena_pack() -> Result<
     let sockets = tempfile::Builder::new().prefix("glmf-").tempdir_in("/tmp")?;
     crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: 0 },
         None, root.path(), sockets.path(), &records, None, 0, 0)?;
-    let packed = source.pack(&library, vocab, hidden, loader.arenas.get(&0))?;
+    // The CPU fixture implements packing, not GEMV workspace queries; the CUDA head oracle
+    // covers GlmfHead::pack's workspace check. Exercise the same verified arena pack here.
+    let packed = crate::shared::packed_head::PackedHead::pack_with(&library,
+        source.allocations()[0].ptr, vocab, hidden, std::ptr::null_mut(),
+        |name, bytes| loader.arenas[&0].view(name, bytes))?;
+    drop(source);
+    let packed = super::super::head::GlmfHead::Packed { head: packed, draft_scratch: None };
     assert_eq!(packed.format(), Some(crate::families::glm5_flash::head::GlmfHeadFormat::Packed));
     assert_eq!(packed.bytes(), layout.total_bytes());
     let destination = loader.arenas[&0].view("packed12", layout.total_bytes())?;
