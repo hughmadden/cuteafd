@@ -1534,7 +1534,7 @@ pub(super) mod tests {
                 assert_eq!(storage.regions.len(), 4 + 3 + 2 * 23 + if format == Qwen4KvCache::Fp8 { 2 } else { 0 });
                 assert!(storage.regions.windows(2).all(|r| r[0].end <= r[1].start));
                 let before = fixture.events()?.matches('D').count();
-                let arena = Arena::named(device, storage.bytes, "staging/step5/test-producers")?;
+                let arena = Arena::new(device, storage.bytes, Tag::staging("step5/test-producers"))?;
                 let planes = storage.regions.iter().map(|r| {
                     arena.planes(device, &[r.len()], r.start)?.pop().context("staging test view")
                 }).collect::<Result<Vec<_>>>()?;

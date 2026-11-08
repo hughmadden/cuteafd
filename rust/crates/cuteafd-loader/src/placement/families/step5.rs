@@ -673,7 +673,7 @@ impl Recipe for Step5Recipe<'_> {
                 ByteCurve::fixed(bytes, self.maximum_pages), false, self.maximum_pages));
         }
         for (id, location, category, bytes, lifetime) in [
-            ("prefix", Location::HOST, Category::Prefix, self.host_cache_bytes,
+            ("prefix", Location::PINNED, Category::Prefix, self.host_cache_bytes,
                 Lifetime { first: Phase::Ready, last: Phase::Growth }),
             ("logits", Location::HOST, Category::Staging,
                 cuteafd_core::memory_layout::host_logits_bytes(

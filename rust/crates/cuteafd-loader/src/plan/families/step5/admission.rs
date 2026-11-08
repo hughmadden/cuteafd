@@ -1015,6 +1015,41 @@ mod tests {
     }
 
     #[test]
+    fn portable_host_prefix_maps_once_per_context_only_while_retained() -> Result<()> {
+        use crate::placement::planner::{driver_page_table_bytes, Location, Phase};
+        for ranks in [1, 2] {
+            let mut input = inputs(ranks);
+            input.marks.host = true;
+            input.host.cache_bytes = Some(32_941_696_000);
+            input.host.memory = (128 << 30, 128 << 30);
+            let admitted = run(&input)?;
+            let facts = &admitted.solved.facts;
+            let prefix = facts.deferred.iter().find(|owner| owner.id == "step5.host.prefix").unwrap();
+            assert_eq!((prefix.location, prefix.bytes), (Location::PINNED, 32_941_696_000));
+            let mappings = facts.driver_page_tables.iter().filter(|owner|
+                owner.backing == prefix.id).collect::<Vec<_>>();
+            assert_eq!(mappings.len(), ranks);
+            for rank in 0..ranks {
+                let mapping = mappings.iter().find(|owner|
+                    owner.location == Location::coordinator(rank as u8)).unwrap();
+                assert_eq!(mapping.mapped_bytes, prefix.bytes);
+                assert_eq!(mapping.bytes(), driver_page_table_bytes(prefix.bytes));
+                assert_eq!(mapping.bytes(), 64_339_250);
+                assert!(!mapping.lifetime.contains(Phase::Load, facts.phase_order));
+                assert!(mapping.lifetime.contains(Phase::Ready, facts.phase_order));
+                assert!(mapping.lifetime.contains(Phase::Growth, facts.phase_order));
+            }
+            input.host.cache_bytes = Some(0);
+            let disabled = run(&input)?;
+            assert!(!disabled.solved.facts.driver_page_tables.iter().any(|owner|
+                owner.backing == "step5.host.prefix"));
+            assert!(!disabled.solved.facts.deferred.iter().any(|owner|
+                owner.id == "step5.host.prefix"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn synchronous_h2d_staging_remains_owned_through_ready_and_growth() -> Result<()> {
         let mut inputs = inputs(1);
         inputs.host.retained_sync_h2d_bytes = 395_968_512;

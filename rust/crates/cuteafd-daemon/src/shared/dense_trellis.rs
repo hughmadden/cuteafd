@@ -363,7 +363,7 @@ mod retained_tests {
             ProjectionScratchLayout::grouped(128, 256, 3, 4)?] {
             let projection = ProjectionLayout { extents: layout.extents.clone(), rows: layout.rows };
             let before = fixture.events()?.matches('D').count();
-            let scratch = projection.allocate_packed(device, "workspace/step5/test-projection")?;
+            let scratch = projection.allocate_packed(device, Tag::workspace("step5/test-projection"))?;
             assert_eq!(fixture.events()?.matches('D').count() - before, 1);
             assert_eq!(scratch._owners.len(), 1);
             let storage = layout.packed()?;
@@ -389,7 +389,7 @@ mod retained_tests {
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 5);
             // Families that have not opted in still retain the original five owners.
-            assert_eq!(projection.allocate(device)?._owners.len(), 5);
+            assert_eq!(projection.allocate(device, Tag::workspace("step5/test-projection"))?._owners.len(), 5);
         }
         Ok(())
     }
