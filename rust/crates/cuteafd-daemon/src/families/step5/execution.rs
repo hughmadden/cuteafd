@@ -160,9 +160,10 @@ impl<'a> NativeOwners<'a> {
                 let (_, rank_layout) = plan.layer(rank, 0)?;
                 let native_layout = native_scratch_layout(rank_layout, rows, count)?;
                 let native_bytes = native_layout.as_ref().map(|l| l.bytes()).transpose()?.unwrap_or(0);
-                // The arena holds attention and FFN regions; the native scratch is its own admitted owner.
+                // The arena holds the sequential attention/FFN regions and, after they
+                // retire, the MTP stage scratch. One backing keeps one kind and charge.
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes,
-                    Tag::workspace("step5/target-scratch"))?;
+                    Tag::workspace("step5/sequential-scratch"))?;
                 let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout)
                     .map(Rc::new)).transpose()?;
                 let rope = Rc::new(TargetTables::load_in(device, programs, &contract, super::weights::ROPE_PREFIX,
