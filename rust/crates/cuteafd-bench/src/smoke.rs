@@ -449,7 +449,23 @@ impl Inflight {
                 });
             }
         });
+        for (name, _, _) in &names {
+            self.finished(name);
+        }
         names.into_iter().map(|(name, _, _)| name).collect()
+    }
+}
+
+/// Declared after the scheduler's locks, so errors and unwinding drain all
+/// registered launches before those locks are dropped.
+struct ServingCleanup(Arc<Inflight>);
+
+impl Drop for ServingCleanup {
+    fn drop(&mut self) {
+        // Block late launches even if an entry thread has not registered yet.
+        let _ = self.0.signal.compare_exchange(0, signal_hook::consts::SIGTERM as usize,
+            Ordering::SeqCst, Ordering::SeqCst);
+        self.0.cancel_all();
     }
 }
 
@@ -1013,6 +1029,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     let mut queue: std::collections::VecDeque<Entry> = pending.into();
     let mut running: Vec<Entry> = Vec::new();
     let mut locks = Locks::default();
+    let _cleanup = ServingCleanup(inflight.clone());
     let (done_tx, done_rx) = mpsc::channel::<(String, Outcome)>();
     let started = Instant::now();
     let mut waiting_note = Instant::now() - Duration::from_secs(600);
@@ -1041,8 +1058,17 @@ pub fn run(args: SmokeArgs) -> Result<()> {
                     let parallel = args.parallel > 1;
                     let inflight = inflight.clone();
                     std::thread::spawn(move || {
-                        let outcome = run_entry(&entry, &repo, &out_root, &configs, &logs, &profile, &build, parallel, &inflight);
-                        let _ = tx.send((entry.name.clone(), outcome));
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                            run_entry(&entry, &repo, &out_root, &configs, &logs, &profile, &build, parallel, &inflight)))
+                        {
+                            Ok(outcome) => { let _ = tx.send((entry.name.clone(), outcome)); }
+                            Err(_) => {
+                                // Wake the scheduler's bounded cancellation path rather
+                                // than leaving this entry and its locks waiting forever.
+                                let _ = inflight.signal.compare_exchange(0, signal_hook::consts::SIGTERM as usize,
+                                    Ordering::SeqCst, Ordering::SeqCst);
+                            }
+                        }
                     });
                 } else if waiting_note.elapsed() > Duration::from_secs(120) {
                     eprintln!("waiting for {needed:?} (held by another agent) for {}", entry.name);
@@ -1055,6 +1081,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         }
         match done_rx.recv_timeout(Duration::from_secs(1)) {
             Ok((name, outcome)) => {
+                // A signal can arrive while recv_timeout waits; cancelled entries
+                // leave their teardown registered for cancel_run, not lock release.
+                if let Some(signal) = inflight.cancelled() {
+                    return cancel_run(&inflight, signal, &running, &mut state, &paths, &state_dir, &entries, &build, started);
+                }
                 if let Some(index) = running.iter().position(|e| e.name == name) {
                     let entry = running.remove(index);
                     locks.release(&locks_for(&entry));
@@ -1493,7 +1524,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         Ok(None) => {
             outcome.status = if outcome.error.is_some() { "failed" } else { "done" }.into();
             outcome.code_tok_s = outcome.sweep.as_ref().and_then(|s| s.rate(1, "levels"));
-            let running = Command::new(&inflight.tools.docker).args(["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)])
+            let running = tool(&inflight.tools.docker, &["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)], Some(INSPECT_S))
                 .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
             if running == Some(false) {
                 outcome.error = Some("the server exited during or after the run (see its coordinator log)".into());
@@ -1523,7 +1554,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             outcome.build = build.to_string();
             let _ = writeln!(log, "server build {}", report.server.build.label());
             // A server that died after finishing the run still fails the entry's serving check.
-            let running = Command::new(&inflight.tools.docker).args(["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)])
+            let running = tool(&inflight.tools.docker, &["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)], Some(INSPECT_S))
                 .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
             if running == Some(false) {
                 outcome.error = Some("the server exited during or after the run (see its coordinator log)".into());
@@ -1536,7 +1567,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             // Only collect serving diagnostics after this entry launched containers
             // (not on a cancellation: the bounded teardown collects the logs).
             if launcher_started && inflight.cancelled().is_none() {
-                let tail = Command::new(&inflight.tools.docker).args(["logs", "--tail", "40", &coordinator_name(entry, parallel)]).output();
+                let tail = tool(&inflight.tools.docker, &["logs", "--tail", "40", &coordinator_name(entry, parallel)], Some(LOGS_S)).output();
                 if let Ok(tail) = tail {
                     let _ = log.write_all(&tail.stdout);
                     let _ = log.write_all(&tail.stderr);
@@ -1556,7 +1587,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
     if launcher_started && inflight.cancelled().is_none() {
         inflight.stop_launcher(&entry.name);
         if let Ok(config) = read_config(&configs.join(format!("{}.config", entry.name))) {
-            teardown(&entry.name, &config, &mut log, &inflight.tools, false);
+            teardown(&entry.name, &config, &mut log, &inflight.tools, true);
         }
         inflight.finished(&entry.name);
     }
@@ -1818,6 +1849,75 @@ mod tests {
         assert!(inflight.launch("late", &mut command, &configs, &logs).unwrap_err().downcast_ref::<Cancelled>().is_some());
         let hook = Hook { argv: vec!["true".into()], timeout_s: 2, required: false, cleanup: None, finish_timeout_s: None };
         assert!(HookChild::spawn(&hook, "http://127.0.0.1", &logs.join("x.log"), &logs.join("x.log"), "precheck", &inflight).is_err());
+    }
+
+    #[test]
+    fn failed_precheck_tears_down_every_container_before_release() {
+        use std::net::TcpListener;
+        use std::io::Read;
+        let root = tempfile::tempdir().unwrap();
+        let (configs, logs) = (root.path().join("configs"), root.path().join("logs"));
+        std::fs::create_dir_all(&configs).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        let calls = root.path().join("calls.log");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ready = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+        });
+        std::fs::write(root.path().join("run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(root.path().join("run.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::write(root.path().join("base.config"), format!(
+            "ADDR=127.0.0.1:{port}\nINSTANCE=precheck-test\nEXPERT_PORT=19441\nSPARK_COUNT=2\nSPARK_0_HOST=kiwi\nSPARK_1_HOST=rhea\n")).unwrap();
+        let entry = Entry { name: "ready".into(), config: Some("base.config".into()),
+            precheck: Some(Hook { argv: vec!["false".into()], timeout_s: 2, required: true,
+                cleanup: None, finish_timeout_s: None }), ..Entry::default() };
+        let inflight = Arc::new(Inflight { tools: fake_tools(root.path(), &calls), ..Inflight::default() });
+        let outcome = run_entry(&entry, root.path(), root.path(), &configs, &logs, "smoke", "test", false, &inflight);
+        ready.join().unwrap();
+        // The scheduler releases an entry's locks only after run_entry returns.
+        writeln!(File::options().append(true).open(&calls).unwrap(), "release").unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert!(outcome.error.unwrap().contains("precheck hook failed before workload"));
+        assert!(inflight.launches.lock().unwrap().is_empty());
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        let before_release = calls.split("release").next().unwrap();
+        assert!(before_release.contains("docker rm -f cuteafd-coordinator-precheck-test"), "{calls}");
+        for host in ["kiwi", "rhea"] {
+            assert!(before_release.lines().any(|line| line.starts_with("ssh ") && line.contains("docker rm -f")
+                && line.contains(&format!("cuteafd-spark-expert-{host}-19441"))), "{calls}");
+        }
+    }
+
+    #[test]
+    fn scheduler_error_drains_launches_before_lock_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let calls = root.path().join("calls.log");
+        let config = root.path().join("base.config");
+        std::fs::write(&config, "INSTANCE=scheduler-error\nSPARK_COUNT=0\n").unwrap();
+        let log = root.path().join("entry.log");
+        let inflight = Arc::new(Inflight { tools: fake_tools(root.path(), &calls), ..Inflight::default() });
+        struct Release(PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                writeln!(File::options().append(true).open(&self.0).unwrap(), "release").unwrap();
+            }
+        }
+        let result = (|| -> Result<()> {
+            let _locks = Release(calls.clone());
+            let _cleanup = ServingCleanup(inflight.clone());
+            inflight.launch("error", &mut Command::new("sleep").arg("30"), &config, &log)?;
+            bail!("scheduler failed");
+        })();
+        assert!(result.is_err());
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        assert!(calls.split("release").next().unwrap().contains("docker rm -f cuteafd-coordinator-scheduler-error"), "{calls}");
+        assert!(inflight.launches.lock().unwrap().is_empty());
+        assert!(inflight.cancelled().is_some());
     }
 
     #[test]
