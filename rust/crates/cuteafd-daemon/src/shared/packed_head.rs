@@ -172,7 +172,7 @@ mod tests {
         let scratch = DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?;
         // SAFETY: initialization is checked before operands; this must reject without dereferencing them.
         assert!(unsafe { packed.apply(&library, std::ptr::null(), std::ptr::null_mut(), true, 1,
-            false, &scratch, std::ptr::null_mut()) }.is_err());
+            false, scratch.buffer, std::ptr::null_mut()) }.is_err());
         device.run(|| packed.initialize(source.buffer.ptr, std::ptr::null_mut()))?;
         assert!(device.run(|| packed.initialize(source.buffer.ptr, std::ptr::null_mut())).is_err());
         drop(arena);
