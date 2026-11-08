@@ -176,11 +176,18 @@ it chooses the serving layout: with one coordinator GPU,
 select `off` (BF16 KDA and head). Explicit `off/row128/channel` KDA and
 `on/off` head settings always win, including the deprecated `GLMF_*` keys;
 current names take precedence over deprecated names. `GLM5_FLASH_FP8_HEAD=packed`
-(`--fp8-head packed`, as `V41_FP8_HEAD=packed`) keeps instead the exact 12-bit
-copy of the BF16 head, packed and verified at load, then the BF16 released
-(956 MB resident against 1,269 MB BF16 and 654 MB FP8): target logits read it
-exactly, the drafter its coarse plane; one GPU only (a head split refuses it). The DFlash2 drafter
-defaults to FP8 on both layouts; `SPECULATOR_FP8=off` keeps it BF16.
+(`--fp8-head packed`, as `V41_FP8_HEAD=packed`) applies only to checkpoints
+with a BF16 head, including the official FP8 and EXL3 K3.25-Core-FP8 releases.
+Native K6 and EXLR8 heads retain their checkpoint representation and ignore
+this conversion setting. Packed keeps an exact 12-bit copy, verified bit for
+bit at load before releasing the BF16 source. For the [154880, 4096] head,
+the payload is 911.784 MiB: 298.216 MiB less than BF16 but 287.878 MiB more
+than the default FP8 copy (arena allocation tails and scratch excluded).
+Target projection reconstructs the original BF16 operands; its reduction
+order need not produce cuBLAS-identical logits. The drafter reads the coarse
+plane. Packed requires one GPU; a head split refuses it for BF16-head
+checkpoints. The FP8 default is unchanged. The DFlash2 drafter defaults to
+FP8 on both layouts; `SPECULATOR_FP8=off` keeps it BF16.
 
 Matched recheck, 2026-10-04: GLM 5.3 Flash EXL3 K3.25, RTX PRO 6000 at
 325 W, fixed code prompts/nonces, one warm batch per concurrency, 512
