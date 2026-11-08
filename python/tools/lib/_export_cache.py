@@ -146,12 +146,28 @@ class Roots:
     def _under(path: str, roots) -> bool:
         return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
 
+    def aliases(self):
+        """Other mount points of the source tree (the dev shell's /workspace/cuteafd)."""
+        if not hasattr(self, "_aliases"):
+            self._aliases = []
+            for candidate in ("/workspace/cuteafd",):
+                try:
+                    if os.path.samefile(candidate, self.source) and os.path.realpath(candidate) != str(self.source):
+                        self._aliases.append(os.path.realpath(candidate))
+                except OSError:
+                    pass
+        return self._aliases
+
     def name(self, path) -> str | None:
         """'src:<rel>' or 'build:<rel>'; None outside both."""
         try:
             resolved = os.path.realpath(os.fsdecode(path))
         except (TypeError, ValueError):
             return None
+        for alias in self.aliases():
+            if resolved == alias or resolved.startswith(alias + "/"):
+                resolved = str(self.source) + resolved[len(alias):]
+                break
         for prefix, root in (("src:third_party/sparkinfer/", self.sparkinfer), ("src:", self.source),
                              ("build:", self.build)):
             if root is None:
