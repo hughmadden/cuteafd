@@ -483,8 +483,10 @@ def test_export_policy_environment_changes_invalidate_identity(monkeypatch):
 
 def test_export_environment_covers_every_source_read(monkeypatch):
     import ast
+    # _export_cache.py is cache tooling like kernel-records.py: it reads only its
+    # own control variables and replays recorded names, never export semantics.
     paths = [*sorted((ROOT / "python/tools/aot").glob("*.py")),
-             *sorted((ROOT / "python/tools/lib").glob("*.py")),
+             *sorted(path for path in (ROOT / "python/tools/lib").glob("*.py") if path.name != "_export_cache.py"),
              ROOT / "scripts/build/compare-sm-exports.py",
              ROOT / "scripts/build/export-placement-inputs.py"]
     names = set()
@@ -512,7 +514,7 @@ def test_export_environment_covers_every_source_read(monkeypatch):
                           "CUTEAFD_SPARKINFER_LOCK_FILE", "TRITON_CACHE_DIR",
                           "CUDA_VISIBLE_DEVICES", "B12X_COMPILE_DISK_CACHE",
                           "B12X_COMPILE_MEMORY_CACHE", "CUTEAFD_EXPORT_NARROW_AOT",
-                          "CUTEAFD_EXPORT_HC_LAGGED"}:
+                          "CUTEAFD_EXPORT_HC_LAGGED", "TRITON_DISABLE_LINE_INFO", "CUTEAFD_EXPORT_CACHE"}:
         before = records.export_environment()
         with monkeypatch.context() as patch:
             patch.setenv(name, "environment-coverage-sentinel")

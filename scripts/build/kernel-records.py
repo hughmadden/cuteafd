@@ -115,20 +115,23 @@ CUTEAFD_EXPORT_HOST_CLASS CUTEAFD_EXPORT_HOST_CONTEXTS CUTEAFD_EXPORT_HOST_WORKE
 CUTEAFD_EXPORT_JOBS CUTEAFD_EXPORT_SLOT_DIR CUTEAFD_EXPORT_HOST_SLOT_DIR
 CUTEAFD_EXPORT_GPU_SLOT_DIR CUTEAFD_EXPORT_GPU_BUDGET_MIB
 CUTEAFD_EXPORT_WORKER_GPU_MIB CUTEAFD_EXPORT_WORKER_RAM_MIB
-CUTEAFD_EXPORT_CONTEXT_SPACING_S HF_HUB_CACHE HF_HOME XDG_CACHE_HOME
+CUTEAFD_EXPORT_CONTEXT_SPACING_S HF_HUB_CACHE HF_HOME XDG_CACHE_HOME TRITON_DISABLE_LINE_INFO CUTEAFD_EXPORT_CACHE
 """.split())
 
 
 def export_environment():
     values = {name: os.environ.get(name) for name in sorted(EXPORT_ENVIRONMENT_NAMES)}
+    # The export cache's launcher variables name per-run paths (its read records,
+    # stats, build and output directories): control, never export semantics.
     values.update({name: value for name, value in sorted(os.environ.items())
-                   if name.startswith("CUTEAFD_")})
+                   if name.startswith("CUTEAFD_") and not name.startswith("CUTEAFD_EXPORT_CACHE_")})
     # These are forced by the offline worker, not inherited policy. Paths name
     # verified sources or disposable compiler storage rather than semantic inputs.
     values.update(CUTEAFD_BUILD_KIND=os.environ.get("CUTEAFD_BUILD_KIND", "development"),
                   CUTEAFD_EXPORT_NARROW_AOT="1", CUTEAFD_EXPORT_HC_LAGGED="1",
                   B12X_COMPILE_DISK_CACHE="0", B12X_COMPILE_MEMORY_CACHE="0",
-                  CUDA_VISIBLE_DEVICES="", TRITON_CACHE_DIR="<worker-cache>",
+                  CUDA_VISIBLE_DEVICES="", TRITON_CACHE_DIR="<worker-cache>", TRITON_DISABLE_LINE_INFO="1",
+                  CUTEAFD_EXPORT_CACHE="<export-cache>",
                   CUTEAFD_SOURCE_ROOT="<verified-source>",
                   CUTEAFD_SPARKINFER_SOURCE_DIR="<verified-fork>",
                   CUTEAFD_SPARKINFER_LOCK_FILE="<verified-lock>")

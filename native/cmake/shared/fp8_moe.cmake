@@ -107,7 +107,7 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${package}"
     COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-      "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
+      ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
       --role "${CUTEAFD_FP8_MOE_ROLE}" --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
       --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports" --output "${package}"
       --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
@@ -126,7 +126,7 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
       COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
       COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bf16_package}"
       COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-        "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
+        ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CUTEAFD_FP8_MOE_TOOL}" build
         --role spark --input bf16 --geometry "${geometry}" --capacities "${CUTEAFD_FP8_MOE_CAPACITIES}" ${exact_slices} ${requested_layouts}
         --build-dir "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_exports_bf16" --output "${bf16_package}"
         --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"

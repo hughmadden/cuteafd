@@ -42,6 +42,10 @@ Set CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=mimo to add BF16-input Spark siblings
 for selected FAMILY:fp8 packages. This does not change serving defaults.
 Set CUTEAFD_WIP_AUDIO_AOT=ON to build the optional audio tower on both SM120
 and SM121. Audio serving remains separately opt-in.
+AOT exports come from the host's export cache (~/.cache/cuteafd/export-cache,
+keyed by what each export read); CUTEAFD_WIP_EXPORT_CACHE=off exports everything.
+CUTEAFD_WIP_EXPORT_LINEINFO=ON keeps Triton/CuTe DSL source line info for
+source-level profiling (SASS-level profiling needs neither).
 --dry-run prints the resolved hosts, role plan and build invocations without
 touching Docker, SSH or any container.
 
@@ -1200,6 +1204,26 @@ wip_coordinator_export_modes() {
   esac
 }
 
+# wip_cached_exports BUILD...: the native phase with every AOT export required
+# to come from the export cache (scripts/build/export-cache.py exits 3 before an
+# exporter would start). CMake and host C++ run; no export touches a GPU. On a
+# miss Ninja keeps the restored outputs and the caller takes the export turn.
+wip_cached_exports() {
+  [[ "${CUTEAFD_BUILD_CACHES:-on}" != off && "${CUTEAFD_WIP_EXPORT_CACHE:-on}" == on ]] || return 1
+  local started=$SECONDS status=0 log
+  log="$(mktemp "${TMPDIR:-/tmp}/wip-cached-exports.XXXXXXXX")"
+  "$@" >"$log" 2>&1 || status=$?
+  echo "WIP cached exports: $(grep -oE '^export cache [a-z-]+' "$log" | sort | uniq -c | awk '{printf "%s %s, ", $4, $1}')"
+  if ((status == 0)); then
+    rm -f "$log"
+    echo "WIP phase cached-exports: $((SECONDS - started))s"
+    return 0
+  fi
+  grep -h 'export cache required-hit-missed' "$log" | head -3 >&2 || true
+  echo "WIP cached exports: not every export is cached (exit $status, log $log); taking the export turn" >&2
+  return 1
+}
+
 # wip_remote_export: the native key's entry from CUTEAFD_EXPORT_HOST, through
 # sparknest, then restored here with REQUIRE_HIT (no GPU turn on raptor).
 wip_remote_export() {
@@ -1252,7 +1276,14 @@ wip_capped_export_on() (
   # on that GPU sharing the WIP container's /wip and cache mounts.
   local -a build env_args=()
   eval "build=($CUTEAFD_CAPPED_BUILD)"
-  local i
+  local i line
+  # The WIP container's own cache plan (export cache, Triton/XDG/torch caches,
+  # compiler caches): --volumes-from brings its mounts, not its environment.
+  local image_env
+  image_env="$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$COORDINATOR_DOCKER_DEV")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && ! grep -qxF -- "$line" <<<"$image_env" && env_args+=(-e "$line")
+  done < <(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$coordinator_container")
   for ((i = 2; i < ${#build[@]}; i++)); do
     [[ "${build[i]}" == -e ]] && env_args+=(-e "${build[i + 1]}")
   done
@@ -1315,7 +1346,7 @@ build_coordinator() {
   fi
   local -a coordinator_build=(docker exec \
     "${cache_env[@]}" \
-    -e "CUTEAFD_WIP_DEV_IMAGE_ID=$image_id" -e "CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}" \
+    -e "CUTEAFD_WIP_DEV_IMAGE_ID=$image_id" -e "CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}" -e "CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}" -e "CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}" \
     -e "CUTEAFD_WIP_HOST_ISA=${wip_coordinator_host_isa:-${CUTEAFD_WIP_HOST_ISA:-}}" \
     -e "CUTEAFD_WIP_CARGO_FEATURES=${wip_cargo_features:-}" \
     -e CUTEAFD_WIP_EXPORT_LOCKS=off -e "CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}" -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}" -e "RUST_TEST_THREADS=${RUST_TEST_THREADS:-}" -e "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}" \
@@ -1378,6 +1409,8 @@ build_coordinator() {
     # The build re-verifies the entry; one that vanished fails rather than exporting unlocked.
     docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
       release_die "coordinator WIP native restore failed"
+  elif wip_cached_exports docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native; then
+    echo "WIP coordinator export: every export restored from the export cache, no GPU turn"
   else
     # Remote first when configured; otherwise take one bounded fair GPU turn.
     # The seed lease and Cargo slot are already released before this phase.
@@ -1447,7 +1480,7 @@ build_expert() (
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   local build_command
-  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}' -e 'CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+  build_command="docker exec -e 'CUTEAFD_WIP_DEV_IMAGE_ID=$image_id' -e 'CUTEAFD_WIP_NATIVE_CACHE=${CUTEAFD_WIP_NATIVE_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_CACHE=${CUTEAFD_WIP_EXPORT_CACHE:-on}' -e 'CUTEAFD_WIP_EXPORT_LINEINFO=${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}' -e 'CUTEAFD_EXPORT_JOBS=${CUTEAFD_EXPORT_JOBS:-}' -e 'CUTEAFD_EXPORT_HOST_CONTEXTS=${CUTEAFD_EXPORT_HOST_CONTEXTS:-}' -e 'CUTEAFD_EXPORT_WORKER_RAM_MIB=${CUTEAFD_EXPORT_WORKER_RAM_MIB:-}' -e 'CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-}' -e 'RUST_TEST_THREADS=${RUST_TEST_THREADS:-}' -e 'CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-}' -e 'CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}' -e 'CUTEAFD_SCCACHE_CUDA=$cuda_cache' -e 'CUTEAFD_KACHE=$cache_wrapper' -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' -e 'CUTEAFD_WIP_V41_AOT=${CUTEAFD_WIP_V41_AOT:-OFF}' -e 'CUTEAFD_WIP_VISION_ATTENTION_AOT=${CUTEAFD_WIP_VISION_ATTENTION_AOT:-OFF}' -e 'CUTEAFD_WIP_AUDIO_AOT=$audio_aot'${wip_exlr8_env[1]:+ -e '${wip_exlr8_env[1]}' -e 'CUTEAFD_WIP_EXLR8_FAMILIES=${CUTEAFD_WIP_EXLR8_FAMILIES}'} '$spark_container' timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$build_command rust" ||
     release_die "Spark WIP Rust phase on $seed_host failed (exit $?)"
   local seed_root
@@ -1461,6 +1494,9 @@ build_expert() (
     echo "WIP Spark export: native cache hit, no export turn"
     timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$restore_command" ||
       release_die "Spark WIP native restore on $seed_host failed"
+  elif wip_cached_exports timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" \
+      "${build_command/docker exec /docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 } native"; then
+    echo "WIP Spark export: every export restored from the export cache, no export turn"
   else
     # The seed's CPU lease admits other builds; its GPU export is one at a time.
     wip_seed_export_turn

@@ -54,6 +54,7 @@ option(CUTEAFD_ENABLE_CUDA "Build CUDA kernels and CUDA-backed ABI functions" OF
 option(CUTEAFD_ENABLE_VISION_ATTENTION_AOT "Build shared Qwen/GLM BF16 vision attention" OFF)
 option(CUTEAFD_ENABLE_AUDIO_AOT "Build bundled MiMo FP32 and Muse BF16 PCM audio towers" OFF)
 option(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT "Build full RTX backbone expert kernels alongside dSpark" OFF)
+option(CUTEAFD_EXPORT_LINEINFO "Keep source line info in AOT exports (profiling; checkout-path dependent)" OFF)
 option(CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT "Build dual RTX TP2 encoder expert kernels" OFF)
 option(CUTEAFD_V41_TP2_COMPACT_EXPERIMENT "Use experimental native compact TP2 experts at capacities 1/16" OFF)
 option(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT "Use experimental compact Spark experts through two live rows" OFF)
@@ -322,6 +323,21 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
     "PYTHONDONTWRITEBYTECODE=1"
     "PYTHONPATH=${CUTEAFD_SPARKINFER_SOURCE_DIR}"
   )
+  # Triton line info embeds the absolute fork path (PTX .file, DWARF comp_dir),
+  # so the same commit in two checkouts exported different bytes (#1485). SASS
+  # is identical without it; CUTEAFD_EXPORT_LINEINFO=ON keeps it for source-level
+  # profiling (CuTe DSL too), and the export cache keys either choice.
+  if(CUTEAFD_EXPORT_LINEINFO)
+    list(APPEND CUTEAFD_SPARKINFER_PYTHON_ENV "TRITON_DISABLE_LINE_INFO=0" "CUTE_DSL_LINEINFO=1")
+  else()
+    list(APPEND CUTEAFD_SPARKINFER_PYTHON_ENV "TRITON_DISABLE_LINE_INFO=1")
+  endif()
+  # Every export command runs through the content-addressed export cache
+  # (scripts/build/export-cache.py): a pass-through unless CUTEAFD_EXPORT_CACHE
+  # names a store and CUTEAFD_EXPORT_IMAGE_ID the compiler image.
+  set(CUTEAFD_EXPORT_LAUNCHER "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/export-cache.py" run
+    --build-dir "${CMAKE_CURRENT_BINARY_DIR}" --)
   execute_process(
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     RESULT_VARIABLE CUTEAFD_SPARKINFER_VERIFY_RESULT

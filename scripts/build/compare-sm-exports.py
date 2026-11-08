@@ -52,12 +52,47 @@ def resolve_source_root(path: Path | str | None = None, env=os.environ) -> Path:
 
 ROOT = resolve_source_root()
 PROGRAM_RECORDER = None
+PROGRAM_PLANS = None  # this worker's comparison-plans.json, by object name
 
 
 def recorded_construction(function, *args, **kwargs):
     if PROGRAM_RECORDER is not None:
         return PROGRAM_RECORDER.construct(function, *args, **kwargs)
     return function(*args, **kwargs)
+
+
+class ProgramRecords:
+    """The exporter's view of this worker's IR records, for programs it reuses whole.
+
+    export_b12x_dsv4_aot.py stores a program's record with its cached object and
+    hands it back here on a hit, so the publication keeps one record per object.
+    """
+
+    def record(self, output, label):
+        if PROGRAM_RECORDER is None:
+            return None
+        path = (Path(output) / (label + ".o")).relative_to(PROGRAM_RECORDER.output).as_posix()
+        record = PROGRAM_RECORDER.exports.get(path)
+        return json.loads(json.dumps(record)) if record is not None else None
+
+    def restore_plan(self, label, geometry, abi):
+        # The plan export_to_c would have captured (worker's export_with_plan).
+        if PROGRAM_PLANS is not None:
+            PROGRAM_PLANS[label] = {"geometry": dict(geometry), "abi": abi}
+
+    def restore(self, output, label, record):
+        if PROGRAM_RECORDER is None:
+            return
+        path = (Path(output) / (label + ".o")).relative_to(PROGRAM_RECORDER.output).as_posix()
+        # The reads it recorded, hashed as they are now (the export cache matched them).
+        record = dict(record, source_reads_sha256={
+            name: sha((ROOT / name).read_bytes()) for name in record.get("source_reads_sha256", {})
+            if (ROOT / name).is_file()})
+        PROGRAM_RECORDER.exports[path] = record
+
+    @property
+    def active(self):
+        return PROGRAM_RECORDER is not None
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
@@ -655,7 +690,7 @@ def export_exl3_routes(extra, output):
 
 
 def worker(payload):
-    global PROGRAM_RECORDER
+    global PROGRAM_RECORDER, PROGRAM_PLANS
     output = Path(payload["output"])
     os.environ["TRITON_CACHE_DIR"] = str(output.parent / f".triton-cache-{payload['sms']}")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -663,6 +698,8 @@ def worker(payload):
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
     os.environ["CUTEAFD_EXPORT_NARROW_AOT"] = "1"
     os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = "1"
+    # As native/CMakeLists.txt: Triton line info embeds the checkout path (#1485).
+    os.environ["TRITON_DISABLE_LINE_INFO"] = "1"
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
     from b12x._lib.compile_pool import _initialize_worker
@@ -680,7 +717,7 @@ def worker(payload):
     import importlib.metadata
     toolchain = {name: importlib.metadata.version(name) for name in ("torch", "triton", "nvidia-cutlass-dsl")}
     from b12x.integration.cuteafd import AotProgram
-    plans = {}
+    plans = PROGRAM_PLANS = {}
     original_export = AotProgram.export_to_c
 
     def export_with_plan(program, file_path, file_name, function_prefix):
@@ -727,6 +764,7 @@ def worker(payload):
         else:
             runpy.run_path(str(path), run_name="__main__", init_globals={
                 "_record_construction": recorded_construction,
+                "_program_records": ProgramRecords(),
                 "_selected_object_labels": payload.get("selected_objects")})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
         raise RuntimeError("exporter changed the synthetic SM count")

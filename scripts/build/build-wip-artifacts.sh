@@ -233,7 +233,7 @@ wip_native_key() {
     # Every scope switch that reaches CMake or an exporter.
     env | grep -E '^CUTEAFD_WIP_[A-Z0-9_]+=' |
       grep -vE '^CUTEAFD_WIP_(KIMIK3|MUSE|ML4)_AOT=OFF$' |
-      grep -vE '^CUTEAFD_WIP_(CARGO_FEATURES|EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
+      grep -vE '^CUTEAFD_WIP_(CARGO_FEATURES|EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|EXPORT_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s v41 %s %s %s vision %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" \
       "$coordinator_aot" "$xgrammar" "$v41_expert_aot" "$v41_coordinator_aot" "$v41_nvfp4_aot" "$vision_attention_aot"
@@ -339,6 +339,7 @@ cmake \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$v41_coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$v41_coordinator_aot" \
   -DCUTEAFD_ENABLE_RDMA=ON \
+  -DCUTEAFD_EXPORT_LINEINFO="${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}" \
   -DCUTEAFD_HOST_ISA="${host_isa_cmake:-}" \
   -DCUTEAFD_SPARKINFER_SOURCE_DIR="$source_dir/third_party/sparkinfer" \
   -DCUTEAFD_SPARKINFER_LOCK_FILE="$source_dir/third_party/sparkinfer.lock.json" \
@@ -348,6 +349,17 @@ cmake \
   -DCUTEAFD_XGRAMMAR_LOCK_FILE="$source_dir/third_party/xgrammar.lock.json" \
   -DPython3_EXECUTABLE="$(command -v python3)" \
   -DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"
+# Exports run through the content-addressed export cache (scripts/build/export-cache.py):
+# keyed by the compiler image and what each export read, shared by every build on
+# this host. Without the mounted store or an image ID each export just runs.
+if [[ "${CUTEAFD_BUILD_CACHES:-on}" != off && "${CUTEAFD_WIP_EXPORT_CACHE:-on}" == on && -n "${CUTEAFD_WIP_DEV_IMAGE_ID:-}" \
+      && -n "${CUTEAFD_EXPORT_CACHE:-}" && "${CUTEAFD_EXPORT_CACHE}" != off ]]; then
+  export CUTEAFD_EXPORT_IMAGE_ID="$CUTEAFD_WIP_DEV_IMAGE_ID"
+  export CUTEAFD_EXPORT_CACHE_STATS="$build_dir/export-cache-stats.jsonl"
+  rm -f "$CUTEAFD_EXPORT_CACHE_STATS"
+else
+  export CUTEAFD_EXPORT_CACHE=off
+fi
 # One process budget shared by variant workers across all Ninja package jobs.
 export CUTEAFD_EXPORT_SLOT_DIR="${CUTEAFD_EXPORT_SLOT_DIR:-$build_dir/cache/export-slots}"
 export CUTEAFD_EXPORT_HOST_CLASS="${CUTEAFD_EXPORT_HOST_CLASS:-$( [[ "$role" == coordinator ]] && echo raptor || echo remote )}"
@@ -507,8 +519,14 @@ if [[ -n "${native_key:-}" ]] && ((${native_hit:-0} == 0)); then
     sort -rn | tail -n +"$((${CUTEAFD_WIP_NATIVE_KEEP:-16} + 1))" | cut -d' ' -f2- |
     while IFS= read -r stale; do rm -rf "$stale"; done
 fi
+export_cache_summary=""
+if [[ -s "${CUTEAFD_EXPORT_CACHE_STATS:-/nonexistent}" ]] && ((${native_hit:-0} == 0)); then
+  export_cache_summary="$(python3 -c 'import collections,json,sys
+c=collections.Counter(json.loads(l)["event"] for l in open(sys.argv[1]) if l.strip())
+print(" ".join(f"{k} {c[k]}" for k in ("hit","miss","uncacheable") if c[k]))' "$CUTEAFD_EXPORT_CACHE_STATS")"
+fi
 [[ -z "${native_started:-}" ]] ||
-  wip_phase_mark native $((SECONDS - native_started)) "$([[ ${native_hit:-0} == 1 ]] && echo reused || echo built)"
+  wip_phase_mark native $((SECONDS - native_started)) "$([[ ${native_hit:-0} == 1 ]] && echo reused || echo built)${export_cache_summary:+; exports $export_cache_summary}"
 
 [[ "${phase:-all}" != export ]] || exit 0
 (

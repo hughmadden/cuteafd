@@ -48,9 +48,22 @@ def _prepend_source() -> None:
     sys.path[:] = [source, *retained_paths]
 
 
+def _export_cache_paused():
+    # The export cache records what an export reads (python/tools/lib/_export_cache.py).
+    # Verification hashes the whole tree against the lock: that proves the tree
+    # is the locked one, it does not consume it, so only the lock is an input.
+    recorder = sys.modules.get("_export_cache")
+    if recorder is None:
+        from contextlib import nullcontext
+        return nullcontext()
+    recorder.note_read(LOCK)
+    return recorder.paused()
+
+
 try:
     _verifier = _load_verifier()
-    LOCK_DATA = _verifier.verify(SOURCE, LOCK)
+    with _export_cache_paused():
+        LOCK_DATA = _verifier.verify(SOURCE, LOCK)
     _prepend_source()
     IMPORTED_MODULE = _verifier.verify_import_source(SOURCE)
 except Exception as exc:

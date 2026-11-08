@@ -819,9 +819,12 @@ def _wip_function(name, end):
 def _trace_tools(tmp_path, extra=None):
     tools = tmp_path / 'tools'
     tools.mkdir()
+    # The export cache is cold: a native phase that requires every export to be
+    # cached fails as export-cache.py does (exit 3) and the caller takes its turn.
+    cold = 'case "$*" in *CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1*) exit 3;; esac\n'
     scripts = {
-        'ssh': '#!/bin/sh\nprintf "ssh %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
-        'docker': '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n',
+        'ssh': '#!/bin/sh\nprintf "ssh %s\\n" "$*" >> "$TRACE"\n' + cold + 'printf "image-id\\n"\n',
+        'docker': '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$TRACE"\n' + cold + 'printf "image-id\\n"\n',
         'flock': '#!/bin/sh\nprintf "flock %s\\n" "$*" >> "$TRACE"\n',
         # hwlock stand-in: record the turn, then run the command it guards.
         'python3': '#!/bin/sh\nprintf "turn %s\\n" "$*" >> "$TRACE"\nwhile [ "$1" != -- ]; do shift; done; shift\nprintf "begin\\n" >> "$TRACE"\n"$@"\nrc=$?\nprintf "end\\n" >> "$TRACE"\nexit $rc\n',
@@ -886,8 +889,11 @@ CUTEAFD_WIP_COORDINATOR_EXPORT=auto
     lines = trace.read_text().splitlines()
     rust = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator rust'))
     capped = lines.index('capped')
-    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native'))
-    assert rust < capped < native
+    # First every export is requested from the export cache (cold here), then the GPU turn.
+    cached = next(i for i, line in enumerate(lines) if 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' in line)
+    native = next(i for i, line in enumerate(lines) if line.endswith('/wip/output/coordinator native')
+                  and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' not in line)
+    assert rust < cached < capped < native
     assert not any('hwlock.py --locks gpu1' in line for line in lines)
     assert all('CUTEAFD_WIP_EXPORT_LOCKS=off' in line for line in lines if 'build-wip-artifacts.sh' in line)
     wip = (ROOT / 'wip.sh').read_text()
@@ -2520,7 +2526,8 @@ def test_an_export_published_while_waiting_is_restored_not_rebuilt(tmp_path):
     # A build ahead of us in the seed's export queue exported this very key.
     lines, lease = _expert_leg(tmp_path, [False, True])
     assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
-    native = [line for line in lines if line.endswith('/wip/output/expert native')]
+    native = [line for line in lines if line.endswith('/wip/output/expert native')
+              and 'CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1' not in line]
     assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
 
 
