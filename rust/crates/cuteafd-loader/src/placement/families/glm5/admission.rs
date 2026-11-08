@@ -1132,6 +1132,18 @@ pub const GLM_MAX_CONTEXT: [MemoryFigure; 2] = [
 /// builds differs (16,827 keys needed 3.73 GB at 9567fdf6 and 3.04 GB at
 /// 5d180b5c8), so a row is never scaled to another key set or another build.
 /// A declared set with no row is refused; measure it and add the row.
+/// `commit` is the cuteafd SHA that produced the census and `sparkinfer` the
+/// SparkInfer revision that build pinned; the bytes follow the fork, so a row
+/// measured under another pin is reported loudly at plan time.
+///
+/// Measure a new row with the family census card, then sum that device's
+/// `profile/graph-census-captures-*.jsonl` `instantiate_bytes` values:
+///
+/// ```text
+/// scripts/bench/wip-cards.py --build --cards glm53-exl3-min \
+///     --set glm53-exl3-min:PROFILE=census --set glm53-exl3-min:MEMORY_PADDING=2GiB \
+///     --probe glm53-exl3-min:memory,console --panels none
+/// ```
 #[derive(Debug, Clone, Copy)]
 struct MeasuredGraphSet {
     keys: usize,
@@ -1140,79 +1152,139 @@ struct MeasuredGraphSet {
     layout: &'static str,
     census: &'static str,
     commit: &'static str,
+    sparkinfer: &'static str,
 }
 
 /// GLM 5.3 K6-HQA (#1242 census, revision 47af23347db743b4666d952e2eb48f2b01c3fede),
-/// GLM 5.3 K6 at 9567fdf6, and Mistral Large 4 at 9567fdf6. Each byte figure is
-/// one device's capture sum; count and fingerprint identify the set.
+/// GLM 5.3 K6 at cuteafd 29212c52, and Mistral Large 4 at cuteafd 3baa1a4a and
+/// 29212c52. Each byte figure is one device's capture sum; count and fingerprint
+/// identify the set. Every row records both the cuteafd commit and the
+/// SparkInfer revision of the build that measured it.
 const MEASURED_GLM_GRAPHS: [MeasuredGraphSet; 8] = [
     MeasuredGraphSet { keys: 16_827, fingerprint: MIN_GRAPHS, bytes: 2_560_622_592, layout: MIN_LAYOUT,
         census: "glm53-exl3-min-census-r1 device 0: 16827 capture instantiate records",
-        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
+        commit: "4a56925e7986a57e3194c0cca6df256838386519",
+        sparkinfer: "78cfee4e04e8d8055853945711e5f28ea27216e0" },
     MeasuredGraphSet { keys: 16_827, fingerprint: MAX_GRAPHS[0], bytes: 3_042_967_552, layout: MAX_LAYOUT,
         census: "glm53-exl3-max-census-r1 device 0: 16827 capture instantiate records",
-        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        sparkinfer: "78cfee4e04e8d8055853945711e5f28ea27216e0" },
     MeasuredGraphSet { keys: 16_614, fingerprint: MAX_GRAPHS[1], bytes: 2_971_664_384, layout: MAX_LAYOUT,
         census: "glm53-exl3-max-census-r1 device 1: 16614 capture instantiate records",
-        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226",
+        sparkinfer: "78cfee4e04e8d8055853945711e5f28ea27216e0" },
     MeasuredGraphSet { keys: 16_827, fingerprint: "743e61e45b39ba6bdb04043401a1b5f9330863bda205bbb35615ff9512aea6dc",
         bytes: 3_732_930_560, layout: "glm53-exl3-k4/core-k6; attention/Context; sparks/6",
         census: "typed-tags-phase-c glm53-exl3-max-fixed-r1 device 0: 16827 capture instantiate records",
-        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+        commit: "29212c52f262afcda61c940f6c007e837d231057",
+        sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
     MeasuredGraphSet { keys: 16_614, fingerprint: "b6f823f3b9defca4fcd752fab3567a19d8056921c5277355e8a5be925bae1d54",
         bytes: 3_986_685_952, layout: "glm53-exl3-k4/core-k6; attention/Context; sparks/6",
         census: "typed-tags-phase-c glm53-exl3-max-fixed-r1 device 1: 16614 capture instantiate records",
-        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+        commit: "29212c52f262afcda61c940f6c007e837d231057",
+        sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
     MeasuredGraphSet { keys: 15_549, fingerprint: "5a2e6d744e3c72d4b192e3e8732ac7681eb2f4f9d44acfa8216420f9df693f70",
         bytes: 2_740_977_664, layout: "ml4-exl3; attention/Heads; 1 rank",
         census: "ml4 1x census memory-census-20261108T172510Z-raptor-coordinator-57-0",
-        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+        commit: "3baa1a4ab72f8e378c07abd0d22ac473db53a840",
+        sparkinfer: "851c42833da26711c68868014cad2fc043916416" },
     MeasuredGraphSet { keys: 15_549, fingerprint: "bc9d9f1d011860a37be849433d80b8b4c728751d7a5bbd8e483d4e147d80c031",
         bytes: 3_445_620_736, layout: "ml4-exl3; attention/Context; 2 ranks",
         census: "typed-tags-phase-c ml4-exl3-max-fixed-r1 device 0: 15549 capture instantiate records",
-        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+        commit: "29212c52f262afcda61c940f6c007e837d231057",
+        sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
     MeasuredGraphSet { keys: 15_336, fingerprint: "4ca4be3bc0b20179dc457a8eff3ec0d9425bb6a4ef1a6851955a9f6a9d4073aa",
         bytes: 3_720_347_648, layout: "ml4-exl3; attention/Context; 2 ranks",
         census: "typed-tags-phase-c ml4-exl3-max-fixed-r1 device 1: 15336 capture instantiate records",
-        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+        commit: "29212c52f262afcda61c940f6c007e837d231057",
+        sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
 ];
+
+/// The SparkInfer revision this build pins. Graph instantiate storage is the
+/// fork's kernels, so a row measured under another pin is stale evidence.
+fn pinned_sparkinfer_revision() -> &'static str {
+    static REVISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REVISION.get_or_init(|| {
+        let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../../third_party/sparkinfer.lock.json")))
+            .expect("embedded SparkInfer lock");
+        lock["revision"].as_str().expect("SparkInfer lock revision").to_owned()
+    })
+}
 
 fn measured_graph_row(fingerprint: &str) -> Option<&'static MeasuredGraphSet> {
     MEASURED_GLM_GRAPHS.iter().find(|row| row.fingerprint == fingerprint)
 }
 
+/// One resolved graph row: the charge, its attribution and, when the row was
+/// measured under another SparkInfer pin, the warning the caller reports.
+struct GraphRow {
+    bytes: u64,
+    basis: Basis,
+    figure: MemoryFigure,
+    stale_pin: Option<String>,
+}
+
 /// The measured row for one declared set, or nothing so the caller refuses with
 /// the geometry and the measurement that would cover it.
-fn graph_row(fingerprint: &str, keys: usize) -> Option<(u64, Basis, MemoryFigure)> {
+fn graph_row(fingerprint: &str, keys: usize) -> Option<GraphRow> {
     if let Some(row) = measured_graph_row(fingerprint) {
         if row.keys != keys { return None; }
-        return Some((row.bytes, Basis::Calibrated,
-            measured(row.bytes, row.fingerprint, row.layout, row.commit, row.census)));
+        let pinned = pinned_sparkinfer_revision();
+        let stale_pin = (row.sparkinfer != pinned).then(|| format!(
+            "GLM startup graph row {fingerprint} ({n} keys, rank-set {}) was measured at cuteafd {} \
+             with SparkInfer {} but this build pins {pinned}; instantiate storage follows the fork, \
+             so re-run this layout's memory census and update MEASURED_GLM_GRAPHS",
+            row.layout, row.commit, row.sparkinfer, n = row.keys));
+        return Some(GraphRow { bytes: row.bytes, basis: Basis::Calibrated, stale_pin,
+            figure: measured(row.bytes, row.fingerprint, row.layout, row.commit, row.census) });
     }
-    #[cfg(test)]
     {
-        // Unit fixtures build plans on synthetic geometries no census covers;
-        // this path is never compiled into the engine.
+        // Unit fixtures build plans on synthetic geometries no census covers.
+        // Production startup never enables this; see `allow_synthetic_graphs`.
         if SYNTHETIC_GRAPHS.with(std::cell::Cell::get) {
             let bytes = keys as u64 * (2 << 20);
-            return Some((bytes, Basis::Estimated, MemoryFigure { bytes,
-                attribution: FigureAttribution::Estimated { derivation: "2 MiB per declared graph" },
-                evidence: "synthetic unit fixture", producing_commit: "test",
-                identity: FigureIdentity { declared_graphs: "", programs_sha256: CENSUS_PROGRAMS,
-                    native_sha256: CENSUS_NATIVE, toolchain: CENSUS_TOOLCHAIN,
-                    gpu_class: "synthetic/sm_120", driver: "test", layout: "synthetic unit fixture" } }));
+            return Some(GraphRow { bytes, basis: Basis::Estimated, stale_pin: None,
+                figure: MemoryFigure { bytes,
+                    attribution: FigureAttribution::Estimated { derivation: "2 MiB per declared graph" },
+                    evidence: "synthetic unit fixture", producing_commit: "test",
+                    identity: FigureIdentity { declared_graphs: "", programs_sha256: CENSUS_PROGRAMS,
+                        native_sha256: CENSUS_NATIVE, toolchain: CENSUS_TOOLCHAIN,
+                        gpu_class: "synthetic/sm_120", driver: "test", layout: "synthetic unit fixture" } } });
+        }
+        // A census run is how an unmeasured fingerprint gets its row: it needs
+        // *some* charge to be admitted, and the live capture replaces it through
+        // `reconcile_startup_graphs` before Ready. Charge the largest measured
+        // row for the same declared count (or 2 MiB per executable when there is
+        // none), never a proportional scale, and say so loudly.
+        if std::env::var("CUTEAFD_GRAPH_CENSUS").is_ok_and(|value| value == "1") {
+            let bytes = MEASURED_GLM_GRAPHS.iter().filter(|row| row.keys == keys)
+                .map(|row| row.bytes).max()
+                .unwrap_or_else(|| keys as u64 * (2 << 20));
+            tracing::warn!(fingerprint, keys, bytes,
+                "GLM startup graph fingerprint has no measured row; this census run charges the largest \
+                 measured row for {keys} keys until the live capture reconciles it");
+            return Some(GraphRow { bytes, basis: Basis::Estimated, stale_pin: None,
+                figure: MemoryFigure { attribution: FigureAttribution::Estimated {
+                        derivation: "unmeasured declared fingerprint; census run placeholder, reconciled from the live capture" },
+                    ..measured(bytes, "", "unmeasured fingerprint; census run", "census",
+                        "census run placeholder; reconciled from the live capture") } });
         }
     }
     None
 }
 
-#[cfg(test)]
 thread_local! {
-    /// Unit fixtures plan synthetic geometries that no census covers. The
-    /// synthetic figure is only compiled into test builds; a test that needs
-    /// the production refusal turns it off.
-    static SYNTHETIC_GRAPHS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Unit fixtures plan synthetic geometries that no census covers. On by
+    /// default in this crate's tests; another crate's fixture must opt in, and
+    /// production startup never does, so an unmeasured fingerprint refuses.
+    static SYNTHETIC_GRAPHS: std::cell::Cell<bool> = const { std::cell::Cell::new(cfg!(test)) };
 }
+
+/// Test fixtures in another crate whose planner geometry no census covers.
+/// Never call this from serving code.
+#[doc(hidden)]
+pub fn allow_synthetic_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(true)); }
 
 #[cfg(test)]
 pub(crate) fn refuse_unmeasured_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(false)); }
@@ -1487,15 +1559,16 @@ impl StartupGraphs {
         let (mut fingerprints, mut ranks, mut figures) = (Vec::new(), Vec::new(), Vec::new());
         for (rank, keys) in declared.iter().enumerate() {
             let fingerprint = keys.fingerprint(rank as u8).map_err(Refusal::InvalidFact)?;
-            let Some((bytes, basis, figure)) = graph_row(&fingerprint, keys.len()) else {
+            let Some(row) = graph_row(&fingerprint, keys.len()) else {
                 return Err(Refusal::InvalidFact(format!(
                     "GLM startup graphs: no measured instantiate row for declared key set {fingerprint} \
                      ({n} keys, rank {rank}, attention {attention:?}, {gpus} coordinator GPU(s), context {context}); \
                      launch this layout with a memory census and sum the CUTEAFD_GRAPH_CENSUS capture \
                      instantiate_bytes for device {rank}, then add that row to MEASURED_GLM_GRAPHS", n = keys.len())));
             };
-            figures.push(figure);
-            ranks.push(GraphRank { executables: keys.len() as u64, bytes, margin: 0, basis });
+            if let Some(warning) = row.stale_pin { tracing::warn!("{warning}"); }
+            figures.push(row.figure);
+            ranks.push(GraphRank { executables: keys.len() as u64, bytes: row.bytes, margin: 0, basis: row.basis });
             fingerprints.push(fingerprint);
         }
         Ok(Self { context, shapes: shapes.len() as u64, attention, layers: layers.to_vec(),

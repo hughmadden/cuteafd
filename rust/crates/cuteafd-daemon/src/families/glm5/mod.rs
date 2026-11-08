@@ -540,6 +540,7 @@ mod draft_cli_tests {
     #[test]
     fn planner_charge_equals_admission_charge_for_the_same_geometry() {
         use cuteafd_loader::plan::exlr8::PrefillActivations;
+        cuteafd_loader::placement::families::glm5::admission::allow_synthetic_graphs();
         const GROUP: &str = "GLM target hooks";
         let dir = tempfile::tempdir().unwrap();
         cuteafd_loader::plan::testing::exlr8::glm_admission_snapshot(dir.path());
