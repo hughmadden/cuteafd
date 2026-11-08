@@ -936,6 +936,7 @@ class Executed:
         self.files: set[str] = set()
         self.last_files: set[str] = set()
         self.closures: dict[str, frozenset] = {}
+        self.unparsed: set[str] = set()
         self.loaded: set[str] = set()
 
     @property
@@ -978,8 +979,13 @@ class Executed:
         return result
 
     def closure(self, path: str) -> frozenset:
-        # Not memoized across programs: dynamic imports keep accruing.
-        return frozenset(self._imports(path))
+        # The parsed imports never change; dynamic imports keep accruing.
+        if path not in self.closures:
+            self.closures[path] = frozenset(self._imports(path))
+        result = self.closures[path] | frozenset(DYNAMIC_IMPORTS.get(path, ()))
+        if path in self.unparsed:
+            result |= frozenset(self._package_modules(path))  # loaded by now, not when parsed
+        return result
 
     def _module_file(self, name: str):
         parts = name.split(".")
@@ -997,7 +1003,8 @@ class Executed:
             text = Path(path).read_text()
             tree = ast.parse(text)
         except (OSError, SyntaxError, ValueError):
-            return self._package_modules(path)  # unreadable: everything near it counts
+            self.unparsed.add(path)  # unreadable: everything loaded near it counts
+            return set()
         relative = Path(path).relative_to(Path(self.fork).parent).with_suffix("")
         parts = list(relative.parts)
         package = parts[:-1] if parts[-1] != "__init__" else parts[:-1]
@@ -1028,9 +1035,8 @@ class Executed:
         # through importlib.import_module (prelude or program; recorded by the
         # wrapper installed at bootstrap). Lazy package __getattr__ resolves
         # through it. Other dynamic loaders key the file's whole loaded package.
-        found.update(DYNAMIC_IMPORTS.get(path, ()))
         if "__import__(" in text or "spec_from_file_location" in text or "exec(" in text:
-            found.update(self._package_modules(path))
+            self.unparsed.add(path)
         return found
 
     def _package_modules(self, path: str):
