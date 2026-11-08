@@ -210,6 +210,8 @@ impl From<libloading::Error> for VisionError {
         Self::Library(e)
     }
 }
+#[cfg(feature = "test-support")]
+pub fn check_for_test(status: i32) -> Result<(), VisionError> { check(status) }
 fn check(status: i32) -> Result<(), VisionError> {
     if status == 0 {
         crate::memory_ledger::fault::clear_failure();

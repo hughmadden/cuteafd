@@ -94,6 +94,7 @@ pub fn ready(listener: &tokio::net::TcpListener) {
         if GRACEFUL.load(std::sync::atomic::Ordering::Relaxed) { return; }
         stopping(reason);
         settle().await;
+        cuteafd_ffi::memory_ledger::fault::shutdown();
         std::process::exit(if reason == "SIGINT" { 130 } else { 143 });
     });
 }

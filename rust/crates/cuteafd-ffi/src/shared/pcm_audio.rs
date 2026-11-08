@@ -58,6 +58,8 @@ type Encode = unsafe extern "C" fn(
 ) -> i32;
 type Ledger = unsafe extern "C" fn(*mut c_void, *mut PcmLedger) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
+#[cfg(feature = "test-support")]
+pub fn check_for_test(code: i32) -> Result<(), AudioError> { check(code) }
 fn check(code: i32) -> Result<(), AudioError> {
     if code == 0 {
         crate::memory_ledger::fault::clear_failure();

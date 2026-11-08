@@ -586,7 +586,10 @@ impl FailureSnapshot {
 }
 
 pub(crate) fn capture_failure(error: anyhow::Error) -> anyhow::Error {
-    if error.chain().any(|cause| cause.is::<FailureSnapshot>()) { return error; }
+    if error.chain().any(|cause| cause.is::<FailureSnapshot>()) {
+        fault::clear_failure();
+        return error;
+    }
     let report = fault::take_failure().or_else(|| {
         let memory = error.downcast_ref::<crate::NativeStatusError>()
             .is_some_and(|status| status.status == crate::CUTEAFD_STATUS_ALLOCATION_FAILED)
@@ -661,28 +664,6 @@ pub fn current_cuda_memory_snapshot() -> Option<serde_json::Value> {
         Some(serde_json::json!({"device": device, "physical_free_bytes": free,
             "physical_total_bytes": total, "cuda_current_pool": pool_data,
             "scope": "raw cudaMemGetInfo under-reports reclaimable page cache on GB10; use host MemAvailable for allocatable headroom; current process/device CUDA runtime queries; no synchronization or pool trimming; CUDA pool bytes are physical telemetry, not additional tracked allocations"}))
-    }
-}
-
-/// Free and total bytes of `device` from the CUDA runtime already in the
-/// process image (never loads a second runtime), queried on the calling
-/// thread: callers that use the device themselves must restore their device.
-/// `None` before the native library has loaded the runtime.
-pub fn device_memory(device: i32) -> Option<(usize, usize)> {
-    use libloading::os::unix::Symbol;
-    type SetDevice = unsafe extern "C" fn(i32) -> i32;
-    type MemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
-    let runtime = loaded_cuda_runtime()?;
-    // SAFETY: symbol types match the CUDA runtime API; both calls only touch
-    // this thread's device selection and write two integers.
-    unsafe {
-        let set: Symbol<SetDevice> = runtime.get(b"cudaSetDevice").ok()?;
-        let info: Symbol<MemGetInfo> = runtime.get(b"cudaMemGetInfo").ok()?;
-        if set(device) != 0 {
-            return None;
-        }
-        let (mut free, mut total) = (0usize, 0usize);
-        (info(&mut free, &mut total) == 0).then_some((free, total))
     }
 }
 

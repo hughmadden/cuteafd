@@ -720,6 +720,7 @@ dependencies = [
  "clap",
  "cuteafd-api",
  "cuteafd-core",
+ "cuteafd-ffi",
  "cuteafd-loader",
  "cuteafd-transport",
  "futures",

@@ -123,6 +123,8 @@ impl From<libloading::Error> for AudioError {
         Self::Library(error)
     }
 }
+#[cfg(feature = "test-support")]
+pub fn check_for_test(code: i32) -> Result<(), AudioError> { check(code) }
 fn check(code: i32) -> Result<(), AudioError> {
     if code == 0 {
         crate::memory_ledger::fault::clear_failure();

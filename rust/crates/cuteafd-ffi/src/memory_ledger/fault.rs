@@ -87,13 +87,53 @@ thread_local! {
     static PENDING: RefCell<Option<Arc<FailureReport>>> = const { RefCell::new(None) };
 }
 
+fn lock_spool(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock only locks the live file descriptor; no pointer arguments.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 { Ok(()) }
+    else { Err(io::Error::last_os_error()) }
+}
+
+fn sweep_unused_spools(directory: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let (pid, trigger) = if let Some(rest) = name.strip_prefix(".memory-spool-") {
+            let Some((pid, index)) = rest.split_once('-') else { continue };
+            if !index.parse::<u32>().is_ok_and(|index| index < 8) { continue; }
+            (pid, false)
+        } else if let Some(rest) = name.strip_prefix("memory-triggers-").and_then(|name| name.strip_suffix(".jsonl")) {
+            let Some((_, pid)) = rest.rsplit_once('-') else { continue };
+            (pid, true)
+        } else { continue };
+        let Ok(pid) = pid.parse::<i32>() else { continue };
+        if pid <= 0 { continue; }
+        // SAFETY: signal zero probes process existence without sending a signal.
+        let dead = unsafe { libc::kill(pid, 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if !dead && pid as u32 != std::process::id() { continue; }
+        let Ok(file) = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(entry.path()) else { continue };
+        let metadata = file.metadata()?;
+        // A restarted private PID namespace may reuse the same PID. The lock
+        // distinguishes its stale files from a live process with that PID.
+        // SAFETY: geteuid reads the process's effective UID.
+        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
+            || (trigger && metadata.len() != 0) || lock_spool(&file).is_err() { continue; }
+        std::fs::remove_file(entry.path())?;
+    }
+    Ok(())
+}
+
 /// Preopen private storage and fixed host scratch before any native allocation.
 /// No report file is published on successful startup unless census was asked for.
 pub fn initialize(directory: &Path, host: &str, role: &str) -> io::Result<()> {
     if SERVICE.get().is_some() { return Ok(()); }
     std::fs::create_dir_all(directory)?;
+    sweep_unused_spools(directory)?;
     let trigger_path = directory.join(format!("memory-triggers-{}-{}-{}.jsonl", sanitize(host), sanitize(role), std::process::id()));
     let trigger_file = OpenOptions::new().append(true).create_new(true).mode(0o600).open(&trigger_path)?;
+    lock_spool(&trigger_file)?;
     let mut spools = Vec::new();
     for index in 0..8 {
         let path = directory.join(format!(".memory-spool-{}-{index}", std::process::id()));
@@ -105,6 +145,7 @@ pub fn initialize(directory: &Path, host: &str, role: &str) -> io::Result<()> {
                 return Err(error);
             }
         };
+        lock_spool(&file)?;
         spools.push((file, path));
     }
     let service = Service { spools, directory: directory.into(),
@@ -715,6 +756,42 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("detailed capture busy"));
         assert!(text.contains("detailed spools exhausted"));
+    }
+
+    #[test]
+    fn stale_spools_are_swept_but_live_locks_and_trigger_evidence_survive() {
+        let _guard = super::super::test_guard();
+        let root = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+            .join(format!("memory-spool-sweep-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let stale = root.join(format!(".memory-spool-{dead}-0"));
+        let empty = root.join(format!("memory-triggers-fixture-rank3-{dead}.jsonl"));
+        let evidence = root.join(format!("memory-triggers-fixture-rank4-{dead}.jsonl"));
+        let reused = root.join(format!(".memory-spool-{}-1", std::process::id()));
+        let live = root.join(format!(".memory-spool-{}-2", std::process::id()));
+        for path in [&stale, &empty, &reused, &live] { std::fs::write(path, b"").unwrap(); }
+        std::fs::write(&evidence, b"{\"sequence\":1}\n").unwrap();
+        let locked = File::open(&live).unwrap(); lock_spool(&locked).unwrap();
+        sweep_unused_spools(&root).unwrap();
+        for path in [&stale, &empty, &reused] { assert!(!path.exists(), "{}", path.display()); }
+        assert!(live.exists()); assert!(evidence.exists());
+        drop(locked);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn already_retained_error_clears_an_untaken_native_token() {
+        let _guard = super::super::test_guard(); setup(); clear_failure();
+        let error = super::super::capture_failure(anyhow::anyhow!("retained fixture"));
+        callback(&fixture(c"untaken-fixture", c"cuda", 2, Some(123), 0));
+        let path = PENDING.with(|pending| pending.borrow().as_ref().unwrap().path.clone());
+        let error = super::super::capture_failure(error);
+        assert!(error.chain().any(|cause| cause.is::<super::super::FailureSnapshot>()));
+        assert!(take_failure().is_none());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
