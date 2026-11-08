@@ -60,6 +60,12 @@ elif args.mode == "ctemp":
         target = os.path.join(tmp, "module.o").encode()
         handle = libc.fopen(target, b"w"); libc.fputs(b"obj", handle); libc.fclose(handle)
         open(target, "rb").read()
+elif args.mode == "staged":
+    # Package into a sibling staging directory, then rename it into place.
+    import tempfile
+    stage = Path(tempfile.mkdtemp(prefix=".stage-", dir=args.output_dir.parent))
+    (stage / "lib.so").write_text("lib")
+    os.replace(stage, args.output_dir / "package")
 elif args.mode == "child":
     import subprocess
     subprocess.run([sys.executable, "-I", "-c", "print(1)"], check=True)
@@ -148,6 +154,14 @@ def test_unrecordable_exports_are_never_stored(tree, tmp_path, mode, reason):
 def test_reading_back_a_temporary_directory_the_export_created_is_cacheable(tree):
     assert run(tree, mode="ctemp")[0] == "miss"
     assert run(tree, mode="ctemp")[0] == "hit"
+
+
+def test_a_package_staged_beside_its_output_and_renamed_in_is_restored(tree):
+    _, build = tree
+    assert run(tree, mode="staged")[0] == "miss"
+    shutil.rmtree(build / "out")
+    assert run(tree, mode="staged")[0] == "hit"
+    assert (build / "out/package/lib.so").read_text() == "lib"
 
 
 def test_known_compilers_and_shells_with_unknown_programs_fail_closed(tree):

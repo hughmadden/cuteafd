@@ -341,6 +341,22 @@ class Recorder:
                 for scope in self.scopes:
                     scope.written.add(resolved)
 
+    def note_move(self, source, destination) -> None:
+        """A staged file or directory renamed into place: its writes now live there."""
+        old = os.path.realpath(os.fsdecode(source))
+        new = os.path.realpath(os.fsdecode(destination)) if not os.path.isdir(os.fsdecode(destination)) \
+            or os.path.isdir(old) else os.path.join(os.path.realpath(os.fsdecode(destination)), os.path.basename(old))
+        with self.lock:
+            moved = {path for path in self.written if path == old or path.startswith(old + "/")}
+            for path in moved:
+                self.written.discard(path)
+                target = new + path[len(old):]
+                self.written.add(target)
+                for scope in self.scopes:
+                    scope.written.discard(path)
+                    scope.written.add(target)
+        self.note_write(destination)
+
     def note_delete(self, path) -> None:
         kind, name = self.roots.classify(path)
         if kind == "src":
@@ -464,7 +480,10 @@ class Recorder:
             target = args[0] if args and args[0] is not None else "."
             if is_path(target) and not getattr(self.local, "importing", 0):
                 self.note_listing(target)
-        elif event in ("os.rename", "os.replace", "shutil.copyfile", "shutil.copytree", "os.link", "os.symlink"):
+        elif event in ("os.rename", "os.replace"):
+            if len(args) >= 2 and is_path(args[0]) and is_path(args[1]) and not self._fd_relative(event, args):
+                self.note_move(args[0], args[1])
+        elif event in ("shutil.copyfile", "shutil.copytree", "os.link", "os.symlink"):
             if len(args) >= 2 and is_path(args[1]) and not self._fd_relative(event, args):
                 self.note_write(args[1])
         elif event in ("os.remove", "os.rmdir", "shutil.rmtree"):

@@ -127,6 +127,9 @@ def run(args) -> int:
         record = cache.merge_records(Path(reads))
     seconds = round(time.monotonic() - started, 3)
     reason = refusal(record, command)
+    if record is not None:
+        # Written then removed (a staging directory renamed or cleaned up): not outputs.
+        record["written"] = [path for path in record["written"] if os.path.lexists(path)]
     if not reason and not watched:
         reason = "the command names no output directory under the build directory"
     if not reason and any(not any(Path(path) == root or root in Path(path).parents for root in watched)
