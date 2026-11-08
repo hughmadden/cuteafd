@@ -38,10 +38,10 @@ pub(crate) struct MuseDraft<'a> {
     rows: usize,
 }
 
-fn drafter_arenas<'a>(device: Device<'a>, snapshot: &Path, devices: &[i32], head_rank: usize)
+fn drafter_arenas<'a>(device: Device<'a>, snapshot: &Path, devices: &[i32], head_rank: usize,
+    representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation)
     -> Result<std::collections::BTreeMap<i32, DeviceWeightArena<'a>>> {
-    use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only;
-    DflashDrafter::arena_requests(snapshot, Bf16Only, devices, head_rank)?.into_iter()
+    DflashDrafter::arena_requests(snapshot, representation, devices, head_rank)?.into_iter()
         .map(|(id, requests)| {
             let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
                 format!("muse/drafter/{id}"), requests)?;
@@ -68,7 +68,7 @@ impl<'a> MuseDraft<'a> {
         let mask = table.host_rows(&[config.mask_token])?;
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         ensure!(exchange.is_some() == !admitted.tp2.is_empty(), "Muse draft split differs from admission");
-        use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only;
+        let representation = admitted.representation;
         let (devices, head_rank) = if let Some(exchange) = exchange.as_ref() {
             ensure!(exchange.device(1) == device.id && exchange.stream(1) == stream,
                 "Muse drafter lead differs from the target head rank");
@@ -76,7 +76,7 @@ impl<'a> MuseDraft<'a> {
         } else {
             (vec![device.id], 0)
         };
-        let arenas = drafter_arenas(device, snapshot, &devices, head_rank)?;
+        let arenas = drafter_arenas(device, snapshot, &devices, head_rank, representation)?;
         let allocate = |id, name: &str, bytes| {
             let arena = arenas.get(&id).context("Muse drafter requested an unplanned physical device")?;
             weight_allocation(Device { library: device.library, id }, Some(arena), name, bytes)
@@ -85,11 +85,11 @@ impl<'a> MuseDraft<'a> {
             use crate::shared::fp8_linear::{Fp8Scales, Fp8Rows};
             if let Some(exchange) = exchange {
                 DflashDrafter::load_tp2_on_with(device.library, programs, snapshot, file, admitted.context_slots,
-                    admitted.sequences, mask, true, Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
+                    admitted.sequences, mask, true, representation, Fp8Scales::Amax, Fp8Rows::W8a16,
                     kv_cache, exchange, head_rank, allocate)
             } else {
                 DflashDrafter::load_with(device.library, programs, snapshot, file, stream, admitted.context_slots,
-                    admitted.sequences, mask, true, Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16, kv_cache, allocate)
+                    admitted.sequences, mask, true, representation, Fp8Scales::Amax, Fp8Rows::W8a16, kv_cache, allocate)
             }
         })?;
         let stored_width = head.globals.head.as_ref().context("Muse drafter on a rank without the head")?.shape[0];
@@ -190,7 +190,7 @@ mod tests {
             let head_rank = devices.len() - 1;
             let head = Device { library: &library, id: devices[head_rank] };
             let requests = DflashDrafter::arena_requests(&snapshot, Bf16Only, &devices, head_rank)?;
-            let arenas = drafter_arenas(head, &snapshot, &devices, head_rank)?;
+            let arenas = drafter_arenas(head, &snapshot, &devices, head_rank, Bf16Only)?;
             let mut views = Vec::new();
             let mut census = Census::default();
             let topology = CoordinatorDevices::new(&devices)?;

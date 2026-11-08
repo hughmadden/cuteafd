@@ -43,6 +43,43 @@ fn zero_spark_is_a_typed_planner_result_not_a_launcher_restriction() {
 }
 
 #[test]
+fn target_admission_replaces_tensor_charges_with_runtime_arenas() {
+    use crate::families::muse_spark::{core::CoreInventory,
+        weight_layout::{coordinator_arena, GlobalLayout, LayerLayout}, MuseSparkConfig};
+    use cuteafd_core::memory_layout::DeviceKind;
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let checkpoint = input.checkpoint();
+    let cfg = MuseSparkConfig::from_hf(&checkpoint.config).unwrap();
+    let core = CoreInventory::from_checkpoint(&cfg, checkpoint).unwrap();
+    let global = GlobalLayout::new(&cfg, &core).unwrap();
+    for gpus in [1, 2] {
+        let report = input.plan(&with_layout(gpus, 6)).unwrap();
+        let placement = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+        let layouts = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, gpus, &core).unwrap())
+            .collect::<Vec<_>>();
+        let devices = report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|device| device.kind == DeviceKind::Rtx).collect::<Vec<_>>();
+        assert_eq!(devices.len(), gpus);
+        for (gpu, device) in devices.iter().enumerate() {
+            let local = layouts.iter().map(|ranks| &ranks[gpu]).collect::<Vec<_>>();
+            let arena = coordinator_arena(gpu, gpus, &global, &local).unwrap();
+            let bytes = arena.bytes() as u64;
+            let tail = bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+            let roots = device.items.iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1, "one target root per physical GPU");
+            assert_eq!(roots[0].bytes, bytes);
+            assert_eq!(device.items.iter().filter(|item| item.group == "allocation granularity")
+                .map(|item| item.bytes).sum::<u64>(), tail);
+            assert!(!placement.items[gpu].iter().any(|item| matches!(item.group.as_str(),
+                "token embedding" | "lm head (K6)" | "final norm" |
+                "Muse native attention values and block scales") || item.group.starts_with("layer weights (")),
+                "the old immutable tensor charge must not survive beside its arena");
+        }
+    }
+}
+
+#[test]
 fn detects_the_checkpoint_and_classifies_every_text_tensor() {
     let dir = snapshot(&[0]);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();

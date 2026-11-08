@@ -172,6 +172,7 @@ impl LocalPackage {
 /// stored-width F32 rows, trimmed, softcapped) over a draft block batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuseDrafter {
+    pub representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
     pub owned: u64,
     pub weights: ResidentWeights,
     pub scratch: u64,
@@ -190,11 +191,11 @@ pub struct MuseDrafter {
 impl MuseDrafter {
     pub fn with_tp2(mut self, snapshot: &std::path::Path, sms: &[u64],
         kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<Self> {
-        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        use crate::families::glm5::draft_representation::GlmDraftCapacity;
         ensure!(sms.len() == 2, "Muse TP2 DFlash needs two GPUs");
         let capacity = GlmDraftCapacity::new(self.context_slots, self.sequences, self.block)?;
         self.tp2 = super::glm5_flash::drafter_tp2_inventory(snapshot, capacity, &[sms[1], sms[0]],
-            GlmDraftRepresentation::Bf16Only, 2, kv_cache)?;
+            self.representation, 2, kv_cache)?;
         Ok(self)
     }
 }
@@ -223,15 +224,16 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
          the target head's", cfg.softcap, cfg.output_multiplier);
     let block = usize::try_from(block)?;
     let capacity = GlmDraftCapacity::new(slots, sequences, block).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let representation = GlmDraftRepresentation::Bf16Only;
     let residency = draft_resident_bytes_with_mode(config, capacity.context_slots, capacity.max_batch_sequences,
-        sms, GlmDraftRepresentation::Bf16Only, 2, kv_cache).map_err(|error| anyhow::anyhow!("Muse drafter: {error}"))?;
+        sms, representation, 2, kv_cache).map_err(|error| anyhow::anyhow!("Muse drafter: {error}"))?;
     // Stored-width F32 rows of the K6 head and the trimmed F32 rows, per draft row.
     ensure!(stored >= cfg.vocab_size, "Muse head stored width below the vocabulary");
     let rows = capacity.max_batch_sequences * block;
     let head_scratch = u64::try_from(rows * (stored + cfg.vocab_size) * 4)?;
     let probe = (cfg.layers * crate::families::muse_spark::lane::HEAD_ROWS * cfg.topk * 4) as u64;
     let runtime = u64::try_from(rows * 4)? + probe;
-    Ok(MuseDrafter { owned: residency.owned, weights: residency.weights, scratch: residency.scratch,
+    Ok(MuseDrafter { representation, owned: residency.owned, weights: residency.weights, scratch: residency.scratch,
         head_scratch, runtime, context_slots: capacity.context_slots,
         sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize, tp2: Vec::new() })
 }
