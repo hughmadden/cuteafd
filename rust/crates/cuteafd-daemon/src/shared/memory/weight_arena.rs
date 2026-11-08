@@ -14,7 +14,16 @@ pub(crate) struct DeviceWeightArena<'a> {
 impl<'a> DeviceWeightArena<'a> {
     pub fn new(device: Device<'a>, layout: cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("weights/coordinator arena");
-        let allocation = std::rc::Rc::new(Allocation::weight_arena(device, layout.bytes(), layout.id())?);
+        let registration = cuteafd_ffi::memory_ledger::fault::register_arena(cuteafd_ffi::memory_ledger::fault::Arena {
+            id: layout.id().into(), kind: cuteafd_core::memory_layout::Category::Weights,
+            device: device.id, bytes: layout.bytes(), padding_bytes: layout.padding_bytes(), tail_bytes: None,
+            views: layout.views().iter().map(|(name, view)| cuteafd_ffi::memory_ledger::fault::ArenaView {
+                name: name.clone(), offset: view.offset(), bytes: view.bytes(),
+            }).collect(),
+        });
+        let mut allocation = Allocation::weight_arena(device, layout.bytes(), layout.id())?;
+        allocation.register_weight_arena(registration);
+        let allocation = std::rc::Rc::new(allocation);
         ensure!(allocation.buffer.bytes == layout.bytes(), "weight arena allocation differs from admitted backing");
         Ok(Self { layout, allocation })
     }
