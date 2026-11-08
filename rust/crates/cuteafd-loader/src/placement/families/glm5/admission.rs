@@ -1,7 +1,7 @@
 //! GLM physical component composition and the common plan/serve assembler.
 //! Loading provenance never changes an owner's charge or its activation.
 use super::{PAGE_ROWS, weights::WeightInventory};
-use super::{buffers::TargetBuffers, exchanges::ExchangeBuffers, hooks::HookBuffers};
+use super::{buffers::{FLOOR, TargetBuffers}, exchanges::ExchangeBuffers, hooks::HookBuffers};
 use crate::families::glm5::GlmDsaConfig;
 use crate::placement::inventory::{DeclaredGraphSet, FigureAttribution, FigureIdentity, MemoryFigure};
 use crate::placement::{AttentionPlacement, GraphRank, GraphSet, LayerMode, planner::*};
@@ -79,6 +79,99 @@ pub struct GlmRecipe<'a> {
 }
 
 impl GlmRecipe<'_> {
+    /// The search prices each pool cudaMalloc at its rounded driver-block
+    /// extent. Split that back into the exact request and one named
+    /// granularity tail per rank, conserving every selected phase cost.
+    pub fn refine_pool_receipts(&self, solved: &mut ResolvedPlan) -> Result<(), Refusal> {
+        if solved.pool_tokens == 0 || solved.pool_tokens % self.page_tokens != 0 {
+            return Err(invalid("selected pool is not a multiple of the prepared page quantum"));
+        }
+        let searched = evaluate(&solved.facts, &solved.budgets)?;
+        if searched.len() != solved.phases.len() || !searched.iter().zip(&solved.phases).all(|(exact, ledger)|
+            exact == ledger)
+        {
+            return Err(invalid("selected ledger differs from the searched phases"));
+        }
+        let mut tails = Vec::new();
+        for device in 0..self.gpus as u8 {
+            let target = self.targets.iter().map(|case| &case.value)
+                .find(|target| target.device == device)
+                .ok_or_else(|| invalid("prepared target buffers are missing for a selected device"))?;
+            if target.page_tokens != self.page_tokens {
+                return Err(invalid("prepared page quantum differs from the recipe"));
+            }
+            let pages = solved.pool_tokens / target.page_tokens;
+            let (requests, floors) = target.pool_requests(self.cfg, pages)
+                .map_err(|error| invalid(&error.to_string()))?;
+            for id in floors {
+                let root = solved.facts.allocations.iter().find(|owner| owner.id == id)
+                    .ok_or_else(|| invalid(&format!("selected pool owner {id} is missing")))?;
+                // The pool's own small-driver-block component priced these.
+                if root.view.is_some() || root.lifetime != Lifetime::TARGET || root.bytes != FLOOR {
+                    return Err(invalid(&format!("selected latent slot {id} changed shape")));
+                }
+            }
+            let mut backings = Vec::new();
+            let mut small = Vec::new();
+            for (id, bytes) in requests {
+                let root = solved.facts.allocations.iter_mut().find(|owner| owner.id == id)
+                    .ok_or_else(|| invalid(&format!("selected pool owner {id} is missing")))?;
+                if root.view.is_some() || root.lifetime != Lifetime::TARGET {
+                    return Err(invalid(&format!("selected pool owner {id} changed shape")));
+                }
+                let searched_bytes = if independent_request(bytes) {
+                    bytes.checked_add(allocation_granularity_forecast(&[bytes])?)
+                        .ok_or(Refusal::Overflow("GLM pool cudaMalloc backing"))?
+                } else {
+                    bytes
+                };
+                if root.bytes != searched_bytes {
+                    return Err(invalid(&format!("selected pool owner {id} searched cost changed")));
+                }
+                if !independent_request(bytes) { small.push(bytes); }
+                root.bytes = bytes;
+                root.shape = vec![bytes];
+                backings.push(GranularityBacking { backing: id, requests: vec![bytes] });
+            }
+            if backings.is_empty() { continue; }
+            // Only requests below the shared-block boundary were priced exactly;
+            // the block they share adds the rest of the refinement.
+            let delta = allocation_granularity_forecast(&small)?;
+            tails.push((Location::coordinator(device), delta));
+            solved.facts.allocation_granularity.push(AllocationGranularity {
+                id: format!("glm.target.gpu.{device}.kv.tail"),
+                location: Location::coordinator(device),
+                lifetime: Lifetime::TARGET,
+                backings,
+                evidence: GranularityEvidence::Forecast,
+            });
+        }
+        let phases = evaluate(&solved.facts, &solved.budgets)?;
+        if phases.len() != searched.len() {
+            return Err(invalid("pool receipt refinement changed the evaluated phase rows"));
+        }
+        for (exact, before) in phases.iter().zip(&searched) {
+            if exact.budget != before.budget || exact.phase != before.phase || exact.available != before.available {
+                return Err(invalid("pool receipt refinement changed the evaluated phase rows"));
+            }
+            let budget = solved.budgets.iter().find(|budget| budget.id == exact.budget)
+                .ok_or_else(|| invalid("evaluated phase names an unknown budget"))?;
+            let extra = tails.iter()
+                .filter(|(location, delta)| *delta > 0 && budget.locations.contains(location)
+                    && Lifetime::TARGET.contains(exact.phase, solved.facts.phase_order))
+                .try_fold(0u64, |sum, (_, delta)| sum.checked_add(*delta)
+                    .ok_or(Refusal::Overflow("GLM pool granularity")))
+                ?;
+            if exact.owned.checked_add(exact.opaque)
+                != before.owned.checked_add(before.opaque).and_then(|total| total.checked_add(extra))
+            {
+                return Err(invalid("pool receipt refinement changed physical phase costs"));
+            }
+        }
+        solved.phases = phases;
+        Ok(())
+    }
+
     /// Mechanical executor output. Backend bytes come from the selected local
     /// physical inventory, not the report's route/payload/check/view totals.
     pub fn execution(&self, solved: &ResolvedPlan, local: &super::local_physical::LocalPhysicalInventory)
@@ -1034,7 +1127,8 @@ impl<'a> ProductionInput<'a> {
 
 impl PreparedGlm<'_> {
     pub fn admit(mut self, request: Request) -> Result<AdmittedGlm, Refusal> {
-        let solved = crate::placement::planner::solve(request, self.budgets, &self.recipe)?;
+        let mut solved = crate::placement::planner::solve(request, self.budgets, &self.recipe)?;
+        self.recipe.refine_pool_receipts(&mut solved)?;
         let count = solved.decisions.onboard_layers.iter().flatten().copied()
             .collect::<BTreeSet<_>>().len();
         let local = self.local.remove(&count).ok_or_else(|| invalid("selected local inventory was not prepared"))?;
@@ -1140,7 +1234,8 @@ pub const GLM_MAX_CONTEXT: [MemoryFigure; 2] = [
 /// the captured kernels, not the key count: one fingerprint measured on two
 /// builds differs (16,827 keys needed 3.73 GB at 9567fdf6 and 3.04 GB at
 /// 5d180b5c8), so a row is never scaled to another key set or another build.
-/// A declared set with no row is refused; measure it and add the row.
+/// A declared set with no row is served on the best measured estimate for its
+/// rank (#1605); a census replaces the estimate with the real row.
 /// `commit` is the cuteafd SHA that produced the census and `sparkinfer` the
 /// SparkInfer revision that build pinned; the bytes follow the fork, so a row
 /// measured under another pin is reported loudly at plan time.
@@ -1156,6 +1251,8 @@ pub const GLM_MAX_CONTEXT: [MemoryFigure; 2] = [
 #[derive(Debug, Clone, Copy)]
 struct MeasuredGraphSet {
     keys: usize,
+    /// Logical rank whose census device produced these bytes.
+    rank: u8,
     fingerprint: &'static str,
     bytes: u64,
     layout: &'static str,
@@ -1170,39 +1267,39 @@ struct MeasuredGraphSet {
 /// identify the set. Every row records both the cuteafd commit and the
 /// SparkInfer revision of the build that measured it.
 const MEASURED_GLM_GRAPHS: [MeasuredGraphSet; 8] = [
-    MeasuredGraphSet { keys: 16_827, fingerprint: MIN_GRAPHS, bytes: 2_984_247_296, layout: HQA_MIN_LAYOUT,
+    MeasuredGraphSet { rank: 0, keys: 16_827, fingerprint: MIN_GRAPHS, bytes: 2_984_247_296, layout: HQA_MIN_LAYOUT,
         census: "glm53-hqa-min-glm5-r1 device 0: 16827 capture instantiate records; free 8245936128->5261688832",
         commit: "a5aa27a3f8968b6c25821f6baf6a10559b4ef5a6",
         sparkinfer: "851c42833da26711c68868014cad2fc043916416" },
-    MeasuredGraphSet { keys: 16_827, fingerprint: MAX_GRAPHS[0], bytes: 3_042_967_552, layout: MAX_LAYOUT,
+    MeasuredGraphSet { rank: 0, keys: 16_827, fingerprint: MAX_GRAPHS[0], bytes: 3_042_967_552, layout: MAX_LAYOUT,
         census: "glm53-exl3-max-census-r1 device 0: 16827 capture instantiate records",
         commit: "5d180b5c8d76636d5937336638dfd71c15a8d226",
         sparkinfer: "78cfee4e04e8d8055853945711e5f28ea27216e0" },
-    MeasuredGraphSet { keys: 16_614, fingerprint: MAX_GRAPHS[1], bytes: 2_971_664_384, layout: MAX_LAYOUT,
+    MeasuredGraphSet { rank: 1, keys: 16_614, fingerprint: MAX_GRAPHS[1], bytes: 2_971_664_384, layout: MAX_LAYOUT,
         census: "glm53-exl3-max-census-r1 device 1: 16614 capture instantiate records",
         commit: "5d180b5c8d76636d5937336638dfd71c15a8d226",
         sparkinfer: "78cfee4e04e8d8055853945711e5f28ea27216e0" },
-    MeasuredGraphSet { keys: 16_827, fingerprint: "743e61e45b39ba6bdb04043401a1b5f9330863bda205bbb35615ff9512aea6dc",
+    MeasuredGraphSet { rank: 0, keys: 16_827, fingerprint: "743e61e45b39ba6bdb04043401a1b5f9330863bda205bbb35615ff9512aea6dc",
         bytes: 3_732_930_560, layout: "glm53-exl3-k4/core-k6; attention/Context; sparks/6",
         census: "typed-tags-phase-c glm53-exl3-max-fixed-r1 device 0: 16827 capture instantiate records",
         commit: "29212c52f262afcda61c940f6c007e837d231057",
         sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
-    MeasuredGraphSet { keys: 16_614, fingerprint: "b6f823f3b9defca4fcd752fab3567a19d8056921c5277355e8a5be925bae1d54",
+    MeasuredGraphSet { rank: 1, keys: 16_614, fingerprint: "b6f823f3b9defca4fcd752fab3567a19d8056921c5277355e8a5be925bae1d54",
         bytes: 3_986_685_952, layout: "glm53-exl3-k4/core-k6; attention/Context; sparks/6",
         census: "typed-tags-phase-c glm53-exl3-max-fixed-r1 device 1: 16614 capture instantiate records",
         commit: "29212c52f262afcda61c940f6c007e837d231057",
         sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
-    MeasuredGraphSet { keys: 15_549, fingerprint: "5a2e6d744e3c72d4b192e3e8732ac7681eb2f4f9d44acfa8216420f9df693f70",
+    MeasuredGraphSet { rank: 0, keys: 15_549, fingerprint: "5a2e6d744e3c72d4b192e3e8732ac7681eb2f4f9d44acfa8216420f9df693f70",
         bytes: 2_740_977_664, layout: "ml4-exl3; attention/Heads; 1 rank",
         census: "ml4 1x census memory-census-20261108T172510Z-raptor-coordinator-57-0",
         commit: "3baa1a4ab72f8e378c07abd0d22ac473db53a840",
         sparkinfer: "851c42833da26711c68868014cad2fc043916416" },
-    MeasuredGraphSet { keys: 15_549, fingerprint: "bc9d9f1d011860a37be849433d80b8b4c728751d7a5bbd8e483d4e147d80c031",
+    MeasuredGraphSet { rank: 0, keys: 15_549, fingerprint: "bc9d9f1d011860a37be849433d80b8b4c728751d7a5bbd8e483d4e147d80c031",
         bytes: 3_445_620_736, layout: "ml4-exl3; attention/Context; 2 ranks",
         census: "typed-tags-phase-c ml4-exl3-max-fixed-r1 device 0: 15549 capture instantiate records",
         commit: "29212c52f262afcda61c940f6c007e837d231057",
         sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
-    MeasuredGraphSet { keys: 15_336, fingerprint: "4ca4be3bc0b20179dc457a8eff3ec0d9425bb6a4ef1a6851955a9f6a9d4073aa",
+    MeasuredGraphSet { rank: 1, keys: 15_336, fingerprint: "4ca4be3bc0b20179dc457a8eff3ec0d9425bb6a4ef1a6851955a9f6a9d4073aa",
         bytes: 3_720_347_648, layout: "ml4-exl3; attention/Context; 2 ranks",
         census: "typed-tags-phase-c ml4-exl3-max-fixed-r1 device 1: 15336 capture instantiate records",
         commit: "29212c52f262afcda61c940f6c007e837d231057",
@@ -1225,28 +1322,31 @@ fn measured_graph_row(fingerprint: &str) -> Option<&'static MeasuredGraphSet> {
     MEASURED_GLM_GRAPHS.iter().find(|row| row.fingerprint == fingerprint)
 }
 
-/// One resolved graph row: the charge, its attribution and, when the row was
-/// measured under another SparkInfer pin, the warning the caller reports.
+/// One resolved graph row: the charge, its attribution and the warning the
+/// caller reports (a stale pin, or an unmeasured fingerprint served from an
+/// estimate). Admission never refuses for a missing row (#1605).
 struct GraphRow {
     bytes: u64,
     basis: Basis,
     figure: MemoryFigure,
-    stale_pin: Option<String>,
+    warning: Option<String>,
 }
 
-/// The measured row for one declared set, or nothing so the caller refuses with
-/// the geometry and the measurement that would cover it.
-fn graph_row(fingerprint: &str, keys: usize) -> Option<GraphRow> {
-    if let Some(row) = measured_graph_row(fingerprint) {
-        if row.keys != keys { return None; }
+/// The measured row for one declared set. A fingerprint with no row is served
+/// with the family's best measured estimate for that rank (#1605), never
+/// refused: the default-context row upper-bounds a lower context because
+/// context can only go down from the checkpoint maximum, and a layout with no
+/// comparable row charges the largest measured row.
+fn graph_row(fingerprint: &str, keys: usize, rank: usize) -> GraphRow {
+    if let Some(row) = measured_graph_row(fingerprint).filter(|row| row.keys == keys) {
         let pinned = pinned_sparkinfer_revision();
-        let stale_pin = (row.sparkinfer != pinned).then(|| format!(
+        let warning = (row.sparkinfer != pinned).then(|| format!(
             "GLM startup graph row {fingerprint} ({n} keys, rank-set {}) was measured at cuteafd {} \
              with SparkInfer {} but this build pins {pinned}; instantiate storage follows the fork, \
              so re-run this layout's memory census and update MEASURED_GLM_GRAPHS",
             row.layout, row.commit, row.sparkinfer, n = row.keys));
-        return Some(GraphRow { bytes: row.bytes, basis: Basis::Calibrated, stale_pin,
-            figure: measured(row.bytes, row.fingerprint, row.layout, row.commit, row.census) });
+        return GraphRow { bytes: row.bytes, basis: Basis::Calibrated, warning,
+            figure: measured(row.bytes, row.fingerprint, row.layout, row.commit, row.census) };
     }
     {
         // Unit fixtures build plans on synthetic geometries no census covers.
@@ -1258,13 +1358,13 @@ fn graph_row(fingerprint: &str, keys: usize) -> Option<GraphRow> {
             // flat 2 MiB per declared graph overstated a 15.5k-key ML4 plan by
             // 26.6 GiB and turned its witness plan into a capacity refusal.
             let bytes = keys as u64 * (256 << 10);
-            return Some(GraphRow { bytes, basis: Basis::Estimated, stale_pin: None,
+            return GraphRow { bytes, basis: Basis::Estimated, warning: None,
                 figure: MemoryFigure { bytes,
                     attribution: FigureAttribution::Estimated { derivation: "256 KiB per declared graph (largest measured per-key rate)" },
                     evidence: "synthetic unit fixture", producing_commit: "test",
                     identity: FigureIdentity { declared_graphs: "", programs_sha256: CENSUS_PROGRAMS,
                         native_sha256: CENSUS_NATIVE, toolchain: CENSUS_TOOLCHAIN,
-                        gpu_class: "synthetic/sm_120", driver: "test", layout: "synthetic unit fixture" } } });
+                        gpu_class: "synthetic/sm_120", driver: "test", layout: "synthetic unit fixture" } } };
         }
         // A census run is how an unmeasured fingerprint gets its row: it needs
         // *some* charge to be admitted, and the live capture replaces it through
@@ -1272,39 +1372,58 @@ fn graph_row(fingerprint: &str, keys: usize) -> Option<GraphRow> {
         // row for the same declared count (or 2 MiB per executable when there is
         // none), never a proportional scale, and say so loudly.
         //
-        // The pool is sized from this placeholder, so a census of a fingerprint
-        // whose live capture exceeds it only reconciles if the growth phase has
-        // slack. The KV pool is allocated before capture (`GlmEngine::new`) and
-        // the captured graphs bake in its pointers, so reconcile can neither
-        // shrink the pool in place (one `Tag::kv` allocation releases nothing to
-        // CUDA) nor reallocate it (graph pointer lifetimes). A census run that
-        // produces a new measured row is a measurement run: with
-        // `KV_TARGET_TOKENS == KV_MAX_TOKENS` the pool fills the budget, there is
-        // no growth slack and reconcile refuses (`during post-ready growth`).
-        // Leave headroom (`KV_TARGET_TOKENS` below `KV_MAX_TOKENS`); the
-        // verification run then serves the measured row at maxed KV.
+        // The pool is sized from this placeholder, so a live capture above it is
+        // resident over the admitted ledger. Reconcile reports that budget gap
+        // and serving continues (#1605): the KV pool is allocated before capture
+        // (`GlmEngine::new`) and the captured graphs bake in its pointers, so it
+        // can be neither shrunk in place nor reallocated. The census row itself
+        // is still the measurement; the row's bytes do not depend on headroom.
         if std::env::var("CUTEAFD_GRAPH_CENSUS").is_ok_and(|value| value == "1") {
             let bytes = MEASURED_GLM_GRAPHS.iter().filter(|row| row.keys == keys)
                 .map(|row| row.bytes).max()
                 .unwrap_or_else(|| keys as u64 * (2 << 20));
             tracing::warn!(fingerprint, keys, bytes,
                 "GLM startup graph fingerprint has no measured row; this census run charges the largest \
-                 measured row for {keys} keys until the live capture reconciles it; a measurement census \
-                 needs KV_TARGET_TOKENS below KV_MAX_TOKENS so the growth phase has room");
-            return Some(GraphRow { bytes, basis: Basis::Estimated, stale_pin: None,
+                 measured row for {keys} keys until the live capture reconciles it");
+            return GraphRow { bytes, basis: Basis::Estimated, warning: None,
                 figure: MemoryFigure { attribution: FigureAttribution::Estimated {
                         derivation: "unmeasured declared fingerprint; census run placeholder, reconciled from the live capture" },
                     ..measured(bytes, "", "unmeasured fingerprint; census run", "census",
-                        "census run placeholder; reconciled from the live capture") } });
+                        "census run placeholder; reconciled from the live capture") } };
         }
     }
-    None
+    // #1605: an unmeasured fingerprint is served, never refused. Charge the
+    // best measured row for this logical rank, identically-keyed first: the
+    // default-context census row is an upper bound for a lower context because
+    // context cannot exceed the checkpoint maximum. A layout the family has no
+    // comparable row for (e.g. ML4's layer placement) charges the largest
+    // measured row. A runtime OOM on an unusual layout is the user's to fix
+    // through GPU_MEMORY_CAP or GPU_RESERVE.
+    let same_rank = || MEASURED_GLM_GRAPHS.iter().filter(|row| row.rank == rank as u8);
+    let source = same_rank().filter(|row| row.keys == keys).max_by_key(|row| row.bytes)
+        .or_else(|| same_rank().max_by_key(|row| row.bytes))
+        .or_else(|| MEASURED_GLM_GRAPHS.iter().max_by_key(|row| row.bytes))
+        .expect("measured graph rows are non-empty");
+    GraphRow { bytes: source.bytes, basis: Basis::Estimated,
+        warning: Some(format!(
+            "GLM startup graph fingerprint {fingerprint} ({keys} keys, rank {rank}) has no measured row; \
+             serving with the measured rank-{} row {} ({} bytes, {}) as an estimated upper bound; \
+             run a memory census of this layout to measure it",
+            source.rank, source.fingerprint, source.bytes, source.layout)),
+        figure: MemoryFigure { bytes: source.bytes,
+            attribution: FigureAttribution::Estimated { derivation: "unmeasured declared fingerprint; charged the measured row of the same rank as an upper bound (#1605)" },
+            evidence: source.census, producing_commit: source.commit,
+            identity: FigureIdentity { declared_graphs: source.fingerprint,
+                programs_sha256: CENSUS_PROGRAMS, native_sha256: CENSUS_NATIVE,
+                toolchain: CENSUS_TOOLCHAIN, gpu_class: "RTX PRO 6000 Blackwell/sm_120/188",
+                driver: "13.2", layout: source.layout } } }
 }
 
 thread_local! {
     /// Unit fixtures plan synthetic geometries that no census covers. On by
     /// default in this crate's tests; another crate's fixture must opt in, and
-    /// production startup never does, so an unmeasured fingerprint refuses.
+    /// production startup never does, so an unmeasured fingerprint is charged a
+    /// synthetic size. Production charges the best measured estimate instead.
     static SYNTHETIC_GRAPHS: std::cell::Cell<bool> = const { std::cell::Cell::new(cfg!(test)) };
 }
 
@@ -1314,7 +1433,7 @@ thread_local! {
 pub fn allow_synthetic_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(true)); }
 
 #[cfg(test)]
-pub(crate) fn refuse_unmeasured_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(false)); }
+pub(crate) fn disallow_synthetic_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(false)); }
 
 const MIN_CENSUS: &str = "builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1";
 const MAX_CENSUS: &str = "builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1";
@@ -1339,7 +1458,7 @@ struct MeasuredDeviceStage {
 /// Each row is charged exactly once, in the phase window where the memory is
 /// resident. Stage deltas partition Ready's untracked bytes beside the preweight
 /// context and the graph owner; no row overlaps another.
-const MEASURED_DEVICE_STAGES: [MeasuredDeviceStage; 15] = [
+const MEASURED_DEVICE_STAGES: [MeasuredDeviceStage; 12] = [
     MeasuredDeviceStage { ranks: 1, rank: 0, label: "target weight load device staging", first: Phase::Load,
         last: Phase::DraftLoad, bytes: 143_391_104,
         stage: "programs-before-weights -> weights-before-draft-pool", census: MIN_CENSUS,
@@ -1349,11 +1468,6 @@ const MEASURED_DEVICE_STAGES: [MeasuredDeviceStage; 15] = [
         last: Phase::Warmup, bytes: 123_296_064,
         stage: "weights-before-draft-pool -> draft-before-kv", census: MIN_CENSUS,
         evidence: "drafter load device staging: weights-before-draft-pool -> draft-before-kv; builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1",
-        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
-    MeasuredDeviceStage { ranks: 1, rank: 0, label: "KV pool cudaMalloc backing", first: Phase::Warmup,
-        last: Phase::Growth, bytes: 122_782_976,
-        stage: "draft-before-kv -> pool-before-transport", census: MIN_CENSUS,
-        evidence: "KV pool cudaMalloc backing: draft-before-kv -> pool-before-transport; builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1",
         commit: "4a56925e7986a57e3194c0cca6df256838386519" },
     MeasuredDeviceStage { ranks: 1, rank: 0, label: "transport device staging", first: Phase::Load,
         last: Phase::Warmup, bytes: 90_144_768,
@@ -1381,11 +1495,6 @@ const MEASURED_DEVICE_STAGES: [MeasuredDeviceStage; 15] = [
         stage: "weights-before-draft-pool -> draft-before-kv", census: MAX_CENSUS,
         evidence: "drafter load device staging: weights-before-draft-pool -> draft-before-kv; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
         commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
-    MeasuredDeviceStage { ranks: 2, rank: 0, label: "KV pool cudaMalloc backing", first: Phase::Warmup,
-        last: Phase::Growth, bytes: 327_036_052,
-        stage: "draft-before-kv -> pool-before-transport", census: MAX_CENSUS,
-        evidence: "KV pool cudaMalloc backing: draft-before-kv -> pool-before-transport; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
-        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
     MeasuredDeviceStage { ranks: 2, rank: 0, label: "transport device staging", first: Phase::Load,
         last: Phase::Warmup, bytes: 169_868_800,
         stage: "pool-before-transport -> transport-before-graphs", census: MAX_CENSUS,
@@ -1400,11 +1509,6 @@ const MEASURED_DEVICE_STAGES: [MeasuredDeviceStage; 15] = [
         last: Phase::DraftLoad, bytes: 140_074_880,
         stage: "programs-before-weights -> weights-before-draft-pool", census: MAX_CENSUS,
         evidence: "target weight load device staging: programs-before-weights -> weights-before-draft-pool; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
-        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
-    MeasuredDeviceStage { ranks: 2, rank: 1, label: "KV pool cudaMalloc backing", first: Phase::Warmup,
-        last: Phase::Growth, bytes: 339_612_820,
-        stage: "draft-before-kv -> pool-before-transport", census: MAX_CENSUS,
-        evidence: "KV pool cudaMalloc backing: draft-before-kv -> pool-before-transport; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
         commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
     MeasuredDeviceStage { ranks: 2, rank: 1, label: "transport device staging", first: Phase::Load,
         last: Phase::Warmup, bytes: 27_965_952,
@@ -1610,8 +1714,9 @@ fn ordinary_heap_subset(component: &Component) -> bool {
 
 /// Independently declared full-context keys plus one measured instantiate row
 /// per rank. The row is keyed by that rank's declared fingerprint; an
-/// undeclared fingerprint is a refusal naming it and the measurement that would
-/// cover it. No scaling, margin or invented post-Ready reserve.
+/// undeclared fingerprint charges the best measured estimate for that rank,
+/// warns once and serves (#1605), never refuses. No scaling, margin or invented
+/// post-Ready reserve.
 #[derive(Debug, Clone)]
 pub struct StartupGraphs {
     context: u64,
@@ -1633,19 +1738,24 @@ impl StartupGraphs {
         let declared = glm_declared_graphs(&shapes, attention, gpus, layers, return_ranks)
             .map_err(Refusal::InvalidFact)?;
         let (mut fingerprints, mut ranks, mut figures) = (Vec::new(), Vec::new(), Vec::new());
+        let mut estimated = Vec::new();
         for (rank, keys) in declared.iter().enumerate() {
             let fingerprint = keys.fingerprint(rank as u8).map_err(Refusal::InvalidFact)?;
-            let Some(row) = graph_row(&fingerprint, keys.len()) else {
-                return Err(Refusal::InvalidFact(format!(
-                    "GLM startup graphs: no measured instantiate row for declared key set {fingerprint} \
-                     ({n} keys, rank {rank}, attention {attention:?}, {gpus} coordinator GPU(s), context {context}); \
-                     launch this layout with a memory census and sum the CUTEAFD_GRAPH_CENSUS capture \
-                     instantiate_bytes for device {rank}, then add that row to MEASURED_GLM_GRAPHS", n = keys.len())));
-            };
-            if let Some(warning) = row.stale_pin { tracing::warn!("{warning}"); }
+            let row = graph_row(&fingerprint, keys.len(), rank);
+            match (row.basis, row.warning) {
+                // One warning for the whole plan, not one per rank (#1605).
+                (Basis::Estimated, Some(warning)) => estimated.push(warning),
+                (_, Some(warning)) => tracing::warn!("{warning}"),
+                _ => {}
+            }
             figures.push(row.figure);
             ranks.push(GraphRank { executables: keys.len() as u64, bytes: row.bytes, margin: 0, basis: row.basis });
             fingerprints.push(fingerprint);
+        }
+        if !estimated.is_empty() {
+            warn_once(&fingerprints.join(","), || format!(
+                "GLM startup graphs are admitted on estimated rows (#1605); no census covers this declared set: {}",
+                estimated.join("; ")));
         }
         Ok(Self { context, shapes: shapes.len() as u64, attention, layers: layers.to_vec(),
             declared, fingerprints, ranks, figures })
@@ -1681,6 +1791,15 @@ impl StartupGraphs {
             drift.join(", ")))
     }
 }
+/// One warning per declared set per process: a recipe prepares a case per
+/// onboarding count, and an estimate is a report, not a fault (#1605).
+fn warn_once(key: &str, message: impl FnOnce() -> String) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> = std::sync::OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if seen.insert(key.to_owned()) { tracing::warn!("{}", message()); }
+}
+
 struct Domains<'a> {
     prefill: (usize, &'a [PrefillShape]),
     lanes: (usize, &'a [u64]),

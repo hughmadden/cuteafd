@@ -1,5 +1,13 @@
 use super::*;
 use crate::placement::{FfnMode, planner};
+
+/// The searched extent: an independent cudaMalloc request rounds to its own
+/// driver block; sub-block requests stay exact and share blocks.
+fn searched(exact: u64) -> u64 {
+    if planner::independent_request(exact) {
+        exact + planner::allocation_granularity_forecast(&[exact]).unwrap()
+    } else { exact }
+}
 use cuteafd_core::memory_layout::Category;
 
 fn cfg() -> GlmDsaConfig {
@@ -1202,7 +1210,7 @@ fn one_contract_activates_physical_owners_by_shape_home_and_unique_target_count(
                 );
                 assert_eq!(
                     owner("glm.target.gpu.0.kv.0").bytes,
-                    33 * super::super::RECORD_PAGE_BYTES
+                    searched(33 * super::super::RECORD_PAGE_BYTES)
                 );
                 assert_eq!(
                     owner("glm.target.gpu.0.prefill.rows.h").bytes,
@@ -1283,8 +1291,8 @@ fn graph_layers(owners: &[u8], tp2: &[bool]) -> Vec<GlmGraphLayer> {
 }
 
 #[test]
-fn graph_figures_are_keyed_by_the_measured_fingerprint_and_refuse_other_layouts() {
-    refuse_unmeasured_graphs();
+fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layouts() {
+    disallow_synthetic_graphs();
     let min_layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
         dense: layer < 3, local: false, attention_owner: None,
     }).collect();
@@ -1315,23 +1323,44 @@ fn graph_figures_are_keyed_by_the_measured_fingerprint_and_refuse_other_layouts(
         assert!(!allowance.assumed, "a measured row is never labelled assumed");
         assert!(allowance.source.contains("startup graphs"));
     }
-    // The declared key set, not the context alone, is the identity. Each of these
-    // produces a fingerprint with no measured row and must refuse, never scale.
+    // The declared key set, not the context alone, is the identity. Each of
+    // these produces a fingerprint with no measured row; #1605 serves it on the
+    // best measured row for its rank (the default-context row upper-bounds a
+    // lower context), labelled Estimated with one warning, and never scales or
+    // refuses.
     let mut owned = max_layers.clone();
     for (layer, spec) in owned.iter_mut().enumerate() { spec.attention_owner = Some((layer % 2) as u8); }
-    let refused = [
+    let estimated = [
         StartupGraphs::new(1 << 19, AttentionPlacement::Heads, 1, &min_layers, 4),
         StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 2, &max_layers, 6),
         StartupGraphs::new(1 << 20, AttentionPlacement::Layers, 2, &owned, 6),
         StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 8),
         StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers[..77], 4),
     ];
-    for refused in refused {
-        let Refusal::InvalidFact(text) = refused.expect_err("an unmeasured declared graph set must refuse") else {
-            panic!("expected a typed refusal")
-        };
-        assert!(text.contains("no measured instantiate row"), "{text}");
-        assert!(text.contains("MEASURED_GLM_GRAPHS"), "{text}");
+    for graphs in estimated {
+        let graphs = graphs.expect("an unmeasured declared graph set is served, not refused");
+        for (rank, graph) in graphs.ranks().iter().enumerate() {
+            assert_eq!(graph.basis, Basis::Estimated);
+            assert_eq!(graph.margin, 0);
+            // Same rank first, identically-keyed first within it.
+            let same_rank = super::MEASURED_GLM_GRAPHS.iter().filter(|row| row.rank == rank as u8);
+            let expected = same_rank.clone().filter(|row| row.keys == graph.executables as usize)
+                .map(|row| row.bytes).max()
+                .or_else(|| same_rank.map(|row| row.bytes).max())
+                .expect("the family has a measured row for every rank");
+            assert_eq!(graph.bytes, expected);
+            let figure = &graphs.figures()[rank];
+            assert!(matches!(figure.attribution, FigureAttribution::Estimated { .. }));
+            // The figure keeps the provenance of the row it borrowed.
+            assert!(!figure.identity.declared_graphs.is_empty());
+            assert_eq!(figure.bytes, expected);
+        }
+        for component in graphs.components(32768).unwrap() {
+            let ComponentKind::Allowance(allowance) = &component.kind else {
+                panic!("graphs are opaque, not physical allocations")
+            };
+            assert!(allowance.assumed, "an estimated graph row is labelled assumed");
+        }
     }
     assert!(StartupGraphs::new(0, AttentionPlacement::Heads, 1, &min_layers, 4).is_err());
     assert!(StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4)
@@ -1380,24 +1409,23 @@ fn stream_inventory_counts_long_lived_serving_streams_and_shared_delivery() {
 fn device_stage_rows_partition_each_reference_census_delta_exactly_once() {
     // #1242 raw untracked samples per phase transition. Each row is the
     // difference between adjacent samples (with the measured instantiate sum
-    // removed from the final sample); the rows cover the residual with no rest.
+    // removed from the final sample). The pool's cudaMalloc backing is no
+    // longer a stage row: the selected pool owners carry the sizes-derived
+    // SM120 granularity tail instead, so it moves with the pool extent.
     let cases: [(usize, usize, u64, &[(&str, u64)]); 3] = [
         (1, 0, 598_999_040, &[
             ("target weight load device staging", 143_391_104),
             ("drafter load device staging", 123_296_064),
-            ("KV pool cudaMalloc backing", 122_782_976),
             ("transport device staging", 90_144_768),
             ("startup prewarm module first touch", 72_615_168),
             ("first ready-step CUDA module touch", 69_045_248)]),
         (2, 0, 594_804_736, &[
             ("target weight load device staging", 269_002_112),
             ("drafter load device staging", 77_117_248),
-            ("KV pool cudaMalloc backing", 327_036_052),
             ("transport device staging", 169_868_800),
             ("first ready-step CUDA module touch", 69_045_248)]),
         (2, 1, 603_193_344, &[
             ("target weight load device staging", 140_074_880),
-            ("KV pool cudaMalloc backing", 339_612_820),
             ("transport device staging", 27_965_952),
             ("first ready-step CUDA module touch", 71_303_168)]),
     ];

@@ -564,7 +564,12 @@ mod draft_cli_tests {
                         cuteafd_loader::families::glm5::native::scratch_bytes(
                             &native_dense_layouts(&cfg, &records, &plan, &engine).unwrap()).unwrap()
                     }).collect::<Vec<_>>();
+                    // A serving layout allocates its prefill lanes on the first live
+                    // prefill and charges them at Growth; scoring runs that prefill
+                    // before Ready, so its items hold every lane the admission
+                    // charge names. Compare the scoring view.
                     let layout = cuteafd_loader::plan::layout::LayoutOptions {
+                        full_prefill_logits: true,
                         rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
                         prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
                         exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
@@ -1057,11 +1062,6 @@ impl Opened {
                     || (cuteafd_core::coordinator_programs::program_namespace(name) == Some("exlr8")
                         && !name.starts_with("exlr8_dense_")))))?;
             tracing::info!(loaded, skipped, "GLM programs loaded");
-            // Spark intake loads every registered native module even on TP1
-            // (`shared/spark_waves.rs` Link::start). Load before this sample so
-            // admission sees its exact occupancy instead of a post-KV late load
-            // (#1554); the later call is a no-op.
-            self.library.tp2_native_initialize()?;
             Ok(())
         })?;
         self.startup_probe(&devices, "glm/programs-before-weights", None, false)?;
@@ -1765,22 +1765,21 @@ impl Opened {
         if engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
             && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
-            let captures = engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
+            let captures = engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))
+                .with_context(|| format!(
+                    "GLM startup graph capture (owner glm.graphs rank 0..{}) failed; free device memory \
+                     with GPU_MEMORY_CAP or GPU_RESERVE", engine.ranks()))?;
             let declared = admitted.graphs.declared();
             let measured = captures.iter().map(|capture|
                 cuteafd_loader::placement::inventory::CapturedGraphRank::measure(capture.rank as u8,
                     &declared[capture.rank], &capture.keys, capture.before, capture.after)
                     .map_err(anyhow::Error::msg)).collect::<Result<Vec<_>>>()?;
-            // The KV pool is already allocated and the captured graphs bake in its
-            // pointers, so a capture above its charge has only the growth phase to
-            // grow into; a census placeholder that undercharges needs that slack.
+            // A successful capture is never refused: an excess over the estimate
+            // is reported by the reconcile and serving continues (#1605).
             let reconciled = cuteafd_loader::placement::planner::serving::reconcile_startup_graphs(
                 &mut admitted.solved, "glm.graphs", &admitted.graphs.set(),
                 admitted.graphs.fingerprints(), &measured).map_err(|error| anyhow::anyhow!(
-                    "{error}; the KV pool was sized before capture and cannot be resized after it, so a \
-                     census of an unmeasured startup-graph fingerprint is a measurement run and must leave \
-                     headroom: set KV_TARGET_TOKENS below KV_MAX_TOKENS; its measured row then serves at \
-                     maxed KV"))?;
+                    "{error}; the startup graph receipt does not match this plan"))?;
             for (rank, (row, live)) in admitted.graphs.ranks().iter().zip(&reconciled.ranks).enumerate() {
                 tracing::info!(rank, executables = live.executables, measured = live.bytes,
                     plan = row.bytes, "GLM startup graph capture reconciled");
