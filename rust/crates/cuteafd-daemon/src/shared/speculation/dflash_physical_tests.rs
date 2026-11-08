@@ -401,6 +401,26 @@ fn assert_arena_bindings(layout: &cuteafd_loader::serving_capacity::WeightArenaL
     assert_eq!(end, layout.bytes(), "no unexplained trailing gap");
 }
 
+#[test]
+fn installed_kimi_mla_projection_recipe_matches_native_manifest() -> Result<()> {
+    let cfg = cuteafd_loader::formats::dflash::MlaDflashConfig::read(
+        &installed_snapshot("lightseekorg/kimi-k3-dflash2")?)?;
+    let path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+            .join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let shapes = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    super::super::weights::mla_weight_recipe(&cfg, |_| Ok(()), |parts, k| {
+        shapes.borrow_mut().insert((k, parts.iter().map(|(_, n)| *n).sum::<usize>()));
+        Ok(())
+    }, |_| Ok(((), ())))?;
+    assert_eq!(shapes.borrow().len(), 5);
+    for (k, n) in shapes.into_inner() {
+        cuteafd_ffi::draft_projection::validate_package_geometry(&manifest, k, n, TAP_ROWS)?;
+    }
+    Ok(())
+}
+
 /// Full production MLA geometry, sparse checkpoint and allocation-only DSO.
 /// Exercises the real loader, not a second test-only traversal or numerical oracle.
 pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
@@ -446,7 +466,8 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
                 .into_iter().collect::<std::collections::BTreeSet<_>>();
             let mut entries = shapes.into_iter().map(|(k,n)| serde_json::json!({
                 "name":format!("draft_bf16_k{k}_n{n}"), "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
-                "scalars":[], "capacity_rows":TAP_ROWS, "geometry":{"width":k,"outputs":n,
+                "scalars":[{"name":"rows","type":"int32"}], "scratch_bytes_at_capacity":{},
+                "capacity_rows":TAP_ROWS, "geometry":{"width":k,"outputs":n,
                     "output_dtype":"torch.bfloat16", "reduction":"ordered_k16", "tiles_by_rows":[[16,1,4,16,64,6]]}
             })).collect::<Vec<_>>();
             for (index, suffix, pointers, scalars, window) in [

@@ -1181,9 +1181,11 @@ pub(super) mod tests {
             physical_bytes: bytes, logical_bytes: bytes, baseline: Baseline::Forecast {
                 occupied: 0, source: "exact test capacity".into(), assumed: false }, headroom: 0 };
         let mut contract = Contract::fixed(64, 1, 1, facts);
-        planner::evaluate(&contract.facts(&[], 1)?, &[budget(640)])?;
+        contract.variables = vec![planner::Variable::Prefill(vec![planner::PrefillShape { rows: 64, waves: 1 }]),
+            planner::Variable::Lanes(vec![1])];
+        planner::evaluate(&contract.facts(&[0, 0], 1)?, &[budget(640)])?;
         contract.components.push(padding_owner(0, None, &layout, 1).unwrap());
-        let packed = contract.facts(&[], 1)?;
+        let packed = contract.facts(&[0, 0], 1)?;
         assert!(matches!(planner::evaluate(&packed, &[budget(640)]), Err(planner::Refusal::Capacity { .. })));
         let phases = planner::evaluate(&packed, &[budget(768)])?;
         assert!(phases.iter().all(|phase| phase.owned == 768));
@@ -1222,13 +1224,15 @@ pub(super) mod tests {
             driver_page_tables: vec![], allocation_granularity: vec![] };
         let mut contract = Contract::fixed(64, 1, 2, facts);
         contract.variables.push(Variable::AttentionProfiles { layers: vec![0], values: vec![vec![WHOLE], vec![LayerMode::HeadSplit]] });
+        contract.variables.extend([Variable::Prefill(vec![planner::PrefillShape { rows: 64, waves: 1 }]),
+            Variable::Lanes(vec![1])]);
         for (option, bytes) in [384, 320].into_iter().enumerate() {
             let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("profile/{option}"),
                 [("a_log".into(), bytes), ("next".into(), 256)])?;
             for rank in 0..2 { contract.components.push(padding_owner(rank, Some(option), &layout, 1).unwrap()); }
         }
         for (option, expected) in [128, 192].into_iter().enumerate() {
-            let facts = contract.facts(&[option], 1)?;
+            let facts = contract.facts(&[option, 0, 0], 1)?;
             assert_eq!(facts.allocations.len(), 2);
             for (rank, owner) in facts.allocations.iter().enumerate() {
                 assert_eq!(owner.location, planner::Location::coordinator(rank as u8));
