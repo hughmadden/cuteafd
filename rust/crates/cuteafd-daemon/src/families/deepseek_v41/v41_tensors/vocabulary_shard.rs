@@ -1,6 +1,7 @@
 //! Direct checkpoint loading of contiguous vocabulary rows onto one GPU.
 use super::*;
 use std::ops::Range;
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) struct VocabularyShard<'a> {
     allocation: Option<DeviceAllocation<'a>>,
@@ -77,7 +78,7 @@ impl<'a> VocabularyShard<'a> {
             // staged BF16 rows straight into it (tiles are independent).
             let device = Device { library, id: device_id };
             let packed = crate::shared::fp8_linear::Fp8Weight::allocate_with(library, rows, 5120,
-                "head.fp8", |name, bytes| weight_allocation(device, arena, name, bytes))?;
+                "head.fp8", |name, bytes| weight_allocation(device, arena, name, bytes, ArenaTag::weights("v41/target")))?;
             let (values, scale) = packed.buffers();
             let steps = Self::pack_steps(whole, device_id, values, scale)?;
             let stream = library.cuda_stream_create()?;

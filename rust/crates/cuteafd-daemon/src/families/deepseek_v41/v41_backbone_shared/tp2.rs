@@ -4,6 +4,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add, V41Fp8Plan, V41SharedSwiGlu};
 use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
+use cuteafd_core::memory_layout::ArenaTag;
 
 /// The packed weight and scales; the raw scales live until their pack ran
 /// (a push lands them and packs at Done), then [`Weights::release_raw_scales`].
@@ -112,8 +113,8 @@ impl<'a> Execution<'a> {
         Ok(Self {
             transfers: [PeerTransfer::new(d1,d0)?, PeerTransfer::new(d0,d1)?],
             ready: [Event::new(d0)?, Event::new(d1)?],
-            staging: [Allocation::new(d0,bytes)?, Allocation::new(d1,bytes)?],
-            output: [Allocation::new(d0,rows as usize*10240)?, Allocation::new(d1,rows as usize*10240)?],
+            staging: [Allocation::untagged(d0,bytes)?, Allocation::untagged(d1,bytes)?],
+            output: [Allocation::untagged(d0,rows as usize*10240)?, Allocation::untagged(d1,rows as usize*10240)?],
             released: [crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?,
                 crate::shared::memory::row_window::ScratchGuard::new(d0.library, &[0, 1])?],
             ranks, add: d0.library.bf16_add()?, capacity,
@@ -212,11 +213,11 @@ impl<'a> Weights<'a> {
             let prefix = format!("layers.{layer}.ffn.shared_experts.{name}");
             let weight_name = format!("{prefix}.weight");
             let weight = crate::shared::memory::weight_arena::weight_allocation(
-                device, arena, &weight_name, (k*n) as usize)?;
+                device, arena, &weight_name, (k*n) as usize, ArenaTag::weights("v41/target"))?;
             let scales = crate::shared::memory::weight_arena::weight_allocation(
                 device, arena, &crate::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),
-                (k*n/32) as usize)?;
-            let source_scales = Allocation::new(device, (k*n/1024) as usize)?;
+                (k*n/32) as usize, ArenaTag::weights("v41/target"))?;
+            let source_scales = Allocation::untagged(device, (k*n/1024) as usize)?;
             for (suffix, target) in [("weight", &weight), ("scale", &source_scales)] {
                 let rect = super::super::v41_tensors::half(catalog, &format!("{prefix}.{suffix}"), axis, device.id as usize)?;
                 ensure!(rect.bytes() == target.buffer.bytes, "shared TP2 tensor has unexpected size");
@@ -271,9 +272,9 @@ impl<'a> RankWave<'a> {
         let stream = Stream::new(device)?;
         let [up,down,a,gate,u,intermediate,output] = Self::allocation_sizes(
             up_kernel.info().scratch_bytes as usize, down_kernel.info().scratch_bytes as usize, capacity);
-        let up_scratch = Allocation::new(device, up)?;
-        let down_scratch = Allocation::new(device, down)?;
-        let alpha = Allocation::new(device, a)?;
+        let up_scratch = Allocation::untagged(device, up)?;
+        let down_scratch = Allocation::untagged(device, down)?;
+        let alpha = Allocation::untagged(device, a)?;
         let initialized = device.run(|| unsafe {
             up_kernel.initialize_scratch(up_scratch.buffer, alpha.buffer, stream.raw)?;
             down_kernel.initialize_scratch(down_scratch.buffer, alpha.buffer, stream.raw)
@@ -282,10 +283,10 @@ impl<'a> RankWave<'a> {
         initialized.and(drained)?;
         Ok(Self { stream, ready: Event::new(device)?, weights, up_kernel, down_kernel,
             activation: device.library.v41_shared_tp2_swiglu()?, up_scratch, down_scratch, alpha,
-            gate: Allocation::new(device, gate)?,
-            up: Allocation::new(device, u)?,
-            intermediate: Allocation::new(device, intermediate)?,
-            output: Allocation::new(device, output)?, capacity })
+            gate: Allocation::untagged(device, gate)?,
+            up: Allocation::untagged(device, u)?,
+            intermediate: Allocation::untagged(device, intermediate)?,
+            output: Allocation::untagged(device, output)?, capacity })
     }
     /// # Safety
     /// Previous use has completed. Input writes are ordered on producer, and
@@ -332,7 +333,7 @@ mod tests {
             Rc::new(vec![Weights::load(devices[1], &catalog, 0, Weights::load_peak_device_bytes())?]),
         ];
         let mut lanes = [Wave::new(weights.clone(), capacity)?, Wave::new(weights, capacity)?];
-        let inputs = [Allocation::new(devices[0], capacity as usize*5120*2)?, Allocation::new(devices[1], capacity as usize*5120*2)?];
+        let inputs = [Allocation::new(devices[0], capacity as usize*5120*2, cuteafd_ffi::memory_ledger::TEST)?, Allocation::new(devices[1], capacity as usize*5120*2, cuteafd_ffi::memory_ledger::TEST)?];
         let producers = [Stream::new(devices[0])?, Stream::new(devices[1])?];
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         for (rows, nonzero) in [(1, false), (capacity, true), (1, true), (capacity, false)] {
@@ -380,7 +381,7 @@ mod tests {
             let device = Device { library: &lib, id };
             let weights = Rc::new(vec![Weights::load(device, &catalog, 0, Weights::load_peak_device_bytes())?]);
             ranks.push((RankWave::new(weights.clone(), 16)?, RankWave::new(weights, 16)?,
-                Allocation::new(device, 16*5120*2)?, Stream::new(device)?));
+                Allocation::new(device, 16*5120*2, cuteafd_ffi::memory_ledger::TEST)?, Stream::new(device)?));
         }
         for nonzero in [false, true] {
             for (first, second, input, producer) in &mut ranks {
@@ -434,8 +435,8 @@ mod shared_storage_tests {
         let weights=[Rc::new(vec![Weights::load(devices[0],&catalog,0,Weights::load_peak_device_bytes())?]),
             Rc::new(vec![Weights::load(devices[1],&catalog,0,Weights::load_peak_device_bytes())?])];
         let runtime=tokio::runtime::Builder::new_current_thread().build()?;
-        let inputs=[ [Allocation::new(devices[0],16*10240)?,Allocation::new(devices[1],16*10240)?],
-            [Allocation::new(devices[0],16*10240)?,Allocation::new(devices[1],16*10240)?] ];
+        let inputs=[ [Allocation::new(devices[0],16*10240, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(devices[1],16*10240, cuteafd_ffi::memory_ledger::TEST)?],
+            [Allocation::new(devices[0],16*10240, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(devices[1],16*10240, cuteafd_ffi::memory_ledger::TEST)?] ];
         for (seed,pair) in inputs.iter().enumerate() {for input in pair {
             input.device.run(||lib.copy_h2d(input.buffer,&(if seed==0 {0x3e80u16}else {0xbe80u16}).to_ne_bytes().repeat(16*5120)))?;
         }}
@@ -451,7 +452,7 @@ mod shared_storage_tests {
             runtime.block_on(unsafe {slot.execute(0,16,i,inputs[i].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]])})?;
         }
         let rank=storage.execution.try_lock().unwrap().ranks[0].output.buffer;
-        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), cuteafd_ffi::memory_ledger::TEST)?;
         devices[1].run(||unsafe {lib.copy_peer_async(saved.buffer,rank,want.len(),reader.raw)})?;reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
         let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;

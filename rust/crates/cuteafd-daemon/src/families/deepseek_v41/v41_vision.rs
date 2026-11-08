@@ -4,6 +4,7 @@ use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, NativeLibrary, V41VisionOps};
 use cuteafd_loader::{OfficialV41Catalog, V41Image, V41ImageGrid};
+use cuteafd_core::memory_layout::ArenaTag;
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -130,17 +131,17 @@ impl<'a> VisionRuntime<'a> {
         let layout = Self::weight_layout(catalog)?;
         // VisionRuntime is constructed inside its owning encoder thread/device.
         let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
-            crate::shared::memory::device::Device { library: lib, id: lib.cuda_get_device()? }, layout)?;
+            crate::shared::memory::device::Device { library: lib, id: lib.cuda_get_device()? }, layout, ArenaTag::weights("v41/vision"))?;
         let weights = NativeRtxTensors::load_in(
             lib, catalog, &names, NativeRtxTensors::plan(catalog, &names)?, 16 << 20, Some(&arena),
         )?;
         super::weight_layout::probe_weights(lib, &[lib.cuda_get_device()?], "v41/vision-weights-loaded",
             |inventory| weights.inventory(inventory))?;
-        let workspace = DeviceAllocation::new(lib, V41VisionOps::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::untagged(lib, V41VisionOps::WORKSPACE_BYTES)?;
         let ops = unsafe { lib.v41_vision_ops(workspace.buffer)? };
         let buffers = Self::buffer_sizes(capacity)?
             .into_iter()
-            .map(|n| DeviceAllocation::new(lib, n))
+            .map(|n| DeviceAllocation::untagged(lib, n))
             .collect::<Result<Vec<_>>>()?;
         let stream = LoadStream {
             library: lib,

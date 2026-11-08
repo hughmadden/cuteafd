@@ -6,6 +6,7 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
 use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
 use crate::shared::memory::row_window::{RowWindow, ScratchGuard};
+use cuteafd_core::memory_layout::ArenaTag;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind { QueryB, OutputB }
@@ -53,11 +54,11 @@ impl<'a> Weights<'a> {
             && catalog.tensor(&scale_name)?.metadata.shape==[2*n/32,k/32],
             "projection checkpoint geometry differs");
         let stream=Stream::new(device)?;
-        let weight=crate::shared::memory::weight_arena::weight_allocation(device,arena,&weight_name,k*n)?;
+        let weight=crate::shared::memory::weight_arena::weight_allocation(device,arena,&weight_name,k*n, ArenaTag::weights("v41/target"))?;
         let scales=crate::shared::memory::weight_arena::weight_allocation(device,arena,
-            &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),k*n/32)?;
-        let raw_scales=Allocation::new(device,k*n/1024)?;
-        let mut staging=HostAllocation::new(device.library,k*n)?;
+            &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),k*n/32, ArenaTag::weights("v41/target"))?;
+        let raw_scales=Allocation::untagged(device,k*n/1024)?;
+        let mut staging=HostAllocation::untagged(device.library,k*n)?;
         for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {
             let bytes=catalog.read_coordinator_tp2_into(name,0,rank,staging.bytes_mut(),&mut [])?;
             ensure!(bytes==target.buffer.bytes,"projection shard payload size differs");
@@ -104,13 +105,13 @@ impl<'a> RankStorage<'a> {
         let plan = device.run(|| device.library.v41_fp8_matrix_plan(capacity, k as u32, (n / 2) as u32))?;
         let stream = Stream::new(device)?;
         let [scratch_bytes, alpha_bytes, input_bytes, output_bytes] = Self::allocation_sizes(plan.info().scratch_bytes as usize, kind, capacity);
-        let scratch = Allocation::new(device, scratch_bytes)?;
-        let alpha = Allocation::new(device, alpha_bytes)?;
+        let scratch = Allocation::untagged(device, scratch_bytes)?;
+        let alpha = Allocation::untagged(device, alpha_bytes)?;
         let initialized = device.run(|| unsafe { plan.initialize_scratch(scratch.buffer, alpha.buffer, stream.raw) });
         initialized.and(stream.drain())?;
         Ok(Rc::new(Self { stream, plan, copy: device.run(|| device.library.v41_peer_copy())?,
-            input: Allocation::new(device, input_bytes)?,
-            output: Allocation::new(device, output_bytes)?, scratch, alpha,
+            input: Allocation::untagged(device, input_bytes)?,
+            output: Allocation::untagged(device, output_bytes)?, scratch, alpha,
             guard: ScratchGuard::new(device.library, readers)?,
         }))
     }
@@ -196,7 +197,7 @@ impl<'a> Storage<'a> {
         for i in 0..2 { devices[i].run(|| devices[i].library.cuda_enable_peer(devices[1-i].id))?; }
         Ok(Rc::new(Self {
             ranks: [RankStorage::new(devices[0], kind, unit, &readers)?, RankStorage::new(devices[1], kind, unit, &readers)?],
-            output: Allocation::new(devices[owner], unit as usize * kind.geometry().1 * 2)?,
+            output: Allocation::untagged(devices[owner], unit as usize * kind.geometry().1 * 2)?,
             peer_done: Event::new(devices[1-owner])?,
             input_ready: [Event::new(devices[0])?, Event::new(devices[1])?],
             guard: ScratchGuard::new(devices[0].library, &readers)?, owner, unit, kind,
@@ -395,13 +396,13 @@ mod tests {
             assert!(Wave::new(banks,capacity,0,[0,0]).is_err());
             let mut lanes=[Wave::new(banks,capacity,0,Wave::device_bytes(&lib,kind,capacity,0)?)?,
                 Wave::new(banks,capacity,1,Wave::device_bytes(&lib,kind,capacity,1)?)?];
-            let inputs=[Allocation::new(devices[0],capacity as usize*k*2)?,
-                Allocation::new(devices[1],capacity as usize*k*2)?];
+            let inputs=[Allocation::new(devices[0],capacity as usize*k*2, cuteafd_ffi::memory_ledger::TEST)?,
+                Allocation::new(devices[1],capacity as usize*k*2, cuteafd_ffi::memory_ledger::TEST)?];
             let plan=devices[0].run(||lib.v41_fp8_matrix_plan(capacity,k as u32,n as u32))?;
             let stream=Stream::new(devices[0])?;
-            let scratch=Allocation::new(devices[0],plan.info().scratch_bytes as usize)?;
-            let alpha=Allocation::new(devices[0],16)?;
-            let output=Allocation::new(devices[0],capacity as usize*n*2)?;
+            let scratch=Allocation::new(devices[0],plan.info().scratch_bytes as usize, cuteafd_ffi::memory_ledger::TEST)?;
+            let alpha=Allocation::new(devices[0],16, cuteafd_ffi::memory_ledger::TEST)?;
+            let output=Allocation::new(devices[0],capacity as usize*n*2, cuteafd_ffi::memory_ledger::TEST)?;
             devices[0].run(||unsafe { plan.initialize_scratch(scratch.buffer,alpha.buffer,stream.raw) })?;
             stream.drain()?;
             for layer in [2,20] {
@@ -409,7 +410,7 @@ mod tests {
                     format!("layers.{layer}.attn.{}.scale",kind.name())];
                 let full=devices[0].own(||NativeRtxTensors::load(&lib,&catalog,&names,
                     NativeRtxTensors::plan(&catalog,&names)?,1<<20))?;
-                let scales=Allocation::new(devices[0],k*n/32)?;
+                let scales=Allocation::new(devices[0],k*n/32, cuteafd_ffi::memory_ledger::TEST)?;
                 devices[0].run(||unsafe { lib.v41_fp8_matrix_kernel(1,k as u32,n as u32)?
                     .pack_scales(full.get().get(&names[1])?,scales.buffer,stream.raw) })?;
                 stream.drain()?;
@@ -493,7 +494,7 @@ mod shared_storage_tests {
             vec![Weights::load(devices[1],&catalog,2,kind,1,Weights::load_peak_device_bytes(kind))?]];
         let banks=[weights[0].as_slice(),weights[1].as_slice()];
         let (rows,unit)=(13u32,16u32);let (k,n)=kind.geometry();
-        let inputs=[Allocation::new(devices[0],rows as usize*k*2)?,Allocation::new(devices[0],rows as usize*k*2)?];
+        let inputs=[Allocation::new(devices[0],rows as usize*k*2, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(devices[0],rows as usize*k*2, cuteafd_ffi::memory_ledger::TEST)?];
         for (seed,input) in inputs.iter().enumerate() {
             let host:Vec<u8>=(0..rows as usize*k).flat_map(|i| {
                 let f=((i*7+seed*11)%29) as f32/32.0-0.4;((f.to_bits()>>16) as u16).to_ne_bytes()
@@ -509,7 +510,7 @@ mod shared_storage_tests {
             slot.select_window(RowWindow::within(i*unit as usize..i*unit as usize+rows as usize,48)?)?;
             runtime.block_on(unsafe {slot.execute(2,rows,inputs[i].buffer)})?;
         }
-        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), cuteafd_ffi::memory_ledger::TEST)?;
         devices[1].run(||unsafe {lib.copy_peer_async(saved.buffer,storage.output.buffer,want.len(),reader.raw)})?;reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
         let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;

@@ -11,6 +11,7 @@ use std::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
+use crate::shared::memory::Tag;
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 mod prefix;
 pub(crate) mod replica;
@@ -89,9 +90,9 @@ impl<'a> WindowState<'a> {
             "window state exceeds budget"
         );
         let value = Self {
-            values: DeviceAllocation::attention_plane(library, slots * 128, 512, "window cache values")?,
-            scales: DeviceAllocation::attention_plane(library, slots * 128, 16, "window cache scales")?,
-            ends: DeviceAllocation::new(library, slots * 8)?,
+            values: DeviceAllocation::attention_plane(library, slots * 128, 512, "window cache values", Tag::kv("v41/window-cache"))?,
+            scales: DeviceAllocation::attention_plane(library, slots * 128, 16, "window cache scales", Tag::kv("v41/window-cache"))?,
+            ends: DeviceAllocation::untagged(library, slots * 8)?,
             slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             writing: Default::default(),
             slot_count: slots,
@@ -338,8 +339,8 @@ impl<'a> WindowWeights<'a> {
             norm: self.library.v41_attention_ops()?,
             kv: self.library.v41_kv()?,
             weights: self,
-            staging: HostAllocation::new(self.library, unit * 8)?,
-            commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit))?,
+            staging: HostAllocation::untagged(self.library, unit * 8)?,
+            commit_staging: HostAllocation::untagged(self.library, commit::staging_bytes(unit))?,
             capacity: unit,
             graph: None,
             graphs: GraphBank::new(None),
@@ -478,18 +479,18 @@ impl<'a> WindowStorage<'a> {
         let value = Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             commit_stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            scratch: DeviceAllocation::new(library, fp8.info().scratch_bytes as usize)?,
-            alpha: DeviceAllocation::new(library, 4)?,
-            input: DeviceAllocation::new(library, unit * 10240)?,
-            projected: DeviceAllocation::new(library, unit * 1024)?,
-            normalized: DeviceAllocation::new(library, unit * 1024)?,
-            positions: DeviceAllocation::new(library, unit * 8)?,
-            frequencies: DeviceAllocation::new(library, unit * 256)?,
+            scratch: DeviceAllocation::untagged(library, fp8.info().scratch_bytes as usize)?,
+            alpha: DeviceAllocation::untagged(library, 4)?,
+            input: DeviceAllocation::untagged(library, unit * 10240)?,
+            projected: DeviceAllocation::untagged(library, unit * 1024)?,
+            normalized: DeviceAllocation::untagged(library, unit * 1024)?,
+            positions: DeviceAllocation::untagged(library, unit * 8)?,
+            frequencies: DeviceAllocation::untagged(library, unit * 256)?,
             planes: layers.iter().map(|&layer| Ok(WindowPlanes {
                 layer,
-                values: DeviceAllocation::attention_plane(library, rows, 512, "window proposal values")?,
-                scales: DeviceAllocation::attention_plane(library, rows, 16, "window proposal scales")?,
-                destinations: DeviceAllocation::new(library, rows * 8)?,
+                values: DeviceAllocation::attention_plane(library, rows, 512, "window proposal values", Tag::workspace("v41/window-proposal"))?,
+                scales: DeviceAllocation::attention_plane(library, rows, 16, "window proposal scales", Tag::workspace("v41/window-proposal"))?,
+                destinations: DeviceAllocation::untagged(library, rows * 8)?,
             })).collect::<Result<Vec<_>>>()?,
             fp8,
             rows,

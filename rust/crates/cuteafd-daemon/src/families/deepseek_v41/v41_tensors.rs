@@ -5,6 +5,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
 use std::collections::{BTreeMap, BTreeSet};
+use cuteafd_core::memory_layout::ArenaTag;
 #[path = "v41_tensors/vocabulary_shard.rs"]
 mod vocabulary_shard;
 pub(crate) use vocabulary_shard::VocabularyShard;
@@ -12,7 +13,7 @@ pub(crate) use vocabulary_shard::VocabularyShard;
 pub(crate) fn allocation<'a>(library: &'a NativeLibrary,
     arena: Option<&DeviceWeightArena<'a>>, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
     Ok(DeviceAllocation::from_allocation(weight_allocation(
-        Device { library, id: library.cuda_get_device()? }, arena, name, bytes)?))
+        Device { library, id: library.cuda_get_device()? }, arena, name, bytes, ArenaTag::weights("v41/target"))?))
 }
 
 /// Checkpoint tensor `name` (an unsharded coordinator tensor) as one
@@ -71,7 +72,7 @@ impl<'a> NativeRtxTensors<'a> {
         }
         cuteafd_loader::plan::checkpoint::Checkpoint::open(catalog.snapshot())?
             .require_untied_embedding("embed.weight")?;
-        let mut storage = HostAllocation::new(library, bytes)?;
+        let mut storage = HostAllocation::untagged(library, bytes)?;
         catalog.coordinator_tensor_reader("embed.weight")?.read_into(0, storage.bytes_mut())?;
         let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
         tracing::info!(?placement, device_bytes=0, pinned_bytes=bytes, "V4.1 embedding placement (single residency, shared target/dSpark)");
@@ -124,7 +125,7 @@ impl<'a> NativeRtxTensors<'a> {
         for name in names {
             let bytes = usize::try_from(catalog.device_tensor_bytes(name, None)?)?;
             let allocation = DeviceAllocation::from_allocation(weight_allocation(
-                Device { library, id: device }, arena, name, bytes)?);
+                Device { library, id: device }, arena, name, bytes, ArenaTag::weights("v41/target"))?);
             dense.operand(crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer,
                 lands: vec![(rect(catalog, name, None)?, 0)], bytes })?;
             tensors.insert(name.clone(), allocation);
@@ -217,7 +218,7 @@ fn pack_fp8_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, row
     let device = Device { library, id: library.cuda_get_device()? };
     let packed = crate::shared::fp8_linear::Fp8Weight::pack_with(library, weight.buffer.ptr, rows, 5120,
         crate::shared::fp8_linear::Fp8Scales::Best, stream, "head.fp8",
-        |name, bytes| weight_allocation(device, arena, name, bytes));
+        |name, bytes| weight_allocation(device, arena, name, bytes, ArenaTag::weights("v41/target")));
     // SAFETY: source and packed destinations remain owned until the pack drains.
     if let Err(error) = unsafe { library.cuda_stream_synchronize(stream) } {
         library.quarantine_module_after_failed_drain();
@@ -241,7 +242,7 @@ fn pack_packed_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, 
     let stream = library.cuda_stream_create()?;
     let device = Device { library, id: library.cuda_get_device()? };
     let packed = crate::shared::packed_head::PackedHead::pack_with(library, weight.buffer.ptr, rows, 5120, stream,
-        |name, bytes| weight_allocation(device, arena, &format!("head.{name}"), bytes));
+        |name, bytes| weight_allocation(device, arena, &format!("head.{name}"), bytes, ArenaTag::weights("v41/target")));
     if packed.is_err() && library.is_quarantined_after_failed_drain() {
         // The pack could not prove its reads of the source retired.
         std::mem::forget(weight);
