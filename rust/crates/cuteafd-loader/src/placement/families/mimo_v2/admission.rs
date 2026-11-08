@@ -177,7 +177,7 @@ impl HostOwners {
             let a = self.demands(recipe, start, count)?;
             let b = self.demands(recipe, last, count)?;
             for (index, ((_, a), (_, b))) in a.iter().zip(&b).enumerate() {
-                curves[index].push(crate::placement::planner::BytePiece { first: start, last,
+                curves[index].push(crate::placement::planner::BytePiece { granularity: 1, first: start, last,
                     bytes_at_first: *a, bytes_per_page: if last == start { 0 } else { b.saturating_sub(*a).div_ceil(last - start) } });
             }
         }

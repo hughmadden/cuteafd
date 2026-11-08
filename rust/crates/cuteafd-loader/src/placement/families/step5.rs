@@ -116,21 +116,9 @@ fn pool_physical_bytes(unit: u64, pages: u64) -> Result<u64, Refusal> {
 /// Both automatic and explicit pools price the backing's physical round-up.
 /// Page counts remain unaligned; the shared solver keeps the last affordable page.
 fn pool_curve(unit: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
-    if unit == 0 || unit % SM120_ALLOCATION_GRANULARITY_BYTES == 0 {
-        return Ok(ByteCurve::linear(unit, unit, maximum));
-    }
-    let at = |pages| pool_physical_bytes(unit, pages);
-    let mut pieces = Vec::new();
-    let mut first = 1;
-    while first <= maximum {
-        let bytes_at_first = at(first)?;
-        let slope = if first < maximum { at(first + 1)? - bytes_at_first } else { 0 };
-        let mut last = first;
-        while last < maximum && at(last + 1)? - at(last)? == slope { last += 1; }
-        pieces.push(BytePiece { first, last, bytes_at_first, bytes_per_page: slope });
-        first = last + 1;
-    }
-    Ok(ByteCurve(pieces))
+    pool_physical_bytes(unit, maximum)?;
+    Ok(ByteCurve(vec![BytePiece { first: 1, last: maximum, bytes_at_first: unit,
+        bytes_per_page: unit, granularity: SM120_ALLOCATION_GRANULARITY_BYTES }]))
 }
 
 #[cfg(test)]
@@ -143,6 +131,7 @@ mod physical_pool_tests {
         for unit in [0, 1, 7, page / 16, page / 2, page, page + 7, 13 * page / 8] {
             let maximum = 259;
             let curve = pool_curve(unit, maximum)?;
+            assert_eq!(curve.0.len(), 1, "physical rounding must not expand the page domain");
             assert_eq!(curve.0.first().unwrap().first, 1);
             assert_eq!(curve.0.last().unwrap().last, maximum);
             assert!(curve.0.windows(2).all(|pair| pair[0].last + 1 == pair[1].first));

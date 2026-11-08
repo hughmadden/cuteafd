@@ -108,7 +108,7 @@ fn floored(stride: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
     };
     let mut pieces = Vec::new();
     if flat > 0 {
-        pieces.push(BytePiece {
+        pieces.push(BytePiece { granularity: 1,
             first: 1,
             last: flat,
             bytes_at_first: FLOOR,
@@ -119,7 +119,7 @@ fn floored(stride: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
         let first = flat
             .checked_add(1)
             .ok_or(Refusal::Overflow("GLM buffer floor"))?;
-        pieces.push(BytePiece {
+        pieces.push(BytePiece { granularity: 1,
             first,
             last: maximum,
             bytes_at_first: mul(first, stride)?,

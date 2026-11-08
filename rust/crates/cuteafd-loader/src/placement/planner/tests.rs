@@ -2,6 +2,75 @@ use super::*;
 use cuteafd_core::SparkReplyFormat;
 use crate::placement::FfnMode;
 
+#[test]
+fn rounded_affine_closed_form_equals_enumeration_at_physical_boundaries() {
+    for granularity in [1, 8, SM120_ALLOCATION_GRANULARITY_BYTES] {
+        for first in [1, 4] {
+            for bytes_at_first in [0, 1, granularity, granularity + 1] {
+                for bytes_per_page in [0, 1, granularity / 2, granularity + 7] {
+                    let piece = BytePiece { first, last: first + 31, bytes_at_first,
+                        bytes_per_page, granularity };
+                    let mut budgets = BTreeSet::from([0, 1, u64::MAX]);
+                    for pages in first..=piece.last {
+                        let bytes = piece.at(pages).unwrap();
+                        budgets.extend([bytes.saturating_sub(1), bytes, bytes + 1]);
+                    }
+                    for available in budgets {
+                        let expected = (first..=piece.last)
+                            .filter(|&pages| piece.at(pages).unwrap() <= available).max();
+                        assert_eq!(piece.last_affordable(available).unwrap(), expected,
+                            "{piece:?}, available={available}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(ByteCurve(vec![BytePiece { first: 1, last: 1, bytes_at_first: 1,
+        bytes_per_page: 0, granularity: 0 }]).validate(1).is_err());
+    assert!(ByteCurve(vec![BytePiece { first: 1, last: 1, bytes_at_first: u64::MAX,
+        bytes_per_page: 0, granularity: 2 }]).validate(1).is_err());
+}
+
+#[test]
+fn rounded_affine_search_matches_exact_independent_backings_and_mixed_slopes() {
+    let maximum = 32;
+    let rounded = |bytes_at_first, bytes_per_page| ByteCurve(vec![BytePiece {
+        first: 1, last: maximum, bytes_at_first, bytes_per_page, granularity: 8,
+    }]);
+    for (other, multiple) in [(None, 1), (Some(ByteCurve::linear(2, 2, maximum)), 1),
+        (Some(rounded(1, 3)), 1), (Some(rounded(1, 3)), 3)] {
+        let mut contract = Linear { maximum: maximum * 64, ..Linear::new() }.prepare(&request()).unwrap();
+        let curve = rounded(3, 5);
+        contract.set_byte_extent("kv", curve.clone()).unwrap();
+        contract.pool_page_multiple = multiple;
+        contract.components.push(Component::allocation(allocation("fixed", 23),
+            ByteCurve::fixed(23, maximum), false, maximum));
+        if let Some(bytes) = &other {
+            let mut component = Component::allocation(allocation("other", 1), bytes.clone(), false, maximum);
+            component.byte_extent(bytes.clone()).unwrap();
+            contract.components.push(component);
+        }
+        for available in 1..=400 {
+            let budgets = vec![budget(available)];
+            let compiled = search::Compiled::new(&contract, &budgets).unwrap();
+            let expected = (1..=maximum).filter(|pages| pages % multiple == 0)
+                .filter(|&pages| curve.at(pages).unwrap() + 23
+                    + other.as_ref().map_or(0, |curve| curve.at(pages).unwrap()) <= available).max();
+            assert_eq!(compiled.limit(&budgets, &[0, 0, 0], 1, maximum).unwrap(), expected);
+            let solved = solve(request(), budgets.clone(), &Prepared(contract.clone()));
+            match expected {
+                Some(pages) => {
+                    let plan = solved.unwrap();
+                    assert_eq!(plan.pool_tokens, pages * 64);
+                    assert_eq!(compiled.phases(&budgets, &[0, 0, 0], pages).unwrap(),
+                        evaluate(&plan.facts, &budgets).unwrap());
+                }
+                None => assert!(solved.is_err()),
+            }
+        }
+    }
+}
+
 fn granular_owner(id: &str, backing: &str, requests: Vec<u64>, lifetime: Lifetime) -> AllocationGranularity {
     AllocationGranularity { id: id.into(), location: Location::coordinator(0), lifetime,
         backings: vec![GranularityBacking { backing: backing.into(), requests }], evidence: GranularityEvidence::Forecast }
@@ -887,11 +956,11 @@ fn pool_page_multiple_aligns_automatic_pool_floor_extent_and_explicit_pins() {
 fn strided_pool_search_matches_enumeration_across_nonmonotonic_breakpoints() {
     let mut contract = Linear { maximum: 64 * 13, ..Linear::new() }.prepare(&request()).unwrap();
     let curve = ByteCurve(vec![
-        BytePiece { first: 1, last: 3, bytes_at_first: 10, bytes_per_page: 10 },
-        BytePiece { first: 4, last: 6, bytes_at_first: 100, bytes_per_page: 0 },
-        BytePiece { first: 7, last: 7, bytes_at_first: 1, bytes_per_page: 0 },
-        BytePiece { first: 8, last: 11, bytes_at_first: 20, bytes_per_page: 10 },
-        BytePiece { first: 12, last: 13, bytes_at_first: 80, bytes_per_page: 5 },
+        BytePiece { granularity: 1, first: 1, last: 3, bytes_at_first: 10, bytes_per_page: 10 },
+        BytePiece { granularity: 1, first: 4, last: 6, bytes_at_first: 100, bytes_per_page: 0 },
+        BytePiece { granularity: 1, first: 7, last: 7, bytes_at_first: 1, bytes_per_page: 0 },
+        BytePiece { granularity: 1, first: 8, last: 11, bytes_at_first: 20, bytes_per_page: 10 },
+        BytePiece { granularity: 1, first: 12, last: 13, bytes_at_first: 80, bytes_per_page: 5 },
     ]);
     contract.set_byte_extent("kv", curve.clone()).unwrap();
     for multiple in [1, 2, 3, 4] {
@@ -985,19 +1054,19 @@ fn piecewise_cost_vectors_match_exact_owners_at_every_breakpoint_neighbor() {
     .prepare(&request())
     .unwrap();
     let curve = ByteCurve(vec![
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 1,
             last: 4,
             bytes_at_first: 0,
             bytes_per_page: 16,
         },
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 5,
             last: 8,
             bytes_at_first: 96,
             bytes_per_page: 0,
         },
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 9,
             last: 20,
             bytes_at_first: 128,
@@ -1067,19 +1136,19 @@ fn analytic_pool_solves_discontinuous_nonmonotone_and_zero_slope_pieces() {
         .set_byte_extent(
             "kv",
             ByteCurve(vec![
-                BytePiece {
+                BytePiece { granularity: 1,
                     first: 1,
                     last: 3,
                     bytes_at_first: 100,
                     bytes_per_page: 10,
                 },
-                BytePiece {
+                BytePiece { granularity: 1,
                     first: 4,
                     last: 6,
                     bytes_at_first: 1000,
                     bytes_per_page: 0,
                 },
-                BytePiece {
+                BytePiece { granularity: 1,
                     first: 7,
                     last: 12,
                     bytes_at_first: 50,
@@ -1985,13 +2054,13 @@ fn correlated_count_profiles_match_exhaustive_full_score_oracle() {
         ],
     });
     let curve = ByteCurve(vec![
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 1,
             last: 3,
             bytes_at_first: 20,
             bytes_per_page: 19,
         },
-        BytePiece {
+        BytePiece { granularity: 1,
             first: 4,
             last: 6,
             bytes_at_first: 12,
@@ -2127,7 +2196,7 @@ fn malformed_curves_and_unrepresentable_recipes_are_typed_refusals() {
     contract
         .set_byte_extent(
             "kv",
-            ByteCurve(vec![BytePiece {
+            ByteCurve(vec![BytePiece { granularity: 1,
                 first: 2,
                 last: 4,
                 bytes_at_first: 1,
@@ -3148,9 +3217,9 @@ fn analytical_weight_cap_prices_every_finite_piece_and_exact_bound() {
     let mut contract = Linear { maximum: 64 * 12, ..Linear::new() }.prepare(&request()).unwrap();
     let mut owner = resource("piecewise.weight", 0, 100, 12);
     owner.bytes = ByteCurve(vec![
-        BytePiece { first: 1, last: 3, bytes_at_first: 100, bytes_per_page: 0 },
-        BytePiece { first: 4, last: 8, bytes_at_first: 10, bytes_per_page: 10 },
-        BytePiece { first: 9, last: 12, bytes_at_first: 100, bytes_per_page: 0 },
+        BytePiece { granularity: 1, first: 1, last: 3, bytes_at_first: 100, bytes_per_page: 0 },
+        BytePiece { granularity: 1, first: 4, last: 8, bytes_at_first: 10, bytes_per_page: 10 },
+        BytePiece { granularity: 1, first: 9, last: 12, bytes_at_first: 100, bytes_per_page: 0 },
     ]);
     contract.components.push(owner);
     let plan = solve(capped(35), vec![budget(1 << 30)], &Prepared(contract.clone())).unwrap();
