@@ -132,6 +132,11 @@ fn resident_inventory<'a>(config: &serde_json::Value,
         return None;
     }
     let decoder = ranks - 1;
+    // The dense dSpark arena's inter-view alignment, from the same header
+    // recipe the serving loader allocates; charged once beside its payload.
+    let draft_padding = if dspark && tensors.iter().any(|t| t.name.starts_with("mtp.") && !t.name.contains(".ffn.experts.")) {
+        super::weight_layout::draft_layout_from_headers(tensors.iter().copied()).ok()?.padding_bytes() as u64
+    } else { 0 };
     let head_mode = Fp8Head::configured();
     let mut totals: Vec<BTreeMap<(Category, String, String), u64>> = vec![BTreeMap::new(); ranks];
     let mut add = |rank: usize, category, group: &str, format: &str, bytes: u64| {
@@ -198,6 +203,7 @@ fn resident_inventory<'a>(config: &serde_json::Value,
         let intermediate = config["moe_intermediate_size"].as_u64()?;
         add(decoder, Category::Drafter, "dspark-experts", "mxfp4-packed", 3 * native_expert_bytes(experts, 5120, intermediate));
     }
+    if draft_padding > 0 { add(decoder, Category::Drafter, "dspark-auxiliary", "arena-padding", draft_padding); }
     Some(totals.into_iter().map(|rank| rank.into_iter().map(|((category, group, format), bytes)|
         Item::new(category, group, format, bytes, Basis::Formula)).collect()).collect())
 }
@@ -312,10 +318,43 @@ mod tests {
         for ranks in [1, 2] {
             let owned = drafter_weights(&checkpoint(combined.clone()), ranks).unwrap();
             assert_eq!(owned, drafter_weights(&checkpoint(draft.clone()), ranks).unwrap());
-            assert_eq!(owned[ranks - 1].iter().map(|i| i.bytes).sum::<u64>(), 3200 + 100 + 3200 + 20);
+            let layout = super::super::weight_layout::draft_layout_from_headers(draft.iter().map(|t| &t.meta)).unwrap();
+            assert_eq!(owned[ranks - 1].iter().map(|i| i.bytes).sum::<u64>(), layout.bytes() as u64);
+            assert_eq!(layout.payload_bytes(), 3200 + 100 + 3200 + 20);
             assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
             assert!(drafter_weights(&checkpoint(target.clone()), ranks).unwrap().iter().all(Vec::is_empty));
         }
+    }
+
+    /// The planner charges exactly the dense dSpark arena the runtime allocates:
+    /// payload, generated packed scales and inter-view alignment, from one
+    /// header recipe. Unaligned extents make any padding split visible here.
+    #[test]
+    fn planned_dspark_dense_residency_equals_the_shared_arena_layout() {
+        use cuteafd_core::DType;
+        let draft = vec![
+            tensor("mtp.0.main_proj.weight", DType::F8E4M3, &[96, 100], 9600),
+            tensor("mtp.1.main_proj.weight", DType::F8E4M3, &[96, 100], 9600),
+            tensor("mtp.0.attn.wq_a.weight", DType::F8E4M3, &[64, 33], 2112),
+            tensor("mtp.0.attn.wq_a.scale", DType::F32, &[2, 2], 16),
+            tensor("mtp.0.norm.weight", DType::Bf16, &[37], 74),
+            tensor("mtp.0.ffn.experts.0.w1.weight", DType::U8, &[512], 512),
+        ];
+        let layout = super::super::weight_layout::draft_layout_from_headers(draft.iter().map(|t| &t.meta)).unwrap();
+        assert!(layout.padding_bytes() > 0, "fixture must exercise alignment padding");
+        for ranks in [1, 2] {
+            let owned = drafter_weights(&checkpoint(draft.clone()), ranks).unwrap();
+            let auxiliary = owned[ranks - 1].iter().filter(|i| i.group == "dspark-auxiliary").map(|i| i.bytes).sum::<u64>();
+            assert_eq!(auxiliary, layout.bytes() as u64, "ranks={ranks}");
+            let padding = owned[ranks - 1].iter().filter(|i| i.format == "arena-padding").collect::<Vec<_>>();
+            assert_eq!(padding.len(), 1);
+            assert_eq!(padding[0].bytes, layout.padding_bytes() as u64);
+            assert!(owned[..ranks - 1].iter().all(Vec::is_empty));
+        }
+        // No dSpark: no draft arena and no padding owner.
+        let target = vec![tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, &[64, 33], 2112)];
+        let items = resident_weights(&checkpoint(target), 1, true).unwrap();
+        assert!(items[0].iter().all(|i| i.format != "arena-padding"));
     }
 
     #[test]

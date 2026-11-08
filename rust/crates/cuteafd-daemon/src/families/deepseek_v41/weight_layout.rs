@@ -5,7 +5,7 @@ use cuteafd_loader::OfficialV41Catalog;
 use crate::shared::memory::{device::Device, weight_arena::DeviceWeightArena};
 pub(crate) use super::v41_tensors::allocation;
 pub(crate) use cuteafd_loader::placement::families::deepseek_v41::weight_layout::{
-    TargetLayout, packed_scale_name, head_requests,
+    TargetLayout, packed_scale_name,
 };
 
 pub(crate) fn target_layout(catalog: &OfficialV41Catalog, placement: Option<CachePlacement>,
@@ -58,6 +58,7 @@ impl<'a> TargetArenas<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuteafd_loader::placement::families::deepseek_v41::weight_layout::head_requests;
     #[test]
     fn installed_target_arenas_inventory() -> Result<()> {
         let Some(snapshot) = super::super::coordinator_golden_tests::snapshot() else { return Ok(()) };

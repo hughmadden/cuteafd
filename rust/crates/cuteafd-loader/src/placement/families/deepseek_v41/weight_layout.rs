@@ -109,9 +109,15 @@ impl TargetLayout {
 
 /// Independently retired dense dSpark weights; routed experts have their own arena.
 pub fn draft_layout(catalog: &OfficialV41Catalog) -> Result<WeightArenaLayout> {
+    draft_layout_from_headers(catalog.tensors().iter().map(|tensor| &tensor.metadata))
+}
+
+/// The one dSpark dense recipe the planner and the serving loader both charge:
+/// checkpoint headers only, so planning needs no catalog or payload read.
+pub fn draft_layout_from_headers<'a>(tensors: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>)
+    -> Result<WeightArenaLayout> {
     let mut requests = BTreeMap::new();
-    for tensor in catalog.tensors() {
-        let meta = &tensor.metadata;
+    for meta in tensors {
         let name = &meta.name;
         if !name.starts_with("mtp.") || name.contains(".ffn.experts.") { continue; }
         let bytes = usize::try_from(meta.byte_length)?;
