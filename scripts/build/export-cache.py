@@ -159,7 +159,12 @@ def run(args) -> int:
             name = roots.name(path)
             files[name] = {"blob": store.put_blob(path), "mode": path.stat().st_mode & 0o777}
     entry = {"files": files, "seconds": seconds, "argv": identity["argv"]}
-    store.record(identity_key, record["checks"], entry)
+    checks = dict(record["checks"])
+    if LOCK_CHECK in checks:
+        # Keyed by the fork files it read, not the pin; restores rename the pin.
+        del checks[LOCK_CHECK]
+        entry["provenance"] = lock_provenance()
+    store.record(identity_key, checks, entry)
     cache.stats("miss", layer="invocation", exporter=label, checks=len(record["checks"]),
                 files=len(files), seconds=seconds)
     return 0
@@ -178,11 +183,67 @@ def refusal(record, command) -> str | None:
     return None
 
 
+LOCK = ROOT / "third_party/sparkinfer.lock.json"
+LOCK_CHECK = "file|src:third_party/sparkinfer.lock.json"
+
+
+def lock_provenance() -> dict:
+    lock = json.loads(LOCK.read_text())
+    return {"revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"]}
+
+
 def restore(store, entry, roots: cache.Roots) -> bool:
     for name, item in entry["files"].items():
         if not store.get_blob(item["blob"], roots.path(name), item["mode"]):
             return False
+    recorded = entry.get("provenance")
+    if recorded and recorded != lock_provenance():
+        # Only JSON may name the pin; anything else carrying it is not reusable
+        # across a pin bump (checked on the restored bytes, before rewriting).
+        needles = [recorded[key].encode() for key in ("revision", "source_tree_sha256")]
+        for name in entry["files"]:
+            if not name.endswith(".json") and any(n in roots.path(name).read_bytes() for n in needles):
+                return False
+        reprovenance(entry, roots, recorded, lock_provenance())
     return True
+
+
+def reprovenance(entry, roots: cache.Roots, old: dict, new: dict) -> None:
+    """Restored manifests name the fork pin they were exported at; name the current one.
+
+    The fork lock is not part of an entry's key (a pin bump that leaves an
+    export's own fork reads unchanged reuses it); the pin appears in exported
+    JSON only as these two strings, and a manifest can carry another restored
+    file's digest, which is updated with it (as the placement republish does).
+    """
+    if old == new:
+        return
+    replaced = {}
+    for name in entry["files"]:
+        if not name.endswith(".json"):
+            continue
+        path = roots.path(name)
+        text = path.read_text()
+        updated = text
+        for key in ("revision", "source_tree_sha256"):
+            updated = updated.replace(old[key], new[key])
+        if updated != text:
+            replaced[cache.digest(text.encode())] = cache.digest(updated.encode())
+            path.write_text(updated)
+    while replaced:
+        changed = {}
+        for name in entry["files"]:
+            if not name.endswith(".json"):
+                continue
+            path = roots.path(name)
+            text = path.read_text()
+            updated = text
+            for before, after in replaced.items():
+                updated = updated.replace(before, after)
+            if updated != text:
+                changed[cache.digest(text.encode())] = cache.digest(updated.encode())
+                path.write_text(updated)
+        replaced = changed
 
 
 def summarise(path: Path) -> int:

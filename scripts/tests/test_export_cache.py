@@ -43,6 +43,13 @@ args = parser.parse_args()
 args.output_dir.mkdir(parents=True, exist_ok=True)
 value = kern.used.SCALE * int(os.environ.get("CUTEAFD_FAKE_FACTOR", "1"))
 (args.output_dir / "kernel.o").write_text(str(value))
+lock = Path(__file__).resolve().parents[3] / "third_party/sparkinfer.lock.json"
+if lock.exists():
+    import json as _json
+    revision = _json.loads(lock.read_text())["revision"]
+    (args.output_dir / "manifest.json").write_text(_json.dumps({"sparkinfer_revision": revision}))
+    if args.mode == "pinned-object":
+        (args.output_dir / "kernel.o").write_text(str(value) + revision)
 if args.mode == "foreign":
     open("/etc/hostname").read() if os.path.exists("/etc/hostname") else None
     open(os.environ["FOREIGN"]).read()
@@ -71,6 +78,8 @@ elif args.mode == "child":
     subprocess.run([sys.executable, "-I", "-c", "print(1)"], check=True)
 print("exported", value)
 ''')
+    (source / "third_party/sparkinfer.lock.json").write_text(json.dumps(
+        {"revision": "a" * 40, "source_tree_sha256": "b" * 64}))
     build = tmp_path / "build"
     build.mkdir()
     return source, build
@@ -162,6 +171,27 @@ def test_a_package_staged_beside_its_output_and_renamed_in_is_restored(tree):
     shutil.rmtree(build / "out")
     assert run(tree, mode="staged")[0] == "hit"
     assert (build / "out/package/lib.so").read_text() == "lib"
+
+
+def bump_pin(source, revision):
+    (source / "third_party/sparkinfer.lock.json").write_text(json.dumps(
+        {"revision": revision * 40, "source_tree_sha256": "c" * 64}))
+
+
+def test_a_pin_bump_reuses_the_export_and_renames_the_pin_in_its_manifests(tree):
+    source, build = tree
+    run(tree)
+    bump_pin(source, "d")
+    assert run(tree)[0] == "hit"
+    assert json.loads((build / "out/manifest.json").read_text()) == {"sparkinfer_revision": "d" * 40}
+
+
+def test_a_pin_named_outside_json_is_never_reused_across_a_bump(tree):
+    source, build = tree
+    run(tree, mode="pinned-object")
+    bump_pin(source, "e")
+    assert run(tree, mode="pinned-object")[0] == "miss"
+    assert (build / "out/kernel.o").read_text().endswith("e" * 40)
 
 
 def test_known_compilers_and_shells_with_unknown_programs_fail_closed(tree):

@@ -265,8 +265,12 @@ class Recorder:
             for scope in self.scopes:
                 scope.checks.add(check)
 
-    def scope(self):
-        """Context collecting every observation (repeated or first) until it closes."""
+    def scope(self, closing=None):
+        """Context collecting every observation (repeated or first) until it closes.
+
+        `closing(scope)` runs before it closes (ProgramCache adds the sources of
+        the code the program executed); by default every loaded module counts.
+        """
         recorder = self
 
         class _Context:
@@ -277,9 +281,7 @@ class Recorder:
                 return self.value
 
             def __exit__(self, *exc):
-                # Every module loaded by now may hold code or constants this
-                # program's recipe used, even if an earlier program imported it.
-                recorder.guarded(recorder.modules)
+                recorder.guarded(closing or (lambda scope: recorder.modules()), self.value)
                 with recorder.lock:
                     recorder.scopes.remove(self.value)
         return _Context()
@@ -877,6 +879,139 @@ def stats(event: str, **fields) -> None:
             handle.write(json.dumps({"event": event, **fields}) + "\n")
 
 
+FORK_MODULE = "file|src:third_party/sparkinfer/b12x/"
+
+
+def is_fork_module(check: str) -> bool:
+    return check.startswith(FORK_MODULE) and check.endswith(".py")
+
+
+class Executed:
+    """The fork sources one program's compilation depended on.
+
+    Every file whose code ran while it compiled (sys.monitoring PY_START,
+    re-armed per program), each file's static import closure (module-level and
+    function-local imports: a constant used by running code was imported from
+    somewhere), and every module first imported meanwhile. A running module that
+    imports by computed name (import_module, __import__, a package __getattr__)
+    pulls in every loaded module of its package, so a lazily resolved constant
+    is still keyed.
+    """
+
+    TOOL_NAME = "cuteafd-export-cache"
+
+    def __init__(self, roots: Roots):
+        self.roots = roots
+        self.fork = str(roots.sparkinfer / "b12x")
+        self.tool = None
+        for tool in (4, 3):
+            if sys.monitoring.get_tool(tool) is None:
+                sys.monitoring.use_tool_id(tool, self.TOOL_NAME)
+                self.tool = tool
+                break
+        self.files: set[str] = set()
+        self.closures: dict[str, frozenset] = {}
+        self.loaded: set[str] = set()
+
+    @property
+    def available(self) -> bool:
+        return self.tool is not None
+
+    def _start(self, code, offset):
+        filename = code.co_filename
+        if filename.startswith(self.fork):
+            self.files.add(filename)
+        return sys.monitoring.DISABLE
+
+    def begin(self) -> None:
+        self.files = set()
+        self.loaded = {name for name, module in sys.modules.items() if getattr(module, "__file__", None)}
+        if self.tool is not None:
+            sys.monitoring.register_callback(self.tool, sys.monitoring.events.PY_START, self._start)
+            sys.monitoring.set_events(self.tool, sys.monitoring.events.PY_START)
+            sys.monitoring.restart_events()
+
+    def end(self) -> set[str]:
+        if self.tool is None:
+            # No monitoring slot: every loaded fork module counts (coarse, sound).
+            return {module.__file__ for module in list(sys.modules.values())
+                    if isinstance(getattr(module, "__file__", None), str) and module.__file__.startswith(self.fork)}
+        sys.monitoring.set_events(self.tool, 0)
+        result = set(self.files)
+        for name, module in list(sys.modules.items()):
+            filename = getattr(module, "__file__", None)
+            if name not in self.loaded and isinstance(filename, str) and filename.startswith(self.fork):
+                result.add(filename)
+        pending = list(result)
+        while pending:
+            path = pending.pop()
+            for dependency in self.closure(path):
+                if dependency not in result:
+                    result.add(dependency)
+                    pending.append(dependency)
+        return result
+
+    def closure(self, path: str) -> frozenset:
+        if path not in self.closures:
+            self.closures[path] = frozenset(self._imports(path))
+        return self.closures[path]
+
+    def _module_file(self, name: str):
+        parts = name.split(".")
+        if not parts or parts[0] != "b12x":
+            return None
+        base = Path(self.fork).parent.joinpath(*parts)
+        for candidate in (base / "__init__.py", base.with_suffix(".py")):
+            if candidate.is_file():
+                return str(candidate)
+        return None
+
+    def _imports(self, path: str):
+        import ast
+        try:
+            text = Path(path).read_text()
+            tree = ast.parse(text)
+        except (OSError, SyntaxError, ValueError):
+            return self._package_modules(path)  # unreadable: everything near it counts
+        relative = Path(path).relative_to(Path(self.fork).parent).with_suffix("")
+        parts = list(relative.parts)
+        package = parts[:-1] if parts[-1] != "__init__" else parts[:-1]
+        if parts[-1] == "__init__":
+            package = parts[:-1]
+        found = set()
+
+        def add(name):
+            pieces = name.split(".")
+            for index in range(1, len(pieces) + 1):
+                file = self._module_file(".".join(pieces[:index]))
+                if file:
+                    found.add(file)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    base = package[:len(package) - (node.level - 1)] if node.level > 1 else package
+                    module = ".".join(base + ([node.module] if node.module else []))
+                else:
+                    module = node.module or ""
+                add(module)
+                for alias in node.names:
+                    add(module + "." + alias.name)
+        dynamic = ("import_module(" in text or "__import__(" in text or "def __getattr__" in text
+                   or "spec_from_file_location" in text)
+        if dynamic:
+            found.update(self._package_modules(path))
+        return found
+
+    def _package_modules(self, path: str):
+        directory = os.path.dirname(path)
+        return {module.__file__ for module in list(sys.modules.values())
+                if isinstance(getattr(module, "__file__", None), str)
+                and module.__file__.startswith(directory + "/")}
+
+
 # A fork pin bump rewrites the lock, which manifests embed, so whole-command
 # entries key it. An exported program does not embed it: the fork files it
 # compiled from are keyed by content (and lock verification proves the tree is
@@ -909,9 +1044,12 @@ class ProgramCache:
         if self.enabled:
             self.recorder.modules()
             with self.recorder.lock:
-                self.prelude = set(self.recorder.checks)
+                # Fork modules key a program only through what that program ran
+                # (Executed below); everything else the exporter read keys all.
+                self.prelude = {check for check in self.recorder.checks if not is_fork_module(check)}
                 if set(self.recorder.unknown):
                     self.enabled = False  # the prelude itself escaped the record
+            self.executed = Executed(self.recorder.roots)
 
     def key(self, identity: dict) -> str:
         return stable({"schema": SCHEMA, "layer": "program", "toolchain": self.toolchain, **identity})
@@ -943,7 +1081,12 @@ class ProgramCache:
         if not self.enabled:
             from contextlib import nullcontext
             return nullcontext(None)
-        return self.recorder.scope()
+        self.executed.begin()
+
+        def closing(scope):
+            for path in self.executed.end():
+                self.recorder.note_read(path)
+        return self.recorder.scope(closing)
 
     def store_program(self, identity: dict, scope, files, metadata) -> None:
         if not self.enabled or scope is None:
