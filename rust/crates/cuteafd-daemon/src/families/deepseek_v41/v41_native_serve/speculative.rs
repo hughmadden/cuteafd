@@ -91,8 +91,8 @@ pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     // Downloaded whenever the length policy is bound, or for diagnostics.
     confidence_trace: std::collections::BTreeMap<u64, Vec<f32>>,
     neural_lengths: std::collections::BTreeMap<u64, usize>,
-    /// Verify every available draft instead of selecting lengths.
-    fixed: bool,
+    /// Shared fixed-length override, absent for adaptive selection.
+    length: crate::shared::draft::length::DraftLength,
     /// Online bandwidth-balance length policy, bound to the installed placement.
     policy: Option<cuteafd_core::DraftPolicy>,
     published: Option<Instant>,
@@ -139,7 +139,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
             draft_width: weights.draft_width(),
             confidence_trace: Default::default(),
             neural_lengths: Default::default(),
-            fixed: false,
+            length: Default::default(),
             policy: None,
             published: None,
             lanes: (0..lane_count).map(|_| LaneRound::new(policy::LAYERS, policy::TOPK)).collect(),
@@ -174,22 +174,15 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub(super) fn prefill_tap_capacity(&self) -> usize { self.mains[0].capacity() }
     pub fn max_verify_rows(&self) -> usize { self.draft_width + crate::shared::draft::copy::COPY_EXTENSION + 1 }
     pub fn attention_drafts(&self) -> usize { self.draft_limit.min(self.draft_width) }
-    pub fn set_draft_limit(&mut self, limit: u8) -> Result<()> {
-        ensure!((1..=self.draft_width as u8).contains(&limit), "draft limit exceeds generated width");
-        self.draft_limit = limit as usize;
+    pub fn set_length(&mut self, length: crate::shared::draft::length::DraftLength) -> Result<()> {
+        self.draft_limit = length.draft_length.unwrap_or(5).min(self.draft_width);
+        self.length = length;
         Ok(())
-    }
-    /// Verify every available draft; the policy still records statistics.
-    pub fn set_fixed(&mut self, fixed: bool) {
-        self.fixed = fixed;
-        if let Some(policy) = &mut self.policy {
-            *policy = policy.restarted(fixed);
-        }
     }
     /// Bind the length policy to the installed expert placement before serving.
     pub fn configure_policy(&mut self, transport: &NativeTp4Wave<'_>, nvfp4: bool) -> Result<()> {
         let geometry = policy::placement(transport, nvfp4, self.draft_width)?;
-        tracing::info!(fixed=self.fixed, draft_limit=self.draft_limit, local_layers=policy::local_layers(&geometry),
+        tracing::info!(fixed=self.length.draft_length.is_some(), draft_limit=self.draft_limit, local_layers=policy::local_layers(&geometry),
             remote_expert_bytes=policy::remote_expert_bytes(&geometry),
             "dSpark bandwidth-balance length policy bound");
         self.bind_policy(geometry)
@@ -200,8 +193,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         ensure!(geometry.widths.last() == Some(&self.draft_width), "policy widths differ from the loaded draft width");
         geometry.max_positions = self.draft_width + crate::shared::draft::copy::COPY_EXTENSION;
         let seed = cuteafd_core::PolicySeed::weak(self.draft_width);
-        let mut policy = cuteafd_core::DraftPolicy::new(geometry, seed, self.fixed)?;
-        crate::shared::draft::apply_length_rule(&mut policy);
+        let policy = self.length.policy(geometry, seed, self.draft_width)?;
         policy::publish(&policy, self.draft_limit);
         self.policy = Some(policy);
         Ok(())
@@ -218,8 +210,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     }
     /// Choose each request's draft length for one lane round. `requests` are
     /// (identity, available drafts) in lane order; `shared` means the other lane
-    /// has active requests. `None` verifies every available draft (fixed mode
-    /// or a fit still warming up).
+    /// has active requests. `None` verifies every available draft while a fit warms up.
     pub fn select_lengths(&mut self, lane: usize, requests: &[(u64, usize)], shared: bool)
         -> Result<Option<Vec<usize>>> {
         let round = self.lanes.get_mut(lane).context("invalid draft policy lane")?;
@@ -239,6 +230,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             .map(|(&(id, _), confidence)| cuteafd_core::DraftCandidate { id, confidence }).collect();
         let started = Instant::now();
         let drafted_requests = round.drafted_requests;
+        if let Some(lengths) = crate::shared::draft::resource::fixed_selection(policy, &candidates,
+            cuteafd_core::V41_VERIFY_ROWS) { return Ok(Some(lengths)); }
         let selection = policy.select_drafted_within(shared, &candidates, width, cuteafd_core::V41_VERIFY_ROWS, drafted_requests)?;
         Ok(match selection {
             Some(selection) => {
@@ -549,7 +542,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     }
 
     pub fn calibrated_confidence(&self, requests: usize, id: u64, extent: usize) -> Result<Option<Vec<f64>>> {
-        let Some(policy) = self.policy.as_ref().filter(|_| !self.fixed) else { return Ok(None); };
+        let Some(policy) = self.policy.as_ref().filter(|policy| !policy.fixed()) else { return Ok(None); };
         let logits = self.confidence_trace.get(&id).context("missing neural draft confidence")?;
         ensure!(extent <= logits.len(), "neural confidence extent mismatch");
         let prior: Vec<_> = logits[..extent].iter().map(|&x| sigmoid(x)).collect();
@@ -947,7 +940,7 @@ mod anchor_fallback_tests {
             windows: [window()?, window()?, window()?], pending_commit_ids: vec![Vec::new(); 2],
             pending_prefix_ids: [None, None], requests: Default::default(), pending: vec![None; 2],
             request_limit: 4, draft_limit: 5, draft_width: 5, confidence_trace: Default::default(),
-            neural_lengths: Default::default(), fixed: false, policy: None, published: None,
+            neural_lengths: Default::default(), length: Default::default(), policy: None, published: None,
             lanes: (0..2).map(|_| LaneRound::new(policy::LAYERS, policy::TOPK)).collect(),
         };
         for id in 1..=4 { runtime.admit(id)?; }

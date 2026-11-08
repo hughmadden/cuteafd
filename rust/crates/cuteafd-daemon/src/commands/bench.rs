@@ -509,7 +509,7 @@ mod tests {
     fn dense_qwen_context_leaves_family_to_loader_and_reports_active_draft_settings() {
         for draft in [None, Some("/model/dspark")] {
             let mut argv = vec!["cuteafd", "serve-qwen35", "--snapshot", "/target", "--native-lib", "/native.so"];
-            if let Some(snapshot) = draft { argv.extend(["--draft", snapshot, "--draft-fixed", "7"]); }
+            if let Some(snapshot) = draft { argv.extend(["--draft", snapshot, "--draft-length", "7"]); }
             let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
             let context = serve_context(&matches, None).unwrap().expect("dense serve context");
             assert_eq!(context.family, None);
@@ -518,7 +518,7 @@ mod tests {
             assert_eq!(configuration.speculator.is_some(), draft.is_some());
             if draft.is_some() {
                 assert_eq!(configuration.speculator.as_deref(), Some("dSpark (dspark)"));
-                assert_eq!(context.settings.iter().find(|s| s.name == "draft-fixed").unwrap().value.as_deref(), Some("7"));
+                assert_eq!(context.settings.iter().find(|s| s.name == "draft-length").unwrap().value.as_deref(), Some("7"));
             }
         }
     }

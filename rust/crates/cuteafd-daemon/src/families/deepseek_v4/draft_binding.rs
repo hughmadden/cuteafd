@@ -36,7 +36,7 @@ fn geometry(homes: &[(u8, f64)], experts: usize, topk: usize, rows: usize, width
     Ok(geometry)
 }
 
-pub(super) fn new(engine: &Engine<'_>, loaded: &Loaded, transports: &[SparkLink<'_>]) -> Result<Option<SharedPolicy>> {
+pub(super) fn new(engine: &Engine<'_>, loaded: &Loaded, transports: &[SparkLink<'_>], length: crate::shared::draft::length::DraftLength) -> Result<Option<SharedPolicy>> {
     let width = engine.draft_block();
     if width == 0 || engine.skip_routed { return Ok(None); }
     let shape = loaded.catalog.routed_experts();
@@ -62,7 +62,7 @@ pub(super) fn new(engine: &Engine<'_>, loaded: &Loaded, transports: &[SparkLink<
         if layer < local { return engine.local_group_rows(rows); }
         resource::worker_group_rows(&remote, layer, rows)
     })?;
-    let mut shared = SharedPolicy::with_geometry(geometry, resource::Prior::History, PolicySeed::weak(width))?;
+    let mut shared = SharedPolicy::with_length(geometry, resource::Prior::History, PolicySeed::weak(width), length)?;
     shared.policy.set_native_confidence_positions(width)?;
     resource::publish(&shared.policy, 0, 0, None);
     Ok(Some(shared))

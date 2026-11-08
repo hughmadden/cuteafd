@@ -455,8 +455,11 @@ pub struct FabricPort {
     pub subnets: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Configuration {
+    /// Effective selection: no speculation, adaptive, or fixed N before row caps.
+    #[serde(default = "adaptive_draft")]
+    pub draft: String,
     /// Renderer capability; absent preserves requests to older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_thinking_off: Option<bool>,
@@ -477,7 +480,20 @@ pub struct Configuration {
     pub settings: Vec<Setting>,
 }
 
+fn adaptive_draft() -> String { "adaptive".into() }
+
+impl Default for Configuration {
+    fn default() -> Self {
+        Self { draft: adaptive_draft(), supports_thinking_off: None, snapshot: None, quant: Vec::new(),
+            speculator: None, layout: None, mapped_placement: None, settings: Vec::new() }
+    }
+}
+
 impl Configuration {
+    pub fn draft_mode(&self) -> &str {
+        if self.speculator.is_none() { "no speculation" } else { &self.draft }
+    }
+
     pub fn supports_thinking_off(&self) -> bool { self.supports_thinking_off != Some(false) }
 
     pub fn thinking_label(&self) -> &'static str {

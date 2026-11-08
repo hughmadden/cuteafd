@@ -538,8 +538,8 @@ pub(crate) struct ServeArgs {
     /// External checkpoint-native BF16 block dSpark; the launcher resolves its default.
     #[arg(long)]
     pub draft: Option<std::path::PathBuf>,
-    #[arg(long)]
-    pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// Checkpoint-native one-layer MTP; external dSpark remains the default.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3), conflicts_with = "draft")]
     pub mtp: u8,
@@ -562,6 +562,7 @@ pub(crate) struct ServeArgs {
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.draft.is_some() || args.mtp > 0);
     cuteafd_core::concurrency::validate("qwen3_5", args.max_sequences as u64)?;
     args.prefix.resolve_entries(args.max_sequences as usize);
     use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile};
@@ -603,7 +604,6 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
                 super::engine::DrafterBytes::block_dspark(snapshot, &config, lanes, library.sm_count()? as u64, header.config.max_context)
             }).transpose()?;
-            ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
             let startup_audit = crate::shared::inventory::startup_probe_enabled()
                 .then(cuteafd_ffi::memory_ledger::AllocationAudit::begin);
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
@@ -620,18 +620,17 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 let mask = target.token_embedding().host_rows(&[config.mask_token])?;
                 let draft = Rc::new(super::dspark::load_drafter(&target, &programs, snapshot, lanes, mask)?);
                 draft.prepare_workspace()?;
-                let depth = engine_args.draft_fixed.unwrap_or(config.drafts());
-                ensure!(depth <= config.drafts(), "--draft-fixed exceeds checkpoint draft block");
+                let depth = config.drafts();
                 backend.drafter = Some(draft);
-                scheduler::Drafts::Neural { depth, fixed: engine_args.draft_fixed.is_some() }
+                scheduler::Drafts::Neural { depth }
             } else if let Some(admission) = mtp_admission {
                 backend.mtp = Some(Rc::new(super::engine::mtp::MtpCache::load(&engine.borrow(), &reader, admission)?));
                 backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
                     crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
-                scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp), fixed: false }
+                scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp) }
             } else { scheduler::Drafts::None };
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
-                drafts, eos, engine_args.decode_share, &engine_args.prefix,
+                drafts, engine_args.draft_length, eos, engine_args.decode_share, &engine_args.prefix,
                 engine_args.loop_abort.config(), engine_args.token_io.token_select, &mut text_media(), None, || {
                     let history = startup_audit.map(|audit| audit.finish());
                     let census = crate::shared::inventory::startup_probe_enabled()
@@ -671,12 +670,12 @@ fn console_layout(args: &ServeArgs, model: &str) -> Result<crate::shared::consol
     layout.hardware = console::hardware(1, 0, true);
     layout.concurrency = usize::from(args.max_sequences);
     layout.speculator = args.draft.as_deref().map(|snapshot| {
-        let depth = args.draft_fixed.unwrap_or(block_dspark::DsparkConfig::read(snapshot)?.drafts());
+        let depth = block_dspark::DsparkConfig::read(snapshot)?.drafts();
         Ok::<_, anyhow::Error>(console::Speculator { name: "dSpark".into(), positions: depth,
-            policy: if args.draft_fixed.is_some() { format!("fixed {depth}") } else { format!("adaptive <= {depth}") } })
+            policy: args.draft_length.label(depth) })
     }).transpose()?;
     if args.mtp > 0 {
-        layout.speculator = Some(console::Speculator { name: "MTP".into(), positions: 1, policy: "adaptive <= 1".into() });
+        layout.speculator = Some(console::Speculator { name: "MTP".into(), positions: usize::from(args.mtp), policy: args.draft_length.label(usize::from(args.mtp)) });
     }
     Ok(layout)
 }
@@ -824,10 +823,10 @@ mod tests {
     fn dense_dspark_preserves_drafting_through_boot_capacity() {
         for c in [1, 16, 17, 32, 33, 64] {
             let args = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so",
-                "--draft", "external", "--draft-fixed", "3", "--max-sequences", &c.to_string()]).unwrap().serve;
+                "--draft", "external", "--draft-length", "3", "--max-sequences", &c.to_string()]).unwrap().serve;
             assert_eq!(usize::from(args.max_sequences), c);
-            assert_eq!(args.draft.is_some(), c <= block_dspark::MAX_SEQUENCES);
-            assert_eq!(args.draft_fixed.is_some(), c <= block_dspark::MAX_SEQUENCES);
+            assert!(args.draft.is_some());
+            assert_eq!(args.draft_length.draft_length, Some(3));
         }
     }
 

@@ -336,7 +336,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // dSpark is admitted before it exists (#65): plan every retained owner from
     // the native plans and AOT packages, sample with no draft allocation, solve
     // with the drafter as a shared Movable, then load with the admitted bytes.
-    let draft_width = if args.dspark_draft_limit > 5 { 7 } else { 5 };
+    let draft_width = if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 };
     ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
     let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let dspark_inventory = if args.dspark {
@@ -462,8 +462,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
         devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency)).transpose()?;
     if let Some(draft) = &mut draft {
-        draft.set_draft_limit(args.dspark_draft_limit)?;
-        draft.set_fixed(args.dspark_fixed);
+        draft.set_length(args.draft_length)?;
     }
     attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
     tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),

@@ -150,7 +150,7 @@ pub struct LayoutOptions {
     /// Drafter batch override; absent uses the family serving default.
     pub draft_sequences: Option<u64>,
     /// V4.1 configured proposal limit; loaded neural width is five or seven.
-    pub dspark_draft_limit: u8,
+    pub v41_draft_width: u8,
     /// DeepSeek V4/V4.1 dSpark expert halves on both coordinator GPUs.
     pub tp2_dspark_experts: bool,
     /// External DFlash attention/FFN split over the two target ranks.
@@ -306,7 +306,7 @@ impl Default for LayoutOptions {
             mimo_swa_kv: crate::families::mimo_v2::MimoKvFormats::default().sliding,
             mimo_expert_input: Default::default(),
             draft_sequences: None,
-            dspark_draft_limit: 5,
+            v41_draft_width: 5,
             tp2_dspark_experts: false,
             tp2_dflash: false,
             glmf_tp2_dflash_auto: false,

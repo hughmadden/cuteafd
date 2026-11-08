@@ -113,7 +113,7 @@ release_die() { echo "$*" >&2; exit 2; }
             with self.subTest(requested=requested, usage=usage), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 config = root / 'sparse.config'
-                config.write_text('  SPECULATOR = "dspark" # draft mode\nDSPARK_DRAFT_LIMIT=\'7\' # width\n'
+                config.write_text('  SPECULATOR = "dspark" # draft mode\nDRAFT_LENGTH=\'7\' # width\n'
                                   'SPARK_0_HOST="ostrich" # first\nSPARK_1_HOST=\'dodo\'\n'
                                   'SPARK_0_LANE_A=10.55.0.1\nSPARK_1_LANE_A=10.55.0.2\n'
                                   + (f'EXPERT_USAGE="{usage}" # telemetry policy\n' if usage else '')
@@ -122,13 +122,13 @@ release_die() { echo "$*" >&2; exit 2; }
 source scripts/lib/release-common.sh
 release_load_config "$1"
 release_resolve_tp2_dspark_experts deepseek_v41 2
-dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
+draft_length="$DRAFT_LENGTH"
 get() { if [[ "$1" == EXPERT_USAGE ]]; then printf '%s' "${EXPERT_USAGE:-${2:-}}"; else printf '%s' "${2:-}"; fi; }
 container_hf_home=/hf
 namespace_mount_args=()
 '''
                 result = subprocess.run(['bash', '-c', script + block + '''
-printf '%s\\n' "$TP2_DSPARK_EXPERTS" "$SPECULATOR" "$dspark_draft_limit" "$RELEASE_AVAILABLE_SPARKS"
+printf '%s\\n' "$TP2_DSPARK_EXPERTS" "$SPECULATOR" "$draft_length" "$RELEASE_AVAILABLE_SPARKS"
 cat "$count_config"
 printf 'arg=%s\\n' "${count_args[@]}"
 printf 'mount=%s\\n' "${count_mounts[@]}"
@@ -137,7 +137,7 @@ printf 'mount=%s\\n' "${count_mounts[@]}"
                 lines = result.stdout.splitlines()
                 self.assertEqual(lines[:4], [expected, 'dspark', '7', '2'])
                 normalized = dict(line.split('=', 1) for line in lines[4:] if not line.startswith(('arg=', 'mount=')))
-                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DSPARK_DRAFT_LIMIT='7', EXPERT_USAGE=usage or 'on',
+                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DRAFT_LENGTH='7', EXPERT_USAGE=usage or 'on',
                     **{f'SPARK_{rank}_HOST': host for rank, host in enumerate(['ostrich', 'dodo'])}))
                 self.assertIn('arg=--config', lines)
                 self.assertIn('arg=/run/cuteafd-plan.config', lines)
@@ -843,7 +843,7 @@ spark_tp_roles=
             self.assertIn(option, help_text)
         for key in ("RTX_GPUS", "CONCURRENCY", "KV_POOL_SIZE", "GPU_MEMORY_CAP", "PREFIX_CACHE_ENTRIES",
                     "MAX_CONTEXT_TOKENS", "MAX_OUTPUT_TOKENS", "PREFILL_BATCH_TOKENS", "SPECULATOR",
-                    "DSPARK_DRAFT_LIMIT", "TP2_ATTENTION"):
+                    "DRAFT_LENGTH", "TP2_ATTENTION"):
             self.assertIn(key, help_text)
 
     def test_standard_release_defaults_are_native(self) -> None:
@@ -913,11 +913,11 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                 (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be auto or in 1..1048576"),
                 (["--set", "MAX_OUTPUT_TOKENS=12k"], "MAX_OUTPUT_TOKENS must be an integer"),
                 (["--set", "RTX_GPUS=3"], "RTX_GPUS must be auto, 1, or 2"),
-                (["--set", "DSPARK_DRAFT_LIMIT=8"], "DSPARK_DRAFT_LIMIT must be in 1..7"),
+                (["--set", "DRAFT_LENGTH=0"], "DRAFT_LENGTH must be a positive integer"),
                 (["--set", "NOT_A_KEY=1"], "unknown configuration key: NOT_A_KEY"),
                 # The former options name the key that replaced them.
                 (["--concurrency", "4"], "--set CONCURRENCY=VALUE"),
-                (["--dspark-draft-limit", "7"], "--set DSPARK_DRAFT_LIMIT=VALUE"),
+                (["--draft-length", "7"], "--set DRAFT_LENGTH=VALUE"),
                 (["--tp2-attention"], "--set TP2_<OPTION>=on|off"),
             ):
                 with self.subTest(args=args):

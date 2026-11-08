@@ -116,7 +116,7 @@ const REFERENCE_MARGIN: f64 = 1.02;
 pub(crate) fn choose_block(policy: &mut DraftPolicy, requests: &[(u64, usize)], width: usize,
     drafted_requests: usize, rows: usize, cold: bool) -> Result<bool> {
     if drafted_requests == 0 || !requests.iter().any(|&(_, room)| room > 0) { return Ok(false); }
-    if cold || policy.draft_mode() != cuteafd_core::DraftMode::Shared { return Ok(true); }
+    if policy.fixed() || cold || policy.draft_mode() != cuteafd_core::DraftMode::Shared { return Ok(true); }
     let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
         width, draft_us: policy.draft_cost_drafted(false, requests.len(), drafted_requests, width) }];
     let chosen = policy.choose_action(false, requests, &actions, rows)?;
@@ -342,6 +342,7 @@ pub(crate) fn prior(prior: &Prior, history: &DraftHistory, evidence: &DraftEvide
 pub(crate) fn copy_continuation(policy: &DraftPolicy, requests: usize, id: u64, history: &[u32], drafted: &[u32],
     prior: &mut Vec<f64>, room: usize, greedy: bool) -> Option<crate::shared::draft::copy::Continuation> {
     prior.truncate(drafted.len());
+    if policy.fixed() { return None; }
     let calibrated = policy.probabilities(requests, DraftCandidate { id, confidence: prior });
     let continuation = crate::shared::draft::copy::continuation(history, drafted, &calibrated, room, greedy)?;
     prior.truncate(continuation.neural);
@@ -384,6 +385,10 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
         .map(|c| &c.prior[..c.prior.len().min(c.limit).min(positions)]).collect();
     let cores: Vec<DraftCandidate<'_>> = candidates.iter().zip(&confidence)
         .map(|(c, &confidence)| DraftCandidate { id: c.id, confidence }).collect();
+    if let Some(lengths) = fixed_selection(policy, &cores, max_rows) {
+        binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
+        return Selection { lengths, predicted: None };
+    }
     if policy.draft_mode() != cuteafd_core::DraftMode::Shared {
         // The simple rule owns every length: no cold floor, no lone-request reference.
         let mut lengths = policy.select_drafted_within(false, &cores, width, max_rows, drafted_requests).ok().flatten()
@@ -423,6 +428,17 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
     if trim_budget_with_priors(&mut lengths, max_rows, &confidence, |i| candidates[i].id) { predicted = None; }
     binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
     Selection { lengths, predicted }
+}
+
+/// Fixed mode bypasses confidence and prices, retaining the existing row-budget cap.
+pub(crate) fn fixed_selection(policy: &DraftPolicy, candidates: &[DraftCandidate<'_>], rows: usize)
+    -> Option<Vec<usize>> {
+    if !policy.fixed() { return None; }
+    let cap = policy.fixed_length().unwrap_or(policy.geometry().max_positions);
+    let priors: Vec<_> = candidates.iter().map(|c| c.confidence).collect();
+    let mut lengths = priors.iter().map(|p| p.len().min(cap)).collect::<Vec<_>>();
+    trim_budget_with_priors(&mut lengths, rows, &priors, |i| candidates[i].id);
+    Some(lengths)
 }
 
 /// Inputs retained inside a round; expensive diagnostics run only after its

@@ -58,6 +58,17 @@ pub fn card_svg(report: &Report) -> String {
     doc.nested(LOGO, pad, 36.0, 46.0 * LOGO_ASPECT, 46.0);
     doc.text(WIDTH - pad, 62.0, Font::new(13.0, t.muted).anchor(Anchor::End).spacing(1.5),
         &format!("{} · {}", crate::profiles::title_of(&r.profile).to_uppercase(), super::date(&r.created)));
+    let draft = r.server.configuration.draft_mode();
+    let label = match draft {
+        "no speculation" => "no speculation".into(),
+        _ => draft.strip_prefix("fixed ").map_or_else(|| "adaptive draft".into(), |n| format!("fixed draft {n}")),
+    };
+    if draft.starts_with("fixed ") {
+        let width = text_width(&label, 15.0) + 28.0;
+        doc.rect_attrs(WIDTH - pad - width, 83.0, width, 32.0, 8.0,
+            &format!(r#"fill="{}" stroke="{}" stroke-width="1.5""#, t.panel2, t.ink2));
+    }
+    doc.text(WIDTH - pad - 14.0, 105.0, Font::new(15.0, t.ink2).anchor(Anchor::End).weight(600), &label);
     bodies::title(&mut doc, &t, pad, 148.0, 40.0, &r.server.checkpoint(), WIDTH - 2.0 * pad);
     let c = &r.server.configuration;
     let mut sub = Vec::new();
@@ -138,7 +149,7 @@ pub fn card_svg(report: &Report) -> String {
     let mut settings: Vec<_> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
         && !s.name.starts_with("provenance.") && !s.name.starts_with("qualification.")
         && !(s.name == "pool-tokens" && matches!(s.value.as_deref(), Some("0" | "auto")))
-        && !matches!(s.name.as_str(), "supersedes-checkpoint" | "rtx-expert-layers"))
+        && !matches!(s.name.as_str(), "supersedes-checkpoint" | "rtx-expert-layers" | "draft-mode" | "draft-length"))
         .collect();
     settings.sort_by_key(|s| chip_priority(s));
     let mut options: Vec<String> = settings.into_iter().map(Setting::chip).collect();

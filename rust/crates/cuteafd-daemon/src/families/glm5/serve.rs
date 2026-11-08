@@ -62,10 +62,8 @@ pub(crate) struct ServeArgs {
     /// template's Low effort, think block open, a short plan as reasoning).
     #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "empty")]
     pub thinking_off: GlmThinkingOff,
-    /// With --draft: verify exactly this many DFlash2 drafts per step
-    /// (within the rows) instead of the adaptive policy.
-    #[arg(long)]
-    pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -126,6 +124,7 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.dspark || args.engine.draft.is_some());
     let view = args.engine.attention.selected_view.clone().map(Ok)
         .unwrap_or_else(|| args.engine.attention.select(&args.engine.snapshot))?;
     args.engine.attention.validate_view(&view)?;
@@ -154,17 +153,17 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let mut engine_args = super::ResolvedEngineArgs::new(&engine_args)?;
     size_draft_window_marks(&mut engine_args, &args.prefix, max_sequences)?;
     let (worker_stats, max_sequences) = (stats.clone(), max_sequences);
-    let policy = Policy { fixed: args.draft_fixed,
+    let policy = Policy { length: args.draft_length,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, &cfg, max_sequences)));
+    let layout = console_layout(&args, &profile.id, &cfg, max_sequences, 0);
     let (vision, media_cache_bytes) = (args.vision, args.media_cache_bytes);
     let remote = crate::families::glm5_flash::media::RemoteVision::from_parts(args.vision, args.vision_peers.as_deref(),
         args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix, vision, media_cache_bytes,
-            remote, args.loop_abort.config()));
-    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+            remote, layout, args.console.console_text, args.loop_abort.config()));
+    let (max_context, media, hub) = ready_rx.await.context("engine failed before it was ready")??;
     let mut profile = profile;
     if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
@@ -207,7 +206,7 @@ fn size_draft_window_marks(resolved: &mut super::ResolvedEngineArgs, prefix: &Pr
 }
 
 /// What the live console shows for GLM 5.3.
-fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig, max_sequences: usize) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families::glm5::GlmDsaConfig, max_sequences: usize, native: usize) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -219,10 +218,10 @@ fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families:
         format!("{resolved} split")
     });
     layout.concurrency = max_sequences;
-    let policy = args.draft_fixed.map_or_else(|| "shared resource-priced + agreed copies".to_string(), |n| format!("fixed {n}"));
+    let policy = args.draft_length.label(native);
     layout.speculator = (args.engine.draft.is_some() || args.engine.dspark).then(|| console::Speculator {
         name: if args.engine.dspark { "dSpark" } else { "DFlash2" }.into(),
-        positions: if args.engine.dspark { 4 } else { 8 }, policy });
+        positions: native, policy });
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "DFlash2 draft", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -238,10 +237,10 @@ fn console_layout(args: &ServeArgs, model: &str, cfg: &cuteafd_loader::families:
     layout
 }
 
-/// A diagnostic fixed DFlash2 count, otherwise shared resource-priced selection.
+/// Neural draft settings and the shared resource-policy binding.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    fixed: Option<usize>,
+    length: crate::shared::draft::length::DraftLength,
     decode_share: DecodeShareArgs,
 }
 
@@ -249,9 +248,10 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady, Arc<cuteafd_api::openai::ConsoleHub>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>,
     remote: Option<crate::families::glm5_flash::media::RemoteVision>,
+    mut layout: console::Layout, console_text: bool,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let args = &resolved.args;
     let opened = match open(args) {
@@ -275,6 +275,10 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_resolved_engine_media(&resolved, media_push.records(), Some((&prefix, max_sequences)), (media_owner, bytes as u64), |engine, transport, runtime| {
+        layout.speculator = engine.drafter.as_ref().map(|draft| console::Speculator {
+            name: if draft.token_only() { "dSpark" } else { "DFlash2" }.into(),
+            positions: draft.cfg.drafts(), policy: policy.length.label(draft.cfg.drafts()) });
+        let mut hub = Some(console::hub(console_text, || Ok(layout)));
         media_push.commit()?;
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_local(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
@@ -284,7 +288,7 @@ fn serve_loop(resolved: super::ResolvedEngineArgs, mut receive: mpsc::Receiver<N
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences, policy,
             ranks, &prefix, loop_abort, args.token_io.token_select, &mut media, expander.as_ref(), || {
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())), hub.take().expect("console hub"))));
                 }
             })
     });
@@ -669,7 +673,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         engine.arm_draft_probe()?;
         let prior = if d.token_only() { resource::Prior::History }
             else { resource::Prior::Selector(d.selector_fit("glm5", false)?) };
-        SharedPolicy::with_geometry(geometry, prior, draft_seed())
+        SharedPolicy::with_length(geometry, prior, draft_seed(), policy.length)
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     // Decoding requests waiting for KV pages: they keep their slot and pages, skip rounds.
@@ -1095,7 +1099,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             continue;
         }
         let cycle = Instant::now();
-        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened, policy.fixed,
+        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             &mut transport, runtime, &mut phases, &mut active, &mut shared, &mut selector, &family, &mut cache,
             &mut free_slots, &mut trace, cycle)))? else { continue };
         for index in (0..active.len()).rev() {
@@ -1168,7 +1172,7 @@ impl LaneCommit for DraftContext<'_, '_> {
 /// plan, verify on the lane's decode link, select, emit and commit. `None`
 /// when the step failed and its requests were released.
 #[allow(clippy::too_many_arguments)]
-async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Opened, fixed: Option<usize>,
+async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Opened,
     transport: &mut Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, phases: &mut [f64; 8],
     active: &mut Vec<Active<'_>>, shared: &mut Option<crate::shared::draft::runtime::SharedPolicy>,
     selector: &mut TokenSelector<'_>, family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
@@ -1188,7 +1192,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     // Skip/block decisions use the same resource prices as post-draft lengths.
     let eligible: Vec<_> = active.iter().zip(&limits).filter(|(a, limit)| a.slot.is_some() && **limit > 0)
         .map(|(a, &limit)| (a.ticket.id(), limit)).take(drafter.map_or(0, |d| d.max_batch_sequences())).collect();
-    let run_draft = if eligible.is_empty() { false } else if fixed.is_some()
+    let run_draft = if eligible.is_empty() { false } else if shared.as_ref().is_some_and(|p| p.policy.fixed())
         || active.iter().any(|a| a.drafts.cold() && eligible.iter().any(|&(id, _)| id == a.ticket.id())) { true } else {
         let shared = shared.as_mut().expect("eligible draft slots have a shared policy");
         let width = drafter.unwrap().cfg.drafts();
@@ -1240,15 +1244,13 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     }).collect();
     let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
         .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
-            (Some(shared), Some(d)) if fixed.is_none() => resource::copy_continuation(&shared.policy, active.len(),
+            (Some(shared), Some(d)) if !shared.policy.fixed() => resource::copy_continuation(&shared.policy, active.len(),
                 a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
             _ => None,
         }).collect();
     let mut predicted = None;
-    let mut planned = match (fixed, shared.as_mut()) {
-        (Some(fixed), _) => drafted.iter().zip(&limits).map(|(draft, &limit)|
-            draft.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect(),
-        (None, Some(shared)) if drafted_width > 0 => {
+    let mut planned = match shared.as_mut() {
+        Some(shared) if drafted_width > 0 => {
             let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
                 resource::Candidate { id: a.ticket.id(), prior, limit, selector: !token_only, cold: a.drafts.cold() }).collect();
             let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
@@ -1491,17 +1493,22 @@ mod draft_tests {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("config.json"), include_str!(
             "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?;
+        std::fs::write(dir.path().join("params.json"), serde_json::to_vec(&serde_json::json!({
+            "mtp": { "n_layers": 3, "depth": 3, "ragged_attention": "2048,2048,2048",
+                "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
+                "dspark": { "markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific" } }
+        }))?)?;
         let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(dir.path())?;
         for (placement, expected) in [("auto", "context split"), ("layers", "layers split"),
             ("context", "context split"), ("heads", "heads split")] {
             let args = Cli::try_parse_from(["test", "--snapshot", dir.path().to_str().unwrap(),
                 "--native-lib", "/unused", "--manifest", "/unused", "--split-device", "1",
                 "--attention-placement", placement, "--dspark"])?.args;
-            let layout = console_layout(&args, "ml4", &cfg, 16);
+            let layout = console_layout(&args, "ml4", &cfg, 16, 3);
             assert_eq!(layout.split.as_deref(), Some(expected));
             let spec = layout.speculator.unwrap();
             assert_eq!(spec.name, "dSpark");
-            assert_eq!(spec.positions, 4);
+            assert_eq!(spec.positions, 3);
         }
         Ok(())
     }

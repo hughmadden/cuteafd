@@ -74,8 +74,8 @@ pub(crate) struct ServeArgs {
     pub model_id: Option<String>,
     /// With --draft: verify this many DFlash drafts per sequence every step
     /// instead of the adaptive plan.
-    #[arg(long)]
-    pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -134,6 +134,7 @@ pub(super) fn resolve_serving_capacity(engine_args: &mut super::EngineArgs, max_
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.draft.is_some() || args.engine.mtp > 0);
     let max_sequences = crate::shared::memory::budget::serving_concurrency(
         args.max_sequences, &args.engine.native_lib, args.engine.device)?;
     cuteafd_core::concurrency::validate("mimo_v2", max_sequences as u64)?;
@@ -160,11 +161,11 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let mut engine_args = args.engine.clone();
     resolve_serving_capacity(&mut engine_args, max_sequences, args.prefix.mimo_prefix_draft);
     let (worker_stats, max_sequences) = (stats.clone(), max_sequences);
-    let draft = Policy { fixed: args.draft_fixed,
+    let draft = Policy { length: args.draft_length,
         decode_share: args.decode_share, chunk_s: args.prefill_chunk_s,
         snapshot_wait: args.mimo_snapshot_wait };
     let prefix = args.prefix.clone();
-    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, max_sequences)));
+    let layout = console_layout(&args, &profile.id, max_sequences, 0);
     let vision = args.vision;
     let audio = args.audio;
     let remote = super::media::RemoteVision::from_args(&args)?;
@@ -172,8 +173,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio,
-            media_cache_bytes, remote, remote_audio, args.loop_abort.config()));
-    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+            media_cache_bytes, remote, remote_audio, layout, args.console.console_text, args.loop_abort.config()));
+    let (max_context, media, hub) = ready_rx.await.context("engine failed before it was ready")??;
     let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, audio_preparer, health, audio_health)) = media {
         if let Some(preparer) = preparer {
@@ -202,7 +203,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
 }
 
 /// What the live console shows for MiMo V2 (Flash and V2.6 Pro).
-fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> console::Layout {
+fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize, native: usize) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("mimo_v2", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
@@ -210,10 +211,10 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> consol
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = max_sequences;
-    let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
+    let policy = args.draft_length.label(native);
     let drafter = if args.engine.draft.is_some() { Some("DFlash") } else if args.engine.mtp > 0 { Some("MTP") } else { None };
     layout.speculator = drafter.map(|name| console::Speculator {
-        name: name.into(), positions: 8, policy: policy + " · agreed copy extension" });
+        name: name.into(), positions: native, policy });
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "draft (DFlash / MTP)", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -230,7 +231,7 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> consol
 /// Neural draft settings and the shared resource-policy binding.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    fixed: Option<usize>,
+    length: crate::shared::draft::length::DraftLength,
     decode_share: DecodeShareArgs,
     chunk_s: Option<f64>,
     snapshot_wait: bool,
@@ -240,8 +241,9 @@ type VisionReady = Option<(Option<Arc<cuteafd_api::openai::media::MediaPreparer>
     Option<Arc<cuteafd_api::openai::media::audio::AudioPreparer>>, Option<Arc<std::sync::atomic::AtomicBool>>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
 
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady, Arc<cuteafd_api::openai::ConsoleHub>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>, remote_audio: Option<super::media::RemoteAudio>,
+    mut layout: console::Layout, console_text: bool,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
@@ -267,6 +269,11 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     let result = opened.with_engine_reserved_media(&args, Some((&prefix, max_sequences)), media_push.records(),
         if args.full_prefill_logits { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::AllRows }
         else { cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow }, |engine, host_config| {
+        layout.speculator = engine.drafter.as_ref().map(|draft| ("DFlash", draft.cfg.drafts()))
+            .or_else(|| engine.mtp.as_ref().map(|mtp| ("MTP", mtp.stages.len())))
+            .map(|(name, native)| console::Speculator { name: name.into(), positions: native,
+                policy: draft.length.label(native) });
+        let mut hub = Some(console::hub(console_text, || Ok(layout)));
         media_push.commit()?;
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
@@ -286,7 +293,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences, draft, &prefix,
             loop_abort, args.token_io.token_select, host_config, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
+                    let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())), hub.take().expect("console hub"))));
                 }
             })
     });
@@ -531,8 +538,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             Some(d) => resource::Prior::Selector(d.confidence_prior(head_numerics)?),
             None => resource::Prior::History,
         };
-        let mut shared = crate::shared::draft::runtime::SharedPolicy::with_geometry(
-            engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width))?;
+        let mut shared = crate::shared::draft::runtime::SharedPolicy::with_length(
+            engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width), policy.length)?;
         shared.policy.set_native_confidence_positions(width)?;
         engine.arm_draft_probe()?;
         resource::publish(&shared.policy, 0, 0, None);
@@ -687,7 +694,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 continue;
             };
             // Disabled neural drafts need neither a ring slot nor context updates.
-            let slot = if probe::no_speculation(&ready.job().job.probe) || policy.fixed == Some(0) {
+            let slot = if probe::no_speculation(&ready.job().job.probe) {
                 None
             } else { free_slots.pop() };
             if prefix.mimo_prefix_draft && engine.drafter.is_some() { family.bind_drafter(ring, slot); }
@@ -968,7 +975,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             continue;
         }
         let cycle = Instant::now();
-        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, policy.fixed,
+        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine,
             prefix.mimo_prefix_draft, width, &mut lane, &mut active, &mut shared, selector, family, cache,
             &mut free_rings, &mut free_slots, &mut failures, &mut trace, cycle)))? else { continue };
         for index in (0..active.len()).rev() {
@@ -1052,7 +1059,7 @@ impl LaneCommit for DraftContext<'_, '_> {
 /// One round of lane 0: draft, plan, verify, select, emit and commit. `None`
 /// when a non-terminal step failure released every active request.
 #[allow(clippy::too_many_arguments)]
-async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Option<usize>, prefix_draft: bool,
+async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draft: bool,
     width: usize, lane: &mut DecodeLane, active: &mut Vec<Active<'_>>,
     shared: &mut Option<crate::shared::draft::runtime::SharedPolicy>, selector: &mut TokenSelector<'_>,
     family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>, free_rings: &mut Vec<i32>,
@@ -1084,7 +1091,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
     let action_requests: Vec<_> = active.iter().zip(&limits).map(|(a, &room)| (a.ticket.id(), room)).collect();
     let run_draft = match shared.as_mut() {
         Some(shared) => select_draft_action(&mut shared.policy, &action_requests, &draft_rooms,
-            width, DECODE_ROWS, fixed)?,
+            width, DECODE_ROWS)?,
         None => false,
     };
     // DFlash drafts after every next token (sequences with a ring slot),
@@ -1122,7 +1129,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
             out
         }
         // Native MTP drafts (MiMo V2 Flash; V2.6 Pro prefers DFlash).
-        None if run_draft && engine.mtp.is_some() && fixed != Some(0)
+        None if run_draft && engine.mtp.is_some()
             && limits.iter().any(|&limit| limit > 0) => {
             let indices: Vec<usize> = (0..active.len()).filter(|&i| draft_rooms[i] > 0).collect();
             for &i in &indices {
@@ -1182,7 +1189,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
     let mut priors = priors;
     let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut priors)
         .map(|(((a, d), &limit), prior)| match (shared.as_ref(), d.as_ref()) {
-            (Some(shared), Some(d)) if fixed.is_none() => resource::copy_continuation(&shared.policy, active.len(),
+            (Some(shared), Some(d)) if !shared.policy.fixed() => resource::copy_continuation(&shared.policy, active.len(),
                 a.ticket.id(), &a.history, &d.tokens, prior, limit, a.job.sampling.is_greedy()),
             _ => None,
         }).collect();
@@ -1192,9 +1199,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
         prior.truncate(available);
     }
     let mut predicted = None;
-    let mut planned = if let Some(fixed) = fixed {
-        drafted.iter().zip(&limits).map(|(d, &limit)| d.as_ref().map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect()
-    } else if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0) {
+    let mut planned = if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0) {
         let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
             resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: a.drafts.cold() }).collect();
         let selection = resource::select_drafted(&mut shared.policy, &candidates, drafted_width, DECODE_ROWS, drafted_requests);
@@ -1202,14 +1207,6 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
         selection.lengths
     } else { vec![0; active.len()] };
     if resource::trim_budget_with_priors(&mut planned, DECODE_ROWS, &priors, |i| active[i].ticket.id()) { predicted = None; }
-    if fixed.is_some() {
-        if let Some(shared) = shared.as_ref() {
-            let candidates: Vec<_> = active.iter().zip(&priors).map(|(a, prior)|
-                cuteafd_core::DraftCandidate { id: a.ticket.id(), confidence: prior }).collect();
-            crate::shared::draft::binding::trace_selection(&shared.policy, &candidates,
-                drafted_width, drafted_requests, DECODE_ROWS, &planned);
-        }
-    }
     let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
         let full = copies[i].as_ref().map(|c| c.tokens.as_slice())
             .unwrap_or_else(|| drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice()));
@@ -1401,7 +1398,7 @@ fn eligible_draft_rooms(limits: &[usize], ready: &[bool], width: usize) -> Vec<u
 }
 
 fn select_draft_action(policy: &mut cuteafd_core::DraftPolicy, requests: &[(u64, usize)],
-    rooms: &[usize], width: usize, max_rows: usize, fixed: Option<usize>) -> Result<bool> {
+    rooms: &[usize], width: usize, max_rows: usize) -> Result<bool> {
     let participants = rooms.iter().filter(|&&room| room > 0).count();
     let actions = [cuteafd_core::DraftAction { width: 0, draft_us: 0. }, cuteafd_core::DraftAction {
         width, draft_us: if participants > 0 {
@@ -1409,9 +1406,7 @@ fn select_draft_action(policy: &mut cuteafd_core::DraftPolicy, requests: &[(u64,
         } else { 0. } }];
     let skip_rooms = vec![0; requests.len()];
     let action_rooms = [skip_rooms.as_slice(), rooms];
-    let chosen = if fixed.is_none() {
-        policy.choose_action_with_rooms(false, requests, &actions, &action_rooms, max_rows)?
-    } else { fixed.map(|count| usize::from(count > 0)) };
+    let chosen = policy.choose_action_with_rooms(false, requests, &actions, &action_rooms, max_rows)?;
     // None is the shared policy's cold-start result, not a history bypass.
     let run = participants > 0 && max_rows > requests.len() && chosen.is_none_or(|action| action == 1);
     crate::shared::draft::binding::trace_action(policy, false, requests, &actions,
@@ -1517,11 +1512,9 @@ mod port_tests {
         let rooms = eligible_draft_rooms(&limits, &[true, false, true, true], 7);
         assert_eq!(rooms, [7, 0, 0, 2]);
         let requests = [(10, 7), (11, 7), (12, 0), (13, 2)];
-        assert!(select_draft_action(&mut shared.policy, &requests, &rooms, 7, 5, None).unwrap());
-        assert!(!select_draft_action(&mut shared.policy, &requests, &rooms, 7, 4, None).unwrap());
-        assert!(!select_draft_action(&mut shared.policy, &requests, &[0; 4], 7, 64, None).unwrap());
-        assert!(!select_draft_action(&mut shared.policy, &requests, &rooms, 7, 64, Some(0)).unwrap());
-        assert!(select_draft_action(&mut shared.policy, &requests, &rooms, 7, 64, Some(3)).unwrap());
+        assert!(select_draft_action(&mut shared.policy, &requests, &rooms, 7, 5).unwrap());
+        assert!(!select_draft_action(&mut shared.policy, &requests, &rooms, 7, 4).unwrap());
+        assert!(!select_draft_action(&mut shared.policy, &requests, &[0; 4], 7, 64).unwrap());
         let rates = [0.99; 7];
         let candidates: Vec<_> = requests.iter().zip(&rooms).map(|(&(id, _), &limit)|
             resource::Candidate { id, prior: if limit > 0 { &rates } else { &[] },

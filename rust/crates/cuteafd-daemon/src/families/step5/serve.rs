@@ -66,6 +66,8 @@ fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
+    #[command(flatten)]
     pub(crate) attention: crate::cli::AttentionArgs,
     #[arg(long)]
     pub(crate) snapshot: PathBuf,
@@ -557,8 +559,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     stats: &Arc<Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(usize) -> Result<()>) -> Result<()> {
     with_backend(args, |backend, sequences| {
         let drafts = if args.mtp == 0 { scheduler::Drafts::None }
-            else { scheduler::Drafts::Neural { depth: usize::from(args.mtp), fixed: false } };
-        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts,
+            else { scheduler::Drafts::Neural { depth: usize::from(args.mtp) } };
+        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, args.draft_length,
             eos, args.decode_share, &args.prefix, args.loop_abort.config(), args.token_io.token_select,
             &mut text_media(), None,
             || initialized(backend.geometry().max_context))
@@ -566,6 +568,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.mtp > 0);
     use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
     let view = args.attention.selected_view.clone().map(Ok)

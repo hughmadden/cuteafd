@@ -1763,7 +1763,7 @@ def table_backend_findings(phases):
 def timing_instrumentation(job):
     values = {**config(job['entry']['config']), **job['entry'].get('set', {})} if job['entry'].get('config') else job['entry'].get('set', {})
     profiles = set(filter(None, values.get('PROFILE', '').split(',')))
-    priced = values.get('DRAFT_POLICY', 'simple') == 'shared' and values.get('DSPARK_DRAFT_POLICY', 'adaptive') != 'full'
+    priced = values.get('DRAFT_POLICY', 'simple') == 'shared' and not values.get('DRAFT_LENGTH')
     layer = bool(profiles & {'draft-timing', 'transport-timing'}) or priced
     return {'per_layer_timing': 'on (perturbing)' if layer else 'off',
             'profiling': bool(profiles), 'source': 'launch configuration'}

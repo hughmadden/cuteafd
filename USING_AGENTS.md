@@ -131,11 +131,9 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   both arms matched.
 - **Adaptive draft C8 swings ±10-18% between launches** on V4.1 max. One
   matched pair cannot decide C8 there. Use 3 interleaved pairs with
-  alternating order, plus a fixed-policy control (`DSPARK_DRAFT_POLICY=full`).
-  That control exists **only on V4.1**. V4's dSpark proposes a fixed block, but
-  which of its rows are verified goes through the shared draft policy, as in
-  every family. On V4, isolate speculation with a `SPECULATOR=off` pair, and
-  check prompt dependence with a second nonce seed.
+  alternating order, plus a fixed-policy control (`DRAFT_LENGTH=5`).
+  Fixed mode is shared by every family; native head width and the step row
+  budget cap the requested length. Unset remains adaptive (V4.1 maximum 5).
   A shared-build toggle (`--arm-wip`) isolates a flag from the build.
 - **Judge on the paired median**, not on the ratio of arm medians, and report
   the raw pairs and their order.

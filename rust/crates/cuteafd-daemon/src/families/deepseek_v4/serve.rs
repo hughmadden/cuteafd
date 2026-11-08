@@ -40,6 +40,8 @@ use tokio::sync::mpsc;
 #[derive(Debug, clap::Args)]
 pub(crate) struct ServeArgs {
     #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
+    #[command(flatten)]
     pub engine: EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
@@ -83,6 +85,7 @@ fn prefix_score_path(position: usize, input_rows: usize) -> probe::ScorePath {
 }
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    args.draft_length.report_inactive(args.engine.dspark);
     cuteafd_core::concurrency::validate("deepseek_v4", args.engine.max_sequences as u64)?;
     args.prefix.resolve_entries(args.engine.max_sequences);
     let api = args.api.load()?;
@@ -103,7 +106,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let packing = args.prefill_packing.unwrap_or_default();
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, args.loop_abort.config(), receive, ready_tx, worker_stats, max_context,
-            decode_share, prefix, packing));
+            decode_share, prefix, packing, args.draft_length));
     let max_context = ready_rx.await.context("engine failed before it was ready")??;
     let limits = args.prefix.reserve.limits(max_context)?;
     cuteafd_bench::context::phase("engine loaded");
@@ -175,6 +178,7 @@ fn serve_loop(
     decode_share: DecodeShareArgs,
     prefix: PrefixArgs,
     packing: crate::shared::prefill_packing::PackingMode,
+    length: crate::shared::draft::length::DraftLength,
 ) -> Result<()> {
     let loaded = match super::load(&args) {
         Ok(loaded) => loaded,
@@ -201,7 +205,7 @@ fn serve_loop(
                 "--max-context-tokens exceeds the exported programs; requests are limited to the programs' context");
         }
         engine.configure_packing(packing, transports)?;
-        let shared = super::draft_binding::new(engine, &loaded, transports)?;
+        let shared = super::draft_binding::new(engine, &loaded, transports, length)?;
         let local = engine.local_layers();
         console::layer_classes((0..engine.weights.layers.len()).map(|l| console::layer_class(false, l >= local)).collect());
         let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,

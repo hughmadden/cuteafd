@@ -306,11 +306,11 @@ pub(super) fn admit_startup(
     let draft = if args.dspark {
         let mut draft = if ranks == 1 {
             crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(
-                lib, catalog, capacity, args.concurrency, if args.dspark_draft_limit > 5 { 7 } else { 5 })?
+                lib, catalog, capacity, args.concurrency, if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 })?
         } else {
             crate::shared::memory::device::Device { library: lib, id: 1 }.run(||
                 crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
-                    lib, catalog, capacity, args.concurrency, if args.dspark_draft_limit > 5 { 7 } else { 5 },
+                    lib, catalog, capacity, args.concurrency, if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 },
                     args.tp2_dspark_experts, 64640, (slots * 3 * 128 * 528) as usize))?
         };
         draft.marks = slots * 3 * 128 * 528;
