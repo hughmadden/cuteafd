@@ -192,7 +192,7 @@ mod budget_tests {
             assert_eq!(finish(Ok(7)).unwrap(), 7);
             let failure = memory_ledger::FailureSnapshot::new(
                 anyhow::anyhow!("startup fixture failure"), memory_ledger::Snapshot::default(), BTreeMap::new());
-            let wrapped = anyhow::Error::new(crate::shared::experts::rtx::push::policy::PushStartupError::Planning(
+            let wrapped = anyhow::Error::new(crate::shared::experts::rtx::push::PushStartupError::Planning(
                 anyhow::Error::new(failure))).context("family initialization");
             assert!(finish::<()>(Err(wrapped)).is_err());
         });
