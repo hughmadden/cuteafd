@@ -171,12 +171,14 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             let per_stage = planes[..4].iter().sum::<usize>() + planes[2] + 8;
             assert_eq!(uploads, (depth * (per_stage + 8)) as u64);
             let contract = coordinator::CoordinatorContract::from_checkpoint(&cp)?;
-            let weights = coordinator::RankWeightLayout::mtp_weight_charge(&cp, &contract, depth)?;
+            let scratch = native::mtp_native_scratch_from_contract(&cp, &contract, depth, inputs.unit_rows())?;
             for rank in 0..2 {
                 let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 let item = |group| admitted.fixed.iter().find(|item| item.gpu == rank as u8 && item.group == group)
                     .expect("native charge").bytes;
-                assert_eq!(item("Step-5 native target and head"), target.immutable + if rank == 0 { weights } else { 0 });
+                assert_eq!(item("Step-5 private native scratch"), target.immutable + if rank == 0 { scratch } else { 0 });
+                assert!(!admitted.fixed.iter().any(|item| item.group == "Step-5 GPU embedding"
+                    || item.group == "Step-5 native target and head"));
                 let workspace = if rank == 0 {
                     target.workspace.max(native::mtp_forecast_workspace(inputs.unit_rows(), depth, kv_format)?)
                 } else { target.workspace };
@@ -2097,17 +2099,24 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
                 let target = native::rank_admission(&checkpoint, &admitted.ownership, rank, 64, 64, 64)?;
                 assert_eq!(target.resident_weights.0, resident);
                 let head = rank == usize::from(admitted.ownership.execution().spec().head_gpu);
-                let expected_resident = resident + if head { mtp.resident_bytes } else { 0 };
-                let predictor = if head { coordinator::RankWeightLayout::mtp_weight_charge(&checkpoint, &contract, depth)?
-                    + native::mtp_native_scratch_from_contract(&checkpoint, &contract, depth, 64)? } else { 0 };
+                let predictor = if head { native::mtp_native_scratch_from_contract(&checkpoint, &contract, depth, 64)? } else { 0 };
                 let owner = admitted.fixed.iter().find(|owner| owner.gpu == rank as u8
-                    && owner.group == "Step-5 native target and head").expect("named weight owner");
-                assert_eq!(owner.resident_weights.0, expected_resident, "{mode:?} depth {depth} rank {rank}");
+                    && owner.group == "Step-5 private native scratch").expect("named scratch owner");
+                assert_eq!(owner.resident_weights.0, 0);
                 assert_eq!(owner.bytes, target.immutable + predictor);
-                let id = format!("step5.owner.{rank}.Step-5.native.target.and.head");
-                let fact = admitted.solved.facts.allocations.iter().find(|owner| owner.id == id
-                    && owner.bytes == target.immutable + predictor);
-                assert!(fact.is_some(), "missing exact selected-mode allocation");
+                let mut arenas = target.weight_arenas.clone();
+                if head && depth > 0 { arenas.push((mtp.mtp_arena(rank as i32)?, ResidentWeights(mtp.resident_bytes))); }
+                for (arena, logical) in arenas {
+                    let facts = &admitted.solved.facts;
+                    let roots = facts.allocations.iter().filter(|owner| owner.id == arena.id()).collect::<Vec<_>>();
+                    assert_eq!(roots.len(), 1);
+                    assert_eq!(roots[0].bytes, arena.bytes() as u64);
+                    assert_eq!(roots[0].lifetime, crate::placement::planner::Lifetime::RESIDENT);
+                    assert_eq!(facts.resident_weights.iter().find(|owner| owner.id == arena.id()).unwrap().weights, logical);
+                    let tail = facts.allocation_granularity.iter().find(|owner| owner.id == format!("{}.tail", arena.id())).unwrap();
+                    assert_eq!(tail.requests(), [arena.bytes() as u64]);
+                    assert_eq!(roots[0].bytes + tail.bytes()?, (arena.bytes() as u64).div_ceil(2 << 20) * (2 << 20));
+                }
             }
         }
     }

@@ -468,12 +468,9 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
     }
     ensure!((1..=cfg.mtp).contains(&depth) && inputs.unit_rows() > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");
-    // Native K4 predictor owners keep their own projection scratch beside their weights.
-    // Logical weights are the payload; the physical charge adds the arena's padding.
-    let weights = super::coordinator::RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?.resident_bytes;
-    let charge = super::coordinator::RankWeightLayout::mtp_weight_charge(checkpoint, contract, depth)?;
-    let immutable = charge.checked_add(super::native::mtp_native_scratch_from_contract(checkpoint, contract, depth, inputs.unit_rows())?)
-        .context("Step-5 predictor native forecast overflow")?;
+    let predictor = super::coordinator::RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?;
+    let weights = predictor.resident_bytes;
+    let immutable = super::native::mtp_native_scratch_from_contract(checkpoint, contract, depth, inputs.unit_rows())?;
     let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
@@ -481,6 +478,7 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
                 inputs.rows, inputs.logit_rows())?;
             if rank == usize::from(ownership.execution().spec().head_gpu) {
                 native.resident_weights = native.resident_weights.checked_add(ResidentWeights(weights))?;
+                native.weight_arenas.push((predictor.mtp_arena(rank as i32)?, ResidentWeights(weights)));
                 native.immutable = native.immutable.checked_add(immutable)
                     .context("Step-5 predictor weight forecast overflow")?;
                 native.workspace = native.workspace.max(workspace);
@@ -593,7 +591,8 @@ mod tests {
         admit_with(&config(), inputs, |o| {
             Ok(vec![
                 RankAdmission {
-                    resident_weights: ResidentWeights(1 << 30),
+                    resident_weights: ResidentWeights(0),
+                    weight_arenas: vec![],
                     immutable: 1 << 30,
                     workspace: 1 << 20
                 };
@@ -754,7 +753,8 @@ mod tests {
             inputs.marks.host = true;
             let native = |predictor: bool| -> Vec<RankAdmission> {
                 (0..2).map(|rank| RankAdmission {
-                    resident_weights: ResidentWeights((1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 }),
+                    resident_weights: ResidentWeights(0),
+                    weight_arenas: vec![],
                     immutable: (1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 },
                     workspace: if rank == 0 && predictor { 512 << 20 } else { 1 << 20 },
                 }).collect()
