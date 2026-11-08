@@ -386,7 +386,7 @@ impl TargetFacts {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let hooks = (0..gpus).map(|rank| HookBuffers { device: rank as u8,
             maximum_pages: 1, native: None, core: core.map(|core| core.ranks[rank].clone()),
-            shared_workspace: None }).collect();
+            shared_workspace: None, full_prefill_logits: false }).collect();
         let row = cfg.hidden.checked_mul(2).context("GLM embedding row overflow")?;
         let embedding_read = Some(crate::shared::dense_read::ReadBatch::new(
             cfg.vocab_size, row, row, crate::shared::dense_read::STEP_BYTES)?);
@@ -410,7 +410,7 @@ impl TargetFacts {
         let load = NativeLoad::new(&dense.iter().collect::<Vec<_>>(), &vocabulary[0], shared, storage)?;
         let hooks = scratch.iter().enumerate().map(|(rank, layouts)| HookBuffers {
             device: rank as u8, maximum_pages: 1, native: Some(layouts.clone()), core: None,
-            shared_workspace: Some(workspace.clone()),
+            shared_workspace: Some(workspace.clone()), full_prefill_logits: false,
         }).collect();
         Ok(Self { weights: vec![(EmbeddingHome::Device(0), weights)], hooks,
             embedding_read: None, native_load: Some(load) })
@@ -661,6 +661,9 @@ pub struct ProductionInput<'a> {
     pub local: Option<(&'a super::local_physical::LocalPhysicalSource,
         super::local_physical::LocalPhysicalInput)>,
     pub spark_ranks: usize,
+    /// The prefix cache's pinned host tier is admitted for this layout, so the
+    /// host copy engine's streams are part of the per-context stream inventory.
+    pub prefix_host: bool,
     pub decode_link: Option<crate::placement::PreparedSparkLink>,
     pub prefill_link: Option<crate::placement::PreparedSparkLink>,
     pub skip_routed_experts: bool,
@@ -856,7 +859,7 @@ impl<'a> ProductionInput<'a> {
         // Source-reference bytes are fixed before admission. Classification
         // against the canonical resolved layout happens after the single solve.
         let reference = if self.gpus == 1 { MIN_LAYOUT } else { MAX_LAYOUT };
-        let runtime = DeviceFigures::new(self.gpus)?;
+        let runtime = DeviceFigures::new(self.gpus, self.spark_ranks > 0, self.prefix_host)?;
         let host = HostFigures::for_layout(self.gpus, reference)?;
         let expert_usage = (self.expert_usage && !self.skip_routed_experts && routed > 0)
             .then(|| cuteafd_core::expert_usage::Geometry { layers: self.layers,
@@ -916,6 +919,7 @@ impl<'a> ProductionInput<'a> {
         }
         for mut hook in hooks {
             hook.maximum_pages = maximum_pages;
+            hook.full_prefill_logits = self.operation == Operation::Scoring;
             recipe.hooks.push(Case { when: vec![], value: hook });
         }
         if self.gpus == 2 {
@@ -1391,6 +1395,28 @@ const MEASURED_DEVICE_STAGES: [MeasuredDeviceStage; 15] = [
         commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
 ];
 
+/// Peak simultaneously-live CUDA streams in one coordinator GPU's context.
+///
+/// #1561 measured on raptor SM120 (driver/runtime 13020, LAZY) that retained
+/// stream counts 2, 6, 10… grow device residency by 2 MiB, that destroying a
+/// stream retains its slot, and that a later creation reuses it. So this counts
+/// streams that are ever simultaneously live, never cumulative creations.
+///
+/// The inventory is the engine's compute stream (rank 1's is the head split's
+/// peer stream), the prefix cache's one copy stream per rank (`shared/prefix`),
+/// the host-prefix copy engine's copy and probe streams when that tier is
+/// admitted (`shared/prefix/cuda_copy.rs`), the decode and prefill Spark intake
+/// copy streams on the rank that owns the intake planes (`shared/spark_intake`),
+/// and the shared delivery copies every coordinator load stages through
+/// (`push_load::COPY_STREAMS`).
+pub fn startup_peak_live_streams(rank: usize, spark_links: bool, host_prefix: bool) -> u64 {
+    1 // the engine's compute stream; rank 1's is the head split's peer stream
+        + 1 // the prefix cache's snapshot/restore copy stream, one per rank
+        + 2 * u64::from(host_prefix) // host-prefix copy engine: copy + probe
+        + 2 * u64::from(spark_links && rank == 0) // decode + prefill Spark intake copies
+        + crate::push_load::COPY_STREAMS as u64
+}
+
 /// Every device residency a census found outside the ledger's named owners,
 /// beside the preweight context figure. One named allocator per row, charged
 /// once in the phase window where it is resident: no envelope, no margin, no
@@ -1399,19 +1425,30 @@ const MEASURED_DEVICE_STAGES: [MeasuredDeviceStage; 15] = [
 pub struct DeviceFigures {
     context: Vec<MemoryFigure>,
     stages: Vec<&'static MeasuredDeviceStage>,
+    /// Stream-slot slabs per rank (#1561), charged as their own owner and
+    /// removed from the context row that absorbed them, with the peak live
+    /// stream count that produced each.
+    slabs: Vec<(u64, u64)>,
 }
 
 impl DeviceFigures {
-    pub fn new(gpus: usize) -> Result<Self, Refusal> {
+    pub fn new(gpus: usize, spark_links: bool, host_prefix: bool) -> Result<Self, Refusal> {
         if !(1..=2).contains(&gpus) {
             return Err(invalid("invalid device figure rank count"));
         }
         let context = if gpus == 1 { vec![GLM_MIN_CONTEXT] } else { GLM_MAX_CONTEXT.to_vec() };
-        Ok(Self { context, stages: MEASURED_DEVICE_STAGES.iter().filter(|row| row.ranks == gpus).collect() })
+        let slabs = (0..gpus).map(|rank| {
+            let peak = startup_peak_live_streams(rank, spark_links, host_prefix);
+            crate::placement::planner::cuda_stream_slab_bytes(peak).map(|bytes| (peak, bytes))
+        }).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { context, stages: MEASURED_DEVICE_STAGES.iter().filter(|row| row.ranks == gpus).collect(),
+            slabs })
     }
 
     pub fn context(&self) -> &[MemoryFigure] { &self.context }
     pub fn stages(&self) -> &[&'static MeasuredDeviceStage] { &self.stages }
+    /// Slab bytes per rank.
+    pub fn slabs(&self) -> Vec<u64> { self.slabs.iter().map(|&(_, bytes)| bytes).collect() }
 
     /// The row's receipt for the census recommendation; charged bytes live in
     /// [`Self::components`] only.
@@ -1422,16 +1459,32 @@ impl DeviceFigures {
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
         if maximum_pages == 0 { return Err(invalid("zero device figure pool extent")); }
-        let mut components = self.context.iter().enumerate().map(|(rank, figure)| Component {
-            activation: Activation::always(),
-            bytes: ByteCurve::fixed(figure.bytes, maximum_pages),
-            kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
-                bytes: figure.bytes, lifetime: Lifetime::RESIDENT,
-                source: format!("GLM context and selected modules: {:?}; {}; producer {}",
-                    figure.attribution, figure.evidence, figure.producing_commit),
-                assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
-            }),
-        }).collect::<Vec<_>>();
+        // The preweight context figure normalizes context + streams + selected
+        // modules, so the slab owner takes its bytes from that row rather than
+        // charging the same driver residency twice.
+        let mut components = self.context.iter().zip(&self.slabs).enumerate().map(|(rank, (figure, &(_, slab)))| {
+            let bytes = figure.bytes.checked_sub(slab)
+                .ok_or_else(|| invalid("GLM stream slabs exceed the measured context figure"))?;
+            Ok(Component {
+                activation: Activation::always(),
+                bytes: ByteCurve::fixed(bytes, maximum_pages),
+                kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
+                    bytes, lifetime: Lifetime::RESIDENT,
+                    source: format!("GLM context and selected modules: {:?}; {}; producer {}; less the \
+                        {slab} B stream-slot slabs charged by glm/driver-stream-slabs/gpu{rank}",
+                        figure.attribution, figure.evidence, figure.producing_commit),
+                    assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
+                }),
+            })
+        }).collect::<Result<Vec<_>, Refusal>>()?;
+        for (rank, &(peak, slab)) in self.slabs.iter().enumerate() {
+            components.push(Component { activation: Activation::always(),
+                bytes: ByteCurve::fixed(slab, maximum_pages),
+                kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
+                    bytes: slab, lifetime: Lifetime::RESIDENT, assumed: false,
+                    source: format!("glm/driver-stream-slabs/gpu{rank} ({peak} peak live streams, \
+                        SM120 driver/runtime13020 LAZY, #1561 2026-11-08)") }) });
+        }
         components.extend(self.stages.iter().map(|row| Component {
             activation: Activation::always(),
             bytes: ByteCurve::fixed(row.bytes, maximum_pages),

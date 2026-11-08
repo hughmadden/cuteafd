@@ -1057,6 +1057,11 @@ impl Opened {
                     || (cuteafd_core::coordinator_programs::program_namespace(name) == Some("exlr8")
                         && !name.starts_with("exlr8_dense_")))))?;
             tracing::info!(loaded, skipped, "GLM programs loaded");
+            // Spark intake loads every registered native module even on TP1
+            // (`shared/spark_waves.rs` Link::start). Load before this sample so
+            // admission sees its exact occupancy instead of a post-KV late load
+            // (#1554); the later call is a no-op.
+            self.library.tp2_native_initialize()?;
             Ok(())
         })?;
         self.startup_probe(&devices, "glm/programs-before-weights", None, false)?;
@@ -1289,7 +1294,8 @@ impl Opened {
                 .context("GLM draft marks overflow")? as u64),
             scratch: [scratch(true)?, scratch(false)?], context_scratch: context,
             exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: physical.peer_diagnostics,
-            local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
+            local: source.as_ref().map(|source| (source, physical)), spark_ranks,
+            prefix_host: host_config.is_some(), decode_link, prefill_link,
             skip_routed_experts: args.skip_routed_experts, operation, sync_upload_bytes: 0,
             owners: additional, budgets }.prepare()?.admit(request)?;
         cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5");

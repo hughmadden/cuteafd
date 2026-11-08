@@ -39,12 +39,13 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
             weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
                 core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: Default::default() })],
             hooks: (0..gpus).map(|rank| HookBuffers { device: rank as u8, maximum_pages: 1,
-                native: None, core: None, shared_workspace: None }).collect(),
+                native: None, core: None, shared_workspace: None, full_prefill_logits: false }).collect(),
             embedding_read: None, native_load: None,
         },
         draft: DraftFacts::default(), scratch: Default::default(),
         context_scratch: (gpus == 2).then(super::super::GlmContext::default),
         exchange_element_bytes: 2, peer_diagnostics: false, local: None, spark_ranks: ranks,
+        prefix_host: gpus == 1,
         decode_link: (ranks > 0).then(|| production_link(cfg, ranks, PrefillShape { rows: 64, waves: 1 }, false)),
         prefill_link: (ranks > 0).then(|| production_link(cfg, ranks, prefill, true)),
         skip_routed_experts: false, operation: Operation::Serving,
@@ -1356,6 +1357,26 @@ fn a_live_capture_replaces_the_row_only_at_the_row_fingerprint() {
 }
 
 #[test]
+fn stream_inventory_counts_long_lived_serving_streams_and_shared_delivery() {
+    use crate::placement::planner::cuda_stream_slab_bytes;
+    let copies = crate::push_load::COPY_STREAMS as u64;
+    // Engine + prefix copy + delivery copies are the floor of every layout.
+    assert_eq!(startup_peak_live_streams(0, false, false), 2 + copies);
+    assert_eq!(startup_peak_live_streams(1, false, false), 2 + copies);
+    // The Spark intakes' copy streams live on the rank that owns their planes.
+    assert_eq!(startup_peak_live_streams(0, true, false), 4 + copies);
+    assert_eq!(startup_peak_live_streams(1, true, false), 2 + copies);
+    // The host-prefix copy engine is per rank; the head split never admits it.
+    assert_eq!(startup_peak_live_streams(0, true, true), 6 + copies);
+    assert_eq!(startup_peak_live_streams(1, true, true), 4 + copies);
+    // One-coordinator serving with Sparks and the host tier needs three slabs;
+    // a head split's ranks need two each.
+    assert_eq!(cuda_stream_slab_bytes(startup_peak_live_streams(0, true, true)).unwrap(), 3 << 21);
+    assert_eq!(cuda_stream_slab_bytes(startup_peak_live_streams(0, true, false)).unwrap(), 2 << 21);
+    assert_eq!(cuda_stream_slab_bytes(startup_peak_live_streams(1, true, false)).unwrap(), 2 << 21);
+}
+
+#[test]
 fn device_stage_rows_partition_each_reference_census_delta_exactly_once() {
     // #1242 raw untracked samples per phase transition. Each row is the
     // difference between adjacent samples (with the measured instantiate sum
@@ -1381,24 +1402,25 @@ fn device_stage_rows_partition_each_reference_census_delta_exactly_once() {
             ("first ready-step CUDA module touch", 71_303_168)]),
     ];
     for (gpus, rank, context, rows) in cases {
-        let figures = DeviceFigures::new(gpus).unwrap();
+        let figures = DeviceFigures::new(gpus, false, false).unwrap();
         assert_eq!(figures.context()[rank].bytes, context);
         assert_eq!(figures.context()[rank].attribution, FigureAttribution::Measured);
         let actual: Vec<_> = figures.stages().iter().filter(|row| row.rank == rank)
             .map(|row| (row.label, row.bytes)).collect();
         assert_eq!(actual, rows);
-        assert_eq!(figures.components(32768).unwrap().len(), gpus + figures.stages().len());
+        assert_eq!(figures.components(32768).unwrap().len(), 2 * gpus + figures.stages().len());
         for component in figures.components(32768).unwrap() {
             let ComponentKind::Allowance(owner) = &component.kind else {
                 panic!("a census stage is not a physical allocation")
             };
             assert!(!owner.assumed);
-            assert!(owner.source.contains("census") || owner.source.contains("GLM context"));
+            assert!(owner.source.contains("census") || owner.source.contains("GLM context")
+                || owner.source.contains("stream-slabs"));
             assert_eq!(component.bytes.at(1).unwrap(), owner.bytes);
         }
         let phase_order = PhaseOrder::DRAFT_THEN_TARGET;
         for (index, row) in figures.stages().iter().enumerate() {
-            let ComponentKind::Allowance(owner) = &figures.components(32768).unwrap()[gpus + index].kind else {
+            let ComponentKind::Allowance(owner) = &figures.components(32768).unwrap()[2 * gpus + index].kind else {
                 panic!("stage rows stay allowance owners")
             };
             assert_eq!(owner.bytes, row.bytes);
@@ -1406,9 +1428,26 @@ fn device_stage_rows_partition_each_reference_census_delta_exactly_once() {
             assert_eq!(owner.lifetime, Lifetime { first: row.first, last: row.last });
             assert!(owner.lifetime.contains(row.first, phase_order) && owner.lifetime.contains(row.last, phase_order));
         }
+        // Stream-slot slabs are their own owner and come out of the context row.
+        let slabs = figures.slabs();
+        for rank in 0..gpus {
+            let peak = startup_peak_live_streams(rank, false, false);
+            assert_eq!(slabs[rank], crate::placement::planner::cuda_stream_slab_bytes(peak).unwrap());
+            let ComponentKind::Allowance(owner) = &figures.components(32768).unwrap()[gpus + rank].kind else {
+                panic!("stream slabs stay an allowance owner")
+            };
+            assert_eq!(owner.bytes, slabs[rank]);
+            assert_eq!(owner.lifetime, Lifetime::RESIDENT);
+            assert!(!owner.assumed);
+            assert!(owner.source.contains(&format!("{peak} peak live streams")));
+            let ComponentKind::Allowance(context) = &figures.components(32768).unwrap()[rank].kind else {
+                panic!("the context row stays an allowance owner")
+            };
+            assert_eq!(context.bytes, figures.context()[rank].bytes - slabs[rank]);
+        }
     }
-    for gpus in [0, 3, usize::MAX] { assert!(DeviceFigures::new(gpus).is_err()); }
-    assert!(DeviceFigures::new(1).unwrap().components(0).is_err());
+    for gpus in [0, 3, usize::MAX] { assert!(DeviceFigures::new(gpus, false, false).is_err()); }
+    assert!(DeviceFigures::new(1, false, false).unwrap().components(0).is_err());
 }
 
 #[test]
@@ -1621,6 +1660,15 @@ fn fixed_prefix_quota_uses_joint_host_ram_after_steady_and_pinned_owners() {
         .map(|owner| owner.bytes).sum();
     assert!(pinned > 0);
     assert_eq!(steady.owned, pinned);
+    // Serving prefill lanes allocate their pinned H2B staging on the first live
+    // prefill, after Ready, so the host budget carries them at Growth even
+    // though the Ready phase does not.
+    let deferred: u64 = without_prefix.facts.allocations.iter().filter(|owner|
+        owner.location == Location::PINNED && owner.view.is_none()
+            && !owner.lifetime.contains(Phase::Ready, without_prefix.facts.phase_order)
+            && owner.lifetime.contains(Phase::Growth, without_prefix.facts.phase_order))
+        .map(|owner| owner.bytes).sum();
+    assert!(deferred > 0);
 
     // Use the existing resolver, not a new cutover default or free-RAM clamp.
     let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 1 << 20,
@@ -1641,14 +1689,15 @@ fn fixed_prefix_quota_uses_joint_host_ram_after_steady_and_pinned_owners() {
         let mut joint = budgets();
         let occupied = 128 << 20;
         let headroom = 256 << 20;
-        let available = host.steady().bytes + pinned + quota;
+        let available = host.steady().bytes + pinned + deferred + quota;
         joint[2] = Budget { id: "physical.2".into(),
             locations: vec![Location::HOST, Location::PINNED],
             physical_bytes: available + occupied + headroom,
             logical_bytes: available + occupied + headroom,
             baseline: Baseline::Forecast { occupied, source: "external host consumers".into(),
                 assumed: false }, headroom };
-        assert_eq!(joint[2].available().unwrap() - host.steady().bytes - pinned, quota);
+        assert_eq!(joint[2].available().unwrap() - host.steady().bytes - pinned,
+            quota + deferred);
         let admitted = planner::solve(request.clone(), joint.clone(), &with_prefix).unwrap();
         let ready = admitted.phases.iter().find(|phase|
             phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
@@ -1685,6 +1734,15 @@ fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
     assert_eq!(embedding.bytes, 8192);
     let pinned = without_prefix.phases.iter().find(|phase|
         phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap().owned;
+    // Serving prefill lanes allocate their pinned H2B staging on the first live
+    // prefill, after Ready, so the host budget carries them at Growth even
+    // though the Ready phase does not.
+    let deferred: u64 = without_prefix.facts.allocations.iter().filter(|owner|
+        owner.location == Location::PINNED && owner.view.is_none()
+            && !owner.lifetime.contains(Phase::Ready, without_prefix.facts.phase_order)
+            && owner.lifetime.contains(Phase::Growth, without_prefix.facts.phase_order))
+        .map(|owner| owner.bytes).sum();
+    assert!(deferred > 0);
     let geometry = HostCacheGeometry { unit_rows: 64, page_bytes: 1 << 20,
         mark_bytes: 0, draft_bytes: 0 };
     let chunk = geometry.chunk_bytes();
@@ -1697,7 +1755,7 @@ fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
             let bytes = ByteCurve::fixed(owner.bytes, with_prefix.maximum_pages);
             Component::allocation(owner, bytes, false, with_prefix.maximum_pages)
         }).collect() });
-        let available = host.steady().bytes + pinned + quota;
+        let available = host.steady().bytes + pinned + deferred + quota;
         let mut joint = budgets();
         joint[2].physical_bytes = available;
         joint[2].logical_bytes = available;
@@ -1716,7 +1774,10 @@ fn auto_embedding_can_move_without_shrinking_fixed_prefix_quota_or_pool() {
             phase.budget == "physical.2" && phase.phase == Phase::Ready).unwrap();
         assert_eq!(ready.opaque, host.steady().bytes);
         assert_eq!(ready.owned, pinned + quota - embedding.bytes);
-        assert_eq!(ready.available - ready.owned - ready.opaque, embedding.bytes - 1);
+        // The unpinned host budget still carries the Growth-only prefill
+        // staging, so Ready keeps exactly that much slack plus the 1-byte hole.
+        assert_eq!(ready.available - ready.owned - ready.opaque,
+            embedding.bytes - 1 + deferred);
         let relocated = moved.facts.allocations.iter()
             .find(|owner| owner.id == embedding.id).unwrap();
         assert_eq!(relocated.location, Location::coordinator(0));

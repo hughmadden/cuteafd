@@ -590,6 +590,8 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         blas_head: if core.is_some_and(|core| core.ranks[0].target_head.is_some()) { serving::BlasHead::Native }
             else { options.bf16_target_head }, blas: vec![], target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
         exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: false,
+        prefix_host: crate::families::glm5::host_prefix_enabled(gpus, attention,
+            options.host_cache_bytes != Some(0), options.mimo_prefix_entries),
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
         skip_routed_experts: false, operation, sync_upload_bytes: 0, owners: additional, budgets,
     }.prepare()?;
@@ -730,6 +732,8 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let admitted = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
         attention, gpus: gpu_count, prefill, blas_head: serving::BlasHead::Native, blas: vec![], target, draft, scratch, context_scratch: context_programs,
         exchange_element_bytes: if glm::local_exchange_f32()? { 4 } else { 2 }, peer_diagnostics: false,
+        prefix_host: crate::families::glm5::host_prefix_enabled(gpu_count, attention,
+            options.host_cache_bytes != Some(0), options.mimo_prefix_entries),
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
         skip_routed_experts: false, operation, sync_upload_bytes: 0, owners: additional, budgets,
     }.prepare()?.admit(request)?;
