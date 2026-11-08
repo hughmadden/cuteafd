@@ -1225,6 +1225,7 @@ pub(crate) struct Qwen4Engine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     peer_workspace: RefCell<Option<Workspace<'a>>>,
     peer_decode_workspace: RefCell<Option<Workspace<'a>>>,
+    workspaces_prepared: Cell<bool>,
     experts: Option<Experts<'a>>,
     hops: Option<crate::shared::peer_split::hop::HopLink<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
@@ -1426,7 +1427,7 @@ impl<'a> Qwen4Engine<'a> {
             last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)),
             pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), peer_workspace: RefCell::new(None),
-            peer_decode_workspace: RefCell::new(None), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
+            peer_decode_workspace: RefCell::new(None), workspaces_prepared: Cell::new(false), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: false,
@@ -1561,6 +1562,36 @@ impl<'a> Qwen4Engine<'a> {
                 if self.full_prefill_logits { self.prefill_rows } else { 1 }, shape.slot_rows() as usize,
                 if self.weights.mtp.is_some() { self.prefill_rows } else { 0 }, shape.waves as usize)?);
         }
+        if self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none() {
+            *self.mtp_prefill_workspace.borrow_mut() = Some(self.on_owner(0, ||
+                self.workspace(self.mtp_prefill_rows(), false, 1))?);
+        }
+        Ok(())
+    }
+
+    /// Retain every admitted serving workspace and private Lt plan before capture or Ready.
+    pub(crate) fn prepare_serving_workspaces(&self) -> Result<()> {
+        self.prepare_prefill_units()?;
+        for owner in 0..self.gdn_banks.len() {
+            for decode in [false, true] {
+                self.on_owner(owner, || {
+                    let slot = self.workspace_slot(owner, decode)?;
+                    if slot.borrow().is_none() {
+                        let rows = if decode { DECODE_ROWS } else { self.prefill_rows };
+                        let logits = if decode { DECODE_ROWS } else if self.full_prefill_logits { self.prefill_rows } else { 1 };
+                        *slot.borrow_mut() = Some(self.workspace(rows, decode, logits)?);
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        self.drain_state()?;
+        self.workspaces_prepared.set(true);
+        Ok(())
+    }
+
+    fn allow_workspace_creation(&self) -> Result<()> {
+        ensure!(!self.workspaces_prepared.get(), "Qwen serving workspace was not prepared before Ready");
         Ok(())
     }
 
@@ -2170,6 +2201,7 @@ impl<'a> Qwen4Engine<'a> {
 
     fn workspace_rows(&self, t: usize, decode: bool, logit_rows: usize, span: usize, terminal_rows: usize, units: usize)
         -> Result<Workspace<'a>> {
+        self.allow_workspace_creation()?;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let cap = if decode { "m64" } else { "m4096" };
@@ -2455,6 +2487,7 @@ impl<'a> Qwen4Engine<'a> {
         let replace = self.workspace.borrow().as_ref().is_none_or(|w| w.rows != shape.unit_rows as usize
             || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < logit_rows);
         if replace {
+            self.allow_workspace_creation()?;
             self.drain_state()?;
             *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
                 if self.full_prefill_logits { self.prefill_rows } else { logit_rows }, shape.slot_rows() as usize,
@@ -3050,6 +3083,7 @@ impl<'a> Qwen4Engine<'a> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows || w.rows < capacity) {
+            self.allow_workspace_creation()?;
             *slot.borrow_mut() = None;
         }
         if slot.borrow().is_none() {
@@ -3180,6 +3214,7 @@ impl<'a> Qwen4Engine<'a> {
             self.on_owner(owner, || {
                 let slot = self.workspace_slot(owner, tables.decode)?;
                 if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows || w.rows < capacity) {
+                    self.allow_workspace_creation()?;
                     self.drain_state()?;
                     *slot.borrow_mut() = None;
                 }
