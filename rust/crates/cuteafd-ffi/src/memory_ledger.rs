@@ -467,6 +467,28 @@ pub fn snapshot() -> Snapshot {
     }
 }
 
+/// Allocation state captured before a native error unwinds owning buffers.
+#[derive(Debug)]
+pub struct FailureSnapshot {
+    pub ledger: Snapshot,
+    pub device_memory: BTreeMap<i32, (usize, usize)>,
+}
+
+impl std::fmt::Display for FailureSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("native failure allocation snapshot")
+    }
+}
+
+impl std::error::Error for FailureSnapshot {}
+
+pub(crate) fn capture_failure(error: anyhow::Error) -> anyhow::Error {
+    let ledger = snapshot();
+    let device_memory = ledger.devices().into_iter()
+        .filter_map(|device| device_memory(device).map(|memory| (device, memory))).collect();
+    error.context(FailureSnapshot { ledger, device_memory })
+}
+
 fn loaded_cuda_runtime() -> Option<&'static libloading::os::unix::Library> {
     use libloading::os::unix::Library;
     static RUNTIME: OnceLock<Library> = OnceLock::new();

@@ -5089,11 +5089,11 @@ impl NativeLibrary {
         let last_error = self
             .last_error()
             .unwrap_or_else(|err| format!("last error unavailable: {err}"));
-        Err(anyhow::Error::new(NativeStatusError {
+        Err(memory_ledger::capture_failure(anyhow::Error::new(NativeStatusError {
             context: context.to_string(),
             status,
             detail: last_error,
-        }))
+        })))
     }
 }
 
