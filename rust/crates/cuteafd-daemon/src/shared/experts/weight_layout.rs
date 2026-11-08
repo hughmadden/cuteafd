@@ -3,6 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::serving_capacity::WeightArenaLayout;
 use crate::shared::memory::{device::Device, weight_arena::DeviceWeightArena};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) fn name(layer: super::layer::ExpertLayer, plane: usize) -> String {
     format!("{layer:?}.{plane}")
@@ -10,7 +11,7 @@ pub(crate) fn name(layer: super::layer::ExpertLayer, plane: usize) -> String {
 
 pub(crate) fn arena<'a>(device: Device<'a>, format: &str,
     regions: impl IntoIterator<Item = (String, usize)>) -> Result<DeviceWeightArena<'a>> {
-    DeviceWeightArena::new(device, layout(device.id, format, regions)?)
+    DeviceWeightArena::new(device, layout(device.id, format, regions)?, ArenaTag::experts("experts/rtx-onboard"))
 }
 
 pub(crate) fn layout(device: i32, format: &str,

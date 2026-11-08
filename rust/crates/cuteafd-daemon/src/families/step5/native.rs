@@ -10,6 +10,7 @@ use cuteafd_ffi::{dense_trellis::TrellisDType, programs::Programs, CuteafdDevice
 use cuteafd_loader::formats::{dense_trellis::TrellisSide, trellis_core::ProjectionScratchLayout};
 use cuteafd_loader::plan::{checkpoint::Checkpoint, families::step5::coordinator::RankWeightLayout};
 use std::{collections::BTreeMap, ffi::c_void, rc::Rc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 /// One resident native projection and its resolved programs.
 pub(super) struct NativeLinear<'a> {
@@ -110,7 +111,7 @@ fn read_core<'a>(device: Device<'a>, checkpoint: &Checkpoint, layout: &CoreWeigh
             source_path: path, bytes, elapsed_micros: 0, sha256: String::new(),
         })
     })?;
-    device.run(|| layout.upload_with(device, loaded, |name, bytes| weight_allocation(device, arena, name, bytes)))
+    device.run(|| layout.upload_with(device, loaded, |name, bytes| weight_allocation(device, arena, name, bytes, ArenaTag::weights("step5/target"))))
 }
 
 /// Per-device lane scratch shared by every native projection on that lane.

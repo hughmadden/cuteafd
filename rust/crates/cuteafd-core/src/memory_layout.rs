@@ -258,6 +258,16 @@ impl std::fmt::Display for Tag {
 /// use cuteafd_core::memory_layout::{ArenaTag, arena_class::ReadWrite};
 /// let scratch: ArenaTag<ReadWrite> = ArenaTag::weights("v41/target"); // weights are immutable
 /// ```
+///
+/// The same tags in their own class compile:
+///
+/// ```
+/// use cuteafd_core::memory_layout::{ArenaTag, arena_class::{FixedPool, Immutable, ReadWrite}};
+/// let weights: ArenaTag<Immutable> = ArenaTag::weights("v41/target");
+/// let kv: ArenaTag<FixedPool> = ArenaTag::kv("v41/kv");
+/// let scratch: ArenaTag<ReadWrite> = ArenaTag::workspace("v41/lane");
+/// # let _ = (weights, kv, scratch);
+/// ```
 pub mod arena_class {
     use super::Behaviour;
     mod sealed { pub trait Sealed {} }

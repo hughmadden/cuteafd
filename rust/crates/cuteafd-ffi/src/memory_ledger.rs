@@ -333,6 +333,24 @@ pub fn tag(kind: MemoryKind, owner: &str) -> Tag {
     Tag::new(kind, intern(owner))
 }
 
+/// The two tags a native media runtime (vision, audio, PCM tower) receives at
+/// create: its immutable weight arena and its scratch arena. After create,
+/// Rust reads the runtime's backings and records each with [`record_tagged`]
+/// under these tags, then retires each with [`record_released`] once native
+/// reports that backing's free succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaTags {
+    pub weights: Tag,
+    pub workspace: Tag,
+}
+
+impl MediaTags {
+    /// `tower` names the encoder (`muse/vision`, `mimo/audio`, ...).
+    pub fn new(tower: &str) -> Self {
+        Self { weights: tag(MemoryKind::Weights, tower), workspace: tag(MemoryKind::Workspace, tower) }
+    }
+}
+
 /// Records native backing this library did not allocate itself (a media
 /// runtime's weights and scratch, read back after create) under its tag.
 /// Retire it with [`record_released`] only after the native free succeeded.

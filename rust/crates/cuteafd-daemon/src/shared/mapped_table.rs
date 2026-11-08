@@ -67,7 +67,7 @@ impl<'a> MappedTableDevice<'a> {
         let table = TokenTable::new(table, shares, rows_per_token)?;
         let pipeline = |rows: usize, slots: usize, suffix: &str, priority: ReadPriority| -> Result<Arc<Pipeline>> {
             let table = Arc::clone(&table);
-            let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes(), Tag::staging("shared/mapped-table"))? }))
+            let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes(), Tag::tables("shared/mapped-table"))? }))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(TablePipeline::new(&format!("{name}-{suffix}"), storage, move |slot: &mut RowSlot, job: &RowJob| {
                 let ids = job.batch.source.rows(job.unit);

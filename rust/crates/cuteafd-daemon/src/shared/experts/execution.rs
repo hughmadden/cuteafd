@@ -263,20 +263,20 @@ impl<'library> ExpertWeights<'library> {
         } else {
             None
         };
-        let scratch = DeviceAllocation::named(library, budget.scratch_bytes, "experts/workspace/main_scratch")?;
-        let hidden = DeviceAllocation::named(library, budget.hidden_bytes, "experts/workspace/hidden")?;
-        let ids = DeviceAllocation::named(library, budget.routing_bytes / 2, "experts/workspace/routes")?;
-        let routing = DeviceAllocation::named(library, budget.routing_bytes / 2, "experts/workspace/routes")?;
+        let scratch = DeviceAllocation::new(library, budget.scratch_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/main_scratch"))?;
+        let hidden = DeviceAllocation::new(library, budget.hidden_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/hidden"))?;
+        let ids = DeviceAllocation::new(library, budget.routing_bytes / 2, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/routes"))?;
+        let routing = DeviceAllocation::new(library, budget.routing_bytes / 2, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/routes"))?;
         let output = if kernel.info().role == 0 {
-            Some(DeviceAllocation::named(library, budget.hidden_bytes, "experts/workspace/hidden")?)
+            Some(DeviceAllocation::new(library, budget.hidden_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/hidden"))?)
         } else {
             None
         };
         let compact_output = if compact_output_role(kernel.info().role) {
-            Some(DeviceAllocation::named(
+            Some(DeviceAllocation::new(
                 library,
                 budget.output_and_shared_bytes,
-                "experts/workspace/compact_output",
+                crate::shared::memory::Tag::workspace("experts/workspace/compact_output"),
             )?)
         } else {
             None
@@ -287,7 +287,7 @@ impl<'library> ExpertWeights<'library> {
             None
         };
         let shared = if kernel.info().role == 0 {
-            Some(DeviceAllocation::named(library, budget.hidden_bytes, "experts/workspace/hidden")?)
+            Some(DeviceAllocation::new(library, budget.hidden_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/hidden"))?)
         } else {
             None
         };
@@ -319,9 +319,9 @@ impl<'library> ExpertWeights<'library> {
                 decode_kernel.info().input_dtype == kernel.info().input_dtype,
                 "decode and grouped expert input formats differ"
             );
-            let decode_scratch = DeviceAllocation::named(library, scratch_bytes, if planned_capacity == 1 {
+            let decode_scratch = DeviceAllocation::new(library, scratch_bytes, crate::shared::memory::Tag::workspace(if planned_capacity == 1 {
                 "experts/workspace/serial_scratch"
-            } else { "experts/workspace/grouped_decode_scratch" })?;
+            } else { "experts/workspace/grouped_decode_scratch" }))?;
             let mut decode_slots = slots;
             unsafe {
                 decode_kernel.bind_scratch(
@@ -350,8 +350,8 @@ impl<'library> ExpertWeights<'library> {
         let decode = prepare_small(1, budget.decode_scratch_bytes)?;
         let grouped = if budget.small_scratch_bytes > 0 { grouped_decode_rows(self.layer, library, compiled, self.is_nvfp4())? } else { compiled };
         let small = prepare_small(grouped, budget.small_scratch_bytes)?;
-        let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
-            budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
+        let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::new(library,
+            budget.routing_bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))).collect::<Result<Vec<_>>>()?;
         let native_reply = if compact_output_role(kernel.info().role) { Some(super::reply::NativeReply::load(library)?) } else { None };
         let stream = if own_stream { Some(stream) } else { drop(stream); None };
         Ok(ExpertExecution {
@@ -396,8 +396,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             let kernel = weights.layer.select_kernel(self.library, rows, weights.is_nvfp4())?;
             ensure!(kernel.info().input_dtype == self.kernel.info().input_dtype,
                 "native width states have different input formats");
-            let scratch = DeviceAllocation::named(self.library,
-                usize::try_from(kernel.info().scratch_bytes)?, name)?;
+            let scratch = DeviceAllocation::new(self.library,
+                usize::try_from(kernel.info().scratch_bytes)?, crate::shared::memory::Tag::workspace(name))?;
             let mut slots = self.slots;
             // SAFETY: the new state owns its scratch; all retained states share
             // the same admitted I/O and execute serially on this owner's stream.
@@ -582,8 +582,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             .context("native route staging overflow")?;
         self.route_staging.clear();
         for _ in 0..units {
-            self.route_staging.push(crate::shared::memory::HostAllocation::named(self.library,
-                bytes, "experts/workspace/route_staging")?);
+            self.route_staging.push(crate::shared::memory::HostAllocation::new(self.library,
+                bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/route_staging"))?);
         }
         self.deferred = true;
         Ok(())

@@ -177,20 +177,20 @@ pub(super) fn run_reduction_root(
         .context("reduction value count overflow")?;
     let local_values = reduction_fixture(REDUCTION_ROOT_RANK, args.rows, args.row_width);
     let expected = reduction_expected(args.reduction_world_size, args.rows, args.row_width);
-    let mut local_f32 = native.alloc_device_buffer_untagged(
+    let mut local_f32 = native.alloc_device_buffer(
         values
             .checked_mul(std::mem::size_of::<f32>())
-            .context("reduction local F32 byte count overflow")?,
+            .context("reduction local F32 byte count overflow")?, cuteafd_ffi::memory_ledger::Tag::workspace("bench/rdma-reduce")
     )?;
-    let mut local_bf16 = native.alloc_device_buffer_untagged(
+    let mut local_bf16 = native.alloc_device_buffer(
         values
             .checked_mul(std::mem::size_of::<u16>())
-            .context("reduction local BF16 byte count overflow")?,
+            .context("reduction local BF16 byte count overflow")?, cuteafd_ffi::memory_ledger::Tag::workspace("bench/rdma-reduce")
     )?;
-    let mut output_f32 = native.alloc_device_buffer_untagged(
+    let mut output_f32 = native.alloc_device_buffer(
         values
             .checked_mul(std::mem::size_of::<f32>())
-            .context("reduction output byte count overflow")?,
+            .context("reduction output byte count overflow")?, cuteafd_ffi::memory_ledger::Tag::workspace("bench/rdma-reduce")
     )?;
     native.copy_h2d(local_f32, f32_bytes(&local_values))?;
     native.cuda_f32_to_bf16(local_f32, local_bf16, values)?;
@@ -354,12 +354,12 @@ pub(super) fn run_reduction_follower(
     let row_indices = (0..args.rows)
         .map(|row| u32::try_from(row).context("reduction row index exceeds u32"))
         .collect::<Result<Vec<_>>>()?;
-    let mut source = native.alloc_device_buffer_untagged(
+    let mut source = native.alloc_device_buffer(
         values
             .checked_mul(std::mem::size_of::<f32>())
-            .context("reduction source byte count overflow")?,
+            .context("reduction source byte count overflow")?, cuteafd_ffi::memory_ledger::Tag::workspace("bench/rdma-reduce")
     )?;
-    let mut indices = native.alloc_device_buffer_untagged(std::mem::size_of_val(row_indices.as_slice()))?;
+    let mut indices = native.alloc_device_buffer(std::mem::size_of_val(row_indices.as_slice()), cuteafd_ffi::memory_ledger::Tag::workspace("bench/rdma-reduce"))?;
     native.copy_h2d(source, f32_bytes(&source_values))?;
     native.copy_h2d(indices, u32_bytes(&row_indices))?;
     let events = ReductionEvents {

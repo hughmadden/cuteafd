@@ -52,20 +52,19 @@ impl<'a, C: arena_class::Class> DeviceArena<'a, C> {
 
 /// Named immutable weights only; scratch, staging and temporary representations
 /// keep their own allocations and retirement. Nonadopted scopes stay standalone.
-/// Without an arena, the standalone allocation carries `tag`; with one, the
-/// view carries the arena's tag, which must be the same kind.
+/// With an arena, the view carries the arena's tag (a view never chooses its
+/// own kind); without one, the standalone allocation carries `standalone`.
 #[track_caller]
 pub(crate) fn weight_allocation<'a>(device: Device<'a>, arena: Option<&DeviceWeightArena<'a>>,
-    name: &str, bytes: usize, tag: ArenaTag<arena_class::Immutable>) -> Result<Allocation<'a>> {
+    name: &str, bytes: usize, standalone: ArenaTag<arena_class::Immutable>) -> Result<Allocation<'a>> {
     ensure!(!name.is_empty() && bytes > 0, "empty named weight allocation");
     match arena {
         Some(arena) => {
             ensure!(device.id == arena.allocation.device.id
                 && std::ptr::eq(device.library, arena.allocation.device.library), "weight arena device mismatch");
-            ensure!(arena.tag.kind() == tag.kind(), "{name}: {} requested from a {} arena", tag.kind(), arena.tag.kind());
             arena.view(name, bytes)
         }
-        None => Allocation::new(device, bytes, tag.tag()),
+        None => Allocation::new(device, bytes, standalone.tag()),
     }
 }
 

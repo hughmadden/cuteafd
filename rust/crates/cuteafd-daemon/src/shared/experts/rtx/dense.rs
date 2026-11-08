@@ -356,7 +356,7 @@ impl PushDestination for DenseArena<'_> {
                     ensure!(self.held + need as u64 <= self.layout.host_staging.staging_bytes as u64,
                         "dense rank GPU {} needs {} pinned staging bytes, beyond admitted ring/step bound {}",
                         self.device.id, self.held + need as u64, self.layout.host_staging.staging_bytes);
-                    let allocation = HostAllocation::named(self.device.library, need, "staging/coordinator-dense")?;
+                    let allocation = HostAllocation::new(self.device.library, need, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense"))?;
                     self.held += need as u64;
                     self.peak_held = self.peak_held.max(self.held);
                     allocation

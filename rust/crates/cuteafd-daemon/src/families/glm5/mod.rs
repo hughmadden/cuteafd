@@ -1347,7 +1347,7 @@ impl Opened {
         };
         let arenas = arena_layouts.into_iter().zip(&devices).map(|(layout, &id)| {
             let device = crate::shared::memory::device::Device { library: &self.library, id };
-            Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?))
+            Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
         }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })

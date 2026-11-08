@@ -476,7 +476,7 @@ mod mask_tests {
             if recording { std::fs::rename(hidden, &path)?; }
             let mut owners = owners?;
             let (row, source) = mask_source(&dir, cfg.hidden)?;
-            let owner = DeviceAllocation::new(&library, row.len().max(256))?;
+            let owner = DeviceAllocation::new(&library, row.len().max(256), cuteafd_ffi::memory_ledger::TEST)?;
             DenseLoad::mount(&library).operand(Operand { device: 0, buffer: owner.buffer,
                 bytes: row.len(), lands: vec![(source, 0)] })?;
             owners.push(owner);
@@ -617,7 +617,7 @@ impl<'a> MimoDrafter<'a> {
         // One planned arena per rank (DraftLoad, after target KV); views retain it.
         let device = Device { library, id: library.cuda_get_device()? };
         let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
-            cuteafd_loader::families::mimo_v2::weight_arena::dflash_arena_requests(&source_cfg, representation, rank, ranks)?)?;
+            cuteafd_loader::families::mimo_v2::weight_arena::dflash_arena_requests(&source_cfg, representation, rank, ranks)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
         let mut allocate = |id: i32, name: &str, bytes: usize| {
             ensure!(id == device.id, "MiMo DFlash rank {rank} allocates on GPU {id}, not {}", device.id);
             arena.view(name, bytes)
@@ -628,7 +628,7 @@ impl<'a> MimoDrafter<'a> {
         }.with_allocator(&mut allocate);
         checkpoint.validate(tensor_shapes(&source_cfg))?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            let allocation = DeviceAllocation::untagged(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -876,7 +876,7 @@ impl<'a> MimoDrafter<'a> {
         let c = &self.cfg;
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();
-        let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
+        let alloc = |bytes: usize| DeviceAllocation::untagged(self.library, bytes.max(256));
         Ok(Workspace {
             sequences,
             h: alloc(rows * c.hidden * 2)?,
@@ -901,7 +901,7 @@ impl<'a> MimoDrafter<'a> {
                     logits: alloc(rows * c.vocab * 4)?,
                     unary: alloc(drafted * 16 * 4)?,
                     candidates: alloc(drafted * 16 * 4)?,
-                    landing: crate::shared::memory::HostAllocation::new(self.library, 2 * drafted * 16 * 4)?,
+                    landing: crate::shared::memory::HostAllocation::untagged(self.library, 2 * drafted * 16 * 4)?,
                     topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
                     // SAFETY: the workspace outlives this head's plan and uses the lead device.
                     head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,

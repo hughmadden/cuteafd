@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
+use cuteafd_core::memory_layout::ArenaTag;
 
 #[cfg(test)]
 #[path = "weights_retirement_tests.rs"]
@@ -228,7 +229,7 @@ impl<'a> MimoLoader<'a> {
             })));
         ensure!(self.arenas.is_empty() || arena.is_some(), "MiMo GPU {id} has no planned operand {name}");
         Ok(DeviceAllocation::from_allocation(weight_allocation(Device { library: self.library, id }, arena,
-            name, bytes.max(256))?))
+            name, bytes.max(256), ArenaTag::weights("mimo/target"))?))
     }
 
     fn upload_weight(&self, name: &str, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
@@ -267,7 +268,7 @@ impl<'a> MimoLoader<'a> {
     }
 
     fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
-        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+        let allocation = DeviceAllocation::untagged(self.library, bytes.len().max(256))?;
         self.library.copy_h2d(allocation.buffer, bytes)?;
         Ok(allocation)
     }
@@ -318,7 +319,7 @@ impl<'a> MimoLoader<'a> {
                 self.library.copy_h2d(scales.buffer, &f32_bytes(&row_scales))?;
                 row_scales
             } else {
-                let staging = DeviceAllocation::new(self.library, usize::try_from(layout.max_load_staging)?)?;
+                let staging = DeviceAllocation::untagged(self.library, usize::try_from(layout.max_load_staging)?)?;
                 let queued = (|| -> Result<()> {
                     let mut block = vec![0u8; staging.buffer.bytes];
                     for first in (0..rows).step_by(MIMO_PROJECTION_STAGING_ROWS as usize) {
@@ -681,7 +682,7 @@ impl<'a> MimoLoader<'a> {
             let transient = lands.iter().all(|(rect, _)| rect.name.ends_with("_scale_inv"));
             let fp8 = !transient && lands.iter().all(|(rect, _)|
                 self.tensor(&rect.name).is_ok_and(|t| t.meta.dtype == DType::F8E4M3));
-            let allocation = if transient { DeviceAllocation::new(self.library, bytes.max(256))? }
+            let allocation = if transient { DeviceAllocation::untagged(self.library, bytes.max(256))? }
                 else { self.allocation(&if fp8 { format!("{names}.fp8") } else { names }, bytes)? };
             for range in zero.iter().filter(|r| !r.is_empty()) {
                 // SAFETY (offset): the range lies inside the new allocation.
@@ -895,18 +896,18 @@ impl<'a> MimoLoader<'a> {
         for (rank, layout) in layouts.target.into_iter().enumerate() {
             let Some(layout) = layout else { continue };
             let (id, _) = self.rank_device(rank)?;
-            arenas.push(DeviceWeightArena::new(Device { library: self.library, id }, layout)?);
+            arenas.push(DeviceWeightArena::new(Device { library: self.library, id }, layout, ArenaTag::weights("mimo/target"))?);
         }
         let target = Self { arenas: std::rc::Rc::new(arenas), ..self.clone() };
         let draft = if let Some(layout) = layouts.mtp {
             Self { arenas: std::rc::Rc::new(vec![DeviceWeightArena::new(
-                Device { library: self.library, id: self.device }, layout)?]), ..self.clone() }
+                Device { library: self.library, id: self.device }, layout, ArenaTag::drafter_weights("mimo/mtp"))?]), ..self.clone() }
         } else { self.clone() };
         crate::shared::token_io::TokenEmbedding::load_with(self.library, source, placement, || {
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
             Ok((target.model(cfg, layers)?, draft.mtp_weights(cfg, stages)?))
         }, |name, bytes| weight_allocation(Device { library: self.library, id: self.device },
-            target.arenas.iter().find(|arena| arena.layout().id() == "mimo.target.rank0"), name, bytes))
+            target.arenas.iter().find(|arena| arena.layout().id() == "mimo.target.rank0"), name, bytes, ArenaTag::embedding("mimo/embedding")))
     }
 
     pub fn mtp_weights(&self, cfg: &MimoV2Config, stages: usize) -> Result<Vec<MtpWeights<'a>>> {

@@ -1,7 +1,7 @@
 //! Routed-expert layer identity and native resident weights; one GPU worker owns
 //! each layer and its buffers. The layer selects the native kernel family (V4.1
 //! MXFP4, NVFP4 W4A4) that the expert service, V4 local experts and V4.1 run.
-use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream, Tag};
 pub(crate) mod nvfp4;
 
 use anyhow::{ensure, Context, Result};
@@ -347,14 +347,14 @@ mod format_dispatch_tests {
             let mut fused = vec![0; stored * 5120];
             fused[..sources[1].1.len()].copy_from_slice(&sources[1].1);
             fused[stored * 2560..stored * 2560 + sources[0].1.len()].copy_from_slice(&sources[0].1);
-            let raw = DeviceAllocation::new(library, fused.len())?;
+            let raw = DeviceAllocation::new(library, fused.len(), cuteafd_ffi::memory_ledger::TEST)?;
             library.copy_h2d(raw.buffer, &fused)?;
-            let raw_down = DeviceAllocation::new(library, sources[2].1.len())?;
+            let raw_down = DeviceAllocation::new(library, sources[2].1.len(), cuteafd_ffi::memory_ledger::TEST)?;
             library.copy_h2d(raw_down.buffer, &sources[2].1)?;
             for plane in [0u32, 2] {
                 let bytes = if plane == 0 { stored * 5120 } else { stored * 2560 };
-                let mounted = DeviceAllocation::new(library, bytes)?;
-                let pushed = DeviceAllocation::new(library, bytes)?;
+                let mounted = DeviceAllocation::new(library, bytes, cuteafd_ffi::memory_ledger::TEST)?;
+                let pushed = DeviceAllocation::new(library, bytes, cuteafd_ffi::memory_ledger::TEST)?;
                 library.copy_h2d(pushed.buffer, &vec![0xa5; bytes])?;
                 // SAFETY: live disjoint buffers on this device; drained before reads.
                 unsafe {
@@ -648,7 +648,7 @@ impl<'a> ExpertWeights<'a> {
         catalog: &OfficialV41Catalog, layers: impl IntoIterator<Item = ExpertLayer>)
         -> Result<crate::shared::memory::weight_arena::DeviceWeightArena<'b>> {
         let layout = Self::arena_layout(device, catalog, layers)?;
-        crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)
+        crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))
     }
 
     pub(crate) fn arena_layout(device: crate::shared::memory::device::Device<'_>,
@@ -701,7 +701,7 @@ impl<'a> ExpertWeights<'a> {
         let layout = Self::arena_layout(device, catalog, [layer])?;
         let staging = Self::plan(library, catalog, layer)?.device_staging_bytes;
         super::weight_layout::admit(&layout, staging, 0, available_device_bytes)?;
-        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
         Self::load_into(library, catalog, layer, available_device_bytes, &arena)
     }
 
@@ -752,9 +752,9 @@ impl<'a> ExpertWeights<'a> {
             drained?;
             queued?;
         }
-        let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes)?;
+        let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes, Tag::staging("experts/native-load"))?;
         let mut hosts = (0..EXPERT_READ_LANES)
-            .map(|_| HostAllocation::new(library, budget.device_staging_bytes))
+            .map(|_| HostAllocation::new(library, budget.device_staging_bytes, Tag::staging("experts/native-load")))
             .collect::<Result<Vec<_>>>()?;
         let mut read_scratch = (0..EXPERT_READ_LANES)
             .map(|_| vec![0; budget.read_scratch_bytes / EXPERT_READ_LANES])
@@ -920,7 +920,7 @@ impl<'a> ExpertWeights<'a> {
             drained?;
             queued?;
             None
-        } else { Some(DeviceAllocation::new(library, per * experts)?) };
+        } else { Some(DeviceAllocation::new(library, per * experts, Tag::experts("experts/native"))?) };
         for expert in 0..experts {
             let plan = catalog.expert_staging(layer.expert(expert))?;
             ensure!(plan.tp_world().is_none() && !matches!(layer.expert(expert),
@@ -987,7 +987,7 @@ impl<'a> ExpertWeights<'a> {
             Ok(layout)
         }).collect::<Result<Vec<_>>>()?;
         let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
-            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout))
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")))
             .collect::<Result<Vec<_>>>()?;
         let mut staging_bytes = [0; 2];
         let mut pinned_admitted = 0;
@@ -1042,8 +1042,8 @@ impl<'a> ExpertWeights<'a> {
                 })?;
             }
         }
-        let staging = [devices[0].own(|| DeviceAllocation::new(devices[0].library, staging_bytes[0]))?,
-            devices[1].own(|| DeviceAllocation::new(devices[1].library, staging_bytes[1]))?];
+        let staging = [devices[0].own(|| DeviceAllocation::new(devices[0].library, staging_bytes[0], Tag::staging("experts/native-pair-load")))?,
+            devices[1].own(|| DeviceAllocation::new(devices[1].library, staging_bytes[1], Tag::staging("experts/native-pair-load")))?];
         let table_bytes = if coded { 2 << 20 } else { 0 };
         let bank_admitted = pinned_admitted.checked_sub(table_bytes).context("paired scale tables under-admitted")?;
         let mut hosts = paired_load::banks(devices[0], lanes, full_bytes, bank_admitted)?;

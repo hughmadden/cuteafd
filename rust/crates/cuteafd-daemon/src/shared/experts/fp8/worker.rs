@@ -89,8 +89,8 @@ impl<'a> Fp8Worker<'a> {
         let Some(rows) = super::segment_rows(&self.experts.module, extent) else { return Ok(()) };
         let rows = rows as usize;
         let topk = self.experts.module.info().topk;
-        let descriptors = (0..extent.buffered_units).map(|_| crate::shared::memory::HostAllocation::named(
-            self.library, extent.staging_rows as usize * 16, "experts/workspace/row_addresses"))
+        let descriptors = (0..extent.buffered_units).map(|_| crate::shared::memory::HostAllocation::new(
+            self.library, extent.staging_rows as usize * 16, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/row_addresses")))
             .collect::<Result<Vec<_>>>()?;
         self.copy_stream = Some(Rc::new(LoadStream { library: self.library, raw: self.library.cuda_stream_create()? }));
         let device = crate::shared::memory::device::Device { library: self.library, id: self.library.cuda_get_device()? };

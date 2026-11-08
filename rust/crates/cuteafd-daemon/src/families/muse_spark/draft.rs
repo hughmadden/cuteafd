@@ -23,6 +23,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::Scalar, CuteafdDeviceBuffer as Buffer};
 use cuteafd_loader::families::muse_spark::MuseSparkConfig;
 use std::{ffi::c_void, path::Path};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) struct MuseDraft<'a> {
     pub drafter: DflashDrafter<'a>,
@@ -45,7 +46,7 @@ fn drafter_arenas<'a>(device: Device<'a>, snapshot: &Path, devices: &[i32], head
         .map(|(id, requests)| {
             let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
                 format!("muse/drafter/{id}"), requests)?;
-            DeviceWeightArena::new(Device { library: device.library, id }, layout)
+            DeviceWeightArena::new(Device { library: device.library, id }, layout, ArenaTag::drafter_weights("muse/drafter"))
                 .map(|arena| (id, arena))
         }).collect()
 }
@@ -79,7 +80,7 @@ impl<'a> MuseDraft<'a> {
         let arenas = drafter_arenas(device, snapshot, &devices, head_rank)?;
         let allocate = |id, name: &str, bytes| {
             let arena = arenas.get(&id).context("Muse drafter requested an unplanned physical device")?;
-            weight_allocation(Device { library: device.library, id }, Some(arena), name, bytes)
+            weight_allocation(Device { library: device.library, id }, Some(arena), name, bytes, ArenaTag::drafter_weights("muse/drafter"))
         };
         let drafter = device.run(|| {
             use crate::shared::fp8_linear::{Fp8Scales, Fp8Rows};
@@ -200,7 +201,7 @@ mod tests {
                 let mut inventory = Inventory::new(topology, &format!("muse.draft.{id}"),
                     Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "Muse drafter");
                 for (name, bytes) in requests {
-                    let view = weight_allocation(device, Some(arena), name, *bytes)?;
+                    let view = weight_allocation(device, Some(arena), name, *bytes, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
                     assert_eq!(view.buffer.device_id, id);
                     assert_eq!(view.buffer.bytes, *bytes);
                     assert_eq!(view.buffer.ptr as usize % 256, 0);
@@ -208,7 +209,7 @@ mod tests {
                     views.push(view);
                 }
                 assert!(weight_allocation(Device { library: &library, id: 1 - id },
-                    Some(arena), &requests[0].0, requests[0].1).is_err());
+                    Some(arena), &requests[0].0, requests[0].1, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")).is_err());
                 let payload = requests.iter().map(|(_, bytes)| bytes).sum::<usize>();
                 let large = requests.iter().filter(|(_, bytes)| *bytes > 1 << 20).collect::<Vec<_>>();
                 let old_tail = large.iter().map(|(_, bytes)| bytes.div_ceil(2 << 20) * (2 << 20) - bytes).sum::<usize>();

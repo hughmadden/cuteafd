@@ -300,7 +300,10 @@ impl<'a> MlaDraftStorage<'a> {
             if immutable {
                 super::weights::checked_allocation(library, &b.name, b.bytes, allocate)
             } else {
-                DeviceAllocation::named(library, b.bytes, "drafter/mla")
+                // Paged and ring caches are the drafter's KV; every other mutable owner is step scratch.
+                let tag = if b.name.starts_with("layer.") && b.name.ends_with(".cache") {
+                    Tag::drafter_kv("shared/mla-draft-cache") } else { Tag::drafter_workspace("shared/mla-draft") };
+                DeviceAllocation::new(library, b.bytes, tag)
             }
         }).collect::<Result<Vec<_>>>()?;
         Ok(Self { layout, buffers })

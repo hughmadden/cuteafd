@@ -46,10 +46,8 @@ impl<'a> PartialEpilogue<'a> {
         let bf16 = program("expert_partial_bf16")?;
         let nvfp4 = program("expert_partial_nvfp4")?;
         let fp8 = program("expert_partial_fp8")?;
-        let row_maps = crate::shared::memory::DeviceAllocation::named(library, 3 * capacity * 4,
-            "experts/workspace/partial_row_maps")?;
-        let staging = crate::shared::memory::HostAllocation::named(library, 3 * capacity * 4,
-            "experts/workspace/partial_row_map_staging")?;
+        let row_maps = crate::shared::memory::DeviceAllocation::new(library, 3 * capacity * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/partial_row_maps"))?;
+        let staging = crate::shared::memory::HostAllocation::new(library, 3 * capacity * 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/partial_row_map_staging"))?;
         Ok(Self { bf16, nvfp4, fp8, row_maps, staging, capacity, library })
     }
 

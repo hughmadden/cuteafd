@@ -387,7 +387,7 @@ fn compact_real_load(owners: Option<&[u8]>, core: bool, placement: EmbedPlacemen
             else { EmbeddingHome::Device(0) })?;
     let arenas = layout_inventory.coordinator_arenas()?.into_iter().enumerate().map(|(rank, layout)| {
         Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
-            Device { library: &library, id: rank as i32 }, layout)?))
+            Device { library: &library, id: rank as i32 }, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
     }).collect::<Result<BTreeMap<_, _>>>()?;
     let loader = GlmLoader {
         library: &library,
@@ -562,7 +562,7 @@ fn glm_and_ml4_k6_min_max_push_plans_preserve_packed_bytes() -> Result<()> {
                 let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
                     format!("glm/coordinator/{rank}"), tensors)?;
                 Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
-                    Device { library: &library, id: rank as i32 }, layout)?))
+                    Device { library: &library, id: rank as i32 }, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
             }).collect::<Result<BTreeMap<_, _>>>()?;
             let loader = GlmLoader { arenas: Some(std::rc::Rc::new(arenas)), ..loader };
             let mut weights = Vec::new();
@@ -859,7 +859,7 @@ fn compact_ml4_query_vectors_and_native_index_equal_real_layer_requests() -> Res
         let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
             format!("glm/coordinator/{rank}"), tensors)?;
         Ok((rank, crate::shared::memory::weight_arena::DeviceWeightArena::new(
-            Device { library: &library, id: rank }, layout)?))
+            Device { library: &library, id: rank }, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
     }).collect::<Result<BTreeMap<_, _>>>()?;
     let loader = GlmLoader { arenas: Some(std::rc::Rc::new(arenas)), ..loader };
     let layers = loader.layer(&cfg, 0, &checkpoint, &core, None, false)?;

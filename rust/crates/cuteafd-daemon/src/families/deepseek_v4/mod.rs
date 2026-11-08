@@ -600,12 +600,12 @@ pub(crate) fn with_engine<T>(
                 &operands, rank, false, args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu)?
                 .context("V4 target weight arena absent")?;
             crate::shared::memory::weight_arena::DeviceWeightArena::new(
-                crate::shared::memory::device::Device { library: &loaded.library, id }, layout)
+                crate::shared::memory::device::Device { library: &loaded.library, id }, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))
         }).collect::<Result<Vec<_>>>()?;
         let draft_arena = cuteafd_loader::families::deepseek_v4::weight_arena::coordinator_arena(
             &operands, 0, true, false)?.map(|layout|
             crate::shared::memory::weight_arena::DeviceWeightArena::new(
-                crate::shared::memory::device::Device { library: &loaded.library, id: args.device }, layout)).transpose()?;
+                crate::shared::memory::device::Device { library: &loaded.library, id: args.device }, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))).transpose()?;
         let loader = weights::WeightLoader {
             library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
             device: args.device, target_arenas: &target_arenas, draft_arena: draft_arena.as_ref(),

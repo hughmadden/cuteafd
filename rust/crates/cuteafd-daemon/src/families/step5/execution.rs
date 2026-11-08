@@ -18,6 +18,7 @@ use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry,
     ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
     expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 const H: usize = 4096;
 
@@ -483,7 +484,7 @@ impl<'e, 'a> Execution<'e, 'a> {
             None => {
                 owned = devices.iter().enumerate().map(|(rank, &device)| DeviceWeightArena::new(device,
                     super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
-                        device.id, count, false)?))
+                        device.id, count, false)?, ArenaTag::weights("step5/target")))
                     .collect::<Result<Vec<_>>>()?;
                 &owned
             }

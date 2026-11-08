@@ -45,6 +45,7 @@ use std::os::unix::fs::FileExt;
 
 use crate::shared::placement::layers::AttentionShare;
 use cuteafd_loader::placement::{FfnMode, LayerExecutionPlan, LayerMode};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) const PREFIX: &str = "model.language_model.";
 
@@ -283,7 +284,7 @@ impl<'a> GlmfLoader<'a> {
     pub(super) fn allocate(&self, device: i32, name: &str, bytes: usize) -> Result<Allocation<'a>> {
         let arena = self.arenas.get(&device).context("Flash target arena absent")?;
         crate::shared::memory::weight_arena::weight_allocation(Device { library: self.library, id: device },
-            Some(arena), name, bytes)
+            Some(arena), name, bytes, ArenaTag::weights("glmf/target"))
     }
 
     fn allocation(&self, rank: usize, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {

@@ -431,7 +431,7 @@ mod device_free_tests {
         // Use private DSO calls, not the process-global allocation ledger.
         // SAFETY: both exports belong to this fixture and the buffer lives until its matching free.
         let (allocate, free) = unsafe {
-            (*library.lib.get::<unsafe extern "C" fn(usize, *mut CuteafdDeviceBuffer) -> i32>(b"cuteafd_alloc_device_buffer")?,
+            (*library.lib.get::<unsafe extern "C" fn(usize, *mut CuteafdDeviceBuffer, u32, *const c_char) -> i32>(b"cuteafd_alloc_device_buffer")?,
              *library.lib.get::<unsafe extern "C" fn(*mut CuteafdDeviceBuffer) -> i32>(b"cuteafd_free_device_buffer")?)
         };
         for strict in [false, true] {
@@ -439,7 +439,7 @@ mod device_free_tests {
             library.cuda_set_device(1)?;
             let mut buffer = CuteafdDeviceBuffer::default();
             // SAFETY: this CPU fixture writes a fresh host-backed device buffer.
-            assert_eq!(unsafe { allocate(256, &mut buffer) }, 0);
+            assert_eq!(unsafe { allocate(256, &mut buffer, crate::memory_ledger::MemoryKind::Workspace.as_raw(), c"test/fixture".as_ptr()) }, 0);
             let pointer = buffer.ptr;
             library.cuda_set_device(0)?;
             // SAFETY: the fixture either frees its own buffer or rejects without modifying it.
