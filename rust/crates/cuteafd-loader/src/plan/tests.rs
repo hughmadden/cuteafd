@@ -3104,11 +3104,13 @@ fn v4_missing_workspace_manifest_keeps_only_the_named_reserve() {
         rtx_bytes: vec![total], workspace_manifest: Some(dir.path().join("absent.json")),
         ..Default::default()
     }), ..sparks(2) }).unwrap().memory_layout.unwrap().devices.remove(0);
-    // No small-card floor or 3 GiB minimum: the default reserve is the family constant.
+    // No small-card floor or 3 GiB minimum: family reserve plus 100MiB release padding.
     assert_eq!(total - solve().capacity_bytes, crate::placement::reserve::gpu("deepseek_v4"));
     let reserved = cuteafd_core::memory_policy::MemoryPolicy { family_reserve: Some(3 << 30), ..Default::default() }
         .scoped(solve);
-    assert_eq!(total - reserved.capacity_bytes, 3 << 30);
+    // FAMILY_RESERVE replaces only the family constant, not 100MiB release padding.
+    assert_eq!(total - reserved.capacity_bytes,
+        (3 << 30) + cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
 }
 
 #[test]
@@ -3414,7 +3416,9 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
         let memory = cuteafd_core::memory_policy::MemoryPolicy { family_reserve: Some(headroom), ..Default::default() }
             .scoped(|| plan(dir.path(), &options)).unwrap().memory_layout.unwrap();
         let gpu = &memory.devices[0];
-        assert_eq!(gpu.capacity_bytes, (32 << 30) - headroom);
+        // The card budget excludes both family headroom and 100MiB release padding.
+        assert_eq!(gpu.capacity_bytes, (32 << 30) - headroom
+            - cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
         // What the engine allocates from the same arithmetic and manifest.
         let shape = GlmfStepShape { lead: true, split: false, local_experts: false, tp2_experts: false, spark: true, partial_bytes: 2,
             output_shard: false, full_prefill_logits: false, table_pages: 2048, table_pool_pages: 512 };

@@ -755,7 +755,10 @@ mod tests {
     #[test]
     fn an_automatic_pool_below_the_context_is_refused_not_clamped() -> anyhow::Result<()> {
         let config = config();
-        let cards = vec![(96u64 << 30, 96u64 << 30, 64 << 20); 2];
+        // Include 100MiB release padding so the remaining 64MiB still tests
+        // the context shortfall, rather than exhausting the reserve itself.
+        let padding = cuteafd_core::memory_policy::MemoryPolicy::current().release_padding();
+        let cards = vec![(96u64 << 30, 96u64 << 30, (64 << 20) + padding); 2];
         let budgets = admission::live_budgets(&cards, &vec![1 << 30; 4])?;
         let input = ProductionInput {
             expert_usage: false,

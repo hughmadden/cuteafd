@@ -946,6 +946,7 @@ mod tests {
         use cuteafd_core::serving_capacity::{
             CapacityPolicy, CapacityProfile, ContextLimits, DeviceCosts, DeviceMemory,
         };
+        let padding = cuteafd_core::memory_policy::MemoryPolicy::current().release_padding();
         let profile = CapacityProfile {
             context: ContextLimits {
                 checkpoint_max_tokens: 32,
@@ -956,7 +957,7 @@ mod tests {
             devices: vec![DeviceCosts {
                 device: 1,
                 pool_unit_bytes: 3200,
-                reserve_bytes: 0,
+                reserve_bytes: padding,
                 reservations: [
                     ("model.layers.0.values", 1000),
                     ("draft.weights", 1000),
@@ -974,8 +975,8 @@ mod tests {
         };
         let memory = [DeviceMemory {
             device: 1,
-            total_bytes: 10000,
-            baseline_free_bytes: 9000,
+            total_bytes: 10000 + padding,
+            baseline_free_bytes: 9000 + padding,
         }];
         let policy = CapacityPolicy {
             max_context_tokens: Some(32),
@@ -986,7 +987,9 @@ mod tests {
             serde_json::from_str(&reservation_report(&profile, &memory, policy).unwrap()).unwrap();
         assert_eq!(report["requested_pool_tokens"], 128);
         let device = &report["devices"][0];
-        // Total less sampled occupancy (1000) and the named reserve (0): no 97% ceiling.
+        // The sample includes 100MiB release padding; subtract it and sampled
+        // occupancy (1000), with no 97% ceiling, before this tiny pool test.
+        assert_eq!(device["minimum_free_bytes"], padding);
         assert_eq!(device["engine_budget_bytes"], 9000);
         assert_eq!(device["fixed_bytes"], 5524);
         assert_eq!(device["requested_pool_bytes"], 6400);
