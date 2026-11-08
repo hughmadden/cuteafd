@@ -4,12 +4,14 @@ use crate::plan::checkpoint::Checkpoint;
 use crate::placement::planner::{self, Operation, Pin, Request};
 use crate::placement::ResidentWeights;
 
-fn fixture() -> (Qwen35Config, NativeWeights, NativeBuffers) {
+fn fixture() -> (Qwen35Config, NativeWeights, NativeBuffers, crate::serving_capacity::WeightArenaLayout) {
     let (dir, _, buffers, _) = native_planner_fixture();
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
     let weights = NativeWeights::native(&checkpoint, &cfg, cuteafd_core::DType::F32).unwrap();
-    (cfg, weights, buffers)
+    let arena = crate::families::qwen3_5::weight_layout::target_arena(&checkpoint, &cfg,
+        cuteafd_core::DType::F32, crate::families::qwen3_5::weight_layout::DenseFormat::Bf16).unwrap();
+    (cfg, weights, buffers, arena)
 }
 
 fn budgets() -> Vec<Budget> {
@@ -23,16 +25,16 @@ fn request() -> Request {
         spark_reply_formats: Default::default() }
 }
 
-fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers)
-    -> DenseFacts<'a> {
-    DenseFacts { cfg, weights, buffers, slots: 4, record_bytes: 4096, drafter: None, serving: None,
+fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers,
+    target_arena: &'a crate::serving_capacity::WeightArenaLayout) -> DenseFacts<'a> {
+    DenseFacts { cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, serving: None,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
 }
 
 #[test]
 fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
-    let (cfg, weights, buffers) = fixture();
-    let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers)).unwrap();
+    let (cfg, weights, buffers, arena) = fixture();
+    let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
     assert_eq!(plan.pool_tokens, 2 << 20);
     assert_eq!(plan.pool_tokens % PAGE_ROWS, 0);
     assert_eq!(plan.decisions.embedding, Some(planner::EmbeddingHome::Device(0)));
@@ -42,7 +44,8 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
     assert_eq!(plan.decisions.lanes, 1);
     // The admitted plan's owners are exactly the physical declarations at the
     // admitted page count, not a second estimate.
-    let declared = facts(&cfg, &weights, &buffers).owner_templates(plan.pool_tokens / PAGE_ROWS).unwrap();
+    let contract = facts(&cfg, &weights, &buffers, &arena).prepare(&plan.request).unwrap();
+    let declared = contract.facts(&vec![0; contract.variables.len()], plan.pool_tokens / PAGE_ROWS).unwrap();
     let map = |facts: &Facts| {
         facts.allocations.iter().map(|a| (a.id.clone(), (a.bytes, a.shape.clone(), a.view.clone(), a.lifetime)))
             .collect::<std::collections::BTreeMap<_, _>>()
@@ -63,9 +66,10 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
     let residency = |facts: &Facts| facts.resident_weights.iter()
         .map(|owner| (owner.id.clone(), owner.weights.0)).collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(residency(&plan.facts), residency(&declared));
-    let resident: u64 = weights.layers.iter().sum::<u64>()
-        + weights.norm + weights.head + weights.embedding;
-    assert_eq!(plan.facts.resident_weights.iter().map(|owner| owner.weights.0).sum::<u64>(), resident);
+    assert_eq!(plan.facts.resident_weights.iter().map(|owner| owner.weights.0).sum::<u64>(), arena.bytes() as u64);
+    assert_arena_charge(&plan.facts, arena.id(), arena.bytes() as u64, Lifetime::RESIDENT);
+    assert!(!plan.facts.allocations.iter().any(|owner| owner.location == Location::coordinator(0)
+        && owner.id.starts_with("weights.")));
     let pages = plan.pool_tokens / PAGE_ROWS;
     let kv: u64 = plan.facts.allocations.iter()
         .filter(|owner| owner.id.starts_with("kv.") && owner.view.is_none())
@@ -73,15 +77,16 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
     let full = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Full).count() as u64;
     assert_eq!(kv, full * pages * PAGE_ROWS * 4096);
     // No drafter: the only compiled extent is the 64-row page table itself.
-    let contract = facts(&cfg, &weights, &buffers).prepare(&plan.request).unwrap();
+    let contract = facts(&cfg, &weights, &buffers, &arena).prepare(&plan.request).unwrap();
     assert_eq!(contract.maximum_pages, u32::MAX as u64 / PAGE_ROWS);
 }
 
 #[test]
 fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
-    let (cfg, weights, buffers) = fixture();
-    let drafter = DrafterBytes { owned: 4096, weights: ResidentWeights(1024), scratch: 512, pool_unit: 4096, host_prefetch: 2_720_000_000 };
-    let mut input = facts(&cfg, &weights, &buffers);
+    let (cfg, weights, buffers, arena) = fixture();
+    let drafter = DrafterBytes { owned: 4096, weights: ResidentWeights(1024),
+        weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), scratch: 512, pool_unit: 4096, host_prefetch: 2_720_000_000 };
+    let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.drafter = Some(drafter);
     let contract = input.prepare(&request()).unwrap();
     assert_eq!(contract.maximum_pages, i32::MAX as u64 / PAGE_ROWS);
@@ -93,12 +98,13 @@ fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
     assert_eq!(owner("draft.prefetch").bytes, 2_720_000_000);
     assert_eq!(owner("draft.prefetch").location, Location::HOST);
     assert_eq!(owner("draft.prefetch").lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad });
-    assert_eq!(owner("draft.weights").bytes, 1024);
+    assert_eq!(owner("qwen3_5/mtp/gpu0").bytes, 1280);
+    assert!(!plan.facts.allocations.iter().any(|owner| owner.id == "draft.weights"));
     assert_eq!(owner("draft.runtime").bytes, owned_rest());
     assert_eq!(owner("draft.scratch").bytes, 512);
     assert_eq!(owner("draft.kv").lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::Growth });
-    assert!(plan.facts.resident_weights.contains(&ResidentWeight { id: "draft.weights".into(),
-        location: Location::coordinator(0), weights: ResidentWeights(1024) }));
+    assert!(plan.facts.resident_weights.contains(&ResidentWeight { id: "qwen3_5/mtp/gpu0".into(),
+        location: Location::coordinator(0), weights: ResidentWeights(1280) }));
     // Draft KV is a page-linear extent, so a smaller explicit pool pays for
     // fewer pages rather than a fixed full-context reservation.
     let mut smaller = request();
@@ -112,10 +118,66 @@ fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
 
 fn owned_rest() -> u64 { 4096 - 1024 }
 
+fn assert_arena_charge(facts: &Facts, id: &str, bytes: u64, lifetime: Lifetime) {
+    let roots: Vec<_> = facts.allocations.iter().filter(|owner| owner.id == id).collect();
+    assert_eq!(roots.len(), 1);
+    let root = roots[0];
+    assert_eq!((root.bytes, root.location, root.lifetime), (bytes, Location::coordinator(0), lifetime));
+    assert!(root.view.is_none());
+    assert_eq!(root.group, "weight arena");
+    assert_eq!(facts.resident_weights.iter().filter(|owner| owner.id == id)
+        .map(|owner| owner.weights.0).collect::<Vec<_>>(), [bytes]);
+    let tails: Vec<_> = facts.allocation_granularity.iter().filter(|tail| tail.id == format!("{id}.tail")).collect();
+    assert_eq!(tails.len(), 1);
+    let tail = tails[0];
+    assert_eq!((tail.location, tail.lifetime), (root.location, lifetime));
+    assert_eq!(tail.backings, [GranularityBacking { backing: id.into(), requests: vec![bytes] }]);
+    assert_eq!(tail.bytes().unwrap(), allocation_granularity_forecast(&[bytes]).unwrap());
+    assert!(matches!(tail.evidence, GranularityEvidence::Forecast));
+}
+
+#[test]
+fn padded_weight_backings_replace_payload_and_activate_with_their_single_tails() {
+    let (cfg, weights, buffers, _) = fixture();
+    let payload = weights.layers.iter().sum::<u64>() + weights.norm + weights.head + weights.embedding;
+    let arena = crate::serving_capacity::WeightArenaLayout::new("qwen3_5/target/gpu0",
+        [("first".into(), 257), ("rest".into(), payload as usize - 257)]).unwrap();
+    assert_eq!(arena.padding_bytes(), 255);
+    let mut input = facts(&cfg, &weights, &buffers, &arena);
+    input.drafter = Some(DrafterBytes { owned: 4096, weights: ResidentWeights(1024),
+        weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), pool_unit: 4096, ..Default::default() });
+    let contract = input.prepare(&request()).unwrap();
+    let home = contract.variables.iter().position(|v| matches!(v, Variable::DraftHome(_))).unwrap();
+    let components = |id: &str| contract.components.iter().filter(|component| match &component.kind {
+        ComponentKind::Allocation { template, .. } => template.id == id,
+        ComponentKind::ResidentWeight(owner) => owner.id == id,
+        ComponentKind::AllocationGranularity(tail) => tail.id == format!("{id}.tail"),
+        _ => false,
+    }).collect::<Vec<_>>();
+    let target = components(arena.id());
+    assert_eq!(target.len(), 3);
+    assert!(target.iter().all(|component| component.activation == Activation::always()));
+    let draft = components("qwen3_5/mtp/gpu0");
+    assert_eq!(draft.len(), 3);
+    assert!(draft.iter().all(|component| component.activation == Activation::choice(home, 0)));
+    let plan = admit(request(), budgets(), input).unwrap();
+    assert_eq!(plan.facts.phase_order, PhaseOrder::TARGET_THEN_DRAFT);
+    assert_arena_charge(&plan.facts, arena.id(), arena.bytes() as u64, Lifetime::RESIDENT);
+    assert_arena_charge(&plan.facts, "qwen3_5/mtp/gpu0", 1280,
+        Lifetime { first: Phase::DraftLoad, last: Phase::Growth });
+    assert_eq!(plan.facts.allocation_granularity.len(), 2);
+    assert_eq!(plan.facts.allocations.iter().filter(|owner| owner.location == Location::coordinator(0)
+        && owner.category == Category::Weights).map(|owner| owner.bytes).sum::<u64>(), arena.bytes() as u64 + 1280);
+    assert_eq!(plan.facts.allocations.iter().find(|owner| owner.id == "draft.runtime").unwrap().bytes, 3072);
+    let mut missing = input;
+    missing.drafter.as_mut().unwrap().weight_arena = None;
+    assert!(matches!(admit(request(), budgets(), missing), Err(Refusal::InvalidFact(_))));
+}
+
 #[test]
 fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
-    let (cfg, weights, buffers) = fixture();
-    let input = facts(&cfg, &weights, &buffers);
+    let (cfg, weights, buffers, arena) = fixture();
+    let input = facts(&cfg, &weights, &buffers, &arena);
     for (pool, expected) in [
         (Pin::Exact(PAGE_ROWS), "below context"),
         (Pin::Exact(3 * PAGE_ROWS + 1), "misaligned"),
@@ -139,9 +201,9 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
 
 #[test]
 fn serving_selector_and_sampler_owners_keep_their_domains() {
-    let (cfg, weights, buffers) = fixture();
+    let (cfg, weights, buffers, arena) = fixture();
     for device_sampling in [false, true] {
-        let mut input = facts(&cfg, &weights, &buffers);
+        let mut input = facts(&cfg, &weights, &buffers, &arena);
         input.serving = Some(ServingFacts { capacity: 64, device_sampling });
         let plan = admit(request(), budgets(), input).unwrap();
         let selector: Vec<_> = plan.facts.allocations.iter()
@@ -166,8 +228,8 @@ fn serving_selector_and_sampler_owners_keep_their_domains() {
 
 #[test]
 fn gdn_slots_and_prefix_marks_are_exact_partitions_of_their_backings() {
-    let (cfg, weights, buffers) = fixture();
-    let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers)).unwrap();
+    let (cfg, weights, buffers, arena) = fixture();
+    let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
     let layers = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
     let slots = 4u64;
     let conv = (cfg.gdn.conv_kernel - 1) as u64 * cfg.gdn.conv_width() as u64 * 2;
@@ -210,7 +272,7 @@ fn gdn_slots_and_prefix_marks_are_exact_partitions_of_their_backings() {
 
 #[test]
 fn host_memory_is_a_required_fact_and_live_samples_replace_the_forecast() {
-    let (_, _, _) = fixture();
+    let (_, _, _, _) = fixture();
     assert!(matches!(forecast_budgets(&crate::placement::ARCH_CONTEXTS[1], 96 << 30, 0, (0, 0)),
         Err(Refusal::InvalidFact(_))));
     // No CUDA total reported yet: the nominal 32 GiB class is explicit.
@@ -229,46 +291,46 @@ fn host_memory_is_a_required_fact_and_live_samples_replace_the_forecast() {
 
 #[test]
 fn onboarding_pins_are_auto_zero_and_refuse_random_layer_counts() {
-    let (cfg, weights, buffers) = fixture();
+    let (cfg, weights, buffers, arena) = fixture();
     for onboard in [Pin::Auto, Pin::Exact(0)] {
         let mut ask = request();
         ask.onboard = onboard;
-        let plan = admit(ask, budgets(), facts(&cfg, &weights, &buffers)).unwrap();
+        let plan = admit(ask, budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
         assert!(plan.decisions.onboard_layers.iter().all(Vec::is_empty));
         assert!(plan.decisions.expert_homes.is_empty());
     }
     for layers in [1, 2, u64::MAX] {
         let mut ask = request();
         ask.onboard = Pin::Exact(layers);
-        assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers)).unwrap_err(),
+        assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap_err(),
             Refusal::InvalidPin("model has 0 routed-expert layers")));
     }
     // A resident-weight limit is a pure policy refusal, not a silent trim.
     let mut ask = request();
     ask.resident_weight_limit = Some(ResidentWeights(1));
-    assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers)).unwrap_err(),
+    assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap_err(),
         Refusal::ResidentWeightLimit { gpu: 0, .. }));
 }
 
 #[test]
 fn operations_must_match_the_allocated_head_rows() {
-    let (cfg, weights, buffers) = fixture();
+    let (cfg, weights, buffers, arena) = fixture();
     let mut ask = request();
     ask.operation = Operation::Scoring;
-    assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers)).unwrap_err(),
+    assert!(matches!(admit(ask, budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap_err(),
         Refusal::InvalidFact(_)));
-    let mut input = facts(&cfg, &weights, &buffers);
+    let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.slots = 0;
     assert!(matches!(admit(request(), budgets(), input).unwrap_err(), Refusal::InvalidFact(_)));
-    let mut input = facts(&cfg, &weights, &buffers);
+    let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.record_bytes = 0;
     assert!(matches!(admit(request(), budgets(), input).unwrap_err(), Refusal::InvalidFact(_)));
 }
 
 #[test]
 fn solved_allowances_are_the_only_estimates_in_the_ready_ledger() {
-    let (cfg, weights, buffers) = fixture();
-    let mut input = facts(&cfg, &weights, &buffers);
+    let (cfg, weights, buffers, arena) = fixture();
+    let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.serving = Some(ServingFacts { capacity: 64, device_sampling: true });
     let plan = admit(request(), budgets(), input).unwrap();
     let ready = plan.items(Location::coordinator(0)).unwrap();
@@ -289,8 +351,8 @@ fn solved_allowances_are_the_only_estimates_in_the_ready_ledger() {
 
 #[test]
 fn host_chunks_and_diagnostic_staging_are_physical_owners_not_allowances() {
-    let (cfg, weights, buffers) = fixture();
-    let mut input = facts(&cfg, &weights, &buffers);
+    let (cfg, weights, buffers, arena) = fixture();
+    let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.host_prefix = serving::HostPrefixOwners { quota_bytes: (1 << 30) + 17, chunk_bytes: 256 << 20 };
     input.verify_check = true;
     let plan = admit(request(), budgets(), input).unwrap();

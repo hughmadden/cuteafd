@@ -152,22 +152,65 @@ fn installed_variant_weight_inventory_equals_production_requests() -> Result<()>
     Ok(())
 }
 
+fn arena_charge(components: &[cuteafd_loader::placement::planner::Component], id: &str,
+    location: cuteafd_loader::placement::planner::Location, bytes: u64, logical: u64) -> Result<u64> {
+    use cuteafd_loader::placement::planner::{Activation, ComponentKind};
+    let roots = components.iter().filter_map(|component| match &component.kind {
+        ComponentKind::Allocation { template, deferred, .. } if template.id == id => {
+            assert!(!deferred);
+            assert_eq!(component.activation, Activation::always());
+            assert_eq!(component.bytes.at(1).unwrap(), bytes);
+            Some(template)
+        }
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(roots.len(), 1, "one physical root {id}");
+    let root = roots[0];
+    assert_eq!((root.location, root.bytes, root.lifetime), (location, bytes, Lifetime::RESIDENT));
+    assert!(root.view.is_none());
+    assert_eq!((root.category, root.group.as_str()), (Category::Weights, "weight arena"));
+    let claims = components.iter().filter_map(|component| match &component.kind {
+        ComponentKind::ResidentWeight(owner) if owner.id == id => {
+            assert_eq!(component.activation, Activation::always());
+            assert_eq!(component.bytes.at(1).unwrap(), logical);
+            Some(owner)
+        }
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(claims.len(), 1, "one logical claim {id}");
+    assert_eq!((claims[0].location, claims[0].weights.0), (location, logical));
+    let tails = components.iter().filter_map(|component| match &component.kind {
+        ComponentKind::AllocationGranularity(owner) if owner.backings.iter().any(|b| b.backing == id) => {
+            assert_eq!(component.activation, Activation::always());
+            assert_eq!(component.bytes.at(1).unwrap(), owner.bytes().unwrap());
+            Some(owner)
+        }
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(tails.len(), 1, "one derived tail {id}");
+    let tail = tails[0];
+    assert_eq!(tail.id, format!("{id}.tail"));
+    assert_eq!((tail.location, tail.lifetime), (location, root.lifetime));
+    assert_eq!(tail.backings.len(), 1);
+    assert_eq!(tail.backings[0].requests, [bytes]);
+    assert!(bytes > 1 << 20, "installed immutable backing uses the large-request rule");
+    let expected = bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+    assert_eq!(tail.bytes()?, expected);
+    Ok(expected)
+}
+
 fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
+    use cuteafd_loader::placement::planner::{ComponentKind, Location, View};
+    let components = inventory.components(1)?;
     for (rank, arena) in inventory.coordinator_arenas()?.iter().enumerate() {
-        let sizes = inventory.owners.iter().filter(|owner|
-            owner.allocation.location == cuteafd_loader::placement::planner::Location::coordinator(rank as u8)
-                && !owner.allocation.id.contains(".shared.layer."))
-            .map(|owner| owner.allocation.bytes).collect::<Vec<_>>();
-        let large = sizes.iter().copied().filter(|&n| n > 1 << 20).collect::<Vec<_>>();
-        let rounding = |n: u64| n.div_ceil(2 << 20) * (2 << 20) - n;
-        let old_slack: u64 = large.iter().copied().map(rounding).sum();
-        let tail = if arena.bytes() > 1 << 20 { rounding(arena.bytes() as u64) } else { 0 };
-        eprintln!("ARENA {label} rank={rank} N={} payload={} large_N={} large_bytes={} old_slack={} arena={} padding={} tail={tail}",
-            sizes.len(), sizes.iter().sum::<u64>(), large.len(), large.iter().sum::<u64>(), old_slack,
-            arena.bytes(), arena.padding_bytes());
-        assert_eq!(arena.payload_bytes() as u64, sizes.iter().sum::<u64>());
+        let location = Location::coordinator(rank as u8);
+        let owners = inventory.owners.iter().filter(|owner| owner.allocation.location == location
+            && !owner.allocation.id.contains(".shared.layer.")).collect::<Vec<_>>();
+        let payload = owners.iter().map(|owner| owner.allocation.bytes).sum::<u64>();
+        assert_eq!(arena.payload_bytes() as u64, payload);
+        assert_eq!(arena.views().len(), owners.len());
         let mut regions = arena.views().values().copied().collect::<Vec<_>>();
-        regions.sort_by_key(|v| v.offset());
+        regions.sort_by_key(|view| view.offset());
         let mut end = 0;
         for view in regions {
             assert_eq!(view.offset() % 256, 0);
@@ -175,6 +218,43 @@ fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
             end = view.offset() + view.bytes();
         }
         assert_eq!(end, arena.bytes());
+        let mut tail = arena_charge(&components, arena.id(), location, arena.bytes() as u64, payload)?;
+        let mut backing = arena.bytes() as u64;
+        let mut old = payload;
+        let mut roots = 1;
+        for owner in owners {
+            let matches = components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::Allocation { template, .. } if template.id == owner.allocation.id => Some(template),
+                _ => None,
+            }).collect::<Vec<_>>();
+            let mut expected = owner.allocation.clone();
+            expected.view = Some(View { backing: arena.id().into(),
+                offset: arena.view(&expected.id).context("target alias recipe")?.offset() as u64 });
+            assert_eq!(matches, [&expected], "noncharging alias preserves its physical operand");
+        }
+        for shared in inventory.owners.iter().filter(|owner| owner.allocation.location == location
+            && owner.allocation.id.contains(".shared.layer.")) {
+            let owner = &shared.allocation;
+            tail += arena_charge(&components, &owner.id, location, owner.bytes, owner.bytes)?;
+            backing += owner.bytes;
+            old += owner.bytes;
+            roots += 1;
+        }
+        assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.location == location && template.view.is_none())).count(), roots);
+        assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+            ComponentKind::ResidentWeight(owner) if owner.location == location)).count(), roots);
+        assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+            ComponentKind::AllocationGranularity(owner) if owner.location == location)).count(), roots);
+        eprintln!("ARENA_CHARGE {label} rank={rank} roots={roots} old={old} B={backing} tail={tail} new={} delta={} old_rounding=no",
+            backing + tail, backing + tail - old);
+    }
+    for owner in inventory.owners.iter().filter(|owner| owner.allocation.location == Location::PINNED) {
+        let found = components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::Allocation { template, .. } if template.id == owner.allocation.id => Some(template),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(found, [&owner.allocation], "pinned embedding stays a separate owner");
     }
     Ok(())
 }
@@ -192,9 +272,11 @@ fn installed_arena_cpu_inventory() -> Result<()> {
             let owners = cuteafd_loader::placement::families::glm5::attention_owners(&cfg, cfg.layers)?;
             for whole in [false, true] {
                 if whole && ranks == 1 { continue; }
-                let inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
-                    whole.then_some(owners.as_slice()), bf16_programs(), false, EmbeddingHome::Device(0))?;
-                arena_inventory(&format!("{model} tp{ranks} whole={whole}"), &inventory)?;
+                for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+                    let inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
+                        whole.then_some(owners.as_slice()), false, false, home)?;
+                    arena_inventory(&format!("{model} tp{ranks} whole={whole} embed={home:?}"), &inventory)?;
+                }
             }
         }
     }
@@ -204,7 +286,7 @@ fn installed_arena_cpu_inventory() -> Result<()> {
     let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
     for ranks in [1, 2] {
         let records = (0..ranks).map(|rank|
-            crate::shared::experts::exlr8::dense_weights::NativeDenseRecords::new(&root, cfg.layers, ranks, rank, &BTreeMap::new()))
+            cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords::new(&root, cfg.layers, ranks, rank, &BTreeMap::new()))
             .collect::<Result<Vec<_>>>()?;
         let plans = records.iter().map(|r| r.plan.clone()).collect::<Vec<_>>();
         let mut inventory = WeightInventory::from_native(&selection, cfg.layers, &plans)?;
@@ -212,7 +294,65 @@ fn installed_arena_cpu_inventory() -> Result<()> {
         let vocabulary = (0..ranks).map(|rank| crate::shared::token_io::native::VocabularyPlan::new(
             &all, &selection, ranks, rank, cfg.hidden, cfg.vocab_size)).collect::<Result<Vec<_>>>()?;
         inventory.extend_native(&selection, cfg.layers, &vocabulary.iter().map(|p| p.dense_plan()).collect::<Vec<_>>())?;
-        arena_inventory(&format!("GLM-EXLR8 tp{ranks} context-or-heads"), &inventory)?;
+        let shared = cuteafd_loader::plan::exlr8::residency::MetadataInput::open(&root, "up1")?;
+        let plans = (0..ranks).map(|rank| (cfg.first_moe_layer..cfg.layers).map(|layer|
+            shared.plan(layer, ranks, rank, cuteafd_loader::plan::exlr8::residency::ExpertSet::Shared)
+                .map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
+        inventory.extend_shared(&plans)?;
+        arena_inventory(&format!("GLM-EXLR8-up1 tp{ranks} context-or-heads"), &inventory)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn installed_glm_and_ml4_draft_arena_charges_equal_shared_load_recipes() -> Result<()> {
+    use cuteafd_loader::{families::glm5::{draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout,
+        gqa_checkpoint_arena_requests}, draft_representation::{GlmDraftCapacity, GlmDraftRepresentation}},
+        families::qwen4::Qwen4KvCache, placement::{families::glm5::{admission::DraftFacts, ml4_draft_layout},
+        planner::{ComponentKind, Location}}, serving_capacity::WeightArenaLayout};
+    let snapshot = installed("incoai--GLM-5.3-DFlash2", "425aa615ce320caac34400208b30808c8f14f76c")?;
+    let cfg = GlmDflashConfig::read(&snapshot)?;
+    for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+        let capacity = GlmDraftCapacity::new(20, 16, cfg.block)?;
+        let layout = GlmDflashPhysicalLayout::read(&snapshot, representation, capacity, 188, 0, Qwen4KvCache::Fp8)?;
+        let logical = layout.resident_weights().0;
+        let requests = gqa_checkpoint_arena_requests(&snapshot, representation, 0, 1)?;
+        let arena = WeightArenaLayout::new("glm/draft/0", requests)?;
+        assert_eq!(arena.payload_bytes() as u64, logical);
+        let facts = DraftFacts::gqa(&snapshot, representation, capacity, 188, 0, Qwen4KvCache::Fp8)?;
+        assert!(!facts.owners().iter().any(|owner| layout.weight_owners().any(|weight|
+            owner.id == format!("glm.draft.{}", weight.id))), "no retired per-tensor charge");
+        for home in facts.homes(2) {
+            let components = facts.components(home, 1)?;
+            let id = format!("glm/draft/{home}");
+            let tail = arena_charge(&components, &id, Location::coordinator(home), arena.bytes() as u64, logical)?;
+            assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+                ComponentKind::ResidentWeight(_))).count(), 1);
+            eprintln!("ARENA_CHARGE GLM-draft-{} home={home} old={logical} B={} tail={tail} new={} delta={} old_rounding=no",
+                representation.name(), arena.bytes(), arena.bytes() as u64 + tail, arena.bytes() as u64 + tail - logical);
+        }
+    }
+    let snapshot = installed("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4-Core-K6",
+        "03c80aebaa483d55760703ae5bc0c9734c9d67d6")?;
+    let layout = ml4_draft_layout(&snapshot, 20, 16, 16384, 188)?;
+    let arena = WeightArenaLayout::new("glm/draft/0", layout.immutable_arena_requests())?;
+    let logical = layout.owners().iter().map(|owner| owner.resident_weights.0).sum::<u64>();
+    let generated = layout.owners().iter().find(|owner| owner.id == "markov_norms")
+        .context("generated immutable ML4 norms")?;
+    assert_eq!(generated.resident_weights.0, 0);
+    let old = logical + generated.bytes as u64;
+    assert_eq!(arena.payload_bytes() as u64, old);
+    let facts = DraftFacts::ml4(&layout)?;
+    assert!(!facts.owners().iter().any(|owner| layout.immutable_arena_requests().iter().any(|(name, _)|
+        owner.id == format!("glm.draft.{name}"))), "no retired ML4 immutable charge");
+    for home in facts.homes(2) {
+        let components = facts.components(home, 1)?;
+        let id = format!("glm/draft/{home}");
+        let tail = arena_charge(&components, &id, Location::coordinator(home), arena.bytes() as u64, logical)?;
+        assert_eq!(components.iter().filter(|component| matches!(&component.kind,
+            ComponentKind::ResidentWeight(_))).count(), 1);
+        eprintln!("ARENA_CHARGE ML4-bundled-draft home={home} old={old} logical={logical} B={} tail={tail} new={} delta={} old_rounding=no",
+            arena.bytes(), arena.bytes() as u64 + tail, arena.bytes() as u64 + tail - old);
     }
     Ok(())
 }
@@ -902,7 +1042,7 @@ fn installed_native_dense_shared_and_vocabulary_equal_reader_requests() -> Resul
     for world in [1, 2] {
         let dense = (0..world)
             .map(|rank| {
-                dense_weights::NativeDenseRecords::new(
+                cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords::new(
                     &root,
                     cfg.layers,
                     world,
@@ -966,7 +1106,7 @@ fn installed_native_dense_shared_and_vocabulary_equal_reader_requests() -> Resul
                 } else {
                     "head"
                 };
-                for (suffix, bytes) in crate::shared::token_io::native::row_requests(slice)? {
+                for (suffix, bytes) in cuteafd_loader::plan::exlr8::dense::requests::row_requests(slice)? {
                     add(rank, format!("vocabulary.{table}.{suffix}"), bytes);
                 }
             }

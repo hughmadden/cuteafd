@@ -15,6 +15,27 @@ fn installed_snapshot(repo: &str) -> Result<PathBuf> {
     Ok(snapshot)
 }
 
+fn assert_glm_draft_lifetimes(common: &[cuteafd_loader::placement::planner::Receipt],
+    family: &[cuteafd_loader::placement::planner::Receipt]) {
+    use cuteafd_loader::placement::planner::Lifetime;
+    assert_eq!(common.len(), family.len());
+    let mut immutable = 0;
+    let mut unchanged = 0;
+    for (before, after) in common.iter().zip(family) {
+        let mut expected = before.allocation.clone();
+        if expected.id.starts_with("glm/draft/") || expected.view.as_ref()
+            .is_some_and(|view| view.backing.starts_with("glm/draft/")) {
+            expected.lifetime = Lifetime::RESIDENT;
+            immutable += 1;
+        } else {
+            unchanged += 1;
+        }
+        assert_eq!(after.allocation, expected);
+        assert_eq!(after.address, before.address);
+    }
+    assert!(immutable > 1 && unchanged > 0, "prove both arena and nonweight chronology");
+}
+
 #[test]
 fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     use crate::shared::memory::{device::{Device, Stream}, weight_arena::DeviceWeightArena};
@@ -53,7 +74,7 @@ fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     let representation = GlmDraftRepresentation::Bf16Only;
     let requests = DflashDrafter::arena_requests(snapshot, representation, &[1], 0)?;
     // Deliberately outside the logical receipt prefix, as shared arena IDs are.
-    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("physical/draft/1", requests[&1].clone())?)?;
+    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("glm/draft/1", requests[&1].clone())?)?;
     let first = arena.view(&requests[&1][0].0, requests[&1][0].1)?.buffer;
     let stream = Stream::new(device)?;
     let mut bound = Vec::new();
@@ -84,7 +105,10 @@ fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     assert_eq!(uploads[0].allocation.location, Location::PINNED);
     assert_eq!(uploads[0].allocation.bytes, first.bytes as u64);
     assert_eq!(after.len(), before.len() + 1);
-    assert_eq!(after.iter().filter(|receipt| receipt.allocation.id == "physical/draft/1").count(), 1);
+    assert_eq!(after.iter().filter(|receipt| receipt.allocation.id == "glm/draft/1").count(), 1);
+    let drafter = crate::families::glm5::drafter::GlmDrafter::Local(drafter);
+    let family = drafter.allocation_receipts(devices, "draft")?;
+    assert_glm_draft_lifetimes(&after, &family);
     drop(drafter);
     stream.drain()?;
     fixture.finish_ordered_uploads(&library)?;
@@ -502,6 +526,9 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
             std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
             let programs = library.programs()?.with_manifest(&manifest)?;
             let requests = DflashDrafter::mla_arena_requests(snapshot, representation, 1)?;
+            assert_eq!(layout.weight_arena_requests(), requests[&1]);
+            assert_eq!(cuteafd_loader::families::glm5::draft_physical::mla_arena_requests(
+                &cfg, representation)?, requests[&1]);
             let planned = WeightArenaLayout::new("kimi/draft/1", requests[&1].clone())?;
             assert_eq!(planned.payload_bytes() as u64, layout.weights().resident_bytes()?);
             assert_eq!(planned.padding_bytes(), 0);
@@ -528,6 +555,112 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
             assert_eq!(fixture.mapped_bytes(&library)?, 0);
         }
     }
+    let tensors = cfg.tensor_shapes();
+    write_safetensors(&snapshot.join("model.safetensors"), &tensors.iter().skip(1)
+        .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
+    assert!(DflashDrafter::mla_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only, 1).is_err());
+    write_safetensors(&snapshot.join("model.safetensors"), &tensors.iter()
+        .map(|(name, shape)| t(name, "F32", shape)).collect::<Vec<_>>());
+    assert!(DflashDrafter::mla_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only, 1).is_err());
+    Ok(())
+}
+
+#[test]
+fn ml4_arena_requests_exactly_cover_real_loader_bindings() -> Result<()> {
+    use cuteafd_loader::{formats::dflash::MlaDflashConfig,
+        families::mistral_large4::{Ml4Config, dspark::Ml4DsparkConfig},
+        plan::testing::{t, write_safetensors}, serving_capacity::WeightArenaLayout};
+    use crate::shared::memory::{device::Stream, weight_arena::DeviceWeightArena};
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.extent_only(&library)?;
+    fixture.quiet_events(&library, true)?;
+    fixture.configure_memory(&library, 1, 96usize << 30)?;
+    let device = Device { library: &library, id: 1 };
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let mut target = Ml4Config::from_hf(&serde_json::from_str(include_str!(
+        "../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?)?;
+    target.vocab_size = 256;
+    target.dense_intermediate = 128;
+    let native = MlaDflashConfig::ml4(&Ml4DsparkConfig { layers: 3, depth: 3,
+        taps: vec![1, 18, 36, 54, 71], window: 2048, markov_rank: 512 }, &target)?;
+    let path = root.path().join("model.safetensors");
+    write_safetensors(&path, &native.tensor_shapes().iter()
+        .map(|(name, shape)| t(name, "BF16", shape)).collect::<Vec<_>>());
+    let source = super::super::weights::Source::open(root.path())?;
+    let layout = native.runtime_layout(GlmDraftRepresentation::Bf16Only,
+        GlmDraftCapacity::new(2, 1, 3)?, 8192, 16384, library.sm_count()?, 0,
+        cuteafd_core::MlaCacheFormat::Fp8)?;
+    let p = layout.program();
+    let mut entries = [(6144, 256), (128, 6144)].into_iter().map(|(k, n)| serde_json::json!({
+        "name":format!("draft_bf16_k{k}_n{n}"), "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
+        "scalars":[{"name":"rows","type":"int32"}], "scratch_bytes_at_capacity":{},
+        "capacity_rows":TAP_ROWS, "geometry":{"width":k,"outputs":n,"output_dtype":"torch.bfloat16",
+            "reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]}
+    })).collect::<Vec<_>>();
+    entries.push(serde_json::json!({"name":"ml4_draft_context_fc", "capacity_rows":2048,
+        "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],
+        "scalars":[{"name":"rows","type":"int32"}], "geometry":{"width":30720,"outputs":6144,
+            "output_dtype":"torch.bfloat16","skinny_rows":0,"exact_row_cap":i32::MAX}}));
+    for (index, suffix, pointers, scalars) in [
+        (0, "producer", vec!["x","kv_slots","positions","cos_sin","unit_s","unit_b","w_q","w_kv_a",
+            "kv_a_norm","w_uk","kv_cache","query","scratch"], "i"),
+        (1, "attention", vec!["query","kv_cache","page_table","cache_seqlens","cu_seqlens_q","attn","lse","scratch"], "iilif"),
+        (2, "output", vec!["attn","w_uv","w_o","out","scratch"], "i"),
+    ] {
+        let mut geometry = serde_json::json!({"name":"ml4_draft","heads":64,"hidden":6144,
+            "q_lora_rank":0,"kv_lora_rank":512,"qk_nope_dim":64,"qk_rope_dim":64,
+            "v_head_dim":128,"page_rows":64,"window_size":2048,"norm_eps":1e-5,"kv_cache":"fp8"});
+        if index == 1 {
+            for (key, value) in [("max_context",p.context),("num_splits",p.splits),
+                ("chunks_per_split",p.chunks_per_split),("partial_output_bytes",p.partial_output_bytes),
+                ("partial_lse_bytes",p.partial_lse_bytes),("scratch_bytes",p.scratch[1])] { geometry[key] = value.into(); }
+            geometry["noncausal_block"] = true.into(); geometry["block_window"] = true.into();
+        }
+        if index == 2 { geometry["output_gate"] = false.into(); }
+        entries.push(serde_json::json!({"name":format!("ml4_draft_{suffix}_m64"),"capacity_rows":64,
+            "pointers":pointers.iter().map(|name| serde_json::json!({"name":name})).collect::<Vec<_>>(),
+            "scalars":scalars.bytes().enumerate().map(|(i, kind)| serde_json::json!({"name":format!("s{i}"),
+                "type":match kind { b'i'=>"int32", b'l'=>"int64", _=>"float32" }})).collect::<Vec<_>>(),
+            "geometry":geometry,"scratch_bytes_at_capacity":{"scratch":p.scratch[index]}}));
+    }
+    fixture.register_programs(&library, &entries)?;
+    let manifest = root.path().join("programs.json");
+    std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({"programs":entries}))?)?;
+    let programs = library.programs()?.with_manifest(&manifest)?;
+    let requests = layout.immutable_arena_requests();
+    let planned = WeightArenaLayout::new("glm/draft/1", requests.clone())?;
+    let arena = DeviceWeightArena::new(device, planned.clone())?;
+    let base = arena.view(&requests[0].0, requests[0].1)?.buffer.ptr as usize;
+    let stream = Stream::new(device)?;
+    let mut bound = Vec::new();
+    let (drafter, records) = device.run(|| crate::shared::experts::rtx::dense::recording(||
+        DflashDrafter::load_ml4_with(&library, &programs, native.clone(), &target,
+            target.logit_softcap as f32, stream.raw, layout.clone(), &|name, shape| source.rect(name, shape),
+            |physical, name, bytes| {
+                assert_eq!(physical, 1);
+                let view = arena.view(name, bytes)?;
+                bound.push((name.to_owned(), view.buffer.ptr as usize - base, view.buffer.bytes));
+                Ok(view)
+            })))?;
+    assert!(!records.operands.is_empty());
+    assert_arena_bindings(&planned, &requests, &bound);
+    assert!(bound.iter().any(|(name, _, _)| name == "markov_norms"));
+    drop(arena);
+    let devices = CoordinatorDevices::new(&[1])?;
+    let common = drafter.allocation_receipts(devices, "draft")?;
+    let drafter = crate::families::glm5::drafter::GlmDrafter::Local(drafter);
+    let receipts = drafter.allocation_receipts(devices, "draft")?;
+    assert_glm_draft_lifetimes(&common, &receipts);
+    let backing = receipts.iter().filter(|receipt| receipt.allocation.id == planned.id()).collect::<Vec<_>>();
+    assert_eq!(backing.len(), 1);
+    assert_eq!(backing[0].allocation.bytes, planned.bytes() as u64);
+    assert_eq!(receipts.iter().filter(|receipt| receipt.allocation.view.as_ref()
+        .is_some_and(|view| view.backing == planned.id())).count(), requests.len());
+    stream.drain()?;
+    drop(drafter);
+    fixture.finish_ordered_uploads(&library)?;
+    assert_eq!(fixture.mapped_bytes(&library)?, 0);
     Ok(())
 }
 

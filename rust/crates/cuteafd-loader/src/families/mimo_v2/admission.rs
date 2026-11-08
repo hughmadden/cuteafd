@@ -29,10 +29,11 @@ pub fn allocation_bytes(label: &str, dimensions: &[usize]) -> Result<u64> {
 }
 
 pub struct DraftReservations {
+    pub arena: super::capacity::MimoWeightArena,
     pub resident_weights: crate::placement::ResidentWeights,
     pub steady: Vec<MemoryReservation>,
-    /// Selected weights and FP8 scratch coexist with one drained source
-    /// matrix during packing, after target KV but before target workspaces.
+    /// FP8 scratch and one drained source matrix coexist with the separate
+    /// immutable arena after target KV but before target workspaces.
     /// Empty for BF16-only, which needs no conversion staging.
     pub packing: Vec<MemoryReservation>,
 }
@@ -162,25 +163,16 @@ pub fn draft_rank_reservations_with(
         .context("DFlash local QKV width")?;
     let layout = cfg.runtime_layout(mode, capacity)?;
     layout.weights.loading_peak_bytes()?;
-    let mut costs = [
-        ("bf16_values", layout.weights.bf16_values),
-        ("fp8_values", layout.weights.fp8_values),
-        ("fp8_scales", layout.weights.fp8_scales),
-        ("small_bf16", layout.weights.small_bf16),
-        ("head_fp8_values", layout.weights.head_fp8_values),
-        ("head_fp8_scales", layout.weights.head_fp8_scales),
-    ]
-    .into_iter()
-    .filter(|(_, bytes)| *bytes > 0)
-    .map(|(name, bytes)| MemoryReservation {
-        name: format!("draft.weights.{name}"),
-        bytes,
-    })
-    .collect::<Vec<_>>();
-    let resident_weights = crate::placement::ResidentWeights(costs.iter()
-        .try_fold(0u64, |sum, owner| sum.checked_add(owner.bytes))
-        .context("DFlash checkpoint weights overflow")?);
-    let mut packing = costs.clone();
+    let arena = super::capacity::MimoWeightArena {
+        layout: super::weight_arena::dflash_arena_requests(source_cfg, mode, rank, ranks)?,
+        lifetime: crate::placement::planner::Lifetime {
+            first: crate::placement::planner::Phase::DraftLoad,
+            last: crate::placement::planner::Phase::Growth,
+        },
+    };
+    let resident_weights = crate::placement::ResidentWeights(arena.layout.bytes() as u64);
+    let mut costs = Vec::new();
+    let mut packing = Vec::new();
     if let Some(fp8) = &layout.fp8_scratch {
         let bytes = fp8
             .shapes
@@ -287,6 +279,7 @@ pub fn draft_rank_reservations_with(
         .try_fold(0u64, |sum, r| sum.checked_add(r.bytes))
         .context("DFlash reservation sum")?;
     Ok(DraftReservations {
+        arena,
         resident_weights,
         steady: costs,
         packing,

@@ -100,9 +100,81 @@ pub fn allocation_granularity_component(owner: AllocationGranularity, maximum: u
         kind: ComponentKind::AllocationGranularity(owner) })
 }
 
+/// One immutable SM120 arena request, its resident-weight claim and its single
+/// separately named backing tail. Replaces payload/padding/old request forecasts;
+/// callers must not retain those charges or apply this model to Spark storage.
+/// Apply a finite-profile activation to every returned component together.
+pub fn weight_arena_components(
+    layout: &crate::serving_capacity::WeightArenaLayout,
+    location: Location,
+    lifetime: Lifetime,
+    maximum: u64,
+) -> Result<Vec<Component>, Refusal> {
+    let bytes = u64::try_from(layout.bytes()).map_err(|_| Refusal::Overflow("weight arena extent"))?;
+    weight_arena_extent_components(layout.id(), bytes, location, lifetime, maximum)
+}
+
+/// Extent-only counterpart for facts carrying the shared recipe's exact ID/B.
+/// `bytes` includes inter-view padding, never the driver tail or a payload sum.
+pub fn weight_arena_extent_components(
+    id: &str,
+    bytes: u64,
+    location: Location,
+    lifetime: Lifetime,
+    maximum: u64,
+) -> Result<Vec<Component>, Refusal> {
+    if id.is_empty() || bytes == 0 || maximum == 0
+        || !matches!(location, Location { device: Device::Coordinator(_), domain: Domain::Device }) {
+        return Err(Refusal::InvalidFact("weight arena requires a named positive SM120 device extent and page domain".into()));
+    }
+    let root = Allocation::buffer(id, location, bytes, lifetime, Category::Weights, "weight arena");
+    let curve = ByteCurve::fixed(bytes, maximum);
+    let resident = ResidentWeight::from_allocation(&root, ResidentWeights(bytes));
+    let tail = allocation_granularity_component(AllocationGranularity {
+        id: format!("{id}.tail"), location, lifetime,
+        backings: vec![GranularityBacking { backing: id.into(), requests: vec![bytes] }],
+        evidence: GranularityEvidence::Forecast,
+    }, maximum)?;
+    Ok(vec![Component::allocation(root, curve.clone(), false, maximum),
+        Component::resident_weight(resident, curve), tail])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_extent_replaces_payload_and_prices_one_physical_request() -> Result<(), Refusal> {
+        let layout = crate::serving_capacity::WeightArenaLayout::new("target.rank0",
+            [("a".into(), (3 << 20) + 1), ("b".into(), 17)])
+            .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
+        assert_eq!(layout.padding_bytes(), 255);
+        let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+        let components = weight_arena_components(&layout, Location::coordinator(0), lifetime, 32)?;
+        assert_eq!(components.len(), 3);
+        let ComponentKind::Allocation { template: root, deferred, .. } = &components[0].kind else { panic!("missing root") };
+        assert_eq!(root.id, layout.id());
+        assert_eq!(root.bytes, layout.bytes() as u64);
+        assert_eq!(root.lifetime, lifetime);
+        assert_eq!(root.group, "weight arena");
+        assert!(root.view.is_none() && !deferred);
+        let ComponentKind::ResidentWeight(resident) = &components[1].kind else { panic!("missing residency") };
+        assert_eq!(resident.id, root.id);
+        assert_eq!(resident.weights, ResidentWeights(root.bytes));
+        let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("missing tail") };
+        assert_eq!(tail.id, "target.rank0.tail");
+        assert_eq!(tail.lifetime, lifetime);
+        assert_eq!(tail.requests(), [root.bytes]);
+        assert_eq!(tail.backings[0].backing, root.id);
+        assert_eq!(root.bytes + tail.bytes()?, 4 << 20);
+        assert_ne!(root.bytes, layout.payload_bytes() as u64);
+        assert!(weight_arena_extent_components("", 1, Location::coordinator(0), lifetime, 32).is_err());
+        assert!(weight_arena_extent_components("x", 0, Location::coordinator(0), lifetime, 32).is_err());
+        assert!(weight_arena_extent_components("x", 1, Location::coordinator(0), lifetime, 0).is_err());
+        assert!(weight_arena_extent_components("x", 1, Location::PINNED, lifetime, 32).is_err());
+        assert!(weight_arena_extent_components("x", 1, Location { device: Device::Spark(0), domain: Domain::Device }, lifetime, 32).is_err());
+        Ok(())
+    }
 
     #[test]
     fn retained_kimi_requests_match_physical_slack_within_one_block() {

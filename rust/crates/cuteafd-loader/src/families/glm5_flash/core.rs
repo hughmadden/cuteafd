@@ -504,7 +504,9 @@ mod tests {
         std::fs::create_dir_all(&draft)?;
         std::fs::write(draft.join("config.json"), json!({"hidden_size":4096,"intermediate_size":12288,"num_hidden_layers":5,
             "num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"vocab_size":154880,
-            "dflash_config":{"target_layer_ids":[0,8,16,24,32],"conv_group_size":16,"selector_rank":256,"block_size":8}}).to_string())?;
+            "rms_norm_eps":1e-6,"sliding_window":2048,"rope_theta":10000.0,
+            "dflash_config":{"target_layer_ids":[0,8,16,24,32],"conv_group_size":16,"selector_rank":256,"block_size":8,
+                "conv_kernel_size":2,"mask_token_id":0,"selector_top_k":16}}).to_string())?;
         let input = testing::BudgetedPlanInput::open(root.path())?;
         assert_eq!(input.checkpoint().tensors.len(), 151198);
         assert_eq!(input.checkpoint().tensors.iter().map(|t| t.meta.byte_length).sum::<u64>(), 165621841672);
@@ -517,6 +519,35 @@ mod tests {
             assert!(report.executable(), "{}", crate::plan::render(&report));
             let layout = report.memory_layout.as_ref().unwrap();
             assert!(layout.devices.iter().take(gpus).all(|d| d.items.iter().any(|i| i.group == "native K6 core")));
+            let representation = crate::families::glm5_flash::resident::GlmfRepresentation {
+                kda_fp8: false, output_shard: false, fp8_head: false,
+            };
+            let embedding = input.checkpoint().tensors.iter().find(|tensor|
+                tensor.meta.name == "model.language_model.embed_tokens.weight").unwrap().meta.byte_length;
+            let targets = crate::families::glm5_flash::weight_layout::target_options(input.checkpoint(), &cfg,
+                &vec![crate::placement::LayerMode::HeadSplit; cfg.layers], gpus, representation, embedding, None)?;
+            let mut draft_owners = crate::placement::families::glm5_flash::admission::ProcessOwners::new(
+                (128 << 30, 128 << 30), 0);
+            draft_owners.draft(&draft, crate::plan::layout::LayoutOptions::default().glmf_draft_representation, gpus, false)?;
+            let draft_home = layout.devices.iter().take(gpus).position(|device| device.items.iter().any(|item|
+                item.group == "allocation granularity" && item.format.starts_with("glm5_flash/draft/"))).unwrap();
+            let expected = targets.into_iter().find(|arenas| arenas.iter().enumerate().all(|(rank, arena)| {
+                let bytes = arena.bytes() as u64 + if rank == draft_home {
+                    draft_owners.draft_arenas[rank].bytes() as u64
+                } else { 0 };
+                layout.devices[rank].items.iter().filter(|item| item.group == "weight arena")
+                    .map(|item| item.bytes).sum::<u64>() == bytes
+            })).expect("one exact target embedding home");
+            for (rank, target) in expected.into_iter().enumerate() {
+                let mut arenas = vec![target];
+                if rank == draft_home { arenas.push(draft_owners.draft_arenas[rank].clone()); }
+                testing::assert_weight_arena_items(&layout.devices[rank], &arenas);
+                assert!(!layout.devices[rank].items.iter().any(|item| item.group == "target weights"));
+                for alias in layout.devices[rank].items.iter().filter(|item| item.group == "embedding") {
+                    assert_eq!(alias.bytes, 0);
+                    assert_eq!(alias.format, "alias of target weight arena; charged in weight arena");
+                }
+            }
             let serialized = serde_json::to_value(&report)?;
             let devices = serialized["memory_layout"]["devices"].as_array().unwrap();
             let sparks: Vec<_> = devices.iter().filter(|device| device["kind"] == "spark").collect();

@@ -285,14 +285,13 @@ impl RankWeightLayout {
         self.arena_layout(format!("step5/mtp/gpu{device}"), |_| true)
     }
 
-    /// Bytes the predictor's weights admit, planned and served alike: its arena
-    /// payload plus the arena's inter-view padding, charged once.
+    /// The predictor's single physical backing and its separately derived SM120 tail.
     pub fn mtp_weight_charge(checkpoint: &Checkpoint, contract: &CoordinatorContract, depth: usize) -> Result<u64> {
         let layout = Self::mtp_from_contract(checkpoint, contract, depth)?;
-        // No predictor owners (depth 0): no arena is allocated, nothing is charged.
         if layout.operands.is_empty() && layout.core.is_empty() { return Ok(0); }
-        let padding = layout.mtp_arena(0)?.padding_bytes() as u64;
-        layout.resident_bytes.checked_add(padding).context("Step-5 predictor arena charge overflow")
+        let bytes = layout.mtp_arena(0)?.bytes() as u64;
+        bytes.checked_add(crate::placement::planner::allocation_granularity_forecast(&[bytes])?)
+            .context("Step-5 predictor arena charge overflow")
     }
 
     pub fn from_checkpoint(checkpoint: &Checkpoint, rank: usize, ranks: usize) -> Result<Self> {

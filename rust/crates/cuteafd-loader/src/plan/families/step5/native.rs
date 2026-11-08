@@ -13,9 +13,12 @@ const TILE: usize = 64;
 const CAPACITY: usize = 131072;
 const SELECT: usize = 4 * 4104;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankAdmission {
     pub resident_weights: crate::placement::ResidentWeights,
+    /// Independently retired backings and their logical weight-budget payloads.
+    pub weight_arenas: Vec<(crate::serving_capacity::WeightArenaLayout, crate::placement::ResidentWeights)>,
+    /// Private scratch only; immutable weight storage is charged by `weight_arenas`.
     pub immutable: u64,
     pub workspace: u64,
 }
@@ -431,15 +434,12 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
         .context("Step-5 native rank immutable overflow")?;
     let weights = layout.core.values().try_fold(weights, |n, core| n.checked_add(core.bytes as u64))
         .context("Step-5 native core weights overflow")?;
-    // The served target arena's inter-view padding, from the same layout the
-    // daemon allocates. Payload stays with its owners: target weights and rotary
-    // planes here, the entry rank's embedding under its Embedding owner.
     let entry = rank == usize::from(ownership.execution().spec().entry_gpu);
-    let padding = layout.target_arena(Some(&contract.rope_tables), rank as i32, cfg.layers, entry)?
-        .padding_bytes() as u64;
-    let mut immutable = weights.checked_add(contract.rope_tables.allocation_bytes)
-        .and_then(|n| n.checked_add(padding))
-        .context("Step-5 native immutable overflow")?;
+    let arena = layout.target_arena(Some(&contract.rope_tables), rank as i32, cfg.layers, entry)?;
+    let embedding = if entry { layout.operands.iter().find(|w| w.name == "model.embed_tokens.weight")
+        .map_or(0, |w| w.allocation_bytes) } else { 0 };
+    let logical = weights.checked_add(embedding).context("Step-5 target logical weights overflow")?;
+    let mut immutable = 0u64;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
         rank_attention_bytes(&cfg, ownership, rank, unit)?.checked_add(ffn_region_bytes(unit, span)?)
@@ -456,6 +456,7 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
     }
     Ok(RankAdmission {
         resident_weights: crate::placement::ResidentWeights(weights),
+        weight_arenas: vec![(arena, crate::placement::ResidentWeights(logical))],
         immutable,
         workspace,
     })
@@ -616,17 +617,15 @@ mod tests {
         assert_eq!(layout.core["lm_head.weight"].bits, 6);
         let weights = layout.operands.iter().filter(|w| w.name != "model.embed_tokens.weight")
             .map(|w| w.allocation_bytes).sum::<u64>()
-            + layout.core.values().map(|core| core.bytes as u64).sum::<u64>()
-            + CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables.allocation_bytes;
-        // The served rank arena's inter-view padding (rank 0 is the entry rank).
-        let padding = layout.target_arena(Some(&CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables),
-            0, cfg.layers, true)?.padding_bytes() as u64;
-        assert!(padding > 0);
+            + layout.core.values().map(|core| core.bytes as u64).sum::<u64>();
+        let arena = layout.target_arena(Some(&CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables),
+            0, cfg.layers, true)?;
+        assert!(arena.padding_bytes() > 0);
         for logits in [16, 64] {
             let admitted = rank_admission(&checkpoint, &ownership, 0, 64, 64, logits)?;
-            assert_eq!(admitted.immutable, weights + padding + 165511240);
-            assert_eq!(admitted.resident_weights.0, weights
-                - CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables.allocation_bytes);
+            assert_eq!(admitted.immutable, 165511240);
+            assert_eq!(admitted.resident_weights.0, weights);
+            assert_eq!(admitted.weight_arenas[0].0, arena);
             let reusable = rank_attention_bytes(&cfg, &ownership, 0, 64)?
                 + ffn_region_bytes(64, 64)? + native_scratch_bytes(&layout, 64)?;
             assert_eq!(admitted.workspace, reusable.max(plane_bytes(&head_planes(logits)?)?));

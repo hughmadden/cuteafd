@@ -80,16 +80,23 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
-    let fixed = devices.iter().flat_map(|d| d.items.iter().map(|i|
+    // Retained device weights are one preplanned arena per GPU, from the same
+    // header recipe the loader allocates; the embedding joins GPU0's arena
+    // only while it stays on the GPU. Planned layouts use the default (unsplit)
+    // query/output projections, the only configuration the planner models.
+    let gpu_embedding = devices[0].items.iter().any(|item| item.category == Category::Embedding);
+    let target_layout = v41::weight_layout::TargetLayout::from_headers(
+        checkpoint.tensors.iter().map(|tensor| &tensor.meta),
+        (ranks == 2).then(|| std::array::from_fn(|layer| usize::from(layer >= 20))),
+        gpu_embedding, mode, false, false)?;
+    for device in &mut devices { device.items.retain(|item| !v41::owners::is_arena_weight(item)); }
+    let mut fixed = v41::owners::target_arena_demands(&target_layout);
+    fixed.extend(devices.iter().flat_map(|d| d.items.iter().map(|i|
         Demand::new(d.index as u8, i.category, i.group.clone(), i.bytes, i.basis)
-            .with_resident_weights(ResidentWeights(i.bytes)))).collect::<Vec<_>>();
+            .with_resident_weights(ResidentWeights(i.bytes)))));
     let mut startup: Vec<Owner> = Vec::new();
     if ranks == 1 {
-        if let Some(head) = checkpoint.tensors.iter().find(|t| t.meta.name == "head.weight") {
-            let source = head.meta.byte_length;
-            let packing = mode.load_bytes(source);
-            startup.push(Owner::from_demand(&v41::owners::vocabulary_load_phase(&fixed, &target, packing)?));
-        }
+        startup.push(Owner::from_demand(&v41::owners::vocabulary_load_phase(&target_layout.ranks[0], mode)?));
     }
     let spark_ranks = report.placement.spark_ranks();
     // The two decode lanes' links, further slots' reduce outputs and the one prefill link.
@@ -112,10 +119,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let staging = catalog.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
         ensure!((1..=cuteafd_core::MAX_DSPARK_PROPOSALS as u8).contains(&options.dspark_draft_limit), "invalid V4.1 dSpark draft limit");
         let width = if options.dspark_draft_limit > 5 { 7 } else { 5 };
+        let dense = v41::weight_layout::draft_layout_from_headers(checkpoint.tensors.iter().map(|tensor| &tensor.meta))?;
         let mut draft = DraftInventory { resident: bytes, runtime: programs.dspark(&manifest, rows, shape.concurrency, width, ranks,
             mode)?, marks: marks * 3 * 128 * 528,
             staging: [staging, 0], loading_experts: [3 * native_expert_bytes(128, 5120, 2304), 0],
-            loader_peak: [bytes, 0], ..Default::default() };
+            loader_peak: [bytes, 0], dense: Some(dense), ..Default::default() };
         if options.tp2_dspark_experts {
             let halves = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"))
                 .context("missing V4.1 TP2 dSpark allocation manifest")?)?;
@@ -234,6 +242,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         experts,
         workspace,
         owners: physical.drain(..).collect(),
+        weight_arenas: target_layout.ranks.clone(),
         startup,
         allowances: reserves,
         draft,
@@ -245,7 +254,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         budgets,
     }.prepare()?;
     prepared.recipe.encoders = encoders.clone();
+    prepared.recipe.vision_arena = (vision_weights > 0).then(|| v41::weight_layout::vision_layout_from_headers(
+        checkpoint.tensors.iter().map(|tensor| &tensor.meta))).transpose()?;
     prepared.recipe.media_cache_bytes = media_cache_bytes;
+    let vision_extent = prepared.recipe.vision_arena.as_ref().map_or(0, |layout| layout.bytes() as u64);
     let admitted = prepared.admit(request)?;
     report.host_ledger = Some(admitted.host_ledger(host_facts.prefix_bytes)?);
     let mut encoder = encoders[admitted.solved.decisions.encoder.context("missing admitted encoder")?].clone();
@@ -280,7 +292,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         ensure_tower_spark(&mut sparks, rank, options);
         let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) else { continue };
         let overhead = crate::plan::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES;
-        device.items.push(Item::new(Category::Weights, "vision tower", "", encoder.weights, Basis::Exact));
+        device.items.push(Item::new(Category::Weights, "vision tower", "", vision_extent, Basis::Exact));
         device.items.push(Item::new(Category::Workspace, "vision scratch", "",
             encoder.scratch.saturating_sub(overhead), Basis::Exact));
         device.items.push(Item::new(Category::Runtime, "vision CUDA overhead", "", overhead, Basis::Exact));
@@ -405,7 +417,7 @@ mod tests {
                 experts: vec![expert; 40], workspace: 0,
                 owners: vec![Owner::charged(0, Category::Weights, "backbone", 2 * gib),
                     Owner::charged(1, Category::Weights, "backbone", 2 * gib)],
-                startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
+                weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
                 media_cache_bytes: 0, resident_weight_limit: limit,
                 spark_reply_formats: Default::default(), operation: Operation::Serving, budgets,
             };
@@ -445,7 +457,7 @@ mod tests {
             replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
             experts: vec![expert; 40], workspace: 0,
             owners: vec![Owner::weights(0, Category::Weights, "backbone", 2 * gib)],
-            startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
+            weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
             media_cache_bytes: 0, resident_weight_limit: 0, spark_reply_formats: Default::default(),
             operation: Operation::Serving, budgets,
         };

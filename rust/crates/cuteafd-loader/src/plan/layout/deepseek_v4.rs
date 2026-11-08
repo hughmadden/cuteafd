@@ -104,6 +104,11 @@ fn layout_for_experts(report: &mut PlanReport, model: &dyn super::super::FamilyM
     if options.host_embedding {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
+    // A GPU embedding is a view of rank 0's target arena, which admission
+    // charges with the rest of the retained weights; it is not baseline.
+    for device in &mut devices {
+        device.items.retain(|item| item.category != Category::Embedding);
+    }
     let exl3_workspace = expert_workspace(report, model, input, options.workspace_manifest.as_deref(), shape.prefill_rows);
     if exl3_workspace.is_none() && report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) {
         notes.push("Local EXL3 workspace allowance is estimated without matching rtx-tp1/m*/v41_exl3.json capacity manifests; images bundle them, or export the exl3 tree alongside PROGRAMS.json".into());
@@ -333,18 +338,16 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
     if devices.len() == 2 && tp2_workspace.is_none() && (options.tp2_dspark_experts || (onboard != Onboard::Auto && onboard.layers(routed.layers - routed.first_layer) != Some(0))) {
         anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for dSpark or explicit local layers");
     }
-    let mut weights = crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg,
-        devices.len(), shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?;
     let host_embedding = options.host_embedding && checkpoint.tensors.iter().filter(|t|
         t.meta.name == "embed.weight" || t.meta.name.ends_with("embed_tokens.weight")).count() == 1
         && checkpoint.require_untied_embedding("embed.weight").is_ok();
-    let embedding = if host_embedding { 0 } else {
-        checkpoint.tensors.iter().find(|t| t.meta.name == "embed.weight")
-            .ok_or_else(|| anyhow::anyhow!("V4 embedding header missing"))?.meta.byte_length
-    };
-    for (group, bytes) in [("loaded embedding weights", embedding), ("loaded drafter weights", options.drafter_bytes)] {
-        weights.fixed.push(crate::placement::Demand::new(0, Category::Weights, group, 0, Basis::Exact)
-            .with_resident_weights(crate::placement::ResidentWeights(bytes)));
+    let weights = crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg,
+        devices.len(), shape.native_layers > 0, !host_embedding, checkpoint.tensors.iter().map(|t| &t.meta))?;
+    let mut extra = Vec::new();
+    if options.drafter_bytes > 0 {
+        // An external drafter's estimated device bytes are baseline; only its residency claim is admitted.
+        extra.push(crate::placement::Demand::new(0, Category::Weights, "loaded drafter weights", 0, Basis::Exact)
+            .with_resident_weights(crate::placement::ResidentWeights(options.drafter_bytes)));
     }
     let inputs = v4::V4Inputs {
         expert_usage: options.expert_usage,
@@ -361,7 +364,7 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
         full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len()),
         context,
-        attention: report.requested_attention, extra: Vec::new(), physical_bytes: Vec::new(),
+        attention: report.requested_attention, extra, physical_bytes: Vec::new(),
         host: Some(v4::V4Host { total: host.0, available: host.1, headroom: (8 << 30).max(host.0 / 10),
             cache_bytes: options.host_cache_bytes, prefix_entries: options.prefix_entries("deepseek_v4"),
             span_rows: report.prefill_span_rows.unwrap_or(shape.prefill_rows * options.prefill_waves), full_prefill_logits: options.full_prefill_logits,

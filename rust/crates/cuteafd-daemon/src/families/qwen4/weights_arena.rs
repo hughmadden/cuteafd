@@ -29,7 +29,7 @@ impl<'a> Qwen4Loader<'a> {
             && ranks.iter().map(|(d, _)| d.id).collect::<std::collections::BTreeSet<_>>().len() == ranks.len(),
             "Qwen arena needs distinct devices in one native library");
         let embedding_bytes = if embedding {
-            usize::try_from(self.tensor(&format!("{PREFIX}embed_tokens.weight"))?.meta.byte_length)?
+            cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(self.checkpoint)?
         } else { 0 };
         let layouts = cuteafd_loader::families::qwen4::weight_layout::coordinator_arenas(
             self.checkpoint, cfg, owners, ranks.len(), mtp,
@@ -104,6 +104,26 @@ mod tests {
         assert!(admit_startup(&layouts, &[0], &[false], &[logical - 1]).is_err());
         Ok(())
     }
+}
+
+/// Physical bytes of the distinct device weight backings actually retained
+/// (arena roots, plus the device embedding when it is one), read from the
+/// same receipts the census inventories: the runtime side of TP1's declared
+/// `single_owner_weights`, compared exactly.
+pub(crate) fn retained_backing_bytes(physical: &[i32], model: &Qwen4Weights<'_>,
+    embedding: &crate::shared::token_io::TokenEmbedding<'_>) -> Result<u64> {
+    use cuteafd_loader::placement::planner::{CoordinatorDevices, Domain};
+    let devices = CoordinatorDevices::new(physical)?;
+    let mut receipts = model.allocation_receipts(devices)?;
+    receipts.extend(embedding.allocation_receipts(devices, "qwen4.embedding")?);
+    let mut roots = std::collections::BTreeMap::new();
+    for receipt in receipts.iter().filter(|r| r.allocation.view.is_none()
+        && r.allocation.location.domain == Domain::Device) {
+        let previous = roots.insert(receipt.allocation.id.clone(), (receipt.address, receipt.allocation.bytes));
+        ensure!(previous.is_none_or(|p| p == (receipt.address, receipt.allocation.bytes)),
+            "Qwen weight backing {} reported with two extents", receipt.allocation.id);
+    }
+    roots.values().try_fold(0u64, |sum, (_, bytes)| sum.checked_add(*bytes).context("Qwen backing bytes overflow"))
 }
 
 pub(crate) fn probe(library: &NativeLibrary, physical: &[i32], model: &Qwen4Weights<'_>,

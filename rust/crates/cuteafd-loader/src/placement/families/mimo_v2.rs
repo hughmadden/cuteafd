@@ -10,7 +10,8 @@ use cuteafd_core::memory_layout::Category;
 
 /// Item category for one profile reservation or pool owner.
 pub fn reservation_category(name: &str) -> Category {
-    if name.contains("embed_tokens") { Category::Embedding }
+    if name.starts_with("mimo.") && name.ends_with(".tail") { Category::Runtime }
+    else if name.contains("embed_tokens") { Category::Embedding }
     else if name == "draft.fp8_scratch" { Category::Workspace }
     else if name.starts_with("draft.") { Category::Drafter }
     else if name.starts_with("workspace.") || name.starts_with("decode.") || name.starts_with("prefill") || name.starts_with("sampling.")
@@ -197,7 +198,7 @@ mod tests {
     }
 
     fn phase_profiles(profile: &CapacityProfile) -> crate::families::mimo_v2::capacity::MimoCapacityProfiles {
-        crate::families::mimo_v2::capacity::MimoCapacityProfiles { resident_weights: vec![ResidentWeights(0); profile.devices.len()],
+        crate::families::mimo_v2::capacity::MimoCapacityProfiles { weight_arenas: vec![vec![]; profile.devices.len()], resident_weights: vec![ResidentWeights(0); profile.devices.len()],
             loading: profile.devices.iter().map(|costs| DeviceCosts { device: costs.device, reservations: vec![], pool_unit_bytes: 0, reserve_bytes: 0 }).collect(),
             post_target_kv: profile.devices.clone(), steady: profile.clone() }
     }
@@ -229,6 +230,77 @@ mod tests {
                 &[0; 2][..ranks], vec![crate::placement::planner::Baseline::Forecast {
                     occupied: 0, source: "unit test".into(), assumed: false }; ranks],
                 (128 << 30, 128 << 30), 108 << 30, 6).unwrap(),
+        }
+    }
+
+    #[test]
+    fn arena_charges_replace_payloads_once_across_phases_and_onboarding() {
+        use crate::families::mimo_v2::capacity::MimoWeightArena;
+        use crate::placement::planner::{self, ComponentKind, Lifetime, Location, Phase, Recipe};
+        use crate::serving_capacity::WeightArenaLayout;
+        let (cfg, spark, no_spark) = fixture(2, 4096);
+        let mut facts = input(&cfg, &spark, &no_spark, 2, 4096);
+        let arenas = (0..2).map(|rank| vec![
+            MimoWeightArena { layout: WeightArenaLayout::new(format!("mimo.target.rank{rank}"),
+                [("payload".into(), (3 << 20) + 1), ("norm".into(), 17)]).unwrap(), lifetime: Lifetime::RESIDENT },
+            MimoWeightArena { layout: WeightArenaLayout::new(format!("mimo.dflash.rank{rank}"),
+                [("draft.payload".into(), (5 << 20) + 1)]).unwrap(),
+                lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth } },
+        ]).collect::<Vec<_>>();
+        for profiles in [&mut facts.spark, &mut facts.no_spark] {
+            profiles.weight_arenas = arenas.clone();
+            for (rank, arenas) in arenas.iter().enumerate() {
+                for arena in arenas {
+                    let rows = arena.reservations().unwrap();
+                    profiles.steady.devices[rank].reservations.extend(rows.clone());
+                    if arena.lifetime == Lifetime::RESIDENT {
+                        profiles.loading[rank].reservations.extend(rows.clone());
+                        profiles.post_target_kv[rank].reservations.extend(rows);
+                    }
+                }
+            }
+        }
+        let prepared = facts.prepare().unwrap();
+        let request = admission::production_request(4096, Some(4096), Onboard::Layers(1),
+            prepared.recipe.prefill, planner::Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+        let contract = prepared.recipe.prepare(&request).unwrap();
+        let mut roots = Vec::new();
+        for component in &contract.components {
+            if let ComponentKind::Allocation { template, .. } = &component.kind {
+                assert!(!template.id.contains(".mimo."), "no phase-specific duplicate arena rows");
+                if template.group == "weight arena" {
+                    assert_eq!(component.activation, planner::Activation::always());
+                    assert!(template.view.is_none());
+                    roots.push(template);
+                }
+            }
+        }
+        assert_eq!(roots.len(), 4);
+        for (rank, arenas) in arenas.iter().enumerate() {
+            for arena in arenas {
+                let root = roots.iter().find(|root| root.id == arena.layout.id()).unwrap();
+                assert_eq!(root.location, Location::coordinator(rank as u8));
+                assert_eq!(root.bytes, arena.layout.bytes() as u64);
+                assert_eq!(root.lifetime, arena.lifetime);
+                let tails = contract.components.iter().filter_map(|component| match &component.kind {
+                    ComponentKind::AllocationGranularity(tail) if tail.id == format!("{}.tail", root.id) => Some(tail),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(tails.len(), 1);
+                assert_eq!(tails[0].backings[0].backing, root.id);
+                assert_eq!(tails[0].requests(), [root.bytes]);
+                assert_eq!(tails[0].lifetime, root.lifetime);
+                assert_eq!(tails[0].bytes().unwrap(), arena.reservations().unwrap()[1].bytes);
+            }
+        }
+        let admitted = prepared.admit(request).unwrap();
+        for rank in 0..2 {
+            let claimed = admitted.solved.facts.resident_weights.iter()
+                .filter(|claim| claim.location == Location::coordinator(rank)).map(|claim| claim.weights.0).sum::<u64>();
+            let expert = admitted.solved.facts.resident_weights.iter()
+                .filter(|claim| claim.location == Location::coordinator(rank) && claim.id.contains("experts.arena"))
+                .map(|claim| claim.weights.0).sum::<u64>();
+            assert_eq!(claimed - expert, 11 << 30, "arena claims replace the old aggregate");
         }
     }
 

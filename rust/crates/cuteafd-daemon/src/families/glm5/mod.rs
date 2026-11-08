@@ -7,7 +7,6 @@ mod packed_check;
 pub(crate) mod serve;
 pub(crate) mod ml4_media;
 pub(crate) mod landing;
-use crate::shared::experts::exlr8::dense_weights;
 pub(crate) mod push;
 pub(crate) mod weights;
 pub(crate) mod core_runtime;
@@ -1030,7 +1029,7 @@ impl Opened {
             .map(|(layer, &rank)| (layer, usize::from(rank))).collect()).unwrap_or_default();
         let native_records = native.then(|| cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(&self.snapshot)).transpose()?;
         let native_dense_records = if native {
-            (0..devices.len()).map(|rank| dense_weights::NativeDenseRecords::new(
+            (0..devices.len()).map(|rank| cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords::new(
                 &self.snapshot, layers, devices.len(), rank, &whole_mla))
                 .collect::<Result<Vec<_>>>()?
         } else { Vec::new() };
@@ -1844,9 +1843,19 @@ impl Opened {
             };
             let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
                 ::from_fp8_option(args.draft_fp8);
-            let drafter = dflash::DflashDrafter::load(&self.library, programs, snapshot, file, stream,
+            let device = crate::shared::memory::device::Device { library: &self.library,
+                id: self.library.cuda_get_device()? };
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
+                    cuteafd_loader::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
+                        snapshot, representation, 0, 1)?)?)?;
+            let drafter = dflash::DflashDrafter::load_with(&self.library, programs, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
+                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache,
+                |id, name, bytes| {
+                    ensure!(id == device.id, "GLM draft arena device differs from load binder");
+                    arena.view(name, bytes)
+                })?;
             // Priming reads the weights; recorded owners prime only after commit.
             if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1870,8 +1879,16 @@ impl Opened {
                 Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard),
                     base: tensor.metadata.byte_offset, row_bytes: bytes / rows, rows: 0..rows, cols: 0..bytes / rows })
             };
-            let drafter = dflash::DflashDrafter::load_ml4(&self.library, programs, native, ml4,
-                ml4.logit_softcap as f32, stream, layout, &source)?;
+            let device = crate::shared::memory::device::Device { library: &self.library,
+                id: self.library.cuda_get_device()? };
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
+                    layout.immutable_arena_requests())?)?;
+            let drafter = dflash::DflashDrafter::load_ml4_with(&self.library, programs, native, ml4,
+                ml4.logit_softcap as f32, stream, layout, &source, |id, name, bytes| {
+                    ensure!(id == device.id, "ML4 draft arena device differs from load binder");
+                    arena.view(name, bytes)
+                })?;
             if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "mtp_dspark drafter resident");
             Some(drafter)
@@ -1881,7 +1898,7 @@ impl Opened {
     /// Native vocabulary, dense operands and drafter share the existing group.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn load_native<'s>(&'s self, args: &EngineArgs, admitted: &cuteafd_loader::placement::families::glm5::admission::NativeLoad, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
-        per_rank: &[dense_weights::NativeDenseRecords], owners: Option<&[u8]>, layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
+        per_rank: &[cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords], owners: Option<&[u8]>, layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
         loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, _peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
         media: &crate::shared::experts::rtx::dense::Records,

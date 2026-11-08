@@ -165,6 +165,7 @@ pub struct MlaDraftRuntimeLayout {
     buffers: Vec<MlaDraftBuffer>,
     owners: Vec<MlaDraftOwner>,
     weight_destinations: Vec<MlaDraftWeight>,
+    weight_arena_requests: Vec<(String, usize)>,
     context_split: bool,
 }
 
@@ -210,6 +211,24 @@ impl MlaDraftRuntimeLayout {
     pub fn buffers(&self) -> &[MlaDraftBuffer] { &self.buffers }
     pub fn owners(&self) -> &[MlaDraftOwner] { &self.owners }
     pub fn weight_destinations(&self) -> &[MlaDraftWeight] { &self.weight_destinations }
+    pub fn is_immutable_buffer(&self, name: &str) -> bool {
+        self.weight_destinations.iter().any(|weight| weight.owner == name)
+            || (self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark
+                && name == "markov_norms")
+    }
+    /// The exact immutable subset handed to the serving weight allocator.
+    pub fn immutable_arena_requests(&self) -> Vec<(String, usize)> {
+        self.common_device_buffers().into_iter().filter(|buffer| self.is_immutable_buffer(&buffer.name))
+            .map(|buffer| (buffer.name, buffer.bytes)).collect()
+    }
+    /// All immutable destinations, including DFlash2's separately loaded MLA weights.
+    pub fn weight_arena_requests(&self) -> Vec<(String, usize)> {
+        if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2 {
+            self.weight_arena_requests.clone()
+        } else {
+            self.immutable_arena_requests()
+        }
+    }
     pub fn device_buffers(&self) -> Vec<MlaDraftBuffer> {
         if self.owners.is_empty() { return self.buffers.clone(); }
         self.owners.iter().filter(|o| o.domain == MlaDraftDomain::Device)
@@ -1145,9 +1164,12 @@ impl MlaDflashConfig {
             add("fp8_scratch".into(), &[usize::try_from(bytes).map_err(|_| invalid())?])?;
             Some(GlmDraftFp8ScratchLayout { rows: scratch_rows, shapes })
         } else { None };
+        let weight_arena_requests = crate::families::glm5::draft_physical::mla_arena_requests(self, mode)
+            .map_err(|error| unsupported(&error.to_string()))?;
         let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
-            fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(), context_split: false };
+            fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(),
+            weight_arena_requests, context_split: false };
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -1260,7 +1282,8 @@ impl MlaDflashConfig {
             .ok_or_else(|| unsupported("mtp_dspark generated weight overflow"))?;
         let layout = MlaDraftRuntimeLayout { kind: self.kind, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
-            fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations, context_split: false };
+            fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations,
+            weight_arena_requests: Vec::new(), context_split: false };
         layout.resident_bytes()?;
         Ok(layout)
     }
@@ -1519,13 +1542,45 @@ mod tests {
             for page_rows in [64, 128] {
                 let facts = crate::placement::families::kimi::draft_facts(&layout, page_rows, 16, 1).unwrap();
                 assert!(facts.context_split);
+                let (gpu, arena) = facts.arena.as_ref().unwrap();
+                assert_eq!(*gpu, 1);
+                assert_eq!(arena.id(), "kimi/draft/1");
+                assert_eq!(arena.payload_bytes() as u64, layout.weights().resident_bytes().unwrap());
+                assert_eq!(arena.views().iter().map(|(name, view)| (name.clone(), view.bytes()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+                    layout.weight_arena_requests().into_iter().collect());
+                assert!(facts.owners.iter().all(|owner| owner.group != "MLA DFlash owned weights"
+                    && owner.weights_at_first == 0 && owner.weights_per_page == 0));
+                use crate::placement::planner::{ComponentKind, Lifetime, Location, weight_arena_components};
+                let components = weight_arena_components(arena, Location::coordinator(*gpu), Lifetime::RESIDENT, 16).unwrap();
+                let ComponentKind::Allocation { template: root, .. } = &components[0].kind else { panic!("arena root") };
+                let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("arena tail") };
+                assert_eq!(root.bytes, arena.bytes() as u64);
+                assert!(root.view.is_none());
+                assert_eq!(tail.backings.len(), 1);
+                assert_eq!(tail.backings[0].backing, root.id);
+                assert_eq!(tail.requests(), [root.bytes]);
+                assert_eq!(root.bytes + tail.bytes().unwrap(), root.bytes.div_ceil(2 << 20) * (2 << 20));
                 for pages in (2..=16).step_by(2) {
                     let physical = layout.with_pool_tokens(pages * page_rows as usize).unwrap().demands(1).unwrap().0;
-                    for (owner, actual) in facts.owners.iter().zip(physical.owned) {
+                    let retired = physical.owned.iter().filter(|owner| owner.group == "MLA DFlash owned weights")
+                        .collect::<Vec<_>>();
+                    assert_eq!(retired.len(), 1);
+                    assert_eq!(retired[0].bytes, arena.payload_bytes() as u64);
+                    let mutable = physical.owned.iter().filter(|owner| owner.group != "MLA DFlash owned weights")
+                        .collect::<Vec<_>>();
+                    assert_eq!(facts.owners.len(), mutable.len());
+                    for (owner, actual) in facts.owners.iter().zip(mutable) {
                         assert_eq!(owner.gpu, actual.gpu);
                         assert_eq!(owner.group, actual.group);
+                        assert_eq!(owner.category, actual.category);
                         assert_eq!(owner.bytes_at_first + owner.bytes_per_page * (pages - 1) as u64, actual.bytes);
                     }
+                    let admitted = facts.owners.iter().map(|owner|
+                        owner.bytes_at_first + owner.bytes_per_page * (pages - 1) as u64).sum::<u64>()
+                        + root.bytes + tail.bytes().unwrap();
+                    assert_eq!(admitted, physical.owned.iter().map(|owner| owner.bytes).sum::<u64>()
+                        - retired[0].bytes + root.bytes + tail.bytes().unwrap());
                 }
             }
         }

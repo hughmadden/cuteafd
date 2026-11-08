@@ -3,6 +3,7 @@ pub mod config;
 pub mod core;
 pub mod core_admission;
 pub mod resident;
+pub mod weight_layout;
 pub use config::{GlmNextAttention, GlmNextConfig};
 
 /// The same projection contract drives native loading and offline checkpoint stitching.

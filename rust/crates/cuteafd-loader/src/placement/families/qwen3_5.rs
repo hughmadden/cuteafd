@@ -19,6 +19,8 @@ pub const SINGLE: ExecutorModes = ExecutorModes { family: "qwen3_5", modes: &[WH
 pub struct DrafterBytes {
     pub owned: u64,
     pub weights: ResidentWeights,
+    /// The independently retired runtime arena; payload stays separate for workspace subtraction.
+    pub weight_arena: Option<(&'static str, u64)>,
     pub scratch: u64,
     /// Full-context draft K/V per target pool page, not per sequence/context.
     pub pool_unit: u64,
@@ -29,6 +31,17 @@ pub struct DrafterBytes {
 impl DrafterBytes {
     /// Native MTP owns one dense block, bounded hidden/logit planes and pooled KV sidecars.
     pub fn native_mtp(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config) -> anyhow::Result<Self> {
+        use crate::families::qwen3_5::weight_layout::{mtp_arena, DenseFormat};
+        let format = if checkpoint.tensors.iter().any(|t|
+            t.meta.name == "mtp.layers.0.mlp.gate_proj.weight" && t.meta.dtype == DType::F8E4M3) {
+            DenseFormat::Fp8
+        } else { DenseFormat::Bf16 };
+        let arena = mtp_arena(checkpoint, cfg, format)?;
+        Ok(Self { weight_arena: Some(("qwen3_5/mtp/gpu0", arena.bytes() as u64)),
+            ..Self::native_mtp_payload(checkpoint, cfg)? })
+    }
+
+    pub(crate) fn native_mtp_payload(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config) -> anyhow::Result<Self> {
         use anyhow::Context;
         ensure!(cfg.mtp_layers == 1, "dense MTP requires one checkpoint-native layer");
         let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
@@ -70,7 +83,8 @@ impl DrafterBytes {
         // The independent greedy selector owns one ID/status/log-probability row.
         owned += 12;
         let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
-        Ok(Self { owned, weights, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64, host_prefetch: 0 })
+        Ok(Self { owned, weights, weight_arena: None, scratch: 0,
+            pool_unit: (64 * record + cfg.hidden * 2) as u64, host_prefetch: 0 })
     }
 
     pub fn block_dspark(snapshot: &std::path::Path, config: &serde_json::Value, slots: usize, sms: u64, context: usize)
@@ -86,8 +100,12 @@ impl DrafterBytes {
             .filter(|tensor| tensor.name != "embed_tokens.weight" && tensor.name != "lm_head.weight")
             .try_fold(0u64, |bytes, tensor| bytes.checked_add(tensor.byte_length))
             .ok_or_else(|| anyhow::anyhow!("drafter prefetch bytes overflow"))?;
+        let arena = crate::serving_capacity::WeightArenaLayout::new("qwen3_5/dspark/gpu0",
+            crate::formats::block_dspark::block_dspark_arena_requests(snapshot, GlmDraftRepresentation::Bf16Only)?)?;
+        ensure!(arena.payload_bytes() as u64 == residency.weights.0, "dense dSpark arena differs from weight payload");
         Ok(Self { owned: residency.owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
-            weights: residency.weights, scratch: residency.scratch, pool_unit: layout.full_bytes, host_prefetch })
+            weights: residency.weights, weight_arena: Some(("qwen3_5/dspark/gpu0", arena.bytes() as u64)),
+            scratch: residency.scratch, pool_unit: layout.full_bytes, host_prefetch })
     }
 }
 

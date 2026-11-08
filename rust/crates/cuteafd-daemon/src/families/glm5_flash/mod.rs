@@ -20,7 +20,7 @@ pub(crate) mod head;
 mod precision;
 mod native;
 pub(crate) mod weights;
-mod weight_layout;
+use cuteafd_loader::families::glm5_flash::weight_layout;
 
 /// Whether this launch's coordinator operands can join a push group: every
 /// representation the push path records (BF16 operands, GPU FP8 copies,
@@ -2000,6 +2000,7 @@ impl Opened {
                 representation, args.token_io.embed_placement,
                 engine::GlmfAttention { first_owner: attention.first_owner ^ 1, ..attention })?);
         }
+        process.target(&headers, &inputs, native_admission.map(|native| (&native.facts, &native.metadata)))?;
         let geometry = admission::admission::host_geometry(&inputs)?;
         let host_config = args.serving_prefix.as_ref().map(|prefix| {
             use cuteafd_engine::prefix::{FamilyLayout, MarkStore, PageOwners};
@@ -2025,6 +2026,11 @@ impl Opened {
             self.experts.as_ref(),
             native_admission.map(|native| (&native.facts, &native.metadata)))?;
         process.draft_tp2 = draft_tp2;
+        if let Some(path) = &args.draft {
+            process.draft(path,
+                cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
+                devices.len(), args.tp2_dflash)?;
+        }
         process.draft_push = self.draft_push(args)?;
         if native_admission.is_none() && process.push_host.is_none() {
             process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);
@@ -2384,7 +2390,7 @@ impl Opened {
                 .then(|| embed.as_ref().context("Flash embedding source").and_then(|source|
                     source.allocation_request("embedding.table", cuteafd_loader::placement::planner::EmbeddingHome::Device(embedding_rank as u8))))
                 .transpose()?.map(|request| (embedding_rank, request.bytes as usize));
-            weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8,
+            weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8 != fp8::KdaFp8::Off,
                 args.kda_output_shard, args.fp8_head, embedding)?
         };
         let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {
@@ -2664,10 +2670,11 @@ impl Opened {
             Ok((loaded.0, (loaded.1, tp2)))
             })?
         };
-        embedding.validate_residency(embedding_device.id, placement.items[embedding_rank].iter()
-            .filter(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
-                && item.group == "embedding" && item.bytes > 0)
-            .map(|item| item.bytes).sum::<u64>()).context("GLM Flash embedding admission")?;
+        embedding.validate_residency(embedding_device.id, admitted_plan.facts.allocations.iter()
+            .filter(|owner| owner.location == cuteafd_loader::placement::planner::Location::coordinator(embedding_rank as u8)
+                && owner.category == cuteafd_core::memory_layout::Category::Embedding
+                && owner.group == "embedding" && owner.view.is_some())
+            .map(|owner| owner.bytes).sum::<u64>()).context("GLM Flash embedding admission")?;
         tracing::info!(rank = embedding_rank, device = embedding_device.id, bytes = embedding.device_bytes(),
             "GLM Flash embedding matches admission (peer-readable single residency)");
         let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
@@ -3088,7 +3095,7 @@ impl Opened {
 impl Opened {
     /// The checkpoint's `embed_tokens` (BF16 [vocab, hidden]).
     fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
-        let name = format!("{}embed_tokens.weight", weights::PREFIX);
+        let name = format!("{}embed_tokens.weight", weight_layout::PREFIX);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(&name))
             .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
         let tensor = &self.checkpoint.tensors[at];

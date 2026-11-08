@@ -652,12 +652,14 @@ impl<'a> Runtime<'a> {
         available: u64, reservations: &[u64]) -> Result<Self> {
         ensure!((1..=3).contains(&depth) && rows > depth,
             "Step-5 predictor runtime depth/row capacity");
-        // One arena holds every predictor stage; the admitted charge is its
-        // payload plus padding, exactly as the planner charged it.
+        // One independently retired predictor arena, plus its single backing tail.
         let packed = RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?
             .mtp_arena(cache.stream.device.id)?;
         let immutable = RankWeightLayout::mtp_weight_charge(checkpoint, contract, depth)?;
-        ensure!(immutable == packed.bytes() as u64, "Step-5 predictor arena differs from its admitted charge");
+        let bytes = packed.bytes() as u64;
+        let tail = cuteafd_loader::placement::planner::allocation_granularity_forecast(&[bytes])?;
+        ensure!(immutable == bytes.checked_add(tail).context("Step-5 predictor backing overflow")?,
+            "Step-5 predictor arena differs from its admitted charge");
         let total = reservations.iter().try_fold(immutable, |n, bytes| n.checked_add(*bytes))
             .context("Step-5 predictor runtime reservation overflow")?;
         ensure!(total <= available && cache.layout().ranks[cache.rank()].mtp_lengths.len() == depth,

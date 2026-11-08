@@ -203,10 +203,10 @@ fn representation_notes(cfg: &Qwen4Config) -> Vec<String> {
     vec![
         format!("GDN/attention in-out projections ({} layers{}): checkpoint BF16 {:.2} GiB resident by default; \
             --fp8-decode true holds them as E4M3 + FP32 128x128 block scales only ({:.2} GiB; qwen4_*_w8 programs: \
-            16-row GEMV, W8A16 above and in prefill, --fp8-prefill-w8a8 for E4M3 activations), converting one \
-            BF16 matrix at a time (<= {:.0} MiB device staging)",
+            16-row GEMV, W8A16 above and in prefill, --fp8-prefill-w8a8 for E4M3 activations), converting \
+            128-row windows on the GPU through one {:.0} MiB device scratch per GPU",
             cfg.layers, if mtp { " + MTP" } else { "" }, gib(all.projections_bf16), gib(all.projections_fp8),
-            all.max_device_staging as f64 / (1u64 << 20) as f64),
+            crate::shared::dense_read::STEP_BYTES as f64 / (1u64 << 20) as f64),
         format!("lm_head (shared by target and MTP drafts): BF16 {:.2} GiB by default; --mtp-fp8-head true holds \
             one E4M3 head with per-row x 128-K scales ({:.2} GiB, quantized on the host) and runs every logits \
             row through qwen4_head_fp8 in 16-row spans", gib(all.head_bf16), gib(all.head_fp8)),

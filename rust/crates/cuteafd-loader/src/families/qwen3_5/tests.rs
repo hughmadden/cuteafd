@@ -122,11 +122,24 @@ fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
         "enable_confidence_head":true,"confidence_head_with_markov":true,
         "dflash_config":{"projector_type":"dspark","mask_token_id":63,"target_layer_ids":[0]}});
     std::fs::write(draft.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
-    crate::plan::testing::write_safetensors(&draft.path().join("model.safetensors"), &[
-        t("fc.weight", "BF16", &[4096, 4096]),
-        t("embed_tokens.weight", "BF16", &[64, 4096]),
-        t("lm_head.weight", "BF16", &[64, 4096]),
-    ]);
+    let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(&config).unwrap();
+    let tensors = std::cell::RefCell::new(Vec::new());
+    crate::formats::block_dspark::block_dspark_weight_recipe(&cfg,
+        |name, shape| { tensors.borrow_mut().push(t(name, "BF16", shape)); Ok::<_, ()>(()) },
+        |parts, cols| { for (name, rows) in parts { tensors.borrow_mut().push(t(*name, "BF16", &[*rows, cols])); } Ok(()) }).unwrap();
+    let tensors = tensors.into_inner();
+    crate::plan::testing::write_safetensors(&draft.path().join("model.safetensors"), &tensors);
+    use crate::placement::families::qwen3_5::DrafterBytes;
+    use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+    let arena = crate::serving_capacity::WeightArenaLayout::new("qwen3_5/dspark/gpu0",
+        crate::formats::block_dspark::block_dspark_arena_requests(draft.path(), GlmDraftRepresentation::Bf16Only).unwrap()).unwrap();
+    let charge = DrafterBytes::block_dspark(draft.path(), &config, 17, 142, 262144).unwrap();
+    assert_eq!(charge.weight_arena, Some(("qwen3_5/dspark/gpu0", arena.bytes() as u64)));
+    assert_eq!(charge.weights.0, arena.payload_bytes() as u64);
+    let checkpoint = plan::Checkpoint::open(dir.path()).unwrap();
+    let target_cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let target = weight_layout::target_arena(&checkpoint, &target_cfg, cuteafd_core::DType::F32,
+        weight_layout::DenseFormat::Bf16).unwrap();
     for c in [17, 32, 33, 64] {
         let layout = options.layout.as_mut().unwrap();
         layout.concurrency = c;
@@ -139,13 +152,19 @@ fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
         let memory = report.memory_layout.unwrap();
         let supported = crate::formats::block_dspark::supports_sequences(c as usize);
         assert_eq!(memory.notes.iter().any(|note| note.contains("anchor-only")), !supported);
-        if !supported {
+        if supported {
+            assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == "weight arena")
+                .map(|item| item.bytes).sum::<u64>(), (target.bytes() + arena.bytes()) as u64);
+        } else {
             options.layout.as_mut().unwrap().dense_qwen_drafter_snapshot = None;
             let plain = plan::plan(dir.path(), &options).unwrap().memory_layout.unwrap();
             assert_eq!(memory.devices, plain.devices);
             assert_eq!(memory.pool_tokens, plain.pool_tokens);
         }
     }
+    let missing = tensors.into_iter().filter(|(name, _, _)| name != "layers.0.self_attn.q_proj.weight").collect::<Vec<_>>();
+    crate::plan::testing::write_safetensors(&draft.path().join("model.safetensors"), &missing);
+    assert!(DrafterBytes::block_dspark(draft.path(), &config, 17, 142, 262144).is_err());
 }
 
 #[test]
@@ -162,6 +181,15 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     let memory = report.memory_layout.unwrap();
     assert_eq!(memory.pool_tokens, 262144, "{:?}", report.hints);
     assert_eq!(memory.devices.len(), 1);
+    let checkpoint = plan::Checkpoint::open(dir.path()).unwrap();
+    let cfg = Qwen35Config::from_hf(&checkpoint.config).unwrap();
+    let arena = weight_layout::target_arena(&checkpoint, &cfg, cuteafd_core::DType::F32,
+        weight_layout::DenseFormat::Bf16).unwrap();
+    assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == "weight arena")
+        .map(|item| item.bytes).sum::<u64>(), arena.bytes() as u64);
+    let tail = crate::placement::planner::allocation_granularity_forecast(&[arena.bytes() as u64]).unwrap();
+    assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
+        .map(|item| item.bytes).sum::<u64>(), tail);
     assert!(memory.devices[0].items.iter().any(|item| item.group == "exact retained prefix marks"
         && item.bytes == buffers.prefix as u64));
     assert!(memory.notes.iter().any(|note| note.contains("no captured graphs")));

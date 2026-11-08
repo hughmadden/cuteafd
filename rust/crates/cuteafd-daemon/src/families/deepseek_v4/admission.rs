@@ -15,9 +15,9 @@ pub(crate) struct Inputs<'a> {
     pub family: &'a str,
     /// (total bytes, baseline) per GPU: `--device` then `--split-device`.
     pub gpus: Vec<(u64, Baseline)>,
-    /// None before uploads; exact frozen modes after uploads. Rebase measured
-    /// free bytes by their non-embedding weights, which remain explicit demands.
-    pub loaded_modes: Option<&'a [cuteafd_loader::placement::LayerMode]>,
+    /// False before uploads. After uploads, measured free bytes are rebased by
+    /// the retained arenas (embedding included), which remain explicit demands.
+    pub weights_resident: bool,
     /// dSpark stages the loaded drafter owns caches for.
     pub cache_stages: usize,
     pub prefill_rows: usize,
@@ -130,10 +130,11 @@ pub(crate) fn admit(inputs: &v4::V4Inputs)
 pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inputs> {
     let gpus = inputs.gpus.len();
     let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
-        inputs.cfg, gpus, args.dspark, inputs.catalog.tensors().iter().map(|t| &t.metadata))?;
+        inputs.cfg, gpus, args.dspark, args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu,
+        inputs.catalog.tensors().iter().map(|t| &t.metadata))?;
     let mut baselines = inputs.gpus.clone();
-    if let Some(modes) = inputs.loaded_modes {
-        let loaded = weights.loaded_bytes(modes, gpus)?;
+    if inputs.weights_resident {
+        let loaded = weights.loaded_bytes()?;
         for ((total, baseline), bytes) in baselines.iter_mut().zip(loaded) {
             *baseline = match *baseline {
                 Baseline::Measured { free_bytes } => {
@@ -197,14 +198,6 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
         }
     } else { (Vec::new(), [0; 2]) };
     let spark_ranks = if args.skip_routed_experts { 0 } else { args.peers.split(',').filter(|p| !p.is_empty()).count() };
-    let embedding_weights = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu {
-        inputs.catalog.tensor("embed.weight")?.metadata.byte_length
-    } else { 0 };
-    let mut weights = weights;
-    weights.fixed.push(cuteafd_loader::placement::Demand::new(0,
-        cuteafd_core::memory_layout::Category::Embedding, "loaded embedding weights", 0,
-        cuteafd_core::memory_layout::Basis::Exact)
-        .with_resident_weights(cuteafd_loader::placement::ResidentWeights(embedding_weights)));
     Ok(v4::V4Inputs {
         expert_usage: args.expert_usage_enabled()?,
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), serving_context: cuteafd_loader::placement::planner::Context::resolve(inputs.max_context as u64, (args.max_context > 0).then_some(args.max_context as u64)), cfg: cache_cfg, weights, cache_stages: inputs.cache_stages,

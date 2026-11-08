@@ -523,6 +523,12 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_launchable() {
         assert_eq!(deployment["report"]["placement_supported"], true);
         assert_eq!(deployment["executable"], true);
         assert_eq!(deployment["wip_launchable"], true);
+        let placement = &deployment["estimated_placement"];
+        assert_eq!(placement["onboard_layers"], 42);
+        assert_eq!(placement["tp2"]["first"], 3);
+        assert_eq!(placement["tp2"]["layers"], 42);
+        assert!(placement["layers"].as_array().unwrap()[3..].iter()
+            .all(|layer| layer["experts"]["home"] == "rtx_tp2"));
         let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
         assert_eq!(devices.len(), 2);
         for (rank, device) in devices.iter().enumerate() {
@@ -530,8 +536,9 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_launchable() {
             assert_eq!(device["index"], rank);
             assert_eq!(device["kv_tokens"], 2_097_152);
             let items = device["items"].as_array().unwrap();
-            let routed = items.iter().find(|item| item["group"] == "TP2 expert layer halves 3..45")
-                .expect("all 42 routed layer halves must be resident on each RTX");
+            let routed = items.iter().find(|item| item["group"] == "RTX expert arena")
+                .expect("the selected routed expert backing must be charged on each RTX");
+            assert_eq!(routed["bytes"], placement["tp2"]["peak_bytes"][rank]);
             assert!(routed["bytes"].as_u64().unwrap() > 70u64 << 30);
             let resident = items.iter().map(|item| item["bytes"].as_u64().unwrap()).sum::<u64>();
             assert!(resident <= device["capacity_bytes"].as_u64().unwrap());

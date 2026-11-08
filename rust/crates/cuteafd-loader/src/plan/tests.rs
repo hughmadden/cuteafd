@@ -1096,6 +1096,34 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
     }
 }
 
+/// A checkpoint whose headers name the projections but not the coordinator
+/// tensors the loader allocates (here: no stream mixer or hyper-connections)
+/// cannot serve. `cuteafd plan` refuses it with the resident-layout hint and
+/// charges no partial payload sum as if it fit.
+#[test]
+fn qwen_incomplete_coordinator_headers_refuse_instead_of_charging_a_partial_payload() {
+    let config = qwen4_config(4);
+    let complete = qwen4_coordinator(&config, false);
+    let incomplete = complete.iter().filter(|(name, ..)| !name.contains("hyper_connection")).cloned()
+        .collect::<Vec<_>>();
+    assert!(incomplete.len() < complete.len());
+    let options = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
+        context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
+        host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..sparks(4) };
+    let hint = "Qwen resident weights: checkpoint headers do not describe the serve-qwen4 resident layout";
+    let resident_item = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+        .flat_map(|d| &d.items).any(|item| item.group == "target incl PLE projections");
+    // The complete headers describe the layout: no such refusal, weights charged.
+    let complete = plan(snapshot(config.clone(), &complete).path(), &options).unwrap();
+    assert!(complete.fits && !complete.hints.iter().any(|h| h.what == hint), "{}", render(&complete));
+    assert!(resident_item(&complete), "{}", render(&complete));
+    let refused = plan(snapshot(config, &incomplete).path(), &options).unwrap();
+    assert!(!refused.placement_supported && !refused.executable(), "{}", render(&refused));
+    assert!(refused.hints.iter().any(|h| h.what == hint), "{}", render(&refused));
+    // No payload-sum weight item stands in for the missing arena.
+    assert!(!resident_item(&refused), "{}", render(&refused));
+}
+
 #[test]
 fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
     let config = qwen4_config(4);
@@ -2793,15 +2821,17 @@ fn v4_snapshot() -> tempfile::TempDir {
 
 #[test]
 fn v4_actual_plan_preserves_exact_resident_weight_refusal_with_and_without_layout() {
-    use crate::placement::{FfnMode, LayerMode, OnboardSetting};
+    use crate::placement::OnboardSetting;
     let dir = v4_snapshot();
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
-    let modes = vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }; cfg.n_layers];
-    let required = crate::families::deepseek_v4::resident::resident_operands(&cfg, &modes, 1,
-        false, checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap()
-        .iter().map(|owner| owner.bytes).sum::<u64>();
-    assert!(required > 0);
+    // The admitted claim is rank 0's whole target arena B (embedding and
+    // inter-view padding included), not the operand payload sum.
+    let weights = crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg, 1,
+        false, true, checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap();
+    assert!(weights.draft.is_none());
+    let required = weights.target[0].bytes() as u64;
+    assert!(required > weights.target[0].payload_bytes() as u64);
     for full_layout in [false, true] {
         let options = PlanOptions { coordinator_budget_bytes: required,
             layout: full_layout.then(|| layout::LayoutOptions {
@@ -3145,9 +3175,8 @@ fn observed_zero_ranks_panics() {
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
     let mtp = cfg.mtp_layers > 0;
-    let owners = crate::families::qwen4::resident::checkpoint_resident_bytes(&checkpoint, &cfg,
-        cfg.layers, mtp, layout::LayoutOptions::default().qwen_representation).unwrap();
-    let required = crate::placement::families::qwen4::single_owner_weights(&owners, false, false).unwrap()
+    let required = crate::placement::families::qwen4::single_owner_weights(&checkpoint, &cfg, cfg.layers, mtp,
+        layout::LayoutOptions::default().qwen_representation, false, false).unwrap()
         .checked_add(crate::placement::families::qwen4::single_expert_weights(
             &crate::read_expert_catalog(dir.path()).unwrap(), cfg.layers, true, mtp).unwrap()).unwrap().0;
     let report = plan(dir.path(), &tight).unwrap();
@@ -3550,6 +3579,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
         let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        process.target(&checkpoint, &input, None).unwrap();
         process.serving(&input, 0, 0, 0, 0).unwrap();
         process.spark_link(&input, checkpoint.spark_input_is_bf16()).unwrap();
         let selected = glmf::admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
@@ -4079,8 +4109,10 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     let draft = tempfile::tempdir().unwrap();
     let config = json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":5,
         "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,
+        "rms_norm_eps":1e-5, "sliding_window":2048, "rope_theta":10000,
         "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
-            "selector_rank":256, "block_size":8}});
+            "conv_kernel_size":2, "mask_token_id":0, "selector_rank":256,
+            "selector_top_k":16, "block_size":8}});
     std::fs::write(draft.path().join("config.json"), config.to_string()).unwrap();
     for draft_kv_cache in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
@@ -4101,18 +4133,22 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
             &[170,188],GlmDraftRepresentation::Fp8Only,2, draft_kv_cache).unwrap();
         let owned = native_draft.memory.resident;
         let natural = run(&options);
-        assert_eq!(bytes(&natural,0,Category::Drafter), owned);
+        assert_eq!(bytes(&natural,0,Category::Drafter), owned - native_draft.resident_weights.0);
         assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);
         assert_eq!(bytes(&natural,1,Category::Workspace), 0);
         options.physical_sms = Some(188);
         let simulated = run(&options);
-        assert_eq!(bytes(&simulated,0,Category::Drafter), owned);
+        assert_eq!(bytes(&simulated,0,Category::Drafter), owned - native_draft.resident_weights.0);
         assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
         options.drafter_bytes = native_draft.resident_weights.0;
         // An explicit weight-only override has no inferred runtime scratch.
         options.glmf_drafter_snapshot = None;
         let explicit = run(&options);
-        assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
+        assert_eq!(bytes(&explicit,0,Category::Drafter), 0);
+        let weight_bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices.iter()
+            .filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| &d.items)
+            .filter(|i| i.group == "weight arena").map(|i| i.bytes).sum::<u64>();
+        assert!(weight_bytes(&explicit) >= options.drafter_bytes);
         assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
         assert_eq!(explicit.pool_tokens, simulated.pool_tokens);
         options.glmf_drafter_disabled = true;
@@ -4193,7 +4229,9 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
         glmf_drafter_disabled: disabled, context_tokens: 131_072, ..Default::default() }), ..sparks(4) };
     let enabled = plan(dir.path(), &options(false)).unwrap().memory_layout.unwrap();
     let disabled = plan(dir.path(), &options(true)).unwrap().memory_layout.unwrap();
-    assert!(enabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
+    let weights = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
+        .filter(|i| i.group == "weight arena").map(|i| i.bytes).sum::<u64>();
+    assert_eq!(weights(&enabled) - weights(&disabled), 256 << 20);
     assert!(!disabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
     let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| {
         let owner = layout.devices[0].items.iter()
@@ -4300,23 +4338,31 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = mimo_pro_config();
     config["tie_word_embeddings"] = json!(false);
-    write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+    // A real-sized embedding spans driver blocks; the 64-row fixture can
+    // disappear inside the same rounded arena backing when moved to host.
+    config["vocab_size"] = json!(4096);
+    let mut tensors = mimo_pro_tensors();
+    for (name, _, shape) in &mut tensors {
+        if name == "model.embed_tokens.weight" || name == "lm_head.weight" { shape[0] = 4096; }
+    }
+    write_snapshot(dir.path(), &config, &tensors, Some(8));
     let mut options = PlanOptions {
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true,
-            // One page below the freed embedding's worth of KV: the GPU plan
-            // misses the context floor, the host plan clears it.
-            context_tokens: 4096, ..Default::default() }),
+            context_tokens: 4096, pool_tokens: Some(4096),
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }),
         ..sparks(6)
     };
-    let probe = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    let bytes = probe.devices[0].by_category()[&Category::Embedding];
+    let probe_report = plan(dir.path(), &options).unwrap();
+    let bytes = component(&probe_report, Component::Embedding).bytes;
     assert!(bytes > 0);
-    // Leave only one table's worth of KV room, below this small fixture's target cap.
-    options.layout.as_mut().unwrap().rtx_bytes[0] =
-        probe.devices[0].used_bytes()
-            - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
-            + bytes + crate::placement::families::mimo_v2::admission::device_headroom(0,
-                crate::families::mimo_v2::admission::spark_intake_probe_bytes(true, None).unwrap());
+    // Put the cap halfway through the removable embedding, accounting for
+    // the real phase peak, baseline and the arena's separate driver tail.
+    let ledger = probe_report.phase_ledger.unwrap();
+    let budget = ledger.budgets.iter().find(|budget| budget.id == "rtx0").unwrap();
+    let crate::placement::planner::Baseline::Forecast { occupied, .. } = budget.baseline else { panic!("forecast") };
+    let peak = ledger.phases.iter().filter(|phase| phase.budget == "rtx0")
+        .map(|phase| phase.owned + phase.opaque).max().unwrap();
+    options.layout.as_mut().unwrap().rtx_bytes[0] = peak + occupied + budget.headroom - bytes / 2;
     let gpu_report = plan(dir.path(), &options).unwrap();
     assert!(!gpu_report.fits, "the GPU plan cannot reach the context floor");
     assert_eq!(gpu_report.memory_layout.as_ref().unwrap().devices[1].by_category()
@@ -4326,17 +4372,20 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     assert!(report.fits, "{:?}", report.hints);
     let gpu = gpu_report.memory_layout.unwrap();
     let host = report.memory_layout.unwrap();
-    assert!(!host.devices.iter().any(|d| d.by_category().contains_key(&Category::Embedding)));
+    // The embedding is an alias inside the target root, not a separate charge.
+    assert_eq!(gpu.devices[0].by_category()[&Category::Weights]
+        - host.devices[0].by_category()[&Category::Weights], bytes);
     assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={} host_notes={:?} gpu_notes={:?}",
         host.pool_tokens, gpu.pool_tokens, host.notes, gpu.notes);
     assert_eq!(host.devices[1].by_category().get(&Category::Weights), gpu.devices[1].by_category().get(&Category::Weights));
     assert!(host.notes.iter().any(|n| n.contains(&format!("{bytes} device bytes freed"))));
     config["tie_word_embeddings"] = json!(true);
-    write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+    write_snapshot(dir.path(), &config, &tensors, Some(8));
     let tied = plan(dir.path(), &options).unwrap();
     assert!(!tied.fits);
     assert!(tied.hints.iter().any(|h| h.what.contains("tie_word_embeddings")));
-    assert_eq!(tied.memory_layout.unwrap().devices[0].by_category()[&Category::Embedding], bytes);
+    assert_eq!(tied.memory_layout.unwrap().devices[0].by_category()[&Category::Weights],
+        gpu.devices[0].by_category()[&Category::Weights]);
 }
 
 #[test]
@@ -4359,7 +4408,11 @@ fn mimo_small_card_auto_embedding_and_full_context() {
     assert!(base.pool_tokens >= 1_048_576, "{}", base.render());
     assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;
-    assert!(plan(dir.path(), &options).unwrap().memory_layout.unwrap().devices[0].by_category().contains_key(&Category::Embedding));
+    let gpu_report = plan(dir.path(), &options).unwrap();
+    let embedding = component(&gpu_report, Component::Embedding).bytes;
+    let gpu = gpu_report.memory_layout.unwrap();
+    assert_eq!(gpu.devices[0].by_category()[&Category::Weights]
+        - base.devices[0].by_category()[&Category::Weights], embedding);
 }
 
 #[test]
@@ -4616,20 +4669,37 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     assert!(off.devices.iter().all(|d| d.items.iter().all(|i| !i.group.starts_with("vision "))));
     assert_eq!(auto.devices[0].used_bytes(), off.devices[0].used_bytes());
     assert_eq!(auto.devices[1].used_bytes() - off.devices[1].used_bytes(), tower);
-    assert_eq!(local.devices[0].used_bytes() - off.devices[0].used_bytes(), local_tower);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let vision = crate::placement::families::deepseek_v41::weight_layout::vision_layout_from_headers(
+        checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap();
+    let vision_b = vision.bytes() as u64;
+    let vision_tail = crate::placement::planner::allocation_granularity_forecast(&[vision_b]).unwrap();
+    assert_eq!(local.devices[0].used_bytes() - off.devices[0].used_bytes(), local_tower + vision_b + vision_tail);
     assert_eq!(auto.pool_tokens, off.pool_tokens);
     assert_eq!(local.pool_tokens, off.pool_tokens);
     use cuteafd_core::memory_layout::Category;
     assert!(!auto.devices[0].by_category().contains_key(&Category::Embedding));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;
     let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert!(gpu.devices[0].by_category()[&Category::Embedding] > 0);
+    assert!(!gpu.devices[0].by_category().contains_key(&Category::Embedding));
     let embedding = component(&plan(dir.path(), &options).unwrap(), Component::Embedding).bytes;
-    assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(), embedding);
+    let target = |embedding| crate::placement::families::deepseek_v41::weight_layout::TargetLayout::from_headers(
+        checkpoint.tensors.iter().map(|tensor| &tensor.meta), None, embedding,
+        crate::placement::families::deepseek_v41::resident::Fp8Head::configured(), false, false).unwrap();
+    let host_target = target(false);
+    let gpu_target = target(true);
+    assert_eq!(gpu_target.ranks[0].payload_bytes() - host_target.ranks[0].payload_bytes(), embedding as usize);
+    let charged = |layout: &crate::serving_capacity::WeightArenaLayout| {
+        let b = layout.bytes() as u64;
+        b + crate::placement::planner::allocation_granularity_forecast(&[b]).unwrap()
+    };
+    assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(),
+        charged(&gpu_target.ranks[0]) - charged(&host_target.ranks[0]));
     options.layout.as_mut().unwrap().force_gpu_embedding = false;
     options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30];
     let pro = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert!(pro.devices[0].by_category()[&Category::Embedding] > 0);
+    assert_eq!(pro.devices[0].items.iter().filter(|item| item.group == "weight arena")
+        .map(|item| item.bytes).sum::<u64>(), gpu_target.ranks[0].bytes() as u64);
 }
 
 #[test]
@@ -5243,17 +5313,25 @@ fn qwen_native_resident_admission_includes_padding_not_source_inventory() {
     let dir = qwen_snapshot(4);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config).unwrap();
-    let owners = crate::families::qwen4::resident::checkpoint_resident_bytes(&checkpoint, &cfg,
-        cfg.layers, false, layout::LayoutOptions::default().qwen_representation).unwrap();
-    let required = crate::placement::families::qwen4::single_owner_weights(&owners, false, false).unwrap()
+    let required = crate::placement::families::qwen4::single_owner_weights(&checkpoint, &cfg, cfg.layers, false,
+        layout::LayoutOptions::default().qwen_representation, false, false).unwrap()
         .checked_add(crate::placement::families::qwen4::single_expert_weights(
             &crate::read_expert_catalog(dir.path()).unwrap(), cfg.layers, true, false).unwrap()).unwrap().0;
     let options = PlanOptions { coordinator_budget_bytes: required, ..sparks(0) };
     let report = plan(dir.path(), &options).unwrap();
     let source = report.components.iter().filter(|c| matches!(c.owner, Owner::Rtx | Owner::SparkSliced))
         .map(|c| c.bytes).sum::<u64>();
-    assert_eq!(source, 1_397_074_944);
-    assert_eq!(required, 1_408_128_000);
+    // Source inventory over the fixture's complete coordinator headers.
+    assert_eq!(source, 1_436_704_192);
+    // The TP1 target arena's backing B (target 168,080,128 + head 168,960 +
+    // device embedding 327,680, inter-view padding 0 at these shapes) plus the
+    // native expert arenas (1,279,262,720): `layout.bytes()`, not a payload sum.
+    let arena = crate::families::qwen4::weight_layout::single_arena_bytes(&checkpoint, &cfg, cfg.layers, false,
+        layout::LayoutOptions::default().qwen_representation,
+        crate::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint).unwrap()).unwrap();
+    assert_eq!(arena, 168_576_768);
+    assert_eq!(required, 1_447_839_488);
+    assert_eq!(required - arena, 1_279_262_720);
     assert!(report.executable(), "{}", render(&report));
     // Expert arena padding outweighs this fixture's small FP8-head saving.
     // A budget that fits the source inventory must still refuse native owners.
@@ -5897,7 +5975,18 @@ fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
     assert!(report.placement_supported, "{:?}", report.hints);
     let memory = report.memory_layout.unwrap();
     assert!(memory.notes.iter().any(|note| note.contains("GPU residency retained")));
-    assert!(memory.devices[0].by_category()[&Category::Embedding] > 0);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let weights = crate::placement::families::glm5::weights::WeightInventory::from_checkpoint(
+        &checkpoint, 1, cfg.layers, None, crate::families::glm5::native_bf16(), false,
+        crate::placement::planner::EmbeddingHome::Device(0)).unwrap();
+    let embedding = weights.owners.iter().find(|owner| owner.allocation.id == "glm.weights.embedding").unwrap();
+    assert_eq!(embedding.allocation.location, crate::placement::planner::Location::coordinator(0));
+    let arenas = weights.coordinator_arenas().unwrap();
+    assert_eq!(arenas[0].view(&embedding.allocation.id).unwrap().bytes() as u64, embedding.allocation.bytes);
+    testing::assert_weight_arena_items(&memory.devices[0], &arenas);
+    assert!(!memory.devices[0].items.iter().any(|item| item.category == Category::Embedding
+        || item.group == "GLM target weights"));
     assert!(report.host_ledger.is_none());
 }
 

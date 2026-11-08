@@ -1,7 +1,8 @@
 //! Flash stage composition over the shared native EXLR8 owners and linears.
 use super::*;
 use crate::shared::{experts::exlr8::{self, dense_execution::{NativeOut, NativePrograms, ScratchOwner},
-    dense_weights::key, NativeExperts}, memory::device::{Allocation, Device}};
+    NativeExperts}, memory::device::{Allocation, Device}};
+use cuteafd_loader::plan::exlr8::dense::requests::key;
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, F32Bf16Narrow,
     glm_stage::{Buffers as KvBuffers, GlmStage}, projected_index::{self, ProjectedIndex, ProjectedKeys},
     projected_kda::{self, ProjectedKda}};

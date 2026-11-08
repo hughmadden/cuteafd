@@ -38,12 +38,21 @@ pub struct Owner {
     pub resident: u64,
     pub deferred: bool,
     pub lifetime: Lifetime,
+    /// An immutable weight arena: `bytes` and `resident` are its physical
+    /// extent B, charged once with its single SM120 tail (no per-tensor payload).
+    pub arena: Option<crate::serving_capacity::WeightArenaLayout>,
 }
 
 impl Owner {
     /// Retained weights: the allocation and its resident-weight ledger agree.
     pub fn weights(gpu: u8, category: Category, group: impl Into<String>, bytes: u64) -> Self {
         Self { resident: bytes, ..Self::charged(gpu, category, group, bytes) }
+    }
+
+    /// One preplanned weight arena on `gpu`, live from Load for the whole run.
+    pub fn arena(gpu: u8, layout: crate::serving_capacity::WeightArenaLayout) -> Self {
+        let bytes = layout.bytes() as u64;
+        Self { arena: Some(layout), ..Self::weights(gpu, Category::Weights, "weight arena", bytes) }
     }
 
     /// A transient allocation that is not retained checkpoint weights.
@@ -56,6 +65,7 @@ impl Owner {
             resident: 0,
             deferred: false,
             lifetime: Lifetime::RESIDENT,
+            arena: None,
         }
     }
 
@@ -99,6 +109,7 @@ impl Owner {
                 ItemLifetime::ReadyResident => Lifetime::RESIDENT,
                 ItemLifetime::PostReadyReserve => Lifetime { first: Phase::Ready, last: Phase::Growth },
             },
+            arena: None,
         }
     }
 }
@@ -149,6 +160,24 @@ fn byte_component(template: Allocation, curve: ByteCurve, maximum: u64) -> Resul
 fn owner_components(prefix: &str, owners: &[Owner], maximum: u64) -> Result<Vec<Component>, Refusal> {
     let mut out = Vec::new();
     for (index, owner) in owners.iter().enumerate() {
+        if let Some(layout) = &owner.arena {
+            // Root B, its resident claim and one separate tail; the shared
+            // helper replaces any payload, padding or per-tensor forecast.
+            if owner.bytes != layout.bytes() as u64 || owner.resident != owner.bytes || owner.deferred {
+                return Err(invalid("weight arena owner differs from its layout"));
+            }
+            // The resident-weight budget keeps counting logical payload P, not
+            // the physical extent; the root and tail carry the physical charge.
+            let mut components = weight_arena_components(layout, owner.location, owner.lifetime, maximum)?;
+            components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
+            let payload = u64::try_from(layout.payload_bytes()).map_err(|_| Refusal::Overflow("V4.1 arena payload"))?;
+            let root = Allocation::buffer(layout.id(), owner.location, owner.bytes, owner.lifetime,
+                Category::Weights, "weight arena");
+            out.extend(components);
+            out.push(Component::resident_weight(ResidentWeight::from_allocation(&root, ResidentWeights(payload)),
+                ByteCurve::fixed(payload, maximum)));
+            continue;
+        }
         let id = format!("v41.{prefix}.{index}");
         if owner.bytes > 0 {
             let allocation = Allocation::buffer(
@@ -690,6 +719,9 @@ pub struct V41Recipe<'a> {
     pub arena_peak: Vec<[u64; 2]>,
     pub arena_resident: Vec<[u64; 2]>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
+    /// The bundled tower's exact arena (`weight_layout::vision_layout_from_headers`),
+    /// charged wherever an encoder option places it (Managed has no SM120 tail).
+    pub vision_arena: Option<crate::serving_capacity::WeightArenaLayout>,
     pub media_cache_bytes: u64,
     pub concurrency: u64,
     pub tails: u64,
@@ -871,6 +903,10 @@ pub struct ProductionInput<'a> {
     pub workspace: u64,
     /// Every retained physical owner except KV and the routed-expert arena.
     pub owners: Vec<Owner>,
+    /// Weight arenas (target ranks, serving vision tower). Each replaces the one
+    /// `owners::arena_demand` owner naming its ID, which carries the same extent
+    /// B, with the shared root, a logical-payload claim and the tail.
+    pub weight_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
     /// Sequential load peaks in absolute bytes above the availability sample.
     /// Each is charged as the part above the owners already live at load, and
     /// the peaks never coexist.
@@ -994,6 +1030,7 @@ impl<'a> ProductionInput<'a> {
             arena_peak: arenas.iter().map(|(peak, _)| *peak).collect(),
             arena_resident: arenas.iter().map(|(_, resident)| *resident).collect(),
             encoders: self.encoders,
+            vision_arena: None,
             media_cache_bytes: self.media_cache_bytes,
             concurrency: self.concurrency,
             tails,
@@ -1002,9 +1039,33 @@ impl<'a> ProductionInput<'a> {
             owners: Vec::new(),
             opaques: self.allowances,
         };
+        // Every arena replaces its one same-ID, same-extent owner exactly once.
+        let mut arenas = BTreeMap::new();
+        for layout in &self.weight_arenas {
+            if arenas.insert(layout.id().to_string(), Some(layout)).is_some() {
+                return Err(invalid("duplicate weight arena layout"));
+            }
+        }
+        let mut owners = Vec::with_capacity(self.owners.len());
+        for owner in &self.owners {
+            let Some(id) = owner.group.strip_prefix(super::owners::WEIGHT_ARENA_PREFIX) else {
+                owners.push(owner.clone());
+                continue;
+            };
+            if owner.arena.is_some() || !matches!(owner.location.device, Device::Coordinator(_)) {
+                return Err(invalid("weight arena owner is not an unbound coordinator owner"));
+            }
+            let layout = arenas.get_mut(id).and_then(Option::take)
+                .ok_or_else(|| invalid("weight arena owner has no layout or appears twice"))?;
+            if layout.bytes() as u64 != owner.bytes || owner.resident != owner.bytes {
+                return Err(invalid("weight arena owner differs from its layout"));
+            }
+            owners.push(Owner { arena: Some(layout.clone()), ..owner.clone() });
+        }
+        if arenas.values().any(Option::is_some) { return Err(invalid("weight arena layout without an owner")); }
         recipe.owners.push(Case {
             when: Vec::new(),
-            value: owner_components("owner", &self.owners, maximum_pages)?,
+            value: owner_components("owner", &owners, maximum_pages)?,
         });
         let draft_demands = recipe.draft.as_ref().map(|draft| draft_owners(draft, self.gpus))
             .transpose()?;
@@ -1073,7 +1134,15 @@ pub fn draft_owners(draft: &DraftInventory, gpus: usize) -> Result<Vec<Owner>, R
         return Err(invalid("dSpark owner is outside the topology"));
     }
     let home = (gpus - 1) as u8;
-    let mut owners = vec![Owner::weights(home, Category::Drafter, "dSpark weights", draft.resident)];
+    let mut owners = Vec::new();
+    let mut experts = draft.resident;
+    if let Some(dense) = &draft.dense {
+        // The dense arena is part of `resident`; the rest is routed experts.
+        experts = experts.checked_sub(dense.bytes() as u64)
+            .ok_or_else(|| invalid("dSpark dense arena exceeds its retained weights"))?;
+        owners.push(Owner::arena(home, dense.clone()));
+    }
+    if experts > 0 { owners.push(Owner::weights(home, Category::Drafter, "dSpark experts", experts)); }
     if draft.marks > 0 {
         owners.push(Owner::charged(home, Category::Prefix, "dSpark marks", draft.marks));
     }
@@ -1359,6 +1428,35 @@ impl Recipe for V41Recipe<'_> {
                         ("scratch", encoder.scratch, Category::Workspace),
                     ] {
                         if bytes == 0 {
+                            continue;
+                        }
+                        // Every tower owns B, budgeted at logical payload P. Only
+                        // coordinator device arenas have the SM120 allocation tail.
+                        if part == "weights" {
+                            let layout = self.vision_arena.as_ref()
+                                .ok_or_else(|| invalid("vision tower lacks its arena layout"))?;
+                            let payload = u64::try_from(layout.payload_bytes())
+                                .map_err(|_| Refusal::Overflow("V4.1 vision payload"))?;
+                            if payload != bytes {
+                                return Err(invalid("vision arena payload differs from the tower source"));
+                            }
+                            let id = format!("v41.encoder.{option}.{copy}.weights");
+                            let extent = u64::try_from(layout.bytes()).map_err(|_| Refusal::Overflow("V4.1 vision arena"))?;
+                            let root = Allocation::buffer(&id, location, extent, Lifetime::RESIDENT,
+                                Category::Weights, "weight arena");
+                            if matches!(location.device, Device::Coordinator(_)) {
+                                let mut arena = weight_arena_extent_components(&id, extent, location,
+                                    Lifetime::RESIDENT, self.maximum_pages)?;
+                                arena.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
+                                components.extend(arena);
+                            } else {
+                                components.push(Component::allocation(root.clone(),
+                                    ByteCurve::fixed(extent, self.maximum_pages), false, self.maximum_pages));
+                            }
+                            components.push(Component::resident_weight(
+                                ResidentWeight::from_allocation(&root, ResidentWeights(payload)),
+                                ByteCurve::fixed(payload, self.maximum_pages),
+                            ));
                             continue;
                         }
                         let owner = Allocation::buffer(

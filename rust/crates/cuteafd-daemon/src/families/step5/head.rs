@@ -113,6 +113,13 @@ impl HeadPlan {
     pub(super) fn immutable_bytes(&self) -> u64 {
         self.bytes - self.workspace_bytes()
     }
+
+    pub(super) fn private_scratch_bytes(&self) -> Result<u64> {
+        self.native.as_ref().map(|name| -> Result<u64> {
+            Ok(cuteafd_loader::formats::head::native_private_scratch(
+                self.layout.core[name].shape, self.kernel_rows)?.bytes()? as u64)
+        }).transpose().map(|bytes| bytes.unwrap_or(0))
+    }
 }
 
 struct HeadWeights<'a> {
@@ -334,9 +341,11 @@ pub(super) mod tests {
             let arena = plan.workspace_bytes() + 1024;
             let admitted = super::super::execution::RankAdmission { immutable: 1000, workspace: arena }
                 .with_head(&plan)?;
-            assert_eq!(admitted.immutable, 1000 + plan.immutable_bytes());
+            assert_eq!(admitted.immutable, 1000 + private_scratch);
             assert_eq!(admitted.workspace, arena);
-            assert_eq!(admitted.bytes()?, 1000 + plan.immutable_bytes() + arena);
+            assert_eq!(admitted.bytes()?, 1000 + private_scratch + arena);
+            assert!(super::super::execution::RankAdmission { immutable: u64::MAX, workspace: 0 }
+                .with_head(&plan).is_err());
         }
         Ok(())
     }

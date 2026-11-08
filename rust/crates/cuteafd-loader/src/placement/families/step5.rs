@@ -40,6 +40,8 @@ struct Figures {
     marks: u64,
     /// Every non-pool, non-hop owner of each rank, in the plan's group names.
     fixed: Vec<Demand>,
+    /// One root and tail per physical weight arena, including the embedding.
+    weights: Vec<Component>,
     /// Residual receive slots, charged by the shared solver apart from `fixed`.
     hops: Vec<u64>,
 }
@@ -62,7 +64,15 @@ impl Figures {
         let pool = unit
             .checked_mul(pages)
             .context("Step-5 pool record total overflow")?;
-        fixed.checked_add(pool).and_then(|bytes| bytes.checked_add(self.hops[usize::from(rank)]))
+        let weights = self.weights.iter().filter(|component| match &component.kind {
+            ComponentKind::Allocation { template, .. } => template.location == Location::coordinator(rank),
+            ComponentKind::AllocationGranularity(owner) => owner.location == Location::coordinator(rank),
+            _ => false,
+        }).try_fold(0u64, |sum, component| -> Result<u64> {
+            sum.checked_add(component.bytes.at(pages)?).context("Step-5 arena charge overflow")
+        })?;
+        fixed.checked_add(weights).and_then(|bytes| bytes.checked_add(pool))
+            .and_then(|bytes| bytes.checked_add(self.hops[usize::from(rank)]))
             .context("Step-5 rank total overflow")
     }
 }
@@ -152,7 +162,7 @@ impl<'a> Step5Recipe<'a> {
             let attention = Self::modes(cfg, gpus, boundary);
             let ownership = ExecutionOwnership::for_modes(cfg, gpus, &attention, inputs.hops())?;
             let admitted = native(&ownership)?;
-            let figures = Self::figures(cfg, inputs, depth, &ownership, &admitted)?;
+            let figures = Self::figures(cfg, inputs, depth, &ownership, &admitted, maximum_pages)?;
             let score = (0..gpus as u8)
                 .map(|rank| figures.total(rank, maximum_pages))
                 .collect::<Result<Vec<_>>>()?
@@ -251,6 +261,7 @@ impl<'a> Step5Recipe<'a> {
         depth: usize,
         ownership: &ExecutionOwnership,
         native: &[RankAdmission],
+        maximum_pages: u64,
     ) -> Result<Figures> {
         let ranks = ownership.ranks();
         ensure!(native.len() == ranks, "Step-5 native admission rank inventory");
@@ -272,22 +283,25 @@ impl<'a> Step5Recipe<'a> {
         )
         .context("Step-5 residual hop storage")?;
         let mut fixed = Vec::new();
+        let mut weights = Vec::new();
         for rank in 0..ranks {
             let reservation =
                 Reservation::new(&cache, rank, inputs.sequences as u64, marks, 1, usize::MAX)?;
-            fixed.push(
-                Demand::new(rank as u8, Category::Weights, "Step-5 native target and head",
-                    native[rank].immutable, Basis::Exact)
-                    .with_resident_weights(native[rank].resident_weights),
-            );
-            if rank == 0 {
-                let bytes = scaled(4096 * 2, cfg.vocab)?;
-                fixed.push(
-                    Demand::new(0, Category::Embedding, "Step-5 GPU embedding", bytes,
-                        Basis::Exact)
-                        .with_resident_weights(ResidentWeights(bytes)),
-                );
+            for (arena, logical) in &native[rank].weight_arenas {
+                ensure!(logical.0 <= arena.bytes() as u64, "Step-5 logical weights exceed arena");
+                let mut components = weight_arena_components(arena, Location::coordinator(rank as u8),
+                    Lifetime::RESIDENT, maximum_pages)?;
+                components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
+                let owner = components.iter().find_map(|component| match &component.kind {
+                    ComponentKind::Allocation { template, .. } => Some(template),
+                    _ => None,
+                }).context("Step-5 arena root missing")?;
+                let resident = Component::resident_weight(ResidentWeight::from_allocation(owner, *logical),
+                    ByteCurve::fixed(logical.0, maximum_pages));
+                components.push(resident);
+                weights.extend(components);
             }
+            exact(&mut fixed, rank, Category::Workspace, "Step-5 private native scratch", native[rank].immutable);
             exact(&mut fixed, rank, Category::Workspace, "Step-5 native workspace", native[rank].workspace);
             exact(&mut fixed, rank, Category::Kv, "Step-5 active sequence state", reservation.active as u64);
             exact(&mut fixed, rank, Category::Prefix, "Step-5 exact retained marks", reservation.marks as u64);
@@ -324,7 +338,7 @@ impl<'a> Step5Recipe<'a> {
                     ])?);
             }
         }
-        Ok(Figures { cache, marks, fixed, hops })
+        Ok(Figures { cache, marks, fixed, weights, hops })
     }
 
     /// The live/offline request: explicit CLI values stay strict, zero and
@@ -486,6 +500,7 @@ impl Recipe for Step5Recipe<'_> {
         } else {
             return Err(Refusal::Unsupported);
         }
+        contract.components.extend(self.figures.weights.iter().cloned());
         for demand in &self.figures.fixed {
             let location = Location::coordinator(demand.gpu);
             let owner = Allocation::buffer(

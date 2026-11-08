@@ -174,14 +174,31 @@ impl<'a> CoordinatorDevices<'a> {
                 return Err(Refusal::InvalidFact(format!("duplicate expert arena {}", allocation.id)));
             }
         }
+        let draft_prefixes = ["qwen3_5/dspark/gpu", "glm/draft/", "glm5_flash/draft/", "kimi/draft/"];
+        for allocation in allocations.iter().filter(|a| a.view.is_none()
+            && a.category == Category::Weights && a.group == "weight arena") {
+            let Some(prefix) = draft_prefixes.into_iter().find(|prefix| allocation.id.starts_with(prefix))
+                else { continue; };
+            let Device::Coordinator(rank) = allocation.location.device else {
+                return Err(Refusal::InvalidFact(format!("invalid logical draft arena {}", allocation.id)));
+            };
+            if allocation.location.domain != Domain::Device
+                || allocation.id.strip_prefix(prefix) != Some(rank.to_string().as_str()) {
+                return Err(Refusal::InvalidFact(format!("invalid logical draft arena {}", allocation.id)));
+            }
+            if names.insert(allocation.id.as_str(), format!("{prefix}{}", self.physical_device(rank)?)).is_some() {
+                return Err(Refusal::InvalidFact(format!("duplicate draft arena {}", allocation.id)));
+            }
+        }
         let mut ids = BTreeSet::new();
         allocations.iter().map(|allocation| {
             let mut mapped = allocation.clone();
             if let Some(id) = names.get(allocation.id.as_str()) { mapped.id = id.clone(); }
             if let Some(view) = &mut mapped.view {
                 if let Some(id) = names.get(view.backing.as_str()) { view.backing = id.clone(); }
-                else if view.backing.starts_with("experts.") {
-                    return Err(Refusal::InvalidFact(format!("missing expert backing for {}", allocation.id)));
+                else if view.backing.starts_with("experts.")
+                    || draft_prefixes.iter().any(|prefix| view.backing.starts_with(prefix)) {
+                    return Err(Refusal::InvalidFact(format!("missing weight backing for {}", allocation.id)));
                 }
             }
             if !ids.insert(mapped.id.clone()) {
@@ -561,7 +578,8 @@ mod contract;
 mod search;
 mod granularity;
 pub use granularity::{AllocationGranularity, GranularityBacking, GranularityEvidence,
-    ALLOCATION_GRANULARITY_GROUP, allocation_granularity_forecast, allocation_granularity_component};
+    ALLOCATION_GRANULARITY_GROUP, allocation_granularity_forecast, allocation_granularity_component,
+    weight_arena_components, weight_arena_extent_components};
 pub mod native_attention;
 pub mod serving;
 pub use contract::{

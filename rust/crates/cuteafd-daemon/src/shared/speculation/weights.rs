@@ -7,8 +7,10 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use std::{borrow::Cow, collections::HashMap, ffi::c_void, path::{Path, PathBuf}};
 
-#[derive(Clone, Copy)]
-pub(crate) enum ShardAxis { Rows, Columns }
+pub(crate) use cuteafd_loader::families::glm5::draft_physical::{
+    ShardAxis, gqa_weight_recipe, gqa_checkpoint_arena_requests as gqa_arena_requests,
+    mla_weight_recipe, mla_checkpoint_arena_requests as mla_arena_requests, absorb_geometry,
+};
 
 fn shard(mut rect: Rect, axis: ShardAxis, rank: usize, ranks: usize) -> Result<Rect> {
     ensure!(matches!(ranks, 1 | 2) && rank < ranks, "drafter shard rank {rank} of {ranks}");
@@ -55,13 +57,6 @@ impl Source {
 
     fn parts(&self, parts: &[(&str, usize)], cols: usize) -> Result<Vec<Rect>> {
         parts.iter().map(|(name, rows)| self.rect(name, &[*rows, cols])).collect()
-    }
-
-    fn matrix_rects(&self, parts: &[(&str, usize)], cols: usize, axis: Option<ShardAxis>,
-        rank: usize, ranks: usize) -> Result<Vec<Rect>> {
-        self.parts(parts, cols)?.into_iter().map(|rect| match axis {
-            Some(axis) => shard(rect, axis, rank, ranks), None => Ok(rect),
-        }).collect()
     }
 
     pub fn rect(&self, name: &str, shape: &[usize]) -> Result<Rect> {
@@ -288,184 +283,6 @@ impl<'a, 'b> Load<'a, 'b> {
     }
 }
 
-pub(crate) struct GqaLayerWeights<T, M> {
-    pub input_norm: T, pub post_norm: T,
-    pub attn_conv: M, pub attn_base: T, pub mlp_conv: M, pub mlp_base: T,
-    pub qkv: M, pub q_norm: T, pub k_norm: T, pub o: M, pub gate_up: M, pub down: M,
-}
-
-pub(crate) struct GqaWeights<T, M> {
-    pub layers: Vec<GqaLayerWeights<T, M>>,
-    pub fc: M, pub hidden_norm: T, pub norm: T,
-    pub selector: Option<(M, T, T)>,
-}
-
-/// The same traversal selects checkpoint slices for CPU requests and real loading.
-/// Only immutable destinations pass through these two operations.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gqa_weight_recipe<T, M>(
-    source: &cuteafd_loader::families::glm5::draft_physical::GlmDflashConfig,
-    rank: usize, ranks: usize,
-    tensor: impl Fn(&str, &[usize]) -> Result<T>,
-    matrix: impl Fn(&[(&str, usize)], usize, Option<ShardAxis>) -> Result<M>,
-) -> Result<GqaWeights<T, M>> {
-    ensure!(rank < ranks, "invalid DFlash recipe rank {rank}/{ranks}");
-    let cfg = source.for_tp(ranks)?;
-    let h = cfg.hidden;
-    let mut layers = Vec::with_capacity(cfg.layers);
-    for l in 0..cfg.layers {
-        let p = format!("layers.{l}");
-        let a = format!("{p}.self_attn");
-        layers.push(GqaLayerWeights {
-            input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
-            post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-            attn_conv: matrix(&[(&format!("{p}.attention_conv.kernel_projection.weight"), cfg.conv_width())], h, None)?,
-            attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-            mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), cfg.conv_width())], h, None)?,
-            mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-            qkv: matrix(&[(&format!("{a}.q_proj.weight"), source.heads * cfg.head_dim),
-                (&format!("{a}.k_proj.weight"), source.kv_width()),
-                (&format!("{a}.v_proj.weight"), source.kv_width())], h, Some(ShardAxis::Rows))?,
-            q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
-            k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-            o: matrix(&[(&format!("{a}.o_proj.weight"), h)], source.heads * cfg.head_dim, Some(ShardAxis::Columns))?,
-            gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), source.intermediate),
-                (&format!("{p}.mlp.up_proj.weight"), source.intermediate)], h, Some(ShardAxis::Rows))?,
-            down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], source.intermediate, Some(ShardAxis::Columns))?,
-        });
-    }
-    Ok(GqaWeights { layers, fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h, None)?,
-        hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
-        selector: if rank == 0 { Some((matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h, None)?,
-            tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
-            tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?)) } else { None },
-    })
-}
-
-pub(crate) struct MlaLayerWeights<T, M> {
-    pub input_norm: T, pub post_norm: T,
-    pub attn_conv: M, pub attn_base: T, pub mlp_conv: M, pub mlp_base: T,
-    pub qkv_a: T, pub q_norm: T, pub kv_norm: T, pub q_b: T,
-    pub uk: T, pub uv: T, pub output: T, pub gate_up: M, pub down: M,
-}
-
-pub(crate) struct MlaWeights<T, M> {
-    pub layers: Vec<MlaLayerWeights<T, M>>,
-    pub fc: M, pub hidden_norm: T, pub norm: T, pub selector: (M, T, T),
-}
-
-/// Shared MLA immutable traversal: header requests and `load_mla_with` bind the
-/// same names, representations and absorption destinations, never KV or scratch.
-pub(crate) fn mla_weight_recipe<T, M>(
-    cfg: &cuteafd_loader::formats::dflash::MlaDflashConfig,
-    tensor: impl Fn(&[(&str, Vec<usize>)]) -> Result<T>,
-    matrix: impl Fn(&[(&str, usize)], usize) -> Result<M>,
-    absorb: impl Fn(&str) -> Result<(T, T)>,
-) -> Result<MlaWeights<T, M>> {
-    use cuteafd_core::coordinator_programs::MlaDraftKind;
-    ensure!(cfg.kind == MlaDraftKind::Dflash2, "MLA DFlash arena recipe requires DFlash2");
-    let m = &cfg.mla;
-    let h = m.hidden;
-    let one = |name: &str, shape: &[usize]| tensor(&[(name, shape.to_vec())]);
-    let mut layers = Vec::with_capacity(cfg.windows.len());
-    for index in 0..cfg.windows.len() {
-        let p = format!("layers.{index}");
-        let a = format!("{p}.self_attn");
-        let (uk, uv) = absorb(&format!("{a}.kv_b_proj.weight"))?;
-        layers.push(MlaLayerWeights {
-            input_norm: one(&format!("{p}.input_layernorm.weight"), &[h])?,
-            post_norm: one(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-            attn_conv: matrix(&[(&format!("{p}.attention_conv.kernel_projection.weight"), 4 * h / cfg.group)], h)?,
-            attn_base: one(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-            mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), 4 * h / cfg.group)], h)?,
-            mlp_base: one(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-            qkv_a: tensor(&[(&format!("{a}.q_a_proj.weight"), vec![m.q_rank, h]),
-                (&format!("{a}.kv_a_proj_with_mqa.weight"), vec![m.kv_rank + m.rope, h])])?,
-            q_norm: one(&format!("{a}.q_a_layernorm.weight"), &[m.q_rank])?,
-            kv_norm: one(&format!("{a}.kv_a_layernorm.weight"), &[m.kv_rank])?,
-            q_b: one(&format!("{a}.q_b_proj.weight"), &[m.heads * (m.nope + m.rope), m.q_rank])?,
-            uk, uv, output: one(&format!("{a}.o_proj.weight"), &[h, m.heads * m.value])?,
-            gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), cfg.intermediate),
-                (&format!("{p}.mlp.up_proj.weight"), cfg.intermediate)], h)?,
-            down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], cfg.intermediate)?,
-        });
-    }
-    Ok(MlaWeights { layers, fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?,
-        hidden_norm: one("hidden_norm.weight", &[h])?, norm: one("norm.weight", &[h])?,
-        selector: (matrix(&[("candidate_selector.hidden_projection.weight", cfg.selector_rank)], h)?,
-            one("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.selector_rank])?,
-            one("candidate_selector.successor_codebook", &[cfg.vocab, cfg.selector_rank])?),
-    })
-}
-
-fn matrix_requests(requests: &std::cell::RefCell<Vec<(String, usize)>>, rects: &[Rect],
-    representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation) -> Result<()> {
-    use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
-    let name = rects.iter().map(|rect| rect.name.as_str()).collect::<Vec<_>>().join("+");
-    let bytes = rects.iter().try_fold(0usize, |n, rect| n.checked_add(rect.bytes()))
-        .context("DFlash recipe matrix overflow")?;
-    if representation == GlmDraftRepresentation::Bf16Only {
-        requests.borrow_mut().push((name, bytes.max(256)));
-    } else {
-        let k = rects.first().context("DFlash recipe matrix missing parts")?.width() / 2;
-        let n = rects.iter().try_fold(0usize, |n, rect| n.checked_add(rect.rows.len()))
-            .context("DFlash recipe matrix rows overflow")?;
-        ensure!(n > 0 && k > 0 && n % 16 == 0 && k % 128 == 0
-            && rects.iter().all(|r| r.width() == k * 2), "DFlash recipe FP8 shape {n}/{k}");
-        let payload = n.checked_mul(k).context("DFlash recipe FP8 extent overflow")?;
-        requests.borrow_mut().extend([(format!("{name}.payload"), payload),
-            (format!("{name}.scales"), payload / 128 * 4)]);
-    }
-    Ok(())
-}
-
-pub(crate) fn mla_arena_requests(snapshot: &Path,
-    representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation)
-    -> Result<Vec<(String, usize)>> {
-    let cfg = cuteafd_loader::formats::dflash::MlaDflashConfig::read(snapshot)?;
-    let source = Source::open(snapshot)?;
-    for (name, shape) in cfg.tensor_shapes() { source.rect(&name, &shape)?; }
-    let requests = std::cell::RefCell::new(Vec::new());
-    mla_weight_recipe(&cfg,
-        |parts| {
-            let bytes = parts.iter().try_fold(0usize, |n, (name, shape)|
-                n.checked_add(source.rect(name, shape)?.bytes()).context("MLA tensor extent overflow"))?;
-            requests.borrow_mut().push((parts.iter().map(|(name, _)| *name).collect::<Vec<_>>().join("+"), bytes.max(256)));
-            Ok(())
-        },
-        |parts, cols| matrix_requests(&requests, &source.parts(parts, cols)?, representation),
-        |name| {
-            let m = &cfg.mla;
-            source.rect(name, &[m.heads * (m.nope + m.value), m.kv_rank])?;
-            let (_, _, uk, uv) = absorb_geometry(m.heads, m.nope, m.value, m.kv_rank)?;
-            requests.borrow_mut().extend([(format!("{name}.uk"), m.heads * uk),
-                (format!("{name}.uv"), m.heads * uv)]);
-            Ok(((), ()))
-        })?;
-    Ok(requests.into_inner())
-}
-
-pub(crate) fn gqa_arena_requests(snapshot: &Path,
-    representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation,
-    rank: usize, ranks: usize) -> Result<Vec<(String, usize)>> {
-    use cuteafd_loader::families::glm5::draft_physical::GlmDflashConfig;
-    let cfg = GlmDflashConfig::read(snapshot)?;
-    let source = Source::open(snapshot)?;
-    for (name, shape) in cfg.tensor_shapes() { source.rect(&name, &shape)?; }
-    let requests = std::cell::RefCell::new(Vec::new());
-    gqa_weight_recipe(&cfg, rank, ranks,
-        |name, shape| {
-            let rect = source.rect(name, shape)?;
-            requests.borrow_mut().push((name.to_owned(), rect.bytes().max(256)));
-            Ok(())
-        },
-        |parts, cols, axis| {
-            let rects = source.matrix_rects(parts, cols, axis, rank, ranks)?;
-            matrix_requests(&requests, &rects, representation)
-        })?;
-    Ok(requests.into_inner())
-}
-
 /// Source-backed destinations from the admitted MLA recipe; synthetic scales
 /// are initialized separately and Uv shares its Uk source staging.
 pub(crate) fn mla_weights_into(
@@ -520,18 +337,6 @@ pub(crate) fn absorb_into(dense: &DenseLoad<'_>, source: Rect, heads: usize, nop
     Ok(())
 }
 
-fn absorb_geometry(heads: usize, nope: usize, value: usize, latent: usize) -> Result<(usize, usize, usize, usize)> {
-    ensure!(heads > 0 && nope > 0 && value > 0 && latent > 0, "empty draft absorption geometry");
-    let rows = nope.checked_add(value).context("draft absorption head rows overflow")?;
-    let width = latent.checked_mul(2).context("draft absorption row bytes overflow")?;
-    let head = |rows: usize| rows.checked_mul(width).context("draft absorption head bytes overflow");
-    let (source, uk, uv) = (head(rows)?, head(nope)?, head(value)?);
-    for bytes in [rows, source, uk, uv] {
-        heads.checked_mul(bytes).context("draft absorption total extent overflow")?;
-    }
-    ensure!(source <= STEP_BYTES, "draft absorption head exceeds staging bound");
-    Ok((rows, source, uk, uv))
-}
 
 fn view(buffer: CuteafdDeviceBuffer, at: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(at.checked_add(bytes).is_some_and(|end| end <= buffer.bytes), "drafter pack destination out of bounds");
@@ -655,7 +460,10 @@ mod tests {
         }
         for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
             for ranks in [1, 2] { for rank in 0..ranks {
-                let expected = gqa_arena_requests(&snapshot, representation, rank, ranks)?;
+                let expected = cuteafd_loader::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
+                    &snapshot, representation, rank, ranks)?;
+                assert_eq!(expected, cuteafd_loader::families::glm5::draft_physical::gqa_arena_requests(
+                    &cfg, representation, rank, ranks)?);
                 #[allow(clippy::too_many_arguments)]
                 fn run<'a>(device: Device<'a>, snapshot: &Path, cfg: &super::super::dflash::DflashConfig,
                     rank: usize, ranks: usize, representation: GlmDraftRepresentation,

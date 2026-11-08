@@ -31,7 +31,7 @@
 use crate::shared::experts::rtx::dense::{Job, Rect};
 use crate::shared::fp8_load_quant::Target;
 use crate::shared::memory::{DeviceAllocation, device::{Allocation, Device}, weight_arena::DeviceWeightArena};
-use super::weight_layout::joined;
+use cuteafd_loader::families::glm5_flash::weight_layout::joined;
 use crate::shared::peer_split::{Axis, RankDevice};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -46,7 +46,7 @@ use std::os::unix::fs::FileExt;
 use crate::shared::placement::layers::AttentionShare;
 use cuteafd_loader::placement::{FfnMode, LayerExecutionPlan, LayerMode};
 
-pub(crate) const PREFIX: &str = "model.language_model.";
+use cuteafd_loader::families::glm5_flash::weight_layout::PREFIX;
 
 pub(crate) struct GlmfLayer<'a> {
     pub attention: GlmNextAttention,
@@ -57,7 +57,7 @@ pub(crate) struct GlmfLayer<'a> {
     pub(crate) core: std::collections::BTreeMap<String, crate::shared::dense_trellis::CoreWeights<'a>>,
     pub(crate) attention_native: std::collections::BTreeMap<String, NativeAttentionWeights<'a>>,
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
-    pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
+    pub(crate) native_projections: HashMap<&'static str, cuteafd_loader::plan::exlr8::dense::requests::NativeProjection>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -1352,10 +1352,11 @@ impl<'a> GlmfLoader<'a> {
     /// Projection bytes stay native; only the original F32 convolution/mHC ABI widens BF16.
     #[allow(clippy::type_complexity)]
     pub fn native_model(&self, cfg: &GlmNextConfig, plan: &LayerExecutionPlan,
-        records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords],
+        records: &[cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords],
         vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
         -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
-        use crate::shared::experts::exlr8::dense_weights::{self, PlainPack};
+        use crate::shared::experts::exlr8::dense_weights;
+        use cuteafd_loader::plan::exlr8::dense::requests::{key, PlainPack};
         ensure!(records.len() == self.ranks() && !records.is_empty() && plan.modes().len() <= cfg.layers,
             "native Flash records or layer plan extent");
         for (rank, records) in records.iter().enumerate() {
@@ -1407,7 +1408,7 @@ impl<'a> GlmfLoader<'a> {
                         take(key, format!("{p}.{leaf}"));
                     }
                     for key in ["conv_w", "w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale"] { take(key, key.into()); }
-                    take("gate", dense_weights::key("router", "bf16"));
+                    take("gate", key("router", "bf16"));
                     ensure!(["attn.fn", "attn.scale", "attn.base", "ffn.fn", "ffn.scale", "ffn.base", "input_norm", "post_norm"]
                         .iter().all(|name| operands.contains_key(name)), "{p}: native Flash common operands");
                     if !dense { ensure!(operands.contains_key("gate") && operands.contains_key("gate.bias"),

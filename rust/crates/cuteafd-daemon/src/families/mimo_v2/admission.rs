@@ -387,6 +387,7 @@ fn preflight_shape(
         let cublas = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
         let mut additional = vec![cublas.clone()];
         let mut resident_weights = cuteafd_loader::placement::ResidentWeights::default();
+        let mut weight_arenas = Vec::new();
         additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
             cfg, ranks, rank, args.prefill_rows, transport_lanes, 0, cuteafd_core::spark_reply::requested().prefill(false))?);
         // Only modules and the already-attached peer are live before drafter
@@ -425,6 +426,7 @@ fn preflight_shape(
                 )?;
                 resident_weights = resident_weights.checked_add(reservations.resident_weights)?;
                 additional.extend(reservations.steady);
+                weight_arenas.push(reservations.arena);
                 let local = draft.for_tp(if args.tp2_dflash { 2 } else { 1 })?;
                 let mark = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(
                     local.layers as u64, local.kv_heads as u64, local.head_dim as u64, args.draft_kv_cache)?;
@@ -448,6 +450,7 @@ fn preflight_shape(
             opened.weight_formats.any_fp8_output(),
         )?;
         runtime.push(MimoRankRuntime {
+            weight_arenas,
             resident_weights,
             device: device_id,
             workspaces,
@@ -1094,8 +1097,9 @@ mod tests {
         assert_eq!(bytes("draft.layer0.k_ring"), 20 * 1024 * 128 * 2);
         assert_eq!(bytes("draft.layer0.v_ring"), 20 * 1024 * 128 * 2);
         assert_eq!(bytes("draft.workspace.logits"), 16 * 8 * 256 * 4);
-        assert_eq!(bytes("draft.weights.fp8_values"), layout.weights.fp8_values);
-        assert_eq!(bytes("draft.weights.fp8_scales"), layout.weights.fp8_scales);
+        assert_eq!(reservations.arena.layout.payload_bytes() as u64,
+            layout.weights.resident_bytes().unwrap());
+        assert_eq!(reservations.resident_weights.0, reservations.arena.layout.bytes() as u64);
         assert!(!costs
             .iter()
             .any(|cost| cost.name == "draft.weights.bf16_values"
@@ -1166,8 +1170,13 @@ mod tests {
                     assert!(!peer.steady.iter().any(|owner| owner.name == format!("draft.workspace.{name}")));
                 }
                 assert_eq!(peer.resident_weights.0, local.resident_weights.0);
-                assert_eq!(local.resident_weights.0, cfg.for_tp(2).unwrap().runtime_layout(mode, capacity)
-                    .unwrap().weights.resident_bytes().unwrap());
+                assert_eq!(local.resident_weights.0, local.arena.layout.bytes() as u64);
+                assert_eq!(local.arena.layout.payload_bytes() as u64,
+                    cfg.for_tp(2).unwrap().runtime_layout(mode, capacity).unwrap().weights.resident_bytes().unwrap());
+                assert_eq!(local.arena.lifetime, cuteafd_loader::placement::planner::Lifetime {
+                    first: cuteafd_loader::placement::planner::Phase::DraftLoad,
+                    last: cuteafd_loader::placement::planner::Phase::Growth,
+                });
                 assert!(local.packing.iter().all(|owner| !owner.name.contains("ring") && !owner.name.contains("workspace")));
                 let whole_mark = mimo_draft_mark_bytes(1, 2, 128, kv).unwrap();
                 let local_mark = mimo_draft_mark_bytes(1, 1, 128, kv).unwrap();
@@ -1249,10 +1258,8 @@ mod tests {
         )
         .unwrap();
         assert!(reservations.steady.iter().all(|r| !r.name.contains("fp8")));
-        assert!(reservations
-            .steady
-            .iter()
-            .any(|r| r.name == "draft.weights.bf16_values"));
+        assert!(reservations.steady.iter().all(|r| !r.name.starts_with("draft.weights.")));
+        assert!(reservations.arena.layout.views().keys().all(|name| !name.ends_with(".payload")));
         assert!(reservations.packing.is_empty());
         let invalid = MimoDraftCapacity {
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,

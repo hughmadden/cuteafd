@@ -44,7 +44,7 @@ pub struct V4Inputs {
     /// Shared model extent and optional operator context pin.
     pub serving_context: crate::placement::planner::Context,
     pub cfg: DeepseekV4Config,
-    /// Header-derived uploads; no attention weights hidden in the baseline.
+    /// The admitted target/dSpark weight arenas and their Load-only startup owners.
     pub weights: crate::families::deepseek_v4::resident::WeightInventory,
     /// dSpark stages that hold caches (all the checkpoint's stages).
     pub cache_stages: usize,
@@ -309,8 +309,7 @@ mod default_tests {
                 let mut input = V4Inputs {
                     expert_usage: false, resident_weight_limit: None,
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, serving_context: crate::placement::planner::Context::pinned(262_144),
-                    cfg: cfg.clone(), weights: crate::families::deepseek_v4::resident::WeightInventory {
-                        c4_attention: Vec::new(), fixed: Vec::new(), startup: Default::default() },
+                    cfg: cfg.clone(), weights: test_weights(gpus),
                     cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned {
                         context_bytes: 0, loaded_bytes: 0 }); gpus],
                     spark_ranks: 6, sequences: 16, prefill_rows: 2752, prefill_waves: 3,
@@ -378,12 +377,19 @@ mod default_tests {
         assert_eq!(context_commit_units(257), 2);
     }
 
+    /// One minimal admitted target arena per GPU, no drafter.
+    fn test_weights(gpus: usize) -> crate::families::deepseek_v4::resident::WeightInventory {
+        crate::families::deepseek_v4::resident::WeightInventory {
+            target: (0..gpus).map(|rank| crate::serving_capacity::WeightArenaLayout::new(
+                format!("v4/target/{rank}"), [("norm.weight".to_string(), 1 << 20)]).unwrap()).collect(),
+            draft: None, startup: Default::default() }
+    }
+
     fn plan_inputs(cfg: &DeepseekV4Config) -> V4Inputs {
         V4Inputs {
             expert_usage: false, resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             serving_context: crate::placement::planner::Context::pinned(262_144), cfg: cfg.clone(),
-            weights: crate::families::deepseek_v4::resident::WeightInventory {
-                c4_attention: vec![ModeBytes::default(); cfg.n_layers], fixed: Vec::new(), startup: Default::default() },
+            weights: test_weights(2),
             cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2],
             spark_ranks: 6, sequences: 1, prefill_rows: 4096, prefill_waves: 3,
             decode_rows: 64, max_context: 262144, mark_slots: 0,
@@ -515,6 +521,7 @@ mod default_tests {
             }
             let mut one = plan_inputs(&cfg);
             one.gpus.truncate(1);
+            one.weights = test_weights(1);
             assert_eq!(admitted(&one).unwrap().attention_placement, AttentionPlacement::Heads);
             assert!(super::super::DEEPSEEK_V4.check_attention(Some(AttentionPlacement::Layers), 2, true).is_err());
         }

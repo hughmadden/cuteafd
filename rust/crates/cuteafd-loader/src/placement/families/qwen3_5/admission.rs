@@ -30,6 +30,7 @@ impl ServingFacts {
 pub struct DenseFacts<'a> {
     pub cfg: &'a Qwen35Config,
     pub weights: &'a NativeWeights,
+    pub target_arena: &'a crate::serving_capacity::WeightArenaLayout,
     pub buffers: &'a NativeBuffers,
     pub slots: usize,
     pub record_bytes: u64,
@@ -94,6 +95,10 @@ pub fn admit(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
     if facts.weights.layers.len() != facts.cfg.attention.len()
         || facts.record_bytes == 0
         || facts.slots == 0
+        || facts.target_arena.id() != "qwen3_5/target/gpu0"
+        || facts.target_arena.payload_bytes() as u64 != facts.weights.layers.iter().sum::<u64>()
+            + facts.weights.norm + facts.weights.head + facts.weights.embedding
+        || facts.drafter.is_some_and(|draft| draft.weights.0 > 0 && draft.weight_arena.is_none())
         || facts.buffers.head_rows != match request.operation {
             Operation::Serving => super::VERIFY_ROWS,
             Operation::Scoring => PREFILL_ROWS,
@@ -112,6 +117,13 @@ impl Recipe for DenseFacts<'_> {
         let token_capacity = if self.drafter.is_some() { i32::MAX as u64 } else { u32::MAX as u64 };
         let maximum = token_capacity / PAGE_ROWS;
         let mut contract = Contract::fixed(PAGE_ROWS, maximum, 1, self.owner_templates(1)?);
+        let gpu = Location::coordinator(0);
+        contract.components.extend(weight_arena_components(self.target_arena, gpu, Lifetime::RESIDENT, maximum)?);
+        let draft_start = contract.components.len();
+        if let Some((id, bytes)) = self.drafter.and_then(|draft| draft.weight_arena) {
+            contract.components.extend(weight_arena_extent_components(id, bytes, gpu,
+                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, maximum)?);
+        }
         contract.variables = self.cfg.attention.iter().enumerate()
             .map(|(layer, _)| Variable::Attention { layer, values: vec![WHOLE] })
             .collect();
@@ -133,8 +145,8 @@ impl Recipe for DenseFacts<'_> {
         if self.drafter.is_some() {
             let home = contract.variables.len();
             contract.variables.push(Variable::DraftHome(vec![0]));
-            for component in &mut contract.components {
-                let draft = match &component.kind {
+            for (index, component) in contract.components.iter_mut().enumerate() {
+                let draft = index >= draft_start || match &component.kind {
                     ComponentKind::Allocation { template, .. } => template.id.starts_with("draft."),
                     ComponentKind::ResidentWeight(owner) => owner.id.starts_with("draft."),
                     _ => false,
@@ -151,28 +163,13 @@ impl DenseFacts<'_> {
     /// page-dependent extents change when the winning plan is materialized.
     fn owner_templates(&self, pages: u64) -> Result<Facts, Refusal> {
         let mut allocations = Vec::new();
-        let mut resident_weights = Vec::new();
+        let resident_weights = Vec::new();
         let mut add = |id: String, location, bytes: u64, lifetime, category, group: &str| {
             if bytes > 0 {
                 allocations.push(Allocation::buffer(id, location, bytes, lifetime, category, group));
             }
         };
         let gpu = Location::coordinator(0);
-        let resident = |id: String, bytes: u64| ResidentWeight { id, location: gpu,
-            weights: crate::placement::ResidentWeights(bytes) };
-        for (layer, &bytes) in self.weights.layers.iter().enumerate() {
-            let id = format!("weights.layer.{layer}");
-            resident_weights.push(resident(id.clone(), bytes));
-            add(id, gpu, bytes, Lifetime::RESIDENT, Category::Weights, "native dense weights");
-        }
-        for (id, bytes, category, group) in [
-            ("weights.norm".to_string(), self.weights.norm, Category::Weights, "final norm"),
-            ("weights.head".to_string(), self.weights.head, Category::Weights, "vocabulary head"),
-            ("weights.embedding".to_string(), self.weights.embedding, Category::Embedding, "token embedding"),
-        ] {
-            resident_weights.push(resident(id.clone(), bytes));
-            add(id, gpu, bytes, Lifetime::RESIDENT, category, group);
-        }
         // The dense loader keeps one reusable pinned staging buffer for the
         // mount copies and releases it when loading ends (STEP_BYTES bound).
         let step = crate::shared::dense_read::STEP_BYTES as u64;
@@ -242,12 +239,6 @@ impl DenseFacts<'_> {
             add("draft.prefetch".into(), Location::HOST, draft.host_prefetch,
                 Lifetime { first: Phase::DraftLoad, last: Phase::DraftLoad }, Category::Staging,
                 "drafter prefetched checkpoint tensors");
-            if draft.weights.0 > 0 {
-                resident_weights.push(ResidentWeight { id: "draft.weights".into(), location: gpu,
-                    weights: draft.weights });
-                add("draft.weights".into(), gpu, draft.weights.0, life, Category::Drafter,
-                    "native drafter weights");
-            }
             add("draft.runtime".into(), gpu, draft.owned.saturating_sub(draft.weights.0), life,
                 Category::Drafter, "native drafter workspaces");
             add("draft.scratch".into(), gpu, draft.scratch, life, Category::Drafter, "native drafter scratch");

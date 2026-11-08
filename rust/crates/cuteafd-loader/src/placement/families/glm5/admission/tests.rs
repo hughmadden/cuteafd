@@ -95,6 +95,52 @@ fn gqa_layout(representation: crate::families::glm5::draft_representation::GlmDr
 }
 
 #[test]
+fn packed_draft_is_charged_once_during_push_target_load() {
+    use crate::families::glm5::{draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout, gqa_arena_requests},
+        draft_representation::{GlmDraftCapacity, GlmDraftRepresentation}};
+    let draft = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
+        kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
+        mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
+        row_window: false, sample_from_anchor: false };
+    for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
+        let layout = GlmDflashPhysicalLayout::new(&draft, representation,
+            GlmDraftCapacity::new(20, 16, draft.block).unwrap(), 188, 0,
+            crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
+        let mut facts = DraftFacts::from_gqa(&layout).unwrap();
+        let old = facts.weights.iter().map(|owner| owner.weights.0).sum::<u64>();
+        facts.pack_arena(gqa_arena_requests(&draft, representation, 0, 1).unwrap()).unwrap();
+        let arena = facts.arena.as_ref().unwrap();
+        assert_eq!(old, arena.payload_bytes() as u64);
+        assert!(facts.weights.is_empty());
+        assert!(!facts.owners.iter().any(|owner| layout.weight_owners().any(|weight|
+            owner.id == format!("glm.draft.{}", weight.id))));
+        let cfg = cfg();
+        let mut input = production_input(&cfg, 1, 4, PrefillShape { rows: 128, waves: 3 });
+        input.draft = facts.clone();
+        let solved = input.prepare().unwrap().admit(request()).unwrap().solved;
+        let root = solved.facts.allocations.iter().find(|owner| owner.id == "glm/draft/0").unwrap();
+        assert_eq!(root.bytes, arena.bytes() as u64);
+        assert_eq!(root.lifetime, Lifetime::RESIDENT);
+        let tail = solved.facts.allocation_granularity.iter().find(|owner|
+            owner.backings.iter().any(|backing| backing.backing == root.id)).unwrap();
+        assert_eq!(tail.lifetime, root.lifetime);
+        assert_eq!(tail.backings.len(), 1);
+        assert_eq!(tail.backings[0].requests, [root.bytes]);
+        let load = solved.phases.iter().find(|row| row.phase == Phase::Load
+            && solved.budgets.iter().any(|budget| budget.id == row.budget
+                && budget.locations.contains(&Location::coordinator(0)))).unwrap();
+        let mut without = solved.facts.clone();
+        without.allocations.retain(|owner| owner.id != root.id);
+        without.resident_weights.retain(|owner| owner.id != root.id);
+        without.allocation_granularity.retain(|owner| owner.id != tail.id);
+        let baseline = planner::evaluate(&without, &solved.budgets).unwrap().into_iter()
+            .find(|row| row.phase == Phase::Load && row.budget == load.budget).unwrap();
+        assert_eq!(load.owned - baseline.owned, root.bytes);
+        assert_eq!(load.opaque - baseline.opaque, tail.bytes().unwrap());
+    }
+}
+
+#[test]
 fn draft_facts_preserve_owner_ids_resources_and_serial_fp8_sources() {
     use crate::families::glm5::draft_representation::GlmDraftRepresentation::{Bf16Only, Fp8Only};
     for representation in [Bf16Only, Fp8Only] {
@@ -198,8 +244,8 @@ fn ml4_draft_facts_preserve_native_owners_and_share_the_library_upload_bank() {
     let layout = cfg.runtime_layout(Bf16Only, GlmDraftCapacity::new(20, 16, 3).unwrap(),
         1 << 20, 1 << 21, 188, 0, cuteafd_core::MlaCacheFormat::Fp8).unwrap();
     let facts = DraftFacts::ml4(&layout).unwrap();
-    let retained = layout.owners().iter().filter(|owner|
-        !owner.on_use && owner.shared_key.as_deref() != Some("library/sync-h2d")).collect::<Vec<_>>();
+    let retained = layout.owners().iter().filter(|owner| !layout.is_immutable_buffer(&owner.id)
+        && !owner.on_use && owner.shared_key.as_deref() != Some("library/sync-h2d")).collect::<Vec<_>>();
     assert_eq!(facts.owners.len(), retained.len() + 1);
     for expected in retained {
         let owner = facts.owners.iter().find(|owner| owner.id == format!("glm.draft.{}", expected.id)).unwrap();
@@ -207,8 +253,18 @@ fn ml4_draft_facts_preserve_native_owners_and_share_the_library_upload_bank() {
         assert_eq!(owner.alignment, expected.alignment as u64);
         assert_eq!(owner.shape, expected.shape.iter().map(|&n| n as u64).collect::<Vec<_>>());
     }
-    assert_eq!(facts.weights.iter().map(|owner| owner.weights.0).sum::<u64>(),
-        layout.weights().resident_bytes().unwrap());
+    assert!(facts.weights.is_empty());
+    assert_eq!(facts.arena_weights, layout.weights().resident_bytes().unwrap());
+    let arena = facts.arena.as_ref().unwrap();
+    assert_eq!(arena.views().len(), layout.weight_destinations().len() + 1);
+    assert!(arena.view("markov_norms").is_some());
+    let components = facts.components(0, 64).unwrap();
+    let roots = components.iter().filter_map(|component| match &component.kind {
+        ComponentKind::Allocation { template, .. } if template.id == "glm/draft/0" => Some(template), _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].bytes, arena.bytes() as u64);
+    assert_eq!(roots[0].lifetime, Lifetime::RESIDENT);
     assert_eq!(facts.sync_upload_bytes, layout.owners().iter()
         .filter(|owner| owner.shared_key.as_deref() == Some("library/sync-h2d"))
         .map(|owner| owner.bytes as u64).max().unwrap());
