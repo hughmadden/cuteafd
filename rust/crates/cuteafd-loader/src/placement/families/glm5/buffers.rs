@@ -189,8 +189,15 @@ impl Builder {
         table_stride: u64,
     ) -> Result<(), Refusal> {
         let name = if decode { "decode" } else { "prefill" };
+        // The decode workspace is allocated by the startup warm pass. Prefill
+        // lanes are allocated by the first prefill: during startup only for
+        // scoring, otherwise by live traffic after Ready.
         let lifetime = Lifetime {
-            first: Phase::Warmup,
+            first: if decode || facts.full_prefill_logits {
+                Phase::Warmup
+            } else {
+                Phase::Growth
+            },
             last: Phase::Growth,
         };
         let span = mul(shape.rows, shape.waves)?;

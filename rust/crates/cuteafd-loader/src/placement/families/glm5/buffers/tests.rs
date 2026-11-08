@@ -185,11 +185,17 @@ fn named_target_buffers_match_independent_pool_geometry_and_aliases() {
                     .any(|a| a.id == format!("{prefix}.decode.upload.0.ids")));
             }
             // Views do not charge a second physical arena or shared logits allocation.
+            // Serving prefill lanes are allocated by the first live prefill (Growth),
+            // so they are absent from the Ready charge.
             let phase = planner::evaluate(&facts, &budgets()).unwrap();
             let physical: u64 = facts
                 .allocations
                 .iter()
-                .filter(|a| a.view.is_none() && a.location == Location::coordinator(device))
+                .filter(|a| {
+                    a.view.is_none()
+                        && a.location == Location::coordinator(device)
+                        && a.lifetime.contains(Phase::Ready, facts.phase_order)
+                })
                 .map(|a| a.bytes)
                 .sum();
             assert_eq!(
