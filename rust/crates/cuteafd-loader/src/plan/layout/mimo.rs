@@ -568,6 +568,11 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let prepared = ProductionInput {
         expert_usage: options.expert_usage,
+        blas_head: if checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
+            .is_some_and(|t| t.meta.dtype == cuteafd_core::DType::Bf16)
+            && default_policy(checkpoint, &cfg) != MimoDefaultPolicy::Fp8 { options.bf16_target_head }
+            else { crate::placement::planner::serving::BlasHead::Native },
+        draft_head: mimo_dflash_dir(checkpoint, options).is_some(),
         cfg: &cfg, layers: cfg.layers, kv, mtp_stages: selected_mtp(checkpoint, options), context, maximum_pool_tokens,
         prefill, lanes: lanes as u64, embedding, gpus: ranks, spark_ranks,
         experts, expert_workspace, tp2_workspace,

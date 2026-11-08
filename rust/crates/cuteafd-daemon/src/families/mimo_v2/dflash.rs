@@ -101,7 +101,7 @@ struct DraftOutput<'a> {
     candidates: Dev<'a>,
     landing: crate::shared::memory::HostAllocation<'a>,
     topk_workspace: Dev<'a>,
-    head: VocabularyHead<'a>,
+    head: Option<VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
 }
 
@@ -165,6 +165,7 @@ pub(crate) struct MimoDrafter<'a> {
     mask_device: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     representation: MimoDraftRepresentation,
+    bf16_head: bool,
     fp8_workspace: Option<Dev<'a>>,
 
     confidence_directory: std::path::PathBuf,
@@ -575,16 +576,16 @@ impl<'a> MimoDrafter<'a> {
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. The trained mask keeps its host fallback row.
     pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
-        max_sequences: usize, representation: MimoDraftRepresentation,
+        max_sequences: usize, representation: MimoDraftRepresentation, bf16_head: bool,
         scales: fp8_linear::Fp8Scales, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         exchange: Option<Rc<PeerExchange<'a>>>) -> Result<Self> {
         let ranks = if exchange.is_some() { 2 } else { 1 };
         let mut lead = Self::load_rank(library, programs, dir, Some(file), stream, slots, max_sequences,
-            representation, scales, kv_cache, 0, ranks)?;
+            representation, scales, kv_cache, bf16_head, 0, ranks)?;
         if let Some(exchange) = exchange {
             let device = Device { library, id: exchange.device(1) };
             let peer = device.own(|| Self::load_rank(library, programs, dir, None, exchange.stream(1),
-                slots, max_sequences, representation, scales, kv_cache, 1, ranks).map(Box::new))?;
+                slots, max_sequences, representation, scales, kv_cache, bf16_head, 1, ranks).map(Box::new))?;
             lead.peer = Some(peer);
             lead.exchange = Some(exchange);
         }
@@ -595,7 +596,7 @@ impl<'a> MimoDrafter<'a> {
     fn load_rank(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
         dir: &Path, file: Option<Vec<u8>>, stream: *mut c_void, slots: usize, max_sequences: usize,
         representation: MimoDraftRepresentation, scales: fp8_linear::Fp8Scales,
-        kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, rank: usize, ranks: usize) -> Result<Self> {
+        kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, bf16_head: bool, rank: usize, ranks: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let source_cfg = DflashConfig::read(dir)?;
         let cfg = source_cfg.for_tp(ranks)?;
@@ -693,6 +694,7 @@ impl<'a> MimoDrafter<'a> {
             mask_row,
             workspace: RefCell::new(None),
             representation,
+            bf16_head,
             confidence_directory: dir.into(),
             confidence_scales: scales,
             fp8_workspace,
@@ -916,8 +918,11 @@ impl<'a> MimoDrafter<'a> {
                         Tag::staging("mimo/dflash-landing"))?,
                     topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
                     // SAFETY: the workspace outlives this head's plan and uses the lead device.
-                    head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                        rows as u32, c.vocab as u32, cuteafd_ffi::programs::HeadMode::Gemm)? },
+                    head: self.bf16_head.then(|| {
+                        // SAFETY: private stable workspace and the borrowed BF16 target geometry.
+                        unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
+                            rows as u32, c.vocab as u32, cuteafd_ffi::programs::HeadMode::Gemm) }
+                    }).transpose()?,
                     _head_workspace: head_workspace,
                 })
             }).transpose()?,
@@ -933,7 +938,7 @@ impl<'a> MimoDrafter<'a> {
         ensure!(head.hidden == self.cfg.hidden && head.vocab == self.cfg.vocab,
             "DFlash borrowed target head geometry differs from its checkpoint");
         self.draft_from(sequences, Anchors::Tokens(embedding), |plan, x, out, rows|
-            head.launch_draft(Some(plan), x, out, rows, self.stream))
+            head.launch_draft(plan, x, out, rows, self.stream))
     }
 
     /// [`Self::draft`] from the anchors' embedding rows (oracles and replays).
@@ -941,12 +946,13 @@ impl<'a> MimoDrafter<'a> {
         self.draft_from(sequences, Anchors::Rows(anchor_rows), |plan, x, out, rows| {
             // SAFETY: ReplayDrafter's caller retains a complete BF16 target
             // head. FP8-only targets reject that diagnostic before loading.
-            unsafe { plan.launch(x.ptr.cast(), head.cast(), out.ptr.cast(), rows as u32, self.stream) }
+            unsafe { plan.context("BF16 diagnostic head was not prepared")?.launch(
+                x.ptr.cast(), head.cast(), out.ptr.cast(), rows as u32, self.stream) }
         })
     }
 
     fn draft_from(&self, sequences: &[DraftSeq], anchors: Anchors<'_>,
-        head: impl FnOnce(&VocabularyHead<'_>, CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize) -> Result<()>) -> Result<Vec<Draft>> {
+        head: impl FnOnce(Option<&VocabularyHead<'_>>, CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize) -> Result<()>) -> Result<Vec<Draft>> {
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let anchors_fit = match anchors {
@@ -955,12 +961,9 @@ impl<'a> MimoDrafter<'a> {
         };
         ensure!(s_count > 0 && s_count <= self.max_sequences && anchors_fit, "draft step of {s_count} sequences");
         let rows = s_count * block;
-        let mut slot = self.workspace.borrow_mut();
-        if slot.as_ref().is_none_or(|w| w.sequences < s_count) {
-            *slot = None;
-            *slot = Some(self.workspace(self.max_sequences)?);
-        }
-        let w = slot.as_ref().context("draft workspace")?;
+        let slot = self.workspace.borrow();
+        let w = slot.as_ref().context("draft workspace must be prepared before use")?;
+        ensure!(w.sequences >= s_count, "draft workspace exceeds prepared sequence capacity");
         let mut positions = Vec::with_capacity(rows);
         let mut tables = vec![0i32; 3 * s_count];
         for (i, seq) in sequences.iter().enumerate() {
@@ -1001,12 +1004,9 @@ impl<'a> MimoDrafter<'a> {
         let (s, l) = (self.stream, self.library);
         let forward_span = self.timing.begin("forward", None, rows, s)?;
         if let (Some(peer), Some(exchange)) = (&self.peer, &self.exchange) {
-            let mut peer_slot = peer.workspace.borrow_mut();
-            if peer_slot.as_ref().is_none_or(|w| w.sequences < s_count) {
-                *peer_slot = None;
-                *peer_slot = Some(peer.device.run(|| peer.workspace(peer.max_sequences))?);
-            }
-            let pw = peer_slot.as_ref().context("peer draft workspace")?;
+            let peer_slot = peer.workspace.borrow();
+            let pw = peer_slot.as_ref().context("peer draft workspace must be prepared before use")?;
+            ensure!(pw.sequences >= s_count, "peer draft workspace exceeds prepared sequence capacity");
             peer.device.run(|| {
                 peer.put(&pw.positions, bytes_of(&positions))?;
                 peer.put(&pw.tables, bytes_of(&tables))
@@ -1045,7 +1045,7 @@ impl<'a> MimoDrafter<'a> {
         // rows are reduced/normalized before the stream reaches this launch.
         unsafe {
             let head_span = self.timing.begin("head_topk", None, rows, s)?;
-            head(&output.head, w.n.buffer, output.logits.buffer, rows)?;
+            head(output.head.as_ref(), w.n.buffer, output.logits.buffer, rows)?;
             l.glm_dflash_topk(output.logits.buffer.ptr, output.unary.buffer.ptr, output.candidates.buffer.ptr,
                 output.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             self.timing.end(head_span, s)?;

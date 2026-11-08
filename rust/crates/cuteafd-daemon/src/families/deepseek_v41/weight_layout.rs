@@ -124,6 +124,7 @@ mod tests {
             gpu: u8, draft: bool| -> Result<(u64, u64)> {
             let demand = owners::arena_demand(gpu, layout);
             let prepared = admission::ProductionInput {
+                blas: Vec::new(),
                 expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
                 prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
                 replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,

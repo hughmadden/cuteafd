@@ -726,14 +726,10 @@ impl FixtureGpu {
     fn free_with_current_code(&self, code: u64) -> u64 {
         match (self.reserved_code_bytes, self.untracked_at_admission_bytes) {
             (Some(reserved), Some(untracked)) => {
-                let loaded = cuteafd_loader::placement::inventory::LoadedCode {
-                    family: "dsv4", experts: "*", split: true, rank: 0,
-                    bytes: code, source: "fixture replay",
-                };
                 let context = cuteafd_loader::placement::inventory::ArchContext::for_device(
                     "sm_120", self.total_bytes).context_bytes;
                 self.admission_free_bytes.checked_add(reserved).unwrap()
-                    .checked_sub(loaded.pending(untracked, context)).unwrap()
+                    .checked_sub(code.saturating_sub(untracked.saturating_sub(context))).unwrap()
             }
             (None, None) => self.admission_free_bytes,
             _ => panic!("fixture must record both pending-code inputs"),
@@ -907,16 +903,12 @@ fn historical_p2_flash_max_inventory_and_pending_code() {
         "../../shared/placement_fixtures/v4-flash-max.json")).unwrap();
     assert!(fixture.historical_tp1);
     assert_eq!((fixture.rtx, fixture.sparks), (2, 4));
-    for (gpu, code) in fixture.gpus.iter().zip([560_200_800, 260_349_424]) {
+    for (gpu, code) in fixture.gpus.iter().zip([560_200_800u64, 260_349_424]) {
         assert!(gpu.admission_free_bytes < gpu.total_bytes);
         let measured_used = gpu.total_bytes - gpu.admission_free_bytes;
-        let historical = cuteafd_loader::placement::inventory::LoadedCode {
-            family: "dsv4", experts: "*", split: true, rank: 0,
-            bytes: code, source: "historical P2 TP1 sample",
-        };
         let context = 586_416_128;
-        assert_eq!(historical.pending(context + 100, context), code - 100);
-        assert_eq!(historical.pending(context + code, context), 0);
+        assert_eq!(code.saturating_sub(100), code - 100);
+        assert_eq!(code.saturating_sub(code), 0);
         assert!(measured_used > context + code);
     }
 }

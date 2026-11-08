@@ -2068,6 +2068,7 @@ impl Opened {
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
+            blas_head: args.resolved_target_head().blas_head(!self.native && core.get_weight("lm_head").is_none() && !representation.fp8_head),
             representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: if shape.full_prefill_logits {

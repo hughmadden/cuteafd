@@ -727,6 +727,7 @@ pub struct V41Recipe<'a> {
     pub tails: u64,
     pub replicated: bool,
     pub draft: Option<DraftInventory>,
+    pub blas: Vec<serving::BlasOwners>,
     /// Every always-active physical owner except KV and the routed-expert arena.
     pub owners: Vec<Case<Vec<Component>>>,
     pub opaques: Vec<Opaque>,
@@ -914,6 +915,8 @@ pub struct ProductionInput<'a> {
     /// Post-ready reserves that are not allocator receipts.
     pub allowances: Vec<Opaque>,
     pub draft: Option<DraftInventory>,
+    /// Future native borrowers above the sample, including a local media thread.
+    pub blas: Vec<serving::BlasOwners>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
     pub media_cache_bytes: u64,
     pub resident_weight_limit: u64,
@@ -1036,6 +1039,7 @@ impl<'a> ProductionInput<'a> {
             tails,
             replicated: self.replicated,
             draft: self.draft,
+            blas: self.blas,
             owners: Vec::new(),
             opaques: self.allowances,
         };
@@ -1394,6 +1398,7 @@ impl Recipe for V41Recipe<'_> {
                 component
             }));
         }
+        let mut blas = self.blas.clone();
         // Encoder candidates are finite; the shared solve picks the first that
         // fits every phase and never runs again to choose a topology.
         if !self.encoders.is_empty() {
@@ -1423,6 +1428,13 @@ impl Recipe for V41Recipe<'_> {
                 };
                 let mut components = Vec::new();
                 for (copy, location) in locations.iter().copied().enumerate() {
+                    // Spark media BLAS is already in V41_SPARK_CUDA_OVERHEAD_BYTES (#1568).
+                    if matches!(location.device, Device::Coordinator(_)) {
+                        blas.push(serving::BlasOwners { name: format!("V4.1 vision candidate {option} copy {copy}"),
+                            process: "coordinator".into(), thread: "v41/blas/media".into(), location,
+                            gemm: true, lt: false, lifetime: Lifetime::RESIDENT,
+                            activation: Activation::choice(variable, option) });
+                    }
                     for (part, bytes, category) in [
                         ("weights", encoder.weights, Category::Weights),
                         ("scratch", encoder.scratch, Category::Workspace),
@@ -1505,6 +1517,12 @@ impl Recipe for V41Recipe<'_> {
                     contract.components.push(component);
                 }
             }
+        }
+        for (arch, coordinator) in [("sm_120", true), ("sm_121", false)] {
+            let borrowers = blas.iter().filter(|owner| matches!(owner.location.device,
+                Device::Coordinator(_)) == coordinator).cloned().collect::<Vec<_>>();
+            contract.components.extend(serving::blas_components(arch, &borrowers,
+                self.maximum_pages, contract.phase_order)?);
         }
         for components in cache_owners(
             self.config,

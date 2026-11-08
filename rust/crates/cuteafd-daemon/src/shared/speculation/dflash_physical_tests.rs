@@ -635,7 +635,7 @@ fn ml4_arena_requests_exactly_cover_real_loader_bindings() -> Result<()> {
     let stream = Stream::new(device)?;
     let mut bound = Vec::new();
     let (drafter, records) = device.run(|| crate::shared::experts::rtx::dense::recording(||
-        DflashDrafter::load_ml4_with(&library, &programs, native.clone(), &target,
+        DflashDrafter::load_ml4_with(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Native, native.clone(), &target,
             target.logit_softcap as f32, stream.raw, layout.clone(), &|name, shape| source.rect(name, shape),
             |physical, name, bytes| {
                 assert_eq!(physical, 1);

@@ -76,6 +76,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 context_tokens: args.context_tokens.unwrap_or(0),
                 prefill_rows: args.prefill_rows,
                 full_prefill_logits: args.full_prefill_logits,
+                bf16_target_head: args.target_head.unwrap_or_else(crate::shared::target_head::TargetHead::configured).blas_head(true),
                 expert_usage: args.expert_usage.unwrap_or(true),
                 // Lane families still read prefill_lanes until their unit ports land.
                 prefill_lanes: args.prefill_waves,

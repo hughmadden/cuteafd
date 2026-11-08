@@ -604,15 +604,18 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         phase_order: p::PhaseOrder::TARGET_THEN_DRAFT, allocations: vec![], deferred: vec![],
         sequential: vec![], reservations: vec![], allowances: vec![], resident_weights: vec![],
     });
-    // Decode and all prefill lanes retain two lead-rank head objects, including
-    // native/core head routes; prefill lanes share one Temporaries. Shared replay
-    // constructs them before target KV, otherwise serving warm-up does.
-    let mut blas = vec![p::serving::BlasOwners {
-        name: "GLM Flash target decode and shared prefill heads".into(), process: "coordinator".into(),
-        location: p::Location::coordinator(0), cublas_handles: 2, lt_handles: 2,
-        lifetime: p::Lifetime { first: if i.shared_replay { p::Phase::PostTargetKv } else { p::Phase::Warmup },
-            last: p::Phase::Growth }, activation: p::Activation::always(),
-    }];
+    // Target lanes and local BF16 draft projections borrow the same serving
+    // thread/device pool. Native vocabulary callbacks create neither backend.
+    let mut blas = Vec::new();
+    if i.blas_head.bf16() {
+        blas.push(p::serving::BlasOwners {
+            name: "GLM Flash target projections".into(), process: "coordinator".into(),
+            thread: "glmf/blas/serve".into(), location: p::Location::coordinator(0),
+            gemm: i.blas_head.gemm(), lt: i.blas_head.lt(),
+            lifetime: p::Lifetime { first: if i.shared_replay { p::Phase::PostTargetKv } else { p::Phase::Warmup },
+                last: p::Phase::Growth }, activation: p::Activation::always(),
+        });
+    }
     contract.pool_page_multiple = if i.attention.mode == AttentionPlacement::Context { 2 } else { 1 };
     contract.spark_reply_formats = (i.spark_ranks > 0).then_some(cuteafd_core::spark_reply::SparkReplyFormats {
         prefill: Some(i.spark_reply_format), decode: Some(cuteafd_core::SparkReplyFormat::Bf16),
@@ -659,11 +662,14 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             };
             let activation = p::Activation::choice(variable, option);
             for (copy, location) in locations.iter().copied().enumerate() {
-                if matches!(location.device, p::Device::Coordinator(_)) {
-                    blas.push(p::serving::BlasOwners { name: format!("GLM Flash vision {option}.{copy}"), process: "coordinator".into(),
-                        location, cublas_handles: 1, lt_handles: 0, lifetime: p::Lifetime::RESIDENT,
-                        activation: activation.clone() });
-                }
+                let process = match location.device {
+                    p::Device::Coordinator(_) => "coordinator".into(),
+                    p::Device::Spark(rank) => format!("glmf-media-worker-{rank}"),
+                    _ => unreachable!("encoder locations are CUDA devices"),
+                };
+                blas.push(p::serving::BlasOwners { name: format!("GLM Flash vision {option}.{copy}"), process,
+                    thread: "glmf/blas/media".into(), location, gemm: true, lt: false, lifetime: p::Lifetime::RESIDENT,
+                    activation: activation.clone() });
                 for (part, bytes, category) in [("weights", encoder.weights, Category::Weights),
                     ("scratch", encoder.scratch, Category::Workspace)] {
                     let owner = p::Allocation::buffer(format!("glmf.encoder.{option}.{copy}.{part}"),
@@ -742,9 +748,9 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         for (rank, layout) in process.draft_tp2.iter().enumerate() {
             let prefix = if rank == 0 { "glmf.draft" } else { "glmf.draft.peer" };
             let location = p::Location::coordinator(rank as u8);
-            if layout.owners().iter().any(|owner| owner.id == "workspace.head") {
+            if i.blas_head.bf16() && layout.owners().iter().any(|owner| owner.id == "workspace.head") {
                 blas.push(p::serving::BlasOwners { name: "GLM Flash TP2 DFlash head".into(), process: "coordinator".into(),
-                    location, cublas_handles: 1, lt_handles: 1,
+                    thread: "glmf/blas/serve".into(), location, gemm: true, lt: false,
                     lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
                     activation: p::Activation::always() });
             }
@@ -891,10 +897,12 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         let (draft_variable, draft_homes) = (variable, homes.clone());
         for (option, gpu) in homes.into_iter().enumerate() {
             let activation = p::Activation::choice(variable, option);
-            blas.push(p::serving::BlasOwners { name: "GLM Flash drafter vocabulary head".into(), process: "coordinator".into(),
-                location: p::Location::coordinator(gpu), cublas_handles: 1, lt_handles: 1,
-                lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
-                activation: activation.clone() });
+            if gpu == 0 && i.blas_head.bf16() {
+                blas.push(p::serving::BlasOwners { name: "GLM Flash drafter vocabulary head".into(), process: "coordinator".into(),
+                    thread: "glmf/blas/serve".into(), location: p::Location::coordinator(gpu), gemm: true, lt: false,
+                    lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
+                    activation: activation.clone() });
+            }
             add_arena(&mut contract, &draft_arenas[usize::from(gpu)], usize::from(gpu),
                 p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }, &activation, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?;
             add_demand(&mut contract, &Demand::new(gpu, Category::Drafter, "DFlash", nonweights,
@@ -906,10 +914,12 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                     head.draft_scratch, Basis::Formula), format!("glmf.draft.head.{gpu}"), activation.clone())?;
             }
             if gpu != 0 {
-                blas.push(p::serving::BlasOwners { name: "GLM Flash remote drafter bridge head".into(), process: "coordinator".into(),
-                    location: p::Location::coordinator(0), cublas_handles: 1, lt_handles: 1,
-                    lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
-                    activation: activation.clone() });
+                if i.blas_head.bf16() {
+                    blas.push(p::serving::BlasOwners { name: "GLM Flash remote drafter bridge head".into(), process: "coordinator".into(),
+                        thread: "glmf/blas/serve".into(), location: p::Location::coordinator(0), gemm: true, lt: false,
+                        lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
+                        activation: activation.clone() });
+                }
                 for (index, demand) in i.drafter_bridge.as_ref().into_iter().flat_map(|bridge| &bridge.demands).enumerate() {
                     add_demand(&mut contract, demand, format!("glmf.draft.bridge.{index}"), activation.clone())?;
                 }
@@ -985,7 +995,10 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             contract.components.push(owner);
         }
     }
-    contract.components.extend(p::serving::blas_components("sm_120", &blas, maximum, contract.phase_order)?);
+    let (rtx_blas, spark_blas): (Vec<_>, Vec<_>) = blas.into_iter()
+        .partition(|owner| matches!(owner.location.device, p::Device::Coordinator(_)));
+    contract.components.extend(p::serving::blas_components("sm_120", &rtx_blas, maximum, contract.phase_order)?);
+    contract.components.extend(p::serving::blas_components("sm_121", &spark_blas, maximum, contract.phase_order)?);
     contract.add_driver_page_tables();
     let request = p::Request { context: i.context,
         pool: PoolPolicy::normalize_request(i.requested_pool).map_or(p::Pin::Auto, p::Pin::Exact),
@@ -1231,10 +1244,15 @@ mod tests {
     fn retained_heads_and_portable_prefix_follow_selected_physical_owners() {
         use crate::plan::encoder::{EncoderKind, EncoderPlacement};
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
-        for (draft, waves) in [(false, 1), (true, 1), (true, 3)] {
+        for (draft, waves, head) in [
+            (false, 1, p::serving::BlasHead::TensorLt), (true, 1, p::serving::BlasHead::TensorLt),
+            (true, 3, p::serving::BlasHead::TensorLt), (true, 3, p::serving::BlasHead::Native),
+            (false, 1, p::serving::BlasHead::Gemm), (true, 3, p::serving::BlasHead::Gemm),
+        ] {
             let mut input = crate::placement::families::glm5_flash::tests::inputs(&cfg, 2,
                 crate::placement::inventory::PRO_TOTAL_BYTES);
             input.prefill_lanes = waves;
+            input.blas_head = head;
             input.requested_pool = Some(262_144);
             input.graphs = GraphSet::budget(&[64 << 20; 2]);
             if !draft { input.drafter_bytes = 0; input.drafter_weights = ResidentWeights(0); }
@@ -1246,7 +1264,7 @@ mod tests {
             let handles = |rank, phase| solved.facts.allowances.iter().filter(|owner|
                 owner.location == p::Location::coordinator(rank) && owner.source.starts_with("cuBLAS handles:")
                     && owner.lifetime.contains(phase, solved.facts.phase_order)).map(|owner| owner.bytes).sum::<u64>();
-            assert_eq!(handles(0, p::Phase::Ready), (2 + u64::from(draft)) * (64 << 20));
+            assert_eq!(handles(0, p::Phase::Ready), u64::from(head.gemm() || (draft && head.bf16())) * (64 << 20));
             assert_eq!(handles(1, p::Phase::Load), 64 << 20);
             assert_eq!(handles(1, p::Phase::Ready), 64 << 20);
             for rank in [0, 1] {
@@ -1254,7 +1272,7 @@ mod tests {
                     owner.location == p::Location::coordinator(rank) && owner.source.starts_with("BLAS device initialization")
                         && owner.lifetime.contains(p::Phase::Ready, solved.facts.phase_order))
                     .map(|owner| owner.bytes).sum::<u64>();
-                assert_eq!(init, 2 << 20);
+                assert_eq!(init, if rank == 1 || head.bf16() { 2 << 20 } else { 0 });
                 let prefix = solved.facts.driver_page_tables.iter().filter(|owner|
                     owner.location == p::Location::coordinator(rank) && owner.backing.starts_with("glmf.host.prefix."))
                     .collect::<Vec<_>>();
@@ -1262,6 +1280,32 @@ mod tests {
                 assert_eq!(prefix.iter().map(|owner| owner.bytes()).sum::<u64>(), 64 << 20);
                 assert!(prefix.iter().all(|owner| owner.lifetime == p::serving::ServingOwners::LIFETIME));
             }
+        }
+    }
+
+    #[test]
+    fn remote_vision_prices_each_sm121_worker_pool() {
+        use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        let mut input = crate::placement::families::glm5_flash::tests::inputs(&cfg, 2,
+            crate::placement::inventory::PRO_TOTAL_BYTES);
+        input.blas_head = p::serving::BlasHead::Native;
+        input.drafter_bytes = 0;
+        input.drafter_weights = ResidentWeights(0);
+        input.requested_pool = Some(262_144);
+        let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        process.physical_sparks = 2;
+        process.encoders = vec![EncoderPlacement { kind: EncoderKind::Spark { rank: 0 },
+            weights: 1024, scratch: 4096, replicas: vec![1], reason: "test".into(), shortfall: 0 }];
+        let solved = prepare(&input, 188, true, process).unwrap().admit().unwrap().solved;
+        for rank in [0, 1] {
+            let location = p::Location { device: p::Device::Spark(rank), domain: p::Domain::Managed };
+            let owners = solved.facts.allowances.iter().filter(|owner| owner.location == location
+                && owner.lifetime.contains(p::Phase::Ready, solved.facts.phase_order)).collect::<Vec<_>>();
+            assert_eq!(owners.iter().filter(|owner| owner.source.starts_with("cuBLAS handles:"))
+                .map(|owner| owner.bytes).sum::<u64>(), 67_508_224);
+            assert_eq!(owners.iter().filter(|owner| owner.source.starts_with("cuBLAS first use"))
+                .map(|owner| owner.bytes).sum::<u64>(), 158_674_944);
         }
     }
 

@@ -56,6 +56,13 @@ impl TargetHead {
         })
     }
 
+    pub fn blas_head(self, bf16: bool) -> cuteafd_loader::placement::planner::serving::BlasHead {
+        use cuteafd_loader::placement::planner::serving::BlasHead;
+        if !bf16 { BlasHead::Native } else {
+            match self { Self::Tensor => BlasHead::TensorLt, Self::Exact => BlasHead::Gemm }
+        }
+    }
+
     pub fn native_mode(self) -> cuteafd_ffi::programs::HeadMode {
         match self {
             Self::Tensor => cuteafd_ffi::programs::HeadMode::TensorLt,

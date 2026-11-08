@@ -220,6 +220,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
             options.resolved_concurrency("qwen3_5"), host.0, chunk)
             .context("dense host prefix quota")? };
     let facts = DenseFacts { cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots, record_bytes, drafter,
+        blas_head: options.bf16_target_head,
         // The shared scheduler's one selector holds `decode_rows` rows and
         // selects on the device by default.
         serving: Some(ServingFacts { capacity: qwen3_5::VERIFY_ROWS as u32, device_sampling: true }),

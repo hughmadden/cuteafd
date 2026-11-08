@@ -529,28 +529,28 @@ impl KimiRecipe {
         Ok(())
     }
 
-    /// Native target IO creates one vocabulary head per lane only without K6.
-    /// The MLA drafter constructor retains its own head even for a K6 target.
-    pub fn blas_owners(&mut self, core_head: bool) -> Result<(), Refusal> {
+    /// Vocabulary plans retain private scratch but borrow one serving-thread pool
+    /// on the head device. A native target callback needs no generic draft head.
+    pub fn blas_owners(&mut self, head: serving::BlasHead) -> Result<(), Refusal> {
         use super::super::planner::serving::{blas_components, BlasOwners};
         if !(1..=2).contains(&self.gpus) || self.lanes == 0 {
             return Err(invalid("invalid BLAS physical rank or lane geometry"));
         }
         if self.owners.iter().any(|component| matches!(&component.kind,
-            ComponentKind::Allowance(owner) if owner.source.starts_with("cuBLAS handles: Kimi "))) {
+            ComponentKind::Allowance(owner) if owner.source.starts_with("BLAS device initialization") || owner.source.contains("kimi/blas/"))) {
             return Err(invalid("BLAS owners already prepared"));
         }
         let location = Location::coordinator((self.gpus - 1) as u8);
         let mut handles = Vec::new();
-        if !core_head {
-            handles.push(BlasOwners { name: "Kimi target vocabulary heads".into(), process: "coordinator".into(),
-                location, cublas_handles: self.lanes, lt_handles: self.lanes,
+        if head.bf16() {
+            handles.push(BlasOwners { name: "Kimi target projections".into(), process: "coordinator".into(),
+                thread: "kimi/blas/serve".into(), location, gemm: head.gemm(), lt: head.lt(),
                 lifetime: Lifetime::TARGET, activation: Activation::always() });
-        }
-        if self.draft.is_some() {
-            handles.push(BlasOwners { name: "Kimi MLA DFlash vocabulary head".into(), process: "coordinator".into(),
-                location, cublas_handles: 1, lt_handles: 1,
-                lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, activation: Activation::always() });
+            if self.draft.is_some() {
+                handles.push(BlasOwners { name: "Kimi MLA DFlash projection".into(), process: "coordinator".into(),
+                    thread: "kimi/blas/serve".into(), location, gemm: true, lt: false,
+                    lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, activation: Activation::always() });
+            }
         }
         self.owners.extend(blas_components("sm_120", &handles, self.maximum_pages, PhaseOrder::DRAFT_THEN_TARGET)?);
         Ok(())
@@ -1115,10 +1115,11 @@ mod tests {
 
     #[test]
     fn blas_owners_follow_actual_target_and_draft_constructors() {
+        use serving::BlasHead;
         let order = PhaseOrder::DRAFT_THEN_TARGET;
         for gpus in [1, 2] {
             for lanes in [1, 2] {
-                for core_head in [false, true] {
+                for head in [BlasHead::Native, BlasHead::TensorLt, BlasHead::Gemm] {
                     for draft in [false, true] {
                         let mut recipe = recipe();
                         recipe.gpus = gpus;
@@ -1126,27 +1127,25 @@ mod tests {
                         recipe.draft = draft.then(|| Draft { context_split: false, arena: None, owners: vec![],
                             staging_at_first: 0, staging_per_page: 0 });
                         recipe.owners.clear();
-                        recipe.blas_owners(core_head).unwrap();
+                        recipe.blas_owners(head).unwrap();
                         let owners = recipe.owners.iter().map(|component| {
                             let ComponentKind::Allowance(owner) = &component.kind else { panic!("BLAS is opaque") };
                             assert!(!owner.assumed);
                             assert_eq!(owner.location, Location::coordinator((gpus - 1) as u8));
                             owner
                         }).collect::<Vec<_>>();
-                        let handles = owners.iter().filter(|owner| owner.source.starts_with("cuBLAS handles:")).collect::<Vec<_>>();
-                        assert_eq!(handles.len(), usize::from(!core_head) + usize::from(draft));
                         for &phase in order.phases() {
-                            let target = if !core_head && order.at_or_before(Phase::PostTargetKv, phase) { lanes } else { 0 };
-                            let draft = u64::from(draft && order.at_or_before(Phase::DraftLoad, phase));
-                            let active = owners.iter().filter(|owner|
-                                order.at_or_before(owner.lifetime.first, phase)
-                                    && order.at_or_before(phase, owner.lifetime.last)).collect::<Vec<_>>();
-                            assert_eq!(active.iter().filter(|owner| owner.source.starts_with("BLAS device initialization")).count(),
-                                usize::from(target + draft > 0));
+                            let target = head.bf16() && order.at_or_before(Phase::PostTargetKv, phase);
+                            let draft = head.bf16() && draft && order.at_or_before(Phase::DraftLoad, phase);
+                            let gemm = (target && head.gemm()) || draft;
+                            let initialized = target || draft;
+                            let active = owners.iter().filter(|owner| owner.lifetime.contains(phase, order)).collect::<Vec<_>>();
+                            assert_eq!(active.iter().filter(|owner| owner.source.starts_with("cuBLAS handles:")).count(),
+                                usize::from(gemm));
                             assert_eq!(active.iter().map(|owner| owner.bytes).sum::<u64>(),
-                                (target + draft) * (64 << 20) + if target + draft > 0 { 2 << 20 } else { 0 });
+                                u64::from(gemm) * (64 << 20) + u64::from(initialized) * (2 << 20));
                         }
-                        if !core_head || draft { assert!(recipe.blas_owners(core_head).is_err()); }
+                        if head.bf16() { assert!(recipe.blas_owners(head).is_err()); }
                     }
                 }
             }
@@ -1155,7 +1154,7 @@ mod tests {
             let mut recipe = recipe();
             recipe.gpus = gpus;
             recipe.lanes = lanes;
-            assert!(recipe.blas_owners(false).is_err());
+            assert!(recipe.blas_owners(BlasHead::TensorLt).is_err());
         }
     }
 

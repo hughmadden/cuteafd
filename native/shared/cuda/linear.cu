@@ -979,7 +979,8 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out, cudaStream_t stream = nullpt
       std::fprintf(stderr, "blas_workspace device=%d thread_id=%ld stream=%p bytes=%zu ptr=%p\n",
           device, state.owner->thread_id, static_cast<void*>(stream), kLinearBlasWorkspace, found->second);
     }
-    auto status = cuteafd::bind_blas(state.owner, stream, found->second, kLinearBlasWorkspace);
+    auto status = cuteafd::bind_blas(state.owner, stream, found->second, kLinearBlasWorkspace,
+        CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
     if (status != CUBLAS_STATUS_SUCCESS) return status_from_cublas(status);
     *out = state.owner->gemm;
     return CUTEAFD_STATUS_OK;

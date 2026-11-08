@@ -3597,6 +3597,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
         let input = glmf::GlmfInputs {
+            blas_head: crate::placement::planner::serving::BlasHead::TensorLt,
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(opts.context_tokens), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().map(|&total| (total, Baseline::Planned {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes,
@@ -4284,7 +4285,6 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
         owner.bytes
     };
     assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
-    assert!(crate::placement::loaded_code("glmf", "*", false, 0).is_none());
     for (layout, handles) in [(&enabled, 3), (&disabled, 2)] {
         let items = &layout.devices[0].items;
         assert!(!items.iter().any(|i| i.group == "workspace runtime overhead"));

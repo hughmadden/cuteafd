@@ -174,6 +174,7 @@ fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, s
     (available, total): (u64, u64), pending: u64, graphs_enabled: bool, context: cuteafd_loader::placement::planner::Context,
     host: qwen4::QwenHost) -> qwen4::QwenInputs<'a> {
     qwen4::QwenInputs {
+        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         loaded_weights: Default::default(),
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), context, admission, capacity_bytes: total,
         baseline: Baseline::Measured { free_bytes: available }, pending_code_bytes: pending,
@@ -664,6 +665,7 @@ mod tests {
             let onboard = Onboard::Auto;
             {
                 let mut inputs = qwen4::QwenDualInputs {
+        blas_head: cuteafd_loader::placement::planner::serving::BlasHead::Native,
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072),
                     owner_manifests: [None; 2],
                     admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,
@@ -882,6 +884,7 @@ mod tests {
             if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, args.prefill_rows as u64)?); }
             let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs {
+        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072), owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
                     reserve_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
@@ -964,6 +967,7 @@ mod tests {
                     .checked_add(qwen4::single_expert_weights(&catalog, cfg.layers, true, false)?)?;
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let planned = qwen4::QwenInputs {
+        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
                     loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
@@ -988,6 +992,7 @@ mod tests {
                 assert_eq!(admitted, reserve.bytes(0));
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let mut invalid = qwen4::QwenInputs {
+        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
                     loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
@@ -1029,8 +1034,9 @@ mod tests {
         for (source, key) in [(ExpertSource::LocalFp8, "fp8"), (ExpertSource::LocalExl3, "exl3")] {
             assert_eq!(source.code_key(), key);
             assert_eq!(source.spark_ranks(), 0);
-            let pending = cuteafd_loader::placement::loaded_code("qwen4", source.code_key(), false, 0)
-                .unwrap().pending(0, 0);
+            let pending = cuteafd_loader::placement::inventory::loaded_code_allowance(
+                "qwen4", source.code_key(), false, 0,
+                cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30), None).pending(0, 0);
             let plain = input(&local, source, pending)?;
             let peers = input(&with_peers, source, pending)?;
             assert_eq!(peers.pending_code_bytes, pending);

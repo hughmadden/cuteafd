@@ -1236,9 +1236,13 @@ impl Opened {
                 Component::allocation(owner, bytes, false, maximum_pages)
             }));
         }
+        let mut blas = Vec::new();
         if let Some((device, weights, total)) = media_owners.0 {
             let rank = devices.iter().position(|&id| id == device).context("vision device absent from GLM placement")?;
             let location = Location::coordinator(rank as u8);
+            blas.push(serving::BlasOwners { name: "GLM local vision".into(), process: "coordinator".into(),
+                thread: "glm/blas/media".into(), location, gemm: true, lt: false,
+                lifetime: Lifetime::RESIDENT, activation: Activation::always() });
             let owner = Allocation::buffer("glm.encoder.weights", location, weights,
                 Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Weights, "bundled encoder weights");
             additional.push(Component::resident_weight(ResidentWeight::from_allocation(&owner,
@@ -1277,7 +1281,9 @@ impl Opened {
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
         let admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
-            maximum_pool_tokens, attention, gpus: devices.len(), prefill, target,
+            maximum_pool_tokens, attention, gpus: devices.len(), prefill,
+            blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!native
+                && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some())), blas, target,
             draft: draft_facts.clone().with_window_marks(mark_bytes.checked_mul(args.draft_window_marks)
                 .context("GLM draft marks overflow")? as u64),
             scratch: [scratch(true)?, scratch(false)?], context_scratch: context,

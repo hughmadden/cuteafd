@@ -320,6 +320,7 @@ constexpr int cudaSuccess = 0, cudaStreamCaptureStatusNone = 0;
 constexpr int CUBLAS_STATUS_SUCCESS = 0, CUBLAS_STATUS_NOT_INITIALIZED = 1;
 constexpr int CUBLAS_STATUS_ALLOC_FAILED = 3, CUBLAS_STATUS_INVALID_VALUE = 7;
 constexpr int CUBLAS_DEFAULT_MATH = 0, CUBLAS_ATOMICS_ALLOWED = 0;
+constexpr int CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16;
 constexpr int CUTEAFD_STATUS_OK = 0, CUTEAFD_STATUS_INVALID_ARGUMENT = 1;
 constexpr int CUTEAFD_STATUS_INTERNAL_ERROR = 2, CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9;
 constexpr int CUBLAS_OP_T = 0, CUBLAS_OP_N = 1, CUDA_R_16BF = 0;
@@ -363,7 +364,7 @@ inline int cublasSetWorkspace(cublasHandle_t h, void* w, size_t bytes) {
 inline int cublasSetMathMode(cublasHandle_t h, int mode) { h->math = mode; return 0; }
 inline int cublasSetAtomicsMode(cublasHandle_t h, int mode) { h->atomics = mode; return 0; }
 template<class... Args> int cublasGemmEx(cublasHandle_t h, Args...) {
-  assert(h->workspace && h->math == 0 && h->atomics == 0);
+  assert(h->workspace && h->math == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION && h->atomics == 0);
   ++gemms; last_gemm = h; return 0;
 }
 inline int cudaStreamBeginCapture(void* s, int mode) {
@@ -433,7 +434,8 @@ int main() {
   assert(cuteafd::bind_blas(shared, nullptr, workspace, 4 << 20, 5, 1) == 0);
   assert(first->math == 5 && first->atomics == 1);
   assert(cublas_handle(&again) == 0 && again == first);
-  assert(first->math == 0 && first->atomics == 0 && first->workspace == workspace);
+  assert(first->math == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION
+      && first->atomics == 0 && first->workspace == workspace);
   device = 1; create_error = 7;
   assert(cublas_handle(&second) == 7 && second == nullptr);
   create_error = 0; alloc_error = 2;

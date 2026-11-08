@@ -39,6 +39,8 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 #[derive(Debug, Clone)]
 pub struct V4Inputs {
     pub expert_usage: bool,
+    /// Backend constructed by the lead owner's target and dSpark heads.
+    pub blas_head: crate::placement::planner::serving::BlasHead,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// Shared model extent and optional operator context pin.
@@ -254,14 +256,13 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>, Vec<u6
     Ok((demands, overhead, reserves))
 }
 
-/// The `LoadedCode::experts` key of a V4 catalog: EXL3 packages load their own modules (the
+/// The code-inventory package key of a V4 catalog: EXL3 packages load their own modules (the
 /// coordinator holds dSpark and any RTX layers in them), native MXFP4 does not.
 pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
     if catalog.exl3().is_some() { "exl3" } else { "*" }
 }
 
-/// Each coordinator GPU's measured loaded code (`placement::inventory::LOADED_CODE`) for a V4
-/// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs.
+/// Selected-program code estimate; native BLAS owners are charged separately.
 pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
     let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);
@@ -307,7 +308,7 @@ mod default_tests {
             cfg.index_topk = topk;
             for gpus in [1, 2] {
                 let mut input = V4Inputs {
-                    expert_usage: false, resident_weight_limit: None,
+                    expert_usage: false, blas_head: crate::placement::planner::serving::BlasHead::TensorLt, resident_weight_limit: None,
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, serving_context: crate::placement::planner::Context::pinned(262_144),
                     cfg: cfg.clone(), weights: test_weights(gpus),
                     cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned {
@@ -387,7 +388,7 @@ mod default_tests {
 
     fn plan_inputs(cfg: &DeepseekV4Config) -> V4Inputs {
         V4Inputs {
-            expert_usage: false, resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            expert_usage: false, blas_head: crate::placement::planner::serving::BlasHead::TensorLt, resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             serving_context: crate::placement::planner::Context::pinned(262_144), cfg: cfg.clone(),
             weights: test_weights(2),
             cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); 2],

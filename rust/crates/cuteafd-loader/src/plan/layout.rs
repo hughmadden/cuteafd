@@ -59,6 +59,8 @@ pub struct LayoutOptions {
     pub prefill_rows: u64,
     /// Admit the probe-only all-row vocabulary output on the lead GPU.
     pub full_prefill_logits: bool,
+    /// Backend selected for BF16 target logits; native checkpoint heads override it.
+    pub bf16_target_head: crate::placement::planner::serving::BlasHead,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
     pub prefill_lanes: u64,
     /// Family-resolved rows per wave, independent of the admitted span.
@@ -261,6 +263,7 @@ impl Default for LayoutOptions {
             head_split: true,
             prefill_rows: 0,
             full_prefill_logits: false,
+            bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             prefill_lanes: 0,
             prefill_unit_rows: None,
             prefill_span_rows: None,
@@ -998,11 +1001,9 @@ impl Shape {
     }
 }
 
-/// A coordinator GPU's runtime before its first weight: the arch context plus
-/// the code the family holds at ready where that ledger is measured
-/// (`placement::inventory::LOADED_CODE` for `package`), else the context,
-/// cuBLAS and the manifest's modules of `programs` (`ProgramSet`), plus the
-/// peer context under a split.
+/// A coordinator GPU's context and selected-program code estimate. Migrated
+/// families charge BLAS pools separately; other families retain the library
+/// formula in `loaded_code_allowance`.
 pub fn runtime_item(manifest: Option<&serde_json::Value>, programs: &[String], package: &str, split: bool,
     rank: usize, total_bytes: u64) -> Item {
     let arch = crate::placement::ArchContext::coordinator(total_bytes, None);
@@ -1196,7 +1197,7 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
     }
 }
 
-/// The local expert package kind a coordinator GPU loads (`LoadedCode::experts`): `exl3`, `fp8`
+/// The local expert package kind a coordinator GPU loads (code-inventory key): `exl3`, `fp8`
 /// (fp8moe/NVFP4 packages) or `none` (Spark experts).
 pub(crate) fn local_package(report: &PlanReport) -> &'static str {
     let package = report.experts.as_ref().map(|e| e.package.as_str()).unwrap_or("");

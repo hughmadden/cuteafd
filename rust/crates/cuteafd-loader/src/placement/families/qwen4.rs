@@ -51,6 +51,7 @@ pub struct QwenInputs<'a> {
     pub capacity_bytes: u64,
     pub baseline: Baseline,
     pub pending_code_bytes: u64,
+    pub blas_head: crate::placement::planner::serving::BlasHead,
     pub max_context: u64,
     pub requested_pool: Option<u64>,
     pub spark_ranks: usize,
@@ -341,7 +342,7 @@ impl Recipe for QwenSingle<'_> {
             .map(|layer| Variable::Attention { layer, values: vec![WHOLE_OWNER_0] })
             .chain([Variable::Prefill(vec![prefill_of(a)]), Variable::Lanes(vec![1])])
             .collect();
-        inputs.encoders.extend(&mut variables, &mut components, 1, self.maximum_pages)?;
+        inputs.encoders.extend(&mut variables, &mut components, 1, inputs.blas_head, self.maximum_pages)?;
         Ok(Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (inputs.spark_ranks > 0)
                 .then(|| reply_formats(inputs.spark_reply_format, inputs.spark_ranks)),
@@ -717,6 +718,7 @@ pub struct QwenDualInputs<'a> {
     pub fixed: Vec<Demand>,
     pub tp2_workspace: [u64; 2],
     pub pending_code_bytes: [u64; 2],
+    pub blas_head: crate::placement::planner::serving::BlasHead,
     pub mark_slots: u64,
     pub max_context: u64,
     pub requested_pool: Option<u64>,
@@ -1089,7 +1091,7 @@ impl Recipe for QwenDual<'_> {
         variables.push(Variable::Lanes(vec![1]));
         variables.push(Variable::Onboard { layers: (0..a.layers).collect(),
             destination: vec![0, 1], counts: vec![a.layers] });
-        inputs.encoders.extend(&mut variables, &mut components, 2, self.maximum_pages)?;
+        inputs.encoders.extend(&mut variables, &mut components, 2, inputs.blas_head, self.maximum_pages)?;
         Ok(Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT, spark_reply_formats: None,
             resident_weight_limit: request.resident_weight_limit, page_rows: page, pool_page_multiple: 1,
             maximum_pages: self.maximum_pages, gpus: 2, variables, requires: vec![], components })
@@ -1216,7 +1218,7 @@ mod tests {
         let experts = vec![Some(tp2_cost()); 4];
         let gib = 1u64 << 30;
         let inputs = QwenDualInputs {
-            resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
+            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
@@ -1439,7 +1441,7 @@ mod tests {
         startup_graph_modes: Option<(usize, bool)>, requested_pool: Option<u64>,
         loaded: ResidentWeights, limit: Option<ResidentWeights>) -> QwenInputs<'a> {
         let gib = 1u64 << 30;
-        QwenInputs { resident_weight_limit: limit, loaded_weights: loaded,
+        QwenInputs { blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: limit, loaded_weights: loaded,
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg, layers: cfg.layers, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
@@ -1534,7 +1536,7 @@ mod tests {
             half: costs, tp2: true, whole_supported: true, spark_ok: true })).collect();
         let gib = 1u64 << 30;
         let build = |startup| QwenDualInputs {
-            resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
+            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },

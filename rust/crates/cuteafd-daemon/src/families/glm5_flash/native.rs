@@ -273,7 +273,7 @@ mod tests {
 
     fn native_test_inputs(cfg: &GlmNextConfig, ranks: usize) -> cuteafd_loader::placement::families::glm5_flash::GlmfInputs<'_> {
         use cuteafd_loader::placement::{families::glm5_flash::GlmfInputs, planner, Onboard};
-        GlmfInputs { cfg, layers: cfg.layers, attention: Default::default(), resident: vec![], gpus: vec![],
+        GlmfInputs { blas_head: cuteafd_loader::placement::planner::serving::BlasHead::Native, cfg, layers: cfg.layers, attention: Default::default(), resident: vec![], gpus: vec![],
             context: planner::Context::pinned(262_144), resident_weight_limit: None,
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, pending_code: vec![0; ranks],
             local_tp2_exl3: false, headroom_bytes: 0, spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096,

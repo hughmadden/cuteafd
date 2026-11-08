@@ -918,6 +918,30 @@ impl Recipe for MuseRecipe<'_> {
             contract.requires.push(Requires { when: Choice { variable: encoder, option },
                 any_of: (0..self.cfg.layers).map(|count| Choice { variable: onboard, option: count }).collect() });
         }
+        let mut blas = Vec::new();
+        for (option, (vision, audio)) in self.encoders.iter().enumerate() {
+            for (name, placement) in [("vision", vision), ("audio", audio)] {
+                let locations = match placement.kind {
+                    crate::plan::encoder::EncoderKind::Off => vec![],
+                    crate::plan::encoder::EncoderKind::Rtx { gpu } => vec![Location::coordinator(gpu as u8)],
+                    _ => placement.spark_ranks().into_iter().map(|rank| Location {
+                        device: Device::Spark(rank as u8), domain: Domain::Managed }).collect(),
+                };
+                for location in locations {
+                    blas.push(serving::BlasOwners { name: format!("Muse {name} {option}/{:?}", location.device),
+                        process: match location.device { Device::Spark(rank) => format!("muse-media-worker-{rank}"),
+                            _ => "coordinator".into() }, thread: "muse/blas/media".into(), location,
+                        gemm: true, lt: false, lifetime: Lifetime::RESIDENT,
+                        activation: Activation::choice(encoder, option) });
+                }
+            }
+        }
+        for arch in ["sm_120", "sm_121"] {
+            let owners = blas.iter().filter(|owner| matches!(owner.location.device, Device::Coordinator(_))
+                == (arch == "sm_120")).cloned().collect::<Vec<_>>();
+            contract.components.extend(serving::blas_components(arch, &owners,
+                self.maximum_pages, contract.phase_order)?);
+        }
         let domains = Domains { onboard: self.cfg.layers, encoders: self.encoders.len() };
         for case in &self.cases {
             let activation = domains.activation(&case.when, onboard, encoder)?;
@@ -959,6 +983,40 @@ impl PreparedMuse<'_> {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn blas_joint_towers_share_only_their_selected_process_thread() {
+        use crate::plan::encoder::EncoderKind;
+        let cfg = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config()).unwrap();
+        let tower = |kind| EncoderPlacement { kind, weights: 0, scratch: 0, replicas: vec![],
+            reason: "test".into(), shortfall: 0 };
+        let prefill = PrefillShape { rows: 64, waves: 1 };
+        let recipe = MuseRecipe { cfg: &cfg, context: 64, gpus: 2, maximum_pages: 1, prefill,
+            attention: vec![LayerMode::HeadSplit; cfg.layers], spark_ranks: 2,
+            encoders: vec![(tower(EncoderKind::Off), tower(EncoderKind::Off)),
+                (tower(EncoderKind::Rtx { gpu: 0 }), tower(EncoderKind::Rtx { gpu: 0 })),
+                (tower(EncoderKind::Rtx { gpu: 0 }), tower(EncoderKind::Rtx { gpu: 1 })),
+                (tower(EncoderKind::Spark { rank: 1 }), tower(EncoderKind::Spark { rank: 1 }))],
+            modes: (MediaMode::Auto, MediaMode::Auto), cases: vec![], peaks: vec![[0; 2]; cfg.layers + 1],
+            local: LocalPackage::Unknown, drafter: None };
+        let request = production_request(64, None, Onboard::Auto, prefill, Operation::Serving, None,
+            SparkReplyFormats::default());
+        let contract = recipe.prepare(&request).unwrap();
+        let encoder = contract.variables.iter().position(|value| matches!(value, Variable::Encoder(_))).unwrap();
+        for option in 0..4 {
+            let mut choices = vec![0; contract.variables.len()];
+            choices[encoder] = option;
+            let facts = contract.facts(&choices, 1).unwrap();
+            let handles = |location| facts.allowances.iter().filter(|owner|
+                owner.location == location && owner.source.starts_with("cuBLAS handles:")
+                    && owner.lifetime.contains(Phase::Ready, contract.phase_order))
+                .map(|owner| owner.bytes).sum::<u64>();
+            assert_eq!(handles(Location::coordinator(0)), u64::from(option == 1 || option == 2) * (64 << 20));
+            assert_eq!(handles(Location::coordinator(1)), u64::from(option == 2) * (64 << 20));
+            assert_eq!(handles(Location { device: Device::Spark(1), domain: Domain::Managed }),
+                u64::from(option == 3) * 67_508_224);
+        }
+    }
 
     #[test]
     fn drafter_charge_table_matches_both_bf16_recipes() {

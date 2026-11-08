@@ -831,7 +831,8 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         fixed, owners: Vec::new(),
     };
     recipe.arena_padding(cfg, &core)?;
-    recipe.blas_owners(core.get_weight("language_model.lm_head").is_some())?;
+    recipe.blas_owners(crate::shared::target_head::TargetHead::configured().blas_head(
+        core.get_weight("language_model.lm_head").is_none()))?;
     let modes = recipe.resolved_attention();
     let prepared_graph_set = (graph_reserve && (RANKS != 2 || placement_mode != AttentionPlacement::Layers)).then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
         graph_slots, graph_verify, RANKS,

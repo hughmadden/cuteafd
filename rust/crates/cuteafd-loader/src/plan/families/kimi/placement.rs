@@ -447,7 +447,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Provide complete selected native weight extents.");
         return memory;
     }
-    if let Err(error) = recipe.blas_owners(model.core.get_weight("language_model.lm_head").is_some()) {
+    if let Err(error) = recipe.blas_owners(if model.core.get_weight("language_model.lm_head").is_some() {
+        crate::placement::planner::serving::BlasHead::Native } else { opts.bf16_target_head }) {
         report.refuse_placement(format!("Kimi BLAS owners refused: {error}"), "Supply supported native head geometry.");
         return memory;
     }

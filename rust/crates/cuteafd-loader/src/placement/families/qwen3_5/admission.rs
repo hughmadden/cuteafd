@@ -35,6 +35,7 @@ pub struct DenseFacts<'a> {
     pub slots: usize,
     pub record_bytes: u64,
     pub drafter: Option<DrafterBytes>,
+    pub blas_head: serving::BlasHead,
     pub serving: Option<ServingFacts>,
     pub host_prefix: serving::HostPrefixOwners,
     /// Diagnostic resets retain one ordered-upload buffer per GDN state region.
@@ -154,6 +155,17 @@ impl Recipe for DenseFacts<'_> {
                 if draft { component.activation = Activation::choice(home, 0); }
             }
         }
+        let target = serving::BlasOwners { name: "dense Qwen target vocabulary".into(),
+            process: "coordinator".into(), thread: "qwen3_5/blas/serve".into(), location: gpu,
+            gemm: self.blas_head.gemm(), lt: self.blas_head.lt(),
+            lifetime: Lifetime::TARGET, activation: Activation::always() };
+        let mut blas = vec![target.clone()];
+        if self.drafter.is_some_and(|draft| draft.gemm_head) {
+            blas.push(serving::BlasOwners { name: "dense Qwen block dSpark vocabulary".into(),
+                gemm: true, lt: false, lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+                ..target });
+        }
+        contract.components.extend(serving::blas_components("sm_120", &blas, maximum, contract.phase_order)?);
         Ok(contract)
     }
 }

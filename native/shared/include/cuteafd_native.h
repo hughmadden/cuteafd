@@ -1069,16 +1069,6 @@ cuteafd_status_t cuteafd_cuda_ds4_flash_router_refine_topk_bf16_async(
     const float *correction_bias, float *approximate_logits,
     uint32_t *topk_indices, float *topk_scores, float *topk_weights, size_t rows,
     void *cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_pro_router_topk_bf16(
-    const uint16_t *hidden, const uint16_t *router_weight,
-    const float *correction_bias, const int64_t *token_to_experts,
-    const int64_t *token_ids, uint32_t *topk_indices, float *topk_scores,
-    float *topk_weights, size_t rows, int hash_routing);
-cuteafd_status_t cuteafd_cuda_ds4_pro_router_topk_bf16_async(
-    const uint16_t *hidden, const uint16_t *router_weight,
-    const float *correction_bias, const int64_t *token_to_experts,
-    const int64_t *token_ids, uint32_t *topk_indices, float *topk_scores,
-    float *topk_weights, size_t rows, int hash_routing, void *cuda_stream);
 cuteafd_status_t cuteafd_cuda_router_topk_bf16_cub(
     const uint16_t* hidden, const uint16_t* router_weight, const float* correction_bias,
     float* corrected_scores, float* sorted_corrected_scores, uint32_t* unsorted_indices,

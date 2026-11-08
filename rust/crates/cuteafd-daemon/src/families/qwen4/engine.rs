@@ -2259,8 +2259,9 @@ impl<'a> Qwen4Engine<'a> {
                 usize::try_from(host.logits)?, Tag::staging("qwen4/logits-host"))?),
             staging: RefCell::new(crate::shared::token_table::RetainedUploads::new(
                 Device { library: self.library, id: self.library.cuda_get_device()? }, host.uploads)?),
+            // Target and MTP logits return to owner zero; peer workspaces never project.
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: if matches!(self.weights.head, Qwen4Head::Bf16(_)) {
+            head: if self.active_owner.get() == 0 && matches!(self.weights.head, Qwen4Head::Bf16(_)) {
                 Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
                     self.cfg.vocab_size as u32, crate::shared::target_head::TargetHead::configured().native_mode())? })
             } else { None },

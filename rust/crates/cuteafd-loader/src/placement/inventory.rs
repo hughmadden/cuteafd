@@ -184,93 +184,10 @@ impl ArchContext {
     }
 }
 
-/// Native code a family's serving process holds on a coordinator GPU at ready,
-/// beyond [`ArchContext::context_bytes`] and outside its tracked allocations
-/// and captured startup graphs: the selected program modules
-/// (`CUDA_MODULE_LOADING=LAZY` loads each function's code on first launch),
-/// the cuBLAS handle, expert-package modules (fp8moe/EXL3 libraries), the
-/// transport's device mappings and the runtime's per-stream bookkeeping.
-/// One definition for both sides: the ready ledger (the `stage: "ready"`
-/// report serve logs at readiness, before any request) splits its untracked
-/// bytes as `context + loaded code + GraphSet::at_ready`, so
-/// `loaded code = untracked at ready - startup graphs - context`. Lazily
-/// captured graphs (V4's attention graphs, any `Lifetime::Growth` set) come
-/// after ready: never in this number, always charged as "graph growth".
-/// Measured per serving configuration (v3-p2 cards, RTX PRO 6000 SM120,
-/// driver 595.91.07, CUDA 13.2, 2026-10-10). The two-RTX `dsv4` entries are
-/// TP2 expert halves (P4), measured at tagged ready on 2026-10-11.
-///
-/// The planner charges `bytes` (with the context) as the GPU's runtime
-/// baseline. The runtime's admission sample already holds part of it (the
-/// modules, an expert package, cuBLAS when a weight load ran a GEMM), so serve
-/// reserves only what is still missing at its sample ([`LoadedCode::pending`]).
-/// Both sides then reach the same ready ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct LoadedCode {
-    /// Program family: `qwen4`, `mimo` (all MiMo sizes), `dsv4` (Flash and
-    /// Pro), `glmf`.
-    pub family: &'static str,
-    /// Local expert package on this GPU: `exl3`, `fp8` (fp8moe/NVFP4), `none`
-    /// (Spark experts), or `*` (measured not to depend on it).
-    pub experts: &'static str,
-    /// Head-split layout (two coordinator GPUs).
-    pub split: bool,
-    /// 0: lead GPU, 1: the head-split peer.
-    pub rank: u8,
-    pub bytes: u64,
-    pub source: &'static str,
-}
-
-/// The measured table ([`loaded_code`]).
-pub const LOADED_CODE: &[LoadedCode] = &[
-    LoadedCode { family: "qwen4", experts: "exl3", split: false, rank: 0, bytes: 780_221_844,
-        source: "qwen38-exl3-min: untracked 5,936,332,180 - graphs 4,569,694,208 - context 586,416,128" },
-    LoadedCode { family: "qwen4", experts: "fp8", split: false, rank: 0, bytes: 1_089_736_388,
-        source: "qwen38-nvfp4-min: untracked 6,245,846,724 - graphs 4,569,694,208 - context 586,416,128" },
-    LoadedCode { family: "mimo", experts: "*", split: false, rank: 0, bytes: 261_483_520,
-        source: "mimo26-flash-min: untracked 847,899,648 - context 586,416,128" },
-    LoadedCode { family: "mimo", experts: "*", split: true, rank: 0, bytes: 365_259_264,
-        source: "mimo26-flash-max rtx0: untracked 951,675,392 - context 586,416,128" },
-    LoadedCode { family: "mimo", experts: "*", split: true, rank: 1, bytes: 165_460_992,
-        source: "mimo26-flash-max rtx1: untracked 751,877,120 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "*", split: false, rank: 0, bytes: 322_050_368,
-        source: "v4-flash-sim5090 (0 RTX layers): untracked 908,466,496 - context 586,416,128; \
-            v4-flash-min p0 (18 FP8 layers) 309,476,320" },
-    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 0, bytes: 1_059_185_592,
-        source: "v4-pro-exl3 TP2 tagged ready rtx0 (b367a34f, 2026-10-11): untracked 1,645,601,720 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "exl3", split: true, rank: 1, bytes: 885_694_212,
-        source: "v4-pro-exl3 TP2 tagged ready rtx1 (b367a34f, 2026-10-11): untracked 1,472,110,340 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "exl3", split: false, rank: 0, bytes: 724_349_124,
-        source: "v4-pro-exl3-min (1 RTX + 4 Sparks, 3 EXL3 layers): untracked 1,310,765,252 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 0, bytes: 1_007_333_728,
-        source: "v4-flash TP2 tagged ready rtx0 (b367a34f, 2026-10-11): untracked 1,593,749,856 - context 586,416,128" },
-    LoadedCode { family: "dsv4", experts: "*", split: true, rank: 1, bytes: 803_054_544,
-        source: "v4-flash TP2 tagged ready rtx1 (b367a34f, 2026-10-11): untracked 1,389,470,672 - context 586,416,128" },
-];
-
-/// The table's family key of a program family (`dsv4f`, `mimop2`, ...).
+/// Canonical family of a program prefix (`dsv4f`, `mimop2`, ...).
 pub fn loaded_code_family(program_family: &str) -> &str {
     let base = program_family.trim_end_matches('2');
     if base.starts_with("mimo") { "mimo" } else if base.starts_with("dsv4") { "dsv4" } else { base }
-}
-
-/// The measured loaded code of `program_family` with `experts` on coordinator
-/// `rank` of a (`split`) layout: exact package, then an explicit `*` entry.
-/// Unmeasured packages retain the manifest formula, never another package's calibration.
-pub fn loaded_code(program_family: &str, experts: &str, split: bool, rank: u8) -> Option<&'static LoadedCode> {
-    let family = loaded_code_family(program_family);
-    let at = |c: &&LoadedCode| c.family == family && c.split == split && c.rank == rank;
-    LOADED_CODE.iter().filter(at).find(|c| c.experts == experts)
-        .or_else(|| LOADED_CODE.iter().filter(at).find(|c| c.experts == "*"))
-}
-
-impl LoadedCode {
-    /// The part serve still reserves at an admission sample whose used bytes
-    /// beyond this process's tracked allocations are `untracked_at_sample`
-    /// (`total - free - tracked`; the CUDA context included).
-    pub fn pending(&self, untracked_at_sample: u64, context_bytes: u64) -> u64 {
-        self.bytes.saturating_sub(untracked_at_sample.saturating_sub(context_bytes))
-    }
 }
 
 /// Ready code beyond the CUDA context, shared by offline and live admission.
@@ -290,24 +207,18 @@ impl CodeAllowance {
     }
 }
 
-/// Exact/explicit-wildcard calibration, otherwise cuBLAS plus selected modules
-/// and peer context. Live admission subtracts bytes already in its sample.
-pub fn loaded_code_allowance(program_family: &str, experts: &str, split: bool, rank: u8,
+/// Selected-program code, separate from named BLAS owners in migrated families.
+/// Other families retain their existing library formula until their owner port.
+pub fn loaded_code_allowance(program_family: &str, _experts: &str, split: bool, _rank: u8,
     arch: &ArchContext, programs: Option<&ProgramSet>) -> CodeAllowance {
-    // Retired mixed rows and generic library/peer formulas lack recorded handle
-    // counts/backing extents. These families use selected-program code only;
-    // BLAS and driver storage are disjoint typed owners (#1463).
-    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3") {
+    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3" | "qwen4" | "mimo" | "dsv4" | "muse") {
         return CodeAllowance { bytes: programs.map_or(32 * MIB, ProgramSet::module_bytes),
             basis: Basis::Estimated, future_library_bytes: 0 };
     }
-    match loaded_code(program_family, experts, split, rank) {
-        Some(code) => CodeAllowance { bytes: code.bytes, basis: Basis::Calibrated, future_library_bytes: 0 },
-        None => CodeAllowance { bytes: arch.cublas_bytes
-            + programs.map_or(32 * MIB, ProgramSet::module_bytes)
-            + if split { arch.peer_context_bytes } else { 0 }, basis: Basis::Formula,
-            future_library_bytes: arch.cublas_bytes },
-    }
+    CodeAllowance { bytes: arch.cublas_bytes
+        + programs.map_or(32 * MIB, ProgramSet::module_bytes)
+        + if split { arch.peer_context_bytes } else { 0 }, basis: Basis::Formula,
+        future_library_bytes: arch.cublas_bytes }
 }
 
 pub use cuteafd_core::RuntimeSample;
@@ -423,7 +334,7 @@ impl ProgramSet {
     /// Native V4.1 projection plans retain a separate aligned arena for each
     /// small-row specialization and the first compiled capacity holding `rows`.
     /// These exports live in V41_FP8_AOT.json, not PROGRAMS.json. Module residency
-    /// still comes from LoadedCode; `scratch` here describes allocation owners.
+    /// is charged separately; `scratch` here describes allocation owners.
     pub fn v41_fp8(manifest: &Value, matrices: &[(u64, u64)], rows: u64, sms: u32)
         -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
@@ -794,8 +705,7 @@ impl GraphSet {
 
     /// The graph bytes `rank`'s ready ledger holds: the captured estimate of a
     /// startup set, nothing of a growth set (lazy captures happen after ready).
-    /// With the context and [`LoadedCode`] this is the ready ledger's untracked
-    /// total: `untracked = context + loaded code + at_ready`.
+    /// These graph bytes are separate from context, selected modules and BLAS owners.
     pub fn at_ready(&self, rank: usize) -> u64 {
         match (self.lifetime, self.ranks.get(rank)) {
             (Lifetime::Startup, Some(r)) => r.bytes - r.margin,
@@ -1081,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_untracked_is_context_plus_code_plus_startup_graphs() {
+    fn startup_and_lazy_graph_owners_partition_ready_and_growth() {
         // Qwen EXL3 1 RTX, v3-p2 ready ledger: untracked 5,936,332,180 B with 30,380 startup graphs
         // of 4,569,694,208 B. Startup graphs count at ready, their margin is growth; a lazy set
         // counts nothing at ready and its whole budget is growth.
@@ -1094,11 +1004,7 @@ mod tests {
             assert_eq!((sum("graphs"), sum(GRAPH_GROWTH)), (set.at_ready(0), set.growth(0)));
         }
         assert_eq!(lazy.at_ready(0), 0);
-        let code = loaded_code("qwen4", "exl3", false, 0).unwrap().bytes;
-        let context = ARCH_CONTEXTS[1].context_bytes;
-        let untracked = 5_936_332_180u64;
-        let planned = context + code + startup.at_ready(0);
-        assert!(planned.abs_diff(untracked) < 4 << 20, "planned {planned} vs ledger {untracked}");
+
     }
 
     #[test]
@@ -1107,12 +1013,12 @@ mod tests {
         let programs = ProgramSet::from_names(&["qwen4"], ["qwen4_decode", "other_decode"]);
         assert_eq!(programs.names, ["qwen4_decode"]);
         let allowance = loaded_code_allowance("qwen4", "unmeasured", false, 0, arch, Some(&programs));
-        assert_eq!(allowance.basis, Basis::Formula);
-        assert_eq!(allowance.bytes, arch.cublas_bytes + programs.module_bytes());
+        assert_eq!(allowance.basis, Basis::Estimated);
+        assert_eq!(allowance.bytes, programs.module_bytes());
         assert!(allowance.bytes > 0);
         assert_eq!(allowance.pending(arch.context_bytes, arch.context_bytes), allowance.bytes);
         assert_eq!(allowance.pending(arch.context_bytes + 100, arch.context_bytes), allowance.bytes - 100);
-        assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), arch.cublas_bytes);
+        assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), 0);
     }
 
     #[test]
@@ -1130,63 +1036,33 @@ mod tests {
             assert_eq!(pending, arch.cublas_bytes);
             assert!(admitted + pending - old_pending >= steady, "rank {rank}");
         }
-        let calibrated = loaded_code_allowance("mimo", "fp8", false, 0, arch, None);
-        assert_eq!(calibrated.pending(u64::MAX, arch.context_bytes), 0);
+        let selected = loaded_code_allowance("mimo", "fp8", false, 0, arch, None);
+        assert_eq!(selected.pending(u64::MAX, arch.context_bytes), 0);
     }
 
     #[test]
-    fn measured_fp8_and_glm_exl3_planner_bytes_do_not_change() {
+    fn migrated_code_estimates_exclude_blas_and_peer_allowances() {
         let arch = &ARCH_CONTEXTS[1];
-        let programs = ProgramSet::from_names(&["glm", "glm2"], ["glm_decode", "glm2_decode"]);
-        for (family, package, split, rank, old_bytes) in [
-            ("mimo", "fp8", false, 0, 261_483_520),
-            ("mimo", "fp8", true, 0, 365_259_264),
-            ("mimo", "fp8", true, 1, 165_460_992),
-            ("qwen4", "fp8", false, 0, 1_089_736_388),
-        ] {
-            let allowance = loaded_code_allowance(family, package, split, rank, arch, Some(&programs));
-            assert_eq!(allowance.basis, Basis::Calibrated);
-            assert_eq!(allowance.bytes, old_bytes);
-        }
-        for rank in 0..2 {
-            let allowance = loaded_code_allowance("glm", "exl3", true, rank, arch, Some(&programs));
-            assert_eq!(allowance.basis, Basis::Formula);
-            assert_eq!(arch.context_bytes + allowance.bytes,
-                arch.context_bytes + arch.cublas_bytes + programs.module_bytes() + arch.peer_context_bytes);
-        }
-    }
-
-    #[test]
-    fn loaded_code_keys_family_split_rank_and_experts() {
-        assert_eq!(loaded_code("qwen4", "fp8", false, 0).unwrap().bytes, 1_089_736_388);
-        assert_eq!(loaded_code("qwen4", "exl3", false, 0).unwrap().bytes, 780_221_844);
-        // No arbitrary expert package can donate its calibration.
-        assert!(loaded_code("qwen4", "none", false, 0).is_none());
-        assert_eq!(loaded_code("dsv4p2", "fp8", true, 1).unwrap().bytes, 803_054_544);
-        // An exact package row wins over the family's any-package row, wherever it sits in the table.
-        assert_eq!(loaded_code("dsv4p", "exl3", false, 0).unwrap().bytes, 724_349_124);
-        assert_eq!(loaded_code("dsv4f", "*", false, 0).unwrap().bytes, 322_050_368);
-        assert_eq!(loaded_code("dsv4p", "exl3", true, 1).unwrap().bytes, 885_694_212);
-        assert_eq!(loaded_code("mimop", "none", true, 0).unwrap().bytes, 365_259_264);
-        assert!(loaded_code("glm", "fp8", false, 0).is_none());
-        assert!(loaded_code("glmf", "exl3", false, 0).is_none());
-        let code = loaded_code_allowance("glmf", "exl3", false, 0, &ARCH_CONTEXTS[1], None);
-        assert_eq!(code.basis, Basis::Estimated);
-        assert_eq!(code.bytes, 32 * MIB);
-        assert_eq!(code.pending(586_416_128 + 100, 586_416_128), code.bytes - 100);
-        assert_eq!(code.pending(586_416_128 + (1 << 40), 586_416_128), 0);
-    }
-
-    #[test]
-    fn v4_tp2_code_matches_tagged_ready_untracked_bytes() {
-        let context = ARCH_CONTEXTS[1].context_bytes;
-        for (experts, untracked) in [("*", [1_593_749_856, 1_389_470_672]),
-            ("exl3", [1_645_601_720, 1_472_110_340])] {
-            for (rank, bytes) in untracked.into_iter().enumerate() {
-                let code = loaded_code("dsv4", experts, true, rank as u8).unwrap();
-                assert_eq!(context + code.bytes, bytes);
-                assert!(code.source.contains("tagged ready"));
+        let programs = ProgramSet::from_names(&["mimo", "qwen4", "dsv4f", "glmf", "kimik3"],
+            ["mimo_decode", "qwen4_decode", "dsv4f_decode", "glmf_decode", "kimik3_decode"]);
+        for family in ["mimo", "mimop2", "qwen4", "dsv4f", "dsv4p2", "glmf", "glmf-k6", "kimik3", "muse"] {
+            for package in ["fp8", "exl3", "none", "unmeasured"] {
+                for (split, rank) in [(false, 0), (true, 0), (true, 1)] {
+                    let code = loaded_code_allowance(family, package, split, rank, arch, Some(&programs));
+                    assert_eq!(code.basis, Basis::Estimated);
+                    assert_eq!(code.bytes, programs.module_bytes());
+                    assert_eq!(code.pending(u64::MAX, arch.context_bytes), 0);
+                    let missing = loaded_code_allowance(family, package, split, rank, arch, None);
+                    assert_eq!(missing.bytes, 32 * MIB);
+                    assert_eq!(missing.basis, Basis::Estimated);
+                }
             }
+        }
+        // GLM's unrelated conversion/upload residuals and existing formula are unchanged.
+        for rank in 0..2 {
+            let code = loaded_code_allowance("glm", "exl3", true, rank, arch, Some(&programs));
+            assert_eq!(code.basis, Basis::Formula);
+            assert_eq!(code.bytes, arch.cublas_bytes + programs.module_bytes() + arch.peer_context_bytes);
         }
     }
 
