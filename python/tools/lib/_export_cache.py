@@ -834,9 +834,11 @@ class Store:
         return True
 
     def _write_json(self, path: Path, value) -> None:
+        # Insertion order kept: restored metadata (geometry dicts) re-enters
+        # manifests, which must come out byte-identical to a fresh export.
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        temporary.write_text(json.dumps(value, sort_keys=True))
+        temporary.write_text(json.dumps(value))
         os.replace(temporary, path)
 
     def lookup(self, identity_key: str, roots: Roots):

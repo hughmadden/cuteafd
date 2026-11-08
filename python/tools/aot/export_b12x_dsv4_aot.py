@@ -1627,8 +1627,10 @@ def main() -> None:
             if reused is not None:
                 geometry, plan_scratch, program_abi, checked = (
                     reused["geometry"], reused["scratch"], reused["abi"], reused["checked"])
-                if records is not None and records.active:
-                    records.restore(output, label, reused["ir_record"])
+                if records is not None:
+                    records.restore_plan(label, geometry, program_abi)
+                    if records.active:
+                        records.restore(output, label, reused["ir_record"])
             else:
                 def construct():
                     with exportable_compilation():

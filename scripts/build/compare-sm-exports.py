@@ -52,6 +52,7 @@ def resolve_source_root(path: Path | str | None = None, env=os.environ) -> Path:
 
 ROOT = resolve_source_root()
 PROGRAM_RECORDER = None
+PROGRAM_PLANS = None  # this worker's comparison-plans.json, by object name
 
 
 def recorded_construction(function, *args, **kwargs):
@@ -73,6 +74,11 @@ class ProgramRecords:
         path = (Path(output) / (label + ".o")).relative_to(PROGRAM_RECORDER.output).as_posix()
         record = PROGRAM_RECORDER.exports.get(path)
         return json.loads(json.dumps(record)) if record is not None else None
+
+    def restore_plan(self, label, geometry, abi):
+        # The plan export_to_c would have captured (worker's export_with_plan).
+        if PROGRAM_PLANS is not None:
+            PROGRAM_PLANS[label] = {"geometry": dict(geometry), "abi": abi}
 
     def restore(self, output, label, record):
         if PROGRAM_RECORDER is None:
@@ -684,7 +690,7 @@ def export_exl3_routes(extra, output):
 
 
 def worker(payload):
-    global PROGRAM_RECORDER
+    global PROGRAM_RECORDER, PROGRAM_PLANS
     output = Path(payload["output"])
     os.environ["TRITON_CACHE_DIR"] = str(output.parent / f".triton-cache-{payload['sms']}")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -711,7 +717,7 @@ def worker(payload):
     import importlib.metadata
     toolchain = {name: importlib.metadata.version(name) for name in ("torch", "triton", "nvidia-cutlass-dsl")}
     from b12x.integration.cuteafd import AotProgram
-    plans = {}
+    plans = PROGRAM_PLANS = {}
     original_export = AotProgram.export_to_c
 
     def export_with_plan(program, file_path, file_name, function_prefix):
