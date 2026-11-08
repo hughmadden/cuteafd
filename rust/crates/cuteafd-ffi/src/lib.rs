@@ -532,6 +532,7 @@ pub struct NativeStatusError {
 }
 
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
+pub const CUTEAFD_STATUS_BUFFER_TOO_SMALL: CuteafdStatus = 2;
 pub const CUTEAFD_STATUS_ALLOCATION_FAILED: CuteafdStatus = 4;
 pub const CUTEAFD_STATUS_CUDA_UNAVAILABLE: CuteafdStatus = 3;
 pub const CUTEAFD_STATUS_RDMA_UNAVAILABLE: CuteafdStatus = 7;
@@ -2636,11 +2637,19 @@ impl NativeLibrary {
     /// The tag this thread last asked a native allocator for, whether or not
     /// that allocation succeeded (failure reports name the attempted owner).
     pub fn last_allocation_tag(&self) -> Result<Option<memory_ledger::Tag>> {
-        type LastTag = unsafe extern "C" fn(*mut u32, *mut c_char, usize) -> CuteafdStatus;
+        type LastTag = unsafe extern "C" fn(*mut u32, *mut c_char, usize, *mut usize) -> CuteafdStatus;
         // SAFETY: versioned native ABI writing into local, bounded outputs.
         let last: libloading::Symbol<LastTag> = unsafe { self.lib.get(b"cuteafd_last_allocation_tag")? };
-        let (mut kind, mut owner) = (0u32, [0 as c_char; 256]);
-        let status = unsafe { last(&mut kind, owner.as_mut_ptr(), owner.len()) };
+        let (mut kind, mut required) = (0u32, 0usize);
+        // First ask for the owner's size, then read it whole: never truncate.
+        // SAFETY: a zero-length query writes only the two scalars.
+        let status = unsafe { last(&mut kind, std::ptr::null_mut(), 0, &mut required) };
+        if status != CUTEAFD_STATUS_BUFFER_TOO_SMALL && status != 0 {
+            self.status_to_result("cuteafd_last_allocation_tag", status)?;
+        }
+        let mut owner = vec![0 as c_char; required.max(1)];
+        // SAFETY: `owner` holds `required` bytes, the size native reported.
+        let status = unsafe { last(&mut kind, owner.as_mut_ptr(), owner.len(), &mut required) };
         self.status_to_result("cuteafd_last_allocation_tag", status)?;
         let Some(kind) = memory_ledger::MemoryKind::from_raw(kind) else { return Ok(None) };
         // SAFETY: native wrote a NUL-terminated string inside `owner`.

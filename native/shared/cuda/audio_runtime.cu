@@ -249,24 +249,35 @@ extern "C" int32_t cuteafd_audio_get_backings(void* opaque, cuteafd_media_backin
 extern "C" int32_t cuteafd_audio_destroy(void* opaque) {
   uint32_t released=0; return cuteafd_audio_destroy_backings(opaque, &released);
 }
+// Release everything releasable, nulling exactly what was freed; the owner and
+// any backing whose free failed are kept for a later attempt.
+static int32_t release_owner(Owner* o, uint32_t* released) {
+  *released=0;
+  int previous=-1;cudaGetDevice(&previous);int first=cudaSetDevice(o->device);
+  if(o->stream)first=drain(o,first);
+  if(o->support) { int e=cuteafd_audio_support_destroy(o->support);if(!first)first=e;o->support=nullptr; }
+  if(o->fft) { int e=fs(cufftDestroy(o->fft));if(!first)first=e;o->fft=0; }
+  if(o->blas) { int e=bs(cublasDestroy(o->blas));if(!first)first=e;o->blas=nullptr; }
+  if(o->weights) { int e=CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;}if(!first)first=e; }
+  if(o->arena) { int e=CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;}if(!first)first=e; }
+  if(o->stream) { int e=cudaStreamDestroy(o->stream);if(!first)first=e;o->stream=nullptr; }
+  if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
+  return first;
+}
 extern "C" int32_t cuteafd_audio_destroy_backings(void* opaque, uint32_t* released) {
   if(released)*released=0;
   if(!opaque)return 0;
   if(!released)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(opaque);
-  int previous=-1;cudaGetDevice(&previous);int first=cudaSetDevice(o->device);
-  if(o->stream)first=drain(o,first);
-  if(o->support) { int e=cuteafd_audio_support_destroy(o->support);if(!first)first=e; }
-  if(o->fft) { int e=fs(cufftDestroy(o->fft));if(!first)first=e; }
-  if(o->blas) { int e=bs(cublasDestroy(o->blas));if(!first)first=e; }
-  if(o->weights) { int e=CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));if(!e)*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;if(!first)first=e; }
-  if(o->arena) { int e=CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));if(!e)*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;if(!first)first=e; }
-  if(o->stream) { int e=cudaStreamDestroy(o->stream);if(!first)first=e; }
-  if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
-  delete o;return first;
+  int first=release_owner(o,released);
+  // A backing still held after a failed free keeps its owner alive so the
+  // caller's ledger entry stays true; retrying destroy frees it later.
+  if(!o->weights && !o->arena) delete o;
+  return first;
 }
-extern "C" int32_t cuteafd_audio_create(const cuteafd_audio_spec* s,int32_t device,uint64_t admitted,void** out) {
-  if(!out)return cudaErrorInvalidValue;*out=nullptr;
+extern "C" int32_t cuteafd_audio_create(const cuteafd_audio_spec* s,int32_t device,uint64_t admitted,
+    const cuteafd_media_tags* tags,void** out) {
+  if(!out||!tags)return cudaErrorInvalidValue;*out=nullptr;
   cuteafd_audio_ledger ledger{};int e=cuteafd_audio_required(s,&ledger);if(e)return e;
   if(admitted<ledger.weights+ledger.scratch+ledger.blas_workspace+ledger.fft_workspace)return cudaErrorMemoryAllocation;
   e=cudaSetDevice(device);if(e)return e;
@@ -276,11 +287,14 @@ extern "C" int32_t cuteafd_audio_create(const cuteafd_audio_spec* s,int32_t devi
   if(major*10+minor!=CUTEAFD_AUDIO_AOT_SM)return cudaErrorInvalidDevice;
   auto* o=new(std::nothrow)Owner;if(!o)return cudaErrorMemoryAllocation;
   o->s=*s;o->device=device;o->ledger=ledger;
-  auto fail=[&](int rc){cuteafd_audio_destroy(o);return rc;};
+  // Failure returns the owner only when a backing could not be freed, holding
+  // exactly the still-live backings the caller must record and destroy later.
+  auto fail=[&](int rc){uint32_t released=0;release_owner(o,&released);
+    if(o->weights||o->arena)*out=o;else delete o;return rc;};
   int low,high;e=cudaDeviceGetStreamPriorityRange(&low,&high);if(e)return fail(e);
   e=cudaStreamCreateWithPriority(&o->stream,cudaStreamNonBlocking,low);if(e)return fail(e);
-  e=CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&o->weights), ledger.weights, 0, cudaMalloc(reinterpret_cast<void**>(&o->weights),ledger.weights));if(e)return fail(e);++o->ledger.device_allocations;
-  e=CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&o->arena), ledger.scratch+BLAS_BYTES+FFT_BYTES, 0, cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+BLAS_BYTES+FFT_BYTES));if(e)return fail(e);++o->ledger.device_allocations;
+  e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->weights),ledger.weights,tags->weight_kind,tags->weight_owner);if(e)return fail(e);++o->ledger.device_allocations;
+  e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->arena),ledger.scratch+BLAS_BYTES+FFT_BYTES,tags->workspace_kind,tags->workspace_owner);if(e)return fail(e);++o->ledger.device_allocations;
   scratch(o);
   e=cuteafd_audio_support_create(&o->support);if(e)return fail(e);
   e=bs(CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&o->blas), 0, 0, nullptr));if(e)return fail(e);

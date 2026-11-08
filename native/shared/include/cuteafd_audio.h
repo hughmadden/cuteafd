@@ -39,7 +39,7 @@ typedef struct {
  * dedicated encoder thread as vision. All work drains on error and destroy. */
 int32_t cuteafd_audio_required(const cuteafd_audio_spec*, cuteafd_audio_ledger*);
 int32_t cuteafd_audio_create(const cuteafd_audio_spec*, int32_t device,
-                            uint64_t admitted_bytes, void** owner);
+                            uint64_t admitted_bytes, const cuteafd_media_tags* tags, void** owner);
 /* All four table pointers NULL select the attested build-time tables. A full
  * non-NULL set is a qualification-only oracle override; partial sets fail.
  * Upload synchronizes before returning, so host inputs may then be released. */

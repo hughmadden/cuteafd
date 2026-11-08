@@ -30,7 +30,8 @@ typedef struct {
 typedef int32_t (*cuteafd_pcm_observer)(void*, int32_t stage, uint32_t token_offset,
                                       const void*, uint32_t rows, uint32_t width);
 int32_t cuteafd_pcm_required(const cuteafd_pcm_spec*, cuteafd_pcm_ledger*);
-int32_t cuteafd_pcm_create(const cuteafd_pcm_spec*, int32_t device, uint64_t admitted, void**);
+int32_t cuteafd_pcm_create(const cuteafd_pcm_spec*, int32_t device, uint64_t admitted,
+                           const cuteafd_media_tags* tags, void**);
 int32_t cuteafd_pcm_upload(void*, uint64_t offset, const void*, uint64_t bytes);
 /* External push writes must drain before commit. No additional allocation. */
 int32_t cuteafd_pcm_weight_arena(void*, void**);

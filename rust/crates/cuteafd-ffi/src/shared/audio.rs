@@ -147,7 +147,7 @@ pub fn audio_geometry(samples: usize) -> Result<(usize, usize), AudioError> {
 }
 
 type Required = unsafe extern "C" fn(*const AudioSpec, *mut AudioLedger) -> i32;
-type Create = unsafe extern "C" fn(*const AudioSpec, i32, u64, *mut *mut c_void) -> i32;
+type Create = unsafe extern "C" fn(*const AudioSpec, i32, u64, *const super::media_backings::RawTags, *mut *mut c_void) -> i32;
 type Upload = unsafe extern "C" fn(
     *mut c_void,
     *const u8,
@@ -327,13 +327,15 @@ impl NativeAudio {
                 output_width: spec.output_width as usize,
                 _thread: PhantomData,
             };
-            check(create(spec, device, admitted_bytes, &mut result.owner))?;
-            if result.owner.is_null() {
-                return Err(AudioError::InvalidInput("null audio owner"));
+            let native = super::media_backings::NativeTags::new(tags).map_err(AudioError::Native)?;
+            let status = create(spec, device, admitted_bytes, &native.raw(), &mut result.owner);
+            // Each backing native still holds is recorded, success or not; on
+            // failure Drop destroys the owner and retires what native frees.
+            match super::media_backings::MediaBackings::created(&result._library, "cuteafd_audio", status,
+                result.owner, device, tags) {
+                Ok(backings) => result.backings = backings,
+                Err((status, backings)) => { result.backings = backings; return Err(AudioError::Native(status)); }
             }
-            // A query failure leaves nothing recorded; Drop destroys the owner.
-            result.backings = super::media_backings::MediaBackings::record(&result._library, "cuteafd_audio",
-                result.owner, device, tags).map_err(AudioError::Native)?;
             if let Some(weights) = weights {
             check(upload(
                 result.owner,

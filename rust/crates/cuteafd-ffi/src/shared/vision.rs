@@ -222,7 +222,7 @@ fn check(status: i32) -> Result<(), VisionError> {
 }
 
 type Required = unsafe extern "C" fn(*const RawVisionSpec, *mut VisionLedger) -> i32;
-type Create = unsafe extern "C" fn(*const RawVisionSpec, i32, u64, *mut *mut c_void) -> i32;
+type Create = unsafe extern "C" fn(*const RawVisionSpec, i32, u64, *const super::media_backings::RawTags, *mut *mut c_void) -> i32;
 type Upload = unsafe extern "C" fn(*mut c_void, u64, *const u8, u64) -> i32;
 type Observer = unsafe extern "C" fn(*mut c_void, i32, *const c_void, i32, i32, i32) -> i32;
 type Encode = unsafe extern "C" fn(
@@ -337,13 +337,15 @@ impl NativeVision {
                 backings: Default::default(),
                 _thread: PhantomData,
             };
-            check(create(&spec.raw()?, device, admitted_bytes, &mut result.owner))?;
-            if result.owner.is_null() {
-                return Err(VisionError::InvalidInput("null vision owner"));
+            let native = super::media_backings::NativeTags::new(tags).map_err(VisionError::Native)?;
+            let status = create(&spec.raw()?, device, admitted_bytes, &native.raw(), &mut result.owner);
+            // Each backing native still holds is recorded, success or not; on
+            // failure Drop destroys the owner and retires what native frees.
+            match super::media_backings::MediaBackings::created(&result._library, "cuteafd_vision", status,
+                result.owner, device, tags) {
+                Ok(backings) => result.backings = backings,
+                Err((status, backings)) => { result.backings = backings; return Err(VisionError::Native(status)); }
             }
-            // A query failure leaves nothing recorded; Drop destroys the owner.
-            result.backings = super::media_backings::MediaBackings::record(&result._library, "cuteafd_vision",
-                result.owner, device, tags).map_err(VisionError::Native)?;
             if let Some(weights) = weights {
                 check(upload(result.owner, 0, weights.as_ptr(), weights.len() as u64))?;
             }
