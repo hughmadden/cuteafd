@@ -88,8 +88,8 @@ pub fn charge(family: &str, architecture: &str, counts: &GraphNodeCounts,
     let missing = |class: &str| GraphNodeError::MissingRate { family: family.into(),
         architecture: architecture.into(), class: class.into() };
     let padding = match architecture {
-        "sm120" => padding.rtx,
-        "sm121" => padding.spark,
+        "sm_120" => padding.rtx,
+        "sm_121" => padding.spark,
         _ => return Err(missing("architecture")),
     };
     let (mut nodes, mut rate_bytes, mut padding_bytes) = (0u64, 0u64, 0u64);
@@ -135,8 +135,8 @@ mod tests {
         evidence: "#1605 archived census, VALIDATION.md", limitation: "inferred capture-key join; single rank",
     };
     fn rates(ordinary: u64, dsa: u64) -> [GraphNodeRate; 2] {
-        [GraphNodeRate { architecture: "sm120", class: ORDINARY, bytes_per_node: ordinary, provenance: PROVENANCE },
-         GraphNodeRate { architecture: "sm120", class: DSA_PAGED, bytes_per_node: dsa, provenance: PROVENANCE }]
+        [GraphNodeRate { architecture: "sm_120", class: ORDINARY, bytes_per_node: ordinary, provenance: PROVENANCE },
+         GraphNodeRate { architecture: "sm_120", class: DSA_PAGED, bytes_per_node: dsa, provenance: PROVENANCE }]
     }
     fn counts(ordinary: u64, dsa: u64) -> GraphNodeCounts {
         GraphNodeCounts(BTreeMap::from([(ORDINARY, ordinary), (DSA_PAGED, dsa)]))
@@ -148,8 +148,8 @@ mod tests {
             ("glm5_flash", rates(7143, 2456), counts(321180, 7700), counts(288996, 4620), 2313158656, 2076180480),
         ] {
             let zero = "0".parse().unwrap();
-            let full = charge(family, "sm120", &full, &rates, zero).unwrap();
-            let small = charge(family, "sm120", &small, &rates, zero).unwrap();
+            let full = charge(family, "sm_120", &full, &rates, zero).unwrap();
+            let small = charge(family, "sm_120", &small, &rates, zero).unwrap();
             assert_eq!(full.packed_bytes, bytes);
             assert_eq!(small.packed_bytes, small_bytes);
             assert!(small.nodes < full.nodes && small.packed_bytes < full.packed_bytes);
@@ -160,35 +160,35 @@ mod tests {
         use cuteafd_core::memory_policy::MemoryPolicy;
         let rates = rates(6680, 2792);
         let policy = MemoryPolicy { graph_node_padding: "rtx=350,spark=22".parse().unwrap(), ..Default::default() };
-        let calculate = || charge("glm5", "sm120", &counts(434790, 28560), &rates,
+        let calculate = || charge("glm5", "sm_120", &counts(434790, 28560), &rates,
             MemoryPolicy::current().graph_node_padding).unwrap();
         let expected = policy.scoped(calculate);
         assert_eq!(expected.padding_bytes, 463350 * 350);
         assert_eq!(expected.packed_bytes, (expected.rate_bytes + expected.padding_bytes).div_ceil(DRIVER_CHUNK) * DRIVER_CHUNK);
         assert_eq!(MemoryPolicy { gpu_reserve: Some(0), ..policy }.scoped(calculate), expected);
-        let spark_rates = rates.map(|rate| GraphNodeRate { architecture: "sm121", ..rate });
-        let spark = charge("fixture", "sm121", &counts(3, 2), &spark_rates, policy.graph_node_padding).unwrap();
+        let spark_rates = rates.map(|rate| GraphNodeRate { architecture: "sm_121", ..rate });
+        let spark = charge("fixture", "sm_121", &counts(3, 2), &spark_rates, policy.graph_node_padding).unwrap();
         assert_eq!(spark.padding_bytes, 5 * 22);
         assert_eq!(spark.packed_bytes, DRIVER_CHUNK); // not one chunk per class
     }
     #[test]
     fn percentage_padding_uses_each_class_rate_and_architecture() {
-        let glm = charge("glm5", "sm120", &counts(434790, 28560), &rates(6680, 2792), Default::default()).unwrap();
+        let glm = charge("glm5", "sm_120", &counts(434790, 28560), &rates(6680, 2792), Default::default()).unwrap();
         assert_eq!(glm.padding_bytes, 434790 * 167 + 28560 * 70);
-        let flash = charge("glm5_flash", "sm120", &counts(321180, 7700), &rates(7143, 2456), Default::default()).unwrap();
+        let flash = charge("glm5_flash", "sm_120", &counts(321180, 7700), &rates(7143, 2456), Default::default()).unwrap();
         assert_eq!(flash.padding_bytes, 321180 * 179 + 7700 * 61);
-        let spark_rates = rates(1000, 2000).map(|r| GraphNodeRate { architecture: "sm121", ..r });
-        let spark = charge("fixture", "sm121", &counts(2, 3), &spark_rates, Default::default()).unwrap();
+        let spark_rates = rates(1000, 2000).map(|r| GraphNodeRate { architecture: "sm_121", ..r });
+        let spark = charge("fixture", "sm_121", &counts(2, 3), &spark_rates, Default::default()).unwrap();
         assert_eq!(spark.padding_bytes, 2 * 25 + 3 * 50);
     }
 
     #[test]
     fn unknown_rates_and_overflow_are_typed() {
-        for arch in ["sm121", "sm999"] {
+        for arch in ["sm_121", "sm_999"] {
             assert!(matches!(charge("glm5", arch, &counts(1, 1), &rates(6680, 2792), Default::default()),
                 Err(GraphNodeError::MissingRate { .. })));
         }
-        assert!(matches!(charge("glm5", "sm120", &counts(u64::MAX, 1), &rates(6680, 2792), Default::default()),
+        assert!(matches!(charge("glm5", "sm_120", &counts(u64::MAX, 1), &rates(6680, 2792), Default::default()),
             Err(GraphNodeError::Overflow(_))));
     }
     #[test]

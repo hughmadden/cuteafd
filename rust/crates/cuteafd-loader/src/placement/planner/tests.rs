@@ -3479,7 +3479,7 @@ fn graph_node_owner_and_padding_survive_reserve_override_once() {
     use crate::serving_capacity::glm_graph_nodes::GLM_SM120_NODE_RATES;
     use cuteafd_core::memory_policy::MemoryPolicy;
     let nodes = GraphNodeCounts(std::collections::BTreeMap::from([("ordinary", 10)]));
-    let charged: GraphNodeCharge = charge("glm5", "sm120", &nodes, &GLM_SM120_NODE_RATES,
+    let charged: GraphNodeCharge = charge("glm5", "sm_120", &nodes, &GLM_SM120_NODE_RATES,
         MemoryPolicy::default().graph_node_padding).unwrap();
     let graph = serving::startup_graph_component("test.0", Location::coordinator(0), charged.rank(2), 1).unwrap();
     let mut contract = with_reserve_components(1);

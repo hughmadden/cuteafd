@@ -117,7 +117,7 @@ the pool then grows into what the fixed layout leaves, up to `KV_MAX_TOKENS`, an
 is refused below `KV_MIN_TOKENS`. The reserve is the sum of named, measured components
 (CUDA context and cuBLAS, loaded code, graphs, runtime growth, Spark worker process residency)
 plus `FAMILY_RESERVE` and the explicit per-coordinator-GPU `release padding` allowance; `GPU_RESERVE` / `SPARK_RESERVE` replace the reserve components,
-not physical driver page tables.
+not physical driver page tables or startup graph owners (including node padding).
 Startup and `cuteafd plan` print one line per device with the cap,
 weights, workspaces, every reserve component and the KV target, min, max and pool.
 The coordinator charges the SM121 worker process census (1,596,606,464 B,
@@ -139,7 +139,8 @@ page array; 16 B/page of vmalloc remains unattributed. Neither the fit's
 intercept nor whole-host reclaim residuals are charged as fixed allowances.
 Driver bytes survive `GPU_RESERVE` / `SPARK_RESERVE`, including zero. Ring, workspace,
 validation and upload owners also stay separate and are charged once.
-Sizes take `B`, `MB`, `GB`, `MiB` or `GiB` (a bare number is bytes); there are no percentages.
+Memory sizes take `B`, `MB`, `GB`, `MiB` or `GiB` (a bare number is bytes), not percentages.
+`GRAPH_NODE_PADDING` is a separate per-node rate adjustment and accepts percentages.
 `MEMORY_PADDING` defaults to `100MiB` (104,857,600 B) per coordinator GPU, inside
 `GPU_MEMORY_CAP`. This visible release allowance covers still-unattributed memory;
 each release lowers it as owners are attributed. It is charged once, separately
@@ -170,7 +171,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
 | `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark engine ceiling, including worker process residency and routed weights; the outside-cap gap leaves room for OS/services. |
-| `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables stay charged. Still inside the cap. |
+| `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables and startup graph owners stay charged. Still inside the cap. |
 | `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
 | `MEMORY_PADDING` | `100MiB` | size | Explicit per-coordinator-GPU release padding, inside the cap; `0` disables only padding. `GPU_RESERVE` replaces it. Global flag: `--memory-padding`. |
 | `GRAPH_NODE_PADDING` | `2.5%` | percentage, integer bytes/node or `rtx=VALUE,spark=VALUE` | Added to measured graph-node rates, packed once per device into 2 MiB chunks. Independent of `GPU_RESERVE`, `SPARK_RESERVE` and `MEMORY_PADDING`; included once in the graph owner, not a reserve. Global flag: `--graph-node-padding`. |

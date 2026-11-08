@@ -15,8 +15,8 @@ const PROVENANCE: GraphRateProvenance = GraphRateProvenance {
 };
 
 pub const GLM_SM120_NODE_RATES: [GraphNodeRate; 2] = [
-    GraphNodeRate { architecture: "sm120", class: ORDINARY, bytes_per_node: 6680, provenance: PROVENANCE },
-    GraphNodeRate { architecture: "sm120", class: DSA_PAGED, bytes_per_node: 2792, provenance: PROVENANCE },
+    GraphNodeRate { architecture: "sm_120", class: ORDINARY, bytes_per_node: 6680, provenance: PROVENANCE },
+    GraphNodeRate { architecture: "sm_120", class: DSA_PAGED, bytes_per_node: 2792, provenance: PROVENANCE },
 ];
 
 /// Launch metadata, not a per-layer capture table. The caller must establish
@@ -83,7 +83,7 @@ mod tests {
                     speculator_tap: [6, 20, 34, 48, 62, 76].contains(&key.layer) })).unwrap();
             assert_eq!(counts.0[ORDINARY], ordinary);
             assert_eq!(counts.0[DSA_PAGED], dsa);
-            assert_eq!(charge("glm5", "sm120", &counts, &GLM_SM120_NODE_RATES,
+            assert_eq!(charge("glm5", "sm_120", &counts, &GLM_SM120_NODE_RATES,
                 "0".parse().unwrap()).unwrap().packed_bytes, bytes);
         }
     }

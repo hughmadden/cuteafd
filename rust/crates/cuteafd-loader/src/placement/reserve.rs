@@ -212,7 +212,12 @@ pub fn layout_lines(layout: &cuteafd_core::memory_layout::MemoryLayout, family: 
             Layout::Spark if device.worker_budget_bytes > 0 => device.worker_budget_bytes,
             Layout::Spark => device.capacity_bytes,
         };
-        cuteafd_core::memory_policy::render_line(&breakdown(device.name(), kind, cap, named, &device.items), &pool)
+        let mut line = cuteafd_core::memory_policy::render_line(&breakdown(device.name(), kind, cap, named, &device.items), &pool);
+        for graph in device.items.iter().filter(|item| item.group.starts_with("startup graphs: ")
+            && item.group.contains("GRAPH_NODE_PADDING=")) {
+            line.push_str(&format!("; {} (padding included, not a reserve)", graph.group));
+        }
+        line
     }).collect()
 }
 
@@ -324,6 +329,21 @@ mod tests {
         assert!(overridden.reserve_overridden);
         assert_eq!(overridden.reserve_bytes(), 5 << 30);
         assert_eq!(overridden.reserve.last().unwrap().name, "GPU_RESERVE");
+    }
+
+    #[test]
+    fn layout_lines_show_computed_graph_padding_inside_each_owner() {
+        use cuteafd_core::memory_layout::{Basis, Category, DeviceKind as Kind, DeviceLayout, Item, MemoryLayout};
+        let layout = MemoryLayout { devices: vec![DeviceLayout { kind: Kind::Rtx, index: 0,
+            capacity_bytes: 96 << 30, worker_budget_bytes: 0, kv_tokens: 1 << 20,
+            items: vec![Item::new(Category::Runtime,
+                "startup graphs: fixture rank 0; nodes=10; measured-rate bytes=66800; GRAPH_NODE_PADDING=1670 bytes (2.50%); packed=2097152 bytes",
+                "", 2 << 20, Basis::Formula)] }], pool_tokens: 1 << 20, waste: vec![], notes: vec![] };
+        let lines = MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }
+            .scoped(|| layout_lines(&layout, "glm5", 1 << 20, &[96 << 30], 96 << 30));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("GRAPH_NODE_PADDING=1670 bytes (2.50%)"), "{}", lines[0]);
+        assert!(lines[0].contains("padding included, not a reserve"), "{}", lines[0]);
     }
 
     #[test]
