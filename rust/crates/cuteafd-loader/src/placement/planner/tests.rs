@@ -3405,3 +3405,21 @@ fn release_padding_charges_once_per_gpu_for_every_family() {
         }
     }
 }
+
+#[test]
+fn zero_padding_is_identical_to_a_plan_with_no_padding_component() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = with_reserve_components(1 << 15);
+    for family in ["glm5", "glm5_flash", "mimo_v2", "step5"] {
+        let mut bare = budget(crate::placement::reserve::family_constant(family) + 1500 + 64 * 100);
+        bare.headroom = crate::placement::reserve::family_constant(family);
+        // Reconstruct the pre-padding budget directly, without calling the
+        // padding helper or dropping any real reserve owner.
+        let expected = solve(request(), vec![bare.clone()], &Prepared(contract.clone())).unwrap();
+        let actual = MemoryPolicy { memory_padding: Some(0), ..Default::default() }.scoped(|| {
+            bare.headroom = crate::placement::reserve::gpu(family);
+            solve(request(), vec![bare], &Prepared(contract.clone())).unwrap()
+        });
+        assert_eq!(actual, expected, "{family}: all decisions, owners and phases must match");
+    }
+}
