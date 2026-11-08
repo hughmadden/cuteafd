@@ -258,6 +258,27 @@ mod tests {
     }
 
     #[test]
+    fn disabled_capture_identity_does_not_format_its_key() {
+        const CHILD: &str = "CUTEAFD_GRAPH_IDENTITY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            struct Unformattable;
+            impl std::fmt::Debug for Unformattable {
+                fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    panic!("census-off capture identity formatted its key");
+                }
+            }
+            assert!(!super::enabled());
+            super::capture_key("test", "decode", 0, 0, None, &Unformattable, std::ptr::null_mut());
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "shared::decode_graph::census::tests::disabled_capture_identity_does_not_format_its_key"])
+            .env(CHILD, "1").env_remove("CUTEAFD_GRAPH_CENSUS")
+            .status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
     fn unknown_control_does_not_select_a_bank() {
         assert_eq!(super::bank_id("baseline"), Some(0));
         for name in ["sparse", "index", "layer_row", "head", "dspark", "window"] {
