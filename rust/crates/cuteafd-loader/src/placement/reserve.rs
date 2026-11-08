@@ -75,7 +75,7 @@ pub fn family_constant(family: &str) -> u64 {
 }
 
 /// The per-GPU named reserve a family's budgets keep free: `GPU_RESERVE`
-/// when set, else `FAMILY_RESERVE` (the key or the family constant).
+/// when set, else `FAMILY_RESERVE` (the key or the family constant) plus release padding.
 pub fn gpu(family: &str) -> u64 {
     MemoryPolicy::current().named_reserve(DeviceKind::Gpu, family_constant(family))
 }
@@ -85,14 +85,17 @@ pub fn spark() -> u64 {
     MemoryPolicy::current().named_reserve(DeviceKind::Spark, 0)
 }
 
-/// The layout item naming a device's named reserve, when it is non-zero:
-/// `GPU_RESERVE` when overridden, else `family reserve`.
-pub fn gpu_item(family: &str) -> Option<cuteafd_core::memory_layout::Item> {
+/// Nonzero layout items for the named reserve: `GPU_RESERVE` when overridden,
+/// else separate `family reserve` and `release padding` components.
+pub fn gpu_item(family: &str) -> Vec<cuteafd_core::memory_layout::Item> {
     use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
     let bytes = gpu(family);
     let name = if MemoryPolicy::current().gpu_reserve.is_some() { "GPU_RESERVE" } else { "family reserve" };
-    (bytes > 0).then(|| Item::new(Category::Reserved, name, "", bytes, Basis::Formula)
-        .with_lifetime(ItemLifetime::PostReadyReserve))
+    let padding = MemoryPolicy::current().release_padding();
+    [(name, bytes.saturating_sub(padding)), ("release padding", padding)].into_iter()
+        .filter(|(_, bytes)| *bytes > 0)
+        .map(|(name, bytes)| Item::new(Category::Reserved, name, "", bytes, Basis::Formula)
+            .with_lifetime(ItemLifetime::PostReadyReserve)).collect()
 }
 
 /// A built-in GPU reserve component's charged bytes (0 under `GPU_RESERVE`).
@@ -132,7 +135,7 @@ pub fn breakdown(device: impl Into<String>, kind: DeviceKind, cap_bytes: u64, na
             Category::Runtime | Category::Reserved => {
                 // Named by the item group's leading label (sources carry long evidence).
                 let name = item.group.split([':', ';', '(']).next().unwrap_or(&item.group).trim();
-                if !matches!(name, "family reserve" | "GPU_RESERVE" | "SPARK_RESERVE") {
+                if !matches!(name, "family reserve" | "release padding" | "GPU_RESERVE" | "SPARK_RESERVE") {
                     let entry = components.entry(name.to_owned()).or_default();
                     *entry = entry.saturating_add(item.bytes);
                 }
@@ -149,7 +152,11 @@ pub fn breakdown(device: impl Into<String>, kind: DeviceKind, cap_bytes: u64, na
     breakdown.reserve = components.into_iter().map(|(name, bytes)| ReserveComponent { name, bytes }).collect();
     // Sparks carry no family reserve; only an explicit SPARK_RESERVE is named there.
     if kind == DeviceKind::Gpu || overridden {
-        breakdown.reserve.push(ReserveComponent { name: named.into(), bytes: named_reserve });
+        let padding = if kind == DeviceKind::Gpu { policy.release_padding() } else { 0 };
+        breakdown.reserve.push(ReserveComponent { name: named.into(), bytes: named_reserve.saturating_sub(padding) });
+        if kind == DeviceKind::Gpu && !overridden {
+            breakdown.reserve.push(ReserveComponent { name: "release padding".into(), bytes: padding });
+        }
     }
     breakdown
 }
@@ -203,6 +210,10 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
         "kv_geometry": {"pages": plan.pool_tokens.checked_div(plan.pool_page_rows),
             "tokens_per_page": plan.pool_page_rows, "capacity_tokens": plan.pool_tokens,
             "status": "admitted planner geometry; live pool occupancy not captured"},
+        "memory_padding": {"bytes_per_gpu": policy.release_padding(),
+            "source": if policy.gpu_reserve.is_some() { "GPU_RESERVE override" }
+                else if policy.memory_padding.is_some() { "MEMORY_PADDING / --memory-padding" }
+                else { "cuteafd-core::memory_policy::DEFAULT_MEMORY_PADDING" }},
         "family": family, "context_tokens": plan.served_context(), "pool_tokens": plan.pool_tokens,
         "kv_target_tokens": kv.target, "kv_min_tokens": kv.min, "kv_max_tokens": kv.max,
         "prefill_rows": plan.decisions.prefill.rows, "prefill_waves": plan.decisions.prefill.waves,
@@ -253,10 +264,10 @@ mod tests {
     fn family_constants_default_to_zero_and_policy_overrides() {
         for family in ["glm5", "mistral_large4", "glm5_flash", "kimi_k3", "muse_spark", "step5", "qwen4",
             "qwen3_5", "deepseek_v4", "deepseek_v41", "mimo_v2"] {
-            assert_eq!(gpu(family), family_constant(family), "{family}");
+            assert_eq!(gpu(family), family_constant(family) + cuteafd_core::memory_policy::DEFAULT_MEMORY_PADDING, "{family}");
         }
         MemoryPolicy { family_reserve: Some(5), ..Default::default() }.scoped(|| {
-            assert_eq!(gpu("glm5"), 5);
+            assert_eq!(gpu("glm5"), 5 + cuteafd_core::memory_policy::DEFAULT_MEMORY_PADDING);
             assert_eq!(gpu_component(7), 7);
         });
         MemoryPolicy { gpu_reserve: Some(9), family_reserve: Some(5), ..Default::default() }.scoped(|| {
@@ -280,7 +291,7 @@ mod tests {
         assert_eq!((device.weights_bytes, device.workspace_bytes, device.kv_bytes), (40 << 30, 2 << 30, 30 << 30));
         let names = device.reserve.iter().map(|c| (c.name.as_str(), c.bytes)).collect::<Vec<_>>();
         assert_eq!(names, [("CUDA context and cuBLAS", 627 << 20), ("GLM startup graph instantiate", 2 << 30),
-            ("family reserve", 1 << 30)]);
+            ("family reserve", 1 << 30), ("release padding", cuteafd_core::memory_policy::DEFAULT_MEMORY_PADDING)]);
         assert!(!device.reserve_overridden);
         let overridden = MemoryPolicy { gpu_reserve: Some(5 << 30), ..Default::default() }
             .scoped(|| breakdown("rtx0", DeviceKind::Gpu, 96 << 30, gpu("glm5"), &items[..2]));
@@ -305,7 +316,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         // The GPU cap is the plan's cap, not the layout capacity already less the reserve.
         assert!(lines[0].starts_with("rtx0: cap 98304MiB; weights 40960MiB"), "{}", lines[0]);
-        assert!(lines[0].contains("reserve 1624MiB [context+modules 600MiB, family reserve 1024MiB]"), "{}", lines[0]);
+        assert!(lines[0].contains("reserve 1724MiB [context+modules 600MiB, family reserve 1024MiB, release padding 100MiB]"), "{}", lines[0]);
         // The same shared default minimum applies with Sparks.
         assert!(lines[0].contains("KV target 2097152 min 262144 max 2097152, pool 1048576 tokens / 20480MiB"), "{}", lines[0]);
         // A Spark's cap is its worker ceiling; its residual is a named component.

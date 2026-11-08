@@ -780,7 +780,7 @@ if args[1].name == "qwen38-exl3-min.config":
         }
         let mut command = Command::new("timeout");
         command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan", config["MODEL_ID"],
-            "--deployment", "--config"]).arg(&example)
+            "--deployment", "--layout", "--config"]).arg(&example)
             .args(["--rtx", config["RTX_GPUS"], "--vision", "off", "--audio", "off",
                 "--speculator", "off", "--hf-home"]).arg(&hf_home)
             .env("HF_HOME", &hf_home);
@@ -802,6 +802,21 @@ if args[1].name == "qwen38-exl3-min.config":
         assert!(elapsed < std::time::Duration::from_secs(30), "{name}: plan took {elapsed:?}");
         let deployment = release_accepts_prefill(&output.stdout);
         assert_unique_deployment_devices(&deployment, name);
+        // Compare the same installed CPU plan without release padding; keep the
+        // selected layout free to change instead of hard-coding pool sizes.
+        let before = command.args(["--memory-padding", "0"]).output().unwrap();
+        assert!(before.status.success(), "{name} without padding: {}", String::from_utf8_lossy(&before.stderr));
+        let before = release_accepts_prefill(&before.stdout);
+        let pool = |plan: &serde_json::Value| plan["memory_layout"]["pool_tokens"].as_u64().unwrap();
+        eprintln!("release padding pool: {name}: {} -> {} tokens (0 -> 100MiB per GPU)",
+            pool(&before), pool(&deployment));
+        let lines = deployment["report"]["memory_policy_lines"].as_array().cloned().unwrap_or_default();
+        let gpu_lines = lines.iter().filter_map(|line| line.as_str()).filter(|line| line.starts_with("rtx"))
+            .collect::<Vec<_>>();
+        // Refused deployments may have no coordinator layout (missing exports).
+        for line in gpu_lines {
+            assert_eq!(line.matches("release padding 100MiB").count(), 1, "{name}: {line}");
+        }
         tested += 1;
         families.insert(deployment["family"].as_str().unwrap().to_owned());
         eprintln!("{name}: {} unit_rows={} waves={} slots={} span_rows={}", deployment["family"],

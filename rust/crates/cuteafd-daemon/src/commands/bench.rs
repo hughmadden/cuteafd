@@ -266,7 +266,7 @@ fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
     for arg in definition.get_arguments() {
         let id = arg.get_id().as_str();
         if matches!(id, "help" | "version" | "gpu_memory_cap" | "spark_memory_cap" | "gpu_reserve" | "spark_reserve"
-            | "family_reserve" | "kv_target_tokens" | "kv_min_tokens" | "kv_max_tokens") {
+            | "family_reserve" | "memory_padding" | "kv_target_tokens" | "kv_min_tokens" | "kv_max_tokens") {
             continue;
         }
         let value = sub.get_raw(id).map(|values| values.map(|v| v.to_string_lossy().into_owned())
@@ -302,7 +302,7 @@ fn serve_context(matches: &ArgMatches, memory: Option<crate::cli::MemoryArgs>)
     if let Some(memory) = memory {
         for (name, value) in [("gpu-memory-cap", memory.gpu_memory_cap), ("spark-memory-cap", memory.spark_memory_cap),
             ("gpu-reserve", memory.gpu_reserve), ("spark-reserve", memory.spark_reserve),
-            ("family-reserve", memory.family_reserve), ("kv-target-tokens", memory.kv_target_tokens),
+            ("family-reserve", memory.family_reserve), ("memory-padding", memory.memory_padding), ("kv-target-tokens", memory.kv_target_tokens),
             ("kv-min-tokens", memory.kv_min_tokens), ("kv-max-tokens", memory.kv_max_tokens)] {
             if let Some(value) = value {
                 settings.push(Setting { name: name.into(), value: Some(value.to_string()), default: None, source: "cli".into() });

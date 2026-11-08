@@ -62,6 +62,9 @@ pub(crate) struct MemoryArgs {
     /// Named per-GPU reserve added to the measured components (default: the family constant).
     #[arg(long, global = true, value_parser = parse_size)]
     pub(crate) family_reserve: Option<u64>,
+    /// Per-GPU release allowance inside the cap (default 100MiB); GPU_RESERVE replaces it.
+    #[arg(long, global = true, value_parser = parse_size)]
+    pub(crate) memory_padding: Option<u64>,
     /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).
     #[arg(long, global = true)]
     pub(crate) kv_target_tokens: Option<u64>,
@@ -82,6 +85,7 @@ impl MemoryArgs {
             gpu_reserve: self.gpu_reserve.or(outer.gpu_reserve),
             spark_reserve: self.spark_reserve.or(outer.spark_reserve),
             family_reserve: self.family_reserve.or(outer.family_reserve),
+            memory_padding: self.memory_padding.or(outer.memory_padding),
             kv_target_tokens: self.kv_target_tokens.or(outer.kv_target_tokens),
             kv_min_tokens: self.kv_min_tokens.or(outer.kv_min_tokens),
             kv_max_tokens: self.kv_max_tokens.or(outer.kv_max_tokens),
@@ -92,13 +96,13 @@ impl MemoryArgs {
         cuteafd_core::memory_policy::MemoryPolicy {
             gpu_cap: self.gpu_memory_cap, spark_cap: self.spark_memory_cap,
             gpu_reserve: self.gpu_reserve, spark_reserve: self.spark_reserve,
-            family_reserve: self.family_reserve, kv_target: self.kv_target_tokens,
+            family_reserve: self.family_reserve, memory_padding: self.memory_padding, kv_target: self.kv_target_tokens,
             kv_min: self.kv_min_tokens, kv_max: self.kv_max_tokens,
         }
     }
 
     pub(crate) fn any_gpu(self) -> bool {
-        self.gpu_memory_cap.is_some() || self.gpu_reserve.is_some() || self.family_reserve.is_some()
+        self.gpu_memory_cap.is_some() || self.gpu_reserve.is_some() || self.family_reserve.is_some() || self.memory_padding.is_some()
     }
 }
 
@@ -829,16 +833,16 @@ mod tests {
     fn memory_policy_flags_parse_sizes_and_reject_percentages() {
         use clap::Parser;
         let cli = super::Cli::try_parse_from(["cuteafd", "--gpu-memory-cap", "32GiB", "--spark-memory-cap", "100GiB",
-            "--gpu-reserve", "3GiB", "--spark-reserve", "512MiB", "--family-reserve", "2GB", "--kv-target-tokens", "1048576",
+            "--gpu-reserve", "3GiB", "--spark-reserve", "512MiB", "--family-reserve", "2GB", "--memory-padding", "100MiB", "--kv-target-tokens", "1048576",
             "--kv-min-tokens", "65536", "--kv-max-tokens", "4194304", "plan", "/model"]).unwrap();
         let policy = cli.memory.policy();
         assert_eq!(policy, cuteafd_core::memory_policy::MemoryPolicy { gpu_cap: Some(32 << 30), spark_cap: Some(100 << 30),
-            gpu_reserve: Some(3 << 30), spark_reserve: Some(512 << 20), family_reserve: Some(2_000_000_000),
+            gpu_reserve: Some(3 << 30), spark_reserve: Some(512 << 20), family_reserve: Some(2_000_000_000), memory_padding: Some(100 << 20),
             kv_target: Some(1 << 20), kv_min: Some(65_536), kv_max: Some(4 << 20) });
         assert!(policy.validate().is_ok());
         assert_eq!(super::Cli::try_parse_from(["cuteafd", "plan", "/model"]).unwrap().memory.policy(), Default::default());
         for (flag, value) in [("--gpu-memory-cap", "50%"), ("--gpu-reserve", "10%"), ("--spark-memory-cap", "1TB"),
-            ("--family-reserve", "-1GiB"), ("--kv-max-tokens", "2M")] {
+            ("--family-reserve", "-1GiB"), ("--memory-padding", "10%"), ("--kv-max-tokens", "2M")] {
             assert!(super::Cli::try_parse_from(["cuteafd", flag, value, "plan", "/model"]).is_err(), "{flag} {value}");
         }
         // Family argv wins key by key over the outer argv.

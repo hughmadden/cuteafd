@@ -116,7 +116,7 @@ The planner fixes the layout (layer placement, onboarding, buffers) for `KV_TARG
 the pool then grows into what the fixed layout leaves, up to `KV_MAX_TOKENS`, and the launch
 is refused below `KV_MIN_TOKENS`. The reserve is the sum of named, measured components
 (CUDA context and cuBLAS, loaded code, graphs, runtime growth, Spark worker process residency)
-plus `FAMILY_RESERVE`; `GPU_RESERVE` / `SPARK_RESERVE` replace the reserve components,
+plus `FAMILY_RESERVE` and the explicit per-coordinator-GPU `release padding` allowance; `GPU_RESERVE` / `SPARK_RESERVE` replace the reserve components,
 not physical driver page tables.
 Startup and `cuteafd plan` print one line per device with the cap,
 weights, workspaces, every reserve component and the KV target, min, max and pool.
@@ -140,6 +140,12 @@ intercept nor whole-host reclaim residuals are charged as fixed allowances.
 Driver bytes survive `GPU_RESERVE` / `SPARK_RESERVE`, including zero. Ring, workspace,
 validation and upload owners also stay separate and are charged once.
 Sizes take `B`, `MB`, `GB`, `MiB` or `GiB` (a bare number is bytes); there are no percentages.
+`MEMORY_PADDING` defaults to `100MiB` (104,857,600 B) per coordinator GPU, inside
+`GPU_MEMORY_CAP`. This visible release allowance covers still-unattributed memory;
+each release lowers it as owners are attributed. It is charged once, separately
+from measured owners and `FAMILY_RESERVE`. `MEMORY_PADDING=0` removes only padding;
+`GPU_RESERVE` replaces the whole reserve including padding, even when set to zero.
+Sparks are unchanged and use `SPARK_RESERVE`, not `MEMORY_PADDING`.
 Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`, ...).
 
 | Key | Default | Values | Notes |
@@ -149,8 +155,9 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `KV_MAX_TOKENS` | the target | positive count, at least the target | After an automatic layout is fixed, the pool grows into free memory up to this. A pinned `RTX_EXPERT_LAYERS` already makes the pool the output (it fills what is left). |
 | `GPU_MEMORY_CAP` | full device | size | Total per-GPU ceiling for plan, serve and golden; leaves SM count and L2 unchanged. |
 | `SPARK_MEMORY_CAP` | the family's Spark default | size | Total per-Spark engine ceiling, including worker process residency and routed weights; the outside-cap gap leaves room for OS/services. |
-| `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components become 0, but physical driver page tables stay charged. Still inside the cap. |
+| `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables stay charged. Still inside the cap. |
 | `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
+| `MEMORY_PADDING` | `100MiB` | size | Explicit per-coordinator-GPU release padding, inside the cap; `0` disables only padding. `GPU_RESERVE` replaces it. Global flag: `--memory-padding`. |
 | `FAMILY_RESERVE` | per-family constant (0; GLM 5.3 Flash 2 GiB until #1442) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
 | `KV_POOL_TOKENS` | unset | multiple of 64 | V4.1 only: fixed KV pool. Conflicts with `POOL_TOKENS`. |
 | `KV_POOL_SIZE` | unset | `B/MB/GB/MiB/GiB` | V4.1 only: fixed KV pool size. |
@@ -433,6 +440,7 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `GPU_MEMORY_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `SPARK_MEMORY_CAP` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GPU_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `MEMORY_PADDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `SPARK_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `FAMILY_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_POOL_TOKENS` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
