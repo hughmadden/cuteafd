@@ -152,7 +152,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             if !working.spark_layers.is_empty() {
                 spark_io(report, model, options, &working, &mut sparks, &mut notes);
             }
-            waste = replicated_weights(&placement);
+            waste = replicated_weights(checkpoint, &placement);
             report.solver_placement = Some(placement.clone());
             pool_tokens = placement.pool_tokens;
             notes.push(format!("placement: {}", placement.summary()));
@@ -227,11 +227,12 @@ fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, opti
 
 /// GQA/SWA cache records and projection shards are partitioned, but the
 /// head-split executor still keeps a whole router and layer norms per rank.
-fn replicated_weights(placement: &crate::placement::Placement) -> Vec<Waste> {
-    let Some(peer) = placement.items.get(1) else { return Vec::new(); };
-    let bytes = peer.iter().filter(|item| item.category == Category::Weights
-        && (item.group.contains("layernorm") || item.group.contains(".mlp.gate."))
-        && placement.items[0].contains(item)).map(|item| item.bytes).sum();
+fn replicated_weights(checkpoint: &super::super::Checkpoint, placement: &crate::placement::Placement) -> Vec<Waste> {
+    if placement.items.len() < 2 { return Vec::new(); }
+    // These are aliases inside the two target arenas, not extra payload owners.
+    let bytes = checkpoint.tensors.iter().filter(|tensor| tensor.meta.name.starts_with("model.layers.")
+        && (tensor.meta.name.contains("layernorm") || tensor.meta.name.contains(".mlp.gate.")))
+        .map(|tensor| tensor.meta.byte_length.max(256)).sum();
     if bytes == 0 { Vec::new() } else {
         vec![Waste { device: "rtx1".into(), what: "router and layer norms replicated under the head split".into(), bytes }]
     }
@@ -321,6 +322,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     for rank in 0..ranks {
         let mut additional = Vec::new();
         let mut resident_weights = crate::placement::ResidentWeights::default();
+        let mut weight_arenas = Vec::new();
         additional.extend(transport_reservations(&cfg, ranks, rank, rows as usize, lanes, spark_ranks, options.resolved_spark_reply_format(false))?);
         if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size)?); }
         if rank == 0 || options.tp2_dflash {
@@ -337,6 +339,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                         crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?;
                 resident_weights = resident_weights.checked_add(costs.resident_weights)?;
                 additional.extend(costs.steady);
+                weight_arenas.push(costs.arena);
 
             }
             let local_mark = if options.tp2_dflash && draft_mark > 0 {
@@ -360,7 +363,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         debug_assert_eq!(graphs.graph_set(decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
             decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).bytes(rank), additional.iter()
                 .filter(|r| r.name.starts_with("runtime.decode_graph")).map(|r| r.bytes).sum::<u64>());
-        runtime.push(MimoRankRuntime { resident_weights, device: rank as u32, workspaces,
+        runtime.push(MimoRankRuntime { weight_arenas, resident_weights, device: rank as u32, workspaces,
             loading_additional: Vec::new(), additional });
     }
     let host_embedding = use_host_embedding(checkpoint, options);
@@ -663,7 +666,7 @@ mod tests {
                             if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size).unwrap()); }
                             additional.extend(graph.reservations(rank, decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
                                 decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).unwrap());
-                            MimoRankRuntime { resident_weights: Default::default(), device: rank as u32, loading_additional: vec![], additional,
+                            MimoRankRuntime { weight_arenas: vec![], resident_weights: Default::default(), device: rank as u32, loading_additional: vec![], additional,
                                 workspaces: workspace_options(&cfg, ranks, rank, 4096, 32768, lanes, true,
                                     opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow, pro, |_| Ok(0)).unwrap() }
                         }).collect();
@@ -680,13 +683,14 @@ mod tests {
                         }).collect();
                         let placement = apply(&input, &opts, &mut devices, 4, 4096, 4, 32768, None).unwrap();
                         assert_eq!(placement.pool_tokens, 32768);
-                        let waste = replicated_weights(&placement);
+                        let waste = replicated_weights(checkpoint, &placement);
                         if ranks == 1 {
                             assert!(waste.is_empty());
                         } else {
-                            let replica: u64 = admitted.steady.devices[1].reservations.iter()
-                                .filter(|r| r.name.contains("layernorm") || r.name.contains(".mlp.gate."))
-                                .map(|r| r.bytes).sum();
+                            let replica: u64 = checkpoint.tensors.iter().filter(|tensor|
+                                tensor.meta.name.starts_with("model.layers.") &&
+                                (tensor.meta.name.contains("layernorm") || tensor.meta.name.contains(".mlp.gate.")))
+                                .map(|tensor| tensor.meta.byte_length.max(256)).sum();
                             assert!(replica > 0);
                             assert_eq!(waste.len(), 1);
                             assert_eq!(waste[0].bytes, replica);
@@ -705,6 +709,138 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires MiMo-V2.6-Flash-MOPD@2479e2d0 installed in the checkpoint test hub"]
+    fn installed_flash_max_arena_charges_equal_runtime_recipe() -> Result<()> {
+        use crate::families::mimo_v2::{resident::MimoResidentLayout,
+            weight_arena::{MimoArenaLayouts, dflash_arena_requests}};
+        use crate::placement::planner::{allocation_granularity_forecast, Lifetime, Phase};
+        let hub = std::env::var_os("CUTEAFD_CHECKPOINT_TEST_HUB").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_hf_home().join("hub"));
+        let snapshot = hub.join("models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/2479e2d0029eca9a34cc7e7f55a121925f81908e");
+        let input = PlanInput::from_checkpoint(Checkpoint::open(&snapshot)?);
+        let checkpoint = input.checkpoint();
+        let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
+        let qualified = default_policy(checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
+        let source = |name: &str| checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name)
+            .map(|tensor| if tensor.meta.dtype == cuteafd_core::DType::Bf16 && !qualified { R::Bf16 } else { R::Fp8 });
+        for native in [0, 1] {
+            let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                rtx_bytes: vec![95 * GIB; 2], head_split: true, tp2_dflash: true,
+                native_mtp_layers: native, concurrency: 4, pool_tokens: Some(32768),
+                onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() };
+            let profiles = profile(checkpoint, &options, 2, 4, 2752, 4, 32768, None)?;
+            let resident = MimoResidentLayout::new(checkpoint, &cfg, &MimoResidentOptions {
+                layers: cfg.layers, coordinator_ranks: 2, checkpoint_tp: checkpoint_tp(&snapshot)?,
+                native_mtp_layers: native, gpu_embedding: true,
+                head_format: source("lm_head.weight").unwrap_or(R::Bf16),
+                output_formats: checkpoint.tensors.iter().filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight"))
+                    .filter_map(|tensor| source(&tensor.meta.name).map(|format| (tensor.meta.name.clone(), format))).collect(),
+            })?;
+            let layouts = MimoArenaLayouts::new(checkpoint, &resident)?;
+            let draft = draft_config::DflashConfig::read(&snapshot.join("dflash"))?;
+            // This is the live loader's selected mode, not the BF16 source dtype.
+            let mode = if options.mimo_draft_bf16 { draft_representation::MimoDraftRepresentation::Bf16Only }
+                else { draft_representation::MimoDraftRepresentation::Fp8Only };
+            for rank in 0..2 {
+                let mut runtime = vec![MimoWeightArena { layout: layouts.target[rank].clone().unwrap(), lifetime: Lifetime::RESIDENT }];
+                if rank == 0 {
+                    runtime.extend(layouts.mtp.iter().cloned().map(|layout| MimoWeightArena { layout, lifetime: Lifetime::RESIDENT }));
+                }
+                runtime.push(MimoWeightArena { layout: dflash_arena_requests(&draft, mode, rank, 2)?,
+                    lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth } });
+                assert_eq!(profiles.weight_arenas[rank], runtime);
+                assert!(profiles.steady.devices[rank].reservations.iter().all(|owner|
+                    !owner.name.starts_with("draft.weights.") && !owner.name.starts_with("model.") && !owner.name.starts_with("lm_head.")));
+                let expected = runtime.iter().map(|arena| arena.layout.bytes() as u64).sum::<u64>();
+                assert_eq!(profiles.resident_weights[rank].0, expected);
+                for arena in &runtime {
+                    let rows = arena.reservations()?;
+                    assert_eq!(rows[0].bytes, arena.layout.bytes() as u64);
+                    assert_eq!(rows[1].bytes, allocation_granularity_forecast(&[rows[0].bytes])?);
+                    let before_draft = profiles.post_target_kv[rank].reservations.iter().any(|row| row.name == arena.layout.id());
+                    assert_eq!(before_draft, arena.lifetime == Lifetime::RESIDENT);
+                }
+            }
+            let mut devices = (0..2).map(|rank| DeviceLayout { kind: DeviceKind::Rtx, index: rank,
+                capacity_bytes: 95 * GIB, worker_budget_bytes: 0, items: vec![], kv_tokens: 0 }).collect::<Vec<_>>();
+            apply(&input, &options, &mut devices, 4, 2752, 4, 32768, None)?;
+            for rank in 0..2 {
+                let bytes = |group: &str| devices[rank].items.iter().filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
+                assert_eq!(bytes("weight arena"), profiles.resident_weights[rank].0);
+                let tail = profiles.weight_arenas[rank].iter().map(|arena| allocation_granularity_forecast(&[arena.layout.bytes() as u64]).unwrap()).sum::<u64>();
+                assert_eq!(bytes(crate::placement::planner::ALLOCATION_GRANULARITY_GROUP), tail);
+                let total = profiles.steady.devices[rank].reservations.iter().map(|row| row.bytes).sum::<u64>()
+                    + (32768 / profiles.steady.pool_unit_rows) * profiles.steady.devices[rank].pool_unit_bytes
+                    + crate::placement::families::mimo_v2::admission::POST_READY_RUNTIME_BYTES;
+                assert_eq!(devices[rank].used_bytes(), total, "one physical charge per arena");
+                eprintln!("native={native} rank={rank} arena B={} tail={tail}", profiles.resident_weights[rank].0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed MiMo-V2.6 Flash/Pro MOPD checkpoint headers"]
+    fn installed_mimo_arena_charge_table() -> Result<()> {
+        use crate::families::mimo_v2::{resident::MimoResidentLayout,
+            weight_arena::{MimoArenaLayouts, dflash_arena_requests}};
+        use crate::placement::planner::allocation_granularity_forecast;
+        use draft_representation::{MimoDraftCapacity, MimoDraftRepresentation};
+        let hub = std::env::var_os("CUTEAFD_CHECKPOINT_TEST_HUB").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::default_hf_home().join("hub"));
+        for (family, revision) in [("Flash", "2479e2d0029eca9a34cc7e7f55a121925f81908e"),
+            ("Pro", "adea8e2c5373181e5a973fa1ecb343cb31af214b")] {
+            let snapshot = hub.join(format!("models--XiaomiMiMo--MiMo-V2.6-{family}-MOPD/snapshots/{revision}"));
+            let checkpoint = Checkpoint::open(&snapshot)?;
+            let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
+            let qualified = default_policy(&checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
+            let source = |name: &str| checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name)
+                .map(|tensor| if tensor.meta.dtype == cuteafd_core::DType::Bf16 && !qualified { R::Bf16 } else { R::Fp8 });
+            let stages = checkpoint.tensors.iter().filter_map(|tensor|
+                tensor.meta.name.strip_prefix("model.mtp.layers.")?.split('.').next()?.parse::<usize>().ok())
+                .max().map_or(0, |stage| stage + 1);
+            let draft = draft_config::DflashConfig::read(&snapshot.join("dflash"))?;
+            for (ranks, native) in [1, 2].into_iter().flat_map(|ranks|
+                (0..=stages).map(move |native| (ranks, native))) {
+                let resident = MimoResidentLayout::new(&checkpoint, &cfg, &MimoResidentOptions {
+                    layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: checkpoint_tp(&snapshot)?,
+                    native_mtp_layers: native, gpu_embedding: true,
+                    head_format: source("lm_head.weight").unwrap_or(R::Bf16),
+                    output_formats: checkpoint.tensors.iter().filter(|tensor| tensor.meta.name.ends_with(".self_attn.o_proj.weight"))
+                        .filter_map(|tensor| source(&tensor.meta.name).map(|format| (tensor.meta.name.clone(), format))).collect(),
+                })?;
+                let layouts = MimoArenaLayouts::new(&checkpoint, &resident)?;
+                let print = |rank, scope: &str, old, layout: &crate::serving_capacity::WeightArenaLayout| -> Result<()> {
+                    let bytes = layout.bytes() as u64;
+                    let tail = allocation_granularity_forecast(&[bytes])?;
+                    assert_eq!(layout.payload_bytes() as u64, old, "old payload recipe: {scope}");
+                    eprintln!("charge|{family}|tp{ranks}|rank{rank}|{scope}|{old}|{bytes}|{tail}|{}|{}|no",
+                        bytes + tail, (bytes + tail) as i64 - old as i64);
+                    Ok(())
+                };
+                for rank in 0..ranks {
+                    let old = |mtp| resident.ranks[rank].iter().filter(|owner| owner.name.starts_with("model.mtp.") == mtp)
+                        .map(|owner| owner.bytes).sum::<u64>();
+                    if native == 0 { print(rank, "target", old(false), layouts.target[rank].as_ref().unwrap())?; }
+                    if rank == 0 {
+                        if let Some(layout) = &layouts.mtp { print(rank, &format!("native-mtp{native}"), old(true), layout)?; }
+                    }
+                    if native != 0 { continue; }
+                    for (label, mode) in [("dflash-fp8", MimoDraftRepresentation::Fp8Only),
+                        ("dflash-bf16", MimoDraftRepresentation::Bf16Only)] {
+                        // The old admission added these six aggregate payload fields, with no SM120 tail.
+                        let weights = draft.for_tp(ranks)?.runtime_layout(mode, MimoDraftCapacity::new(4, 4, draft.block)?)?.weights;
+                        let old = weights.bf16_values + weights.fp8_values + weights.fp8_scales
+                            + weights.small_bf16 + weights.head_fp8_values + weights.head_fp8_scales;
+                        print(rank, label, old, &dflash_arena_requests(&draft, mode, rank, ranks)?)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -901,13 +1037,17 @@ mod tests {
             placement: crate::plan::ExpertPlacement::Sparks { ranks: 2 },
             layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
             ..Default::default() }).unwrap();
+        let tails = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
+            .filter(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
+            .map(|item| item.bytes).sum::<u64>();
         let ledger = report.phase_ledger.unwrap();
         let baseline = &ledger.budgets.iter().find(|b| b.id == "rtx0").unwrap().baseline;
         let crate::placement::planner::Baseline::Forecast { occupied, .. } = baseline else { panic!("forecast") };
         assert_eq!(*occupied, 575 << 20);
         let ready = ledger.phases.iter().find(|row| row.budget == "rtx0"
             && row.phase == crate::placement::planner::Phase::Ready).unwrap();
-        assert_eq!(ready.opaque, 570 << 20);
+        let runtime = ready.opaque - tails;
+        assert_eq!(runtime, 570 << 20);
         let measured_baseline = 1_179_189_248u64 - 576_716_800;
         let measured_owned = 97_985_769_216u64;
         let corrected_peak = 99_185_393_664u64;
@@ -915,8 +1055,8 @@ mod tests {
         assert_eq!(measured_baseline, 602_472_448);
         assert_eq!(measured_runtime, 597_152_000);
         assert_eq!(*occupied, measured_baseline.div_ceil(1 << 20) * (1 << 20));
-        assert_eq!(ready.opaque, measured_runtime.div_ceil(1 << 20) * (1 << 20));
-        assert_eq!(measured_owned + occupied + ready.opaque - corrected_peak, 995_072);
+        assert_eq!(runtime, measured_runtime.div_ceil(1 << 20) * (1 << 20));
+        assert_eq!(measured_owned + occupied + runtime - corrected_peak, 995_072);
     }
 
     #[test]

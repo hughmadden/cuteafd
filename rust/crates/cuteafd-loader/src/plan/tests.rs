@@ -4300,23 +4300,31 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = mimo_pro_config();
     config["tie_word_embeddings"] = json!(false);
-    write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+    // A real-sized embedding spans driver blocks; the 64-row fixture can
+    // disappear inside the same rounded arena backing when moved to host.
+    config["vocab_size"] = json!(4096);
+    let mut tensors = mimo_pro_tensors();
+    for (name, _, shape) in &mut tensors {
+        if name == "model.embed_tokens.weight" || name == "lm_head.weight" { shape[0] = 4096; }
+    }
+    write_snapshot(dir.path(), &config, &tensors, Some(8));
     let mut options = PlanOptions {
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![24 << 30, 96 << 30], force_gpu_embedding: true,
-            // One page below the freed embedding's worth of KV: the GPU plan
-            // misses the context floor, the host plan clears it.
-            context_tokens: 4096, ..Default::default() }),
+            context_tokens: 4096, pool_tokens: Some(4096),
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)), ..Default::default() }),
         ..sparks(6)
     };
-    let probe = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    let bytes = probe.devices[0].by_category()[&Category::Embedding];
+    let probe_report = plan(dir.path(), &options).unwrap();
+    let bytes = component(&probe_report, Component::Embedding).bytes;
     assert!(bytes > 0);
-    // Leave only one table's worth of KV room, below this small fixture's target cap.
-    options.layout.as_mut().unwrap().rtx_bytes[0] =
-        probe.devices[0].used_bytes()
-            - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
-            + bytes + crate::placement::families::mimo_v2::admission::device_headroom(0,
-                crate::families::mimo_v2::admission::spark_intake_probe_bytes(true, None).unwrap());
+    // Put the cap halfway through the removable embedding, accounting for
+    // the real phase peak, baseline and the arena's separate driver tail.
+    let ledger = probe_report.phase_ledger.unwrap();
+    let budget = ledger.budgets.iter().find(|budget| budget.id == "rtx0").unwrap();
+    let crate::placement::planner::Baseline::Forecast { occupied, .. } = budget.baseline else { panic!("forecast") };
+    let peak = ledger.phases.iter().filter(|phase| phase.budget == "rtx0")
+        .map(|phase| phase.owned + phase.opaque).max().unwrap();
+    options.layout.as_mut().unwrap().rtx_bytes[0] = peak + occupied + budget.headroom - bytes / 2;
     let gpu_report = plan(dir.path(), &options).unwrap();
     assert!(!gpu_report.fits, "the GPU plan cannot reach the context floor");
     assert_eq!(gpu_report.memory_layout.as_ref().unwrap().devices[1].by_category()
@@ -4326,17 +4334,20 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     assert!(report.fits, "{:?}", report.hints);
     let gpu = gpu_report.memory_layout.unwrap();
     let host = report.memory_layout.unwrap();
-    assert!(!host.devices.iter().any(|d| d.by_category().contains_key(&Category::Embedding)));
+    // The embedding is an alias inside the target root, not a separate charge.
+    assert_eq!(gpu.devices[0].by_category()[&Category::Weights]
+        - host.devices[0].by_category()[&Category::Weights], bytes);
     assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={} host_notes={:?} gpu_notes={:?}",
         host.pool_tokens, gpu.pool_tokens, host.notes, gpu.notes);
     assert_eq!(host.devices[1].by_category().get(&Category::Weights), gpu.devices[1].by_category().get(&Category::Weights));
     assert!(host.notes.iter().any(|n| n.contains(&format!("{bytes} device bytes freed"))));
     config["tie_word_embeddings"] = json!(true);
-    write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+    write_snapshot(dir.path(), &config, &tensors, Some(8));
     let tied = plan(dir.path(), &options).unwrap();
     assert!(!tied.fits);
     assert!(tied.hints.iter().any(|h| h.what.contains("tie_word_embeddings")));
-    assert_eq!(tied.memory_layout.unwrap().devices[0].by_category()[&Category::Embedding], bytes);
+    assert_eq!(tied.memory_layout.unwrap().devices[0].by_category()[&Category::Weights],
+        gpu.devices[0].by_category()[&Category::Weights]);
 }
 
 #[test]
@@ -4359,7 +4370,11 @@ fn mimo_small_card_auto_embedding_and_full_context() {
     assert!(base.pool_tokens >= 1_048_576, "{}", base.render());
     assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
     options.layout.as_mut().unwrap().force_gpu_embedding = true;
-    assert!(plan(dir.path(), &options).unwrap().memory_layout.unwrap().devices[0].by_category().contains_key(&Category::Embedding));
+    let gpu_report = plan(dir.path(), &options).unwrap();
+    let embedding = component(&gpu_report, Component::Embedding).bytes;
+    let gpu = gpu_report.memory_layout.unwrap();
+    assert_eq!(gpu.devices[0].by_category()[&Category::Weights]
+        - base.devices[0].by_category()[&Category::Weights], embedding);
 }
 
 #[test]

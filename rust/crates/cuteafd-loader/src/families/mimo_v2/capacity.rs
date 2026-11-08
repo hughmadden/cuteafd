@@ -3,16 +3,20 @@
 //! CUDA module, graph, transport, expert and external-drafter reservations are
 //! supplied by the runtime, where their selected implementations are known.
 use super::resident::{MimoResidentLayout, MimoResidentOptions};
+use super::weight_arena::MimoArenaLayouts;
 use super::{MimoKvFormats, MimoV2Config, MimoWorkspaceLayout, MimoWorkspaceOptions};
 use crate::plan::checkpoint::Checkpoint;
-use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
+use crate::placement::planner::{allocation_granularity_forecast, Lifetime};
+use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError, WeightArenaLayout};
 use cuteafd_core::serving_capacity::{
     CapacityProfile, ContextLimits, DeviceCosts, MemoryReservation,
 };
 
 #[derive(Debug, Clone)]
 pub struct MimoRankRuntime {
-    /// Checkpoint weights in `additional`, from their native owner recipes.
+    /// Independently retired immutable sets, e.g. the selected DFlash arena.
+    pub weight_arenas: Vec<MimoWeightArena>,
+    /// Retained arena bytes plus checkpoint weights in `additional`.
     pub resident_weights: crate::placement::ResidentWeights,
     pub device: u32,
     /// Every workspace that can remain live together: prefill lanes and decode.
@@ -42,6 +46,7 @@ pub struct MimoCapacityOptions {
 
 #[derive(Debug, Clone)]
 pub struct MimoCapacityProfiles {
+    pub weight_arenas: Vec<Vec<MimoWeightArena>>,
     pub resident_weights: Vec<crate::placement::ResidentWeights>,
     /// Fixed-only admission before any target weight allocation.
     pub loading: Vec<DeviceCosts>,
@@ -53,6 +58,26 @@ pub struct MimoCapacityProfiles {
     pub post_target_kv: Vec<DeviceCosts>,
     /// Persistent admission, including the selected logical KV pool.
     pub steady: CapacityProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MimoWeightArena {
+    pub layout: WeightArenaLayout,
+    pub lifetime: Lifetime,
+}
+
+impl MimoWeightArena {
+    /// Reporting rows mirror the physical root and its one derived tail.
+    /// The planner uses the shared arena component constructor instead.
+    pub fn reservations(&self) -> Result<Vec<MemoryReservation>, CacheGeometryError> {
+        let bytes = self.layout.bytes() as u64;
+        let tail = allocation_granularity_forecast(&[bytes])
+            .map_err(|error| CacheGeometryError::ResidentTensor {
+                name: self.layout.id().into(), what: error.to_string(),
+            })?;
+        Ok(vec![MemoryReservation { name: self.layout.id().into(), bytes },
+            MemoryReservation { name: format!("{}.tail", self.layout.id()), bytes: tail }])
+    }
 }
 
 fn product(label: &'static str, dims: &[u64]) -> Result<u64, CacheGeometryError> {
@@ -96,6 +121,16 @@ pub fn mimo_capacity_profiles(
         });
     }
     let resident = MimoResidentLayout::new(checkpoint, cfg, &resident_options)?;
+    let layouts = MimoArenaLayouts::new(checkpoint, &resident)
+        .map_err(|error| CacheGeometryError::ResidentTensor {
+            name: "MiMo weight arenas".into(), what: error.to_string(),
+        })?;
+    let mut weight_arenas = layouts.target.into_iter().map(|layout| layout.into_iter()
+        .map(|layout| MimoWeightArena { layout, lifetime: Lifetime::RESIDENT }).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if let Some(layout) = layouts.mtp {
+        weight_arenas[0].push(MimoWeightArena { layout, lifetime: Lifetime::RESIDENT });
+    }
     let cache = mimo_cache_geometry(
         cfg,
         resident_options.layers,
@@ -150,7 +185,9 @@ pub fn mimo_capacity_profiles(
             });
         }
         let storage = cache.ranks[rank];
-        let mut loading_costs = resident.ranks[rank].clone();
+        let target_weights = weight_arenas[rank].iter().map(MimoWeightArena::reservations)
+            .collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect::<Vec<_>>();
+        let mut loading_costs = target_weights.clone();
         if rank == 0 {
             reserve(
                 &mut loading_costs,
@@ -178,7 +215,7 @@ pub fn mimo_capacity_profiles(
             pool_unit_bytes: 0,
             reserve_bytes: 0,
         });
-        let mut costs = resident.ranks[rank].clone();
+        let mut costs = target_weights;
         reserve(
             &mut costs,
             "state.active_rings",
@@ -246,6 +283,9 @@ pub fn mimo_capacity_profiles(
         }
         costs.extend(kv_shadow.reservation());
         costs.extend(runtime.additional.iter().cloned());
+        for arena in &runtime.weight_arenas {
+            costs.extend(arena.reservations()?);
+        }
         costs
             .iter()
             .try_fold(0u64, |n, reservation| n.checked_add(reservation.bytes))
@@ -257,13 +297,17 @@ pub fn mimo_capacity_profiles(
             reserve_bytes: 0,
         });
     }
-    let resident_weights = resident.ranks.iter().zip(&options.ranks).map(|(owners, runtime)| {
+    let resident_weights = weight_arenas.iter().zip(&options.ranks).map(|(owners, runtime)| {
         let bytes = owners.iter().try_fold(runtime.resident_weights.0, |sum, owner|
-            sum.checked_add(owner.bytes))
+            sum.checked_add(owner.layout.bytes() as u64))
             .ok_or(CacheGeometryError::Overflow("MiMo checkpoint resident weights"))?;
         Ok(crate::placement::ResidentWeights(bytes))
     }).collect::<Result<Vec<_>, CacheGeometryError>>()?;
+    for (arenas, runtime) in weight_arenas.iter_mut().zip(&options.ranks) {
+        arenas.extend(runtime.weight_arenas.iter().cloned());
+    }
     Ok(MimoCapacityProfiles {
+        weight_arenas,
         resident_weights,
         loading,
         post_target_kv,
@@ -316,6 +360,7 @@ mod tests {
             host_prefix_bytes: 64 << 30,
             ranks: (0..ranks)
                 .map(|rank| MimoRankRuntime {
+                    weight_arenas: vec![],
                     resident_weights: Default::default(),
                     // Rank0 need not be physical device0.
                     device: (1 - rank) as u32,
@@ -398,11 +443,11 @@ mod tests {
             assert!(profile.devices[0]
                 .reservations
                 .iter()
-                .any(|r| r.name == "lm_head.bf16"));
+                .any(|r| r.name == "mimo.target.rank0"));
             assert!(profile.devices[1]
                 .reservations
                 .iter()
-                .all(|r| r.name != "lm_head.bf16"));
+                .all(|r| r.name != "mimo.target.rank0"));
             assert_eq!(profile.host_prefix_bytes, 64 << 30);
             let arena = |rank: usize| {
                 profile.devices[rank]
