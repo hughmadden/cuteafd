@@ -259,15 +259,17 @@ fn checkpoint_owners_match_loader_floors_splits_and_pinned_embedding() {
     );
     assert!(inventory.components(0).is_err());
     let components = inventory.components(16).unwrap();
-    assert_eq!(components.len(), 2 * inventory.owners.len());
+    check_arenas(&inventory).unwrap();
     let resources: Vec<_> = components.iter().filter_map(|component| {
         if let ComponentKind::ResidentWeight(owner) = &component.kind { Some(owner) } else { None }
     }).collect();
-    assert_eq!(resources.len(), inventory.owners.len());
-    for (resource, physical) in resources.iter().zip(&inventory.owners) {
-        assert_eq!(resource.id, physical.allocation.id);
-        assert_eq!(resource.location, physical.allocation.location);
-        assert_eq!(resource.weights.0, physical.allocation.bytes);
+    assert_eq!(resources.len(), inventory.ranks + 1);
+    for location in [Location::PINNED, Location::coordinator(0), Location::coordinator(1)] {
+        let payload = inventory.owners.iter().filter(|owner| owner.allocation.location == location)
+            .map(|owner| owner.allocation.bytes).sum::<u64>();
+        let resources = resources.iter().filter(|owner| owner.location == location).collect::<Vec<_>>();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].weights.0, payload);
     }
 
     // ModelOpt conversion splits request exact small grids, not landing's floor.
