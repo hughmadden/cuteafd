@@ -102,7 +102,14 @@ impl<'a> VisionRuntime<'a> {
                 "vision tensor must retain BF16: {name}"
             );
         }
-        NativeRtxTensors::plan(catalog, &names)
+        Ok(Self::weight_layout(catalog)?.bytes())
+    }
+    fn weight_layout(catalog: &OfficialV41Catalog) -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
+        cuteafd_loader::serving_capacity::WeightArenaLayout::new("v41/vision",
+            Self::names().into_iter().map(|name| {
+                let bytes = usize::try_from(catalog.device_tensor_bytes(&name, None)?)?;
+                Ok((name, bytes))
+            }).collect::<Result<Vec<_>>>()?)
     }
     pub fn device_bytes(catalog: &OfficialV41Catalog, capacity: usize) -> Result<usize> {
         Ok(Self::weight_bytes(catalog)?
@@ -120,13 +127,15 @@ impl<'a> VisionRuntime<'a> {
             "vision owner exceeds device budget"
         );
         let names = Self::names();
-        let weights = NativeRtxTensors::load(
-            lib,
-            catalog,
-            &names,
-            NativeRtxTensors::plan(catalog, &names)?,
-            16 << 20,
+        let layout = Self::weight_layout(catalog)?;
+        // VisionRuntime is constructed inside its owning encoder thread/device.
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            crate::shared::memory::device::Device { library: lib, id: lib.cuda_get_device()? }, layout)?;
+        let weights = NativeRtxTensors::load_in(
+            lib, catalog, &names, NativeRtxTensors::plan(catalog, &names)?, 16 << 20, Some(&arena),
         )?;
+        super::weight_layout::probe_weights(lib, &[lib.cuda_get_device()?], "v41/vision-weights-loaded",
+            |inventory| weights.inventory(inventory))?;
         let workspace = DeviceAllocation::new(lib, V41VisionOps::WORKSPACE_BYTES)?;
         let ops = unsafe { lib.v41_vision_ops(workspace.buffer)? };
         let buffers = Self::buffer_sizes(capacity)?

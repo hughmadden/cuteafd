@@ -10,6 +10,10 @@ pub(crate) struct PlacedEngramWeights<'a> {
     weights: [DeviceOwner<'a, EngramLayerWeights<'a>>; 2],
 }
 impl<'a> PlacedEngramWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for weights in &self.weights { weights.inventory(inventory)?; }
+        Ok(())
+    }
     pub fn device_bytes(
         library: &NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -24,6 +28,7 @@ impl<'a> PlacedEngramWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -38,6 +43,11 @@ impl<'a> PlacedEngramWeights<'a> {
                 .all(|(n, b)| n <= b),
             "Engram weights exceed a GPU budget"
         );
+        Self::load_in(library, catalog, map, staging, None)
+    }
+    pub(crate) fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        map: CachePlacement, staging: usize,
+        arenas: Option<&crate::families::deepseek_v41::weight_layout::TargetArenas<'a>>) -> Result<Self> {
         let weights = [1, 14]
             .into_iter()
             .enumerate()
@@ -46,13 +56,12 @@ impl<'a> PlacedEngramWeights<'a> {
                     library,
                     id: map.attention(layer)? as i32,
                 };
+                let arena = arenas.map(|arenas| arenas.get(device.id)).transpose()?;
                 device.own(|| {
-                    EngramLayerWeights::load(
-                        library,
-                        catalog,
-                        index,
+                    EngramLayerWeights::load_in(
+                        library, catalog, index,
                         EngramLayerWeights::device_bytes(library, catalog, index)?,
-                        staging,
+                        staging, arena,
                     )
                 })
             })

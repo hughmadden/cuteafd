@@ -1,5 +1,6 @@
 //! Official coordinator tensors retain their native checkpoint representations.
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, device::Device,
+    weight_arena::{DeviceWeightArena, weight_allocation}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
@@ -7,6 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 #[path = "v41_tensors/vocabulary_shard.rs"]
 mod vocabulary_shard;
 pub(crate) use vocabulary_shard::VocabularyShard;
+
+pub(crate) fn allocation<'a>(library: &'a NativeLibrary,
+    arena: Option<&DeviceWeightArena<'a>>, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
+    Ok(DeviceAllocation::from_allocation(weight_allocation(
+        Device { library, id: library.cuda_get_device()? }, arena, name, bytes)?))
+}
 
 /// Checkpoint tensor `name` (an unsharded coordinator tensor) as one
 /// rectangle: its rows (`rows` of them, or all), each whole.
@@ -48,14 +55,19 @@ pub(crate) struct NativeRtxTensors<'a> {
 }
 impl<'a> NativeRtxTensors<'a> {
     /// Target and dSpark borrow the same immutable table on both CED devices.
+    #[cfg(test)]
     pub fn load_embedding(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         placement: crate::shared::memory::EmbedPlacement) -> Result<Self> {
+        Self::load_embedding_in(library, catalog, placement, None)
+    }
+    pub fn load_embedding_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        placement: crate::shared::memory::EmbedPlacement, arena: Option<&DeviceWeightArena<'a>>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("embedding");
         let names = ["embed.weight".to_owned()];
         let bytes = Self::plan(catalog, &names)?;
         if placement == crate::shared::memory::EmbedPlacement::Gpu {
             tracing::info!(?placement, device_bytes=bytes, pinned_bytes=0, "V4.1 embedding placement (single residency, RTX0 only)");
-            return Self::load(library, catalog, &names, bytes, 16 << 20);
+            return Self::load_in(library, catalog, &names, bytes, 16 << 20, arena);
         }
         cuteafd_loader::plan::checkpoint::Checkpoint::open(catalog.snapshot())?
             .require_untied_embedding("embed.weight")?;
@@ -83,6 +95,7 @@ impl<'a> NativeRtxTensors<'a> {
     }
     /// Admission precedes allocation and payload reads; bounded pinned staging is
     /// released after synchronous uploads. Engram tables cannot enter this path.
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -90,6 +103,11 @@ impl<'a> NativeRtxTensors<'a> {
         device_budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, names, device_budget, staging_bytes, None)
+    }
+
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, names: &[String],
+        device_budget: usize, staging_bytes: usize, arena: Option<&DeviceWeightArena<'a>>) -> Result<Self> {
         let resident_bytes = Self::plan(catalog, names)?;
         ensure!(
             resident_bytes <= device_budget,
@@ -105,7 +123,8 @@ impl<'a> NativeRtxTensors<'a> {
         let mut tensors = BTreeMap::new();
         for name in names {
             let bytes = usize::try_from(catalog.device_tensor_bytes(name, None)?)?;
-            let allocation = DeviceAllocation::new(library, bytes)?;
+            let allocation = DeviceAllocation::from_allocation(weight_allocation(
+                Device { library, id: device }, arena, name, bytes)?);
             dense.operand(crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer,
                 lands: vec![(rect(catalog, name, None)?, 0)], bytes })?;
             tensors.insert(name.clone(), allocation);
@@ -129,6 +148,11 @@ impl<'a> NativeRtxTensors<'a> {
     }
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
+    }
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (name, allocation) in &self.tensors { allocation.inventory(inventory, name)?; }
+        if let Some((owner, _)) = &self.mapped_embedding { inventory.pinned("embed.weight", owner.buffer)?; }
+        Ok(())
     }
 }
 
@@ -185,12 +209,15 @@ pub(crate) struct HeadScratch<'a> {
 
 /// Packs a resident BF16 head, draining before releasing the source. Failed
 /// drains quarantine both formats and the native module until process teardown.
-fn pack_fp8<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize)
+fn pack_fp8_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize,
+    arena: Option<&DeviceWeightArena<'a>>)
     -> Result<(Option<DeviceAllocation<'a>>, crate::shared::fp8_linear::Fp8Weight<'a>)> {
     ensure!(weight.buffer.bytes == rows * 10240, "FP8 head geometry differs from BF16");
     let stream = library.cuda_stream_create()?;
-    let packed = crate::shared::fp8_linear::Fp8Weight::pack(library, weight.buffer.ptr, rows, 5120,
-        crate::shared::fp8_linear::Fp8Scales::Best, stream);
+    let device = Device { library, id: library.cuda_get_device()? };
+    let packed = crate::shared::fp8_linear::Fp8Weight::pack_with(library, weight.buffer.ptr, rows, 5120,
+        crate::shared::fp8_linear::Fp8Scales::Best, stream, "head.fp8",
+        |name, bytes| weight_allocation(device, arena, name, bytes));
     // SAFETY: source and packed destinations remain owned until the pack drains.
     if let Err(error) = unsafe { library.cuda_stream_synchronize(stream) } {
         library.quarantine_module_after_failed_drain();
@@ -208,11 +235,13 @@ fn pack_fp8<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: 
 /// Packs a resident BF16 head into the exact 12-bit copy, which verifies itself
 /// bit for bit, then releases the BF16 source. A failed drain quarantines the
 /// destination, the source and the native module until process teardown.
-fn pack_packed<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize)
-    -> Result<crate::shared::packed_head::PackedHead<'a>> {
+fn pack_packed_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, rows: usize,
+    arena: Option<&DeviceWeightArena<'a>>) -> Result<crate::shared::packed_head::PackedHead<'a>> {
     ensure!(weight.buffer.bytes == rows * 10240, "packed head geometry differs from BF16");
     let stream = library.cuda_stream_create()?;
-    let packed = crate::shared::packed_head::PackedHead::pack(library, weight.buffer.ptr, rows, 5120, stream);
+    let device = Device { library, id: library.cuda_get_device()? };
+    let packed = crate::shared::packed_head::PackedHead::pack_with(library, weight.buffer.ptr, rows, 5120, stream,
+        |name, bytes| weight_allocation(device, arena, &format!("head.{name}"), bytes));
     if packed.is_err() && library.is_quarantined_after_failed_drain() {
         // The pack could not prove its reads of the source retired.
         std::mem::forget(weight);
@@ -314,6 +343,9 @@ mod head_site_tests {
     }
 }
 impl<'library> VocabularyHead<'library> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.shard.inventory(inventory)
+    }
     /// Peak load admission, including BF16 staging and FP8 destinations.
     pub fn plan(catalog: &OfficialV41Catalog) -> Result<usize> {
         VocabularyShard::load_bytes(catalog, 0..129280)
@@ -322,13 +354,18 @@ impl<'library> VocabularyHead<'library> {
         let source = VocabularyShard::device_bytes(catalog, 0..129280)?;
         Ok(usize::try_from(fp8_head().resident(source as u64).0)?)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'library NativeLibrary,
         catalog: &OfficialV41Catalog,
         budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
-        Ok(Self { shard: VocabularyShard::load(library, catalog, 0..129280, budget, staging_bytes)? })
+        Self::load_in(library, catalog, budget, staging_bytes, None)
+    }
+    pub fn load_in(library: &'library NativeLibrary, catalog: &OfficialV41Catalog,
+        budget: usize, staging_bytes: usize, arena: Option<&DeviceWeightArena<'library>>) -> Result<Self> {
+        Ok(Self { shard: VocabularyShard::load_in(library, catalog, 0..129280, budget, staging_bytes, arena)? })
     }
     pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.shard.weight() }
     pub fn device_id(&self) -> i32 { self.shard.device_id() }

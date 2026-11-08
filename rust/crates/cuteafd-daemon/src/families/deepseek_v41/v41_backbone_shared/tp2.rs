@@ -179,13 +179,28 @@ pub(crate) struct Weights<'a> {
     matrices: [Matrix<'a>; 3],
 }
 impl<'a> Weights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (stem, matrix) in ["w1", "w3", "w2"].into_iter().zip(&self.matrices) {
+            let name = format!("gpu{}.layers.{}.ffn.shared_experts.{stem}.weight", self.device.id, self.layer);
+            matrix.weight.inventory(inventory, &name)?;
+            matrix.scales.inventory(inventory,
+                &crate::families::deepseek_v41::weight_layout::packed_scale_name(&name))?;
+            if let Some(raw) = &matrix.source_scales { raw.inventory(inventory, &format!("{name}.transient_scales"))?; }
+        }
+        Ok(())
+    }
     pub fn device(&self) -> Device<'a> { self.device }
     /// Frees raw scales kept for a recorded scale pack (after it ran).
     pub fn release_raw_scales(&mut self) { for m in &mut self.matrices { drop(m.source_scales.take()); } }
     pub fn device_bytes() -> usize { 3 * (5120 * 1152 + 5120 * 1152 / 32) }
     /// Including every matrix's raw scales (resident until their pack ran).
     pub fn load_peak_device_bytes() -> usize { Self::device_bytes() + 3 * (5120 * 1152 / 1024) }
+    #[cfg(test)]
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize, budget: usize) -> Result<Self> {
+        Self::load_in(device, catalog, layer, budget, None)
+    }
+    pub fn load_in(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize, budget: usize,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(layer < 40 && matches!(device.id, 0 | 1) && budget >= Self::load_peak_device_bytes(),
             "invalid TP2 shared weight layer, rank, or budget");
         let stream = Stream::new(device)?;
@@ -195,8 +210,12 @@ impl<'a> Weights<'a> {
             let (axis, k, n) = if name == "w2" { (1, 1152, 5120) } else { (0, 5120, 1152) };
             let kernel = device.run(|| device.library.v41_fp8_matrix_kernel(1, k, n))?;
             let prefix = format!("layers.{layer}.ffn.shared_experts.{name}");
-            let weight = Allocation::new(device, (k*n) as usize)?;
-            let scales = Allocation::new(device, (k*n/32) as usize)?;
+            let weight_name = format!("{prefix}.weight");
+            let weight = crate::shared::memory::weight_arena::weight_allocation(
+                device, arena, &weight_name, (k*n) as usize)?;
+            let scales = crate::shared::memory::weight_arena::weight_allocation(
+                device, arena, &crate::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),
+                (k*n/32) as usize)?;
             let source_scales = Allocation::new(device, (k*n/1024) as usize)?;
             for (suffix, target) in [("weight", &weight), ("scale", &source_scales)] {
                 let rect = super::super::v41_tensors::half(catalog, &format!("{prefix}.{suffix}"), axis, device.id as usize)?;

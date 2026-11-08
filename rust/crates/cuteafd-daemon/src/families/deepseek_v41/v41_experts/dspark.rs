@@ -225,8 +225,9 @@ impl<'library> DsparkWeights<'library> {
                 .context("dSpark expert residency overflow")?;
             load_staging_bytes = load_staging_bytes.max(budget.device_staging_bytes);
         }
-        let auxiliary_resident_bytes =
-            NativeRtxTensors::plan(catalog, &Self::auxiliary_names(catalog))?;
+        let padding = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(catalog)?.padding_bytes();
+        let auxiliary_resident_bytes = NativeRtxTensors::plan(catalog, &Self::auxiliary_names(catalog))?
+            .checked_add(padding).context("dSpark arena padding overflow")?;
         let execution_bytes_per_wave = ExpertWeights::plan_execution(ExpertLayer::Dspark { stage: 0 }, library, capacity, capacity, false)?.total()?
             .checked_mul(3)
             .context("dSpark stage workspace overflow")?;
@@ -493,18 +494,32 @@ impl<'library> DsparkWeights<'library> {
         resident: usize) -> Result<PreparedDspark<'library>> {
         ensure!(budget.load_bound()? <= device_budget, "dSpark auxiliary preparation exceeds load admission");
         ensure!((1..=64 * 1024 * 1024).contains(&pinned_staging_bytes), "invalid dSpark auxiliary staging");
-        let auxiliary = NativeRtxTensors::load(
-            library,
-            catalog,
-            &Self::auxiliary_names(catalog),
-            device_budget
-                .checked_sub(resident)
-                .context("dSpark auxiliary budget underflow")?,
-            pinned_staging_bytes,
+        let layout = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(catalog)?;
+        ensure!(layout.bytes() <= device_budget.checked_sub(resident).context("dSpark auxiliary budget underflow")?,
+            "dSpark dense arena exceeds remaining admission");
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            crate::shared::memory::device::Device { library, id: library.cuda_get_device()? }, layout)?;
+        let auxiliary = NativeRtxTensors::load_in(
+            library, catalog, &Self::auxiliary_names(catalog),
+            budget.auxiliary_resident_bytes, pinned_staging_bytes, Some(&arena),
         )?;
-        let shared_scales = shared::pack_scales(library, &auxiliary)?;
-        let projection_scales = projection::pack_scales(library, &auxiliary)?;
-        let grouped_output_scales = attention_output::pack_grouped_scales(library, &auxiliary)?;
+        let shared_scales = shared::pack_scales(library, &auxiliary, &arena)?;
+        let projection_scales = projection::pack_scales(library, &auxiliary, &arena)?;
+        let grouped_output_scales = attention_output::pack_grouped_scales(library, &auxiliary, &arena)?;
+        crate::families::deepseek_v41::weight_layout::probe_weights(library,
+            &[library.cuda_get_device()?], "v41/dspark-dense-loaded", |inventory| {
+                auxiliary.inventory(inventory)?;
+                for (index, scales) in shared_scales.iter().enumerate() {
+                    scales.inventory(inventory, &format!("dspark.shared_scales.{index}"))?;
+                }
+                for (index, scales) in projection_scales.iter().enumerate() {
+                    scales.inventory(inventory, &format!("dspark.projection_scales.{index}"))?;
+                }
+                for (index, scales) in grouped_output_scales.iter().enumerate() {
+                    scales.inventory(inventory, &format!("dspark.grouped_scales.{index}"))?;
+                }
+                Ok(())
+            })?;
         Ok(PreparedDspark {
             library,
             draft_width: width,

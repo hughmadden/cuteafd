@@ -38,16 +38,29 @@ pub(crate) struct TargetHeadWeights<'a> {
     norm: NativeRtxTensors<'a>,
 }
 impl<'a> TargetHeadWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.norm.inventory(inventory)
+    }
     pub fn device_bytes(catalog: &OfficialV41Catalog) -> Result<usize> {
         let bytes = NativeRtxTensors::plan(catalog, &["norm.weight".into()])?;
         ensure!(bytes == 10240, "unexpected target norm geometry");
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
         budget: usize,
         staging: usize,
+    ) -> Result<Self> {
+        Self::load_in(library, catalog, budget, staging, None)
+    }
+    pub fn load_in(
+        library: &'a NativeLibrary,
+        catalog: &OfficialV41Catalog,
+        budget: usize,
+        staging: usize,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>,
     ) -> Result<Self> {
         ensure!(
             Self::device_bytes(catalog)? <= budget,
@@ -55,12 +68,8 @@ impl<'a> TargetHeadWeights<'a> {
         );
         Ok(Self {
             library,
-            norm: NativeRtxTensors::load(
-                library,
-                catalog,
-                &["norm.weight".into()],
-                budget,
-                staging,
+            norm: NativeRtxTensors::load_in(
+                library, catalog, &["norm.weight".into()], budget, staging, arena,
             )?,
         })
     }
