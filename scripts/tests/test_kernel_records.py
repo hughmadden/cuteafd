@@ -559,9 +559,13 @@ def test_sm170_recompiles_only_changed_routed_objects(tmp_path, monkeypatch):
     directory.mkdir(parents=True)
     programs = {"same.o": {"object_sha256": "same"}, "changed.o": {"object_sha256": "new"}}
     (directory / "program-records.json").write_text(json.dumps(programs))
+    previous.mkdir()
+    prior = {job[0] + "/" + name: {**record, "object_sha256": "old" if name == "changed.o"
+                                   else record["object_sha256"]} for name, record in programs.items()}
+    (previous / "INPUTS.json").write_text(json.dumps({"program_records": prior}))
     def publication(path, jobs):
-        return {job[0] + "/" + name: {**record, "object_sha256": "old" if path != staging and name == "changed.o"
-                                     else record["object_sha256"]} for name, record in programs.items()}
+        assert path == staging, "previous records must come from INPUTS, not historical worker schemas"
+        return {job[0] + "/" + name: record for name, record in programs.items()}
     monkeypatch.setattr(publisher, "publication_records", publication)
     calls = []
     def worker(command, **kwargs):
