@@ -56,8 +56,8 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
   drafting admissions that found no ring, and must read 0.
 - Dense NVFP4 MLPs run natively on a ModelOpt release; its per-tensor FP8
   dense MLPs prefill as static W8A8 on their own scales; BF16 attention,
-  indexer and shared experts quantize to FP8 blocks at load by default
-  (`CUTEAFD_GLM_BF16=native` keeps them BF16 at a coordinator-step cost).
+  indexer and shared experts quantize to FP8 blocks at load (GLM Flash has
+  no BF16 path for them; `CUTEAFD_GLM_BF16=native` is the GLM 5.3 family's).
 - KV format: FP8 MLA latent record on the MLA+DSA layers; a recurrent FP32
   state per KDA layer plus short-convolution state. `GLM5_FLASH_KDA_STATE=bf16`
   (`--kda-state bf16`, opt-in; BF16 KDA projections on one GPU) stores the
@@ -99,8 +99,8 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
   FP32 accumulation at every row count, one read of the head (the shared route
   for every family, launcher key `TARGET_HEAD`). `GLM5_FLASH_TARGET_HEAD=exact`
   or `TARGET_HEAD=exact` keeps the pedantic FP32 GEMM as a diagnostic. With the
-  FP8 head the setting does not apply, and an explicit `tensor` there is
-  refused.
+  FP8 or packed head the setting does not apply, and an explicit `tensor` there
+  is refused.
 - 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` keeps `64`;
   explicit `128` (`--decode-rows 128`) remains opt-in on one GPU. Builds with
   `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128` run steps of 65-128 rows on the
@@ -175,7 +175,11 @@ it chooses the serving layout: with one coordinator GPU,
 `GLM5_FLASH_FP8_HEAD=auto` selects `on`; with the two-GPU head split they
 select `off` (BF16 KDA and head). Explicit `off/row128/channel` KDA and
 `on/off` head settings always win, including the deprecated `GLMF_*` keys;
-current names take precedence over deprecated names. The DFlash2 drafter
+current names take precedence over deprecated names. `GLM5_FLASH_FP8_HEAD=packed`
+(`--fp8-head packed`, as `V41_FP8_HEAD=packed`) keeps instead the exact 12-bit
+copy of the BF16 head, packed and verified at load, then the BF16 released
+(956 MB resident against 1,269 MB BF16 and 654 MB FP8): target logits read it
+exactly, the drafter its coarse plane; one GPU only (a head split refuses it). The DFlash2 drafter
 defaults to FP8 on both layouts; `SPECULATOR_FP8=off` keeps it BF16.
 
 Matched recheck, 2026-10-04: GLM 5.3 Flash EXL3 K3.25, RTX PRO 6000 at
@@ -389,9 +393,6 @@ of every quant, mixed placement or hardware combination.
   BF16 block projections quantize to FP8 at load, including the two-GPU
   split; native NVFP4 dense and routed experts retain their own format.
   Dated cards below describe their original checkpoint/precision recipes.
-- Running BF16 attention natively (`CUTEAFD_GLM_BF16=native`) costs a
-  meaningful coordinator-step slowdown versus the default FP8-block path;
-  use it only when the extra precision is worth it.
 - Original column-split FP8 KDA/head misses the nominal paired top-1 bar
   on the two-GPU layout. Its large single-pair C4/prefill losses were not
   stable across warmed launches. Full-K KDA token rows pass component
