@@ -492,7 +492,7 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
         let ready_mappings = pinned.iter().filter(|owner| owner.lifetime.contains(Phase::Ready, PhaseOrder::TARGET_THEN_DRAFT))
             .map(|owner| driver_page_table_bytes(owner.bytes)).sum::<u64>();
         assert_eq!(placement.items[gpu].iter().filter(|item|
-            item.group == crate::placement::planner::DRIVER_PAGE_TABLES_GROUP).map(|item| item.bytes).sum::<u64>(), ready_mappings);
+            item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP).map(|item| item.bytes).sum::<u64>(), ready_mappings);
     }
     options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
     let direct = input.plan(&options).unwrap();

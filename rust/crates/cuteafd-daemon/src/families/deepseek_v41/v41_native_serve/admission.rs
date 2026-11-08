@@ -1233,7 +1233,7 @@ mod admission_tests {
                             as usize
                         + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
                     let mappings = admitted.placement.items[gpu].iter()
-                        .filter(|item| item.group == cuteafd_loader::placement::planner::DRIVER_PAGE_TABLES_GROUP)
+                        .filter(|item| item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP)
                         .map(|item| item.bytes as usize).sum::<usize>();
                     (bytes + reserve + deferred[gpu] as usize + usage_bytes + mappings, total)
                 })

@@ -1074,7 +1074,7 @@ mod tests {
         let ready = ledger.phases.iter().find(|row| row.budget == "rtx0"
             && row.phase == crate::placement::planner::Phase::Ready).unwrap();
         let mappings = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
-            .filter(|item| item.group == crate::placement::planner::DRIVER_PAGE_TABLES_GROUP)
+            .filter(|item| item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP)
             .map(|item| item.bytes).sum::<u64>();
         assert!(mappings > 0);
         let runtime = ready.opaque - tails - mappings;
