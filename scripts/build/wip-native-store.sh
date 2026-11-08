@@ -14,6 +14,7 @@ wip_native_required_items() {
       printf 'file V41_EXPERT_WORKSPACES/mxfp4_%s.json\n' "$item"
       [[ "$v41_nvfp4_aot" != ON ]] || printf 'file V41_EXPERT_WORKSPACES/nvfp4_%s.json\n' "$item"
     done
+    printf 'file V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json\n'
   fi
   local -a families
   IFS=';' read -ra families <<<"$expert_families"

@@ -306,6 +306,7 @@ def test_complete_native_store_entry_is_accepted(tmp_path):
                                     'exl3/exl3-qwen4-k4/manifest.json',
                                     'fp8/fp8-mimo/manifest.json',
                                     'V41_EXPERT_WORKSPACES/mxfp4_rtx_tp2.json',
+                                    'V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json',
                                     'lib-variants/x86-64-v2/libcuteafd_native.so'])
 def test_native_store_rejects_scope_limited_or_incomplete_entry(tmp_path, missing):
     import shutil
