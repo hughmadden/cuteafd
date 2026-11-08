@@ -193,10 +193,6 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("modules-context-attention")?;
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
     let inventory = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight, |_| {
-        // Load the TP2 native module set inside the measured baseline on both
-        // layouts: `Waves::start` would otherwise load it after admission, where
-        // its module images are an uncharged owner.
-        library.tp2_native_initialize()?;
         if RANKS == 2 {
             library.peer_exchange_initialize()?;
             library.peer_abort_initialize()?;
@@ -426,14 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn native_modules_load_inside_the_measured_baseline_on_every_layout() {
+    fn native_modules_load_inside_the_shared_measured_baseline() {
+        assert!(include_str!("../../shared/inventory.rs").contains("library.tp2_native_initialize()"));
         let source = include_str!("startup.rs");
         let measured = source.split("RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight")
             .nth(1).unwrap().split("let lane_layouts").next().unwrap();
-        let native = measured.find("library.tp2_native_initialize()?").unwrap();
-        let peer = measured.find("if RANKS == 2 {").unwrap();
-        assert!(native < peer, "Spark intake native modules must be sampled on one rank too");
-        assert_eq!(measured.matches("library.tp2_native_initialize()?").count(), 1);
+        assert!(!measured.contains("tp2_native_initialize"),
+            "the shared inventory preloads native modules; a family copy would load them twice");
     }
 
     fn projection(stem:&str)->CoreProjection {
