@@ -709,6 +709,27 @@ def install_bookkeeping_pauses() -> None:
     sys.meta_path.insert(0, Finder())
 
 
+# caller file -> files of modules it imported through importlib.import_module
+DYNAMIC_IMPORTS: dict[str, set[str]] = {}
+
+
+def install_dynamic_import_record() -> None:
+    import importlib
+    original = importlib.import_module
+    if getattr(original, "_export_cache_recorded", False):
+        return
+
+    def import_module(name, package=None):
+        module = original(name, package)
+        caller = sys._getframe(1).f_code.co_filename
+        filename = getattr(module, "__file__", None)
+        if isinstance(filename, str):
+            DYNAMIC_IMPORTS.setdefault(caller, set()).add(filename)
+        return module
+    import_module._export_cache_recorded = True
+    importlib.import_module = import_module
+
+
 def child_bootstrap() -> None:
     """sitecustomize: record this process's observations into READS_ENV/<pid>.json."""
     directory = os.environ.get(READS_ENV)
@@ -719,6 +740,7 @@ def child_bootstrap() -> None:
         return  # multiprocessing's tracker only unlinks semaphores
     import atexit
     recorder = Recorder(Roots(Path(root), os.environ.get(BUILD_ENV) or None)).install()
+    install_dynamic_import_record()
     pid = [os.getpid()]
     Path(directory, f"{pid[0]}.started").write_text("")
 
@@ -954,9 +976,8 @@ class Executed:
         return result
 
     def closure(self, path: str) -> frozenset:
-        if path not in self.closures:
-            self.closures[path] = frozenset(self._imports(path))
-        return self.closures[path]
+        # Not memoized across programs: dynamic imports keep accruing.
+        return frozenset(self._imports(path))
 
     def _module_file(self, name: str):
         parts = name.split(".")
@@ -1001,9 +1022,12 @@ class Executed:
                 add(module)
                 for alias in node.names:
                     add(module + "." + alias.name)
-        dynamic = ("import_module(" in text or "__import__(" in text or "def __getattr__" in text
-                   or "spec_from_file_location" in text)
-        if dynamic:
+        # Imports by computed name: every module this file's code ever imported
+        # through importlib.import_module (prelude or program; recorded by the
+        # wrapper installed at bootstrap). Lazy package __getattr__ resolves
+        # through it. Other dynamic loaders key the file's whole loaded package.
+        found.update(DYNAMIC_IMPORTS.get(path, ()))
+        if "__import__(" in text or "spec_from_file_location" in text or "exec(" in text:
             found.update(self._package_modules(path))
         return found
 
