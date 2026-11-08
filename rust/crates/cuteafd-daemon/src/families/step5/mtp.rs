@@ -280,10 +280,12 @@ impl<'a> StageOwner<'a> {
         metadata.extend(arena.planes(device, &sizes[4..],
             usize::try_from(native::mtp_scratch_core(rows, kv_format)?)? + stage * 256)?);
         let compact = if kv_format == Qwen4KvCache::Fp8 {
+            // The stage planes are views of the rank's sequential scratch arena, so
+            // the tag must describe that backing, not the predictor.
             Some(CompactKv::new(device, programs, rows, &[64],
                 native::mtp_compact_planes(rows, kv_format)?,
                 Some((arena, usize::try_from(native::mtp_compact_offset(rows)?)?)),
-                Tag::drafter_workspace("step5/mtp-stage"))?)
+                Tag::workspace("step5/sequential-scratch"))?)
         } else { None };
         Ok(Self { stream, input, attention, head, metadata, uploads, upload_done, compact, kv_format, stage, rows,
             cache_owner: std::cell::Cell::new(None) })
