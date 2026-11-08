@@ -15,6 +15,27 @@ fn installed_snapshot(repo: &str) -> Result<PathBuf> {
     Ok(snapshot)
 }
 
+fn assert_glm_draft_lifetimes(common: &[cuteafd_loader::placement::planner::Receipt],
+    family: &[cuteafd_loader::placement::planner::Receipt]) {
+    use cuteafd_loader::placement::planner::Lifetime;
+    assert_eq!(common.len(), family.len());
+    let mut immutable = 0;
+    let mut unchanged = 0;
+    for (before, after) in common.iter().zip(family) {
+        let mut expected = before.allocation.clone();
+        if expected.id.starts_with("glm/draft/") || expected.view.as_ref()
+            .is_some_and(|view| view.backing.starts_with("glm/draft/")) {
+            expected.lifetime = Lifetime::RESIDENT;
+            immutable += 1;
+        } else {
+            unchanged += 1;
+        }
+        assert_eq!(after.allocation, expected);
+        assert_eq!(after.address, before.address);
+    }
+    assert!(immutable > 1 && unchanged > 0, "prove both arena and nonweight chronology");
+}
+
 #[test]
 fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     use crate::shared::memory::{device::{Device, Stream}, weight_arena::DeviceWeightArena};
@@ -53,7 +74,7 @@ fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     let representation = GlmDraftRepresentation::Bf16Only;
     let requests = DflashDrafter::arena_requests(snapshot, representation, &[1], 0)?;
     // Deliberately outside the logical receipt prefix, as shared arena IDs are.
-    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("physical/draft/1", requests[&1].clone())?)?;
+    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("glm/draft/1", requests[&1].clone())?)?;
     let first = arena.view(&requests[&1][0].0, requests[&1][0].1)?.buffer;
     let stream = Stream::new(device)?;
     let mut bound = Vec::new();
@@ -84,7 +105,10 @@ fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     assert_eq!(uploads[0].allocation.location, Location::PINNED);
     assert_eq!(uploads[0].allocation.bytes, first.bytes as u64);
     assert_eq!(after.len(), before.len() + 1);
-    assert_eq!(after.iter().filter(|receipt| receipt.allocation.id == "physical/draft/1").count(), 1);
+    assert_eq!(after.iter().filter(|receipt| receipt.allocation.id == "glm/draft/1").count(), 1);
+    let drafter = crate::families::glm5::drafter::GlmDrafter::Local(drafter);
+    let family = drafter.allocation_receipts(devices, "draft")?;
+    assert_glm_draft_lifetimes(&after, &family);
     drop(drafter);
     stream.drain()?;
     fixture.finish_ordered_uploads(&library)?;
@@ -623,8 +647,11 @@ fn ml4_arena_requests_exactly_cover_real_loader_bindings() -> Result<()> {
     assert_arena_bindings(&planned, &requests, &bound);
     assert!(bound.iter().any(|(name, _, _)| name == "markov_norms"));
     drop(arena);
-    let receipts = drafter.allocation_receipts_with_lifetime(CoordinatorDevices::new(&[1])?,
-        "draft", cuteafd_loader::placement::planner::Lifetime::RESIDENT)?;
+    let devices = CoordinatorDevices::new(&[1])?;
+    let common = drafter.allocation_receipts(devices, "draft")?;
+    let drafter = crate::families::glm5::drafter::GlmDrafter::Local(drafter);
+    let receipts = drafter.allocation_receipts(devices, "draft")?;
+    assert_glm_draft_lifetimes(&common, &receipts);
     let backing = receipts.iter().filter(|receipt| receipt.allocation.id == planned.id()).collect::<Vec<_>>();
     assert_eq!(backing.len(), 1);
     assert_eq!(backing[0].allocation.bytes, planned.bytes() as u64);
