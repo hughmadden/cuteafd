@@ -39,6 +39,7 @@ pub use shared::expert_usage;
 mod cuda_runtime;
 pub mod host_isa;
 pub mod memory_ledger;
+mod observer_context;
 pub mod synchronized_load;
 pub mod push_ring;
 pub mod event_waiters;
@@ -2480,9 +2481,13 @@ impl NativeLibrary {
     /// Subtract non-reclaimable usage, not the min of available bytes and the budget:
     /// otherwise every successive owner would spend the same budget again.
     pub fn cuda_memory_info(&self) -> Result<(usize, usize)> {
-        let (free, total) = self.cuda_allocatable_memory_info()?;
-        let Some(budget) = coordinator_gpu_budget() else { return Ok((free, total)) };
         let device = self.cuda_get_device()?;
+        // Wait for the observer before sampling: its context must already be
+        // resident in these device-wide counters when we exclude it.
+        let observer = observer_context::bytes(device)?;
+        let (free, total) = self.cuda_allocatable_memory_info()?;
+        let (free, total) = observer_context::exclude(free, total, observer)?;
+        let Some(budget) = coordinator_gpu_budget() else { return Ok((free, total)) };
         let sample = cuteafd_core::serving_capacity::DeviceMemory {
             device: u32::try_from(device)?, total_bytes: total as u64, baseline_free_bytes: free as u64,
         };

@@ -3141,7 +3141,7 @@ def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(ent
             killed.append(True)
 
     def fake_popen(cmd, **kwargs):
-        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":1,"sampler_bytes":0,"corrected_bytes":1}]}\n')
+        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":2,"sampler_bytes":1,"corrected_bytes":1}]}\n')
         kwargs['stdout'].flush()
         return SlowSampler(kwargs['stdout'])
 
@@ -3793,3 +3793,44 @@ def test_spark_teardown_kills_all_before_reaping(entry, tmp_path, monkeypatch):
     assert [e[:2] for e in events[2:]] == [('reap', 0), ('reap', 1)]
     assert all(e[2] > 2 for e in events[2:])
     assert all(child.stdin.closed for child in children)
+
+
+def test_observer_context_handoff_is_measured_atomic_and_logical(entry, tmp_path):
+    entry.update(gpus=[1, 0], sparks=[], set={'SPARK_COUNT': '0'})
+    job = cards.generate(entry, 'candidate', dict(instance='observer-context', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'memory'}, None, 1)
+    dest = Path(job['state'])
+    handoff = Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json'
+    assert json.loads(handoff.read_text()) == {'pending': True}
+    samples = dest / 'memory.jsonl'
+    samples.write_text('{')
+    assert not cards.publish_observer_context(job)
+    assert json.loads(handoff.read_text()) == {'pending': True}
+    samples.write_text(json.dumps({'devices': [dict(gpu=0, sampler_bytes=234), dict(gpu=1, sampler_bytes=123)]}) + '\n')
+    assert cards.publish_observer_context(job)
+    assert json.loads(handoff.read_text()) == {'0': 123, '1': 234}
+    assert not handoff.with_suffix('.tmp').exists()
+    samples.write_text('{"devices":[{"gpu":1,"sampler_bytes":0}]}\n')
+    with pytest.raises(ValueError, match='invalid measured observer'):
+        cards.publish_observer_context(job)
+
+
+def test_launcher_mounts_and_declares_observer_for_coordinator_only(tmp_path):
+    profile = tmp_path / 'profile'
+    profile.mkdir()
+    (profile / 'observer-context.json').write_text('{"pending":true}\n')
+    source = (ROOT / 'scripts/launch/run-family.sh').read_text()
+    block = 'shared_profile_args() {\n' + source.split('shared_profile_args() {\n', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+    shell = f'source {ROOT}/scripts/lib/release-common.sh\n' + '''
+get() { case "$1" in PROFILE_DIR) printf '%s' "$TEST_PROFILE_DIR";; esac; }
+''' + block + '\nshared_profile_args\nprintf "%s\\0" "${profile_args[@]}"'
+    result = subprocess.run(['bash', '-c', shell], env={**os.environ, 'TEST_PROFILE_DIR': str(profile)}, capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    args = result.stdout.decode().split('\0')
+    assert f'{profile}:{profile}' in args
+    assert f'CUTEAFD_OBSERVER_CONTEXT_FILE={profile}/observer-context.json' in args
+    # Spark launchers call only release_profile_docker_args, never shared_profile_args.
+    shell = f'source {ROOT}/scripts/lib/release-common.sh\nrelease_profile_docker_args "" "$TEST_PROFILE_DIR" rhea\nprintf "%s\\0" "${{RELEASE_PROFILE_ARGS[@]}}"'
+    result = subprocess.run(['bash', '-c', shell], env={**os.environ, 'TEST_PROFILE_DIR': str(profile)}, capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    assert b'CUTEAFD_OBSERVER_CONTEXT_FILE' not in result.stdout
