@@ -143,20 +143,22 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     // The selected model owns caches only for its retained dSpark stages.
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
+    let mut pending_code = Vec::new();
     let gpus = layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
         .enumerate().map(|(gpu, device)| {
             // The GPU embedding is admitted inside rank 0's target arena, not sampled as loaded.
-            let loaded: u64 = device.items.iter().filter(|i| i.group == "context+modules")
-                .map(|i| i.bytes).sum();
+            let group = |name: &str| device.items.iter().filter(|i| i.group == name)
+                .map(|i| i.bytes).sum::<u64>();
             let budget = if gpu == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget };
-            (budget, Baseline::Measured { free_bytes: budget - loaded })
+            pending_code.push(group("loaded code"));
+            (budget, Baseline::Measured { free_bytes: budget - group("context+modules") })
         }).collect();
     // The planner's EXL3 arena from the same capacity manifests serve-dsv4 reads.
     let prefill = cli.engine.prefill_shape(manifest["capacities"]["prefill_rows"].as_u64().unwrap(), None)?;
     let max_rows = prefill.unit_rows.max(manifest["capacities"]["decode_rows"].as_u64().unwrap());
     let expert_workspace = layout_expert_workspace(case, &catalog, max_rows)?;
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
-        weights_resident: false, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
+        pending_code, weights_resident: false, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: tp1_available.then_some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
@@ -734,16 +736,34 @@ struct FixtureGpu {
 }
 
 impl FixtureGpu {
+    fn context_bytes(&self) -> u64 {
+        cuteafd_loader::placement::inventory::ArchContext::for_device(
+            "sm_120", self.total_bytes).context_bytes
+    }
     fn free_with_current_code(&self, code: u64) -> u64 {
         match (self.reserved_code_bytes, self.untracked_at_admission_bytes) {
             (Some(reserved), Some(untracked)) => {
-                let context = cuteafd_loader::placement::inventory::ArchContext::for_device(
-                    "sm_120", self.total_bytes).context_bytes;
+                let context = self.context_bytes();
                 self.admission_free_bytes.checked_add(reserved).unwrap()
                     .checked_sub(code.saturating_sub(untracked.saturating_sub(context))).unwrap()
             }
             (None, None) => self.admission_free_bytes,
             _ => panic!("fixture must record both pending-code inputs"),
+        }
+    }
+
+    /// The raw pre-weight sample and the code still pending: admission carries
+    /// them separately as the `context+modules` and `loaded code` owners
+    /// (#1614), where the recorded fixture stored only their net free bytes.
+    /// A fixture with no pending-code inputs keeps its raw sample and charges
+    /// no separate code owner.
+    fn sample_with_current_code(&self, code: u64) -> (u64, u64) {
+        match (self.reserved_code_bytes, self.untracked_at_admission_bytes) {
+            (Some(_), Some(untracked)) => {
+                let pending = code.saturating_sub(untracked.saturating_sub(self.context_bytes()));
+                (self.free_with_current_code(code).saturating_add(pending), pending)
+            }
+            _ => (self.free_with_current_code(code), 0),
         }
     }
 }
@@ -756,6 +776,13 @@ fn measured_fixture_replays_pending_code_without_changing_raw_sample() {
     assert_eq!(gpu.free_with_current_code(1_007_333_728), gpu.admission_free_bytes - 27_262_976);
     assert_eq!(gpu.free_with_current_code(0), gpu.admission_free_bytes + 967_770_976);
     assert_eq!(gpu.admission_free_bytes, 93_570_006_176);
+    // The split sample charges the same total: raw sample plus pending code.
+    for code in [980_070_752u64, 1_007_333_728, 0] {
+        let (raw, pending) = gpu.sample_with_current_code(code);
+        assert_eq!(raw, gpu.free_with_current_code(code).saturating_add(pending));
+    }
+    assert_eq!(gpu.sample_with_current_code(980_070_752),
+        (gpu.admission_free_bytes + 967_770_976, 967_770_976));
 }
 
 const MIB: u64 = 1 << 20;
@@ -801,14 +828,21 @@ fn planner_equals_runtime_deepseek_v4_measured() {
             assert!(supported, "{label}: planner refused: {:?} {:?}", layout.notes, hints);
             let catalog = shared.input.expert_catalog().unwrap();
             let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(&snapshot, 1).unwrap();
-            let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
-                cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
+            let arch = cuteafd_loader::placement::inventory::ArchContext::for_device(
+                "sm_120", cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES);
+            let family = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
+            let code = (0..fixture.rtx).map(|rank| cuteafd_loader::placement::inventory::loaded_code_allowance(
+                family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog),
+                fixture.rtx == 2, rank as u8, arch, None).bytes).collect::<Vec<u64>>();
             // Replay pending-code reservation, retaining the raw launch sample.
             for (gpu, measured) in fixture.gpus.iter().enumerate() {
                 let device = &layout.devices[gpu];
                 let planned_loaded: u64 = device.items.iter().filter(|i| matches!(i.category,
-                    Category::Weights | Category::Embedding | Category::Drafter) || i.group == "context+modules")
+                    Category::Weights | Category::Embedding | Category::Drafter)
+                    || i.group == "context+modules" || i.group == "loaded code")
                     .map(|i| i.bytes).sum();
+                // The fixture's stored sample nets out pending code; the charged
+                // total at ready is the raw occupancy plus that pending code.
                 let measured_loaded = measured.total_bytes - measured.free_with_current_code(code[gpu]);
                 let diff = planned_loaded as i64 - measured_loaded as i64;
                 eprintln!("{label} rtx{gpu}: planned loaded {planned_loaded} measured {measured_loaded} diff {diff} \
@@ -895,15 +929,22 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
     cli.prefix.resolve_entries(cli.engine.max_sequences);
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
-    let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(
-        cfg.dim, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog), fixture.rtx);
-    let gpus = fixture.gpus.iter().enumerate().map(|(gpu, g)| (g.total_bytes,
-        Baseline::Measured { free_bytes: g.free_with_current_code(code[gpu]) })).collect();
+    let arch = cuteafd_loader::placement::inventory::ArchContext::for_device(
+        "sm_120", cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES);
+    let code = (0..fixture.rtx).map(|rank| cuteafd_loader::placement::inventory::loaded_code_allowance(
+        family, cuteafd_loader::placement::families::deepseek_v4::code_experts(&catalog),
+        fixture.rtx == 2, rank as u8, arch, None).bytes).collect::<Vec<u64>>();
+    let mut pending_code = Vec::new();
+    let gpus = fixture.gpus.iter().enumerate().map(|(gpu, g)| {
+        let (free, pending) = g.sample_with_current_code(code[gpu]);
+        pending_code.push(pending);
+        (g.total_bytes, Baseline::Measured { free_bytes: free })
+    }).collect();
     let prefill = cli.engine.prefill_shape(manifest["capacities"]["prefill_rows"].as_u64().unwrap(), None)?;
     let max_rows = prefill.unit_rows.max(manifest["capacities"]["decode_rows"].as_u64().unwrap());
     let expert_workspace = layout_expert_workspace(case, &catalog, max_rows)?;
     let inputs = admission::Inputs { cfg: &cfg, catalog: &catalog, manifest: &manifest, family, gpus,
-        weights_resident: true, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
+        pending_code, weights_resident: true, cache_stages: stages, prefill_rows: prefill.unit_rows as usize,
         decode_rows: manifest["capacities"]["decode_rows"].as_u64().unwrap() as usize,
         max_context: case.context as usize, prefix: Some(&cli.prefix), expert_workspace: Some(expert_workspace),
         tp2_workspace: if case.rtx == 2 { cuteafd_loader::serving_capacity::deepseek_v4_tp2_workspace(
