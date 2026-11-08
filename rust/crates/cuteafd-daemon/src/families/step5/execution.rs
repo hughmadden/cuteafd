@@ -86,7 +86,7 @@ impl RankAdmission {
 
     pub(super) fn with_head(self, head: &super::head::HeadPlan) -> Result<Self> {
         Ok(Self {
-            immutable: self.immutable.checked_add(head.immutable_bytes())
+            immutable: self.immutable.checked_add(head.private_scratch_bytes()?)
                 .context("Step-5 native head weight overflow")?,
             workspace: self.workspace.max(head.workspace_bytes()),
         })
@@ -338,8 +338,13 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(matches!(count, 1 | 92), "Step-5 diagnostic layer count");
         ensure!(matches!(ownership.ranks(), 1 | 2), "Step-5 shared execution rank count");
         let plan = NativePlan::new(checkpoint, ownership, Rc::new(CoordinatorContract::from_checkpoint(checkpoint)?))?;
+        let arena = super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
+            rank as i32, count, false)?;
+        let bytes = arena.bytes() as u64;
+        let tail = cuteafd_loader::placement::planner::allocation_granularity_forecast(&[bytes])?;
         Self::rank_admission(programs, checkpoint, ownership, rank, rows, rows, count, &plan)?
-            .bytes()
+            .bytes()?.checked_add(bytes).and_then(|n| n.checked_add(tail))
+            .context("Step-5 diagnostic arena charge overflow")
     }
 
     /// Includes the vocabulary head on its owning rank. Call for every rank before
@@ -348,7 +353,15 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn serving_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, rank: usize, rows: usize, span: usize, logits: usize) -> Result<RankAdmission> {
         let plan = NativePlan::new(checkpoint, ownership, Rc::new(CoordinatorContract::from_checkpoint(checkpoint)?))?;
-        Self::serving_admission_with_plan(programs, checkpoint, ownership, rank, rows, span, logits, &plan)
+        let mut admission = Self::serving_admission_with_plan(programs, checkpoint, ownership, rank, rows, span, logits, &plan)?;
+        // Standalone goldens have no solved ledger reserving their target backing.
+        let arena = super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
+            rank as i32, 92, false)?;
+        let bytes = arena.bytes() as u64;
+        let tail = cuteafd_loader::placement::planner::allocation_granularity_forecast(&[bytes])?;
+        admission.immutable = admission.immutable.checked_add(bytes).and_then(|n| n.checked_add(tail))
+            .context("Step-5 standalone target backing overflow")?;
+        Ok(admission)
     }
 
     pub(super) fn serving_admission_with_plan(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -360,13 +373,8 @@ impl<'e, 'a> Execution<'e, 'a> {
             admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership,
                 &plan.layouts[rank])?)?
         } else { admission };
-        // The arena serve allocates for this rank: its inter-view padding is the
-        // one owner its payload owners do not already hold.
-        let entry = rank == usize::from(ownership.execution().spec().entry_gpu);
-        let padding = super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
-            rank as i32, 92, entry)?.padding_bytes() as u64;
-        Ok(RankAdmission { immutable: admission.immutable.checked_add(padding)
-            .context("Step-5 target arena padding overflow")?, ..admission })
+        // Weight arenas (including rotary and embedding) are separate solved owners.
+        Ok(admission)
     }
 
     fn rank_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -375,12 +383,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(matches!(count, 1 | 92) && rank < ownership.ranks(), "Step-5 native rank/layer admission");
         ensure!(rows as u64 <= ownership.execution().spec().rows, "Step-5 native row admission");
         let (contract, layout) = plan.layer(rank, 0)?;
-        let in_count = |name: &str| (0..count).any(|layer| name.starts_with(&format!("model.layers.{layer}.")));
-        let immutable = layout.operands.iter().filter(|w| in_count(&w.name))
-            .try_fold(contract.rope_tables.allocation_bytes, |n, w| n.checked_add(w.allocation_bytes))
-            .and_then(|n| layout.core.iter().filter(|(name, _)| in_count(name))
-                .try_fold(n, |n, (_, core)| n.checked_add(core.bytes as u64)))
-            .context("Step-5 native rank weight overflow")?;
+        let immutable = 0;
         // Plans validate every owned layer's ABI and shapes; the arena is one
         // attention region plus one FFN region shared by every FFN kind.
         let mut owned = false;
@@ -1659,12 +1662,10 @@ mod tests {
             theta: vec![], rotary: vec![], rope_scaling: None, scale_full: false,
             scale_sliding: false, activation: vec![], shared_activation: vec![] }
     }
-    /// Planner == runtime for packed weights: the planner's rank charge exceeds
-    /// its payload by exactly the padding of the arena serve allocates, the
-    /// predictor charge is exactly its arena, and the loader's rotary planes
-    /// are the views RotaryTables::load_with requests.
+    /// Planner == runtime: one served backing and one tail, with rotary and
+    /// embedding only in that backing and private head scratch kept outside it.
     #[test]
-    fn planned_arena_padding_equals_the_served_arenas() -> Result<()> {
+    fn planned_arena_charges_equal_the_served_arenas_and_single_tails() -> Result<()> {
         use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
         let fixture = tempfile::tempdir()?;
         testing::write_step5_exl3_snapshot(fixture.path());
@@ -1697,25 +1698,31 @@ mod tests {
                 }
                 let admitted = cuteafd_loader::plan::families::step5::native::rank_admission_for_layout(
                     &contract, &cfg, layout, &ownership, rank, 64, 64, 1)?;
-                // Payload the rank charges under immutable: target owners (not the
-                // embedding, which its own owner charges) and the rotary planes.
-                let payload = admitted.resident_weights.0 + contract.rope_tables.allocation_bytes;
                 let head = rank == usize::from(ownership.execution().spec().head_gpu);
                 let head_scratch = if head { layout.core.get("lm_head.weight").map(|core|
                     cuteafd_loader::formats::head::native_private_scratch(core.shape, 64)?.bytes())
                     .transpose()?.unwrap_or(0) as u64 } else { 0 };
-                assert_eq!(admitted.immutable - payload - head_scratch, served.padding_bytes() as u64,
-                    "ranks {ranks} rank {rank}: planner padding differs from the served arena");
+                assert_eq!(admitted.immutable, head_scratch);
+                assert_eq!(admitted.weight_arenas[0].0, served);
+                let components = cuteafd_loader::placement::planner::weight_arena_components(
+                    &served, cuteafd_loader::placement::planner::Location::coordinator(rank as u8),
+                    cuteafd_loader::placement::planner::Lifetime::RESIDENT, 1)?;
+                let charge = components.iter().filter(|component| !matches!(component.kind,
+                    cuteafd_loader::placement::planner::ComponentKind::ResidentWeight(_)))
+                    .map(|component| component.bytes.at(1)).collect::<Result<Vec<_>, _>>()?
+                    .into_iter().sum::<u64>();
+                assert_eq!(charge, (served.bytes() as u64).div_ceil(2 << 20) * (2 << 20));
                 let embedding = layout.operands.iter().find(|o| o.name == "model.embed_tokens.weight")
                     .map_or(0, |o| o.allocation_bytes);
                 assert_eq!(served.payload_bytes() as u64, admitted.resident_weights.0 + contract.rope_tables.allocation_bytes
                     + if entry { embedding } else { 0 }, "ranks {ranks} rank {rank}: served payload owners");
+                assert_eq!(admitted.weight_arenas[0].1.0, admitted.resident_weights.0 + if entry { embedding } else { 0 });
             }
         }
         for depth in 1..=cfg.mtp {
             let layout = RankWeightLayout::mtp_from_contract(&checkpoint, &contract, depth)?;
             assert_eq!(RankWeightLayout::mtp_weight_charge(&checkpoint, &contract, depth)?,
-                layout.mtp_arena(0)?.bytes() as u64, "predictor depth {depth}");
+                (layout.mtp_arena(0)?.bytes() as u64).div_ceil(2 << 20) * (2 << 20), "predictor depth {depth}");
         }
         Ok(())
     }
@@ -1779,7 +1786,12 @@ mod tests {
                         }
                         let reused = cuteafd_loader::plan::families::step5::native::rank_admission_for_layout(
                             &plan.contract, &cfg, &plan.layouts[rank], &ownership, rank, 64, 64, 1)?;
-                        assert!(reused.immutable > 0 && reused.workspace > 0);
+                        assert!(reused.workspace > 0);
+                        assert_eq!(reused.weight_arenas.len(), 1);
+                        assert!(reused.weight_arenas[0].0.bytes() > 0);
+                        if rank != usize::from(ownership.execution().spec().head_gpu) {
+                            assert_eq!(reused.immutable, 0);
+                        }
                     }
                 }
                 for stage in 0..3 {
@@ -2086,13 +2098,15 @@ mod admission_tests {
     }
 
     #[test]
-    fn final_head_weights_and_private_blas_workspace_are_included() -> Result<()> {
+    fn final_head_only_adds_private_scratch_and_reuses_workspace() -> Result<()> {
         let head = super::super::head::tests::admission_plan(64);
         let base = RankAdmission { immutable: 1000, workspace: 2000 };
         let plan = base.with_head(&head)?;
-        assert_eq!(plan.bytes()?, base.immutable + head.immutable_bytes() + head.workspace_bytes());
+        assert_eq!(head.private_scratch_bytes()?, 0);
+        assert_eq!(plan.immutable, base.immutable);
+        assert_eq!(plan.bytes()?, base.immutable + head.workspace_bytes());
         assert!(plan.check(plan.bytes()? - 1, &[]).is_err());
-        assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head).is_err());
+        assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head)?.bytes().is_err());
         assert_eq!(RankAdmission { immutable: 0, workspace: u64::MAX }.with_head(&head)?.workspace, u64::MAX);
         Ok(())
     }
