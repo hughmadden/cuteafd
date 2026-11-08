@@ -1252,10 +1252,15 @@ fn graph_row(fingerprint: &str, keys: usize) -> Option<GraphRow> {
         // Unit fixtures build plans on synthetic geometries no census covers.
         // Production startup never enables this; see `allow_synthetic_graphs`.
         if SYNTHETIC_GRAPHS.with(std::cell::Cell::get) {
-            let bytes = keys as u64 * (2 << 20);
+            // Size a synthetic geometry the way a census of it would: the
+            // largest measured per-key rate above (3,720,347,648 B over 15,336
+            // keys, the ML4 two-rank census), rounded up to 256 KiB per key. A
+            // flat 2 MiB per declared graph overstated a 15.5k-key ML4 plan by
+            // 26.6 GiB and turned its witness plan into a capacity refusal.
+            let bytes = keys as u64 * (256 << 10);
             return Some(GraphRow { bytes, basis: Basis::Estimated, stale_pin: None,
                 figure: MemoryFigure { bytes,
-                    attribution: FigureAttribution::Estimated { derivation: "2 MiB per declared graph" },
+                    attribution: FigureAttribution::Estimated { derivation: "256 KiB per declared graph (largest measured per-key rate)" },
                     evidence: "synthetic unit fixture", producing_commit: "test",
                     identity: FigureIdentity { declared_graphs: "", programs_sha256: CENSUS_PROGRAMS,
                         native_sha256: CENSUS_NATIVE, toolchain: CENSUS_TOOLCHAIN,
