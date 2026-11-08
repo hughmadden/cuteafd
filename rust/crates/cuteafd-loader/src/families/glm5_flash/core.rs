@@ -519,12 +519,12 @@ mod tests {
             assert!(report.executable(), "{}", crate::plan::render(&report));
             let layout = report.memory_layout.as_ref().unwrap();
             assert!(layout.devices.iter().take(gpus).all(|d| d.items.iter().any(|i| i.group == "native K6 core")));
-            let representation = super::resident::GlmfRepresentation {
+            let representation = crate::families::glm5_flash::resident::GlmfRepresentation {
                 kda_fp8: false, output_shard: false, fp8_head: false,
             };
             let embedding = input.checkpoint().tensors.iter().find(|tensor|
                 tensor.meta.name == "model.language_model.embed_tokens.weight").unwrap().meta.byte_length;
-            let targets = super::weight_layout::target_options(input.checkpoint(), &cfg,
+            let targets = crate::families::glm5_flash::weight_layout::target_options(input.checkpoint(), &cfg,
                 &vec![crate::placement::LayerMode::HeadSplit; cfg.layers], gpus, representation, embedding, None)?;
             let mut draft_owners = crate::placement::families::glm5_flash::admission::ProcessOwners::new(
                 (128 << 30, 128 << 30), 0);
