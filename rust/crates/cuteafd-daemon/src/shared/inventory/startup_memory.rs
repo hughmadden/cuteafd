@@ -376,11 +376,13 @@ mod tests {
         fixture.strict_device_free(&library, true)?;
         let ids = [0, 1];
         let devices = CoordinatorDevices::new(&ids)?;
-        let arena = |rank, id, tensors| DeviceWeightArena::new(Device { library: &library, id: rank },
-            WeightArenaLayout::new(id, tensors)?);
-        let target0 = arena(0, "step5/target/0", vec![("target".into(), 257), ("embedding.table".into(), 64)])?;
-        let target1 = arena(1, "step5/target/1", vec![("target".into(), 258)])?;
-        let mtp = arena(0, "step5/mtp/0", vec![("mtp".into(), 259)])?;
+        use cuteafd_core::memory_layout::ArenaTag;
+        let arena = |rank, id, tensors, tag| DeviceWeightArena::new(Device { library: &library, id: rank },
+            WeightArenaLayout::new(id, tensors)?, tag);
+        let target0 = arena(0, "step5/target/0", vec![("target".into(), 257), ("embedding.table".into(), 64)],
+            ArenaTag::weights("step5/target"))?;
+        let target1 = arena(1, "step5/target/1", vec![("target".into(), 258)], ArenaTag::weights("step5/target"))?;
+        let mtp = arena(0, "step5/mtp/0", vec![("mtp".into(), 259)], ArenaTag::drafter_weights("step5/mtp"))?;
         let table = root.path().join("embedding.bin");
         std::fs::write(&table, [0; 64])?;
         let (embedding, ()) = TokenEmbedding::load_with(&library, EmbedSource { path: table,
