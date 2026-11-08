@@ -10,6 +10,22 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+pub(crate) fn register_inputs(matches: &clap::ArgMatches, policy: &cuteafd_core::memory_policy::MemoryPolicy, weight_budget: Option<f64>) {
+    let mut inputs = serde_json::to_value(policy).unwrap_or(Value::Null).as_object().cloned().unwrap_or_default();
+    inputs.insert("coordinator_weight_budget_gib".into(), json!(weight_budget.unwrap_or(80.0)));
+    // Allowlist only numeric/enum reservation inputs; never arbitrary arguments,
+    // paths, credentials, prompts, or an environment dump.
+    if let Some((_, args)) = matches.subcommand() {
+        for key in ["max_context_tokens", "max_sequences", "prefill_rows", "pool_tokens", "max_prefill_tokens",
+            "kv_page_tokens", "prefix_cache_bytes", "speculator", "speculation_depth"] {
+            if let Ok(Some(values)) = args.try_get_raw(key) {
+                inputs.insert(key.into(), json!(values.map(|v| v.to_string_lossy().into_owned()).collect::<Vec<_>>()));
+            }
+        }
+    }
+    memory_ledger::fault::set_inputs(Value::Object(inputs));
+}
+
 fn meminfo() -> Value {
     let Ok(text) = std::fs::read_to_string("/proc/meminfo") else { return Value::Null };
     let mut out = Map::new();
@@ -78,6 +94,12 @@ fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
 
 /// Logs a report from a helper thread (the caller's device selection is untouched).
 pub(crate) fn log(stage: &str) {
+    if stage == "ready" {
+        memory_ledger::fault::ready();
+        let summary = memory_ledger::fault::compact_summary(stage);
+        tracing::info!(target: "cuteafd::memory", "{summary}");
+        return;
+    }
     let stage = stage.to_owned();
     let value = std::thread::spawn(move || report(&stage)).join();
     if let Ok(value) = value {
@@ -90,6 +112,11 @@ pub(crate) fn log(stage: &str) {
 pub(crate) fn finish<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
     if let Err(error) = &result {
         let retained = error.chain().find_map(|cause| cause.downcast_ref::<memory_ledger::FailureSnapshot>());
+        if let Some(report) = retained.and_then(|failure| failure.report.as_ref()) {
+            tracing::error!(target: "cuteafd::memory", path = %report.path.display(), complete = report.complete,
+                error = %error, "retained memory failure dump\n{}", report.summary);
+            return result;
+        }
         let mut value = match retained {
             Some(failure) => report_snapshot("failure", &failure.ledger,
                 &|device| failure.device_memory.get(&device).copied()),

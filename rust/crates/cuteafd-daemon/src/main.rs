@@ -362,6 +362,13 @@ fn main() -> Result<()> {
         .init();
     tracing::info!("{host_isa}");
     tracing::info!("{malloc}");
+    let dump_dir = std::env::var_os("CUTEAFD_MEMORY_DUMP_DIR").map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("CUTEAFD_PROFILE_DIR").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let host = std::env::var("CUTEAFD_PROFILE_HOST").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
+    if let Err(error) = cuteafd_ffi::memory_ledger::fault::initialize(&dump_dir, &host, "coordinator") {
+        tracing::error!(%error, directory = %dump_dir.display(), "memory failure dump unavailable: cannot preopen spool");
+    }
     shared::memory_report::finish(
         tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run()))
 }
@@ -463,6 +470,7 @@ async fn run() -> Result<()> {
         tracing::info!(bytes = cap, "installed per-GPU memory cap; SM count and L2 unchanged");
     }
     policy.install().map_err(anyhow::Error::msg)?;
+    shared::memory_report::register_inputs(&matches, &policy, weight_budget_gib);
     // A serve command's resolved options, for the server's benchmark reports.
     commands::bench::capture(&matches, memory)?;
     // Memory ledger reports for the long-running roles (device use by category).
