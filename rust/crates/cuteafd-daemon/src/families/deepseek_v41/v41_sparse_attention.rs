@@ -344,6 +344,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let owner = unsafe { GraphOwner::new(self.storage.stream.library, device, graph, ())? };
         tracing::debug!(target: "cuteafd::graph_capture", site = "sparse_attention", device, layer,
             bank = self as *const Self as usize, key = ?fingerprint, "native binding graph captured");
+        self.graphs.census_capture_key("sparse_attention", device, None, &(layer, &fingerprint), graph);
         self.graphs.insert((layer, fingerprint), owner, None);
         Ok(())
     }

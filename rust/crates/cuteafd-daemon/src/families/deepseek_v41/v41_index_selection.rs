@@ -483,6 +483,7 @@ impl<'a> IndexSelectionWave<'a> {
         let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(self.storage.stream.library, device, graph, ())? };
         tracing::debug!(target: "cuteafd::graph_capture", site="index_selection", device,
             bank=self as *const Self as usize, key=?fingerprint, "native binding graph captured");
+        self.graphs.census_capture_key("index_selection", device, None, &fingerprint, graph);
         self.graphs.insert(fingerprint.clone(), owner, None);
         self.graph = Some((graph, fingerprint));
         Ok(())
