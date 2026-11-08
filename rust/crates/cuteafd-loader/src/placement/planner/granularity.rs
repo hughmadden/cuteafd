@@ -55,6 +55,22 @@ fn round(bytes: u64) -> Result<u64, Refusal> {
     bytes.div_ceil(PAGE).checked_mul(PAGE).ok_or(Refusal::Overflow("cudaMalloc backing"))
 }
 
+/// Requests above this size take their own driver block and round
+/// independently; smaller ones share blocks, so they are summed first.
+pub fn independent_request(bytes: u64) -> bool { bytes > SMALL }
+
+/// Smallest page count whose affine request (`pages * stride + page`) becomes
+/// an independent driver block. Callers price curves below it exactly and
+/// round above it, so the search never charges a block a request cannot take.
+pub fn first_independent_pages(stride: u64, page: u64) -> Result<u64, Refusal> {
+    let first = stride.checked_add(page).ok_or(Refusal::Overflow("cudaMalloc request"))?;
+    if independent_request(first) { return Ok(1); }
+    if stride == 0 {
+        return Err(Refusal::InvalidFact("flat cudaMalloc request has no independent pages".into()));
+    }
+    Ok(SMALL.saturating_sub(page) / stride + 1)
+}
+
 /// Physical bytes one device request of `bytes` commits on SM120: requests at
 /// or below the shared-block threshold cost their own bytes, larger ones each
 /// back their own 2 MiB-granular block (#1454 sizes-only forecast).
@@ -69,7 +85,7 @@ pub fn allocation_granularity_forecast(requests: &[u64]) -> Result<u64, Refusal>
     let requested = sum_requests(requests.iter().copied())?;
     let (mut large, mut small) = (0u64, 0u64);
     for &bytes in requests {
-        if bytes > SMALL {
+        if independent_request(bytes) {
             large = large.checked_add(round(bytes)?).ok_or(Refusal::Overflow("large cudaMalloc backing"))?;
         } else {
             small = small.checked_add(bytes).ok_or(Refusal::Overflow("small cudaMalloc backing"))?;
@@ -334,5 +350,19 @@ mod tests {
         }
         assert!(allocation_granularity_forecast(&[0]).is_err());
         assert!(allocation_granularity_forecast(&[u64::MAX]).is_err());
+    }
+
+    #[test]
+    fn page_threshold_matches_the_shared_block_boundary() {
+        for (stride, page) in [(41_984, 41_984), (33_792, 33_792), (8_448, 8_448), (4_096, 4_096)] {
+            let first = first_independent_pages(stride, page).unwrap();
+            let at = |pages: u64| pages * stride + page;
+            assert!(at(first) > SMALL, "{stride}/{page}");
+            assert!(first == 1 || at(first - 1) <= SMALL, "{stride}/{page}");
+        }
+        assert_eq!(first_independent_pages(0, 1 << 21).unwrap(), 1);
+        assert_eq!(first_independent_pages(1 << 21, 0).unwrap(), 1);
+        assert!(first_independent_pages(0, 0).is_err());
+        assert!(first_independent_pages(u64::MAX, 1).is_err());
     }
 }
