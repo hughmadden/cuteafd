@@ -447,6 +447,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             "Provide complete selected native weight extents.");
         return memory;
     }
+    if let Err(error) = recipe.arena_padding(cfg, &model.core) {
+        report.refuse_placement(format!("Kimi packed arena inventory refused: {error:#}"),
+            "Provide complete selected native weight extents.");
+        return memory;
+    }
     if let Err(error) = recipe.blas_owners(model.core.get_weight("language_model.lm_head").is_some()) {
         report.refuse_placement(format!("Kimi BLAS owners refused: {error}"), "Supply supported native head geometry.");
         return memory;

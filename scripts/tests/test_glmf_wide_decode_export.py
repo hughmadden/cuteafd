@@ -691,7 +691,7 @@ def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, na
     shared = (daemon / "shared/speculation/dflash.rs").read_text()
     assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Full, options.cache_format)' in startup
     assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Sliding4096, options.cache_format)' in startup
-    assert f'DflashDrafter::load_mla(device.library, programs, "{namespace}",' in admission
+    assert f'DflashDrafter::load_mla_with(device.library, programs, "{namespace}",' in admission
     assert "MlaDraft::load(programs, program_namespace," in shared
 
 

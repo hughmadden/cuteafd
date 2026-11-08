@@ -12,6 +12,19 @@ use crate::formats::dflash::MlaDraftRuntimeLayout;
 use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 
+pub const ARENA_PADDING_GROUP: &str = "kimi arena padding";
+
+pub fn arena_padding_owner(rank: usize, option: Option<usize>,
+    layout: &crate::serving_capacity::WeightArenaLayout, maximum: u64) -> Option<Component> {
+    let bytes = layout.padding_bytes() as u64;
+    if bytes == 0 { return None; }
+    let owner = Allocation::buffer(format!("{ARENA_PADDING_GROUP}.{rank}"), Location::coordinator(rank as u8),
+        bytes, Lifetime::RESIDENT, Category::Weights, ARENA_PADDING_GROUP);
+    let mut component = Component::allocation(owner, ByteCurve::fixed(bytes, maximum), false, maximum);
+    if let Some(option) = option { component.activation = Activation::choice(0, option); }
+    Some(component)
+}
+
 /// One shared decode/prefill endpoint per lane, using the same finite probe
 /// candidates as execution. Its GPU intake is separately owned by the lane.
 pub fn production_links(gpu: u8, ranks: usize, lanes: u64, prefill: PrefillShape,
@@ -486,6 +499,29 @@ impl KimiRecipe {
         let profiles = self.attention_profiles();
         let middle = self.attention.iter().filter(|mode| matches!(mode, LayerMode::Whole { .. })).count().div_ceil(2);
         profiles[if self.gpus == 2 && self.placement == AttentionPlacement::Layers { middle.min(2) } else { 0 }].clone()
+    }
+
+    /// The payload already has logical owners. Admit only exact inter-view padding,
+    /// not another copy of B; the unpacked granularity forecast is a separate port.
+    pub fn arena_padding(&mut self,
+        cfg: &crate::families::kimi_k3::config::KimiK3Config,
+        core: &crate::families::kimi_k3::core::CoreInventory) -> anyhow::Result<()> {
+        use crate::families::kimi_k3::weight_layout::{coordinator_arena, GlobalLayout, LayerLayout};
+        anyhow::ensure!(!self.fixed.iter().any(|owner| owner.group == ARENA_PADDING_GROUP)
+            && !self.owners.iter().any(|component| matches!(&component.kind,
+                ComponentKind::Allocation { template, .. } if template.group == ARENA_PADDING_GROUP)),
+            "Kimi arena padding supplied twice");
+        let globals = GlobalLayout::ranks_with_core(cfg, core, self.gpus)?;
+        let profiled = self.gpus == 2 && self.placement == AttentionPlacement::Layers;
+        for (option, modes) in self.attention_profiles().iter().enumerate() {
+            let layers = modes.iter().enumerate().map(|(layer, &mode)|
+                LayerLayout::ranks_with_core(cfg, layer, mode, core, self.gpus)).collect::<anyhow::Result<Vec<_>>>()?;
+            for (rank, global) in globals.iter().enumerate() {
+                let layout = coordinator_arena(rank, global, &layers.iter().map(|pair| &pair[rank]).collect::<Vec<_>>())?;
+                self.owners.extend(arena_padding_owner(rank, profiled.then_some(option), &layout, self.maximum_pages));
+            }
+        }
+        Ok(())
     }
 
     /// Price actual weight cudaMalloc requests, not aggregate layer demands.

@@ -17,42 +17,9 @@ const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 const SINGLE: ExecutorModes = ExecutorModes { family: "kimi_k3", modes: &[WHOLE],
     hops: false, attention: AttentionPlacement::Layers };
 const DRAFT_MARKS: &str = "Kimi exact draft windows";
-const ARENA_PADDING: &str = "kimi arena padding";
-
-fn padding_owner(rank: usize, option: Option<usize>,
-    layout: &cuteafd_loader::serving_capacity::WeightArenaLayout, maximum: u64)
-    -> Option<planner::Component> {
-    use planner::{Activation, Allocation, ByteCurve, Component, Lifetime, Location};
-    let bytes = layout.padding_bytes() as u64;
-    if bytes == 0 { return None; }
-    let owner = Allocation::buffer(format!("{ARENA_PADDING}.{rank}"), Location::coordinator(rank as u8),
-        bytes, Lifetime::RESIDENT, Category::Weights, ARENA_PADDING);
-    let mut component = Component::allocation(owner, ByteCurve::fixed(bytes, maximum), false, maximum);
-    if let Some(option) = option { component.activation = Activation::choice(0, option); }
-    Some(component)
-}
-
-/// The payload already has logical owners. Admit only exact inter-view padding,
-/// not another copy of B; the unpacked granularity forecast is a separate port.
-fn arena_padding(recipe: &mut families::kimi::KimiRecipe, cfg: &KimiK3Config,
-    core: &cuteafd_loader::families::kimi_k3::core::CoreInventory) -> Result<()> {
-    use cuteafd_loader::families::kimi_k3::weight_layout::{coordinator_arena, GlobalLayout, LayerLayout};
-    ensure!(!recipe.fixed.iter().any(|owner| owner.group == ARENA_PADDING)
-        && !recipe.owners.iter().any(|component| matches!(&component.kind,
-            planner::ComponentKind::Allocation { template, .. } if template.group == ARENA_PADDING)),
-        "Kimi arena padding supplied twice");
-    let globals = GlobalLayout::ranks_with_core(cfg, core, recipe.gpus)?;
-    let profiled = recipe.gpus == 2 && recipe.placement == AttentionPlacement::Layers;
-    for (option, modes) in recipe.attention_profiles().iter().enumerate() {
-        let layers = modes.iter().enumerate().map(|(layer, &mode)|
-            LayerLayout::ranks_with_core(cfg, layer, mode, core, recipe.gpus)).collect::<Result<Vec<_>>>()?;
-        for (rank, global) in globals.iter().enumerate() {
-            let layout = coordinator_arena(rank, global, &layers.iter().map(|pair| &pair[rank]).collect::<Vec<_>>())?;
-            recipe.owners.extend(padding_owner(rank, profiled.then_some(option), &layout, recipe.maximum_pages));
-        }
-    }
-    Ok(())
-}
+use cuteafd_loader::placement::families::kimi::ARENA_PADDING_GROUP as ARENA_PADDING;
+#[cfg(test)]
+use cuteafd_loader::placement::families::kimi::arena_padding_owner as padding_owner;
 
 fn reconcile_arena(rank: usize, layout: &cuteafd_loader::serving_capacity::WeightArenaLayout,
     items: &[cuteafd_core::memory_layout::Item]) -> Result<()> {
@@ -853,7 +820,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         fixed, owners: Vec::new(),
     };
     recipe.allocation_granularity(cfg, &core)?;
-    arena_padding(&mut recipe, cfg, &core)?;
+    recipe.arena_padding(cfg, &core)?;
     recipe.blas_owners(core.get_weight("language_model.lm_head").is_some())?;
     let modes = recipe.resolved_attention();
     let prepared_graph_set = (graph_reserve && (RANKS != 2 || placement_mode != AttentionPlacement::Layers)).then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
@@ -2022,6 +1989,22 @@ pub(super) mod tests {
         assert_eq!(devices.len(), 1);
         let planned = devices[0];
         assert_eq!(planned.index, 0);
+        use cuteafd_loader::families::kimi_k3::weight_layout;
+        let global = weight_layout::GlobalLayout::ranks_with_core(&cfg, &Default::default(), 1)?;
+        let layers = (0..cfg.layers).map(|layer|
+            weight_layout::LayerLayout::ranks_with_core(&cfg, layer, WHOLE, &Default::default(), 1))
+            .collect::<Result<Vec<_>>>()?;
+        let arena = weight_layout::coordinator_arena(0,
+            &global[0], &layers.iter().map(|pair| &pair[0]).collect::<Vec<_>>())?;
+        // Each of the 69 whole KDA A_log views is 384 bytes, then aligns to 512.
+        assert_eq!(arena.padding_bytes(), cfg.kda_layers() * 128);
+        assert_eq!(arena.padding_bytes(), 8832);
+        for items in [&planned.items, &admitted.placement.items[0]] {
+            let padding = items.iter().filter(|item| item.group == ARENA_PADDING).collect::<Vec<_>>();
+            assert_eq!(padding.len(), 1);
+            assert_eq!(padding[0].bytes, arena.padding_bytes() as u64);
+            reconcile_arena(0, &arena, items)?;
+        }
         let runtime_bytes = admitted.placement.items[0].iter().map(|item| item.bytes).sum::<u64>();
         // The plan's named-reserve item (absent at the default 0) is the runtime's kept-free bytes.
         assert_eq!(planned.used_bytes(), runtime_bytes + cuteafd_loader::placement::reserve::gpu("kimi_k3"));
