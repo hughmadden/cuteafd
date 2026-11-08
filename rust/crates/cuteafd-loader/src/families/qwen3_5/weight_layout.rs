@@ -179,7 +179,7 @@ pub fn mtp_arena(checkpoint: &Checkpoint, cfg: &Qwen35Config, format: DenseForma
         requests.push((name, usize::try_from(tensor.byte_length)?.max(256)));
     }
     let layout = WeightArenaLayout::new("qwen3_5/mtp/gpu0", requests)?;
-    let admitted = crate::placement::families::qwen3_5::DrafterBytes::native_mtp(checkpoint, cfg)?;
+    let admitted = crate::placement::families::qwen3_5::DrafterBytes::native_mtp_payload(checkpoint, cfg)?;
     ensure!(layout.payload_bytes() as u64 == admitted.weights.0, "dense MTP layout differs from admitted payload");
     Ok(layout)
 }
