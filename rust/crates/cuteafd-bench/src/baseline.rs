@@ -47,7 +47,7 @@ pub fn estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     let decode = 3.0 * rates.seconds(60.0, DECODE_TOKENS as f64);
     let prefill = rates.seconds(PREFILL_TOKENS as f64 + 1600.0, 4.0);
     let fidelity = 4096.0 / rates.decode_tok_s + 24000.0 / rates.prefill_tok_s + 8.0 * 0.15;
-    let cache = rates.seconds(6.0 * CACHE_PROMPT_TOKENS as f64, 30.0);
+    let cache = rates.seconds(6.0 * cache_prompt_tokens(cache_minimum_tokens(info)) as f64, 30.0);
     let spec = rates.seconds(200.0, 2.0 * 128.0 * 1.6);
     let template = rates.seconds(400.0, 400.0);
     let c4 = rates.seconds(500.0, 2.0 * 64.0);
@@ -368,7 +368,8 @@ fn cache_exact_with(client: &Client, info: &ServerInfo, check: &mut Check, fixtu
     let body = |text: &str, n| cache_body(client, text, n, fixture);
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
-    let (text, turn_text) = cache_prompts();
+    let minimum = cache_minimum_tokens(info);
+    let (text, turn_text) = cache_prompts(minimum);
     let first = request(body(&text, 2), rows(2))?;
     if !honoured(&first) {
         unsupported(check);
@@ -376,8 +377,7 @@ fn cache_exact_with(client: &Client, info: &ServerInfo, check: &mut Check, fixtu
     }
     if let Some(fixture) = fixture { cache_bound(&first, fixture)?; }
     let restored = request(body(&text, 2), rows(2))?;
-    let minimum = cache_minimum_tokens(info);
-    check.set("prompt_reference_tokens", CACHE_PROMPT_TOKENS as u64);
+    check.set("prompt_reference_tokens", cache_prompt_tokens(minimum) as u64);
     check.set("minimum_prompt_tokens", minimum as u64);
     check.set("prompt_tokens", restored.prompt_ids.len() as u64);
     if !cache_coverage(check, "prompt", restored.prompt_ids.len(), minimum) { return Ok(()); }
@@ -446,7 +446,7 @@ fn cache_bound(record: &ProbeRecord, fixture: &Value) -> Result<()> {
 /// hits above only decode and cannot catch a leaked prefill staging-reuse flag.
 fn cache_continuation(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> Result<()> {
     let client = run.client;
-    let text = format!("[{}] Read these notes.\n\n{}", nonce(), corpus(73, CACHE_PROMPT_TOKENS));
+    let text = format!("[{}] Read these notes.\n\n{}", nonce(), corpus(73, cache_prompt_tokens(minimum)));
     let discovery = probed(client, plain(client, &text, 1), ProbeSpec {
         no_speculation: true, record_rows: 1, ..ProbeSpec::default() })?;
     if !cache_coverage(check, "continuation seed", discovery.prompt_ids.len(), minimum) { return Ok(()); }
@@ -527,12 +527,19 @@ fn continuation_rows(warm: &ProbeRecord, cold: &ProbeRecord) -> Result<Value> {
 
 // Leave room for model/reference tokenizer differences above three 2752-row units.
 const CACHE_PROMPT_TOKENS: usize = 10240;
+/// Three units of the default 2752-row prefill.
+const CACHE_DEFAULT_MINIMUM: usize = 3 * 2752;
+
+/// Reference tokens that clear `minimum` model tokens by the same margin as the default.
+fn cache_prompt_tokens(minimum: usize) -> usize {
+    CACHE_PROMPT_TOKENS + minimum.saturating_sub(CACHE_DEFAULT_MINIMUM)
+}
 
 fn cache_minimum_tokens(info: &ServerInfo) -> usize {
     let positive = |name| info.setting(name).and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0);
     // Qwen's explicit unit override takes precedence over its span-sized prefill-rows.
     positive("prefill-units").or_else(|| positive("prefill-rows"))
-        .map_or(8256, |rows| rows.saturating_mul(3))
+        .map_or(CACHE_DEFAULT_MINIMUM, |rows| rows.saturating_mul(3))
 }
 
 fn cache_coverage(check: &mut Check, name: &str, actual: usize, minimum: usize) -> bool {
@@ -542,10 +549,11 @@ fn cache_coverage(check: &mut Check, name: &str, actual: usize, minimum: usize) 
     false
 }
 
-fn cache_prompts() -> (String, String) {
-    (format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, CACHE_PROMPT_TOKENS)),
+fn cache_prompts(minimum: usize) -> (String, String) {
+    let tokens = cache_prompt_tokens(minimum);
+    (format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, tokens)),
         format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
-            nonce(), corpus(57, CACHE_PROMPT_TOKENS)))
+            nonce(), corpus(57, tokens)))
 }
 
 /// Generated tokens of the turn-end case's turn.
@@ -1219,12 +1227,17 @@ mod tests {
 
     #[test]
     fn cache_prompts_cover_three_largest_prefill_units() {
-        assert!(CACHE_PROMPT_TOKENS >= 3 * 2752);
-        let (prompt, turn) = cache_prompts();
-        for (text, seed) in [(prompt, 31), (turn, 57)] {
-            let body = corpus(seed, CACHE_PROMPT_TOKENS);
-            assert!(text.contains(&body));
-            assert!(body.len() > corpus(seed, 3 * 2752).len());
+        assert_eq!(cache_prompt_tokens(CACHE_DEFAULT_MINIMUM), CACHE_PROMPT_TOKENS);
+        // 4096-row units (V4, Qwen) need 12288 model tokens; 10240 reference tokens gave 10173.
+        for minimum in [CACHE_DEFAULT_MINIMUM, 3 * 4096] {
+            let tokens = cache_prompt_tokens(minimum);
+            assert_eq!(tokens - minimum, CACHE_PROMPT_TOKENS - CACHE_DEFAULT_MINIMUM);
+            let (prompt, turn) = cache_prompts(minimum);
+            for (text, seed) in [(prompt, 31), (turn, 57)] {
+                let body = corpus(seed, tokens);
+                assert!(text.contains(&body));
+                assert!(body.len() > corpus(seed, minimum).len());
+            }
         }
     }
 

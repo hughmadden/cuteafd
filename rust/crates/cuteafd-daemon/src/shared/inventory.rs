@@ -336,7 +336,7 @@ impl<'a> StartupMemoryPhases<'a> {
 
     pub(crate) fn sample_layer(&mut self, layer: usize, layers: usize) -> Result<()> {
         if self.enabled && sampled_startup_layer(layer, layers) {
-            self.sample(&format!("weights-core-layer-{layer}-recorded"))?;
+            self.sample(&format!("weights-core-layer-{layer}-upload-staging-recorded"))?;
         }
         Ok(())
     }

@@ -94,6 +94,16 @@ pub(crate) fn layer_digests(library: &NativeLibrary, prefix: &str, weights: &Lay
         out.insert(format!("{prefix}.{name}"), digest(library, allocation)?);
     }
     for (name, core) in &weights.core { core_digests(library, &format!("{prefix}.{name}"), core, out)?; }
+    for (name, native) in &weights.native {
+        for (part, allocation) in [("values", Some(&native.values)), ("scales", native.scales.as_ref())] {
+            if let Some(allocation) = allocation {
+                let mut bytes = vec![0u8; allocation.buffer.bytes];
+                Device { library, id: allocation.buffer.device_id }.run(||
+                    library.copy_d2h(&mut bytes, allocation.buffer))?;
+                out.insert(format!("{prefix}.{name}.{part}"), format!("{:x}", Sha256::digest(&bytes)));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -111,7 +121,40 @@ pub(crate) fn installed(snapshot: &std::path::Path) -> Result<Installed> {
     Ok(Installed { checkpoint, cfg, core })
 }
 
-/// Every golden operand through the coordinator loader, each owner on its GPU.
+// The standalone path is a test-only before-packing byte oracle, not a loader.
+fn baseline_operands<'a>(device: Device<'a>, operands: BTreeMap<&'static str, Vec<u8>>)
+    -> Result<BTreeMap<&'static str, Allocation<'a>>> {
+    operands.into_iter().map(|(name, bytes)| {
+        let owner = Allocation::new(device, bytes.len())?;
+        device.run(|| device.library.copy_h2d(owner.buffer, &bytes))?;
+        Ok((name, owner))
+    }).collect()
+}
+
+pub(crate) fn baseline_global<'a>(device: Device<'a>, layout: &GlobalLayout, packed: PackedGlobal)
+    -> Result<GlobalWeights<'a>> {
+    layout.check(&packed)?;
+    let operands = baseline_operands(device, packed.operands)?;
+    let core_head = packed.core_head.map(|head| layout.core_head.as_ref().unwrap().upload(device, head)).transpose()?;
+    Ok(GlobalWeights { operands, core_head })
+}
+
+fn baseline_layer<'a>(device: Device<'a>, layout: &LayerLayout, packed: PackedLayer)
+    -> Result<LayerWeights<'a>> {
+    layout.check(&packed)?;
+    let operands = baseline_operands(device, packed.operands)?;
+    let core = packed.core.into_iter().map(|(name, loaded)|
+        Ok((name, layout.core[name].upload(device, loaded)?))).collect::<Result<_>>()?;
+    let native = packed.native.into_iter().map(|(name, bytes)| device.run(|| {
+        let values = crate::shared::memory::DeviceAllocation::new(device.library, bytes.len())?;
+        device.library.copy_h2d(values.buffer, &bytes)?;
+        Ok((name, crate::shared::native_attention::NativeAttentionWeights {
+            layout: layout.native[name].clone(), values, scales: None }))
+    })).collect::<Result<_>>()?;
+    Ok(LayerWeights { operands, attention: packed.attention, core, native })
+}
+
+/// Every golden operand through the independent host packer, on its own GPU.
 pub(crate) fn mount(library: &NativeLibrary, model: &Installed, out: &mut Digests) -> Result<()> {
     mount_for_ranks(library, model, 2, out)
 }
@@ -128,14 +171,14 @@ fn mount_for_ranks(library: &NativeLibrary, model: &Installed, ranks: usize, out
     let read = |name: &str| read_tensor(&model.checkpoint, name);
     let globals = GlobalLayout::ranks_with_core(&model.cfg, &model.core, ranks)?;
     for (rank, layout) in globals.iter().enumerate() {
-        let weights = layout.upload(devices[rank], layout.pack(&model.cfg, read)?)?;
+        let weights = baseline_global(devices[rank], layout, layout.pack(&model.cfg, read)?)?;
         global_digests(library, rank, &weights, out)?;
     }
     for (layer, mode) in fixture_layers(&model.cfg, ranks)? {
         let layouts = LayerLayout::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks)?;
         let packed = PackedLayer::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks, read)?;
         for ((rank, packed), layout) in packed.into_iter().enumerate().zip(&layouts) {
-            let weights = LayerWeights::upload(devices[rank], packed, layout, layout.bytes()?)?;
+            let weights = baseline_layer(devices[rank], layout, packed)?;
             layer_digests(library, &format!("layers.{layer}.{}.{rank}", mode_tag(mode)), &weights, out)?;
         }
     }
@@ -172,15 +215,30 @@ fn recorded_for_ranks<'a>(library: &'a NativeLibrary, model: &Installed,
     load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, ranks: usize)
     -> Result<(Vec<(usize, GlobalWeights<'a>)>, Vec<(String, usize, LayerWeights<'a>)>)> {
     let devices = (0..ranks).map(|id| Device { library, id: id as i32 }).collect::<Vec<_>>();
-    let records = records::KimiRecords { checkpoint: &model.checkpoint, cfg: &model.cfg, core: &model.core, dense: load,
-        streams: devices.iter().map(|device| (device.id, std::ptr::null_mut())).collect() };
+    let mut records = records::KimiRecords::new(&model.checkpoint, &model.cfg, &model.core, load,
+        devices.iter().map(|device| (device.id, std::ptr::null_mut())).collect());
     let globals = GlobalLayout::ranks_with_core(&model.cfg, &model.core, ranks)?;
+    let selected = (0..model.cfg.layers).map(|layer| LayerLayout::ranks_with_core(&model.cfg, layer,
+        if ranks == 1 { LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner } } else { LayerMode::HeadSplit },
+        &model.core, ranks)).collect::<Result<Vec<_>>>()?;
+    records.arenas = devices.iter().enumerate().map(|(rank, &device)| {
+        let global = globals[rank].shared_layout();
+        let layers = selected.iter().map(|layouts| layouts[rank].shared_layout()).collect::<Vec<_>>();
+        let layout = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(
+            rank, &global, &layers.iter().collect::<Vec<_>>())?;
+        Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?))
+    }).collect::<Result<BTreeMap<_, _>>>()?.into();
     let mut global = Vec::new();
     for (rank, layout) in globals.iter().enumerate() { global.push((rank, records.global(devices[rank], layout)?)); }
     let mut layers = Vec::new();
     for (layer, mode) in fixture_layers(&model.cfg, ranks)? {
         let layouts = LayerLayout::ranks_with_core(&model.cfg, layer, mode, &model.core, ranks)?;
-        for (rank, weights) in records.layer_ranks(&devices, layer, &layouts)?.into_iter().enumerate() {
+        // Whole-MLA variants are independent golden scopes. The selected heads
+        // path exercises the same complete per-GPU arena as production.
+        let alternate = records::KimiRecords::new(&model.checkpoint, &model.cfg, &model.core, load,
+            records.streams.clone());
+        let target = if ranks == 1 || mode == LayerMode::HeadSplit { &records } else { &alternate };
+        for (rank, weights) in target.layer_ranks(&devices, layer, &layouts)?.into_iter().enumerate() {
             layers.push((format!("layers.{layer}.{}.{rank}", mode_tag(mode)), rank, weights));
         }
     }
@@ -250,7 +308,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
 /// head, layers 0..4 covering dense KDA, routed KDA and MLA) with patterned
 /// payloads, as a SparkNest namespace. Returns the scaled config and the core
 /// inventory from the shards' own headers.
-fn small_checkpoint(root: &std::path::Path) -> Result<(KimiK3Config, CoreInventory)> {
+fn small_checkpoint(root: &std::path::Path, native_fp8: bool) -> Result<(KimiK3Config, CoreInventory)> {
     use cuteafd_loader::{families::kimi_k3::core::{split, CoreProjection},
         formats::exl3_storage::{exl3_module, Exl3Codebook}, plan::testing::{t, Tensor}};
     let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
@@ -267,7 +325,18 @@ fn small_checkpoint(root: &std::path::Path) -> Result<(KimiK3Config, CoreInvento
         t(format!("{p}.norm.weight"), "BF16", &[h]), t(format!("{p}.output_attn_res_norm.weight"), "BF16", &[h]),
         t(format!("{p}.output_attn_res_proj.weight"), "BF16", &[1, h])];
     let mut core = Vec::<(String, [usize; 2], usize, Exl3Codebook)>::new();
+    let mut selected_native = BTreeMap::new();
     let mut native = |tensors: &mut Vec<Tensor>, stem: String, n: usize, k: usize, stored: usize, book: Exl3Codebook| {
+        if stem.ends_with(".q_b_proj") || stem == "language_model.model.layers.1.self_attn.o_proj" {
+            tensors.push(t(format!("{stem}.weight"), if native_fp8 { "F8_E4M3" } else { "BF16" }, &[n, k]));
+            if native_fp8 {
+                let suffix = if stem.ends_with("q_b_proj") { "weight_scale_inv" } else { "qscale_weight" };
+                tensors.push(t(format!("{stem}.{suffix}"), "F32", &[n.div_ceil(128), k.div_ceil(128)]));
+            }
+            selected_native.insert(stem.clone(), cuteafd_loader::formats::native_attention::NativeProjection {
+                shape: [n, k], fp8: native_fp8, split: split(&stem).expect("fixture native split") });
+            return;
+        }
         tensors.push(t(format!("{stem}.trellis"), "I16", &[k / 16, stored / 16, 96]));
         tensors.push(t(format!("{stem}.suh"), "F16", &[k]));
         tensors.push(t(format!("{stem}.svh"), "F16", &[stored]));
@@ -329,7 +398,9 @@ fn small_checkpoint(root: &std::path::Path) -> Result<(KimiK3Config, CoreInvento
     let checkpoint = Checkpoint::open(root)?;
     for tensor in &checkpoint.tensors {
         let meta = &tensor.meta;
-        let mut bytes: Vec<u8> = (0..meta.byte_length).map(|i| (i as u8).wrapping_mul(29) ^ (meta.name.len() as u8)).collect();
+        let mut bytes: Vec<u8> = (0..meta.byte_length).map(|i|
+            (i as u8).wrapping_mul(29) ^ ((i >> 8) as u8).wrapping_mul(17)
+                ^ ((i >> 16) as u8).wrapping_mul(11) ^ (meta.name.len() as u8)).collect();
         if let Some(book) = [Exl3Codebook::Mcg, Exl3Codebook::Mul1].into_iter().find(|b| meta.name.ends_with(&format!(".{}", b.marker()))) {
             bytes = book.multiplier().to_le_bytes().to_vec();
         } else if meta.name.ends_with(".A_log") {
@@ -337,7 +408,7 @@ fn small_checkpoint(root: &std::path::Path) -> Result<(KimiK3Config, CoreInvento
         }
         std::fs::File::options().write(true).open(root.join(&tensor.shard))?.write_all_at(&bytes, meta.byte_offset)?;
     }
-    let mut inventory = CoreInventory::default();
+    let mut inventory = CoreInventory { native: selected_native, ..Default::default() };
     for (stem, shape, stored, book) in core {
         let members = ["trellis", "suh", "svh", book.marker()].map(|s| checkpoint.tensors.iter()
             .find(|t| t.meta.name == format!("{stem}.{s}")).map(|t| (s, t.meta.clone())));
@@ -364,12 +435,12 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
     let library = fixture.load()?;
     for device in 0..2 { fixture.configure_memory(&library, device, 64 << 30)?; }
     let root = tempfile::tempdir_in(fixture.directory())?;
-    let (cfg, core) = small_checkpoint(root.path())?;
+    let (cfg, core) = small_checkpoint(root.path(), false)?;
     let checkpoint = Checkpoint::open(root.path())?;
     let model = Installed { checkpoint, cfg, core };
     let rejected = DenseLoad::push(&library);
-    let records = records::KimiRecords { checkpoint: &model.checkpoint, cfg: &model.cfg,
-        core: &model.core, dense: &rejected, streams: vec![(0, std::ptr::null_mut())] };
+    let records = records::KimiRecords::new(&model.checkpoint, &model.cfg,
+        &model.core, &rejected, vec![(0, std::ptr::null_mut())]);
     let device = Device { library: &library, id: 0 };
     let whole = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
     let mut invalid = LayerLayout::ranks_with_core(&model.cfg, 0, whole, &model.core, 1)?;
@@ -394,8 +465,10 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
             && (ranks == 2 || !expected.keys().any(|key| key.starts_with("global.1."))),
             "entry and terminal operands follow physical owners");
         ensure!(expected.keys().any(|k| k.ends_with("mla.uk")) && expected.keys().any(|k| k.contains("head.payload"))
-            && expected.keys().any(|k| k.ends_with("kda.a_log")) && expected.keys().any(|k| k.ends_with("ffn.down.payload")),
-            "fixture covers absorption, the K6 head, A_log and input-side K6");
+            && expected.keys().any(|k| k.ends_with("kda.a_log")) && expected.keys().any(|k| k.ends_with("ffn.down.payload"))
+            && expected.keys().any(|k| k.ends_with("mla.q_b.values"))
+            && expected.keys().any(|k| k.ends_with("kda.output.values")),
+            "fixture covers absorption, the K6 head, A_log, input-side K6 and native TP slices");
         // Mount fill of the records.
         let load = DenseLoad::mount(&library);
         let (global, layers) = recorded_for_ranks(&library, &model, &load, ranks)?;
@@ -443,5 +516,96 @@ fn recorded_k6_operands_match_the_host_packer_on_mount_and_push() -> Result<()> 
         ensure!(pushed == expected, "records by push differ: {:?}", pushed.iter().filter(|(k, v)| expected.get(*k) != Some(v))
             .map(|(k, _)| k).take(8).collect::<Vec<_>>());
     }
+    Ok(())
+}
+// Independent of attention_records, Rect, fp8_scale and the BF16 host packer.
+fn checkpoint_rectangle(checkpoint: &Checkpoint, name: &str, dtype: cuteafd_core::DType,
+    rows: std::ops::Range<usize>, cols: std::ops::Range<usize>, width: usize) -> Result<Vec<u8>> {
+    let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name)
+        .with_context(|| format!("oracle tensor missing: {name}"))?;
+    let header = &tensor.meta;
+    ensure!(header.dtype == dtype && header.shape.len() == 2 && rows.end <= header.shape[0]
+        && cols.end <= header.shape[1] && header.byte_length == (header.shape[0] * header.shape[1] * width) as u64,
+        "oracle rectangle outside checkpoint header: {name}");
+    let file = std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?;
+    let mut bytes = vec![0; rows.len() * cols.len() * width];
+    for (destination, row) in bytes.chunks_exact_mut(cols.len() * width).zip(rows) {
+        file.read_exact_at(destination, header.byte_offset + ((row * header.shape[1] + cols.start) * width) as u64)?;
+    }
+    Ok(bytes)
+}
+
+#[test]
+fn native_fp8_arena_bytes_match_checkpoint_tp_rectangles_on_mount_and_push() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{DenseLoad, Records};
+    use cuteafd_loader::formats::trellis_core::CoreSplit;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.immediate_copies(&library)?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 64 << 30)?; }
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (cfg, core) = small_checkpoint(root.path(), true)?;
+    let model = Installed { checkpoint: Checkpoint::open(root.path())?, cfg, core };
+    let marker = |path: &std::path::Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        // SAFETY: live, NUL-terminated path/name and the exact value slice.
+        let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        Ok(())
+    };
+    marker(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+    for entry in std::fs::read_dir(root.path())? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "safetensors") {
+            marker(&path, c"user.sparknest.hosts", b"coordinator")?;
+        }
+    }
+    for ranks in [1, 2] { for push in [false, true] {
+        let load = if push { DenseLoad::push(&library) } else { DenseLoad::mount(&library) };
+        let (globals, layers) = recorded_for_ranks(&library, &model, &load, ranks)?;
+        if push {
+            let records = load.sink.as_ref().context("native FP8 push sink")?.take_all();
+            let sockets = tempfile::tempdir()?;
+            for gpu in 0..ranks as i32 {
+                let mine = Records { operands: records.operands.iter().filter(|owner| owner.device == gpu).cloned().collect(),
+                    steps: records.steps.iter().filter(|step| step.device == gpu).cloned().collect(), ..Default::default() };
+                crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu },
+                    None, root.path(), sockets.path(), &mine, None, 0, gpu as usize)?;
+            }
+        } else { load.release(); }
+        let mut checked = std::collections::BTreeSet::new();
+        for (_, _, layer) in &layers { for native in layer.native.values() {
+            let layout = &native.layout;
+            assert!(layout.fp8);
+            let [n, k] = layout.shape;
+            let (row, col) = match layout.split {
+                CoreSplit::Output => (layout.rank * n, 0),
+                CoreSplit::Input => (0, layout.rank * k),
+                CoreSplit::Whole => (0, 0),
+            };
+            let suffix = if layout.stem.ends_with("q_b_proj") { "weight_scale_inv" } else { "qscale_weight" };
+            let expected = checkpoint_rectangle(&model.checkpoint, &format!("{}.weight", layout.stem),
+                cuteafd_core::DType::F8E4M3, row..row + n, col..col + k, 1)?;
+            let expected_scales = checkpoint_rectangle(&model.checkpoint, &format!("{}.{suffix}", layout.stem),
+                cuteafd_core::DType::F32, row / 128..(row + n) / 128, col / 128..(col + k) / 128, 4)?;
+            for (owner, expected) in [(&native.values, expected), (native.scales.as_ref().context("FP8 scales")?, expected_scales)] {
+                // The min-256 allocation tail is not initialized tensor data.
+                let mut actual = vec![0; expected.len()];
+                let buffer = cuteafd_ffi::CuteafdDeviceBuffer { bytes: actual.len(), ..owner.buffer };
+                Device { library: &library, id: buffer.device_id }.run(|| library.copy_d2h(&mut actual, buffer))?;
+                assert_eq!(actual, expected, "{} TP{ranks} rank{} push={push}", layout.stem, layout.rank);
+                let ids = [0, 1];
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(
+                    cuteafd_loader::placement::planner::CoordinatorDevices::new(&ids[..ranks])?, "native",
+                    cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+                    cuteafd_core::memory_layout::Category::Weights, "native attention");
+                owner.inventory(&mut inventory, "plane")?;
+                assert!(inventory.receipts.iter().any(|receipt| receipt.allocation.view.is_some()), "must be an arena view");
+            }
+            checked.insert(suffix);
+        }}
+        assert_eq!(checked.len(), 2);
+        drop((globals, layers));
+    }}
     Ok(())
 }

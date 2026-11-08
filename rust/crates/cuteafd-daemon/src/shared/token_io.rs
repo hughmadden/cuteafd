@@ -141,14 +141,13 @@ impl<'a> TokenEmbedding<'a> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::Lifetime;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
-            Lifetime::TARGET, Category::Weights, "embedding owners");
+            Lifetime::RESIDENT, Category::Weights, "embedding owners");
         match &self.table {
-            ResidentWeight::Device(owner) => inventory.device("table", owner.buffer)?,
+            ResidentWeight::Device(owner) => owner.inventory(&mut inventory, "table")?,
             ResidentWeight::Host { storage, .. } => inventory.pinned("table", storage.buffer)?,
         }
         if let Some(vocabulary) = &self.row_fp8 {
-            inventory.device("native.payload", vocabulary.embedding.payload())?;
-            inventory.device("native.scales", vocabulary.embedding.scales())?;
+            vocabulary.embedding.inventory(&mut inventory, "native")?;
         }
         Ok(inventory.receipts)
     }
@@ -158,6 +157,10 @@ impl<'a> TokenEmbedding<'a> {
         use cuteafd_loader::placement::planner::Lifetime;
         let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, prefix,
             Lifetime::RESIDENT, cuteafd_core::memory_layout::Category::Embedding, "token embedding");
+        if let ResidentWeight::Device(owner) = &self.table {
+            ensure!(owner.backing.as_ref().and_then(|allocation| allocation.weight_backing()).is_none(),
+                "arena-backed embedding requires allocation_receipts, not table_receipt");
+        }
         match &self.table {
             ResidentWeight::Device(owner) => inventory.device(name, owner.buffer)?,
             ResidentWeight::Host { storage, .. } => inventory.pinned(name, storage.buffer)?,
@@ -183,6 +186,17 @@ impl<'a> TokenEmbedding<'a> {
     /// recorded on the caller's thread instead, and filled before publication.
     pub fn load<T>(library: &'a NativeLibrary, source: EmbedSource, placement: EmbedPlacement,
         during: impl FnOnce() -> Result<T>) -> Result<(Self, T)> {
+        Self::load_with(library, source, placement, during, |_, bytes| {
+            crate::shared::memory::device::Allocation::new(crate::shared::memory::device::Device {
+                library, id: library.cuda_get_device()?,
+            }, bytes)
+        })
+    }
+
+    pub fn load_with<T>(library: &'a NativeLibrary, source: EmbedSource, placement: EmbedPlacement,
+        during: impl FnOnce() -> Result<T>,
+        mut allocate: impl FnMut(&str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>,
+    ) -> Result<(Self, T)> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("embedding");
         let file = std::fs::File::open(&source.path).with_context(|| format!("opening {}", source.path.display()))?;
         if placement == EmbedPlacement::Host {
@@ -195,7 +209,13 @@ impl<'a> TokenEmbedding<'a> {
             cuteafd_loader::placement::planner::EmbeddingHome::HostPinned
         } else { cuteafd_loader::placement::planner::EmbeddingHome::Device(0) };
         let request = source.allocation_request("embedding.table", home)?;
-        let mut table = ResidentWeight::new(library, usize::try_from(request.bytes)?, placement == EmbedPlacement::Host)?;
+        let mut table = if placement == EmbedPlacement::Host {
+            ResidentWeight::new(library, usize::try_from(request.bytes)?, true)?
+        } else {
+            let owner = allocate("embedding.table", usize::try_from(request.bytes)?)?;
+            ensure!(std::ptr::eq(owner.device.library, library), "embedding allocation library mismatch");
+            ResidentWeight::Device(DeviceAllocation::from_allocation(owner))
+        };
         let device = library.cuda_get_device()?;
         ensure!(table.buffer().bytes as u64 == request.bytes
             && table.is_host() == (placement == EmbedPlacement::Host)
@@ -232,13 +252,27 @@ impl<'a> TokenEmbedding<'a> {
     /// names the payload `embed_tokens.fp8`; its scales follow the owner).
     pub fn row_fp8(library: &'a NativeLibrary, source: EmbedSource,
         owner: std::rc::Rc<native::NativeVocabulary<'a>>) -> Result<Self> {
+        Self::row_fp8_with(library, source, owner, |_, bytes| {
+            crate::shared::memory::device::Allocation::new(crate::shared::memory::device::Device {
+                library, id: library.cuda_get_device()?,
+            }, bytes)
+        })
+    }
+
+    /// Vocabulary planes are loaded through `NativeVocabulary::load_prepared_with`;
+    /// this owner injects only its distinct embedding placeholder.
+    pub fn row_fp8_with(library: &'a NativeLibrary, source: EmbedSource,
+        owner: std::rc::Rc<native::NativeVocabulary<'a>>,
+        mut allocate: impl FnMut(&str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>) -> Result<Self> {
         let file = std::fs::File::open(&source.path).with_context(|| format!("opening {}", source.path.display()))?;
         ensure!(owner.embedding.payload().bytes == source.vocab * source.hidden
             && owner.embedding.scales().bytes == source.vocab * 4
             && owner.embedding.payload().device_id == owner.embedding.scales().device_id,
             "row-FP8 embedding payload/scales differ from [{}, {}] on one device", source.vocab, source.hidden);
         let request = EmbedSource::placeholder_request("embedding.table", 0)?;
-        let table = ResidentWeight::new(library, usize::try_from(request.bytes)?, false)?;
+        let allocation = allocate("embedding.table", usize::try_from(request.bytes)?)?;
+        ensure!(std::ptr::eq(allocation.device.library, library), "embedding allocation library mismatch");
+        let table = ResidentWeight::Device(DeviceAllocation::from_allocation(allocation));
         ensure!(table.buffer().bytes as u64 == request.bytes
             && table.buffer().device_id == library.cuda_get_device()? && !table.buffer().ptr.is_null(),
             "native embedding placeholder differs from request");
@@ -1272,6 +1306,32 @@ mod tests {
         };
         assert_eq!(read(&pushed)?, payload);
         assert_eq!(read(&mounted)?, payload);
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
+            crate::shared::memory::device::Device { library: &library, id: 0 },
+            cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/embedding",
+                [("embedding.table".into(), payload.len())])?)?;
+        let (packed, ()) = TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu,
+            || Ok(()), |name, bytes| arena.view(name, bytes))?;
+        let ((recorded, ()), packed_records) = dense::recording(||
+            TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu,
+                || Ok(()), |name, bytes| arena.view(name, bytes)))?;
+        assert_eq!(packed_records.operands[0].buffer.ptr, recorded.table.buffer().ptr);
+        dense::fill_records_by_mount(&library, &packed_records, |_| std::ptr::null_mut())?;
+        drop(arena);
+        assert_eq!(read(&packed)?, payload);
+        assert_eq!(read(&recorded)?, payload);
+        let physical = [0];
+        let receipts = packed.allocation_receipts(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?, "embedding")?;
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts.iter().all(|receipt| receipt.allocation.lifetime
+            == cuteafd_loader::placement::planner::Lifetime::RESIDENT));
+        assert_eq!(receipts[0].allocation.id, "test/embedding");
+        assert_eq!(receipts[1].allocation.view.as_ref().context("embedding view")?.backing, "test/embedding");
+        let error = packed.table_receipt(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?, "embedding", "table")
+            .err().context("singular receipt must reject arena views")?;
+        assert!(error.to_string().contains("allocation_receipts"));
         // Mapped-host embeddings remain immediate and never enter the GPU group.
         let ((host, ()), host_records) = dense::recording(||
             TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Host, || Ok(())))?;

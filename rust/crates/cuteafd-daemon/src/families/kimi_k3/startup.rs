@@ -313,6 +313,21 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
             peer.as_ref().map(|peer| ([streams[0].clone(), streams[1].clone()], peer.clone())))).transpose()?;
     let draft_records = recorder.map(|recorder| recorder.finish()).unwrap_or_default();
     memory.sample("draft-allocated-and-recorded")?;
+    if memory.enabled() {
+        if let Some(draft) = &draft {
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(draft.allocation_receipts(
+                cuteafd_loader::placement::planner::CoordinatorDevices::new(&options.devices)?)?);
+            census.normalize(cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)?;
+            let roots = census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()
+                && receipt.allocation.group == "weight arena").collect::<Vec<_>>();
+            tracing::info!(roots = roots.len(), bytes = roots.iter().map(|root| root.allocation.bytes).sum::<u64>(),
+                load_phase = roots.iter().all(|root| root.allocation.lifetime.contains(
+                    cuteafd_loader::placement::planner::Phase::Load,
+                    cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)),
+                "Kimi retained draft weight arena census");
+        }
+    }
     let engine = Engine::load_admitted(library, streams, lane_streams, draft, draft_records, admitted, options.expert_usage_reader.clone(), checkpoint, native, context_programs, peer, hops,
         options.peers.clone(), cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() }, expert_modules, &mut memory)?
         .with_served_context(options.max_context)?;

@@ -36,8 +36,19 @@ impl<'a> PackedHead<'a> {
     /// retain the source.
     pub fn pack(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, stream: *mut c_void)
         -> Result<Self> {
+        Self::pack_with(library, w, n, k, stream, |_, bytes| {
+            crate::shared::memory::device::Allocation::new(crate::shared::memory::device::Device {
+                library, id: library.cuda_get_device()? }, bytes)
+        })
+    }
+
+    pub fn pack_with(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, stream: *mut c_void,
+        allocate: impl FnMut(&str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>)
+        -> Result<Self> {
         let layout = PackedHeadLayout::new(n, k)?;
-        let storage = DeviceAllocation::new(library, layout.total_bytes())?;
+        let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+        let storage = DeviceAllocation::from_allocation(crate::shared::memory::weight_arena::checked_weight_allocation(
+            device, "packed12", layout.total_bytes(), allocate)?);
         let status = status_buffer(storage.buffer, &layout);
         // SAFETY: `w` is a live [n, k] BF16 weight; the planes and status are regions of `storage`,
         // sized by `layout` for this shape and `layout.capacity` table entries.
@@ -63,6 +74,11 @@ impl<'a> PackedHead<'a> {
 
     /// Device bytes of the head (the planner's [`PackedHeadLayout::bytes`]).
     pub fn bytes(&self) -> usize { self.layout.total_bytes() }
+
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
+        name: &str) -> Result<()> {
+        self.storage.inventory(inventory, &format!("{name}.packed12"))
+    }
 
     /// Values outside their rows' windows, and the most in any row.
     pub fn exceptions(&self) -> (u64, u64) { (self.status.exceptions, self.status.max_row_exceptions) }
@@ -101,6 +117,78 @@ impl PackedHead<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_pack_matches_reference_and_retains_backing() -> Result<()> {
+        use crate::shared::memory::{device::{Allocation, Device}, weight_arena::DeviceWeightArena, receipts::Inventory};
+        use cuteafd_core::{memory_layout::Category, packed_head::PackedReference};
+        use cuteafd_loader::{serving_capacity::WeightArenaLayout, placement::planner::{CoordinatorDevices, Lifetime, Phase}};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 1 };
+        let (n, k) = (32, 128);
+        let mut values = (0..n*k).map(|i| (((i % 2) as u16) << 15) | ((120 + i % 6) as u16) << 7
+            | (i % 128) as u16).collect::<Vec<_>>();
+        for (index, bits) in [(0, 0), (k+7, 0x7f80), (2*k+9, 0xffc1)] { values[index] = bits; }
+        let reference = PackedReference::pack(&values, n, k)?;
+        let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+        let source = Allocation::new(device, bytes.len())?;
+        device.run(|| library.copy_h2d(source.buffer, &bytes))?;
+        let baseline = device.run(|| PackedHead::pack(&library, source.buffer.ptr, n, k, std::ptr::null_mut()))?;
+        let layout = PackedHeadLayout::new(n,k)?;
+        let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head", [("packed12".into(), layout.total_bytes())])?)?;
+        let packed = device.run(|| PackedHead::pack_with(&library, source.buffer.ptr, n, k, std::ptr::null_mut(),
+            |name, bytes| arena.view(name, bytes)))?;
+        drop(arena);
+        let expected = [(Region::Coarse, reference.coarse),
+            (Region::Fine, reference.fine.iter().flat_map(|v| v.to_le_bytes()).collect()),
+            (Region::Base, reference.base),
+            (Region::RowPtr, reference.row_ptr.iter().flat_map(|v| v.to_le_bytes()).collect()),
+            (Region::Columns, reference.columns.iter().flat_map(|v| v.to_le_bytes()).collect()),
+            (Region::Values, reference.values.iter().flat_map(|v| v.to_le_bytes()).collect())];
+        for (region, expected) in expected {
+            for owner in [&baseline, &packed] {
+                let mut actual = vec![0; expected.len()];
+                device.run(|| library.copy_d2h(&mut actual, CuteafdDeviceBuffer {
+                    ptr: owner.storage.buffer.ptr.wrapping_byte_add(layout.offset(region)),
+                    bytes: expected.len(), ..owner.storage.buffer }))?;
+                assert_eq!(actual, expected, "{region:?}");
+            }
+        }
+        assert_eq!(packed.exceptions(), (3,1));
+        assert_eq!(packed.status, baseline.status);
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&[1])?, "head",
+            Lifetime { first: Phase::Load, last: Phase::Growth }, Category::Weights, "head");
+        packed.inventory(&mut inventory, "vocab")?;
+        assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),1);
+        assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),1);
+        Ok(())
+    }
+
+    #[test]
+    fn arena_failed_pack_drain_retains_destination_and_module() -> Result<()> {
+        use crate::shared::memory::{device::{Allocation, Device}, weight_arena::DeviceWeightArena};
+        use cuteafd_loader::serving_capacity::WeightArenaLayout;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.stage(&library)?;
+        fixture.configure_pack(&library, 1, 1)?;
+        let device = Device { library: &library, id: 0 };
+        let source = Allocation::new(device, 16*128*2)?;
+        let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head/quarantine",
+            [("packed12".into(), PackedHeadLayout::new(16,128)?.total_bytes())])?)?;
+        let packed = PackedHead::pack_with(&library, source.buffer.ptr,16,128,std::ptr::null_mut(),
+            |name, bytes| arena.view(name, bytes));
+        assert!(packed.is_err());
+        drop(packed); drop(arena);
+        std::mem::forget(source);
+        drop(library);
+        assert!(fixture.resident()?);
+        assert!(!fixture.events()?.contains('d'), "quarantined backing must not free");
+        Ok(())
+    }
 
     /// The planes array is the layout's first six regions, in the native order, and the
     /// status words follow the table.

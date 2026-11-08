@@ -18,7 +18,7 @@ pub mod prefill_waves;
 mod fp8moe_workspace;
 pub use fp8moe_workspace::fp8moe_tp2_workspace;
 mod weight_storage;
-pub use weight_storage::PackedWeightRegions;
+pub use weight_storage::{PackedWeightRegions, WeightArenaLayout, WeightArenaView};
 mod peer_storage;
 pub use peer_storage::PeerStorageLayout;
 pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format, spark_intake_bytes, PrefillShape};
