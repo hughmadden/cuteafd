@@ -2147,6 +2147,16 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
                     assert_eq!(owner.category, category);
                     assert_eq!(owner.bytes, expected);
                 }
+                let facts = &admitted.solved.facts;
+                let stream_owners = facts.allowances.iter().filter(|owner|
+                    owner.source.starts_with("step5/driver-stream-slabs/")
+                        && owner.location == crate::placement::planner::Location::coordinator(rank as u8))
+                    .collect::<Vec<_>>();
+                assert_eq!(stream_owners.len(), 1);
+                assert_eq!(admission::startup_peak_live_streams(), 7);
+                assert_eq!(stream_owners[0].bytes, 4 << 20);
+                assert_eq!(stream_owners[0].lifetime, crate::placement::planner::Lifetime::RESIDENT);
+                assert!(!stream_owners[0].assumed);
                 let mut arenas = target.weight_arenas.clone();
                 if head && depth > 0 { arenas.push((mtp.mtp_arena(rank as i32)?, crate::placement::ResidentWeights(mtp.resident_bytes), cuteafd_core::memory_layout::MemoryKind::DrafterWeights)); }
                 for (arena, logical, kind) in arenas {

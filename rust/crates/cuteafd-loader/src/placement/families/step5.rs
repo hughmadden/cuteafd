@@ -44,8 +44,8 @@ struct Figures {
     weights: Vec<Component>,
     /// Physical requests behind fixed logical owners; weight arena tails are separate.
     granularity: Vec<Component>,
-    /// Retained BF16 vocabulary handles only; native heads create none.
-    blas: Vec<Component>,
+    /// Measured driver stream slabs and retained BF16 vocabulary handles.
+    runtime: Vec<Component>,
     /// Residual receive slots, charged by the shared solver apart from `fixed`.
     hops: Vec<u64>,
 }
@@ -66,7 +66,7 @@ impl Figures {
             .context("Step-5 pool geometry rank")?
             .persistent_unit_bytes;
         let pool = pool_physical_bytes(unit, pages)?;
-        let weights = self.weights.iter().chain(&self.granularity).chain(&self.blas).filter(|component| match &component.kind {
+        let weights = self.weights.iter().chain(&self.granularity).chain(&self.runtime).filter(|component| match &component.kind {
             ComponentKind::Allocation { template, .. } => template.location == Location::coordinator(rank),
             ComponentKind::AllocationGranularity(owner) => owner.location == Location::coordinator(rank),
             ComponentKind::Allowance(owner) => owner.location == Location::coordinator(rank)
@@ -434,8 +434,18 @@ impl<'a> Step5Recipe<'a> {
                 location: Location::coordinator(rank as u8), cublas_handles: 1, lt_handles: 1,
                 lifetime: Lifetime::RESIDENT, activation: Activation::always(),
             })).collect::<Vec<_>>();
-        let blas = serving::blas_components("sm_120", &heads, maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?;
-        Ok(Figures { cache, marks, fixed, weights, granularity, blas, hops })
+        let mut runtime = serving::blas_components("sm_120", &heads, maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?;
+        let peak = crate::plan::families::step5::admission::startup_peak_live_streams();
+        let bytes = cuda_stream_slab_bytes(peak)?;
+        for rank in 0..ranks {
+            // Slab residency survives delivery-stream retirement. This is not
+            // a cudaMalloc request, so it receives no allocation-tail charge.
+            runtime.push(Component { activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum_pages),
+                kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8), bytes,
+                    lifetime: Lifetime::RESIDENT, assumed: false,
+                    source: format!("step5/driver-stream-slabs/gpu{rank} ({peak} peak live streams, SM120 driver/runtime13020 LAZY, #1511 2026-11-08)") }) });
+        }
+        Ok(Figures { cache, marks, fixed, weights, granularity, runtime, hops })
     }
 
     /// The live/offline request: explicit CLI values stay strict, zero and
@@ -618,7 +628,7 @@ impl Recipe for Step5Recipe<'_> {
         } else {
             return Err(Refusal::Unsupported);
         }
-        contract.components.extend(self.figures.weights.iter().chain(&self.figures.granularity).chain(&self.figures.blas).cloned());
+        contract.components.extend(self.figures.weights.iter().chain(&self.figures.granularity).chain(&self.figures.runtime).cloned());
         for demand in &self.figures.fixed {
             let location = Location::coordinator(demand.gpu);
             let owner = Allocation::buffer(

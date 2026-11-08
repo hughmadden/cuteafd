@@ -7,6 +7,15 @@ pub const SM120_ALLOCATION_GRANULARITY_BYTES: u64 = 2 << 20;
 const PAGE: u64 = SM120_ALLOCATION_GRANULARITY_BYTES;
 const SMALL: u64 = 1 << 20;
 
+/// SM120, driver/runtime 13020, LAZY: stream slots grow in retained 2 MiB
+/// slabs at live-stream counts 2, 6, 10, ... . Destroyed streams reuse slots;
+/// count the context's peak live streams, never cumulative creations. Qualified
+/// on both raptor GPUs, 2026-11-08 (#1511); not qualified for GB10/SM121.
+pub fn cuda_stream_slab_bytes(peak_live: u64) -> Result<u64, Refusal> {
+    let slabs = peak_live / 4 + u64::from(peak_live % 4 >= 2);
+    slabs.checked_mul(PAGE).ok_or(Refusal::Overflow("CUDA stream slabs"))
+}
+
 /// Explicit physical requests behind one logical owner, not its tensor views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GranularityBacking {
@@ -145,6 +154,19 @@ pub fn weight_arena_extent_components(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_slabs_follow_peak_live_slots_not_cumulative_creations() -> Result<(), Refusal> {
+        for peak in 0..=34 {
+            assert_eq!(cuda_stream_slab_bytes(peak)?, (peak + 2) / 4 * PAGE);
+        }
+        // Two retained cache/lane streams plus sequential rotary streams.
+        assert_eq!(cuda_stream_slab_bytes(3)?, PAGE);
+        // Dense load plus four copies coexist with cache/lane streams.
+        assert_eq!(cuda_stream_slab_bytes(7)?, 2 * PAGE);
+        assert!(cuda_stream_slab_bytes(u64::MAX).is_err());
+        Ok(())
+    }
 
     #[test]
     fn arena_extent_replaces_payload_and_prices_one_physical_request() -> Result<(), Refusal> {

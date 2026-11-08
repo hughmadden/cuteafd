@@ -8,6 +8,14 @@ use crate::{
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
 
+/// Cache maintenance and transaction lane survive loading. Delivery adds one
+/// dense transform stream and the shared copy-stream set on each device.
+/// Rotary streams retire before delivery; MTP uses the transaction lane, and
+/// unused diagnostic streams remain lazy.
+pub fn startup_peak_live_streams() -> u64 {
+    2 + 1 + crate::push_load::COPY_STREAMS as u64
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarkRule {
     pub lanes: usize,
