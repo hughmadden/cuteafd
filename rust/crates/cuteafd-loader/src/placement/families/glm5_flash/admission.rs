@@ -24,7 +24,7 @@ pub struct ProcessOwners {
     pub alternate_target_arenas: Vec<Vec<crate::serving_capacity::WeightArenaLayout>>,
     /// Native shared experts retain their independent format-owned backings.
     pub shared_arenas: Vec<Vec<(String, u64)>>,
-    /// Standalone drafter layouts; TP1 has one home-independent layout.
+    /// Drafter backings indexed by coordinator home (sharded only for TP2).
     pub draft_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
     /// The drafter's standalone push group, after the target group has committed.
@@ -206,6 +206,26 @@ impl ProcessOwners {
             encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None,
             target_arenas: vec![], alternate_target_arenas: vec![], shared_arenas: vec![], draft_arenas: vec![], push_host: None,
             draft_push: None, draft_tp2: vec![] }
+    }
+
+    pub fn draft(&mut self, snapshot: &std::path::Path,
+        representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
+        gpus: usize, tp2: bool) -> anyhow::Result<()> {
+        use crate::families::glm5::{draft_physical::{gqa_arena_requests, GlmDflashConfig},
+            draft_representation::is_dspark};
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let block = is_dspark(&config);
+        anyhow::ensure!(!tp2 || gpus == 2 && !block, "TP2 requires a two-rank GQA drafter");
+        self.draft_arenas = (0..gpus).map(|home| {
+            let requests = if block {
+                crate::formats::block_dspark::block_dspark_arena_requests(snapshot, representation)?
+            } else {
+                gqa_arena_requests(&GlmDflashConfig::from_value(&config)?, representation,
+                    if tp2 { home } else { 0 }, if tp2 { gpus } else { 1 })?
+            };
+            crate::serving_capacity::WeightArenaLayout::new(format!("glm5_flash/draft/{home}"), requests)
+        }).collect::<anyhow::Result<_>>()?;
+        Ok(())
     }
 
     /// Prepare the exact target backings before admission, including the
@@ -678,6 +698,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         if gpus != 2 || process.draft_tp2.len() != 2 || i.drafter_bytes != 0 || i.drafter_bridge.is_some() {
             return Err(invalid("TP2 DFlash requires two fixed rank owners, not a movable"));
         }
+        if process.draft_arenas.len() != gpus { return Err(invalid("TP2 draft arena inventory")); }
         for (rank, layout) in process.draft_tp2.iter().enumerate() {
             let prefix = if rank == 0 { "glmf.draft" } else { "glmf.draft.peer" };
             let location = p::Location::coordinator(rank as u8);
@@ -687,16 +708,15 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                     lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
                     activation: p::Activation::always() });
             }
-            for owner in layout.allocations(prefix, location) {
+            let immutable: std::collections::BTreeSet<_> = layout.weight_owners()
+                .map(|owner| format!("{prefix}.{}", owner.id)).collect();
+            for owner in layout.allocations(prefix, location).into_iter()
+                .filter(|owner| !immutable.contains(&owner.id)) {
                 let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
                 contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
             }
-            for owner in layout.weight_owners() {
-                contract.components.push(p::Component::resident_weight(p::ResidentWeight {
-                    id: format!("{prefix}.{}", owner.id), location,
-                    weights: ResidentWeights(owner.bytes),
-                }, p::ByteCurve::fixed(owner.bytes, maximum)));
-            }
+            add_arena(&mut contract, &process.draft_arenas[rank], rank,
+                p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }, &p::Activation::always())?;
         }
         if let Some(draft) = &process.draft_push {
             for owner in draft.allocations(0)? {
@@ -814,6 +834,17 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             Basis::Formula), format!("glmf.hops.{gpu}"), p::Activation::always())?;
     }
     if i.drafter_bytes > 0 {
+        let nonweights = i.drafter_bytes.checked_sub(i.drafter_weights.0)
+            .ok_or_else(|| invalid("draft weights exceed draft owned storage"))?;
+        let draft_arenas = if process.draft_arenas.is_empty() {
+            #[cfg(test)]
+            { (0..gpus).map(|rank| crate::serving_capacity::WeightArenaLayout::new(
+                format!("glm5_flash/draft/{rank}"), [("fixture.weights".into(), i.drafter_weights.0 as usize)])
+                .map_err(invalid)).collect::<Result<Vec<_>, _>>()? }
+            #[cfg(not(test))]
+            { return Err(invalid("Flash draft arena recipe missing")); }
+        } else { process.draft_arenas.clone() };
+        if draft_arenas.len() != gpus { return Err(invalid("Flash draft arena candidate inventory")); }
         let homes = if i.drafter_bridge.is_some() { vec![0, 1] } else { vec![0] };
         let variable = contract.variables.len();
         contract.variables.push(p::Variable::DraftHome(homes.clone()));
@@ -824,8 +855,10 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 location: p::Location::coordinator(gpu), cublas_handles: 1, lt_handles: 1,
                 lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
                 activation: activation.clone() });
-            add_demand(&mut contract, &Demand::new(gpu, Category::Drafter, "DFlash", i.drafter_bytes,
-                Basis::Exact).with_resident_weights(i.drafter_weights), format!("glmf.draft.{gpu}"), activation.clone())?;
+            add_arena(&mut contract, &draft_arenas[usize::from(gpu)], usize::from(gpu),
+                p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }, &activation)?;
+            add_demand(&mut contract, &Demand::new(gpu, Category::Drafter, "DFlash", nonweights,
+                Basis::Exact), format!("glmf.draft.{gpu}"), activation.clone())?;
             add_demand(&mut contract, &Demand::new(gpu, Category::Workspace, "DFlash linear/attention scratch", i.drafter_scratch[usize::from(gpu)],
                 Basis::Formula), format!("glmf.draft.scratch.{gpu}"), activation.clone())?;
             if gpu != 0 {
@@ -1016,6 +1049,139 @@ impl PreparedGlmf<'_> {
 mod tests {
     use super::*;
     use crate::plan::exlr8::residency::{ExpertSet, Residency};
+
+    #[test]
+    fn selected_arenas_replace_payload_and_share_activation_with_their_single_tail() -> anyhow::Result<()> {
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        use crate::serving_capacity::WeightArenaLayout;
+        let root = tempfile::tempdir()?;
+        let config = glm5_flash_config(4);
+        write_snapshot(root.path(), &config, &glm5_flash_tensors(&config), None);
+        let checkpoint = crate::plan::Checkpoint::open(root.path())?;
+        let cfg = GlmNextConfig::from_hf(&config)?;
+        for ranks in [1, 2] {
+            let mut input = super::super::tests::inputs(&cfg, ranks, 96 << 30);
+            input.requested_pool = Some(262_144);
+            input.graphs = GraphSet::budget(&vec![64 << 20; ranks]);
+            if ranks == 2 { input.attention.mode = AttentionPlacement::Layers; }
+            input.resident = crate::families::glm5_flash::resident::resident_weights_placed(
+                &checkpoint, &cfg, cfg.layers, ranks, input.representation,
+                input.attention.mode, 0).map_err(anyhow::Error::msg)?;
+            let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            if ranks == 2 {
+                process.alternate_resident = Some(crate::families::glm5_flash::resident::resident_weights_placed(
+                    &checkpoint, &cfg, cfg.layers, ranks, input.representation,
+                    input.attention.mode, 1).map_err(anyhow::Error::msg)?);
+            }
+            process.target(&checkpoint, &input, None)?;
+            process.draft_arenas = (0..ranks).map(|rank| WeightArenaLayout::new(
+                format!("glm5_flash/draft/{rank}"), [("a".into(), (3 << 20) + 1), ("b".into(), 17)]))
+                .collect::<anyhow::Result<_>>()?;
+            let targets = process.target_arenas.clone();
+            let alternate_targets = process.alternate_target_arenas.clone();
+            let drafts = process.draft_arenas.clone();
+            let prepared = prepare(&input, 188, true, process)?;
+            let components = &prepared.recipe.contract.components;
+            for (index, owner) in components.iter().enumerate() {
+                let p::ComponentKind::Allocation { template, .. } = &owner.kind else { continue; };
+                if template.group != "weight arena" { continue; }
+                let resident = components.iter().find(|other| other.activation == owner.activation
+                    && matches!(&other.kind, p::ComponentKind::ResidentWeight(weight) if weight.id == template.id)).unwrap();
+                let tail = components.iter().find(|other| other.activation == owner.activation
+                    && matches!(&other.kind, p::ComponentKind::AllocationGranularity(tail) if tail.id == format!("{}.tail", template.id))).unwrap();
+                assert!(matches!(&resident.kind, p::ComponentKind::ResidentWeight(weight) if weight.weights.0 == template.bytes));
+                let p::ComponentKind::AllocationGranularity(tail) = &tail.kind else { unreachable!() };
+                assert_eq!(tail.requests(), [template.bytes]);
+                assert_eq!(tail.lifetime, template.lifetime);
+                assert!(!components[..index].iter().any(|other| other.activation == owner.activation
+                    && matches!(&other.kind, p::ComponentKind::Allocation { template: prior, .. } if prior.id == template.id)));
+            }
+            let admitted = prepared.admit()?;
+            let home = super::super::embedding_home(&admitted.placement) as usize;
+            let targets = if ranks == 2 && super::super::placed_attention(input.attention, &admitted.placement).first_owner == 1 {
+                &alternate_targets
+            } else { &targets };
+            for (rank, layout) in targets[home].iter().enumerate() {
+                let facts = &admitted.solved.facts;
+                let root = facts.allocations.iter().find(|owner| owner.id == layout.id()).unwrap();
+                assert_eq!((root.bytes, root.location, root.lifetime),
+                    (layout.bytes() as u64, p::Location::coordinator(rank as u8), p::Lifetime::RESIDENT));
+                assert_eq!(facts.allocation_granularity.iter().filter(|tail| tail.backings.iter()
+                    .any(|backing| backing.backing == root.id)).count(), 1);
+                assert!(!facts.allocations.iter().any(|owner| owner.group == "target weights"));
+                let aliases = facts.allocations.iter().filter(|owner| owner.category == Category::Embedding
+                    && owner.location == root.location).collect::<Vec<_>>();
+                assert_eq!(aliases.len(), usize::from(rank == home));
+                for alias in aliases {
+                    let view = alias.view.as_ref().unwrap();
+                    let expected = layout.view("embedding.table").unwrap();
+                    assert_eq!((&view.backing, view.offset, alias.bytes),
+                        (&root.id, expected.offset() as u64, expected.bytes() as u64));
+                }
+            }
+            let draft = admitted.solved.facts.allocations.iter().find(|owner| owner.id == drafts[0].id()).unwrap();
+            assert_eq!(draft.bytes, drafts[0].bytes() as u64);
+            assert_eq!(draft.lifetime, p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth });
+            let owned = admitted.solved.facts.allocations.iter().find(|owner| owner.id == "glmf.draft.0").unwrap();
+            assert_eq!(owned.bytes, input.drafter_bytes - input.drafter_weights.0);
+            assert_eq!(admitted.solved.facts.phase_order, p::PhaseOrder::TARGET_THEN_DRAFT);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tp2_draft_arenas_replace_only_immutable_physical_owners() -> anyhow::Result<()> {
+        use crate::{families::glm5::{draft_physical::GlmDflashConfig,
+            draft_representation::{GlmDraftCapacity, GlmDraftRepresentation}},
+            families::qwen4::Qwen4KvCache, plan::testing::{t, write_safetensors}};
+        let snapshot = tempfile::tempdir()?;
+        let config = serde_json::json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":2,
+            "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,
+            "rms_norm_eps":1e-5, "sliding_window":2048, "rope_theta":10000,
+            "dflash_config":{"target_layer_ids":[0,8], "conv_group_size":16, "conv_kernel_size":2,
+                "mask_token_id":0, "selector_rank":256, "selector_top_k":16, "block_size":8}});
+        std::fs::write(snapshot.path().join("config.json"), config.to_string())?;
+        let draft = GlmDflashConfig::from_value(&config)?;
+        write_safetensors(&snapshot.path().join("model.safetensors"), &draft.tensor_shapes().into_iter()
+            .map(|(name, shape)| t(name, "BF16", &shape)).collect::<Vec<_>>());
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4))?;
+        for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
+            let mut input = super::super::tests::inputs(&cfg, 2, 96 << 30);
+            input.drafter_bytes = 0;
+            input.drafter_weights = ResidentWeights(0);
+            input.requested_pool = Some(262_144);
+            input.graphs = GraphSet::budget(&[64 << 20; 2]);
+            let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+            process.draft_tp2 = super::super::drafter_tp2_inventory(snapshot.path(),
+                GlmDraftCapacity::new(8, 8, draft.block)?, &[188, 188], representation, 2, Qwen4KvCache::Bf16)?;
+            process.draft(snapshot.path(), representation, 2, true)?;
+            let layouts = process.draft_tp2.clone();
+            let arenas = process.draft_arenas.clone();
+            let facts = prepare(&input, 188, true, process)?.admit()?.solved.facts;
+            for rank in 0..2 {
+                let prefix = if rank == 0 { "glmf.draft" } else { "glmf.draft.peer" };
+                let location = p::Location::coordinator(rank as u8);
+                let immutable = layouts[rank].weight_owners().map(|owner| format!("{prefix}.{}", owner.id))
+                    .collect::<std::collections::BTreeSet<_>>();
+                let expected = layouts[rank].allocations(prefix, location).into_iter()
+                    .filter(|owner| !immutable.contains(&owner.id)).collect::<Vec<_>>();
+                for owner in expected { assert!(facts.allocations.contains(&owner), "changed nonweight owner {}", owner.id); }
+                assert!(!facts.allocations.iter().any(|owner| immutable.contains(&owner.id)));
+                assert!(!facts.resident_weights.iter().any(|owner| immutable.contains(&owner.id)));
+                let root = facts.allocations.iter().find(|owner| owner.id == arenas[rank].id()).unwrap();
+                assert_eq!((root.bytes, root.location, root.lifetime), (arenas[rank].bytes() as u64, location,
+                    p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }));
+                assert_eq!(facts.resident_weights.iter().find(|owner| owner.id == root.id).unwrap().weights.0, root.bytes);
+                let tails = facts.allocation_granularity.iter().filter(|tail| tail.backings.iter()
+                    .any(|backing| backing.backing == root.id)).collect::<Vec<_>>();
+                assert_eq!(tails.len(), 1);
+                assert_eq!(tails[0].requests(), [root.bytes]);
+                assert_eq!(tails[0].lifetime, root.lifetime);
+            }
+            assert_eq!(facts.phase_order, p::PhaseOrder::TARGET_THEN_DRAFT);
+        }
+        Ok(())
+    }
 
     #[test]
     fn retained_heads_and_portable_prefix_follow_selected_physical_owners() {

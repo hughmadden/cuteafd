@@ -2026,6 +2026,11 @@ impl Opened {
             self.experts.as_ref(),
             native_admission.map(|native| (&native.facts, &native.metadata)))?;
         process.draft_tp2 = draft_tp2;
+        if let Some(path) = &args.draft {
+            process.draft(path,
+                cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
+                devices.len(), args.tp2_dflash)?;
+        }
         process.draft_push = self.draft_push(args)?;
         if native_admission.is_none() && process.push_host.is_none() {
             process.mount_load = Some(admission::admission::mount_load(&headers, devices.len())?);

@@ -318,8 +318,14 @@ mod tests {
                 let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
                 let slack: usize = large.iter().map(|v| v.bytes().div_ceil(2 << 20)*(2 << 20)-v.bytes()).sum();
                 let tail = layout.bytes().div_ceil(2 << 20)*(2 << 20)-layout.bytes();
+                let old = super::super::resident::resident_weights(&checkpoint, &cfg, cfg.layers, ranks,
+                    super::super::resident::GlmfRepresentation::default()).map_err(anyhow::Error::msg)?;
+                let old = old[rank].weights + old[rank].embedding;
+                assert_eq!(old, layout.payload_bytes() as u64);
                 eprintln!("FLASH_INVENTORY ranks={ranks} rank={rank} allocations={} payload={} large_count={} large_bytes={} old_slack={slack} arena={} padding={} tail={tail}",
                     layout.views().len(), layout.payload_bytes(), large.len(), large.iter().map(|v| v.bytes()).sum::<usize>(), layout.bytes(), layout.padding_bytes());
+                eprintln!("FLASH_CHARGE target ranks={ranks} rank={rank} old={old} B={} tail={tail} new={} delta={} old_rounding=no",
+                    layout.bytes(), layout.bytes() + tail, (layout.bytes() + tail) as i128 - i128::from(old));
             }
         }
         Ok(())

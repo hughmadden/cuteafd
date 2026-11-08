@@ -127,8 +127,10 @@ impl<'a> Drafter<'a> {
             }
         };
         for receipt in &mut receipts {
-            if receipt.allocation.id.starts_with("glm5_flash/draft/") {
-                receipt.allocation.lifetime = cuteafd_loader::placement::planner::Lifetime::RESIDENT;
+            use cuteafd_loader::placement::planner::{Lifetime, Phase};
+            if receipt.allocation.id.starts_with("glm5_flash/draft/")
+                || receipt.allocation.view.as_ref().is_some_and(|view| view.backing.starts_with("glm5_flash/draft/")) {
+                receipt.allocation.lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
             }
         }
         Ok(receipts)
@@ -352,6 +354,45 @@ impl<'a> Drafter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_draft_admission_arenas_equal_runtime_requests() -> Result<()> {
+        use cuteafd_loader::{placement::families::glm5_flash::{admission::ProcessOwners, drafter_inventory, drafter_tp2_inventory},
+            placement::planner::allocation_granularity_forecast, serving_capacity::WeightArenaLayout};
+        let Some(snapshot) = std::env::var_os("CUTEAFD_FLASH_DRAFT_SNAPSHOT") else { return Ok(()); };
+        let snapshot = Path::new(&snapshot);
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let block = is_dspark(snapshot)?;
+        let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config, Some(8), 8)?;
+        for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
+            for ranks in 1..=if block { 1 } else { 2 } {
+                let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+                process.draft(snapshot, representation, ranks, ranks == 2)?;
+                let devices = [3, 1];
+                let mut runtime = if block { DsparkDrafter::arena_requests(snapshot, representation, devices[0])? }
+                    else { crate::shared::speculation::dflash::DflashDrafter::arena_requests(
+                        snapshot, representation, &devices[..ranks], 0)? };
+                let old = if ranks == 1 {
+                    vec![drafter_inventory(&config, capacity.context_slots, capacity.max_batch_sequences,
+                        &[188], representation, 2, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?.0.resident_weights.0]
+                } else {
+                    drafter_tp2_inventory(snapshot, capacity, &[188, 188], representation, 2,
+                        cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?.iter().map(|layout| layout.resident_weights().0).collect()
+                };
+                for (rank, layout) in process.draft_arenas.iter().enumerate() {
+                    let expected = WeightArenaLayout::new(layout.id(), runtime.remove(&devices[rank]).context("runtime draft rank missing")?)?;
+                    assert_eq!(*layout, expected, "planner/runtime draft rank {rank}/{ranks}");
+                    let bytes = layout.bytes() as u64;
+                    let tail = allocation_granularity_forecast(&[bytes])?;
+                    eprintln!("FLASH_CHARGE draft={} representation={representation:?} ranks={ranks} rank={rank} old={} B={bytes} tail={tail} new={} delta={} old_rounding=no",
+                        if block { "block-dspark" } else { "DFlash" }, old[rank], bytes + tail, i128::from(bytes + tail) - i128::from(old[rank]));
+                    assert!(!layout.views().keys().any(|name| name.contains("embed_tokens") || name == "lm_head.weight"));
+                }
+                assert!(runtime.is_empty());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn drafter_detection_reports_missing_and_corrupt_config() {

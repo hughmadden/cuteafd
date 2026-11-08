@@ -398,6 +398,14 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         process.push_host = glmf::admission::push_host_envelope(checkpoint, &cfg, ranks, Some(&catalog), exlr8)?;
         // The serving drafter loads FP8-packed (its default) as its own push group.
         process.draft_tp2 = draft_tp2;
+        if let Some((_, _, path)) = draft_config.as_ref() {
+            process.draft(path, options.glmf_draft_representation, ranks, options.tp2_dflash)?;
+        } else if draft > 0 {
+            // An explicit offline byte override describes one opaque backing.
+            process.draft_arenas = (0..ranks).map(|rank| crate::serving_capacity::WeightArenaLayout::new(
+                format!("glm5_flash/draft/{rank}"), [("explicit.weights".into(), usize::try_from(draft)?)]))
+                .collect::<anyhow::Result<_>>()?;
+        }
         process.draft_push = draft_config.as_ref().filter(|_| draft > 0 || !process.draft_tp2.is_empty()).map(|(config, _, path)|
             glmf::admission::DraftPush::for_snapshot(path, config,
                 options.glmf_draft_representation))
