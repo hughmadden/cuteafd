@@ -88,6 +88,12 @@ extern "C" int32_t cuteafd_glmf_dspark_markov_norms(const void* source, void* ou
   return markov_norms(source, output, rows, cols, false);
 }
 
+// Mirror ml4_dspark.cu's partials, argmax, state/embedding and joint buffers.
+extern "C" uint64_t cuteafd_ml4_dspark_markov_workspace(int32_t sequences, int32_t block) {
+  return uint64_t(sequences) * 296 * 8 + uint64_t(sequences) * block * 4 +
+      uint64_t(sequences) * 512 * 4 + uint64_t(sequences) * 1536 * 4;
+}
+
 extern "C" int32_t cuteafd_ml4_dspark_markov_norms(const void* source, void* output, int32_t rows,
                                                  int32_t cols, void* stream) {
   (void)stream;
