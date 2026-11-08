@@ -520,7 +520,7 @@ mod tests {
             let layout = report.memory_layout.as_ref().unwrap();
             assert!(layout.devices.iter().take(gpus).all(|d| d.items.iter().any(|i| i.group == "native K6 core")));
             let representation = crate::families::glm5_flash::resident::GlmfRepresentation {
-                kda_fp8: false, output_shard: false, fp8_head: false,
+                kda_fp8: false, output_shard: false, head: super::resident::GlmfHeadFormat::Bf16,
             };
             let embedding = input.checkpoint().tensors.iter().find(|tensor|
                 tensor.meta.name == "model.language_model.embed_tokens.weight").unwrap().meta.byte_length;
