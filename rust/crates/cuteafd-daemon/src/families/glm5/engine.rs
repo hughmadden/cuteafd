@@ -2190,6 +2190,15 @@ impl<'a> GlmEngine<'a> {
         // transport-free and post-warmup paths stay eager, including before
         // Ready; the shape allocates nothing outside the declared set.
         if !startup_capture_allowed(self.graphs_warmed.get(), self.graphs_warming.get()) {
+            // After the startup pass a key the sealed set lacks is real traffic
+            // outside the declared shapes: it ran ungraphed and allocated
+            // nothing, and is reported once through the shared inventory. The
+            // warm pass itself is eager by design, so it reports nothing.
+            if self.graphs_warmed.get() {
+                crate::shared::decode_graph::note_eager(self.cfg.family_id(), &format!("{key:?}"), || format!(
+                    "rank={rank} segment=decode max_context={} pages={} prefill_rows={}",
+                    self.max_context, self.pages, self.prefill_rows));
+            }
             return segment();
         }
         // SAFETY: capture records launches on that rank's stream; nothing in the
