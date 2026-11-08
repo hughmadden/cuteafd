@@ -2394,7 +2394,7 @@ impl Opened {
                 args.kda_output_shard, args.fp8_head, embedding)?
         };
         let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {
-            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(*device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
+            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(*device, layout, cuteafd_core::memory_layout::ArenaTag::weights("glmf/target"))?))
         }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let loader = weights::GlmfLoader { arenas: std::rc::Rc::new(arenas), ..loader };
         let plan_dense = |sparks: usize| -> Result<_> {

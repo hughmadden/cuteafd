@@ -1237,7 +1237,7 @@ mod tests {
                         prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("prefetch panic"))?? };
                     let mut allocate = |id,name:&str,bytes| {
                         assert_eq!(id,device.id); requested.borrow_mut().push((name.to_owned(),bytes));
-                        weight_allocation(device,arena,name,bytes, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))
+                        weight_allocation(device,arena,name,bytes, crate::shared::memory::TEST_ARENA)
                     };
                     let cfg = DsparkConfig::read(snapshot)?;
                     let drafter = device.run(|| if cfg.window.is_some() {
@@ -1263,7 +1263,7 @@ mod tests {
                 };
                 let wanted = digest(&baseline)?;
                 for recorded in [false,true] {
-                    let arena = DeviceWeightArena::new(device,WeightArenaLayout::new("test/block",expected.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+                    let arena = DeviceWeightArena::new(device,WeightArenaLayout::new("test/block",expected.clone())?, crate::shared::memory::TEST_ARENA)?;
                     let actual = if recorded {
                         let (draft,records) = dense::recording(|| run(device,&programs,&snapshot,representation,Some(&arena),&expected))?;
                         let sockets=tempfile::tempdir()?;

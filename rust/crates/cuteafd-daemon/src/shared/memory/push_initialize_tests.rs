@@ -57,7 +57,7 @@ fn delivered<'a>(
     let mut loading = LoadingArena::new(
         device,
         ArenaLayout::new([destination_bytes], destination_bytes)?,
-        ExpectedCoverage::from_plan(&plan, 0)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")
+        ExpectedCoverage::from_plan(&plan, 0)?, crate::shared::memory::TEST_ARENA
     )?;
     device.run(|| {
         device
@@ -135,7 +135,7 @@ fn padded_rows_coalesce_and_failed_zero_drains_before_free() -> Result<()> {
         let mut loading = LoadingArena::new(
             device,
             ArenaLayout::new([24], 24)?,
-            ExpectedCoverage::from_plan(&plan, 0)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")
+            ExpectedCoverage::from_plan(&plan, 0)?, crate::shared::memory::TEST_ARENA
         )?;
         for row in 0..4 {
             library.copy_h2d(loading.destination(row * 6, 3)?, &[7; 3])?;
@@ -615,7 +615,7 @@ fn fp8_header_plans_widen_pad_and_validate_like_mount() -> Result<()> {
             let mut arena = LoadingArena::new(
                 device,
                 ArenaLayout::new([cursor], cursor)?,
-                ExpectedCoverage::from_plan(&plan, 0)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")
+                ExpectedCoverage::from_plan(&plan, 0)?, crate::shared::memory::TEST_ARENA
             )?;
             // Deliberately reverse delivery to exercise zero generation without
             // depending on source order or zero-filled fake device allocations.

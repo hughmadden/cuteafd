@@ -532,7 +532,7 @@ mod upload_tests {
                 suh:(0..256).map(|i| (i as u8).wrapping_add(7)).collect(),
                 svh:(0..512).map(|i| (i as u8).wrapping_mul(17)).collect() } };
             let baseline = layout.upload(device,loaded())?;
-            let arena = DeviceWeightArena::new(device,WeightArenaLayout::new(format!("test/k{bits}"),requests.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+            let arena = DeviceWeightArena::new(device,WeightArenaLayout::new(format!("test/k{bits}"),requests.clone())?, crate::shared::memory::TEST_ARENA)?;
             let mut requested = Vec::new();
             let actual = layout.upload_with(device,loaded(),|name,bytes| {
                 requested.push((name.to_owned(),bytes)); arena.view(name,bytes)

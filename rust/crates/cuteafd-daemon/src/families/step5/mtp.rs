@@ -1039,7 +1039,7 @@ mod tests {
                 let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
                 let weight_arena = DeviceWeightArena::new(device,
                     RankWeightLayout::mtp_stage_from_contract(&checkpoint, &contract, stage)?
-                        .arena_layout(format!("step5/mtp/gpu{}", device.id), |_| true)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+                        .arena_layout(format!("step5/mtp/gpu{}", device.id), |_| true)?, crate::shared::memory::TEST_ARENA)?;
                 let mut owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
                     rope.clone(), u64::MAX, &[], &arena, Rc::new(Stream::new(device)?), kv_format, &contract,
                     &weight_arena)?;

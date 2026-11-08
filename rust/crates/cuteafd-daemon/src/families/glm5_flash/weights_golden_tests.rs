@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 fn arenas<'a>(library: &'a NativeLibrary, layouts: Vec<cuteafd_loader::serving_capacity::WeightArenaLayout>)
     -> Result<std::rc::Rc<std::collections::BTreeMap<i32, DeviceWeightArena<'a>>>> {
     Ok(std::rc::Rc::new(layouts.into_iter().enumerate().map(|(rank, layout)| {
-        Ok((rank as i32, DeviceWeightArena::new(Device { library, id: rank as i32 }, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
+        Ok((rank as i32, DeviceWeightArena::new(Device { library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
     }).collect::<Result<_>>()?))
 }
 

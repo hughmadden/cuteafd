@@ -139,7 +139,7 @@ mod tests {
         device.run(|| library.copy_h2d(source.buffer, &bytes))?;
         let baseline = device.run(|| PackedHead::pack(&library, source.buffer.ptr, n, k, std::ptr::null_mut()))?;
         let layout = PackedHeadLayout::new(n,k)?;
-        let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head", [("packed12".into(), layout.total_bytes())])?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+        let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head", [("packed12".into(), layout.total_bytes())])?, crate::shared::memory::TEST_ARENA)?;
         let packed = device.run(|| PackedHead::pack_with(&library, source.buffer.ptr, n, k, std::ptr::null_mut(),
             |name, bytes| arena.view(name, bytes)))?;
         drop(arena);
@@ -179,7 +179,7 @@ mod tests {
         let device = Device { library: &library, id: 0 };
         let source = Allocation::new(device, 16*128*2, crate::shared::memory::TEST)?;
         let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head/quarantine",
-            [("packed12".into(), PackedHeadLayout::new(16,128)?.total_bytes())])?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+            [("packed12".into(), PackedHeadLayout::new(16,128)?.total_bytes())])?, crate::shared::memory::TEST_ARENA)?;
         let packed = PackedHead::pack_with(&library, source.buffer.ptr,16,128,std::ptr::null_mut(),
             |name, bytes| arena.view(name, bytes));
         assert!(packed.is_err());

@@ -459,7 +459,7 @@ pub(crate) mod tests {
             use crate::shared::memory::{weight_arena::DeviceWeightArena, receipts::Inventory};
             use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Phase};
             let arena = DeviceWeightArena::new(Device { library: &library, id: 0 },
-                cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/exlr8", named.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/exlr8", named.clone())?, crate::shared::memory::TEST_ARENA)?;
             let load = if recording { DenseLoad::push(&library) } else { DenseLoad::mount(&library) };
             let mut called = BTreeMap::new();
             let packed = load_layer_packed_with(&library, &load, &records, &packs, std::ptr::null_mut(), |name, bytes| {

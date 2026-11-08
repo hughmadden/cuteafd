@@ -58,7 +58,7 @@ fn ready<'a>(device: Device<'a>, sizes: Vec<usize>) -> Result<Rc<ReadyArena<'a>>
     let admitted = sizes.iter().try_fold(0usize, |sum, &bytes| sum.checked_add(bytes)
         .context("test arena size overflow"))? + sizes.len() * 256;
     Ok(Rc::new(LoadingArena::new(device, ArenaLayout::new(sizes, admitted)?,
-        ExpectedCoverage::default(), cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?.done()?.initialize(|_| Ok(()))?))
+        ExpectedCoverage::default(), crate::shared::memory::TEST_ARENA)?.done()?.initialize(|_| Ok(()))?))
 }
 
 fn modules<'a>(fixture: &cuteafd_ffi::native_library_lifetime_fixture::Fixture,

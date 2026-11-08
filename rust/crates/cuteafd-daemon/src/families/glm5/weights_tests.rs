@@ -186,7 +186,7 @@ fn golden_arenas<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         EmbeddingHome::Device(0))?.coordinator_arenas()?;
     Ok(std::rc::Rc::new(layouts.into_iter().enumerate().map(|(rank, layout)| {
         Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
-            Device { library, id: rank as i32 }, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
+            Device { library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
     }).collect::<Result<_>>()?))
 }
 

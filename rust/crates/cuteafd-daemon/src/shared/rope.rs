@@ -153,7 +153,7 @@ mod tests {
         let requests=RotaryTables::arena_requests(&plan,"draft.")?;
         assert_eq!(requests.len(),4);
         assert_eq!(requests.iter().map(|(_,bytes)|bytes).sum::<usize>() as u64,plan.allocation_bytes);
-        let arena=DeviceWeightArena::new(device,WeightArenaLayout::new("test/rotary",requests.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+        let arena=DeviceWeightArena::new(device,WeightArenaLayout::new("test/rotary",requests.clone())?, crate::shared::memory::TEST_ARENA)?;
         let tables=requests.chunks_exact(2).map(|pair| -> Result<_> {
             let cos=arena.view(&pair[0].0,pair[0].1)?;
             let sin=arena.view(&pair[1].0,pair[1].1)?;

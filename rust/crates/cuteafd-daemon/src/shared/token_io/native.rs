@@ -501,7 +501,7 @@ mod tests {
             .context("standalone vocabulary")?;
         let arena = DeviceWeightArena::new(Device { library: &library, id: 0 }, WeightArenaLayout::new("test/vocabulary",
             [("embedding.payload".into(), 32768), ("embedding.scales".into(), 1024),
-                ("head.payload".into(), 32768), ("head.scales".into(), 1024), ("embedding.table".into(), 256)])?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+                ("head.payload".into(), 32768), ("head.scales".into(), 1024), ("embedding.table".into(), 256)])?, crate::shared::memory::TEST_ARENA)?;
         let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared_with(&library, &programs, plan()?,
             plan()?.staging_bytes() as u64, 0, |name, bytes| arena.view(name, bytes))?.context("packed vocabulary")?);
         let embedding = TokenEmbedding::row_fp8_with(&library, EmbedSource {

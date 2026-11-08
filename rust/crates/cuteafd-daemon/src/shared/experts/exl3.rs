@@ -205,7 +205,7 @@ impl<'a> Exl3Weights<'a> {
             Ok(layout)
         }).collect::<Result<Vec<_>>>()?;
         let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
-            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")))
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/exl3-tp2")))
             .collect::<Result<Vec<_>>>()?;
         let mut full_bytes = 0;
         let mut pinned_admitted = 0;

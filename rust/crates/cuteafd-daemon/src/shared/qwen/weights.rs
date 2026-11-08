@@ -324,7 +324,7 @@ mod tests {
         fn load<'a>(reader: &WeightReader<'a>, arena: Option<&DeviceWeightArena<'a>>)
             -> Result<Vec<Allocation<'a>>> {
             let device = Device { library: reader.library, id: reader.library.cuda_get_device()? };
-            let mut allocate = |name: &str, bytes| crate::shared::memory::weight_arena::weight_allocation(device, arena, name, bytes, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"));
+            let mut allocate = |name: &str, bytes| crate::shared::memory::weight_arena::weight_allocation(device, arena, name, bytes, crate::shared::memory::TEST_ARENA);
             Ok(vec![reader.bf16_with("bf", "bf16", &mut allocate)?,
                 reader.native_with("native", &["fp8".into()], false, &mut allocate)?,
                 reader.f32_with("float", "bf16", &mut allocate)?,
@@ -333,7 +333,7 @@ mod tests {
         }
         let baseline = device.run(|| load(&reader, None))?;
         for recorded in [false, true] {
-            let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/qwen", expected.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+            let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/qwen", expected.clone())?, crate::shared::memory::TEST_ARENA)?;
             let owners = device.run(|| {
                 if recorded {
                     let (owners, records) = recording(|| load(&reader, Some(&arena)))?;

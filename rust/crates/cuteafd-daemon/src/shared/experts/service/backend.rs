@@ -713,7 +713,7 @@ pub(super) fn load_fp8<'a>(
             "physical expert arena startup peak exceeds configured device budget");
         admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
         resident = layout.bytes();
-        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/spark-mount"))?;
         for (owner, group) in owners.iter_mut().zip(&groups) {
             owner.load_mount_into(library, &group.tensors, &group.layers, group.slicing, &arena)?;
         }
@@ -789,7 +789,7 @@ pub(super) fn load_exl3<'a>(
         "physical expert arena startup peak exceeds configured device budget");
     admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
     let remaining = config.device_budget.checked_sub(layout.bytes()).context("EXL3 mount arena exceeds budget")?;
-    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/spark-exl3"))?;
     let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {
         let plan = &plans[index];
         let started = std::time::Instant::now();
