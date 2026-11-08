@@ -79,7 +79,7 @@ fn arena_ordered_upload_receipt_uses_the_offset_zero_alias() -> Result<()> {
     let stream = Stream::new(device)?;
     let mut bound = Vec::new();
     let (drafter, records) = device.run(|| crate::shared::experts::rtx::dense::recording(||
-        DflashDrafter::load_with(&library, &programs, snapshot, Vec::new(), stream.raw, 2, 1,
+        DflashDrafter::load_with(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Native, snapshot, Vec::new(), stream.raw, 2, 1,
             vec![0; cfg.hidden * 2], false, representation, fp8_linear::Fp8Scales::Amax,
             fp8_linear::Fp8Rows::W8a16, Qwen4KvCache::Bf16, |physical, name, bytes| {
                 assert_eq!(physical, 1);
@@ -178,7 +178,7 @@ fn installed_standard_dflash_physical_layout_equals_serving_receipts() -> Result
                     let planned = DflashDrafter::arena_requests(&snapshot, representation, &[0], 0)?;
                     let mut requested = BTreeMap::<i32, Vec<(String, usize)>>::new();
                     let (drafter, records) = crate::shared::experts::rtx::dense::recording(|| {
-                        DflashDrafter::load_with(&library, &programs, &snapshot, Vec::new(), std::ptr::null_mut(),
+                        DflashDrafter::load_with(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Native, &snapshot, Vec::new(), std::ptr::null_mut(),
                             slots, sequences, vec![0; cfg.hidden * 2], false, representation,
                             fp8_linear::Fp8Scales::Amax, mode, kv, |device, name, bytes| {
                                 assert_eq!(device, library.cuda_get_device()?);
@@ -271,7 +271,7 @@ fn installed_tp2_dflash_physical_layout_equals_both_rank_receipts() -> Result<()
                     let planned = DflashDrafter::arena_requests(&snapshot, representation, &[0, 1], lead)?;
                     let mut requested = BTreeMap::<i32, Vec<(String, usize)>>::new();
                     let (drafter, _) = crate::shared::experts::rtx::dense::recording(|| DflashDrafter::load_tp2_on_with(
-                        &library, &programs, &snapshot, Vec::new(), 20, 16, vec![0; cfg.hidden * 2],
+                        &library, &programs, crate::shared::speculation::dflash::TargetProjection::Native, &snapshot, Vec::new(), 20, 16, vec![0; cfg.hidden * 2],
                         true, representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::Wide,
                         kv, exchange.clone(), lead, |device, name, bytes| {
                             assert_eq!(device, library.cuda_get_device()?);
@@ -331,7 +331,7 @@ fn native_tp2_gqa_cross_owner_restore_is_byte_exact() -> Result<()> {
     let cfg = DflashConfig::read(&snapshot)?;
     for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
         for kv in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
-            let draft = DflashDrafter::load_tp2(&library, &programs, &snapshot,
+            let draft = DflashDrafter::load_tp2(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Native, &snapshot,
                 std::fs::read(snapshot.join("model.safetensors"))?, 2, 2, vec![0; cfg.hidden * 2],
                 true, representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16,
                 kv, exchange.clone())?;
@@ -537,7 +537,7 @@ pub(crate) fn with_mla_arena_fixture(mut verify: impl FnMut(&DflashDrafter<'_>,
             let stream = Stream::new(device)?;
             let mut bound = Vec::new();
             let (drafter, records) = device.run(|| crate::shared::experts::rtx::dense::recording(||
-                DflashDrafter::load_mla_with(&library, &programs, "kimik3", snapshot, Vec::new(), stream.raw,
+                DflashDrafter::load_mla_with(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Native, "kimik3", snapshot, Vec::new(), stream.raw,
                     layout.clone(), representation, fp8_linear::Fp8Scales::Amax, fp8_linear::Fp8Rows::W8a16, None,
                     |physical, name, bytes| {
                         assert_eq!(physical, 1);

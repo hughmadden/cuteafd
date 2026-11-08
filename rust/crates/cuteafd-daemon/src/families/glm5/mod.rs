@@ -1402,7 +1402,7 @@ impl Opened {
                         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                         planning.model(&self.cfg, layers, owners.as_deref(), native)
                     }, |_, bytes| planning.allocate_owner("embedding", bytes))?;
-                let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home)?;
+                let drafter = self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home, &model.0.head)?;
                 Ok((embedding, model, drafter))
             })?;
             let (dense_records, deferred) = sink.take();
@@ -1612,7 +1612,7 @@ impl Opened {
         // admission peak is above the same resident target-weight baseline.
         let drafter = match planned_drafter {
             Some(drafter) => drafter,
-            None => self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home)?,
+            None => self.load_drafter(args, &programs, &embedding, stream, &ml4_draft, &mut draft_file, &draft_home, &model.head)?,
         };
         if let Some(drafter) = &drafter { drafter.prepare_workspace()?; }
         self.startup_probe(&devices, "glm/draft-before-kv", None, false)?;
@@ -1793,7 +1793,7 @@ impl Opened {
         embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
-        home: &DraftHome) -> Result<Option<drafter::GlmDrafter<'s>>> {
+        home: &DraftHome, head: &weights::GlmHead<'_>) -> Result<Option<drafter::GlmDrafter<'s>>> {
         let prepared = match home {
             DraftHome::Local => None,
             DraftHome::Peer { device, stream: peer_stream, rows, .. } => Some(crate::shared::draft::remote::Prepared::new(
@@ -1804,7 +1804,10 @@ impl Opened {
         let draft_stream = prepared.as_ref().map_or(stream, |prepared| prepared.stream.raw);
         let draft_device = crate::shared::memory::device::Device { library: &self.library,
             id: prepared.as_ref().map_or(args.device, |prepared| prepared.stream.device.id) };
-        let common = draft_device.own(|| self.load_common_drafter(args, programs, embedding, draft_stream, ml4_draft, draft_file))?;
+        let target_projection = dflash::TargetProjection::from_bf16(matches!(head, weights::GlmHead::Bf16(_)));
+        let draft_projection = if prepared.is_some() { dflash::TargetProjection::Native } else { target_projection };
+        let common = draft_device.own(|| self.load_common_drafter(args, programs, draft_projection,
+            embedding, draft_stream, ml4_draft, draft_file))?;
         let Some(common) = common.into_inner() else { return Ok(None) };
         if let DraftHome::Peer { rows, bridge, .. } = home {
             let c = &common.cfg;
@@ -1819,11 +1822,12 @@ impl Opened {
         Ok(Some(match prepared {
             None => drafter::GlmDrafter::Local(common),
             Some(prepared) => drafter::GlmDrafter::Remote(crate::shared::draft::remote_dflash::RemoteDflash::new(
-                draft_device.own(|| Ok(common))?, prepared)?),
+                draft_device.own(|| Ok(common))?, prepared, target_projection)?),
         }))
     }
 
     fn load_common_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>,
+        target_projection: dflash::TargetProjection,
         embedding: &crate::shared::token_io::TokenEmbedding<'s>, stream: *mut c_void,
         ml4_draft: &Option<cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout>,
         draft_file: &mut Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>)
@@ -1850,7 +1854,7 @@ impl Opened {
                     cuteafd_loader::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
                         snapshot, representation, 0, 1)?)?,
                 cuteafd_core::memory_layout::ArenaTag::drafter_weights("glm/draft"))?;
-            let drafter = dflash::DflashDrafter::load_with(&self.library, programs, snapshot, file, stream,
+            let drafter = dflash::DflashDrafter::load_with(&self.library, programs, target_projection, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
                 mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache,
                 |id, name, bytes| {
@@ -1886,7 +1890,7 @@ impl Opened {
                 cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
                     layout.immutable_arena_requests())?,
                 cuteafd_core::memory_layout::ArenaTag::drafter_weights("glm/draft"))?;
-            let drafter = dflash::DflashDrafter::load_ml4_with(&self.library, programs, native, ml4,
+            let drafter = dflash::DflashDrafter::load_ml4_with(&self.library, programs, target_projection, native, ml4,
                 ml4.logit_softcap as f32, stream, layout, &source, |id, name, bytes| {
                     ensure!(id == device.id, "ML4 draft arena device differs from load binder");
                     arena.view(name, bytes)
@@ -1936,7 +1940,7 @@ impl Opened {
             Some((push, sparks)) => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::push(&self.library);
                 let model = loader.native_model(&self.cfg, layers, &per_rank, owners, &load, vocabulary.clone())?;
-                planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file, draft_home)?);
+                planned_drafter = Some(self.load_drafter(args, programs, &embedding, stream, ml4_draft, draft_file, draft_home, &model.0.head)?);
                 let mut records = recorder.context("native push recorder")?.finish();
                 records.extend(load.sink.as_ref().context("push sink")?.take_all());
                 records.extend(media.clone());

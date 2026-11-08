@@ -19,7 +19,7 @@ def test_bf16_projection_first_capture_and_eager_stream(n, k, rows):
         pytest.skip("requires sealed native CUDA library")
     native = C.CDLL(path)
     for name, args in {
-        "cuteafd_cuda_prepare_cublas_handle": [],
+        "cuteafd_cuda_prepare_cublas_stream": [C.c_void_p],
         "cuteafd_cuda_graph_begin_capture": [C.c_void_p],
         "cuteafd_cuda_graph_end_capture": [C.c_void_p, C.POINTER(C.c_void_p)],
         "cuteafd_cuda_graph_launch": [C.c_void_p, C.c_void_p],
@@ -48,7 +48,8 @@ def test_bf16_projection_first_capture_and_eager_stream(n, k, rows):
                 x.data_ptr(), weight.data_ptr(), None, out.data_ptr(),
                 rows, k, n, stream.cuda_stream) == 0
 
-        assert native.cuteafd_cuda_prepare_cublas_handle() == 0
+        assert native.cuteafd_cuda_prepare_cublas_stream(capture_stream.cuda_stream) == 0
+        assert native.cuteafd_cuda_prepare_cublas_stream(eager_stream.cuda_stream) == 0
         assert native.cuteafd_cuda_graph_begin_capture(capture_stream.cuda_stream) == 0
         try:
             gemm(output, capture_stream)

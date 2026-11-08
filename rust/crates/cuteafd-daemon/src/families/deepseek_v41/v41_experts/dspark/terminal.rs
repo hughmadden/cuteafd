@@ -11,7 +11,7 @@ mod distributed;
 pub(crate) use distributed::DistributedDsparkTerminal;
 
 struct LocalHead<'w, 'a> {
-    kernel: V41VocabularyProjection<'a>,
+    kernel: Option<V41VocabularyProjection<'a>>,
     _workspace: DeviceAllocation<'a>,
     weights: &'w VocabularyHead<'a>,
     /// Scratch of the head copy (`CUTEAFD_V41_FP8_HEAD`; a packed head's coarse plane).
@@ -68,9 +68,11 @@ impl<'library> DsparkWeights<'library> {
         let local_head = head.map(|weights| -> Result<_> {
             ensure!(weights.device_id() == library.cuda_get_device()?, "dSpark head device differs");
             let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::drafter_workspace("v41/draft-terminal"))?;
-            let kernel = unsafe { library.v41_vocabulary_head(workspace.buffer)? };
             let fp8_scratch = crate::families::deepseek_v41::v41_tensors::fp8_scratch(library, weights.copy(),
                 capacity * self.draft_width, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
+            let kernel = if fp8_scratch.is_some() { None } else {
+                Some(unsafe { library.v41_vocabulary_head(workspace.buffer, cuteafd_ffi::programs::HeadMode::Gemm)? })
+            };
             Ok(LocalHead { kernel, _workspace: workspace, weights, fp8_scratch })
         }).transpose()?;
         Ok(DsparkTerminal {
@@ -236,7 +238,7 @@ impl DsparkTerminal<'_, '_> {
         unsafe {
             self.enqueue_normalize_on(requests, stream)?;
             let span = self.timing.begin_retained("head", "head", None, requests * self.width, stream)?;
-            crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, &head.kernel,
+            crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, head.kernel.as_ref(),
                 head.weights.weight(), head.weights.copy().zip(head.fp8_scratch.as_ref()), self.normalized.buffer,
                 self.shared_logits.buffer, requests * self.width, stream)?;
             self.timing.end_retained(span, stream)?;

@@ -30,7 +30,7 @@ pub(super) fn load_drafter<'a>(engine: &DenseEngine<'a>, programs: &'a Programs<
         } else {
             block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft loader panicked"))??
         };
-        DsparkDrafter::load_paged_with(device.library, programs, snapshot, tensors,
+        DsparkDrafter::load_paged_with(device.library, programs, crate::shared::speculation::dflash::TargetProjection::Bf16, snapshot, tensors,
             engine.target_stream().raw, lanes, lanes, mask, GlmDraftRepresentation::Bf16Only,
             Fp8Scales::Amax, Fp8Rows::W8a16, engine.cfg.max_context, engine.pool_tokens,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, |id, name, bytes| {

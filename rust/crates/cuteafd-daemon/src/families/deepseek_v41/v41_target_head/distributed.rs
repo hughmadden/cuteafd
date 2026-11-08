@@ -2,12 +2,12 @@
 use super::*;
 use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Device, DeviceOwner, Stream, Allocation};
-use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
+use crate::families::deepseek_v41::v41_tensors::{Fp8Head, VocabularyShard};
 
 struct Rank<'w, 'a> {
     stream: LoadStream<'a>,
     draft_timing: Option<crate::shared::draft::timing::DraftTiming<'a>>,
-    projection: V41VocabularyProjection<'a>,
+    projection: Option<V41VocabularyProjection<'a>>,
     _workspace: DeviceAllocation<'a>,
     input: DeviceAllocation<'a>,
     logits: DeviceAllocation<'a>,
@@ -26,18 +26,25 @@ fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<Cut
     Ok(CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes, ..buffer })
 }
 impl<'w, 'a> Rank<'w, 'a> {
-    fn new(library: &'a NativeLibrary, weights: &'w VocabularyShard<'a>, capacity: usize) -> Result<Self> {
-        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/target-head"))?;
-        let projection = unsafe { library.v41_vocabulary_shard(workspace.buffer, weights.tokens().len())? };
+    fn new(library: &'a NativeLibrary, weights: &'w VocabularyShard<'a>, capacity: usize, site: Fp8Head) -> Result<Self> {
+        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/blas/target-head"))?;
+        let native = crate::families::deepseek_v41::v41_tensors::fp8_scratch(library, weights.copy(), capacity,
+            site)?;
+        let projection = if native.is_some() { None } else {
+            Some(unsafe { library.v41_vocabulary_shard(workspace.buffer, weights.tokens().len(),
+                crate::shared::target_head::TargetHead::configured().native_mode())? })
+        };
         let input = DeviceAllocation::new(library, capacity * 10240, Tag::workspace("v41/target-head"))?;
         ensure!(input.buffer.device_id == weights.device_id(), "vocabulary rank weight device differs");
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            draft_timing: None,
+            draft_timing: if site == Fp8Head::Draft {
+                Some(crate::shared::draft::timing::DraftTiming::from_env(library, "v41-head")?)
+            } else { None },
             projection, _workspace: workspace, input,
             logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4, Tag::workspace("v41/target-head"))?,
             candidates: DeviceAllocation::new(library, capacity * 8, Tag::workspace("v41/target-head"))?,
-            weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity)), fp8_scratch: None,
+            weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity)), fp8_scratch: native,
             sm: Some(library.v41_peer_copy()?),
         })
     }
@@ -48,7 +55,7 @@ impl<'w, 'a> Rank<'w, 'a> {
     unsafe fn enqueue(&self, rows: usize, greedy: bool) -> Result<()> {
         let lib = self.stream.library;
         unsafe {
-            crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(lib, &self.projection, self.weights.weight(),
+            crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(lib, self.projection.as_ref(), self.weights.weight(),
                 self.weights.copy().zip(self.fp8_scratch.as_ref()), self.input.buffer, self.logits.buffer, rows,
                 self.stream.raw)?;
             if greedy {
@@ -169,25 +176,8 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         Ok([V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + split * 4 + 8),
             V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + (129280 - split) * 4 + 24)])
     }
-    /// Projects through the shards' copies when `site` uses them
-    /// (`CUTEAFD_V41_FP8_HEAD`; `Fp8Head::All` for target logits, `Fp8Head::Draft`
-    /// for the drafter); call before the first execution.
-    pub fn use_fp8(&mut self, site: crate::families::deepseek_v41::v41_tensors::Fp8Head) -> Result<()> {
-        let capacity = self.capacity;
-        for rank in &mut self.ranks {
-            let device = rank.device;
-            let rank = rank.get_mut();
-            rank.fp8_scratch = device.run(|| crate::families::deepseek_v41::v41_tensors::fp8_scratch(device.library,
-                rank.weights.copy(), capacity, site))?;
-            if matches!(site, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft) {
-                rank.draft_timing = Some(device.run(|| crate::shared::draft::timing::DraftTiming::from_env(
-                    device.library, "v41-head"))?);
-            }
-        }
-        Ok(())
-    }
     pub fn new(devices: [Device<'a>; 2], weights: [&'w VocabularyShard<'a>; 2],
-        capacity: usize, budgets: [usize; 2]) -> Result<Self> {
+        capacity: usize, budgets: [usize; 2], site: Fp8Head) -> Result<Self> {
         let split = weights[0].tokens().end;
         ensure!(weights[0].tokens() == (0..split) && weights[1].tokens() == (split..129280),
             "vocabulary shards do not partition the full vocabulary");
@@ -199,8 +189,8 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
             devices[rank].run(|| devices[rank].library.cuda_enable_peer(devices[1-rank].id))?;
         }
         Ok(Self {
-            ranks: [devices[0].own(|| Rank::new(devices[0].library, weights[0], capacity))?,
-                devices[1].own(|| Rank::new(devices[1].library, weights[1], capacity))?],
+            ranks: [devices[0].own(|| Rank::new(devices[0].library, weights[0], capacity, site))?,
+                devices[1].own(|| Rank::new(devices[1].library, weights[1], capacity, site))?],
             merge_stream: Stream::new(devices[1])?,
             remote: Allocation::new(devices[1], capacity * 8, Tag::transport("v41/target-merge"))?,
             merged: Allocation::new(devices[1], capacity * 8, Tag::workspace("v41/target-merge"))?,
@@ -468,7 +458,7 @@ mod tests {
         let lib = fixture.load()?;
         fixture.extent_only(&lib)?;
         let weights = VocabularyShard::without_resident_weights_for_test();
-        let mut rank = Rank::new(&lib, &weights, 1)?;
+        let mut rank = Rank::new(&lib, &weights, 1, Fp8Head::All)?;
         rank.graphs[0].declare_startup(&[1])?;
         fixture.configure_capture(&lib, 98)?;
         // SAFETY: the real enqueue guard rejects absent resident weights before launching;
@@ -493,7 +483,7 @@ mod tests {
         let b = devices[1].own(|| VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?;
         let full = devices[1].own(|| VocabularyHead::load(&lib, &catalog, 2 << 30, 16 << 20))?;
         let workspace = Allocation::new(devices[1], V41VocabularyProjection::WORKSPACE_BYTES, crate::shared::memory::TEST)?;
-        let projection = devices[1].own(|| unsafe { lib.v41_vocabulary_head(workspace.buffer) })?;
+        let projection = devices[1].own(|| unsafe { lib.v41_vocabulary_head(workspace.buffer, cuteafd_ffi::programs::HeadMode::Gemm) })?;
         let full_stream = Stream::new(devices[1])?;
         let full_logits = Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?;
         let input = Allocation::new(devices[1], 80 * 10240, crate::shared::memory::TEST)?;
@@ -509,8 +499,8 @@ mod tests {
         }).collect();
         devices[1].run(|| lib.copy_h2d(other_input.buffer, &other_values))?;
         let budgets = DistributedVocabularyWave::device_bytes(80, 64640)?;
-        let mut first = DistributedVocabularyWave::new(devices, [&a, &b], 80, budgets)?;
-        let mut second = DistributedVocabularyWave::new(devices, [&a, &b], 80, budgets)?;
+        let mut first = DistributedVocabularyWave::new(devices, [&a, &b], 80, budgets, Fp8Head::All)?;
+        let mut second = DistributedVocabularyWave::new(devices, [&a, &b], 80, budgets, Fp8Head::All)?;
         let assembled = [Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?,
             Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?];
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;

@@ -859,7 +859,7 @@ struct Workspace<'a> {
     staging: RefCell<crate::shared::token_table::RetainedUploads<'a>>,
     /// Pinned landing of the logits rows.
     logits_host: RefCell<HostAllocation<'a>>,
-    head: VocabularyHead<'a>,
+    head: Option<VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
 }
 
@@ -2260,8 +2260,10 @@ impl<'a> Qwen4Engine<'a> {
             staging: RefCell::new(crate::shared::token_table::RetainedUploads::new(
                 Device { library: self.library, id: self.library.cuda_get_device()? }, host.uploads)?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
-                self.cfg.vocab_size as u32)? },
+            head: if matches!(self.weights.head, Qwen4Head::Bf16(_)) {
+                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
+                    self.cfg.vocab_size as u32, crate::shared::target_head::TargetHead::configured().native_mode())? })
+            } else { None },
             _head_workspace: head_workspace,
         })
     }
@@ -3407,7 +3409,7 @@ impl<'a> Qwen4Engine<'a> {
         match &self.weights.head {
             // SAFETY: `x` holds `rows` head inputs; the head and the logits rows are live buffers of these shapes.
             Qwen4Head::Bf16(head) => unsafe {
-                crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(), &w.head,
+                crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(), w.head.as_ref().context("BF16 head not constructed")?,
                     x.cast_const(), head.buffer.ptr.cast_const(), Self::region(&w.logits, w.logit_offset.get() * vocab * 4, rows * vocab * 4).ptr.cast(), rows, self.execution_stream())
             },
             Qwen4Head::Fp8 { values, scales } => {

@@ -262,11 +262,11 @@ fn pack_packed_in<'a>(library: &'a NativeLibrary, weight: DeviceAllocation<'a>, 
 /// As [`cuteafd_ffi::V41VocabularyProjection::launch`]; `scratch` was sized by
 /// [`fp8_scratch`] for at least `rows` rows of this head.
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn project_vocabulary(library: &NativeLibrary, projection: &cuteafd_ffi::V41VocabularyProjection<'_>,
+pub(crate) unsafe fn project_vocabulary(library: &NativeLibrary, projection: Option<&cuteafd_ffi::V41VocabularyProjection<'_>>,
     bf16: Option<CuteafdDeviceBuffer>, copy: Option<(HeadCopy<'_, '_>, &HeadScratch<'_>)>,
     input: CuteafdDeviceBuffer, logits: CuteafdDeviceBuffer, rows: usize, stream: *mut std::ffi::c_void) -> Result<()> {
     let Some((copy, scratch)) = copy else {
-        return unsafe { projection.launch(input, bf16.context("BF16 vocabulary is not resident; head copy scratch required")?,
+        return unsafe { projection.context("BF16 head projection not constructed")?.launch(input, bf16.context("BF16 vocabulary is not resident; head copy scratch required")?,
             logits, rows, stream) };
     };
     ensure!(input.bytes >= rows * 10240 && logits.bytes >= rows * copy.shape().0 * 4
@@ -288,12 +288,12 @@ pub(crate) unsafe fn project_vocabulary(library: &NativeLibrary, projection: &cu
 /// As [`project_vocabulary`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn project_target_vocabulary(library: &NativeLibrary,
-    projection: &cuteafd_ffi::V41VocabularyProjection<'_>, bf16: Option<CuteafdDeviceBuffer>,
+    projection: Option<&cuteafd_ffi::V41VocabularyProjection<'_>>, bf16: Option<CuteafdDeviceBuffer>,
     copy: Option<(HeadCopy<'_, '_>, &HeadScratch<'_>)>, input: CuteafdDeviceBuffer,
     logits: CuteafdDeviceBuffer, rows: usize, stream: *mut std::ffi::c_void) -> Result<()> {
     if copy.is_none() && crate::shared::target_head::TargetHead::configured().tensor_cores() {
         let weight = bf16.context("BF16 vocabulary is not resident; head copy scratch required")?;
-        return unsafe { projection.launch_tensor_invariant(input, weight, logits, rows, stream) };
+        return unsafe { projection.context("BF16 target projection not constructed")?.launch_tensor_invariant(input, weight, logits, rows, stream) };
     }
     unsafe { project_vocabulary(library, projection, bf16, copy, input, logits, rows, stream) }
 }

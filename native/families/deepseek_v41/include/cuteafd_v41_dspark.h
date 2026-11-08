@@ -20,7 +20,7 @@ int32_t cuteafd_v41_markov_launch(void* handle, const uint16_t* embedding,
 // Shared vocabulary head: same ownership/status contract as Markov, but
 // BF16 input [rows,5120], weight [129280,5120], FP32 output [rows,129280], rows 1..128.
 // Release with cuteafd_v41_markov_destroy after destroying captured graphs.
-int32_t cuteafd_v41_vocabulary_head_create(void* workspace, uint64_t bytes, void** handle);
+int32_t cuteafd_v41_vocabulary_head_create(void* workspace, uint64_t bytes, int32_t mode, void** handle);
 int32_t cuteafd_v41_vocabulary_head_launch(void* handle, const uint16_t* input,
     const uint16_t* weight, float* output, int32_t rows, void* stream);
 // Contiguous vocabulary shard: BF16 weight [vocab_rows,5120], FP32 output
@@ -28,7 +28,7 @@ int32_t cuteafd_v41_vocabulary_head_launch(void* handle, const uint16_t* input,
 // local column j corresponds to the caller's shard-start token plus j.
 // Same per-wave workspace/device/graph lifetime and destruction contract.
 int32_t cuteafd_v41_vocabulary_shard_create(void* workspace, uint64_t bytes,
-    int32_t vocab_rows, void** handle);
+    int32_t vocab_rows, int32_t mode, void** handle);
 // Merge checked local argmax candidates for contiguous shards [0,split) and
 // [split,129280). Six arrays of rows elements on the stream's device; rows
 // 1..128, split 1..129279. Lower global token wins ties. Any invalid local ID or

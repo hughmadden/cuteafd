@@ -86,15 +86,16 @@ impl NativeLibrary {
         &self,
         workspace: CuteafdDeviceBuffer,
     ) -> Result<V41VocabularyProjection<'_>> {
-        unsafe { self.v41_head_projection(workspace, false) }
+        unsafe { self.v41_head_projection(workspace, None) }
     }
     /// # Safety
     /// Same workspace/device/graph lifetime contract as v41_dspark_markov.
     pub unsafe fn v41_vocabulary_head(
         &self,
         workspace: CuteafdDeviceBuffer,
+        mode: crate::programs::HeadMode,
     ) -> Result<V41VocabularyProjection<'_>> {
-        unsafe { self.v41_head_projection(workspace, true) }
+        unsafe { self.v41_head_projection(workspace, Some(mode)) }
     }
     /// Create a projection for one contiguous set of vocabulary rows.
     ///
@@ -105,14 +106,15 @@ impl NativeLibrary {
         &self,
         workspace: CuteafdDeviceBuffer,
         vocab_rows: usize,
+        mode: crate::programs::HeadMode,
     ) -> Result<V41VocabularyProjection<'_>> {
         ensure!((1..=129280).contains(&vocab_rows), "invalid vocabulary shard rows");
-        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, *mut *mut c_void) -> i32;
+        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, *mut *mut c_void) -> i32;
         let create = unsafe { *self.lib.get::<Create>(b"cuteafd_v41_vocabulary_shard_create")? };
         let launch = unsafe { *self.lib.get::<MarkovLaunch>(b"cuteafd_v41_vocabulary_head_launch")? };
         let destroy = unsafe { *self.lib.get::<MarkovDestroy>(b"cuteafd_v41_markov_destroy")? };
         let mut handle = std::ptr::null_mut();
-        let status = unsafe { create(workspace.ptr, workspace.bytes as u64, vocab_rows as i32, &mut handle) };
+        let status = unsafe { create(workspace.ptr, workspace.bytes as u64, vocab_rows as i32, mode as i32, &mut handle) };
         ensure!(status == 0 && !handle.is_null(), "vocabulary shard initialization status {status}");
         let launch_tensor_op = unsafe { self.lib.get::<MarkovLaunch>(b"cuteafd_vocabulary_head_launch_tensor_op") }
             .ok().map(|f| *f);
@@ -153,8 +155,9 @@ impl NativeLibrary {
     unsafe fn v41_head_projection(
         &self,
         workspace: CuteafdDeviceBuffer,
-        full: bool,
+        mode: Option<crate::programs::HeadMode>,
     ) -> Result<V41VocabularyProjection<'_>> {
+        let full = mode.is_some();
         let create_name: &[u8] = if full {
             b"cuteafd_v41_vocabulary_head_create"
         } else {
@@ -165,7 +168,6 @@ impl NativeLibrary {
         } else {
             b"cuteafd_v41_markov_launch"
         };
-        let create = unsafe { *self.lib.get::<MarkovCreate>(create_name)? };
         let launch = unsafe { *self.lib.get::<MarkovLaunch>(launch_name)? };
         let destroy = unsafe {
             *self
@@ -173,7 +175,14 @@ impl NativeLibrary {
                 .get::<MarkovDestroy>(b"cuteafd_v41_markov_destroy")?
         };
         let mut handle = std::ptr::null_mut();
-        let status = unsafe { create(workspace.ptr, workspace.bytes as u64, &mut handle) };
+        let status = if let Some(mode) = mode {
+            type HeadCreate = unsafe extern "C" fn(*mut c_void, u64, i32, *mut *mut c_void) -> i32;
+            let create = unsafe { *self.lib.get::<HeadCreate>(create_name)? };
+            unsafe { create(workspace.ptr, workspace.bytes as u64, mode as i32, &mut handle) }
+        } else {
+            let create = unsafe { *self.lib.get::<MarkovCreate>(create_name)? };
+            unsafe { create(workspace.ptr, workspace.bytes as u64, &mut handle) }
+        };
         ensure!(
             status == 0 && !handle.is_null(),
             "Markov initialization status {status}"

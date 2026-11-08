@@ -1808,7 +1808,7 @@ impl IoLayout {
         let head = workspace.as_ref().map(|workspace| device.own(|| {
             // SAFETY: lane-local workspace remains after the head and all stream readers drain.
             unsafe { device.library.vocabulary_head_rows(workspace.buffer.ptr, self.hidden as u32,
-                self.rows.min(64) as u32, self.vocab as u32) }
+                self.rows.min(64) as u32, self.vocab as u32, crate::shared::target_head::TargetHead::configured().native_mode()) }
         })).transpose()?;
         Ok(TokenIo { stream, head, workspace, ids, logits, weights, layout: self.clone() })
     }

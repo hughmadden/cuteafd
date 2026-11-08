@@ -702,6 +702,16 @@ impl<'a> MimoDrafter<'a> {
         })
     }
 
+    pub(crate) fn prepare_workspace(&self) -> Result<()> {
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.workspace(self.max_sequences)?);
+        }
+        if let Some(peer) = &self.peer {
+            peer.device.run(|| peer.prepare_workspace())?;
+        }
+        Ok(())
+    }
+
     /// Drafter weights as their `mimo.dflash.rank{r}` arena backing plus view
     /// aliases, live from DraftLoad (after target KV) through Growth.
     pub(crate) fn allocation_receipts(&self, devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
@@ -907,7 +917,7 @@ impl<'a> MimoDrafter<'a> {
                     topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
                     // SAFETY: the workspace outlives this head's plan and uses the lead device.
                     head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                        rows as u32, c.vocab as u32)? },
+                        rows as u32, c.vocab as u32, cuteafd_ffi::programs::HeadMode::Gemm)? },
                     _head_workspace: head_workspace,
                 })
             }).transpose()?,

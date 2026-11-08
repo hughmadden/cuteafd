@@ -56,6 +56,13 @@ impl TargetHead {
         })
     }
 
+    pub fn native_mode(self) -> cuteafd_ffi::programs::HeadMode {
+        match self {
+            Self::Tensor => cuteafd_ffi::programs::HeadMode::TensorLt,
+            Self::Exact => cuteafd_ffi::programs::HeadMode::Gemm,
+        }
+    }
+
     /// Whether this setting takes tensor cores (every row count, or none).
     pub fn tensor_cores(self) -> bool {
         self == Self::Tensor

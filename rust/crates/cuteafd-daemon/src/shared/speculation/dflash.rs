@@ -524,10 +524,22 @@ struct Workspace<'a> {
     head: Option<HeadWorkspace<'a>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetProjection {
+    Bf16,
+    Native,
+}
+
+impl TargetProjection {
+    pub(crate) fn from_bf16(bf16: bool) -> Self {
+        if bf16 { Self::Bf16 } else { Self::Native }
+    }
+}
+
 struct HeadWorkspace<'a> {
     logits: Dev<'a>, anchors: Dev<'a>, ids: Dev<'a>, tokens: Dev<'a>,
     landing: crate::shared::memory::HostAllocation<'a>,
-    head: VocabularyHead<'a>, _head_workspace: Dev<'a>,
+    head: Option<VocabularyHead<'a>>, _head_workspace: Dev<'a>,
     unary: Option<Dev<'a>>, candidates: Option<Dev<'a>>, projected: Option<Dev<'a>>,
     features: Option<Dev<'a>>, topk_workspace: Option<Dev<'a>>,
 }
@@ -588,13 +600,16 @@ impl<'a> Workspace<'a> {
         self.dflash.as_ref().context("DFlash-only workspace requested by plain drafter")
     }
 
-    fn admitted_mla(library: &'a NativeLibrary, cfg: &DflashConfig, sequences: usize,
+    fn admitted_mla(library: &'a NativeLibrary, cfg: &DflashConfig, sequences: usize, target_projection: TargetProjection,
         layout: &cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         owners: &mut AdmittedBuffers<Dev<'a>>) -> Result<Self> {
         let head_workspace = owners.take("head_workspace")?;
-        // SAFETY: the admitted head workspace outlives this borrowed native handle.
-        let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr,
-            cfg.hidden as u32, (sequences * cfg.block) as u32, cfg.vocab as u32)? };
+        let head = if target_projection == TargetProjection::Bf16 {
+            // SAFETY: the admitted head workspace outlives this borrowed native handle.
+            Some(unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr,
+                cfg.hidden as u32, (sequences * cfg.block) as u32, cfg.vocab as u32,
+                cuteafd_ffi::programs::HeadMode::Gemm)? })
+        } else { None };
         let plain = layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark;
         let dflash = if plain { None } else { Some(DflashWorkspace {
             conv: owners.take("conv")?, dynamic: owners.take("dynamic")?,
@@ -842,6 +857,7 @@ pub(crate) struct DflashDrafter<'a> {
     mask_rows: Option<Dev<'a>>,
     /// The recurrent Markov head's workspace (mtp_dspark).
     markov_workspace: Option<Dev<'a>>,
+    target_projection: TargetProjection,
     workspace: RefCell<Option<Workspace<'a>>>,
     startup_primed: Cell<bool>,
     representation: GlmDraftRepresentation,
@@ -1072,22 +1088,22 @@ impl<'a> DflashDrafter<'a> {
     /// the mask token. `fp8_rows` is how the FP8 GEMMs run (their scratch serves
     /// it and the modes before it, see [`Self::set_draft_linear`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
-        Self::load_with(library, programs, snapshot, file, stream, slots, max_sequences, mask_row,
+        Self::load_with(library, programs, target_projection, snapshot, file, stream, slots, max_sequences, mask_row,
             row_window, representation, scales, fp8_rows, kv_cache,
             |device, name, bytes| super::weights::standalone(library, device, name, bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize, max_sequences: usize,
         mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         mut allocate: impl FnMut(i32, &str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
-        Self::load_rank(library, programs, snapshot, Some(Rc::new(file)), stream, slots, max_sequences,
+        Self::load_rank(library, programs, target_projection, snapshot, Some(Rc::new(file)), stream, slots, max_sequences,
             mask_row, row_window, representation, scales, fp8_rows, kv_cache, 0, 1, &mut allocate)
     }
 
@@ -1118,40 +1134,40 @@ impl<'a> DflashDrafter<'a> {
 
     /// Reuses the target's peer exchange and cooperative streams; no extra transport owners.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_tp2(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_tp2(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         snapshot: &Path, file: Vec<u8>, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         exchange: Rc<PeerExchange<'a>>) -> Result<Self> {
-        Self::load_tp2_on(library, programs, snapshot, file, slots, max_sequences, mask_row,
+        Self::load_tp2_on(library, programs, target_projection, snapshot, file, slots, max_sequences, mask_row,
             row_window, representation, scales, fp8_rows, kv_cache, exchange, 0)
     }
 
     /// The target head may live on either exchange rank; keep its selector local.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_tp2_on(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_tp2_on(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         snapshot: &Path, file: Vec<u8>, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         exchange: Rc<PeerExchange<'a>>, head_rank: usize) -> Result<Self> {
-        Self::load_tp2_on_with(library, programs, snapshot, file, slots, max_sequences, mask_row,
+        Self::load_tp2_on_with(library, programs, target_projection, snapshot, file, slots, max_sequences, mask_row,
             row_window, representation, scales, fp8_rows, kv_cache, exchange, head_rank,
             |device, name, bytes| super::weights::standalone(library, device, name, bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_tp2_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_tp2_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         snapshot: &Path, file: Vec<u8>, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         exchange: Rc<PeerExchange<'a>>,
         allocate: impl FnMut(i32, &str, usize) -> Result<Allocation<'a>>) -> Result<Self> {
-        Self::load_tp2_on_with(library, programs, snapshot, file, slots, max_sequences, mask_row,
+        Self::load_tp2_on_with(library, programs, target_projection, snapshot, file, slots, max_sequences, mask_row,
             row_window, representation, scales, fp8_rows, kv_cache, exchange, 0, allocate)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_tp2_on_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_tp2_on_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         snapshot: &Path, file: Vec<u8>, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -1160,10 +1176,10 @@ impl<'a> DflashDrafter<'a> {
         ensure!(head_rank < 2 && library.cuda_get_device()? == exchange.device(head_rank),
             "invalid DFlash head rank or current device");
         let file = Rc::new(file);
-        let mut lead = Self::load_rank(library, programs, snapshot, Some(file.clone()), exchange.stream(head_rank), slots,
+        let mut lead = Self::load_rank(library, programs, target_projection, snapshot, Some(file.clone()), exchange.stream(head_rank), slots,
             max_sequences, mask_row.clone(), row_window, representation, scales, fp8_rows, kv_cache, 0, 2, &mut allocate)?;
         let device = Device { library, id: exchange.device(1 - head_rank) };
-        let peer = device.own(|| Self::load_rank(library, programs, snapshot, Some(file), exchange.stream(1 - head_rank), slots,
+        let peer = device.own(|| Self::load_rank(library, programs, target_projection, snapshot, Some(file), exchange.stream(1 - head_rank), slots,
             max_sequences, mask_row, row_window, representation, scales, fp8_rows, kv_cache, 1, 2, &mut allocate).map(Box::new))?;
         let bytes = max_sequences * lead.cfg.block * lead.cfg.hidden * 2;
         let reduced = DeviceAllocation::new(library, bytes, Tag::drafter_workspace("shared/dflash-reduce"))?;
@@ -1173,7 +1189,7 @@ impl<'a> DflashDrafter<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn load_rank(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path,
+    fn load_rank(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection, snapshot: &Path,
         file: Option<Rc<Vec<u8>>>, stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         row_window: bool, representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -1252,7 +1268,7 @@ impl<'a> DflashDrafter<'a> {
             mask_row,
             mask_rows: None,
             markov_workspace: None,
-            workspace: RefCell::new(None),
+            target_projection, workspace: RefCell::new(None),
             startup_primed: Cell::new(false),
             representation,
             confidence_directory: snapshot.into(),
@@ -1271,19 +1287,19 @@ impl<'a> DflashDrafter<'a> {
     /// Called inside the one admitted `device.own` callback, before target weights.
     /// Programs and headers are checked before the exact arenas are allocated.
     #[allow(clippy::too_many_arguments, dead_code)]
-    pub(crate) fn load_mla(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_mla(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         program_namespace: &str, snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows,
         split: Option<context_split::ContextOwner<'a>>) -> Result<Self> {
-        Self::load_mla_with(library, programs, program_namespace, snapshot, file, stream, layout,
+        Self::load_mla_with(library, programs, target_projection, program_namespace, snapshot, file, stream, layout,
             representation, scales, fp8_rows, split,
             |device, name, bytes| super::weights::standalone(library, device, name, bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_mla_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_mla_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         program_namespace: &str, snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
@@ -1330,7 +1346,7 @@ impl<'a> DflashDrafter<'a> {
                 gate_up: weight.gate_up, down: weight.down,
             });
         }
-        let workspace = Workspace::admitted_mla(library, &cfg, layout.capacity().max_batch_sequences, &layout, &mut owners)?;
+        let workspace = Workspace::admitted_mla(library, &cfg, layout.capacity().max_batch_sequences, target_projection, &layout, &mut owners)?;
         let AttentionWorkspace::Mla(attention) = &workspace.attention else { unreachable!() };
         library.copy_h2d(draft_view(attention.inverse_frequencies.buffer, 0,
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
@@ -1344,7 +1360,7 @@ impl<'a> DflashDrafter<'a> {
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 split, layout, slots: owners.take("context_slots")? }),
-            mask_row: Vec::new(), mask_rows: None, markov_workspace: None, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
+            mask_row: Vec::new(), mask_rows: None, markov_workspace: None, target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
             confidence_directory: snapshot.into(), confidence_scales: scales,
@@ -1362,17 +1378,17 @@ impl<'a> DflashDrafter<'a> {
     /// pre-norm layers (attention_norm, MLA, ffn_norm, SwiGLU), position-specific
     /// mask rows, the target's soft-capped head and the RNN Markov head.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_ml4(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_ml4(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         native: cuteafd_loader::formats::dflash::MlaDflashConfig,
         target: &cuteafd_loader::families::mistral_large4::Ml4Config, softcap: f32, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         source: &dyn Fn(&str, &[usize]) -> Result<crate::shared::experts::rtx::dense::Rect>) -> Result<Self> {
-        Self::load_ml4_with(library, programs, native, target, softcap, stream, layout, source,
+        Self::load_ml4_with(library, programs, target_projection, native, target, softcap, stream, layout, source,
             |device, name, bytes| super::weights::standalone(library, device, name, bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn load_ml4_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+    pub(crate) fn load_ml4_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: TargetProjection,
         native: cuteafd_loader::formats::dflash::MlaDflashConfig,
         target: &cuteafd_loader::families::mistral_large4::Ml4Config, softcap: f32, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
@@ -1436,7 +1452,7 @@ impl<'a> DflashDrafter<'a> {
                 down: DraftWeight::Bf16(tensor(&mut owners, &format!("{p}.feed_forward.w2.weight"), &[h, inter])?),
             });
         }
-        let workspace = Workspace::admitted_mla(library, &cfg, layout.capacity().max_batch_sequences, &layout, &mut owners)?;
+        let workspace = Workspace::admitted_mla(library, &cfg, layout.capacity().max_batch_sequences, target_projection, &layout, &mut owners)?;
         let AttentionWorkspace::Mla(attention) = &workspace.attention else { unreachable!() };
         // The draft's FP32 cos|sin table (YaRN, no LeRoPE) in the producer's rotary slot.
         let table = target.rope_table(&vec![0.0; native.mla.rope / 2], layout.program().context)?;
@@ -1466,7 +1482,7 @@ impl<'a> DflashDrafter<'a> {
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 split: None, layout, slots: owners.take("context_slots")? }),
             mask_row: Vec::new(), mask_rows: Some(masks), markov_workspace: Some(markov_workspace),
-            workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false),
+            target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false),
             representation: GlmDraftRepresentation::Bf16Only, fp8_workspace: None,
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_linear::Fp8Rows::default()),
             fp8_admitted: fp8_linear::Fp8Rows::default(), confidence_directory: std::path::PathBuf::new(),
@@ -2456,9 +2472,11 @@ impl<'a> DflashDrafter<'a> {
         let alloc = |id: &str| DeviceAllocation::new(self.library, physical.owner_bytes(&format!("workspace.{id}"))?, Tag::drafter_workspace("shared/dflash-workspace"));
         let head = if has_head {
             let head_workspace = alloc("head")?;
-            // SAFETY: the retained scratch outlives this borrowed handle.
-            let head = unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                rows as u32, c.vocab as u32)? };
+            let head = if self.target_projection == TargetProjection::Bf16 {
+                // SAFETY: the retained scratch outlives this borrowed handle.
+                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
+                    rows as u32, c.vocab as u32, cuteafd_ffi::programs::HeadMode::Gemm)? })
+            } else { None };
             Some(HeadWorkspace { head, _head_workspace: head_workspace,
                 logits: alloc("logits")?, anchors: alloc("anchors")?, ids: alloc("ids")?, tokens: alloc("tokens")?,
                 landing: crate::shared::memory::HostAllocation::new(self.library, physical.owner_bytes("workspace.landing")?, Tag::staging("shared/dflash-landing"))?,
@@ -2771,9 +2789,9 @@ impl<'a> DflashDrafter<'a> {
             }
             let head_span = self.timing.begin("head_topk", None, rows, s)?;
             match &head {
-                HeadCall::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head()?.head,
+                HeadCall::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(w.head()?.head.as_ref().context("BF16 draft projection was not prepared before serving")?,
                     w.n.buffer.ptr.cast(), weight.cast(), w.head()?.logits.buffer.ptr.cast(), rows, s)?,
-                HeadCall::Bf16(weight) => launch_draft_head(l, &w.head()?.head, w.n.buffer.ptr, *weight,
+                HeadCall::Bf16(weight) => launch_draft_head(l, w.head()?.head.as_ref().context("BF16 draft projection was not prepared before serving")?, w.n.buffer.ptr, *weight,
                     w.head()?.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.head()?.logits.buffer.ptr.cast(), rows, s)?,
             }

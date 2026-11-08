@@ -32,6 +32,7 @@ struct Owner {
   cuteafd_vision_ledger ledger{};
   int device = 0;
   cudaStream_t stream = nullptr;
+  std::shared_ptr<cuteafd::BlasOwner> blas_owner;
   cublasHandle_t blas = nullptr;
   unsigned char *weights = nullptr, *arena = nullptr;
   float *x = nullptr, *xt = nullptr, *qkv = nullptr, *proj = nullptr, *gu = nullptr, *fc1 = nullptr, *fc2 = nullptr;
@@ -137,6 +138,9 @@ __global__ void cast_float(const uint16_t* x, float* y, size_t n) {
   if(i<n)y[i]=__bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(x+i));
 }
 int gemm(Owner* o, const uint16_t* x, uint64_t offset, int m, int n, int k, float* y) {
+  int bound=blas_status(cuteafd::bind_blas(o->blas_owner,o->stream,o->workspace,BLAS_BYTES,
+      CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,CUBLAS_ATOMICS_NOT_ALLOWED));
+  if(bound)return bound;
   const float one=1,zero=0;
   // Exclusive handle/workspace and stream, atomics/reduced reduction disabled. The
   // cuBLAS version participates in the encoder identity at integration time.
@@ -226,7 +230,7 @@ static int32_t release_owner(Owner* o, uint32_t* released) {
   if(o->attention) { int rc=cuteafd_vision_attention_destroy(o->attention);if(!first)first=rc; }
 #endif
   o->window_attention=nullptr; o->attention=nullptr;
-  if(o->blas) { cublasDestroy(o->blas); o->blas=nullptr; }
+  o->blas_owner.reset(); o->blas=nullptr;
   if(o->weights) { int rc=cudaFree(o->weights); if(rc==0){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;} else if(!first)first=rc; }
   if(o->arena) { int rc=cudaFree(o->arena); if(rc==0){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;} else if(!first)first=rc; }
   if(o->stream) { int rc=cudaStreamDestroy(o->stream); if(!first)first=rc; o->stream=nullptr; }
@@ -277,8 +281,8 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   }
 #endif
   if(ledger.blas_workspace) {
-    // Third-party residual: cuBLAS internal context/workspace bytes; handle ownership is unchanged.
-    e=blas_status(CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&o->blas), 0, 0, nullptr));if(e)return fail(e);
+    e=blas_status(cuteafd::borrow_blas(false,o->blas_owner));if(e)return fail(e);
+    o->blas=o->blas_owner->gemm;
     e=blas_status(cublasSetMathMode(o->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));if(e)return fail(e);
     e=blas_status(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);
     e=blas_status(cublasSetStream(o->blas,o->stream));if(e)return fail(e);

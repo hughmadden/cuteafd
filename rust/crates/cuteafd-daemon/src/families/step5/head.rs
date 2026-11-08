@@ -193,7 +193,7 @@ impl<'a> TargetHeadOwner<'a> {
                 crate::shared::memory::Tag::workspace("step5/target-scratch"))?;
             // SAFETY: private workspace survives the private handle on this device.
             let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
-                H as u32, rows as u32, V as u32)? };
+                H as u32, rows as u32, V as u32, crate::shared::target_head::TargetHead::configured().native_mode())? };
             let stream = scratch::standalone(device, arena);
             Ok(Self { stream, head, planes, rows, immutable })
         })

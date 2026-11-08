@@ -353,7 +353,9 @@ cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_even
 cuteafd_status_t cuteafd_cuda_graph_census_begin(void* cuda_stream, const char* bank,
     uint64_t rows, int32_t replay, int32_t arm, void** token);
 cuteafd_status_t cuteafd_cuda_graph_census_end(void* token);
-// Required on the calling thread/device before capturing a shared cuBLAS GEMM.
+// Prepare before Ready/capture, on the execution thread/device. Each stream
+// retains its own 4 MiB workspace; the no-argument form prepares stream zero.
+cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_prepare_cublas_handle();
 cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_graph_end_capture(void* cuda_stream, void** out_cuda_graph_exec);

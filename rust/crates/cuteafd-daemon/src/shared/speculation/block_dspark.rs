@@ -222,7 +222,7 @@ struct Workspace<'a> {
     tables: Dev<'a>,
     attention_workspace: Dev<'a>,
     markov_workspace: Dev<'a>,
-    head: VocabularyHead<'a>,
+    head: Option<VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
 }
 
@@ -323,6 +323,7 @@ pub(crate) struct DsparkDrafter<'a> {
     context_positions: Dev<'a>,
     context_slots: Dev<'a>,
     mask_row: Vec<u8>,
+    target_projection: super::dflash::TargetProjection,
     workspace: RefCell<Option<Workspace<'a>>>,
     representation: GlmDraftRepresentation,
     /// GEMV scratch of the FP8 representation (every context/draft row count).
@@ -378,62 +379,62 @@ impl<'a> DsparkDrafter<'a> {
     /// `mask_row` is the target embedding of the mask token; `fp8_rows` how the
     /// FP8 GEMMs run.
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
         slots: usize, max_sequences: usize, mask_row: Vec<u8>, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
-        Self::load_with(library, programs, snapshot, tensors, stream, slots, max_sequences, mask_row,
+        Self::load_with(library, programs, target_projection, snapshot, tensors, stream, slots, max_sequences, mask_row,
             representation, scales, fp8_rows, kv_cache,
             |device, name, bytes| super::weights::standalone(library, device, name, bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn load_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
+    pub fn load_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
         slots: usize, max_sequences: usize, mask_row: Vec<u8>, representation: GlmDraftRepresentation,
         scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         mut allocate: impl FnMut(i32, &str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>) -> Result<Self> {
         let cfg = DsparkConfig::read(snapshot)?;
         let capacity = cfg.window.context("full-context dSpark requires explicit admitted context capacity")?;
-        Self::load_admitted_with(library, programs, snapshot, tensors, stream, slots, max_sequences, mask_row,
+        Self::load_admitted_with(library, programs, target_projection, snapshot, tensors, stream, slots, max_sequences, mask_row,
             representation, scales, fp8_rows, capacity, kv_cache, &mut allocate)
     }
 
     /// Full-context capacity is explicit: reject positions beyond admission,
     /// never silently wrap them into the GLM sliding window.
     #[allow(clippy::too_many_arguments)]
-    pub fn load_admitted(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
+    pub fn load_admitted(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
         stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
-        Self::load_admitted_with(library, programs, snapshot, tensors, stream, slots, max_sequences, mask_row,
+        Self::load_admitted_with(library, programs, target_projection, snapshot, tensors, stream, slots, max_sequences, mask_row,
             representation, scales, fp8_rows, context_capacity, kv_cache,
             |device, name, bytes| super::weights::standalone(library, device, name, bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn load_admitted_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
+    pub fn load_admitted_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
         stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         mut allocate: impl FnMut(i32, &str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>) -> Result<Self> {
         let target_tokens = slots.checked_mul(context_capacity).context("dSpark token budget overflow")?;
-        Self::load_paged_with(library, programs, snapshot, tensors, stream, slots, max_sequences, mask_row,
+        Self::load_paged_with(library, programs, target_projection, snapshot, tensors, stream, slots, max_sequences, mask_row,
             representation, scales, fp8_rows, context_capacity, target_tokens, kv_cache, &mut allocate)
     }
 
     /// Serving full-context layers use the same aggregate token budget as target KV.
     #[allow(clippy::too_many_arguments)]
-    pub fn load_paged(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
+    pub fn load_paged(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
         stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
-        Self::load_paged_with(library, programs, snapshot, tensors, stream, slots, max_sequences, mask_row,
+        Self::load_paged_with(library, programs, target_projection, snapshot, tensors, stream, slots, max_sequences, mask_row,
             representation, scales, fp8_rows, context_capacity, target_tokens, kv_cache,
             |device, name, bytes| super::weights::standalone(library, device, name, bytes))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn load_paged_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
+    pub fn load_paged_with(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: super::dflash::TargetProjection, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
         stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, target_tokens: usize,
@@ -528,7 +529,7 @@ impl<'a> DsparkDrafter<'a> {
             context_positions: zeroed(TAP_ROWS * 8, Tag::drafter_workspace("shared/dspark-context-update"))?,
             context_slots: zeroed(TAP_ROWS * 4, Tag::drafter_workspace("shared/dspark-context-update"))?,
             mask_row,
-            workspace: RefCell::new(None),
+            target_projection, workspace: RefCell::new(None),
             projections, representation,
             fp8_workspace,
             head_mode: Cell::new(DraftHead::Exact),
@@ -932,9 +933,11 @@ impl<'a> DsparkDrafter<'a> {
             tables: alloc(3 * sequences * 4)?,
             attention_workspace,
             markov_workspace: alloc(self.library.glmf_dspark_markov_workspace(sequences, c.block)?)?,
-            // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                rows as u32, c.vocab as u32)? },
+            head: if self.target_projection == super::dflash::TargetProjection::Bf16 {
+                // SAFETY: the retained scratch drops after the borrowed native head.
+                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
+                    rows as u32, c.vocab as u32, cuteafd_ffi::programs::HeadMode::Gemm)? })
+            } else { None },
             _head_workspace: head_workspace,
         })
     }
@@ -1071,9 +1074,9 @@ impl<'a> DsparkDrafter<'a> {
                     rows, h, eps, s)?;
             }
             match head {
-                HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(&w.head,
+                HeadRef::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(w.head.as_ref().context("BF16 dSpark head was not prepared before serving")?,
                     w.n.buffer.ptr.cast(), weight.cast(), w.logits.buffer.ptr.cast(), rows, s)?,
-                HeadRef::Bf16(weight) => crate::shared::speculation::dflash::launch_draft_head(l, &w.head, w.n.buffer.ptr,
+                HeadRef::Bf16(weight) => crate::shared::speculation::dflash::launch_draft_head(l, w.head.as_ref().context("BF16 dSpark head was not prepared before serving")?, w.n.buffer.ptr,
                     weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
@@ -1241,11 +1244,11 @@ mod tests {
                     };
                     let cfg = DsparkConfig::read(snapshot)?;
                     let drafter = device.run(|| if cfg.window.is_some() {
-                        DsparkDrafter::load_with(device.library,programs,snapshot,tensors,std::ptr::null_mut(),
+                        DsparkDrafter::load_with(device.library,programs,crate::shared::speculation::dflash::TargetProjection::Native,snapshot,tensors,std::ptr::null_mut(),
                             1,1,vec![0;512],representation,fp8_linear::Fp8Scales::Pow2,fp8_linear::Fp8Rows::W8a16,
                             Qwen4KvCache::Bf16,&mut allocate)
                     } else {
-                        DsparkDrafter::load_paged_with(device.library,programs,snapshot,tensors,std::ptr::null_mut(),
+                        DsparkDrafter::load_paged_with(device.library,programs,crate::shared::speculation::dflash::TargetProjection::Native,snapshot,tensors,std::ptr::null_mut(),
                             1,1,vec![0;512],representation,fp8_linear::Fp8Scales::Pow2,fp8_linear::Fp8Rows::W8a16,
                             8,64,Qwen4KvCache::Bf16,&mut allocate)
                     })?;

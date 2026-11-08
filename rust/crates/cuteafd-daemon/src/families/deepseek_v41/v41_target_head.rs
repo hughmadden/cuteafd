@@ -85,8 +85,13 @@ impl<'a> TargetHeadWeights<'a> {
             "target head wave exceeds budget"
         );
         let workspace =
-            DeviceAllocation::new(self.library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/target-head"))?;
-        let projection = unsafe { self.library.v41_vocabulary_head(workspace.buffer)? };
+            DeviceAllocation::new(self.library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/blas/target-head"))?;
+        let native = crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.copy(), capacity,
+            crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?;
+        let projection = if native.is_some() { None } else {
+            Some(unsafe { self.library.v41_vocabulary_head(workspace.buffer,
+                crate::shared::target_head::TargetHead::configured().native_mode())? })
+        };
         let buffers = STRIDES
             .into_iter()
             .map(|n| DeviceAllocation::new(self.library, n * capacity, Tag::workspace("v41/target-head")))
@@ -109,8 +114,7 @@ impl<'a> TargetHeadWeights<'a> {
             head,
             capacity,
             graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity),
-            fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.copy(), capacity,
-                crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?,
+            fp8_scratch: native,
             ready: None,
             origin: None,
             selected: Vec::new(),
@@ -140,7 +144,7 @@ impl TargetLogits<'_> {
 pub(crate) struct TargetHeadWave<'w, 'a> {
     download: crate::shared::memory::RowDownload<'a>,
     stream: LoadStream<'a>,
-    projection: V41VocabularyProjection<'a>,
+    projection: Option<V41VocabularyProjection<'a>>,
     _workspace: DeviceAllocation<'a>,
     hc: V41Hc<'a>,
     buffers: Vec<DeviceAllocation<'a>>,
@@ -208,7 +212,7 @@ impl TargetHeadWave<'_, '_> {
                 1e-20,
                 self.stream.raw,
             )?;
-            crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(self.stream.library, &self.projection,
+            crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(self.stream.library, self.projection.as_ref(),
                 self.head.weight(), self.head.copy().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
                 self.stream.raw)?;
             Ok(())

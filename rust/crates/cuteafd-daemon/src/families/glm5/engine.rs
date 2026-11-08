@@ -1159,7 +1159,7 @@ impl<'a> GlmEngine<'a> {
             // SAFETY: the head workspace lives in every workspace holding the head, which drops first.
             head: if lead && !native_head {
                 Some(Rc::new(unsafe { self.library.vocabulary_head_rows(head_workspace.as_ref().context("LM head workspace")?.buffer.ptr, h as u32, t as u32,
-                    self.cfg.vocab_size as u32)? }))
+                    self.cfg.vocab_size as u32, crate::shared::target_head::TargetHead::configured().native_mode())? }))
             } else {
                 None
             },

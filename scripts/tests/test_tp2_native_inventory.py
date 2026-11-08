@@ -295,239 +295,233 @@ def test_owner_pair_diagnostic_timing_waits_for_end_before_elapsed_query():
     assert "end.record(&rank.stream)?;" in execute
 
 
-def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
-    compiler = shutil.which("g++")
-    if not compiler:
-        pytest.skip("C++ compiler unavailable")
-    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
-    helper = source.split("cuteafd_status_t cublas_handle(", 1)[1].split(
-        "cuteafd_status_t validate_linear_args", 1)[0]
-    mock = r'''
-#include <cassert>
-#include <unordered_map>
-#include <string>
-using cudaStream_t = void*;
-using cudaStreamCaptureStatus = int;
-constexpr int cudaStreamCaptureStatusNone = 0;
-constexpr int CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9;
-int cudaStreamIsCapturing(void*, int* out) { *out = 0; return 0; }
-void cuteafd_set_last_error_message(const char*) {}
-using cuteafd_status_t = int;
-using cublasHandle_t = int*;
-using cublasStatus_t = int;
-using cudaError_t = int;
-constexpr int CUTEAFD_STATUS_OK = 0, CUTEAFD_STATUS_INVALID_ARGUMENT = 1;
-constexpr int cudaSuccess = 0, CUBLAS_STATUS_SUCCESS = 0;
-static int device = 0, device_error = 0, create_error = 0, creates = 0, logs = 0;
-static int owners[8];
-int cudaGetDevice(int* out) { *out = device; return device_error; }
-int cublasCreate(cublasHandle_t* out) {
-  ++creates;
-  if (create_error) return create_error;
-  owners[creates] = device;
-  *out = &owners[creates];
-  return 0;
-}
-constexpr int CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16;
-static int modes[8], mode_error = 0, destroys = 0;
-int cublasSetMathMode(cublasHandle_t handle, int mode) {
-  if (mode_error) return mode_error;
-  modes[handle - owners] = mode;
-  return 0;
-}
-int cublasDestroy(cublasHandle_t) { ++destroys; return 0; }
-int status_from_cuda(int status) { return status; }
-int status_from_cublas(int status) { return status; }
-void log_blas_handle_created(const char*) { ++logs; }
-'''
-    main = r'''
-int main() {
-  cublasHandle_t first = nullptr, second = nullptr, again = nullptr;
-  assert(cublas_handle(nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
-  assert(creates == 0);
-  assert(cublas_handle(&first) == 0 && *first == 0);
-  device = 1; create_error = 7;
-  assert(cublas_handle(&second) == 7 && second == nullptr);
-  create_error = 0;
-  assert(cublas_handle(&second) == 0 && *second == 1 && first != second);
-  device = 0;
-  assert(cublas_handle(&again) == 0 && again == first);
-  device = 1;
-  assert(cublas_handle(&again) == 0 && again == second);
-  device_error = 19;
-  assert(cublas_handle(&again) == 19 && again == second);
-  assert(creates == 3 && logs == 2);
-  // Every shared handle keeps FP32 reductions; one whose mode cannot be set is destroyed, not cached.
-  assert(modes[1] == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
-  assert(modes[3] == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
-  device_error = 0; device = 2; mode_error = 5;
-  assert(cublas_handle(&again) == 5 && destroys == 1 && logs == 2);
-  mode_error = 0;
-  assert(cublas_handle(&again) == 0 && *again == 2 && logs == 3);
-}
-'''
-    fixture = tmp_path / "blas_handles.cc"
-    fixture.write_text(FAILURE_HEADER + mock + "cuteafd_status_t cublas_handle(" + helper + main)
-    executable = tmp_path / "blas_handles"
-    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                    str(fixture), str(CALLBACK_SOURCE), "-I", str(ROOT / "native/shared/include"), "-o", str(executable)], check=True, capture_output=True)
-    subprocess.run([str(executable)], check=True, capture_output=True)
-
-
-def test_compiled_graph_capture_requires_explicit_blas_prepare_without_changing_stream(tmp_path):
-    compiler = shutil.which("g++")
-    if not compiler:
-        pytest.skip("C++ compiler unavailable")
-    linear = (ROOT / "native/shared/cuda/linear.cu").read_text()
-    native = (ROOT / "native/shared/src/cuteafd_native.cc").read_text()
-    helper = "cuteafd_status_t cublas_handle(" + linear.split(
-        "cuteafd_status_t cublas_handle(", 1)[1].split(
-        "cuteafd_status_t validate_linear_args", 1)[0]
-    prepare = 'extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle()' + linear.split(
-        'extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle()', 1)[1].split(
-        'extern "C" cuteafd_status_t cuteafd_cuda_graph_update_linear_bf16_node', 1)[0]
-    capture = 'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(' + native.split(
-        'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(', 1)[1].split(
-        'extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture(', 1)[0]
-    # Exercise the real GEMM handle/stream binding, excluding only its CUDA bias kernel.
-    launch = "cuteafd_status_t launch_linear_bf16_cublas(" + linear.split(
-        "cuteafd_status_t launch_linear_bf16_cublas(", 1)[1].split(
-        "  if (bias != nullptr) {", 1)[0] + "  (void)bias; return 0;\n}\n"
-    mock = r'''
+BLAS_MOCK = r"""
+#pragma once
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
-#include <thread>
-#include <unordered_map>
+#include <memory>
 #include <string>
-#define CUTEAFD_NATIVE_ENABLE_CUDA 1
-using cudaStreamCaptureStatus = int;
-constexpr int cudaStreamCaptureStatusNone = 0;
-constexpr int CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9;
-static std::string last_error;
-void cuteafd_set_last_error_message(const char* message) { last_error = message; }
-using cuteafd_status_t = int;
-using cudaError_t = int;
-using cublasStatus_t = int;
+#include <thread>
 using cudaStream_t = void*;
-struct Handle { int device; std::thread::id thread; void* stream; };
-using cublasHandle_t = Handle*;
+using cudaStreamCaptureStatus = int;
+using cudaError_t = int;
+using cuteafd_status_t = int;
+using cublasStatus_t = int;
+using cublasMath_t = int;
+using cublasAtomicsMode_t = int;
+struct MockBlas { int device; std::thread::id thread; void* stream; void* workspace;
+                  int math = 0, atomics = 0; };
+using cublasHandle_t = MockBlas*;
+using cublasLtHandle_t = MockBlas*;
+constexpr int cudaSuccess = 0, cudaStreamCaptureStatusNone = 0;
+constexpr int CUBLAS_STATUS_SUCCESS = 0, CUBLAS_STATUS_NOT_INITIALIZED = 1;
+constexpr int CUBLAS_STATUS_ALLOC_FAILED = 3, CUBLAS_STATUS_INVALID_VALUE = 7;
+constexpr int CUBLAS_DEFAULT_MATH = 0, CUBLAS_ATOMICS_ALLOWED = 0;
 constexpr int CUTEAFD_STATUS_OK = 0, CUTEAFD_STATUS_INVALID_ARGUMENT = 1;
-constexpr int CUTEAFD_STATUS_INTERNAL_ERROR = 2, cudaSuccess = 0;
-constexpr int CUBLAS_STATUS_SUCCESS = 0, cudaStreamCaptureModeThreadLocal = 1;
+constexpr int CUTEAFD_STATUS_INTERNAL_ERROR = 2, CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE = 9;
 constexpr int CUBLAS_OP_T = 0, CUBLAS_OP_N = 1, CUDA_R_16BF = 0;
 constexpr int CUBLAS_COMPUTE_32F = 0, CUBLAS_GEMM_DEFAULT_TENSOR_OP = 0;
-static thread_local int device = 0, device_error = 0;
-static thread_local bool capturing = false;
-static int creates = 0, begins = 0, bindings = 0, gemms = 0;
-static int create_error = 0, capture_error = 0;
-static Handle handles[16];
-static cublasHandle_t last_gemm = nullptr;
-int cudaGetDevice(int* out) { *out = device; return device_error; }
-int cublasCreate(cublasHandle_t* out) {
-  assert(!capturing);
-  ++creates;
+constexpr int cudaStreamCaptureModeThreadLocal = 1;
+inline thread_local int device = 0, device_error = 0;
+inline thread_local bool capturing = false;
+inline int creates = 0, lt_creates = 0, destroys = 0, lt_destroys = 0;
+inline int allocations = 0, frees = 0, bindings = 0, gemms = 0, begins = 0, drains = 0;
+inline int create_error = 0, alloc_error = 0, capture_error = 0;
+inline std::string last_error;
+inline cublasHandle_t last_gemm = nullptr;
+inline int cudaGetDevice(int* out) { *out = device; return device_error; }
+inline int cudaSetDevice(int id) { device = id; return 0; }
+inline int cudaDeviceSynchronize() { ++drains; return 0; }
+inline int cudaStreamIsCapturing(void*, int* out) { *out = capturing ? 1 : 0; return 0; }
+inline int cudaMalloc(void** out, size_t bytes) {
+  assert(!capturing && bytes == (4 << 20));
+  if (alloc_error) return alloc_error;
+  ++allocations; *out = malloc(1); return *out ? 0 : 2;
+}
+inline int cudaFree(void* ptr) { ++frees; free(ptr); return 0; }
+inline int cublasCreate(cublasHandle_t* out) {
+  assert(!capturing); ++creates;
   if (create_error) return create_error;
-  handles[creates] = {device, std::this_thread::get_id(), nullptr};
-  *out = &handles[creates];
-  return 0;
+  *out = new MockBlas{device, std::this_thread::get_id(), nullptr, nullptr}; return 0;
 }
-int cublasSetStream(cublasHandle_t handle, void* stream) {
-  assert(handle->device == device && handle->thread == std::this_thread::get_id());
-  ++bindings; handle->stream = stream; return 0;
+inline int cublasLtCreate(cublasLtHandle_t* out) {
+  assert(!capturing); ++lt_creates;
+  *out = new MockBlas{device, std::this_thread::get_id(), nullptr, nullptr}; return 0;
 }
-constexpr int CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION = 16;
-int cublasSetMathMode(cublasHandle_t, int mode) {
-  assert(!capturing && mode == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION); return 0;
+inline int cublasDestroy(cublasHandle_t h) { assert(device == h->device); ++destroys; delete h; return 0; }
+inline int cublasLtDestroy(cublasLtHandle_t h) { assert(device == h->device); ++lt_destroys; delete h; return 0; }
+inline int cublasSetStream(cublasHandle_t h, void* s) {
+  assert(h->device == device && h->thread == std::this_thread::get_id());
+  ++bindings; h->stream = s; h->workspace = nullptr; return 0;
 }
-int cublasDestroy(cublasHandle_t) { return 0; }
-template<class... Args> int cublasGemmEx(cublasHandle_t handle, Args...) {
-  ++gemms; last_gemm = handle; return 0;
+inline int cublasSetWorkspace(cublasHandle_t h, void* w, size_t bytes) {
+  assert(w && bytes == (4 << 20)); h->workspace = w; return 0;
 }
-int cudaStreamBeginCapture(void* stream, int mode) {
-  assert(stream && mode == cudaStreamCaptureModeThreadLocal && !capturing);
-  ++begins;
-  capturing = capture_error == 0;
-  return capture_error;
+inline int cublasSetMathMode(cublasHandle_t h, int mode) { h->math = mode; return 0; }
+inline int cublasSetAtomicsMode(cublasHandle_t h, int mode) { h->atomics = mode; return 0; }
+template<class... Args> int cublasGemmEx(cublasHandle_t h, Args...) {
+  assert(h->workspace && h->math == 0 && h->atomics == 0);
+  ++gemms; last_gemm = h; return 0;
 }
-int cudaStreamIsCapturing(void*, int* out) { *out = capturing ? 1 : 0; return 0; }
-int status_from_cuda(int status) { return status; }
-int status_from_cublas(int status) { return status; }
-void log_blas_handle_created(const char*) {}
-int fail(int status, const char*) { return status; }
-int fail_cuda(int status, const char*, int) { return status; }
-int ok() { return 0; }
-int validate_linear_bf16_args(const uint16_t*, const uint16_t*, uint16_t*,
-                              size_t, size_t, size_t) { return 0; }
-'''
-    main = r'''
+inline int cudaStreamBeginCapture(void* s, int mode) {
+  assert(s && mode == cudaStreamCaptureModeThreadLocal && !capturing);
+  ++begins; capturing = capture_error == 0; return capture_error;
+}
+inline void cuteafd_set_last_error_message(const char* s) { last_error = s; }
+inline int status_from_cuda(int s) { return s; }
+inline int status_from_cublas(int s) { return s; }
+inline int fail(int status, const char*) { return status; }
+inline int fail_cuda(int status, const char*, int) { return status; }
+inline int ok() { return 0; }
+inline int validate_linear_bf16_args(const uint16_t*, const uint16_t*, uint16_t*, size_t, size_t, size_t) { return 0; }
+"""
+
+
+def _compile_blas_fixture(tmp_path, main, extra=""):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    (tmp_path / "mock_blas.h").write_text(BLAS_MOCK)
+    for name in ("cuda_runtime.h", "cublas_v2.h", "cublasLt.h"):
+        (tmp_path / name).write_text('#include "mock_blas.h"\n')
+    linear = (ROOT / "native/shared/cuda/linear.cu").read_text()
+    helper = "constexpr size_t kLinearBlasWorkspace" + linear.split(
+        "constexpr size_t kLinearBlasWorkspace", 1)[1].split(
+        "cuteafd_status_t validate_linear_args", 1)[0]
+    prepare = 'extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(' + linear.split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(', 1)[1].split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_update_linear_bf16_node', 1)[0]
+    native = (ROOT / "native/shared/src/cuteafd_native.cc").read_text()
+    capture = 'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(' + native.split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(', 1)[1].split(
+        'extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture(', 1)[0]
+    launch = "cuteafd_status_t launch_linear_bf16_cublas(" + linear.split(
+        "cuteafd_status_t launch_linear_bf16_cublas(", 1)[1].split(
+        "  if (bias != nullptr) {", 1)[0] + "  (void)bias; return 0;\n}\n"
+    fixture = tmp_path / "blas.cc"
+    fixture.write_text('#define CUTEAFD_NATIVE_ENABLE_CUDA 1\n#include "blas_owner.h"\n' +
+                       helper + prepare + capture + launch + main)
+    sources = [str(fixture), str(CALLBACK_SOURCE)]
+    if extra:
+        other = tmp_path / "borrower.cc"
+        other.write_text('#include "blas_owner.h"\n' + extra)
+        sources.append(str(other))
+    executable = tmp_path / "blas"
+    built = subprocess.run([compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
+                            *sources, "-I", str(tmp_path), "-I", str(ROOT / "native/shared/include"),
+                            "-o", str(executable)], capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    ran = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert ran.returncode == 0, ran.stderr
+    return ran.stderr
+
+
+def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_path):
+    logs = _compile_blas_fixture(tmp_path, r"""
+std::shared_ptr<cuteafd::BlasOwner> other_borrower(bool lt);
+int main() {
+  cublasHandle_t first = nullptr, second = nullptr, again = nullptr;
+  assert(cublas_handle(nullptr) == 1 && creates == 0);
+  assert(cublas_handle(&first) == 0 && first->device == 0);
+  auto shared = other_borrower(false);
+  assert(shared->gemm == first && creates == 1);
+  assert(other_borrower(true) == shared && lt_creates == 1);
+  void* workspace = first->workspace;
+  assert(cuteafd::bind_blas(shared, nullptr, workspace, 4 << 20, 5, 1) == 0);
+  assert(first->math == 5 && first->atomics == 1);
+  assert(cublas_handle(&again) == 0 && again == first);
+  assert(first->math == 0 && first->atomics == 0 && first->workspace == workspace);
+  device = 1; create_error = 7;
+  assert(cublas_handle(&second) == 7 && second == nullptr);
+  create_error = 0; alloc_error = 2;
+  assert(cublas_handle(&second) == 2 && second == nullptr);
+  alloc_error = 0;
+  assert(cublas_handle(&second) == 0 && second->device == 1 && first != second);
+  assert(creates == 3 && allocations == 2);
+  device = 0;
+  assert(cublas_handle(&again) == 0 && again == first);
+  device_error = 19;
+  assert(cublas_handle(&again) == 19 && again == first);
+  device_error = 0;
+  std::thread worker([&] {
+    assert(cuteafd::bind_blas(shared, nullptr, workspace, 4 << 20) == 7);
+    auto local = other_borrower(false);
+    assert(local != shared && local->gemm != first);
+  });
+  worker.join();
+  assert(creates == 4 && destroys == 1);
+}
+""", r"""
+std::shared_ptr<cuteafd::BlasOwner> other_borrower(bool lt) {
+  std::shared_ptr<cuteafd::BlasOwner> owner;
+  assert(cuteafd::borrow_blas(lt, owner) == 0);
+  return owner;
+}
+""")
+    assert logs.count("event=create backend=gemm") == 3
+    assert logs.count("event=create backend=lt") == 1
+    assert logs.count("event=destroy backend=gemm") == 3
+    assert logs.count("event=destroy backend=lt") == 1
+    assert logs.count("blas_workspace ") == 2
+    assert "thread_id=" in logs and "thread_name=" in logs
+
+
+def test_compiled_graph_capture_requires_explicit_blas_prepare_without_changing_stream(tmp_path):
+    _compile_blas_fixture(tmp_path, r"""
 int main() {
   void* capture_stream = reinterpret_cast<void*>(uintptr_t(0x10));
   void* eager_stream = reinterpret_cast<void*>(uintptr_t(0x20));
   uint16_t buffer = 0;
   auto gemm = [&](void* stream) {
-    assert(launch_linear_bf16_cublas(&buffer, &buffer, nullptr, &buffer,
-                                   1, 1, 1, stream) == 0);
+    assert(launch_linear_bf16_cublas(&buffer, &buffer, nullptr, &buffer, 1, 1, 1, stream) == 0);
     assert(last_gemm->stream == stream);
   };
   assert(cuteafd_cuda_graph_begin_capture(nullptr) == 1 && creates == 0);
   assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 0);
-  assert(launch_linear_bf16_cublas(&buffer, &buffer, nullptr, &buffer,
-                                1, 1, 1, capture_stream) == 9);
-  assert(capturing && creates == 0 && bindings == 0 && gemms == 0);
+  assert(launch_linear_bf16_cublas(&buffer, &buffer, nullptr, &buffer, 1, 1, 1, capture_stream) == 9);
+  assert(capturing && creates == 0 && allocations == 0 && bindings == 0 && gemms == 0);
   assert(last_error.find("cuteafd_cuda_linear_bf16_cublas_async") != std::string::npos);
-  assert(last_error.find("prepare_cublas_handle before capture") != std::string::npos);
+  assert(last_error.find("before capture") != std::string::npos);
   capturing = false;
-  device_error = 19;
-  assert(cuteafd_cuda_prepare_cublas_handle() == 19 && creates == 0);
-  device_error = 0; create_error = 7;
-  assert(cuteafd_cuda_prepare_cublas_handle() == 7 && creates == 1);
-  create_error = 0;
-  assert(cuteafd_cuda_prepare_cublas_handle() == 0 && creates == 2);
+  assert(cuteafd_cuda_prepare_cublas_stream(capture_stream) == 0);
+  cublasHandle_t first = nullptr;
+  gemm(capture_stream); first = last_gemm;
+  auto captured_workspace = first->workspace;
+  assert(cuteafd_cuda_prepare_cublas_stream(eager_stream) == 0);
+  auto eager_workspace = first->workspace;
+  assert(eager_workspace != captured_workspace && allocations == 2 && creates == 1);
+  const auto bound = bindings;
   assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
-  assert(creates == 2 && bindings == 0);
+  assert(bindings == bound && first->stream == eager_stream);
   gemm(capture_stream);
-  const auto first = last_gemm;
+  assert(first->workspace == captured_workspace && allocations == 2 && creates == 1);
   capturing = false;
   gemm(eager_stream);
-  const int bound = bindings;
-  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
-  assert(first->stream == eager_stream && bindings == bound && creates == 2);
-  gemm(capture_stream);
-  capturing = false;
-  gemm(eager_stream);
+  assert(first->workspace == eager_workspace);
   device = 1;
-  assert(cuteafd_cuda_prepare_cublas_handle() == 0 && creates == 3);
-  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 3);
+  assert(cuteafd_cuda_prepare_cublas_stream(capture_stream) == 0 && creates == 2);
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
   gemm(capture_stream);
   assert(last_gemm != first && last_gemm->device == 1);
-  capturing = false;
-  device = 0;
-  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 3);
-  capturing = false;
+  capturing = false; device = 0;
   std::thread worker([&] {
-    assert(cuteafd_cuda_prepare_cublas_handle() == 0 && creates == 4);
-    assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0 && creates == 4);
+    assert(cuteafd_cuda_prepare_cublas_stream(capture_stream) == 0 && creates == 3);
+    assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 0);
     gemm(capture_stream);
     assert(last_gemm != first && last_gemm->device == 0);
     capturing = false;
   });
   worker.join();
+  assert(frees == 1 && destroys == 1 && drains == 1);
   capture_error = 71;
-  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == CUTEAFD_STATUS_INTERNAL_ERROR);
-  assert(!capturing && creates == 4 && begins == 7 && gemms == 6);
+  assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 2);
+  assert(!capturing && creates == 3 && begins == 5 && gemms == 5);
   assert(first->stream == eager_stream);
 }
-'''
-    fixture = tmp_path / "capture_blas.cc"
-    fixture.write_text(FAILURE_HEADER + mock + helper + prepare + capture + launch + main)
-    executable = tmp_path / "capture_blas"
-    built = subprocess.run([compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
-                            str(fixture), str(CALLBACK_SOURCE), "-I", str(ROOT / "native/shared/include"), "-o", str(executable)], capture_output=True, text=True)
-    assert built.returncode == 0, built.stderr
-    ran = subprocess.run([str(executable)], capture_output=True, text=True)
-    assert ran.returncode == 0, ran.stderr
+""")
 
 
 def test_inventory_signature_matches_installed_toolkit_without_cuda_initialization(tmp_path):

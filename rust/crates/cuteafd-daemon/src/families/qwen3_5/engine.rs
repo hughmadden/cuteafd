@@ -222,7 +222,7 @@ impl<'a> DenseEngine<'a> {
         let head_workspace = Allocation::new(device, buffers.head, Tag::workspace("qwen35/head-workspace"))?;
         // SAFETY: owned workspace is retained after the head and stream, including error cleanup.
         let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr, cfg.hidden as u32,
-            buffers.head_rows as u32, cfg.vocab as u32)? };
+            buffers.head_rows as u32, cfg.vocab as u32, crate::shared::target_head::TargetHead::configured().native_mode())? };
         let commit = match admitted.prefix { "qwen35" => "qwen35_gdn_commit", "qwen38" => "qwen38_gdn_commit",
             _ => anyhow::bail!("unadmitted dense prefix") };
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;

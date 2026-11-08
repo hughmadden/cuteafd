@@ -395,7 +395,7 @@ mod tests {
                 devices[1].run(|| library.sm_count())?, Fp8Rows::W8a16.code() as u8, cache_format)?
                 .with_context_split(true)?;
             let split = ContextOwner::allocate(&programs, &layout, streams.clone(), peer.clone(), lead.raw)?;
-            let draft = devices[1].own(|| super::super::DflashDrafter::load_mla(&library, &programs,
+            let draft = devices[1].own(|| super::super::DflashDrafter::load_mla(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Native,
                 "kimik3", &snapshot, std::fs::read(snapshot.join("model.safetensors"))?, lead.raw,
                 layout, GlmDraftRepresentation::Fp8Only, Fp8Scales::Amax, Fp8Rows::W8a16, Some(split)))?;
             let iterations = if cache_format == cuteafd_core::MlaCacheFormat::Fp8 {

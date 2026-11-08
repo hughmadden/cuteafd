@@ -132,16 +132,19 @@ def test_glm_memory_diagnostics_do_not_change_cuda_state():
 
 
 def test_blas_handle_diagnostics_log_only_after_successful_creation():
-    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
-    logging = source.split("void log_blas_handle_created(", 1)[1].split("cuteafd_status_t cublas_handle", 1)[0]
-    assert "pthread_getname_np" in logging
-    assert "configured_workspace=runtime-default configured_workspace_bytes=unknown" in logging
-    assert "cuda" not in logging and "cublas" not in logging
-    blas = source.split("cuteafd_status_t cublas_handle(", 1)[1].split("\n}", 1)[0]
-    assert blas.index("cublasCreate(&handle)") < blas.index("return status_from_cublas(status)") < blas.index('log_blas_handle_created("cublas")')
-    assert "static thread_local" in blas
-    assert "cublasSetWorkspace" not in blas
-
+    owner = (ROOT / "native/shared/include/blas_owner.h").read_text()
+    assert "pthread_getname_np" in owner and "SYS_gettid" in owner
+    assert "thread_id=%ld thread_name=%s owner=%p" in owner
+    assert 'if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", "gemm")' in owner
+    assert 'if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", "lt")' in owner
+    assert "static thread_local" in owner
+    bind = owner.split("inline cublasStatus_t bind_blas(", 1)[1]
+    assert bind.index("cublasSetStream") < bind.index("cublasSetWorkspace")
+    assert "cublasSetMathMode" in bind and "cublasSetAtomicsMode" in bind
+    linear = (ROOT / "native/shared/cuda/linear.cu").read_text()
+    assert "blas_workspace device=%d thread_id=%ld stream=%p bytes=%zu ptr=%p" in linear
+    assert "constexpr size_t kLinearBlasWorkspace = 4 << 20" in linear
+    assert "CUTEAFD_TRACK_ALLOC" in linear and "CUTEAFD_TRACK_FREE" in linear
 
 
 def test_glm_text_cold_replay_uses_serving_decode_not_eager_scoring():

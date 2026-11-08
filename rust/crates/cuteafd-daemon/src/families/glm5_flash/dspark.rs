@@ -171,7 +171,7 @@ impl<'a> Drafter<'a> {
     /// else DFlash2) for a target of `hidden` x `vocab` with `layers` layers:
     /// `slots` ring contexts, draft steps of up to `sequences` sequences.
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, target_projection: crate::shared::speculation::dflash::TargetProjection, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
         embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, read: DraftRead)
         -> Result<Self> {
@@ -193,7 +193,7 @@ impl<'a> Drafter<'a> {
                     Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(
                         crate::shared::memory::device::Device { library, id }, layout, ArenaTag::drafter_weights("glmf/draft"))?))
                 }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-            return Ok(Self::Dspark(DsparkDrafter::load_with(library, programs, snapshot, tensors, stream, slots,
+            return Ok(Self::Dspark(DsparkDrafter::load_with(library, programs, target_projection, snapshot, tensors, stream, slots,
                 sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache,
                 |device, name, bytes| draft_allocation(library, &arenas, device, name, bytes))?));
         }
@@ -204,7 +204,7 @@ impl<'a> Drafter<'a> {
         tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
         let file = read.ok().context("DFlash2 drafter read")?.join_dflash()?;
         let arenas = dflash_arenas(library, snapshot, representation, &[library.cuda_get_device()?])?;
-        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load_with(library, programs, snapshot, file, stream, slots,
+        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load_with(library, programs, target_projection, snapshot, file, stream, slots,
             sequences, mask, true, representation, scales, fp8_rows, kv_cache,
             |device, name, bytes| draft_allocation(library, &arenas, device, name, bytes))?))
     }
