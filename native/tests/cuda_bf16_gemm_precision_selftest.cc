@@ -30,9 +30,9 @@ int main() {
   for (auto& v : w) { const uint32_t b = next(); v = uint16_t(((b & 1) << 15) | ((118 + (b >> 1) % 6) << 7) | ((b >> 5) & 127)); }
   for (auto& v : x) { const uint32_t b = next(); v = uint16_t(((b & 1) << 15) | ((124 + (b >> 1) % 4) << 7) | ((b >> 5) & 127)); }
   cuteafd_device_buffer_t dw{}, dx{}, dy{};
-  ok(cuteafd_alloc_device_buffer(w.size() * 2, &dw));
-  ok(cuteafd_alloc_device_buffer(x.size() * 2, &dx));
-  ok(cuteafd_alloc_device_buffer(max_rows * n * 2, &dy));
+  ok(cuteafd_alloc_device_buffer(w.size() * 2, &dw, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
+  ok(cuteafd_alloc_device_buffer(x.size() * 2, &dx, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
+  ok(cuteafd_alloc_device_buffer(max_rows * n * 2, &dy, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
   ok(cuteafd_copy_h2d(dw, w.data(), w.size() * 2));
   ok(cuteafd_copy_h2d(dx, x.data(), x.size() * 2));
   void* stream = nullptr;
