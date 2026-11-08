@@ -513,6 +513,29 @@ pub struct Row {
     pub allocations: usize,
 }
 
+/// Backing a direct device allocation reserves beyond its requested bytes.
+///
+/// SM120, driver/runtime 13020, LAZY: requests above one MiB round
+/// independently to the 2 MiB granule; smaller requests share driver blocks,
+/// so the group carries one rounding (never one per request). Qualified on
+/// raptor's SM120 cards (#1511); other pools report zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Granularity {
+    /// Rounding beyond the requests, already included in measured bytes used.
+    pub tail: usize,
+    /// Live requests above one MiB, each with its own backing.
+    pub large_requests: usize,
+    /// Live request bytes at or below one MiB, sharing driver blocks.
+    pub small_bytes: usize,
+}
+
+const GRANULARITY_PAGE: usize = 2 << 20;
+const GRANULARITY_SMALL: usize = 1 << 20;
+
+fn round_to_granule(bytes: usize) -> usize {
+    bytes.div_ceil(GRANULARITY_PAGE) * GRANULARITY_PAGE
+}
+
 /// Live bytes by key, plus the peak per pool and device since start.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -520,6 +543,8 @@ pub struct Snapshot {
     /// Full tensor names uploaded in more than one non-scale format, per device.
     pub duals: Vec<(i32, &'static str, Vec<&'static str>)>,
     pub peak: BTreeMap<(Space, i32), usize>,
+    /// Per device pool: the live allocations' own rounding (zero off SM120).
+    pub granularity: BTreeMap<(Space, i32), Granularity>,
 }
 
 impl Snapshot {
@@ -575,11 +600,28 @@ impl Snapshot {
 
 pub fn snapshot() -> Snapshot {
     let state = state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut granularity: BTreeMap<(Space, i32), Granularity> = BTreeMap::new();
+    for live in state.live.values() {
+        // Only discrete device memory carries the SM120 2 MiB granule; managed
+        // pools and pinned/host backings are owned by their own rules.
+        if live.key.space != Space::Device { continue; }
+        let entry = granularity.entry((live.key.space, live.key.device)).or_default();
+        if live.bytes > GRANULARITY_SMALL {
+            entry.large_requests += 1;
+            entry.tail += round_to_granule(live.bytes) - live.bytes;
+        } else {
+            entry.small_bytes += live.bytes;
+        }
+    }
+    for entry in granularity.values_mut() {
+        entry.tail += round_to_granule(entry.small_bytes) - entry.small_bytes;
+    }
     Snapshot {
         rows: state.totals.iter().map(|(&key, &(bytes, allocations))| Row { key, bytes, allocations }).collect(),
         duals: state.formats.iter().filter(|(_, f)| f.len() > 1)
             .map(|(&(device, name), formats)| (device, name, formats.clone())).collect(),
         peak: state.peak.clone(),
+        granularity,
     }
 }
 

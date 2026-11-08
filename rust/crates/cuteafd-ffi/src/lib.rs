@@ -518,6 +518,17 @@ pub fn graph_capture_sites() -> Vec<(String, u64)> {
     sites
 }
 
+/// Live `cudaStreamCreate` handles this crate made minus successful destroys,
+/// and its peak since start. Every context's driver slabs follow the live count
+/// (2 MiB per four live streams), so admission can charge the measured peak.
+static LIVE_STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PEAK_STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide stream census (`live`, `peak`).
+pub fn stream_census() -> (u64, u64) {
+    (LIVE_STREAMS.load(std::sync::atomic::Ordering::SeqCst), PEAK_STREAMS.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 pub type CuteafdStatus = c_int;
 
 /// A native-library call returned a non-OK status. This is a device/driver
@@ -2690,13 +2701,17 @@ impl NativeLibrary {
         let mut cuda_stream = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_stream) };
         self.status_to_result("cuteafd_cuda_stream_create", status)?;
+        let live = LIVE_STREAMS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        PEAK_STREAMS.fetch_max(live, std::sync::atomic::Ordering::SeqCst);
         Ok(cuda_stream)
     }
 
     pub unsafe fn cuda_stream_destroy(&self, cuda_stream: *mut c_void) -> Result<()> {
         let destroy_fn: CudaStreamDestroyFn = self.cuteafd_cuda_stream_destroy()?;
         let status = unsafe { destroy_fn(cuda_stream) };
-        self.status_to_result("cuteafd_cuda_stream_destroy", status)
+        self.status_to_result("cuteafd_cuda_stream_destroy", status)?;
+        LIVE_STREAMS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     /// Diagnostic drain of every stream on the calling thread's current CUDA device.

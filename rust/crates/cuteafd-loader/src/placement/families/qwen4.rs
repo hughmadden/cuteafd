@@ -5,10 +5,10 @@
 //! pool, so admission needs one solve instead of a second pass over the pool.
 use crate::families::qwen4::Qwen4Attention;
 use crate::placement::planner::{
-    solve, Activation, Allocation, Allowance, Baseline as PlanBaseline, Budget, ByteCurve, Component,
-    ComponentKind, Contract, Lifetime as PlanLifetime, Location, Operation, Phase, PhaseOrder, Pin,
-    PrefillShape as PlanPrefill, Recipe, Refusal, Request, ResidentWeight, ResolvedPlan, Variable,
-    weight_arena_components,
+    solve, Activation, Allocation, Allowance, Baseline as PlanBaseline, Budget, ByteCurve, BytePiece,
+    Component, ComponentKind, Contract, Lifetime as PlanLifetime, Location, Operation, Phase, PhaseOrder,
+    Pin, PrefillShape as PlanPrefill, Recipe, Refusal, Request, ResidentWeight, ResolvedPlan, Variable,
+    weight_arena_components, SM120_ALLOCATION_GRANULARITY_BYTES,
 };
 use crate::placement::*;
 use crate::serving_capacity::qwen_graphs::{
@@ -26,7 +26,6 @@ pub use encoder::QwenEncoders;
 pub use host::QwenHost;
 
 pub const DEFAULT_MARK_SLOTS: u64 = 18;
-pub const LAZY_GRAPH_BYTES: u64 = (1 << 30) / 2;
 pub const SPARK_WORKSPACE_BYTES: u64 = 56 * (1 << 30) / 100;
 
 /// A dual Qwen executor requires nonempty whole-width ownership on both ends.
@@ -149,6 +148,21 @@ fn owner(id: impl Into<String>, location: Location, bytes: u64, category: Catego
 fn pooled(id: impl Into<String>, location: Location, per_unit: u64, category: Category, group: &str,
     maximum: u64) -> Result<Component, Refusal> {
     let curve = ByteCurve::linear(per_unit, per_unit, maximum);
+    let mut component = Component::allocation(Allocation::buffer(id, location, per_unit,
+        PlanLifetime::TARGET, category, group), curve.clone(), false, maximum);
+    component.byte_extent(curve)?;
+    Ok(component)
+}
+
+/// A pooled record set whose charge is its physical cudaMalloc. The engine
+/// holds one arena per pooled record set (records, token keys and pool keys at
+/// aligned offsets of one block, `Qwen4Engine::new_placed`), so the set rounds
+/// once at the SM120 granule rather than once per part. Page counts stay
+/// unaligned; the solver keeps the last affordable page.
+fn pooled_backing(id: impl Into<String>, location: Location, per_unit: u64, category: Category,
+    group: &str, maximum: u64) -> Result<Component, Refusal> {
+    let curve = ByteCurve(vec![BytePiece { first: 1, last: maximum, bytes_at_first: per_unit,
+        bytes_per_page: per_unit, granularity: SM120_ALLOCATION_GRANULARITY_BYTES }]);
     let mut component = Component::allocation(Allocation::buffer(id, location, per_unit,
         PlanLifetime::TARGET, category, group), curve.clone(), false, maximum);
     component.byte_extent(curve)?;
@@ -308,17 +322,32 @@ impl Recipe for QwenSingle<'_> {
             let unit = current.checked_sub(previous)
                 .ok_or_else(|| Refusal::InvalidFact("Qwen per-layer records shrink".into()))?;
             previous = current;
-            components.push(pooled(format!("qwen.records.{layer}"), gpu, unit, Category::Kv,
+            components.push(pooled_backing(format!("qwen.records.{layer}"), gpu, unit, Category::Kv,
                 "records", self.maximum_pages)?);
         }
-        // Includes the optional MTP records, pool metadata, both page tables and
-        // the per-token rounding of those table bytes.
+        // The MTP layer is its own record arena on owner zero; the rest of the
+        // per-token pool total is page tables and their per-token rounding.
         let unit_bytes = self.admission.per_token.checked_mul(page)
             .ok_or(Refusal::Overflow("Qwen pool unit"))?;
         let overhead = unit_bytes.checked_sub(previous)
             .ok_or_else(|| Refusal::InvalidFact("Qwen per-token pool total is below its records".into()))?;
-        components.push(pooled("qwen.records.metadata", gpu, overhead, Category::Kv, "records",
-            self.maximum_pages)?);
+        let mtp_records = if a.mtp {
+            compute(a.layers, true)?.ranks[0].persistent_unit_bytes
+                .checked_sub(previous)
+                .ok_or_else(|| Refusal::InvalidFact("Qwen MTP records shrink".into()))?
+        } else {
+            0
+        };
+        if mtp_records > 0 {
+            components.push(pooled_backing("qwen.records.mtp", gpu, mtp_records, Category::Kv,
+                "records", self.maximum_pages)?);
+        }
+        let tables = overhead.checked_sub(mtp_records)
+            .ok_or_else(|| Refusal::InvalidFact("Qwen pool total is below its record arenas".into()))?;
+        if tables > 0 {
+            components.push(pooled("qwen.records.metadata", gpu, tables, Category::Kv, "records",
+                self.maximum_pages)?);
+        }
         for (index, &(category, group, bytes)) in self.admission.items.iter().enumerate() {
             components.push(owner(format!("qwen.admission.{index}"), gpu, bytes, category, group,
                 PlanLifetime::RESIDENT, self.maximum_pages));
@@ -340,13 +369,12 @@ impl Recipe for QwenSingle<'_> {
         }
         // One flat reserve at the widest compiled pool: the graph shape count is
         // monotone in the pool, so every admitted set is a subset of this one.
-        let (graph_bytes, graph_source, graph_life) = match &self.graphs {
-            Some(graphs) => (graphs.bytes(0), "startup graphs",
-                PlanLifetime { first: Phase::Warmup, last: Phase::Growth }),
-            None => (LAZY_GRAPH_BYTES, "graph growth",
-                PlanLifetime { first: Phase::Ready, last: Phase::Growth }),
-        };
-        components.push(allowance(graph_source, gpu, graph_bytes, graph_life, self.maximum_pages));
+        // With startup graphs off nothing is captured, so nothing is charged: a
+        // decode step outside the set runs ungraphed and allocates no graphs.
+        if let Some(graphs) = &self.graphs {
+            components.push(allowance("startup graphs", gpu, graphs.bytes(0),
+                PlanLifetime { first: Phase::Warmup, last: Phase::Growth }, self.maximum_pages));
+        }
         components.push(weights("qwen.loaded.owners", gpu, inputs.loaded_weights, self.maximum_pages));
         if inputs.host.uploads.len() != 1 {
             return Err(Refusal::InvalidFact("Qwen single-owner host owners must name one upload owner".into()));
@@ -994,7 +1022,7 @@ impl Recipe for QwenDual<'_> {
             let location = Location::coordinator(gpu as u8);
             components.push(owner(format!("qwen.layer.{layer}.state"), location, state,
                 Category::Kv, "layer state and marks", PlanLifetime::RESIDENT, self.maximum_pages));
-            components.push(pooled(format!("qwen.layer.{layer}.records"), location, kv,
+            components.push(pooled_backing(format!("qwen.layer.{layer}.records"), location, kv,
                 Category::Kv, "records", self.maximum_pages)?);
             for (index, demand) in inputs.layer_extra[layer].iter().enumerate() {
                 let id = format!("qwen.layer.{layer}.extra.{index}");
@@ -1015,14 +1043,22 @@ impl Recipe for QwenDual<'_> {
         }
         let complete = compute(a.layers, a.mtp)?.ranks[0];
         // Both ranks allocate full-width page tables; owner0 alone owns pool
-        // metadata, MTP records/pending rows and the deferred MTP id buffer.
+        // metadata, the MTP record arena and pending rows, and the deferred MTP
+        // id buffer. The MTP arena is priced as its own physical backing.
         let tables = (1 + QWEN_DECODE_ROWS as u64) * 5 * 4;
         let mut overhead = [tables, tables];
-        let mtp_records = complete.persistent_unit_bytes
-            .checked_sub(previous.persistent_unit_bytes)
-            .ok_or_else(|| Refusal::InvalidFact("Qwen MTP records shrink".into()))?;
-        overhead[0] = overhead[0].checked_add(mtp_records)
-            .and_then(|bytes| bytes.checked_add(complete.pool_metadata_unit_bytes))
+        let mtp_records = if a.mtp {
+            complete.persistent_unit_bytes
+                .checked_sub(previous.persistent_unit_bytes)
+                .ok_or_else(|| Refusal::InvalidFact("Qwen MTP records shrink".into()))?
+        } else {
+            0
+        };
+        if mtp_records > 0 {
+            components.push(pooled_backing("qwen.owner0.mtp.records", Location::coordinator(0),
+                mtp_records, Category::Kv, "records", self.maximum_pages)?);
+        }
+        overhead[0] = overhead[0].checked_add(complete.pool_metadata_unit_bytes)
             .ok_or(Refusal::Overflow("Qwen pool metadata"))?;
         // Preserve the single-owner per-token rounding of table bytes.
         for bytes in &mut overhead {
@@ -1057,12 +1093,10 @@ impl Recipe for QwenDual<'_> {
                 Category::Experts, &group, PlanLifetime::RESIDENT, self.maximum_pages));
             components.push(weights(format!("qwen.tp2.{gpu}"), location,
                 ResidentWeights(self.resident[gpu]), self.maximum_pages));
-            components.push(match &self.graphs {
-                Some(graphs) => allowance("startup graphs", location, graphs.bytes(gpu),
-                    PlanLifetime { first: Phase::Warmup, last: Phase::Growth }, self.maximum_pages),
-                None => allowance("graph growth", location, LAZY_GRAPH_BYTES,
-                    PlanLifetime { first: Phase::Ready, last: Phase::Growth }, self.maximum_pages),
-            });
+            if let Some(graphs) = &self.graphs {
+                components.push(allowance("startup graphs", location, graphs.bytes(gpu),
+                    PlanLifetime { first: Phase::Warmup, last: Phase::Growth }, self.maximum_pages));
+            }
         }
         for (index, demand) in inputs.fixed.iter().enumerate() {
             if usize::from(demand.gpu) >= 2 {
@@ -1563,12 +1597,55 @@ mod tests {
         assert_eq!(zero, runtime);
         let admission = qwen_admission(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
             0, Some((16, true)), None, ResidentWeights(1024), None).admission).unwrap();
+        // One arena per pooled record set: the engine allocates the layer's
+        // records, token keys and pool keys as one block, so each set is
+        // charged as its single physical cudaMalloc, rounding once at the
+        // SM120 granule. Everything else in the pool total (page tables and
+        // their per-token rounding) stays linear.
+        let granule = SM120_ALLOCATION_GRANULARITY_BYTES;
+        let pool_pages = (2u64 << 20) / QWEN_UNIT_ROWS as u64;
+        let geometry = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&cfg, layers, mtp,
+            Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
+        let (mut previous, mut expected) = (0u64, 0u64);
+        for layer in 0..cfg.layers {
+            let current = geometry(layer + 1, false);
+            expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
+            previous = current;
+        }
+        expected += (admission.per_token * QWEN_UNIT_ROWS as u64 - geometry(cfg.layers, false)) * pool_pages;
         assert_eq!(planned.items[0].iter().filter(|item| item.group == "records")
-            .map(|item| item.bytes).sum::<u64>(), admission.per_token * (2 << 20));
+            .map(|item| item.bytes).sum::<u64>(), expected);
         let graphs = qwen_startup_graphs(131072, 2 << 20, cfg.dense_context(), 16, true, cfg.layers)
             .unwrap();
         assert_eq!(planned.items[0].iter().filter(|item| item.group == "startup graphs")
             .map(|item| item.bytes).collect::<Vec<_>>(), vec![graphs.bytes(0)]);
+
+        // MTP records are their own record arena on owner zero, so they round
+        // once as a physical cudaMalloc instead of sharing the pool table
+        // rounding; everything left in the per-token total is page tables.
+        let mut mtp_json = crate::plan::testing::qwen4_config(4);
+        mtp_json["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+        let mtp_cfg = Qwen4Config::from_hf(&mtp_json).unwrap();
+        let mut mtp_inputs = single_inputs(&mtp_cfg, Baseline::Measured { free_bytes: 96 << 30 },
+            0, Some((16, true)), None, ResidentWeights(1024), None);
+        mtp_inputs.admission.mtp = true;
+        let mtp_admission = qwen_admission(&mtp_inputs.admission).unwrap();
+        let mtp_planned = placement(&mtp_inputs).unwrap();
+        assert_eq!(mtp_planned.pool_tokens, 2 << 20);
+        let geometry_mtp = |layers, mtp| crate::serving_capacity::qwen_cache_geometry(&mtp_cfg, layers, mtp,
+            Qwen4KvCache::Bf16).unwrap().ranks[0].persistent_unit_bytes;
+        let mtp_records = geometry_mtp(mtp_cfg.layers, true) - geometry_mtp(mtp_cfg.layers, false);
+        let (mut previous, mut mtp_expected) = (0u64, 0u64);
+        for layer in 0..mtp_cfg.layers {
+            let current = geometry_mtp(layer + 1, false);
+            mtp_expected += ((current - previous) * pool_pages).div_ceil(granule) * granule;
+            previous = current;
+        }
+        mtp_expected += (mtp_records * pool_pages).div_ceil(granule) * granule;
+        mtp_expected += (mtp_admission.per_token * QWEN_UNIT_ROWS as u64
+            - geometry_mtp(mtp_cfg.layers, true)) * pool_pages;
+        assert_eq!(mtp_planned.items[0].iter().filter(|item| item.group == "records")
+            .map(|item| item.bytes).sum::<u64>(), mtp_expected);
         // The first typed refusal is preserved, not clamped or re-solved.
         let limited = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
             Some((16, true)), None, ResidentWeights(2048), Some(ResidentWeights(1)));
@@ -1690,15 +1767,16 @@ mod tests {
         }
     }
 
-    /// A lazy diagnostic run keeps the former growth reserve; a serving run
+    /// A run without startup graphs charges no graph owner at all: nothing is
+    /// captured, and a shape outside the set runs ungraphed. A serving run
     /// prices the exact owner graph set instead of a pool-dependent ladder.
     #[test]
     fn qwen_pool_demands_match_geometry_and_lazily_loaded_experts() {
         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
         let lazy = placement(&single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
             0, None, None, ResidentWeights(0), None)).unwrap();
-        assert_eq!(lazy.items[0].iter().filter(|item| item.group == "graph growth")
-            .map(|item| item.bytes).collect::<Vec<_>>(), vec![LAZY_GRAPH_BYTES]);
+        assert!(lazy.items[0].iter().all(|item| item.group != "graph growth"
+            && item.group != "startup graphs"), "no capture, no graph bytes");
         // An explicit pool below the context is the first typed refusal.
         let short = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0, None,
             Some(65536), ResidentWeights(0), None);
@@ -1743,8 +1821,8 @@ mod tests {
             assert_eq!(placement.items[gpu].iter().filter(|item|
                 item.group == "TP2 expert layer halves 0..4").map(|item| item.bytes).collect::<Vec<_>>(),
                 vec![peak]);
-            assert_eq!(placement.items[gpu].iter().filter(|item| item.group == "graph growth")
-                .map(|item| item.bytes).collect::<Vec<_>>(), vec![LAZY_GRAPH_BYTES]);
+            assert!(placement.items[gpu].iter().all(|item| item.group != "graph growth"
+                && item.group != "startup graphs"), "no capture, no graph bytes");
         }
         assert_eq!(placement.layers.iter().map(|layer| layer.experts).collect::<Vec<_>>(),
             vec![ExpertHome::RtxTp2; 4]);

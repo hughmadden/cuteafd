@@ -365,7 +365,16 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     assert "if diagnostic {\n        engine.verify_device_ungraphed" in serve
     assert "logits.rows = rows;" in engine
     assert "Self::region(&w.select, rows * 4, rows * 4)" in engine
-    assert "Qwen serving graph was not captured at startup" in engine
+    # A shape outside the sealed startup set runs ungraphed and allocates no
+    # graph: replay records it once for /v1/stats and warns, and only the
+    # startup warm-up ever begins a capture.
+    assert engine.count("cuda_graph_begin_capture(") == 1
+    fallback = engine[engine.index("    fn replay(&self, key: GraphKey"):engine.index("    fn miss_graph(")]
+    assert "if !self.warming_graphs.get() {" in fallback
+    assert "self.miss_graph(key);" in fallback
+    assert "consider adding it to the startup graph set" in engine
+    assert 'crate::shared::decode_graph::note_missing("qwen4", &variant)' in engine
+    assert "return Ok(())" in fallback
     graphed = engine[engine.index("    fn decode_graphed("):engine.index("    fn replay(")]
     assert "tables.positions.iter().take_while(|&&position| position >= 0).count()" in graphed
     assert 'if self.startup_graphs { Ok(()) } else { self.moe_front(' in graphed
