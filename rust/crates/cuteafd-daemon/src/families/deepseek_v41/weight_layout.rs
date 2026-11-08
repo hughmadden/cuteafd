@@ -89,6 +89,20 @@ mod tests {
                 }
             }
         }
+        // The planner's dense dSpark charge is the serving arena, padding
+        // included, on the installed checkpoint (routed draft experts present).
+        let draft = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(&catalog)?;
+        let config = serde_json::from_slice(&std::fs::read(catalog.snapshot().join("config.json"))?)?;
+        for ranks in [1, 2] {
+            let items = cuteafd_loader::placement::families::deepseek_v41::resident::resident_headers(&config,
+                catalog.tensors().iter().map(|t| &t.metadata), ranks, true)
+                .ok_or_else(|| anyhow::anyhow!("installed dSpark residency unsupported"))?;
+            let auxiliary = items[ranks - 1].iter().filter(|i| i.group == "dspark-auxiliary").map(|i| i.bytes).sum::<u64>();
+            let padding = items[ranks - 1].iter().filter(|i| i.format == "arena-padding").map(|i| i.bytes).collect::<Vec<_>>();
+            eprintln!("V41_DRAFT ranks={ranks} auxiliary={auxiliary} arena={} padding={padding:?}", draft.bytes());
+            assert_eq!(auxiliary, draft.bytes() as u64);
+            assert_eq!(padding, [draft.padding_bytes() as u64]);
+        }
         Ok(())
     }
 

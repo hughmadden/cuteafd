@@ -338,7 +338,6 @@ mod tests {
             tensor("mtp.0.attn.wq_a.weight", DType::F8E4M3, &[64, 33], 2112),
             tensor("mtp.0.attn.wq_a.scale", DType::F32, &[2, 2], 16),
             tensor("mtp.0.norm.weight", DType::Bf16, &[37], 74),
-            tensor("mtp.0.ffn.experts.0.w1.weight", DType::U8, &[512], 512),
         ];
         let layout = super::super::weight_layout::draft_layout_from_headers(draft.iter().map(|t| &t.meta)).unwrap();
         assert!(layout.padding_bytes() > 0, "fixture must exercise alignment padding");
