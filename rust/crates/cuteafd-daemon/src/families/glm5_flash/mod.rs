@@ -1644,7 +1644,7 @@ impl EngineArgs {
 /// The step settings these arguments give the engine (its step plan's inputs besides layers and experts),
 /// with the DSA index cache `with_engine` resolved (a head split keeps `keys`).
 fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache) -> engine::StepSettings {
-    engine::StepSettings { kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
+    engine::StepSettings { target_head: args.resolved_target_head(), kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
         max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records,
         decode_rows: args.decode_rows }
@@ -2068,6 +2068,8 @@ impl Opened {
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
+            blas_head: args.resolved_target_head().blas_head(!self.native && core.get_weight("lm_head").is_none()
+                && representation.head == head::GlmfHeadFormat::Bf16),
             representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: if shape.full_prefill_logits {
@@ -2829,7 +2831,7 @@ impl Opened {
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
             let mut settings = step_settings(args, index_cache);
             settings.max_context = max_context;
-            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, matches!(model.head, head::GlmfHead::K6(_) | head::GlmfHead::RowFp8(_)), step_experts, settings);
+            let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, &model.head, step_experts, settings);
             let lanes = args.prefill_waves;
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };
@@ -2930,7 +2932,8 @@ impl Opened {
         engine.bind_expert_homes(&placement, &spark_layers, args.skip_experts)?;
         finish_loading(&self.library, &mut engine, |engine| {
             engine.drafter = self.load_drafter(args, &programs, stream, &engine.embedding, prepared_draft.take(), draft_read,
-                if args.tp2_dflash { Some(engine.draft_exchange()?) } else { None })?;
+                if args.tp2_dflash { Some(engine.draft_exchange()?) } else { None },
+                crate::shared::speculation::dflash::TargetProjection::from_bf16(engine.weights.head.bf16().is_some()))?;
             engine.bind_draft_core_head()?;
             engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
             cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
@@ -3019,7 +3022,8 @@ impl Opened {
     /// The drafter `--draft` names, on `stream` (it reads only the mask token's embedding row).
     fn load_drafter<'s>(&'s self, args: &EngineArgs, programs: &'s cuteafd_ffi::programs::Programs<'s>, stream: *mut std::ffi::c_void,
         embedding: &crate::shared::token_io::TokenEmbedding<'_>, prepared: Option<crate::shared::draft::remote::Prepared<'s>>,
-        read: Option<dspark::DraftRead>, exchange: Option<std::rc::Rc<crate::shared::peer_split::PeerExchange<'s>>>)
+        read: Option<dspark::DraftRead>, exchange: Option<std::rc::Rc<crate::shared::peer_split::PeerExchange<'s>>>,
+        target_projection: crate::shared::speculation::dflash::TargetProjection)
         -> Result<Option<dspark::Drafter<'s>>> {
         let Some(snapshot) = &args.draft else { return Ok(None) };
         let read = read.context("the drafter read was not started with --draft")?;
@@ -3046,7 +3050,7 @@ impl Opened {
             dspark::Drafter::Dflash2(crate::shared::experts::rtx::push::load_alone_admitted(snapshot,
                 &devices, admitted, || {
                     let arenas = dspark::dflash_arenas(&self.library, snapshot, representation, &devices.map(|d| d.id))?;
-                    DflashDrafter::load_tp2_with(&self.library, programs, snapshot, file,
+                    DflashDrafter::load_tp2_with(&self.library, programs, target_projection, snapshot, file,
                         slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear,
                         args.draft_kv_cache, exchange,
                         |device, name, bytes| dspark::draft_allocation(&self.library, &arenas, device, name, bytes))
@@ -3062,15 +3066,15 @@ impl Opened {
             let draft = crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
                 device.own(|| {
                     let arenas = dspark::dflash_arenas(&self.library, snapshot, representation, &[device.id])?;
-                    DflashDrafter::load_with(&self.library, programs, snapshot, file, prepared.stream.raw,
+                    DflashDrafter::load_with(&self.library, programs, crate::shared::speculation::dflash::TargetProjection::Native, snapshot, file, prepared.stream.raw,
                         slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache,
                         |device, name, bytes| dspark::draft_allocation(&self.library, &arenas, device, name, bytes))
                 }))?;
-            dspark::Drafter::RemoteDflash(crate::shared::draft::remote_dflash::RemoteDflash::new(draft, prepared)?)
+            dspark::Drafter::RemoteDflash(crate::shared::draft::remote_dflash::RemoteDflash::new(draft, prepared, target_projection)?)
         } else {
             let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
             crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
-                dspark::Drafter::load(&self.library, programs, snapshot, stream, slots, batch,
+                dspark::Drafter::load(&self.library, programs, target_projection, snapshot, stream, slots, batch,
                     embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
                     args.draft_linear, args.draft_kv_cache, read))?
         };

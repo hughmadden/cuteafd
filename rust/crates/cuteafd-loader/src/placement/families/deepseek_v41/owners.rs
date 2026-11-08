@@ -224,6 +224,28 @@ impl TargetOwners {
     }
 }
 
+/// All compressor/index plans borrow the serving thread's Lt pool. dSpark's
+/// Markov GEMM lives only beside the terminal; vocabulary plans join that pool.
+pub fn blas_owners(ranks: usize, head: crate::placement::planner::serving::BlasHead,
+    dspark: bool) -> Result<Vec<crate::placement::planner::serving::BlasOwners>> {
+    use crate::placement::planner::{Activation, Lifetime, Location, Phase, serving::BlasOwners};
+    ensure!(matches!(ranks, 1 | 2), "invalid V4.1 BLAS owners");
+    let mut owners = (0..ranks).map(|gpu| BlasOwners {
+        name: format!("V4.1 compressor, index and vocabulary owner{gpu}"),
+        process: "coordinator".into(), thread: "v41/blas/serve".into(),
+        location: Location::coordinator(gpu as u8), gemm: head.gemm(), lt: true,
+        lifetime: Lifetime::RESIDENT, activation: Activation::always(),
+    }).collect::<Vec<_>>();
+    if dspark {
+        owners.push(BlasOwners { name: "V4.1 dSpark Markov and terminal".into(),
+            process: "coordinator".into(), thread: "v41/blas/serve".into(),
+            location: Location::coordinator((ranks - 1) as u8), gemm: true, lt: false,
+            lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+            activation: Activation::always() });
+    }
+    Ok(owners)
+}
+
 pub struct NativePrograms<'a> {
     manifest: &'a Value,
     sms: u32,
@@ -239,6 +261,48 @@ impl<'a> NativePrograms<'a> {
         ProgramSet::v41_fp8(self.manifest, &[(k, n)], rows, self.sms)?.scratch
             .into_iter().try_fold(0u64, |sum, (_, bytes)| sum.checked_add(bytes)
                 .context("V4.1 projection arena overflow"))
+    }
+
+    /// Selected native projection modules, not the all-family PROGRAMS.json.
+    /// Each selected variant loads quantization and GEMM; grouped queries also
+    /// load their RoPE quantizer. The shared module formula includes fixed CUDA
+    /// kernels, but no BLAS residency or graph executables.
+    pub fn modules(&self, decode_rows: u64, unit: u64, ranks: usize,
+        draft_rows: Option<u64>) -> Result<Vec<ProgramSet>> {
+        ensure!(matches!(ranks, 1 | 2), "invalid V4.1 module owners");
+        let target = [(5120, 1280), (1280, 32768), (32768, 8192),
+            (8192, 5120), (5120, 512), (1280, 4096)];
+        (0..ranks).map(|rank| {
+            let mut selected = std::collections::BTreeSet::new();
+            let mut add = |rows, matrices: &[(u64, u64)]| -> Result<()> {
+                let plans = ProgramSet::v41_fp8(self.manifest, matrices, rows, self.sms)?;
+                for label in plans.names {
+                    selected.insert(format!("{label}/quant"));
+                    selected.insert(format!("{label}/gemm"));
+                    let variant = self.manifest["variants"].as_array().context("missing native module variants")?.iter()
+                        .find(|variant| variant["label"].as_str() == Some(label.as_str()))
+                        .context("selected native module label disappeared")?;
+                    if variant["groups"].as_u64().unwrap_or(1) > 1 {
+                        selected.insert(format!("{label}/quant_rope"));
+                    }
+                }
+                Ok(())
+            };
+            for rows in [decode_rows, unit] {
+                add(rows, &target)?;
+                if rank == 0 { add(rows, &[(6144, 25600)])?; }
+                add(rows, if ranks == 1 { &[(5120, 2304), (2304, 5120)] }
+                    else { &[(5120, 1152), (1152, 5120)] })?;
+            }
+            if rank == ranks - 1 {
+                if let Some(rows) = draft_rows {
+                    add(rows, &target)?;
+                    add(rows, &[(15360, 5120), (5120, 2304), (2304, 5120)])?;
+                }
+            }
+            Ok(ProgramSet { families: vec!["v41".into()],
+                names: selected.into_iter().collect(), scratch: Vec::new() })
+        }).collect()
     }
 
     fn shared_ffn(&self, rows: u64) -> Result<u64> {
@@ -546,7 +610,7 @@ mod tests {
     fn manifest() -> Value {
         let matrices = [(5120, 1280), (1280, 32768), (32768, 8192), (8192, 5120),
             (5120, 2304), (2304, 5120), (5120, 512), (1280, 4096),
-            (6144, 25600), (15360, 5120)];
+            (6144, 25600), (15360, 5120), (5120, 1152), (1152, 5120)];
         let variants = matrices.into_iter().flat_map(|(k, n)| {
             [1, 16, 64, 80, 256, 1024, 4096].map(move |rows| json!({
                 "capacity": rows, "input_dim": k, "output_dim": n,
@@ -567,6 +631,43 @@ mod tests {
 
     fn owner(demands: &[Demand], rank: u8, group: &str) -> u64 {
         demands.iter().find(|d| d.gpu == rank && d.group == group).unwrap().bytes
+    }
+
+    #[test]
+    fn selected_native_modules_follow_devices_capacities_and_draft_home() -> Result<()> {
+        let manifest = manifest();
+        let programs = NativePrograms::new(&manifest, 188)?;
+        let target = programs.modules(DECODE_LANE_ROWS, 256, 2, None)?;
+        assert!(target[0].names.iter().any(|name| name.contains("6144_25600")));
+        assert!(!target[1].names.iter().any(|name| name.contains("6144_25600")));
+        assert!(target.iter().all(|set| set.names.iter().any(|name| name.contains("5120_1152"))));
+        assert!(target.iter().all(|set| !set.names.iter().any(|name| name.contains("_4096/"))));
+        let draft = programs.modules(DECODE_LANE_ROWS, 256, 2, Some(80))?;
+        assert_eq!(target[0], draft[0]);
+        assert!(draft[1].names.iter().any(|name| name.contains("15360_5120")));
+        assert!(draft[1].names.len() > target[1].names.len());
+        for set in draft {
+            assert_eq!(set.names.len(), set.names.iter().collect::<std::collections::BTreeSet<_>>().len());
+            assert!(set.scratch.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blas_pools_follow_compressors_and_decoder_markov_not_lanes() -> Result<()> {
+        use crate::placement::planner::serving::BlasHead;
+        for ranks in [1, 2] {
+            for head in [BlasHead::Native, BlasHead::Gemm, BlasHead::TensorLt] {
+                let target = blas_owners(ranks, head, false)?;
+                assert_eq!(target.len(), ranks);
+                assert!(target.iter().all(|owner| owner.lt && owner.gemm == head.gemm()));
+                let draft = blas_owners(ranks, head, true)?;
+                assert_eq!(draft.len(), ranks + 1);
+                assert_eq!(draft.last().unwrap().location, crate::placement::planner::Location::coordinator((ranks - 1) as u8));
+                assert!(draft.last().unwrap().gemm);
+            }
+        }
+        Ok(())
     }
 
     #[test]

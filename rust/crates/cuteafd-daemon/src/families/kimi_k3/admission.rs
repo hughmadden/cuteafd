@@ -226,6 +226,8 @@ impl<'a> Admission<'a> {
         exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>)
         -> Result<DeviceOwner<'a, DflashDrafter<'a>>> {
         let rank = self.devices.len() - 1;
+        let target_projection = crate::shared::speculation::dflash::TargetProjection::from_bf16(
+            !self.core.projections.contains_key("language_model.lm_head"));
         self.allocate_draft_with(device.id, |layout| device.own(|| {
             let split = if layout.context_split() {
                 let (streams, peer) = exchange.context("Kimi Context draft requires target exchange")?;
@@ -240,7 +242,8 @@ impl<'a> Admission<'a> {
             ensure!(arena_layout.bytes() == admitted.bytes() && arena_layout.views() == admitted.views(),
                 "Kimi draft binder differs from admitted immutable arena");
             let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, arena_layout, ArenaTag::drafter_weights("kimi/draft"))?;
-            DflashDrafter::load_mla_with(device.library, programs, "kimik3", snapshot, file, stream, layout,
+            DflashDrafter::load_mla_with(device.library, programs,
+                target_projection, "kimik3", snapshot, file, stream, layout,
                 representation, scales, rows, split, |physical, name, bytes| {
                     ensure!(physical == device.id, "Kimi draft arena physical owner changed");
                     arena.view(name, bytes)
@@ -828,7 +831,8 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         fixed, owners: Vec::new(),
     };
     recipe.arena_padding(cfg, &core)?;
-    recipe.blas_owners(core.get_weight("language_model.lm_head").is_some())?;
+    recipe.blas_owners(crate::shared::target_head::TargetHead::configured().blas_head(
+        core.get_weight("language_model.lm_head").is_none()))?;
     let modes = recipe.resolved_attention();
     let prepared_graph_set = (graph_reserve && (RANKS != 2 || placement_mode != AttentionPlacement::Layers)).then(|| super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows,
         graph_slots, graph_verify, RANKS,

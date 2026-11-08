@@ -186,7 +186,8 @@ int cuteafd_peer_exchange_initialize(void) { return 0; }
 /* Head fixture records the scratch selected by the real Rust handle binding. */
 struct fixture_head { void *workspace; int width, rows, vocab; };
 int cuteafd_vocabulary_head_create_vocab(void *workspace, uint64_t bytes,
-        int width, int rows, int vocab, void **out) {
+        int width, int rows, int vocab, int mode, void **out) {
+    (void)mode;
     if (!workspace || bytes < (4u << 20) || width <= 0 || rows <= 0 || vocab <= 0) return 1;
     struct fixture_head *head = malloc(sizeof(*head));
     if (!head) return 1;
@@ -204,8 +205,8 @@ int cuteafd_vocabulary_head_launch_width(void *opaque, const uint16_t *input,
     output[0] = (float)input[0];
     return 0;
 }
-int cuteafd_v41_vocabulary_shard_create(void *workspace, uint64_t bytes, int vocab, void **out) {
-    return cuteafd_vocabulary_head_create_vocab(workspace, bytes, 5120, 128, vocab, out);
+int cuteafd_v41_vocabulary_shard_create(void *workspace, uint64_t bytes, int vocab, int mode, void **out) {
+    return cuteafd_vocabulary_head_create_vocab(workspace, bytes, 5120, 128, vocab, mode, out);
 }
 int cuteafd_v41_vocabulary_head_launch(void *head, const uint16_t *input,
         const uint16_t *weight, float *output, int rows, void *stream) {

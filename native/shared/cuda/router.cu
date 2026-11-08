@@ -10,12 +10,6 @@ constexpr size_t kDs4FlashTopK = 6;
 constexpr size_t kDs4FlashVocabSize = 129280;
 constexpr float kDs4FlashRoutedScalingFactor = 1.5f;
 constexpr size_t kDs4FlashHybridCandidates = 12;
-constexpr size_t kDs4ProHiddenDim = 7168;
-constexpr size_t kDs4ProExperts = 384;
-constexpr size_t kDs4ProTopK = 6;
-constexpr size_t kDs4ProVocabSize = 129280;
-constexpr float kDs4ProRoutedScalingFactor = 2.5f;
-constexpr size_t kDs4ProExactRouterMaxRows = 256;
 
 __device__ float sqrt_softplus_f32(float value) {
   const float softplus = fmaxf(value, 0.0f) + log1pf(expf(-fabsf(value)));
@@ -55,17 +49,6 @@ __global__ void ds4_router_bf16_score_workspace_kernel(
 
   const float score = sqrt_softplus_f32(scratch[0]);
   raw_scores[row * Experts + expert] = score;
-}
-
-template <size_t Experts>
-__global__ void ds4_router_logits_to_scores_kernel(float *raw_scores,
-                                                   size_t rows) {
-  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
-                       threadIdx.x;
-  const size_t values = rows * Experts;
-  if (index < values) {
-    raw_scores[index] = sqrt_softplus_f32(raw_scores[index]);
-  }
 }
 
 // Score production remains fully parallel over (row, expert). Selection is a
@@ -321,75 +304,6 @@ __global__ void ds4_flash_router_finalize_kernel(uint32_t *topk_indices,
     topk_scores[offset + rank] = isfinite(score) ? score : 0.0f;
     topk_weights[offset + rank] =
         topk_scores[offset + rank] / score_sum * kDs4FlashRoutedScalingFactor;
-  }
-}
-
-__global__ void ds4_pro_hash_router_bf16_score_kernel(
-    const uint16_t *hidden, const uint16_t *router_weight,
-    const int64_t *token_to_experts, const int64_t *token_ids,
-    uint32_t *topk_indices, float *topk_scores, size_t rows) {
-  __shared__ float scratch[kBlock];
-  const size_t rank = blockIdx.x;
-  const size_t row = blockIdx.y;
-  if (row >= rows || rank >= kDs4ProTopK) {
-    return;
-  }
-  const size_t tid = threadIdx.x;
-  const int64_t token_id = token_ids[row];
-  const bool valid_token =
-      token_id >= 0 && token_id < static_cast<int64_t>(kDs4ProVocabSize);
-  const int64_t expert_id =
-      valid_token ? token_to_experts[token_id * kDs4ProTopK + rank]
-                  : int64_t{-1};
-  const bool valid_expert =
-      expert_id >= 0 && expert_id < static_cast<int64_t>(kDs4ProExperts);
-  float partial = 0.0f;
-  if (valid_expert) {
-    const uint16_t *row_hidden = hidden + row * kDs4ProHiddenDim;
-    const uint16_t *weight_row = router_weight + expert_id * kDs4ProHiddenDim;
-    for (size_t col = tid; col < kDs4ProHiddenDim; col += blockDim.x) {
-      partial = fmaf(bf16_to_f32(row_hidden[col]), bf16_to_f32(weight_row[col]),
-                     partial);
-    }
-  }
-  scratch[tid] = partial;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < static_cast<size_t>(stride)) {
-      scratch[tid] += scratch[tid + stride];
-    }
-    __syncthreads();
-  }
-  if (tid == 0) {
-    const size_t output = row * kDs4ProTopK + rank;
-    const float raw_score = valid_expert ? sqrt_softplus_f32(scratch[0]) : 0.0f;
-    topk_indices[output] = valid_expert ? static_cast<uint32_t>(expert_id) : 0;
-    topk_scores[output] = isfinite(raw_score) ? raw_score : 0.0f;
-  }
-}
-
-__global__ void ds4_pro_router_finalize_kernel(uint32_t *topk_indices,
-                                               float *topk_scores,
-                                               float *topk_weights,
-                                               size_t rows) {
-  const size_t row = blockIdx.x;
-  if (row >= rows || threadIdx.x != 0) {
-    return;
-  }
-  const size_t offset = row * kDs4ProTopK;
-  float score_sum = 0.0f;
-  for (size_t rank = 0; rank < kDs4ProTopK; ++rank) {
-    const float score = topk_scores[offset + rank];
-    score_sum += isfinite(score) ? score : 0.0f;
-  }
-  score_sum = fmaxf(score_sum, 1.0e-12f);
-  for (size_t rank = 0; rank < kDs4ProTopK; ++rank) {
-    topk_indices[offset + rank] &= ~kRouterTopKLockBit;
-    const float score = topk_scores[offset + rank];
-    topk_scores[offset + rank] = isfinite(score) ? score : 0.0f;
-    topk_weights[offset + rank] =
-        topk_scores[offset + rank] / score_sum * kDs4ProRoutedScalingFactor;
   }
 }
 
@@ -1075,95 +989,6 @@ extern "C" cuteafd_status_t cuteafd_cuda_ds4_flash_router_refine_topk_bf16_async
       approximate_logits, correction_bias, topk_indices, topk_scores,
       topk_weights, rows);
   return status_from_cuda(cudaGetLastError());
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_ds4_pro_router_topk_bf16_async(
-    const uint16_t *hidden, const uint16_t *router_weight,
-    const float *correction_bias, const int64_t *token_to_experts,
-    const int64_t *token_ids, uint32_t *topk_indices, float *topk_scores,
-    float *topk_weights, size_t rows, int hash_routing, void *cuda_stream) {
-  if (hidden == nullptr || router_weight == nullptr || topk_indices == nullptr ||
-      topk_scores == nullptr || topk_weights == nullptr || rows == 0 ||
-      rows > static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
-    return CUTEAFD_STATUS_INVALID_ARGUMENT;
-  }
-  if ((hash_routing == 0 && correction_bias == nullptr) ||
-      (hash_routing != 0 &&
-       (token_to_experts == nullptr || token_ids == nullptr))) {
-    return CUTEAFD_STATUS_INVALID_ARGUMENT;
-  }
-  size_t ignored = 0;
-  if (!checked_mul(rows, kDs4ProHiddenDim, &ignored) ||
-      !checked_mul(rows, kDs4ProTopK + kDs4ProExperts, &ignored)) {
-    return CUTEAFD_STATUS_INVALID_ARGUMENT;
-  }
-
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  if (hash_routing != 0) {
-    ds4_pro_hash_router_bf16_score_kernel<<<
-        dim3(kDs4ProTopK, static_cast<unsigned int>(rows), 1), kBlock, 0,
-        stream>>>(hidden, router_weight, token_to_experts, token_ids,
-                  topk_indices, topk_scores, rows);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      return status_from_cuda(err);
-    }
-    ds4_pro_router_finalize_kernel<<<static_cast<unsigned int>(rows), 1, 0,
-                                     stream>>>(topk_indices, topk_scores,
-                                               topk_weights, rows);
-  } else {
-    float *raw_scores = topk_scores + rows * kDs4ProTopK;
-    // Preserve the qualified reduction order for decode and ordinary small
-    // prompts. Large prefill chunks use the tensor-core BF16/FP32 projection;
-    // converting its logits in place avoids the one-block-per-(row, expert)
-    // dot product without perturbing the latency/quality-sensitive path.
-    if (rows > kDs4ProExactRouterMaxRows) {
-      const cuteafd_status_t score_status =
-          cuteafd_cuda_linear_bf16_f32_cublas_async(
-              hidden, router_weight, raw_scores, rows, kDs4ProHiddenDim,
-              kDs4ProExperts, cuda_stream);
-      if (score_status != CUTEAFD_STATUS_OK) {
-        return score_status;
-      }
-      const size_t values = rows * kDs4ProExperts;
-      const size_t blocks = (values + kBlock - 1) / kBlock;
-      if (blocks >
-          static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
-        return CUTEAFD_STATUS_INVALID_ARGUMENT;
-      }
-      ds4_router_logits_to_scores_kernel<kDs4ProExperts>
-          <<<static_cast<unsigned int>(blocks), kBlock, 0, stream>>>(
-              raw_scores, rows);
-    } else {
-      ds4_router_bf16_score_workspace_kernel<kDs4ProHiddenDim,
-                                              kDs4ProExperts><<<
-          dim3(kDs4ProExperts, static_cast<unsigned int>(rows), 1), kBlock, 0,
-          stream>>>(hidden, router_weight, raw_scores, rows);
-    }
-    const cudaError_t score_error = cudaGetLastError();
-    if (score_error != cudaSuccess) {
-      return status_from_cuda(score_error);
-    }
-    ds4_router_select_workspace_kernel<kDs4ProExperts, kDs4ProTopK>
-        <<<static_cast<unsigned int>(rows), 1, 0, stream>>>(
-            raw_scores, correction_bias, topk_indices, topk_scores,
-            topk_weights, rows, kDs4ProRoutedScalingFactor);
-  }
-  return status_from_cuda(cudaGetLastError());
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_ds4_pro_router_topk_bf16(
-    const uint16_t *hidden, const uint16_t *router_weight,
-    const float *correction_bias, const int64_t *token_to_experts,
-    const int64_t *token_ids, uint32_t *topk_indices, float *topk_scores,
-    float *topk_weights, size_t rows, int hash_routing) {
-  const cuteafd_status_t status = cuteafd_cuda_ds4_pro_router_topk_bf16_async(
-      hidden, router_weight, correction_bias, token_to_experts, token_ids,
-      topk_indices, topk_scores, topk_weights, rows, hash_routing, nullptr);
-  if (status != CUTEAFD_STATUS_OK) {
-    return status;
-  }
-  return status_from_cuda(cudaStreamSynchronize(nullptr));
 }
 
 extern "C" cuteafd_status_t cuteafd_cuda_router_topk_bf16_cub_async(

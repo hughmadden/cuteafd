@@ -34,7 +34,7 @@ pub use spark::{ComponentDemand, PreparedSparkLink, SparkAssignment, SparkBudget
 #[cfg(test)]
 mod tests;
 
-pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
+pub use inventory::{ArchContext, GraphRank, GraphSet, Lifetime, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::{CoordinatorCard, PoolPolicy, AGENTIC_FLOOR_TOKENS};
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
 pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};

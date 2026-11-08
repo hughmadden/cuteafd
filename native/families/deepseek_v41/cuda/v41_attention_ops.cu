@@ -102,11 +102,12 @@ extern "C" int32_t cuteafd_v41_attention_rope(const uint16_t* input, const float
   return cudaGetLastError();
 }
 
+#include "blas_owner.h"
 #include <cublas_v2.h>
 #include <new>
 namespace {
 constexpr uint64_t kGroupedWorkspace = 4*1024*1024;
-struct GroupedHandle { cublasHandle_t blas; void* workspace; int device; };
+struct GroupedHandle { std::shared_ptr<cuteafd::BlasOwner> owner; cublasHandle_t blas; void* workspace; int device; };
 int32_t blas_status(cublasStatus_t s) { return s==CUBLAS_STATUS_SUCCESS ? 0 : -int32_t(s); }
 }
 extern "C" int32_t cuteafd_v41_grouped_output_create(void* workspace, uint64_t bytes, void** out) {
@@ -117,18 +118,15 @@ extern "C" int32_t cuteafd_v41_grouped_output_create(void* workspace, uint64_t b
   if (!h) return cudaErrorMemoryAllocation;
   auto status=cudaGetDevice(&h->device);
   if(status!=cudaSuccess) {delete h;return status;}
-  // Third-party residual: cuBLAS/cuBLASLt internal storage; handle ownership is unchanged.
-  auto result=CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&h->blas), 0, 0, nullptr);
+  auto result=cuteafd::borrow_blas(false,h->owner,"v41/blas/grouped-output");
+  if(result==CUBLAS_STATUS_SUCCESS)h->blas=h->owner->gemm;
   if(result!=CUBLAS_STATUS_SUCCESS) {delete h;return blas_status(result);}
-  // Prevent reduced-precision intermediate reductions before the final BF16 output.
-  result=cublasSetMathMode(h->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
-  if(result!=CUBLAS_STATUS_SUCCESS) {cublasDestroy(h->blas);delete h;return blas_status(result);}
   h->workspace=workspace;*out=h;return 0;
 }
 extern "C" int32_t cuteafd_v41_grouped_output_destroy(void* opaque) {
   if(!opaque) return cudaErrorInvalidValue;
   auto* h=static_cast<GroupedHandle*>(opaque);
-  auto status=cublasDestroy(h->blas);delete h;return blas_status(status);
+  delete h;return 0;
 }
 extern "C" int32_t cuteafd_v41_grouped_output_launch(void* opaque, const uint16_t* input,
     const uint16_t* weight, uint16_t* output, int32_t rows, void* stream) {
@@ -143,10 +141,8 @@ extern "C" int32_t cuteafd_v41_grouped_output_launch(void* opaque, const uint16_
       !disjoint(h->workspace,kGroupedWorkspace,input,a) ||
       !disjoint(h->workspace,kGroupedWorkspace,weight,w) ||
       !disjoint(h->workspace,kGroupedWorkspace,output,c)) return cudaErrorInvalidValue;
-  auto result=cublasSetStream(h->blas,reinterpret_cast<cudaStream_t>(stream));
-  if(result!=CUBLAS_STATUS_SUCCESS) return blas_status(result);
-  // SetStream resets the workspace; restore caller-owned storage for every launch.
-  result=cublasSetWorkspace(h->blas,h->workspace,kGroupedWorkspace);
+  auto result=cuteafd::bind_blas(h->owner,reinterpret_cast<cudaStream_t>(stream),
+      h->workspace,kGroupedWorkspace,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
   if(result!=CUBLAS_STATUS_SUCCESS) return blas_status(result);
   const float alpha=1,beta=0;
   // Column-major W^T [1024,4096] times strided token columns; group slices

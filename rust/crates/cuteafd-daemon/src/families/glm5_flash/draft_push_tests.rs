@@ -110,14 +110,14 @@ fn installed_flash_drafters_push_byte_identical_to_mount_within_admitted_staging
                     let tensors = if recording { Default::default() }
                         else { crate::shared::speculation::block_dspark::prefetch(&snapshot).join()
                             .map_err(|_| anyhow::anyhow!("prefetch panicked"))?? };
-                    Loaded::Dspark(DsparkDrafter::load(&library, &programs, &snapshot, tensors, std::ptr::null_mut(),
+                    Loaded::Dspark(DsparkDrafter::load(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Bf16, &snapshot, tensors, std::ptr::null_mut(),
                         slots, batch, mask(cfg.hidden), representation, crate::shared::fp8_linear::Fp8Scales::Pow2,
                         crate::shared::fp8_linear::Fp8Rows::W8a16, Qwen4KvCache::Bf16)?)
                 } else {
                     let cfg = DflashConfig::read(&snapshot)?;
                     let file = if recording { Vec::new() } else { crate::shared::speculation::dflash::prefetch(&snapshot)
                         .join().map_err(|_| anyhow::anyhow!("prefetch panicked"))?? };
-                    Loaded::Dflash(DflashDrafter::load(&library, &programs, &snapshot, file, std::ptr::null_mut(),
+                    Loaded::Dflash(DflashDrafter::load(&library, &programs, crate::shared::speculation::dflash::TargetProjection::Bf16, &snapshot, file, std::ptr::null_mut(),
                         slots, batch, mask(cfg.hidden), true, representation, crate::shared::fp8_linear::Fp8Scales::Pow2,
                         crate::shared::fp8_linear::Fp8Rows::W8a16, Qwen4KvCache::Bf16)?)
                 }))

@@ -211,6 +211,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         if matches!(engine.experts(), Some(super::engine::Experts::SharedOnly)) {
             tracing::warn!("serve-qwen4 --shared-only: replies do not match the model (plumbing and cache gates only)");
         }
+        engine.prepare_serving_workspaces()?;
         engine.warm_decode_graphs(max_sequences, !matches!(draft, Drafts::None))?;
         if let Ok(path) = std::env::var("CUTEAFD_QWEN4_PADDING_TOKENS") {
             let bytes = std::fs::read(&path).with_context(|| format!("Qwen padding tokens {path}"))?;

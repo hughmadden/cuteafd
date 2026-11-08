@@ -63,6 +63,7 @@ pub struct GlmRecipe<'a> {
     pub draft_homes: Vec<u8>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
     pub media_cache_bytes: u64,
+    pub blas: Vec<serving::BlasOwners>,
     pub experts: Option<ExpertProfile>,
     pub targets: Vec<Case<TargetBuffers>>,
     pub hooks: Vec<Case<HookBuffers>>,
@@ -648,6 +649,8 @@ pub struct ProductionInput<'a> {
     pub attention: AttentionPlacement,
     pub gpus: usize,
     pub prefill: PrefillShape,
+    pub blas_head: serving::BlasHead,
+    pub blas: Vec<serving::BlasOwners>,
     pub target: TargetFacts,
     pub draft: DraftFacts,
     pub scratch: [super::GlmScratch; 2],
@@ -862,9 +865,21 @@ impl<'a> ProductionInput<'a> {
             maximum_pages, attention, gpus: self.gpus, spark_links: self.spark_ranks > 0,
             prefill: vec![self.prefill], lanes: vec![1],
             embedding: weights.iter().map(|(home, _)| *home).collect(), draft_homes: self.draft.homes(self.gpus),
-            encoders: vec![], media_cache_bytes: 0, experts,
+            encoders: vec![], media_cache_bytes: 0, blas: self.blas, experts,
             targets: vec![], hooks: vec![], exchanges: vec![], weights: vec![], graphs: vec![],
             host: Some(host), owners: vec![], };
+        if self.blas_head.bf16() {
+            let target = serving::BlasOwners { name: "GLM target vocabulary".into(),
+                process: "coordinator".into(), thread: "glm/blas/serve".into(),
+                location: Location::coordinator(0), gemm: self.blas_head.gemm(), lt: self.blas_head.lt(),
+                lifetime: Lifetime::TARGET, activation: Activation::always() };
+            recipe.blas.push(target.clone());
+            if !self.draft.is_empty() {
+                // A local draft or remote BF16 bridge owns its GEMM head on GPU0.
+                recipe.blas.push(serving::BlasOwners { name: "GLM draft vocabulary bridge".into(),
+                    gemm: true, lt: false, lifetime: Lifetime::RESIDENT, ..target });
+            }
+        }
         recipe.owners.push(Case { when: vec![], value: self.owners });
         if let Some(geometry) = &recipe.expert_usage {
             let mut owners = crate::placement::expert_usage::components(geometry, &[0], maximum_pages)?;
@@ -1648,6 +1663,7 @@ impl Recipe for GlmRecipe<'_> {
                 variable
             })
         });
+        let mut blas = self.blas.clone();
         if !self.encoders.is_empty() {
             use crate::plan::encoder::EncoderKind;
             let variable = contract.variables.len();
@@ -1665,6 +1681,11 @@ impl Recipe for GlmRecipe<'_> {
                 };
                 let mut components = Vec::new();
                 for (copy, location) in locations.iter().copied().enumerate() {
+                    blas.push(serving::BlasOwners { name: format!("GLM vision {option}/{copy}"),
+                        process: match location.device { Device::Spark(rank) => format!("glm-media-worker-{rank}"),
+                            _ => "coordinator".into() }, thread: "glm/blas/media".into(), location,
+                        gemm: true, lt: false, lifetime: Lifetime::RESIDENT,
+                        activation: Activation::choice(variable, option) });
                     for (part, bytes, category) in [("weights", encoder.weights, cuteafd_core::memory_layout::Category::Weights),
                         ("scratch", encoder.scratch, cuteafd_core::memory_layout::Category::Workspace)] {
                         if bytes == 0 { continue; }
@@ -1687,6 +1708,12 @@ impl Recipe for GlmRecipe<'_> {
                     contract.components.push(component);
                 }
             }
+        }
+        for arch in ["sm_120", "sm_121"] {
+            let owners = blas.iter().filter(|owner| matches!(owner.location.device, Device::Coordinator(_))
+                == (arch == "sm_120")).cloned().collect::<Vec<_>>();
+            contract.components.extend(serving::blas_components(arch, &owners,
+                self.maximum_pages, contract.phase_order)?);
         }
         if request.operation == Operation::Scoring {
             for (option, shape) in self.prefill.iter().enumerate() {

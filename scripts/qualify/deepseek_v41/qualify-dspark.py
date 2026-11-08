@@ -66,7 +66,7 @@ def main():
     confidence, raw_confidence = bind('cuteafd_v41_dspark_confidence', [P,P,P,P,I,P])
     create, _ = bind('cuteafd_v41_markov_create', [P,C.c_uint64,C.POINTER(P)])
     destroy, _ = bind('cuteafd_v41_markov_destroy', [P])
-    create_head, _ = bind('cuteafd_v41_vocabulary_head_create', [P,C.c_uint64,C.POINTER(P)])
+    create_head, _ = bind('cuteafd_v41_vocabulary_head_create', [P,C.c_uint64,I,C.POINTER(P)])
     head_projection, _ = bind('cuteafd_v41_vocabulary_head_launch', [P,P,P,P,I,P])
     norm, _ = bind('cuteafd_cuda_ds4_rmsnorm_bf16_rne_async', [P,P,P,I,I,C.c_float,P])
     markov, raw_markov = bind('cuteafd_v41_markov_launch', [P,P,P,P,I,P])
@@ -248,7 +248,7 @@ def main():
                 head_output = torch.empty((80,V),device='cuda')
                 head_workspace = torch.empty(4*1024*1024,dtype=torch.uint8,device='cuda')
                 head_handle = P()
-                create_head(ptr(head_workspace),head_workspace.numel(),C.byref(head_handle))
+                create_head(ptr(head_workspace),head_workspace.numel(),0,C.byref(head_handle))
                 head_graph = None
                 try:
                     def project_head(rows=80):

@@ -586,7 +586,9 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let mut prepared = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
-        attention, gpus, prefill, target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
+        attention, gpus, prefill,
+        blas_head: if core.is_some_and(|core| core.ranks[0].target_head.is_some()) { serving::BlasHead::Native }
+            else { options.bf16_target_head }, blas: vec![], target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
         exchange_element_bytes: if exchange_f32 { 4 } else { 2 }, peer_diagnostics: false,
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
         skip_routed_experts: false, operation, sync_upload_bytes: 0, owners: additional, budgets,
@@ -726,7 +728,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let admitted = ProductionInput { expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, maximum_pool_tokens,
-        attention, gpus: gpu_count, prefill, target, draft, scratch, context_scratch: context_programs,
+        attention, gpus: gpu_count, prefill, blas_head: serving::BlasHead::Native, blas: vec![], target, draft, scratch, context_scratch: context_programs,
         exchange_element_bytes: if glm::local_exchange_f32()? { 4 } else { 2 }, peer_diagnostics: false,
         local: source.as_ref().map(|source| (source, physical)), spark_ranks, decode_link, prefill_link,
         skip_routed_experts: false, operation, sync_upload_bytes: 0, owners: additional, budgets,

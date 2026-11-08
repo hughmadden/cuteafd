@@ -660,7 +660,17 @@ pub(super) fn resolve_with_owners(
     let mut budgets = live_budgets(&cards, &sparks)?;
     budgets.extend(admission::production_budgets(&cards.iter().map(|&(total, ceiling, _)| (total, ceiling)).collect::<Vec<_>>(),
         0, Some(host_memory), 0, &[])?.into_iter().filter(|budget| budget.locations.contains(&cuteafd_loader::placement::planner::Location::HOST)));
+    let mut blas = families::deepseek_v41::owners::blas_owners(ranks,
+        crate::shared::target_head::TargetHead::configured().blas_head(
+            !crate::families::deepseek_v41::v41_tensors::fp8_head().target()), draft.is_some())?;
+    if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
+        use cuteafd_loader::placement::planner::{Activation, Lifetime, Location, serving::BlasOwners};
+        blas.push(BlasOwners { name: "V4.1 local vision".into(), process: "coordinator".into(),
+            thread: "v41/blas/media".into(), location: Location::coordinator(0), gemm: true, lt: false,
+            lifetime: Lifetime::RESIDENT, activation: Activation::always() });
+    }
     let input = ProductionInput {
+        blas,
         expert_usage: args.expert_usage_enabled()?,
         config: &config,
         gpus: ranks,
@@ -1091,8 +1101,11 @@ mod admission_tests {
                     ResidentWeights(draft.peer_half)));
             }
             fixed.extend(draft.runtime.iter().cloned());
+            // Its retained storage is in `fixed`, but the loaded drafter still
+            // borrows the serving pool's Markov GEMM backend.
+            let loaded_draft = DraftInventory::default();
             let original = resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; ranks], 0,
-                &fixed, &[], &[], None)?;
+                &fixed, &[], &[], Some(&loaded_draft))?;
             assert_eq!(moved.cache_bytes, original.cache_bytes);
             for gpu in 0..ranks {
                 let total = |items: &[cuteafd_core::memory_layout::Item]| items.iter().map(|i| i.bytes).sum::<u64>();
@@ -1232,10 +1245,14 @@ mod admission_tests {
                         + families::deepseek_v41::runtime_reserve(total as u64, ranks)
                             as usize
                         + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
+                    let blas = admitted.placement.items[gpu].iter().filter(|item|
+                        item.group.starts_with("cuBLAS handles:")
+                            || item.group.starts_with("BLAS device initialization"))
+                        .map(|item| item.bytes).sum::<u64>() as usize;
                     let mappings = admitted.placement.items[gpu].iter()
                         .filter(|item| item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP)
                         .map(|item| item.bytes as usize).sum::<usize>();
-                    (bytes + reserve + deferred[gpu] as usize + usage_bytes + mappings, total)
+                    (bytes + reserve + deferred[gpu] as usize + usage_bytes + blas + mappings, total)
                 })
                 .collect::<Vec<_>>();
             assert_eq!(

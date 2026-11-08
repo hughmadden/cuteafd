@@ -25,7 +25,7 @@ def main():
     torch.manual_seed(91641)
     lib = C.CDLL(str(args.native_lib.resolve()))
     create = lib.cuteafd_v41_vocabulary_shard_create
-    create.argtypes = [C.c_void_p, C.c_uint64, C.c_int32, C.POINTER(C.c_void_p)]
+    create.argtypes = [C.c_void_p, C.c_uint64, C.c_int32, C.c_int32, C.POINTER(C.c_void_p)]
     launch = lib.cuteafd_v41_vocabulary_head_launch
     launch.argtypes = [C.c_void_p] * 4 + [C.c_int32, C.c_void_p]
     destroy = lib.cuteafd_v41_markov_destroy
@@ -63,11 +63,11 @@ def main():
                   torch.empty((vocab, 5120), device='cuda', dtype=torch.bfloat16).normal_(std=.02))
         workspace = torch.empty(4 * 1024 * 1024, device='cuda', dtype=torch.uint8)
         handle = C.c_void_p()
-        assert create(workspace.data_ptr(), workspace.numel(), vocab, C.byref(handle)) == 0
+        assert create(workspace.data_ptr(), workspace.numel(), vocab, 0, C.byref(handle)) == 0
         candidate_handle = C.c_void_p()
         if candidate_lib:
             assert candidate_lib.cuteafd_v41_vocabulary_shard_create(
-                workspace.data_ptr(), workspace.numel(), vocab, C.byref(candidate_handle)) == 0
+                workspace.data_ptr(), workspace.numel(), vocab, 0, C.byref(candidate_handle)) == 0
         try:
             for rows in (1, 4, 16):
                 x = torch.empty((rows, 5120), device='cuda', dtype=torch.bfloat16).normal_(std=.2)

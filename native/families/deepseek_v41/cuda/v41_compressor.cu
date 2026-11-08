@@ -1,4 +1,5 @@
 #include "memory_failure.h"
+#include "blas_owner.h"
 #include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -31,11 +32,12 @@ struct ProjectionPlan {
   }
 };
 struct Handle {
+  std::shared_ptr<cuteafd::BlasOwner> owner;
   cublasLtHandle_t blas=nullptr;
   void* workspace=nullptr;
   int device=0;
   ProjectionPlan plans[4];
-  ~Handle(){if(blas)cublasLtDestroy(blas);}
+
 };
 cublasStatus_t set_rows(ProjectionPlan& plan,uint64_t rows) {
   auto status=cublasLtMatrixLayoutSetAttribute(plan.input,CUBLASLT_MATRIX_LAYOUT_COLS,&rows,sizeof(rows));
@@ -193,8 +195,8 @@ extern "C" int32_t cuteafd_v41_compressor_create(void* workspace,uint64_t bytes,
   if(!h)return cudaErrorMemoryAllocation;
   auto cuda=cudaGetDevice(&h->device);
   if(cuda!=cudaSuccess){delete h;return cuda;}
-  // Third-party residual: cuBLAS/cuBLASLt internal storage; handle ownership is unchanged.
-  auto status=CUTEAFD_CHECK_MEMORY("cublasLtCreate", "cublas", cublasLtCreate(&h->blas), 0, 0, nullptr);
+  auto status=cuteafd::borrow_blas(true,h->owner,"v41/blas/serving");
+  if(status==CUBLAS_STATUS_SUCCESS)h->blas=h->owner->lt;
   if(status!=CUBLAS_STATUS_SUCCESS){delete h;return bs(status);}
   const int n[]={512,512,128,32},k[]={5120,5120,512,5120};
   for(int i=0;i<4;++i) {
@@ -213,6 +215,8 @@ static int32_t project(void* opaque,const uint16_t* input,
   auto* h=static_cast<Handle*>(opaque);int device;auto cuda=cudaGetDevice(&device);
   if(cuda!=cudaSuccess)return cuda;
   if(device!=h->device)return cudaErrorInvalidDevice;
+  const auto owner_status=cuteafd::check_blas_owner(h->owner);
+  if(owner_status!=CUBLAS_STATUS_SUCCESS)return bs(owner_status);
   const uint64_t x=uint64_t(rows)*k*2,w=uint64_t(n)*k*2,o=uint64_t(rows)*n*(ratio==2?4:2);
   if(!valid(input,x,16)||!valid(weight,w,16)||!valid(output,o,16)||
       !disjoint(input,x,output,o)||!disjoint(weight,w,output,o)||

@@ -1420,12 +1420,12 @@ impl<'a> MimoEngine<'a> {
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
         let slot_count = if decode { 1 } else { self.prefill_waves() };
         let head_stride = head_workspace.buffer.bytes / slot_count;
-        let slot_heads = Rc::new(if with_head {
+        let slot_heads = Rc::new(if with_head && matches!(self.weights.head, super::head::MimoHead::Bf16(_)) {
             (0..slot_count).map(|slot| {
                 let buffer = head_workspace.view(slot * head_stride, head_stride)?;
                 // SAFETY: each handle has disjoint admitted scratch, retained by this workspace.
                 Ok(Rc::new(unsafe { self.library.vocabulary_head_rows(buffer.buffer.ptr,
-                    h as u32, size(layout.logits_rows)? as u32, self.cfg.vocab_size as u32)? }))
+                    h as u32, size(layout.logits_rows)? as u32, self.cfg.vocab_size as u32, crate::shared::target_head::TargetHead::configured().native_mode())? }))
             }).collect::<Result<Vec<_>>>()?
         } else { Vec::new() });
         let workspace = Workspace {
@@ -3316,7 +3316,7 @@ mod tests {
         let heads = Rc::new((0..slots).map(|slot| {
             let scratch = head_workspace.view(slot * VOCABULARY_HEAD_WORKSPACE, VOCABULARY_HEAD_WORKSPACE)?;
             // SAFETY: the CPU fixture owns each scratch slice until all head handles drop.
-            Ok(Rc::new(unsafe { library.vocabulary_head_rows(scratch.buffer.ptr, hidden as u32, 1, 64)? }))
+            Ok(Rc::new(unsafe { library.vocabulary_head_rows(scratch.buffer.ptr, hidden as u32, 1, 64, crate::shared::target_head::TargetHead::configured().native_mode())? }))
         }).collect::<anyhow::Result<Vec<_>>>()?);
         let base = Workspace {
             rows, slot_count: slots, decode: false, logits_rows: 1,

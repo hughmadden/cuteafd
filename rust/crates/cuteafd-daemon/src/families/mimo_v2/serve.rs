@@ -527,6 +527,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce()) -> Result<()> {
     let drafter = engine.drafter.as_ref();
+    if let Some(drafter) = drafter { drafter.prepare_workspace()?; }
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let head_numerics = match engine.head().weight {
         super::head::MimoHead::Bf16(_) => "head-bf16",

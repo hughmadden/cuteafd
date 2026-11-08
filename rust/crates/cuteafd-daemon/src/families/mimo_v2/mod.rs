@@ -1293,7 +1293,8 @@ impl Opened {
                 }
                 let drafter = crate::shared::experts::rtx::push::load_alone(dir, &devices, ||
                     dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
-                        capacity.max_batch_sequences, representation, args.fp8_scales, args.draft_kv_cache, exchange))?;
+                        capacity.max_batch_sequences, representation, self.weight_formats.head == MimoProjectionRepresentation::Bf16,
+                        args.fp8_scales, args.draft_kv_cache, exchange))?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
                 if crate::shared::inventory::startup_probe_enabled() {
@@ -1357,6 +1358,7 @@ impl Opened {
                 engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             }
             engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
+            if let Some(drafter) = &engine.drafter { drafter.prepare_workspace()?; }
             body(&engine, preflight.host_config)
         })();
         let submission_failed = engine.submission_failed();

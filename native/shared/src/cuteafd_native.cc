@@ -5654,6 +5654,11 @@ extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_async(const uint16_t*, cons
               "CUDA BF16 linear projection kernel is unavailable in this build");
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(void*) {
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+              "CUDA cuBLAS stream preparation is unavailable in this build");
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_prepare_cublas_handle() {
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
               "CUDA cuBLAS handle preparation is unavailable in this build");

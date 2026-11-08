@@ -378,14 +378,12 @@ fn preflight_shape(
             total_bytes: total as u64,
             baseline_free_bytes: free as u64,
         });
-        // The code still to load before ready: the serving thread's cuBLAS handle, lazily loaded
-        // functions and transport mappings (`placement::inventory::LOADED_CODE`, which the planner
-        // charges in its baseline), instead of another context/module envelope.
+        // Selected program code only; BLAS pools have separate named owners.
         let pending = crate::shared::inventory::pending_code(library, device, rank, ranks == 2,
             cfg.program_family()?, "*", &cuteafd_loader::placement::ProgramSet::from_names(
                 &[cfg.program_family()?, &format!("{}2", cfg.program_family()?)], programs.names()))?;
-        let cublas = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
-        let mut additional = vec![cublas.clone()];
+        let code = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
+        let mut additional = vec![code.clone()];
         let mut resident_weights = cuteafd_loader::placement::ResidentWeights::default();
         let mut weight_arenas = Vec::new();
         additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
@@ -455,7 +453,7 @@ fn preflight_shape(
             device: device_id,
             workspaces,
             additional,
-            loading_additional: vec![cublas],
+            loading_additional: vec![code],
         });
     }
     let profiles_for = |selected_spark_ranks: usize| -> Result<_> {
@@ -542,6 +540,9 @@ fn preflight_shape(
         crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
     let prepared = ProductionInput {
         expert_usage: args.expert_usage_enabled()?,
+        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(
+            opened.weight_formats.head == cuteafd_loader::families::mimo_v2::projection::MimoProjectionRepresentation::Bf16),
+        draft_head: args.draft.is_some(),
         cfg, layers, kv, mtp_stages: args.mtp, context: args.max_context as u64,
         maximum_pool_tokens, prefill, lanes: transport_lanes as u64, embedding, gpus: ranks,
         spark_ranks, experts: expert_costs, expert_workspace, tp2_workspace,

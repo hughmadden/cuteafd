@@ -174,7 +174,7 @@ pub struct GlmfInputs<'a> {
     pub layers: usize,
     /// Sample after programs, before any weights; planned baseline charges context/code only.
     pub gpus: Vec<(u64, Baseline)>,
-    /// Code not present at the baseline sample: LoadedCode minus already-sampled code, per rank.
+    /// Code not present at the baseline sample: selected modules minus already-sampled code, per rank.
     pub pending_code: Vec<u64>,
     /// Measured native EXL3 TP2 program/package path, not the legacy Spark graph path.
     pub local_tp2_exl3: bool,
@@ -195,6 +195,7 @@ pub struct GlmfInputs<'a> {
     pub kda_state_bytes: u64,
     pub shared_replay: bool,
     pub representation: GlmfRepresentation,
+    pub blas_head: crate::placement::planner::serving::BlasHead,
     pub resident: Vec<GlmfResidentRank>,
     /// Exact component-owned step rows with Spark lanes and without Sparks.
     pub workspace: Vec<GlmfBufferDemand>,
@@ -624,7 +625,7 @@ pub(crate) mod tests {
             spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262_144, sequences: 8, speculation: true, state_slots: 8, mark_slots: 16, pool_marks: false,
             index: cache::GlmfIndexCache::Keys, kda_state_bytes: 4, shared_replay: false,
-            representation: GlmfRepresentation::default(),
+            representation: GlmfRepresentation::default(), blas_head: crate::placement::planner::serving::BlasHead::Native,
             resident: (0..ranks).map(|rank| GlmfResidentRank {
                 embedding: if rank == 0 { 1 << 30 } else { 0 }, weights: (5 << 30) + if rank == 1 { 64 << 20 } else { 0 } }).collect(), workspace: workspace_fixture(ranks, 3 << 30), local_workspace: workspace_fixture(ranks, 2 << 30),
             graphs: startup_graphs(cfg, cfg.layers, 262_144, if capacity <= 34 << 30 { 1 << 20 } else { 2 << 20 },
@@ -943,7 +944,6 @@ pub(crate) mod tests {
         calibrate_local_tp2_graphs(&mut graphs);
         let programs = ProgramSet::from_names(&["glmf", "glmf2"], ["glmf_decode", "glmf2_decode"]);
         for rank in 0..2 {
-            assert!(loaded_code("glmf", "exl3-tp2-local", true, rank).is_none());
             let code = inventory::loaded_code_allowance("glmf", "exl3-tp2-local", true, rank,
                 ArchContext::for_device("sm_120", inventory::PRO_TOTAL_BYTES), Some(&programs));
             assert_eq!(code.basis, Basis::Estimated);

@@ -767,7 +767,7 @@ impl<'a> Engine<'a> {
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
             head: if lead {
-                Some(unsafe { self.library.vocabulary_head(head_workspace.buffer.ptr, h as u32, t as u32)? })
+                Some(unsafe { self.library.vocabulary_head(head_workspace.buffer.ptr, h as u32, t as u32, crate::shared::target_head::TargetHead::configured().native_mode())? })
             } else {
                 None
             },

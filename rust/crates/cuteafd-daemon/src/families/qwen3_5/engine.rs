@@ -183,6 +183,7 @@ impl<'a> DenseEngine<'a> {
         let admitted_plan = qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
             weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
             record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
+            blas_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             serving: serving.map(|(_, _, device_sampling, _)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),
             host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
                 quota_bytes: host_config.as_ref().map_or(0, |config| config.bytes),
@@ -222,7 +223,7 @@ impl<'a> DenseEngine<'a> {
         let head_workspace = Allocation::new(device, buffers.head, Tag::workspace("qwen35/head-workspace"))?;
         // SAFETY: owned workspace is retained after the head and stream, including error cleanup.
         let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr, cfg.hidden as u32,
-            buffers.head_rows as u32, cfg.vocab as u32)? };
+            buffers.head_rows as u32, cfg.vocab as u32, crate::shared::target_head::TargetHead::configured().native_mode())? };
         let commit = match admitted.prefix { "qwen35" => "qwen35_gdn_commit", "qwen38" => "qwen38_gdn_commit",
             _ => anyhow::bail!("unadmitted dense prefix") };
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;

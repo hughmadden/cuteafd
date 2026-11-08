@@ -210,6 +210,7 @@ mod tests {
             whole_supported: true, spark_ok: true };
         admission::ProductionInput {
             expert_usage: false,
+            blas_head: crate::placement::planner::serving::BlasHead::Native, draft_head: false,
             cfg, layers: 4, kv: MimoKvFormats::default(), mtp_stages: 0, context,
             maximum_pool_tokens: admission::maximum_pool_tokens(&[96 << 30; 2][..ranks], context,
                 None, spark.pool_unit_rows),
@@ -362,6 +363,43 @@ mod tests {
         facts.expert_usage = true;
         facts.experts.fill(None);
         assert!(facts.prepare().unwrap().recipe.expert_usage.is_none());
+    }
+
+    #[test]
+    fn blas_capacity_receipt_matches_ready_owners_and_pre_body_preparation() {
+        use crate::placement::planner::{Location, Phase, serving::BlasHead};
+        for ranks in [1, 2] {
+            for head in [BlasHead::Native, BlasHead::TensorLt, BlasHead::Gemm] {
+                for draft in [false, true] {
+                    let (cfg, spark, no_spark) = fixture(ranks, 4096);
+                    let mut facts = input(&cfg, &spark, &no_spark, ranks, 4096);
+                    facts.blas_head = head;
+                    facts.draft_head = draft;
+                    let prepared = facts.prepare().unwrap();
+                    let request = admission::production_request(4096, Some(4096), Onboard::Layers(0),
+                        prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
+                        ResidentWeights(u64::MAX), Default::default());
+                    let admitted = prepared.admit(request).unwrap();
+                    let capacity = admission::resolved_capacity(&admitted, 1, 1).unwrap();
+                    let solved = &admitted.solved;
+                    for rank in 0..ranks {
+                        let allowances = |phase| solved.facts.allowances.iter().filter(move |owner|
+                            owner.location == Location::coordinator(rank as u8)
+                                && owner.lifetime.contains(phase, solved.facts.phase_order));
+                        assert_eq!(allowances(Phase::DraftLoad).count(), 0);
+                        let gemm = allowances(Phase::Ready).filter(|owner| owner.source.starts_with("cuBLAS handles:"))
+                            .map(|owner| owner.bytes).sum::<u64>();
+                        assert_eq!(gemm, u64::from(rank == 0 && (head.gemm() || (head.bf16() && draft))) * (64 << 20));
+                        for owner in allowances(Phase::Ready) {
+                            let receipts = capacity.devices[rank].reservations.iter()
+                                .filter(|item| item.name == owner.source).collect::<Vec<_>>();
+                            assert_eq!(receipts.len(), 1);
+                            assert_eq!(receipts[0].bytes, owner.bytes);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

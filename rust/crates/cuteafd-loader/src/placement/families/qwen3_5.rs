@@ -26,6 +26,8 @@ pub struct DrafterBytes {
     pub pool_unit: u64,
     /// All wanted checkpoint tensors coexist in the prefetch HashMap at DraftLoad.
     pub host_prefetch: u64,
+    /// Block dSpark prepares a GEMM head; native MTP borrows the target projection.
+    pub gemm_head: bool,
 }
 
 impl DrafterBytes {
@@ -84,7 +86,7 @@ impl DrafterBytes {
         owned += 12;
         let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
         Ok(Self { owned, weights, weight_arena: None, scratch: 0,
-            pool_unit: (64 * record + cfg.hidden * 2) as u64, host_prefetch: 0 })
+            pool_unit: (64 * record + cfg.hidden * 2) as u64, host_prefetch: 0, gemm_head: false })
     }
 
     pub fn block_dspark(snapshot: &std::path::Path, config: &serde_json::Value, slots: usize, sms: u64, context: usize)
@@ -105,7 +107,7 @@ impl DrafterBytes {
         ensure!(arena.payload_bytes() as u64 == residency.weights.0, "dense dSpark arena differs from weight payload");
         Ok(Self { owned: residency.owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
             weights: residency.weights, weight_arena: Some(("qwen3_5/dspark/gpu0", arena.bytes() as u64)),
-            scratch: residency.scratch, pool_unit: layout.full_bytes, host_prefetch })
+            scratch: residency.scratch, pool_unit: layout.full_bytes, host_prefetch, gemm_head: true })
     }
 }
 

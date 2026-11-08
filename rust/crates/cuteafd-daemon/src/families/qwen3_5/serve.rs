@@ -738,7 +738,8 @@ mod tests {
                 qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30),
                     96 << 30, 0, (128 << 30, 128 << 30))?,
                 DenseFacts { cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
-                    record_bytes: 4096, drafter: None, serving: None, host_prefix: owner, verify_check: false })?;
+                    record_bytes: 4096, drafter: None,
+                    blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt, serving: None, host_prefix: owner, verify_check: false })?;
             assert_eq!(admitted.request.context, requested_context);
             assert_eq!(admitted.served_context(), if context == "auto" { cfg.max_context as u64 } else { 131072 });
             let pinned: u64 = admitted.facts.allocations.iter().filter(|a| a.id.starts_with("host.prefix."))

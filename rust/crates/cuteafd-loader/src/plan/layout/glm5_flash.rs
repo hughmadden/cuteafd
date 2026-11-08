@@ -348,6 +348,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation, state_slots: options.resolved_state_slots("glm5_flash"),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0,
             index, kda_state_bytes: state.bytes(), shared_replay, representation,
+            blas_head: if exlr8.is_some() || core.get_weight("lm_head").is_some()
+                || representation.head != resident::GlmfHeadFormat::Bf16 {
+                placement::planner::serving::BlasHead::Native
+            } else { options.bf16_target_head },
             resident, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },

@@ -215,11 +215,39 @@ def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body
     assert "let Some(shape) = self.prefill_shape else { return Ok(()) };" in prepare
     assert "self.workspace_rows(shape.unit_rows as usize, false," in prepare
     assert "shape.slot_rows() as usize" in prepare
+    assert "self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none()" in prepare
+    assert "self.workspace(self.mtp_prefill_rows(), false, 1)" in prepare
     assert "RetainedUploads::new(" in engine
     stage = engine[engine.index("    fn stage(&self"):engine.index("    fn stage_table")]
     assert "w.staging.borrow_mut().upload(dst, bytes, self.execution_stream())" in stage
     assert "copy_h2d_ordered" not in stage
     assert "begin_staging(" not in engine and "reserve_h2d_ordered(" not in engine
+
+
+def test_qwen_serving_prepares_every_blas_workspace_and_freezes_creation_before_ready():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    serve = (root / "serve.rs").read_text()
+    assert serve.index("engine.prepare_serving_workspaces()?") < serve.index("engine.warm_decode_graphs(")
+    assert serve.index("engine.warm_decode_graphs(") < serve.index("scheduler::schedule(")
+    assert serve.index("scheduler::schedule(") < serve.index("ready.send(Ok(")
+    prepare = engine.split("pub(crate) fn prepare_serving_workspaces(", 1)[1].split("fn allow_workspace_creation(", 1)[0]
+    for required in ("self.prepare_prefill_units()?", "for owner in 0..self.gdn_banks.len()",
+                     "for decode in [false, true]", "self.on_owner(owner, ||",
+                     "self.workspace_slot(owner, decode)?", "self.workspace(rows, decode, logits)?"):
+        assert required in prepare
+    assert prepare.index("self.drain_state()?") < prepare.index("self.workspaces_prepared.set(true)")
+    guard = engine.split("fn allow_workspace_creation(", 1)[1].split("/// Pre-capture", 1)[0]
+    assert "!self.workspaces_prepared.get()" in guard
+    # All target/MTP/owner request paths reach this guard before allocating even
+    # a scratch byte or constructing a private Lt plan; missing preparation fails.
+    allocate = engine.split("fn workspace_rows(", 1)[1].split("fn put<T", 1)[0]
+    assert allocate.index("self.allow_workspace_creation()?") < allocate.index("self.alloc(")
+    assert allocate.index("self.alloc(") < allocate.index("self.library.vocabulary_head_rows(")
+    admission = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/qwen_graphs.rs").read_text()
+    assert "let separate_mtp = inputs.prefill_shape.is_some() && inputs.mtp;" in admission
+    assert '(Category::Workspace, "prefill MTP step", mtp_workspace)' in admission
+    assert "inputs.prefill_shape.unwrap().unit_rows, false, 1" in admission
 
 
 def test_packed_qwen_metadata_is_uploaded_once_and_only_viewed_inside_layers():

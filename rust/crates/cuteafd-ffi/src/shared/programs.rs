@@ -879,6 +879,14 @@ int cuteafd_dsv4_program_launch(unsigned i, void **p, uint64_t *s, void *stream)
 
 type HeadLaunchFn = unsafe extern "C" fn(*mut c_void, *const u16, *const u16, *mut f32, i32, *mut c_void) -> i32;
 
+/// The only native library a vocabulary projection will launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum HeadMode {
+    Gemm = 0,
+    TensorLt = 1,
+}
+
 /// cuBLAS vocabulary head at the model width with pedantic FP32 accumulation
 /// (the reference promotes the projection to FP32); logits that need not
 /// follow it may take the tensor-op launch ([`VocabularyHead::launch_tensor_op`]).
@@ -898,9 +906,9 @@ impl NativeLibrary {
     /// # Safety
     /// `workspace` must be live device memory of at least
     /// [`VOCABULARY_HEAD_WORKSPACE`] bytes that outlives the head.
-    pub unsafe fn vocabulary_head(&self, workspace: *mut c_void, width: u32, max_rows: u32) -> Result<VocabularyHead<'_>> {
+    pub unsafe fn vocabulary_head(&self, workspace: *mut c_void, width: u32, max_rows: u32, mode: HeadMode) -> Result<VocabularyHead<'_>> {
         let _failure_boundary = crate::memory_ledger::fault::boundary();
-        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, *mut *mut c_void) -> i32;
+        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, *mut *mut c_void) -> i32;
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
         let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
@@ -909,7 +917,7 @@ impl NativeLibrary {
             .ok().map(|f| *f);
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
-            create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, &mut handle)
+            create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, mode as i32, &mut handle)
         };
         if status != 0 {
             return Err(crate::memory_ledger::capture_failure(
@@ -1299,10 +1307,10 @@ impl NativeLibrary {
     ///
     /// # Safety
     /// As [`Self::vocabulary_head`].
-    pub unsafe fn vocabulary_head_rows(&self, workspace: *mut c_void, width: u32, max_rows: u32, vocab: u32)
+    pub unsafe fn vocabulary_head_rows(&self, workspace: *mut c_void, width: u32, max_rows: u32, vocab: u32, mode: HeadMode)
         -> Result<VocabularyHead<'_>> {
         let _failure_boundary = crate::memory_ledger::fault::boundary();
-        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, *mut *mut c_void) -> i32;
+        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, i32, *mut *mut c_void) -> i32;
         let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create_vocab") }?;
         let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
         let launch_tensor_op = unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_tensor_op") }.ok().map(|f| *f);
@@ -1312,7 +1320,7 @@ impl NativeLibrary {
         let mut handle = std::ptr::null_mut();
         let status = unsafe {
             create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?,
-                i32::try_from(vocab)?, &mut handle)
+                i32::try_from(vocab)?, mode as i32, &mut handle)
         };
         if status != 0 {
             return Err(crate::memory_ledger::capture_failure(

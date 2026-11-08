@@ -27,8 +27,31 @@ fn request() -> Request {
 
 fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers,
     target_arena: &'a crate::serving_capacity::WeightArenaLayout) -> DenseFacts<'a> {
-    DenseFacts { cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, serving: None,
+    DenseFacts { cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
+}
+
+#[test]
+fn blas_heads_share_one_pool_only_for_genuine_bf16_drafts() {
+    let (cfg, weights, buffers, arena) = fixture();
+    for head in [serving::BlasHead::Native, serving::BlasHead::TensorLt, serving::BlasHead::Gemm] {
+        for draft in [None, Some(false), Some(true)] {
+            let mut input = facts(&cfg, &weights, &buffers, &arena);
+            input.blas_head = head;
+            input.drafter = draft.map(|gemm_head| DrafterBytes { gemm_head, ..Default::default() });
+            let contract = input.prepare(&request()).unwrap();
+            let selected = contract.facts(&vec![0; contract.variables.len()], 4).unwrap();
+            for phase in [Phase::Load, Phase::DraftLoad, Phase::Ready] {
+                let handles = selected.allowances.iter().filter(|owner|
+                    owner.source.starts_with("cuBLAS handles:")
+                        && owner.lifetime.contains(phase, contract.phase_order))
+                    .map(|owner| owner.bytes).sum::<u64>();
+                assert_eq!(handles, u64::from(phase != Phase::Load
+                    && (head.gemm() || draft == Some(true))) * (64 << 20),
+                    "head {head:?}, draft {draft:?}, phase {phase:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -85,7 +108,7 @@ fn auto_pool_matches_the_declared_owners_and_never_shrinks_context() {
 fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
     let (cfg, weights, buffers, arena) = fixture();
     let drafter = DrafterBytes { owned: 4096, weights: ResidentWeights(1024),
-        weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), scratch: 512, pool_unit: 4096, host_prefetch: 2_720_000_000 };
+        weight_arena: Some(("qwen3_5/mtp/gpu0", 1280)), scratch: 512, pool_unit: 4096, host_prefetch: 2_720_000_000, gemm_head: false };
     let mut input = facts(&cfg, &weights, &buffers, &arena);
     input.drafter = Some(drafter);
     let contract = input.prepare(&request()).unwrap();
@@ -337,8 +360,10 @@ fn solved_allowances_are_the_only_estimates_in_the_ready_ledger() {
     let plan = admit(request(), budgets(), input).unwrap();
     let ready = plan.items(Location::coordinator(0)).unwrap();
     assert!(ready.iter().any(|item| item.basis == cuteafd_core::memory_layout::Basis::Estimated));
-    assert!(plan.facts.allowances.iter().all(|allowance| allowance.assumed));
-    // Every non-estimated item is a physical owner the executor allocates.
+    let calibrated = plan.facts.allowances.iter().filter(|allowance| !allowance.assumed).collect::<Vec<_>>();
+    assert!(!calibrated.is_empty());
+    assert!(calibrated.iter().all(|allowance| allowance.source.starts_with("BLAS device initialization")));
+    // Exact items are physical owners; calibrated BLAS residency is an allowance.
     let exact: u64 = ready.iter().filter(|item| item.basis == cuteafd_core::memory_layout::Basis::Exact)
         .map(|item| item.bytes).sum();
     let declared: u64 = plan.facts.allocations.iter()

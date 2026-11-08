@@ -482,6 +482,7 @@ mod tests {
         let total = 96 << 30;
         let budgets = admission::live_budgets(&vec![(total, total, free); ranks], &vec![64 << 30; 4])?;
         let input = ProductionInput {
+            blas: Vec::new(),
             expert_usage: false,
             config, gpus: ranks, context, maximum_pool_tokens: pool.unwrap_or(2 << 20),
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency, retained_turns: turns,
@@ -503,6 +504,7 @@ mod tests {
         for ranks in [1, 2] {
             for enabled in [false, true] {
                 let prepared = ProductionInput {
+                    blas: Vec::new(),
                     expert_usage: enabled, config: &config, gpus: ranks, context: 512,
                     maximum_pool_tokens: 4096, prefill: PrefillShape { rows: 128, waves: 1 },
                     concurrency: 1, retained_turns: 0, replicated: false, spark_ranks: 4,
@@ -564,6 +566,7 @@ mod tests {
         use crate::plan::encoder::{EncoderKind, EncoderPlacement};
         let config = config();
         let input = ProductionInput {
+            blas: Vec::new(),
             expert_usage: false, config: &config, gpus: 2, context: 32768, maximum_pool_tokens: 32768,
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 1, onboard_minimum: 0, onboard_counts: None,
@@ -611,6 +614,7 @@ mod tests {
                     kind, weights: payload, scratch: 333, reason: "arena proof".into(), shortfall: 0,
                 }).collect();
                 let mut prepared = ProductionInput {
+                    blas: Vec::new(),
                     expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
                     prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
                     replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
@@ -641,6 +645,13 @@ mod tests {
                 }
                 let admitted = prepared.admit(request)?;
                 assert_eq!(admitted.solved.decisions.encoder, Some(0));
+                let handles = admitted.solved.facts.allowances.iter().filter(|owner|
+                    owner.source.starts_with("cuBLAS handles:")
+                        && owner.lifetime.contains(Phase::Ready, admitted.solved.facts.phase_order))
+                    .collect::<Vec<_>>();
+                // Spark media is covered by its existing measured overhead (#1568).
+                assert_eq!(handles.len(), usize::from(matches!(ordered[0], EncoderKind::Rtx { .. })));
+                assert!(handles.iter().all(|owner| matches!(owner.location.device, Device::Coordinator(_))));
                 let mapped = devices.remap_plan_weight_arenas(&admitted.solved)?;
                 let roots = mapped.facts.allocations.iter().filter(|owner|
                     owner.id.starts_with("v41.encoder.") && owner.id.ends_with(".weights")).collect::<Vec<_>>();
@@ -761,6 +772,7 @@ mod tests {
         let cards = vec![(96u64 << 30, 96u64 << 30, (64 << 20) + padding); 2];
         let budgets = admission::live_budgets(&cards, &vec![1 << 30; 4])?;
         let input = ProductionInput {
+            blas: Vec::new(),
             expert_usage: false,
             config: &config, gpus: 2, context: 262_144, maximum_pool_tokens: 2 << 20,
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,

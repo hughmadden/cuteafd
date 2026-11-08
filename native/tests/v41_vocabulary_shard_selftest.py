@@ -13,9 +13,9 @@ def main():
     lib = C.CDLL(sys.argv[1])
     ptr = C.c_void_p
     create = lib.cuteafd_v41_vocabulary_shard_create
-    create.argtypes = [ptr, C.c_uint64, C.c_int32, C.POINTER(ptr)]
+    create.argtypes = [ptr, C.c_uint64, C.c_int32, C.c_int32, C.POINTER(ptr)]
     full_create = lib.cuteafd_v41_vocabulary_head_create
-    full_create.argtypes = [ptr, C.c_uint64, C.POINTER(ptr)]
+    full_create.argtypes = [ptr, C.c_uint64, C.c_int32, C.POINTER(ptr)]
     launch = lib.cuteafd_v41_vocabulary_head_launch
     launch.argtypes = [ptr, ptr, ptr, ptr, C.c_int32, ptr]
     destroy = lib.cuteafd_v41_markov_destroy
@@ -39,9 +39,9 @@ def main():
             outputs.append(torch.empty((80, size), device=device, dtype=torch.float32))
             handle = ptr()
             if size == vocab:
-                status = full_create(workspaces[-1].data_ptr(), workspaces[-1].numel(), C.byref(handle))
+                status = full_create(workspaces[-1].data_ptr(), workspaces[-1].numel(), 0, C.byref(handle))
             else:
-                status = create(workspaces[-1].data_ptr(), workspaces[-1].numel(), size, C.byref(handle))
+                status = create(workspaces[-1].data_ptr(), workspaces[-1].numel(), size, 0, C.byref(handle))
             assert status == 0 and handle.value, status
             handles.append(handle)
     for device in (0, 1):
@@ -122,7 +122,7 @@ def main():
         with torch.cuda.device(0):
             for count in (0, -1, vocab + 1):
                 bad = ptr(1)
-                assert create(workspaces[0].data_ptr(), workspaces[0].numel(), count, C.byref(bad)) != 0
+                assert create(workspaces[0].data_ptr(), workspaces[0].numel(), count, 0, C.byref(bad)) != 0
                 assert not bad.value
             # Head handles support up to 128 rows (including K7 verification).
             assert launch(handles[0], xs[0].data_ptr(), weights[0].data_ptr(), outputs[0].data_ptr(), 129, streams[0].cuda_stream) != 0

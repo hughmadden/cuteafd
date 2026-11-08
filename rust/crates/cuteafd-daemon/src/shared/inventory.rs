@@ -129,7 +129,7 @@ mod phase_tests {
     }
 
     #[test]
-    fn unknown_package_live_reservation_uses_same_positive_formula_as_plan() {
+    fn unknown_package_live_reservation_uses_same_program_estimate_as_plan() {
         use cuteafd_loader::placement::{inventory::loaded_code_allowance, ArchContext, ProgramSet};
         let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
         let arch = ArchContext::for_device("sm_120", 96 << 30);
@@ -140,7 +140,7 @@ mod phase_tests {
         let pending = allowance.pending(arch.context_bytes, arch.context_bytes);
         assert!(pending > 0);
         assert_eq!(pending + arch.context_bytes, planned.bytes);
-        assert_eq!(allowance.basis, cuteafd_core::memory_layout::Basis::Formula);
+        assert_eq!(allowance.basis, cuteafd_core::memory_layout::Basis::Estimated);
     }
 
     #[test]

@@ -254,14 +254,13 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>, Vec<u6
     Ok((demands, overhead, reserves))
 }
 
-/// The `LoadedCode::experts` key of a V4 catalog: EXL3 packages load their own modules (the
+/// The code-inventory package key of a V4 catalog: EXL3 packages load their own modules (the
 /// coordinator holds dSpark and any RTX layers in them), native MXFP4 does not.
 pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
     if catalog.exl3().is_some() { "exl3" } else { "*" }
 }
 
-/// Each coordinator GPU's measured loaded code (`placement::inventory::LOADED_CODE`) for a V4
-/// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs.
+/// Retained dev mixed residency, including BLAS, until measured owners replace it (#1579).
 pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
     let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);

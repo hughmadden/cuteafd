@@ -358,6 +358,7 @@ mod tests {
         cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
         let checkpoint = Checkpoint::open(&snapshot)?;
         let inputs = RuntimeInputs {
+            bf16_target_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
             host: HostInputs::default(), resident_weight_limit: None,
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,

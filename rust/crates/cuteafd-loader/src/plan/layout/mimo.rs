@@ -568,6 +568,11 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let prepared = ProductionInput {
         expert_usage: options.expert_usage,
+        blas_head: if checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
+            .is_some_and(|t| t.meta.dtype == cuteafd_core::DType::Bf16)
+            && default_policy(checkpoint, &cfg) != MimoDefaultPolicy::Fp8 { options.bf16_target_head }
+            else { crate::placement::planner::serving::BlasHead::Native },
+        draft_head: mimo_dflash_dir(checkpoint, options).is_some(),
         cfg: &cfg, layers: cfg.layers, kv, mtp_stages: selected_mtp(checkpoint, options), context, maximum_pool_tokens,
         prefill, lanes: lanes as u64, embedding, gpus: ranks, spark_ranks,
         experts, expert_workspace, tp2_workspace,
@@ -708,6 +713,8 @@ mod tests {
                             vec![Baseline::Forecast { occupied: 0, source: "empty fixture devices".into(), assumed: false }; ranks],
                             opts.host_memory.unwrap(), opts.spark_bytes, 4).unwrap();
                         let runtime = production::ProductionInput {
+                            blas_head: if pro { crate::placement::planner::serving::BlasHead::Native }
+                                else { opts.bf16_target_head }, draft_head: false,
                             expert_usage: opts.expert_usage, cfg: &cfg, layers: cfg.layers, kv,
                             mtp_stages: 0, context: 32768, maximum_pool_tokens: 32768, prefill,
                             lanes: lanes as u64, embedding: EmbeddingHome::Device(0), gpus: ranks, spark_ranks: 4,
@@ -724,6 +731,10 @@ mod tests {
                             opts.spark_reply_formats)).unwrap();
                         assert_eq!(runtime.placement.pool_tokens, placement.pool_tokens);
                         for rank in 0..ranks {
+                            let blas = devices[rank].items.iter().filter(|item|
+                                item.group.starts_with("cuBLAS handles:") || item.group.starts_with("BLAS device initialization"))
+                                .map(|item| item.bytes).sum::<u64>();
+                            assert_eq!(blas, u64::from(!pro && rank == 0) * (2 << 20));
                             assert_eq!(devices[rank].items, runtime.placement.items[rank],
                                 "all physical owners, pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
                             let total = runtime.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
@@ -1067,6 +1078,10 @@ mod tests {
         let tails = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
             .filter(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
             .map(|item| item.bytes).sum::<u64>();
+        let blas = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
+            .filter(|item| item.group.starts_with("BLAS device initialization"))
+            .map(|item| item.bytes).sum::<u64>();
+        assert_eq!(blas, 2 << 20);
         let ledger = report.phase_ledger.unwrap();
         let baseline = &ledger.budgets.iter().find(|b| b.id == "rtx0").unwrap().baseline;
         let crate::placement::planner::Baseline::Forecast { occupied, .. } = baseline else { panic!("forecast") };
@@ -1077,7 +1092,7 @@ mod tests {
             .filter(|item| item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP)
             .map(|item| item.bytes).sum::<u64>();
         assert!(mappings > 0);
-        let runtime = ready.opaque - tails - mappings;
+        let runtime = ready.opaque - tails - blas - mappings;
         assert_eq!(runtime, 570 << 20);
         let measured_baseline = 1_179_189_248u64 - 576_716_800;
         let measured_owned = 97_985_769_216u64;

@@ -875,6 +875,8 @@ pub(crate) struct StepPlan<'p, 'a> {
     cfg: &'p GlmNextConfig,
     scratch: GlmfScratchOptions,
     native: GlmfCoreScratch,
+    native_head: bool,
+    target_head: TargetHeadRoute,
     /// Rank 0's shape (rank 1 is not the lead and runs no experts).
     shape: GlmfStepShape,
     /// Rows of the decode workspace (`--decode-rows`): it runs the `_m64` programs, and with 128 the
@@ -896,6 +898,7 @@ pub(crate) struct StepExperts {
 /// The engine settings a step plan depends on besides its layers and experts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StepSettings {
+    pub target_head: TargetHeadRoute,
     pub kda_fp32_partials: bool,
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
@@ -917,7 +920,7 @@ pub(crate) struct StepSettings {
 impl<'p, 'a> StepPlan<'p, 'a> {
     /// The plan of an engine over `layers` with `experts` and `settings` (rank 0's shape).
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: &'p GlmNextConfig,
-        layers: &[GlmfLayer<'_>], native_head: bool, experts: StepExperts, settings: StepSettings) -> Self {
+        layers: &[GlmfLayer<'_>], head: &GlmfHead<'_>, experts: StepExperts, settings: StepSettings) -> Self {
         let split = layers.first().is_some_and(|l| l.split);
         let (table_pages, table_pool_pages) = glmf_table_pages(settings.max_context as u64);
         // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
@@ -933,6 +936,8 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             library,
             programs,
             cfg,
+            native_head: head.bf16().is_none(),
+            target_head: settings.target_head,
             native: GlmfCoreScratch {
                 kda: layers.iter().filter(|l| l.attention == GlmNextAttention::Kda)
                     .all(|l| ["q_proj", "k_proj", "v_proj", "o_proj"].iter()
@@ -957,7 +962,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
                 output_shard: settings.kda_output_shard,
                 // K6 scoring downloads tiles through the ordinary bounded staging.
-                full_prefill_logits: settings.full_prefill_logits && !native_head,
+                full_prefill_logits: settings.full_prefill_logits && !matches!(head, GlmfHead::K6(_) | GlmfHead::RowFp8(_)),
                 table_pages,
                 table_pool_pages,
             },
@@ -982,15 +987,15 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             decode_scratch, prefill_scratch).device_bytes())
     }
 
-    fn key(&self) -> (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64) {
-        (self.scratch, self.native, self.shape, self.decode_rows, self.shared_records)
+    fn key(&self) -> (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64, bool, TargetHeadRoute) {
+        (self.scratch, self.native, self.shape, self.decode_rows, self.shared_records, self.native_head, self.target_head)
     }
 }
 
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
 /// every prefill lane, so the KV pool is sized from the memory they leave.
 pub(crate) struct StepWorkspaces<'a> {
-    key: (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64),
+    key: (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64, bool, TargetHeadRoute),
     rows: usize,
     decode: Workspace<'a>,
     lanes: Vec<Workspace<'a>>,
@@ -1056,9 +1061,9 @@ impl<'a> StepPlan<'_, 'a> {
             topk_scratch: self.zeroed(bytes.topk_scratch, tag)?,
             logits: self.alloc(bytes.logits, tag)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: if shape.lead {
+            head: if shape.lead && !self.native_head {
                 Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, self.cfg.hidden as u32,
-                    rows as u32, self.cfg.vocab_size as u32)? })
+                    rows as u32, self.cfg.vocab_size as u32, self.target_head.native_mode())? })
             } else {
                 None
             },
@@ -1816,7 +1821,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// Own every ordinary text/media workspace before readiness: both ranks' decode workspaces and
     /// the prefill lanes a Spark prefill runs in (`--prefill-lanes`, over one set of temporaries;
-    /// otherwise the serial workspace, lane 0), and the drafter's. No shared BLAS handles.
+    /// otherwise the serial workspace, lane 0), and the drafter's. BLAS pools are thread/device shared.
     pub fn prepare_serving_workspaces(&self) -> Result<()> {
         let lanes = if self.pipelined() { self.prefill_waves } else { 1 };
         for rank in 0..self.ranks() {
@@ -3247,8 +3252,8 @@ impl<'a> GlmfEngine<'a> {
 
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
-        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, matches!(self.weights.head, GlmfHead::K6(_) | GlmfHead::RowFp8(_)), self.step_experts,
-            StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
+        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, &self.weights.head, self.step_experts,
+            StepSettings { target_head: self.target_head, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
                 replay_records: self.replay_records, decode_rows: self.decode_rows })

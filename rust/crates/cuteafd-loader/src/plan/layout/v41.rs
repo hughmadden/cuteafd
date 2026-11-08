@@ -10,10 +10,6 @@ use crate::placement::{self, families::deepseek_v41 as v41, ArchContext, Demand,
 use crate::placement::planner::{Lifetime, Location, Operation, PrefillShape};
 use v41::DraftInventory;
 
-// Conservative combined code/ready-graph envelope; pure LoadedCode is unqualified.
-// Neither generic PROGRAMS.json module counts nor other families' graph costs
-// describe the native executor's loaded code.
-const NATIVE_CODE_ESTIMATE: u64 = 2 * GIB;
 const SPARK: SparkCharges = SparkCharges {
     host_bytes: Some(9 * GIB), wave_bytes: 21 * GIB / 10, basis: Basis::Estimated,
 };
@@ -74,7 +70,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }).collect::<Vec<_>>();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
-        "Native LoadedCode: Estimated 2 GiB per GPU beyond the measured architecture context; combined startup census residuals fit this bound. Pure LoadedCode and ready parity are not qualified.".into(),
+        "Native module residency: selected V41_FP8_AOT projection exports, estimated separately from physical BLAS pools. The existing lazy graph reserve remains; diagnostic startup capture is uncharged and outside this inventory.".into(),
         "Spark host, wave residual and native runtime: Estimated pending qualified worker inventory; explicit rank I/O remains formula-derived.".into(),
         "Lazy graph/runtime growth is a typed post-ready reserve, not part of the ready residency claim.".into()];
     if options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding) {
@@ -163,6 +159,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // and the routed-expert arenas are separate contract components.
     let mut physical = owners.fixed.iter().map(Owner::from_demand).collect::<Vec<_>>();
     let mut reserves = Vec::new();
+    let draft_rows = dspark.then(|| {
+        let lanes = if shape.concurrency == 1 { 1 } else { 2 };
+        let live = shape.concurrency.div_ceil(lanes) * if options.v41_draft_width > 5 { 7 } else { 5 };
+        [16, 40, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64,
+            cuteafd_core::V41_DRAFT_WIDE_ROWS as u64].into_iter().find(|&rows| rows >= live).unwrap()
+    });
+    let modules = programs.modules(v41::owners::DECODE_LANE_ROWS, rows, ranks, draft_rows)?;
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
         let arch = ArchContext::coordinator(total, None);
@@ -171,8 +174,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         devices[gpu].items.clear();
         cards.push((total, ceiling));
         for (bytes, basis, source) in [
-            (arch.context_bytes + arch.cublas_bytes, Basis::Calibrated, "CUDA context and cuBLAS"),
-            (NATIVE_CODE_ESTIMATE, Basis::Estimated, "native LoadedCode estimate"),
+            (arch.context_bytes, Basis::Calibrated, "CUDA context"),
+            (modules[gpu].module_bytes(), Basis::Estimated, "V4.1 selected native modules"),
         ] {
             reserves.push(Opaque { location: Location::coordinator(gpu as u8), bytes, basis,
                 lifetime: Lifetime::RESIDENT, source: source.into() });
@@ -227,6 +230,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         options.weight_budget_bytes, options.spark_reply_formats);
     let media_cache_bytes = options.media_cache_bytes.unwrap_or(0);
     let mut prepared = ProductionInput {
+        blas: v41::owners::blas_owners(ranks,
+            if mode.target() { crate::placement::planner::serving::BlasHead::Native }
+            else { options.bf16_target_head }, dspark)?,
         expert_usage: options.expert_usage,
         config: &checkpoint.config,
         gpus: ranks,
@@ -354,22 +360,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn independent_ready_census_residuals_fit_the_native_estimate() {
-        // Raw ready untracked samples from the min/max native startup census.
-        // Removing the calibrated context/cuBLAS leaves a combined code/graph
-        // residual, NOT pure LoadedCode or a 64 MiB ready-parity qualification.
-        let arch = ArchContext::coordinator(96 * GIB, None);
-        assert_eq!(arch.context_bytes + arch.cublas_bytes, 657_719_296);
-        for (card, untracked, residual, slack) in [
-            ("min GPU0", 2_149_527_512, 1_491_808_216, 655_675_432),
-            ("max GPU0", 1_771_348_088, 1_113_628_792, 1_033_854_856),
-            ("max GPU1", 2_010_851_632, 1_353_132_336, 794_351_312),
-        ] {
-            let combined = untracked - arch.context_bytes - arch.cublas_bytes;
-            assert_eq!(combined, residual, "{card}");
-            assert!(combined <= NATIVE_CODE_ESTIMATE, "{card}");
-            assert_eq!(NATIVE_CODE_ESTIMATE - combined, slack, "{card}");
-        }
+    fn lazy_graph_reserves_remain_separate_from_native_code_and_blas() {
+        let growth = admission::growth_allowances(96 * GIB, 2, 0);
+        assert!(growth.iter().any(|owner| owner.bytes == 1472 << 20
+            && owner.lifetime.first == crate::placement::planner::Phase::Ready));
     }
 
     /// The recipe's KV decomposition is the allocator's own total at every
@@ -410,6 +404,7 @@ mod tests {
             let cards = vec![(96 * gib, 96 * gib); 2];
             let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
             let input = ProductionInput {
+            blas: Vec::new(),
             expert_usage: false,
                 config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
                 prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,
@@ -451,6 +446,7 @@ mod tests {
         let cards = vec![(96 * gib, 96 * gib); 2];
         let budgets = admission::production_budgets(&cards, 0, None, 0, &[4 * gib; 4])?;
         let input = ProductionInput {
+            blas: Vec::new(),
             expert_usage: false,
             config: &config, gpus: 2, context: 512, maximum_pool_tokens: 512 * 64,
             prefill: PrefillShape { rows: 64, waves: 1 }, concurrency: 1, retained_turns: 0,

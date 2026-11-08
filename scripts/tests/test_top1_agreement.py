@@ -88,7 +88,9 @@ def test_mimo_serving_draft_head_is_separate_from_fixed_target_and_replay():
     draft = (source / 'families/mimo_v2/dflash.rs').read_text()
     serving = draft.split('pub fn draft(', 1)[1].split('pub fn draft_rows(', 1)[0]
     replay = draft.split('pub fn draft_rows(', 1)[1].split('fn draft_from(', 1)[0]
-    assert 'head.launch_draft(' in serving and 'plan.launch(' in replay
+    assert 'head.launch_draft(' in serving
+    assert 'plan.context("BF16 diagnostic head was not prepared")?.launch(' in replay
+    assert 'prepare_workspace' not in serving and 'prepare_workspace' not in replay
 
 
 def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():

@@ -5,7 +5,9 @@ use serde::Serialize;
 const GIB: u64 = 1 << 30;
 
 /// SM121 tower free-memory delta was 2,670,125,056 bytes for a 1,587,976,256-byte
-/// ledger. Reserve 1.25 GiB for CUDA context/modules (measured overhead + margin).
+/// ledger. The retained 1.25 GiB includes CUDA context/modules, the media BLAS
+/// handle and the historical margin; do not stack a separate Spark media BLAS
+/// owner. Replace it with measured selected owners in #1568.
 pub const V41_SPARK_CUDA_OVERHEAD_BYTES: u64 = 5 * GIB / 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

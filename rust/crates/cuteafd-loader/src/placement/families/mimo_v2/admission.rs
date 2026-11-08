@@ -199,6 +199,8 @@ pub struct ProductionInput<'a> {
     pub layers: usize,
     pub kv: MimoKvFormats,
     pub mtp_stages: usize,
+    pub blas_head: crate::placement::planner::serving::BlasHead,
+    pub draft_head: bool,
     pub context: u64,
     pub maximum_pool_tokens: u64,
     pub prefill: PrefillShape,
@@ -277,6 +279,8 @@ pub struct MimoRecipe<'a> {
     pub host: HostOwners,
     pub kv: MimoKvFormats,
     pub mtp_stages: usize,
+    pub blas_head: crate::placement::planner::serving::BlasHead,
+    pub draft_head: bool,
     pub spark_reply_formats: cuteafd_core::spark_reply::SparkReplyFormats,
     pub resident_weights: Vec<ResidentWeights>,
 }
@@ -352,6 +356,7 @@ impl<'a> ProductionInput<'a> {
                 resident_weights: self.resident_weights, post_kv_additional: self.post_kv_additional,
                 draft_packing: self.draft_packing, host: self.host, kv: self.kv, mtp_stages: self.mtp_stages,
                 spark_reply_formats: self.spark_reply_formats,
+                blas_head: self.blas_head, draft_head: self.draft_head,
             },
             budgets: self.budgets.into_iter().map(|mut budget| {
                 if budget.locations.contains(&Location::HOST) { budget.headroom = self.host.headroom; }
@@ -586,6 +591,26 @@ impl Recipe for MimoRecipe<'_> {
                 rank_sets: vec![(0..self.spark_ranks as u8).collect()],
             });
         }
+        let mut blas = Vec::new();
+        if self.blas_head.bf16() {
+            blas.push(crate::placement::planner::serving::BlasOwners {
+                name: "MiMo target and MTP vocabulary projections".into(), process: "coordinator".into(),
+                thread: "mimo/blas/serve".into(), location: Location::coordinator(0),
+                gemm: self.blas_head.gemm(), lt: self.blas_head.lt(),
+                lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                activation: crate::placement::planner::Activation::always(),
+            });
+            if self.draft_head {
+                blas.push(crate::placement::planner::serving::BlasOwners {
+                    name: "MiMo DFlash borrowed BF16 vocabulary".into(), process: "coordinator".into(),
+                    thread: "mimo/blas/serve".into(), location: Location::coordinator(0), gemm: true, lt: false,
+                    lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                    activation: crate::placement::planner::Activation::always(),
+                });
+            }
+        }
+        contract.components.extend(crate::placement::planner::serving::blas_components(
+            "sm_120", &blas, maximum, contract.phase_order)?);
         let measured_runtime = matches!(self.cfg.program_family(), Ok("mimof"))
             && self.gpus == 1 && self.spark_ranks == 2;
         let runtime_source = if measured_runtime {
@@ -772,8 +797,10 @@ pub fn resolved_capacity(admitted: &AdmittedMimo, concurrency: u32, rings: u32)
             reservations.push(MemoryReservation { name: "transport.tp2_routes".into(),
                 bytes: admitted.route[rank] });
         }
-        reservations.push(MemoryReservation { name: "runtime.post_ready".into(),
-            bytes: POST_READY_RUNTIME_BYTES });
+        reservations.extend(admitted.solved.facts.allowances.iter().filter(|owner|
+            owner.location == Location::coordinator(rank as u8)
+                && owner.lifetime.contains(Phase::Ready, admitted.solved.facts.phase_order))
+            .map(|owner| MemoryReservation { name: owner.source.clone(), bytes: owner.bytes }));
         let reserved = reservations.iter().try_fold(0u64, |sum, reservation|
             sum.checked_add(reservation.bytes))
             .ok_or(PlacementError::Overflow("MiMo reservations"))?;

@@ -34,7 +34,7 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
     }
     ProductionInput { expert_usage: false, cfg, layers: cfg.layers, context: 4096, maximum_pool_tokens: 8192,
         attention: if gpus == 2 { AttentionPlacement::Context } else { AttentionPlacement::Heads },
-        gpus, prefill,
+        gpus, prefill, blas_head: serving::BlasHead::TensorLt, blas: vec![],
         target: TargetFacts {
             weights: vec![(EmbeddingHome::Device(0), WeightInventory { ranks: gpus, owners: vec![],
                 core_loading: Default::default(), kv_b_loading: Default::default(), row_loading: Default::default(), attention_mount: Default::default() })],
@@ -49,6 +49,30 @@ fn production_input(cfg: &GlmDsaConfig, gpus: usize, ranks: usize, prefill: Pref
         prefill_link: (ranks > 0).then(|| production_link(cfg, ranks, prefill, true)),
         skip_routed_experts: false, operation: Operation::Serving,
         sync_upload_bytes: 0, owners: vec![], budgets }
+}
+
+#[test]
+fn blas_target_and_bridge_share_root_while_media_owns_its_thread() {
+    use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+    let cfg = cfg();
+    for head in [serving::BlasHead::Native, serving::BlasHead::TensorLt, serving::BlasHead::Gemm] {
+        for draft in [false, true] {
+            let mut input = production_input(&cfg, 2, 2, PrefillShape { rows: 64, waves: 1 });
+            input.blas_head = head;
+            if draft { input.draft = DraftFacts::default().with_window_marks(1024); }
+            let mut prepared = input.prepare().unwrap();
+            prepared.recipe.encoders = vec![EncoderPlacement { kind: EncoderKind::Rtx { gpu: 1 },
+                weights: 1024, scratch: 4096, replicas: vec![], reason: "test".into(), shortfall: 0 }];
+            let contract = prepared.recipe.prepare(&request()).unwrap();
+            let selected = contract.facts(&vec![0; contract.variables.len()], 4).unwrap();
+            let handles = |rank| selected.allowances.iter().filter(|owner|
+                owner.location == Location::coordinator(rank) && owner.source.starts_with("cuBLAS handles:")
+                    && owner.lifetime.contains(Phase::Ready, contract.phase_order))
+                .map(|owner| owner.bytes).sum::<u64>();
+            assert_eq!(handles(0), u64::from(head.gemm() || (head.bf16() && draft)) * (64 << 20));
+            assert_eq!(handles(1), 64 << 20);
+        }
+    }
 }
 
 #[test]
@@ -586,7 +610,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
         spark_links: true,
         prefill,
         lanes: vec![1],
-        encoders: vec![], media_cache_bytes: 0,
+        encoders: vec![], media_cache_bytes: 0, blas: vec![],
         embedding: vec![EmbeddingHome::Device(0), EmbeddingHome::HostPinned],
         draft_homes: vec![],
         experts: Some(ExpertProfile {

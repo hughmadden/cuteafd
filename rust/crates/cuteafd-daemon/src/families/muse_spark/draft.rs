@@ -93,11 +93,11 @@ impl<'a> MuseDraft<'a> {
         let drafter = device.run(|| {
             use crate::shared::fp8_linear::{Fp8Scales, Fp8Rows};
             if let Some(exchange) = exchange {
-                DflashDrafter::load_tp2_on_with(device.library, programs, snapshot, file, admitted.context_slots,
+                DflashDrafter::load_tp2_on_with(device.library, programs, crate::shared::speculation::dflash::TargetProjection::Native, snapshot, file, admitted.context_slots,
                     admitted.sequences, mask, true, representation, Fp8Scales::Amax, Fp8Rows::W8a16,
                     kv_cache, exchange, head_rank, allocate)
             } else {
-                DflashDrafter::load_with(device.library, programs, snapshot, file, stream, admitted.context_slots,
+                DflashDrafter::load_with(device.library, programs, crate::shared::speculation::dflash::TargetProjection::Native, snapshot, file, stream, admitted.context_slots,
                     admitted.sequences, mask, true, representation, Fp8Scales::Amax, Fp8Rows::W8a16, kv_cache, allocate)
             }
         })?;
