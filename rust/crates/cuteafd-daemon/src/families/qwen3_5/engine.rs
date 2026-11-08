@@ -140,6 +140,7 @@ impl<'a> DenseEngine<'a> {
         let format = super::weights::DenseFormat::detect(checkpoint)?;
         let admitted = DensePrograms::new(&cfg, programs, kv_format, format)?;
         let weight_bytes = NativeWeights::native(checkpoint, &cfg, admitted.norm_dtype.clone())?;
+        let target_arena = super::weights::target_arena(checkpoint, &cfg, admitted.norm_dtype.clone(), format)?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
         let device = Device { library, id: library.cuda_get_device()? };
         let stream = Stream::new(device)?;
@@ -179,7 +180,7 @@ impl<'a> DenseEngine<'a> {
             cfg.max_context, concurrency)).transpose()?.flatten();
         let solve_started = std::time::Instant::now();
         let admitted_plan = qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
-            weights: &weight_bytes, buffers: &buffers, slots,
+            weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
             record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
             serving: serving.map(|(_, _, device_sampling, _)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),
             host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
@@ -196,8 +197,7 @@ impl<'a> DenseEngine<'a> {
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         // One preplanned backing holds every target layer, the final norm, head and embedding.
-        let arena = super::weights::ScopeArena::new(device,
-            super::weights::target_arena(checkpoint, &cfg, admitted.norm_dtype.clone(), format)?)?;
+        let arena = super::weights::ScopeArena::new(device, target_arena)?;
         tracing::info!(arena = arena.layout().id(), bytes = arena.layout().bytes(),
             views = arena.layout().views().len(), padding = arena.layout().padding_bytes(),
             "dense Qwen target weight arena allocated");

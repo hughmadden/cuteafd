@@ -262,6 +262,80 @@ mod tests {
     }
 
     #[test]
+    fn native_arena_admission_equals_loaded_target_and_mtp_backings() -> Result<()> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::{families::qwen3_5::{self, DenseFacts, DrafterBytes, NativeBuffers, NativeWeights},
+            planner::{CoordinatorDevices, Lifetime, Operation, Phase, Pin, Request}};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        fixture.quiet_events(&library, true)?;
+        let device = Device { library: &library, id: 0 };
+        for format in [DenseFormat::Bf16, DenseFormat::Fp8] {
+            let (mut checkpoint, cfg) = self::fixture(format, false);
+            let snapshot = tempfile::tempdir_in(fixture.directory())?;
+            checkpoint.snapshot = snapshot.path().into();
+            let mut end = 0;
+            for tensor in &mut checkpoint.tensors {
+                tensor.meta.byte_offset = end;
+                end += tensor.meta.byte_length;
+                checkpoint.weight_map.insert(tensor.meta.name.clone(), tensor.shard.clone());
+            }
+            std::fs::File::create(snapshot.path().join("model.safetensors"))?.set_len(end)?;
+            let target = target_arena(&checkpoint, &cfg, DType::Bf16, format)?;
+            let mtp = mtp_arena(&checkpoint, &cfg, format)?;
+            let weights = NativeWeights::native(&checkpoint, &cfg, DType::Bf16)?;
+            let buffers = NativeBuffers::new(&cfg, 256, 1, 0, false)?;
+            let draft = DrafterBytes::native_mtp(&checkpoint, &cfg)?;
+            assert_eq!(draft.weight_arena, Some(("qwen3_5/mtp/gpu0", mtp.bytes() as u64)));
+            assert_eq!(draft.weights.0, mtp.payload_bytes() as u64);
+            let request = Request { context: 4096.into(), pool: Pin::Exact(4096), onboard: Pin::Auto,
+                prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
+                spark_reply_formats: Default::default() };
+            let plan = qwen3_5::admit(request, qwen3_5::forecast_budgets(&cuteafd_loader::placement::ARCH_CONTEXTS[1],
+                96 << 30, 0, (128 << 30, 128 << 30))?, DenseFacts { cfg: &cfg, weights: &weights,
+                target_arena: &target, buffers: &buffers, slots: 1, record_bytes: 1024, drafter: Some(draft),
+                serving: None, host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
+                    quota_bytes: 0, chunk_bytes: 0 }, verify_check: false })?;
+            device.run(|| -> Result<()> {
+                let reader = WeightReader { library: &library, checkpoint: &checkpoint };
+                for (layout, lifetime) in [(target, Lifetime::RESIDENT), (mtp,
+                    Lifetime { first: Phase::DraftLoad, last: Phase::Growth })] {
+                    let arena = ScopeArena::new(device, layout)?;
+                    let mut inventory = Inventory::new(CoordinatorDevices::new(&[0])?, "test", lifetime,
+                        Category::Weights, "native weights");
+                    if lifetime == Lifetime::RESIDENT {
+                        let weights = reader.dense_native(&cfg, DType::Bf16, format,
+                            &mut |name: &str, bytes: usize| arena.allocate(name, bytes))?;
+                        let embedding = reader.bf16_with("embedding.table", &format!("{PREFIX}embed_tokens.weight"),
+                            &mut |name: &str, bytes: usize| arena.allocate(name, bytes))?;
+                        weights.inventory(&mut inventory)?;
+                        embedding.inventory(&mut inventory, "embedding")?;
+                    } else {
+                        let layer = reader.dense_layer("mtp.layers.0", HybridAttention::Full, format,
+                            &mut |name: &str, bytes: usize| arena.allocate(name, bytes))?;
+                        layer.inventory(&mut inventory, "mtp.layer")?;
+                        for name in ["mtp.fc.weight", "mtp.pre_fc_norm_hidden.weight",
+                            "mtp.pre_fc_norm_embedding.weight", "mtp.norm.weight"] {
+                            reader.bf16_with(name, name, &mut |name: &str, bytes: usize| arena.allocate(name, bytes))?
+                                .inventory(&mut inventory, name)?;
+                        }
+                    }
+                    arena.complete()?;
+                    let roots: Vec<_> = inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).collect();
+                    assert_eq!(roots.len(), 1);
+                    let planned = plan.facts.allocations.iter().find(|owner| owner.id == arena.layout().id()).unwrap();
+                    assert_eq!(&roots[0].allocation, planned);
+                    assert_eq!(inventory.receipts.len() - 1, arena.layout().views().len());
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "reads installed checkpoint headers; set CUTEAFD_QWEN_DENSE_ARENA_SNAPSHOT"]
     fn installed_arena_inventory() -> Result<()> {
         let snapshot = std::env::var("CUTEAFD_QWEN_DENSE_ARENA_SNAPSHOT")?;
@@ -272,13 +346,77 @@ mod tests {
         let format = if gate.meta.dtype == DType::F8E4M3 { DenseFormat::Fp8 } else { DenseFormat::Bf16 };
         let norm = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}layers.0.linear_attn.norm.weight"))
             .context("missing GDN norm")?.meta.dtype.clone();
-        let mut layouts = vec![target_arena(&checkpoint, &cfg, norm, format)?];
-        if cfg.mtp_layers == 1 { layouts.push(mtp_arena(&checkpoint, &cfg, format)?); }
+        use cuteafd_loader::placement::{families::qwen3_5::{self, DenseFacts, DrafterBytes, NativeBuffers, NativeWeights},
+            planner::{Lifetime, Operation, Phase, Pin, Request, allocation_granularity_forecast, ALLOCATION_GRANULARITY_GROUP}};
+        let target = target_arena(&checkpoint, &cfg, norm.clone(), format)?;
+        let programs = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+            .context("set CUTEAFD_DEPLOYMENT_TEST_PROGRAMS to installed exports")?;
+        let mut options = cuteafd_loader::plan::PlanOptions {
+            placement: cuteafd_loader::plan::ExpertPlacement::Local,
+            vision: cuteafd_loader::plan::MediaMode::Off, audio: cuteafd_loader::plan::MediaMode::Off,
+            layout: Some(cuteafd_loader::plan::layout::LayoutOptions {
+                rtx_bytes: vec![96 << 30], host_memory: Some((128 << 30, 128 << 30)), concurrency: 1,
+                state_slots: Some(1), prefix_slots: Some(0), host_cache_bytes: Some(0), native_mtp_layers: 0,
+                pool_tokens: Some(262144), workspace_manifest: Some(programs.into()),
+                dense_qwen_kv: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, ..Default::default()
+            }), ..Default::default()
+        };
+        let weights = NativeWeights::native(&checkpoint, &cfg, norm)?;
+        let buffers = NativeBuffers::new(&cfg, 256, 1, 0, false)?;
+        let mut layouts = vec![target.clone()];
+        let mut drafts = vec![None];
+        if cfg.mtp_layers == 1 {
+            layouts.push(mtp_arena(&checkpoint, &cfg, format)?);
+            drafts.push(Some(DrafterBytes::native_mtp(&checkpoint, &cfg)?));
+        }
         if let Ok(draft) = std::env::var("CUTEAFD_QWEN_DENSE_ARENA_DRAFT") {
             use crate::shared::speculation::block_dspark::DsparkDrafter;
-            let mut requests = DsparkDrafter::arena_requests(std::path::Path::new(&draft),
+            let snapshot = std::path::Path::new(&draft);
+            let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+            let mut requests = DsparkDrafter::arena_requests(snapshot,
                 cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only, 0)?;
             layouts.push(WeightArenaLayout::new("qwen3_5/dspark/gpu0", requests.remove(&0).context("dSpark device")?)?);
+            drafts.push(Some(DrafterBytes::block_dspark(snapshot, &config, 1, 142, cfg.max_context)?));
+        }
+        for drafter in drafts {
+            let expected = layouts.iter().filter(|layout| layout.id() == target.id()
+                || drafter.and_then(|draft| draft.weight_arena).is_some_and(|(id, _)| id == layout.id())).collect::<Vec<_>>();
+            let layout = options.layout.as_mut().unwrap();
+            layout.dense_qwen_mtp = drafter.and_then(|draft| draft.weight_arena)
+                .is_some_and(|(id, _)| id == "qwen3_5/mtp/gpu0");
+            layout.dense_qwen_drafter_snapshot = drafter.and_then(|draft| draft.weight_arena)
+                .filter(|(id, _)| *id == "qwen3_5/dspark/gpu0")
+                .map(|_| std::env::var_os("CUTEAFD_QWEN_DENSE_ARENA_DRAFT").unwrap().into());
+            let report = cuteafd_loader::plan::plan(std::path::Path::new(&snapshot), &options)?;
+            assert!(report.executable(), "{:?}", report.hints);
+            let memory = report.memory_layout.context("installed dense layout")?;
+            assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == "weight arena")
+                .map(|item| item.bytes).sum::<u64>(), expected.iter().map(|layout| layout.bytes() as u64).sum::<u64>());
+            let tails = expected.iter().map(|layout| allocation_granularity_forecast(&[layout.bytes() as u64]))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            assert_eq!(memory.devices[0].items.iter().filter(|item| item.group == ALLOCATION_GRANULARITY_GROUP)
+                .map(|item| item.bytes).sum::<u64>(), tails.iter().sum::<u64>());
+            let request = Request { context: 4096.into(), pool: Pin::Exact(4096), onboard: Pin::Auto,
+                prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
+                spark_reply_formats: Default::default() };
+            let plan = qwen3_5::admit(request, qwen3_5::forecast_budgets(&cuteafd_loader::placement::ARCH_CONTEXTS[1],
+                96 << 30, 0, (128 << 30, 128 << 30))?, DenseFacts { cfg: &cfg, weights: &weights,
+                target_arena: &target, buffers: &buffers, slots: 1, record_bytes: 4096, drafter,
+                serving: None, host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
+                    quota_bytes: 0, chunk_bytes: 0 }, verify_check: false })?;
+            assert_eq!(plan.facts.resident_weights.len(), expected.len());
+            assert_eq!(plan.facts.allocation_granularity.len(), expected.len());
+            for layout in expected {
+                let root = plan.facts.allocations.iter().find(|owner| owner.id == layout.id()).unwrap();
+                assert_eq!(root.bytes, layout.bytes() as u64);
+                assert!(root.view.is_none());
+                assert_eq!(root.lifetime, if layout.id() == target.id() { Lifetime::RESIDENT }
+                    else { Lifetime { first: Phase::DraftLoad, last: Phase::Growth } });
+                let tail = plan.facts.allocation_granularity.iter().find(|tail| tail.id == format!("{}.tail", layout.id())).unwrap();
+                assert_eq!(tail.requests(), [layout.bytes() as u64]);
+                assert_eq!(tail.bytes()?, allocation_granularity_forecast(&[root.bytes])?);
+                assert_eq!(plan.facts.resident_weights.iter().find(|owner| owner.id == root.id).unwrap().weights.0, root.bytes);
+            }
         }
         for layout in layouts {
             check_layout(&layout);

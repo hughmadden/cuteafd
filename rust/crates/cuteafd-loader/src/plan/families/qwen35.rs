@@ -174,7 +174,10 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(options.resolved_concurrency("qwen3_5"),
         options.prefix_entries("qwen3_5"), mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let buffers = qwen3_5::NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
-    let weights = qwen3_5::NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
+    let norm = norm.context("missing GDN precision")?;
+    let weights = qwen3_5::NativeWeights::native(input.checkpoint(), cfg, norm.clone())?;
+    let target_arena = crate::families::qwen3_5::weight_layout::target_arena(input.checkpoint(), cfg, norm,
+        crate::families::qwen3_5::weight_layout::DenseFormat::detect(input.checkpoint())?)?;
     let capacity = options.rtx_bytes[0];
     // Physical card class fixes the CUDA context/module image and SM count;
     // `--gpu-memory-cap` only lowers the logical ceiling.
@@ -216,7 +219,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         else { geometry.resolve(options.host_cache_bytes, cfg.max_context as u64,
             options.resolved_concurrency("qwen3_5"), host.0, chunk)
             .context("dense host prefix quota")? };
-    let facts = DenseFacts { cfg, weights: &weights, buffers: &buffers, slots, record_bytes, drafter,
+    let facts = DenseFacts { cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots, record_bytes, drafter,
         // The shared scheduler's one selector holds `decode_rows` rows and
         // selects on the device by default.
         serving: Some(ServingFacts { capacity: qwen3_5::VERIFY_ROWS as u32, device_sampling: true }),

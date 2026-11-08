@@ -709,6 +709,8 @@ mod tests {
             rms_norm_eps: 1e-6, max_context: 262144, mtp_layers: 0, tied_embeddings: false };
         let buffers = NativeBuffers::new(&cfg, 1024, 4, 2, false)?;
         let weights = NativeWeights { layers: vec![256; 2], norm: 256, head: 256, embedding: 256 };
+        let target_arena = cuteafd_loader::serving_capacity::WeightArenaLayout::new("qwen3_5/target/gpu0",
+            [("target".into(), 5 * 256)])?;
         let geometry = qwen3_5::host_prefix_geometry(&cfg, 4096, buffers.mark_bytes as u64);
         let memory = cuteafd_loader::formats::mapped_preload::host_memory_before_process()?;
         for (value, context) in ["auto", "0", "1GiB"].into_iter()
@@ -737,7 +739,7 @@ mod tests {
                 resident_weight_limit: None, spark_reply_formats: Default::default() },
                 qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30),
                     96 << 30, 0, (128 << 30, 128 << 30))?,
-                DenseFacts { cfg: &cfg, weights: &weights, buffers: &buffers, slots: 4,
+                DenseFacts { cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
                     record_bytes: 4096, drafter: None, serving: None, host_prefix: owner, verify_check: false })?;
             assert_eq!(admitted.request.context, requested_context);
             assert_eq!(admitted.served_context(), if context == "auto" { cfg.max_context as u64 } else { 131072 });
