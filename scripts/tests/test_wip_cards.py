@@ -3834,3 +3834,22 @@ get() { case "$1" in PROFILE_DIR) printf '%s' "$TEST_PROFILE_DIR";; esac; }
     result = subprocess.run(['bash', '-c', shell], env={**os.environ, 'TEST_PROFILE_DIR': str(profile)}, capture_output=True)
     assert result.returncode == 0, result.stderr.decode()
     assert b'CUTEAFD_OBSERVER_CONTEXT_FILE' not in result.stdout
+
+
+def test_failed_memory_only_resume_recreates_pending_before_preflight(entry, tmp_path, monkeypatch):
+    entry.update(sparks=[], set={'SPARK_COUNT': '0'})
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    argv = ['--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+            '--state', str(state), '--probe', 'v41-min:memory']
+    rc, _ = _run_main(monkeypatch, argv, rc_for=lambda job: 1)
+    assert rc == 1
+    seen = []
+    def deployment(job, arm):
+        path = Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json'
+        assert json.loads(path.read_text()) == {'pending': True}
+        seen.append(path)
+        return {'spark_roles': [], 'artifact_requirements': {}}
+    monkeypatch.setattr(cards, 'preflight_deployment', deployment)
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'])
+    assert rc == 0 and launched == ['v41-min/a'] and seen

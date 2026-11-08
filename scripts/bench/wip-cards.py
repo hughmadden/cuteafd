@@ -3189,6 +3189,8 @@ def main():
                     path.rename(attempt / path.name)
                 if job['entry']['set'].get('PROFILE_DIR'):
                     Path(job['entry']['set']['PROFILE_DIR']).mkdir(exist_ok=True)
+                    if 'memory' in job['probes']:
+                        save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \

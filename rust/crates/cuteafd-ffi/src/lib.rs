@@ -2460,7 +2460,8 @@ impl NativeLibrary {
         Ok((free, total))
     }
 
-    /// Allocatable free/total bytes on the current device, before logical budgets.
+    /// Allocatable free/total bytes before logical budgets, excluding declared
+    /// external observer capacity. Raw physical diagnostics remain unchanged.
     /// Integrated-device allocations reclaim Linux page cache, so MemAvailable is the
     /// shared device/host headroom. GB10 device pages are not charged to memcg,
     /// so Docker memory limits bound host allocations only, not device admission.
@@ -2469,25 +2470,25 @@ impl NativeLibrary {
     /// before reclaiming page cache. Raw samples remain available for diagnostics.
     /// Discrete devices keep cudaMemGetInfo, regardless of compute capability.
     pub fn cuda_allocatable_memory_info(&self) -> Result<(usize, usize)> {
-        let info = self.cuda_device_info(self.cuda_get_device()?)?;
-        device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
+        let device = self.cuda_get_device()?;
+        // The observer must be resident before taking the device-wide sample.
+        let observer = observer_context::bytes(device)?;
+        let info = self.cuda_device_info(device)?;
+        let (free, total) = device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
             let available = allocatable_bytes(true, 0,
                 || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
             Ok(available)
-        })
+        })?;
+        observer_context::exclude(free, total, observer)
     }
 
     /// Effective free/total bytes under the coordinator's logical ceiling.
     /// Subtract non-reclaimable usage, not the min of available bytes and the budget:
     /// otherwise every successive owner would spend the same budget again.
     pub fn cuda_memory_info(&self) -> Result<(usize, usize)> {
-        let device = self.cuda_get_device()?;
-        // Wait for the observer before sampling: its context must already be
-        // resident in these device-wide counters when we exclude it.
-        let observer = observer_context::bytes(device)?;
         let (free, total) = self.cuda_allocatable_memory_info()?;
-        let (free, total) = observer_context::exclude(free, total, observer)?;
         let Some(budget) = coordinator_gpu_budget() else { return Ok((free, total)) };
+        let device = self.cuda_get_device()?;
         let sample = cuteafd_core::serving_capacity::DeviceMemory {
             device: u32::try_from(device)?, total_bytes: total as u64, baseline_free_bytes: free as u64,
         };
