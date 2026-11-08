@@ -114,7 +114,7 @@ fn installed_pushed_scale_codes_equal_cpu_pack() -> Result<()> {
         let expected_coverage = ExpectedCoverage::from_plan(&checked, 0)?;
         let arena = scales.destination(device, layout, expected_coverage)?;
         let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8,
-            cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
+            cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, crate::shared::memory::TEST)?;
         let fake = FakeRank::new(&checked, &snapshot, 0, &ring)?;
         let delivered = push_consumer::consume(device, arena, ring, fake, 8)?;
         // This is the production post-Done padding pass; it must not erase
@@ -157,7 +157,7 @@ fn installed_coordinator_tp2_scale_codes_equal_cpu_pack() -> Result<()> {
         cols: 0..tensor.metadata.shape[1] };
     let mut dense_expected = vec![0; rect.bytes()];
     rect.read(&mut dense_expected)?;
-    let allocations = [DeviceAllocation::new(&library, 256)?, DeviceAllocation::new(&library, 256)?];
+    let allocations = [DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?, DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?];
     let mut records = Records::default();
     records.operands.push(Operand { device: 0, buffer: allocations[0].buffer,
         lands: vec![(rect.clone(), 0)], bytes: rect.bytes() });

@@ -109,9 +109,10 @@ pub fn weight_arena_components(
     location: Location,
     lifetime: Lifetime,
     maximum: u64,
+    kind: MemoryKind,
 ) -> Result<Vec<Component>, Refusal> {
     let bytes = u64::try_from(layout.bytes()).map_err(|_| Refusal::Overflow("weight arena extent"))?;
-    weight_arena_extent_components(layout.id(), bytes, location, lifetime, maximum)
+    weight_arena_extent_components(layout.id(), bytes, location, lifetime, maximum, kind)
 }
 
 /// Extent-only counterpart for facts carrying the shared recipe's exact ID/B.
@@ -122,12 +123,13 @@ pub fn weight_arena_extent_components(
     location: Location,
     lifetime: Lifetime,
     maximum: u64,
+    kind: MemoryKind,
 ) -> Result<Vec<Component>, Refusal> {
-    if id.is_empty() || bytes == 0 || maximum == 0
+    if kind.behaviour() != Behaviour::Immutable || id.is_empty() || bytes == 0 || maximum == 0
         || !matches!(location, Location { device: Device::Coordinator(_), domain: Domain::Device }) {
         return Err(Refusal::InvalidFact("weight arena requires a named positive SM120 device extent and page domain".into()));
     }
-    let root = Allocation::buffer(id, location, bytes, lifetime, Category::Weights, "weight arena");
+    let root = Allocation::buffer(id, location, bytes, lifetime, kind.category(), "weight arena");
     let curve = ByteCurve::fixed(bytes, maximum);
     let resident = ResidentWeight::from_allocation(&root, ResidentWeights(bytes));
     let tail = allocation_granularity_component(AllocationGranularity {
@@ -150,7 +152,7 @@ mod tests {
             .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
         assert_eq!(layout.padding_bytes(), 255);
         let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
-        let components = weight_arena_components(&layout, Location::coordinator(0), lifetime, 32)?;
+        let components = weight_arena_components(&layout, Location::coordinator(0), lifetime, 32, cuteafd_core::memory_layout::MemoryKind::Weights)?;
         assert_eq!(components.len(), 3);
         let ComponentKind::Allocation { template: root, deferred, .. } = &components[0].kind else { panic!("missing root") };
         assert_eq!(root.id, layout.id());
@@ -168,11 +170,30 @@ mod tests {
         assert_eq!(tail.backings[0].backing, root.id);
         assert_eq!(root.bytes + tail.bytes()?, 4 << 20);
         assert_ne!(root.bytes, layout.payload_bytes() as u64);
-        assert!(weight_arena_extent_components("", 1, Location::coordinator(0), lifetime, 32).is_err());
-        assert!(weight_arena_extent_components("x", 0, Location::coordinator(0), lifetime, 32).is_err());
-        assert!(weight_arena_extent_components("x", 1, Location::coordinator(0), lifetime, 0).is_err());
-        assert!(weight_arena_extent_components("x", 1, Location::PINNED, lifetime, 32).is_err());
-        assert!(weight_arena_extent_components("x", 1, Location { device: Device::Spark(0), domain: Domain::Device }, lifetime, 32).is_err());
+        assert!(weight_arena_extent_components("", 1, Location::coordinator(0), lifetime, 32, cuteafd_core::memory_layout::MemoryKind::Weights).is_err());
+        assert!(weight_arena_extent_components("x", 0, Location::coordinator(0), lifetime, 32, cuteafd_core::memory_layout::MemoryKind::Weights).is_err());
+        assert!(weight_arena_extent_components("x", 1, Location::coordinator(0), lifetime, 0, cuteafd_core::memory_layout::MemoryKind::Weights).is_err());
+        assert!(weight_arena_extent_components("x", 1, Location::PINNED, lifetime, 32, cuteafd_core::memory_layout::MemoryKind::Weights).is_err());
+        assert!(weight_arena_extent_components("x", 1, Location { device: Device::Spark(0), domain: Domain::Device }, lifetime, 32, cuteafd_core::memory_layout::MemoryKind::Weights).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn arena_root_kind_is_immutable_and_never_guessed_from_id() -> Result<(), Refusal> {
+        for kind in MemoryKind::ALL {
+            let components = weight_arena_extent_components("neutral", 3 << 20,
+                Location::coordinator(0), Lifetime::RESIDENT, 1, kind);
+            if kind.behaviour() == Behaviour::Immutable {
+                let components = components?;
+                let ComponentKind::Allocation { template, .. } = &components[0].kind else { panic!("root") };
+                assert_eq!(template.category, kind.category());
+                let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("tail") };
+                assert_eq!(tail.bytes()?, 1 << 20);
+                assert_eq!(tail.backings[0].backing, template.id);
+            } else {
+                assert!(components.is_err(), "nonimmutable {kind:?} accepted by weight arena");
+            }
+        }
         Ok(())
     }
 

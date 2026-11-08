@@ -186,7 +186,7 @@ fn golden_arenas<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         EmbeddingHome::Device(0))?.coordinator_arenas()?;
     Ok(std::rc::Rc::new(layouts.into_iter().enumerate().map(|(rank, layout)| {
         Ok((rank as i32, crate::shared::memory::weight_arena::DeviceWeightArena::new(
-            Device { library, id: rank as i32 }, layout)?))
+            Device { library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA)?))
     }).collect::<Result<_>>()?))
 }
 
@@ -255,7 +255,7 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
         let checked = layout.checked(root.path(), world, sparks + gpu as usize)?;
         let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, (sparks + gpu as usize) as u32)?;
         device.run(|| -> Result<()> {
-            let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
+            let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, crate::shared::memory::TEST)?;
             let fake = crate::shared::experts::rtx::dense::testing::FakeRank::new(&checked, root.path(), (sparks + gpu as usize) as u32, &ring)?;
             let arena = DenseArena::new(device, layout, expected)?;
             crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)

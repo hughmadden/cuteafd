@@ -3,6 +3,7 @@ pub(crate) mod distributed;
 pub(crate) mod distributed_target;
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::BlockOutput;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::{Context, Result, ensure};
@@ -84,11 +85,11 @@ impl<'a> TargetHeadWeights<'a> {
             "target head wave exceeds budget"
         );
         let workspace =
-            DeviceAllocation::new(self.library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+            DeviceAllocation::new(self.library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/target-head"))?;
         let projection = unsafe { self.library.v41_vocabulary_head(workspace.buffer)? };
         let buffers = STRIDES
             .into_iter()
-            .map(|n| DeviceAllocation::new(self.library, n * capacity))
+            .map(|n| DeviceAllocation::new(self.library, n * capacity, Tag::workspace("v41/target-head")))
             .collect::<Result<Vec<_>>>()?;
         ensure!(
             head.device_id() == buffers[0].buffer.device_id
@@ -114,7 +115,7 @@ impl<'a> TargetHeadWeights<'a> {
             origin: None,
             selected: Vec::new(),
             tokens: Vec::new(),
-            greedy_staging: HostAllocation::new(self.library, capacity * 8)?,
+            greedy_staging: HostAllocation::new(self.library, capacity * 8, Tag::staging("v41/target-head"))?,
             greedy_ready: false,
             sampling: TargetSamplingWave::new(self.library, capacity, SAMPLING_VOCAB)?,
             download: crate::shared::memory::RowDownload::new(self.library, capacity * STRIDES[4])?,
@@ -1098,7 +1099,7 @@ mod sampler_wiring_tests {
             use super::recording_sampler as rec;
             let library: &'static NativeLibrary = Box::leak(Box::new(wiring_library()?));
             let mut wave = TargetSamplingWave::allocate(library, rec::stages(), rows, SAMPLING_VOCAB).unwrap();
-            let logits_buffer = library.alloc_device_buffer(rows * vocab * 4).unwrap();
+            let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::shared::memory::TEST).unwrap();
             let values = logits(rows, vocab);
             library.copy_h2d(logits_buffer, &logit_bytes(&values)).unwrap();
             wave.upload(&plan.rows, Some(arena), cuteafd_ffi::cuteafd_sampler_mask_words(vocab),
@@ -1590,7 +1591,7 @@ mod sampler_device_tests {
             .map(|mask| vec![mask.clone()]).collect();
         build_sampling_masks(&row_masks, &mut arena)?;
 
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
         let stream = library.cuda_stream_create()?;
         // One wave for both launches: its buffers must not be freed under the
@@ -1744,7 +1745,7 @@ mod sampler_device_tests {
             let plan = build_target_sampling_plan(&members, &inputs)?;
             let mut arena = vec![0u32; rows * words];
             build_sampling_masks(&vec![vec![None]; rows], &mut arena)?;
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let mut host_rows = vec![0u8; rows * VOCAB * 4];
             let stream = library.cuda_stream_create()?;
@@ -1833,7 +1834,7 @@ mod sampler_device_tests {
             let inputs: Vec<Vec<u32>> = vec![vec![0]; rows];
             let plan = build_target_sampling_plan(&members, &inputs)?;
             assert!(!plan.routes_need_ordered_tail());
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(&library, rows, SAMPLING_VOCAB)?;
@@ -1877,10 +1878,10 @@ mod sampler_device_tests {
         // the kernel stage only.
         let rows = 48usize;
         let values = smooth_narrow(rows);
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
-        let indices = library.alloc_device_buffer(rows * 4)?;
-        let scores = library.alloc_device_buffer(rows * 4)?;
+        let indices = library.alloc_device_buffer(rows * 4, crate::shared::memory::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::shared::memory::TEST)?;
         let stream = library.cuda_stream_create()?;
         let mut greedy_us = Vec::new();
         for iteration in 0..60 {
@@ -1918,7 +1919,7 @@ mod sampler_device_tests {
             let inputs: Vec<Vec<u32>> = vec![vec![0]; rows];
             let plan = build_target_sampling_plan(&members, &inputs)?;
             assert!(plan.route.iter().all(|route| *route == crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingRoute::DeviceGreedy));
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(&library, rows, SAMPLING_VOCAB)?;
@@ -1970,7 +1971,7 @@ mod sampler_device_tests {
         {
             let rows = 8usize;
             let values = smooth_narrow(rows);
-            let buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(buffer, &bytes(&values))?;
             let mut host = vec![0u8; VOCAB * 4];
             let mut one_row = buffer;
@@ -2168,7 +2169,7 @@ mod sampler_device_tests {
         let plan = build_target_sampling_plan(&members, &inputs)?;
         let mut arena = vec![0u32; rows * words];
         build_sampling_masks(&[vec![Some(mask.clone())], vec![None]], &mut arena)?;
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
         let stream = library.cuda_stream_create()?;
         let result = (|| -> Result<Vec<u32>> {
@@ -2235,7 +2236,7 @@ mod sampler_device_tests {
         fn new(library: &'a NativeLibrary, rows: usize, values: &[f32],
             plan: &crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingPlan, arena: Option<&[u32]>,
         ) -> Result<Self> {
-            let logits = library.alloc_device_buffer(rows * VOCAB * 4)?;
+            let logits = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits, &bytes(values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(library, rows, SAMPLING_VOCAB)?;

@@ -5,6 +5,7 @@ use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use std::os::unix::fs::FileExt;
+use crate::shared::memory::Tag;
 
 pub(crate) struct WeightReader<'a> {
     pub(crate) library: &'a NativeLibrary,
@@ -97,7 +98,7 @@ impl<'a> WeightReader<'a> {
 
     pub(crate) fn upload(&self, bytes: &[u8]) -> Result<Allocation<'a>> {
         self.upload_with("upload", bytes, |_, bytes| Allocation::new(
-            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes, Tag::weights("shared/qwen")))
     }
 
     pub(crate) fn upload_with(&self, name: &str, bytes: &[u8],
@@ -112,7 +113,7 @@ impl<'a> WeightReader<'a> {
     /// Native checkpoint bytes, concatenated without changing element precision.
     pub(crate) fn native(&self, names: &[String], widen_bf16: bool) -> Result<Allocation<'a>> {
         self.native_with(&names.join("+"), names, widen_bf16, |_, bytes| Allocation::new(
-            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes, Tag::weights("shared/qwen")))
     }
 
     pub(crate) fn native_with(&self, name: &str, names: &[String], widen_bf16: bool,
@@ -170,7 +171,7 @@ impl<'a> WeightReader<'a> {
 
     pub(crate) fn bf16(&self, name: &str) -> Result<Allocation<'a>> {
         self.bf16_with(name, name, |_, bytes| Allocation::new(
-            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes, Tag::weights("shared/qwen")))
     }
 
     pub(crate) fn bf16_with(&self, name: &str, source: &str,
@@ -183,7 +184,7 @@ impl<'a> WeightReader<'a> {
     /// Concatenate BF16 matrices in source order, retaining zero padded rows.
     pub(crate) fn rows(&self, names: &[String], pad_rows: usize) -> Result<Allocation<'a>> {
         self.rows_with(&names.join("+"), names, pad_rows, |_, bytes| Allocation::new(
-            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes, Tag::weights("shared/qwen")))
     }
 
     pub(crate) fn rows_with(&self, name: &str, names: &[String], pad_rows: usize,
@@ -222,7 +223,7 @@ impl<'a> WeightReader<'a> {
     /// Native FP32 values stay byte-identical; BF16 values widen exactly.
     pub(crate) fn f32(&self, name: &str) -> Result<Allocation<'a>> {
         self.f32_with(name, name, |_, bytes| Allocation::new(
-            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes))
+            Device { library: self.library, id: self.library.cuda_get_device()? }, bytes, Tag::weights("shared/qwen")))
     }
 
     pub(crate) fn f32_with(&self, name: &str, source: &str,
@@ -323,7 +324,7 @@ mod tests {
         fn load<'a>(reader: &WeightReader<'a>, arena: Option<&DeviceWeightArena<'a>>)
             -> Result<Vec<Allocation<'a>>> {
             let device = Device { library: reader.library, id: reader.library.cuda_get_device()? };
-            let mut allocate = |name: &str, bytes| crate::shared::memory::weight_arena::weight_allocation(device, arena, name, bytes);
+            let mut allocate = |name: &str, bytes| crate::shared::memory::weight_arena::weight_allocation(device, arena, name, bytes, crate::shared::memory::TEST_ARENA);
             Ok(vec![reader.bf16_with("bf", "bf16", &mut allocate)?,
                 reader.native_with("native", &["fp8".into()], false, &mut allocate)?,
                 reader.f32_with("float", "bf16", &mut allocate)?,
@@ -332,7 +333,7 @@ mod tests {
         }
         let baseline = device.run(|| load(&reader, None))?;
         for recorded in [false, true] {
-            let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/qwen", expected.clone())?)?;
+            let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/qwen", expected.clone())?, crate::shared::memory::TEST_ARENA)?;
             let owners = device.run(|| {
                 if recorded {
                     let (owners, records) = recording(|| load(&reader, Some(&arena)))?;
@@ -355,7 +356,7 @@ mod tests {
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 5);
         }
         device.run(|| {
-            assert!(reader.upload_with("bad", &[1], |_, bytes| Allocation::new(device, bytes + 1)).is_err());
+            assert!(reader.upload_with("bad", &[1], |_, bytes| Allocation::new(device, bytes + 1, crate::shared::memory::TEST)).is_err());
             Ok(())
         })?;
         Ok(())

@@ -18,7 +18,7 @@ fn glm_expert_census_resides_weights_before_kv_only() -> Result<()> {
     let owner = |id: &str| Receipt { allocation: Allocation::buffer(id, Location::coordinator(0), 64,
         Lifetime::TARGET, Category::Experts, "resident expert owners"), address: 0x10000 };
     let mut root = owner("experts.exl3.gpu.1.selection");
-    root.allocation.category = Category::Weights;
+    root.allocation.category = Category::Experts;
     root.allocation.group = "weight arena".into();
     let mut alias = owner("glm.expert.routed.rank.0.weight.3.0");
     alias.allocation.view = Some(View { backing: root.allocation.id.clone(), offset: 0 });
@@ -58,7 +58,7 @@ fn ready<'a>(device: Device<'a>, sizes: Vec<usize>) -> Result<Rc<ReadyArena<'a>>
     let admitted = sizes.iter().try_fold(0usize, |sum, &bytes| sum.checked_add(bytes)
         .context("test arena size overflow"))? + sizes.len() * 256;
     Ok(Rc::new(LoadingArena::new(device, ArenaLayout::new(sizes, admitted)?,
-        ExpectedCoverage::default())?.done()?.initialize(|_| Ok(()))?))
+        ExpectedCoverage::default(), crate::shared::memory::TEST_ARENA)?.done()?.initialize(|_| Ok(()))?))
 }
 
 fn modules<'a>(fixture: &cuteafd_ffi::native_library_lifetime_fixture::Fixture,

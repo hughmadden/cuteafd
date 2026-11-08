@@ -1,4 +1,5 @@
 //! Namespace-required native Spark load; execution views exist only after Done.
+use crate::shared::memory::Tag;
 use super::{ExpertLayer, ExpertWeights, NativeExpertServiceConfig};
 use crate::shared::{experts::layer::ExpertLoadBudget, memory::{device::Device,
     push_consumer, push_initialize, push_native::RankPlan,
@@ -61,7 +62,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     let joined = (|| -> Result<_> {
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
         let arena = plan.scales.destination(device, plan.layout.clone(), expected)?;
-        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
+        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let rank = client.join(JoinArgs { group, token, rank: u32::try_from(rank_id)?,
             ring_fd: ring.fd().as_raw_fd(), slots: u32::try_from(ring.slots())?,
             slot_bytes: u32::try_from(ring.slot_bytes())? })?;

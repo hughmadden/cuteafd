@@ -6,6 +6,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs};
 use cuteafd_loader::OfficialV41Catalog;
 use std::{ffi::c_void, rc::Rc};
+use crate::shared::memory::Tag;
 
 pub(crate) struct Weights<'a> {
     pub device: Device<'a>,
@@ -139,7 +140,7 @@ impl<'a> Wave<'a> {
     pub fn new(weights: Rc<Weights<'a>>, capacity: u32) -> Result<Self> {
         let device = weights.device;
         let bytes = Self::device_bytes(device.library, capacity, weights.layout)?;
-        let scratch = Allocation::new(device, bytes)?;
+        let scratch = Allocation::new(device, bytes, Tag::drafter_workspace("experts/draft-rank"))?;
         let stream = Stream::new(device)?;
         let mut states = Vec::new();
         for cap in Self::capacities(capacity)? {

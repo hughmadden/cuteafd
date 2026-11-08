@@ -1,5 +1,6 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkConfidence, DsparkMarkov, DsparkWeights};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::VocabularyHead;
 use anyhow::{ensure, Context, Result};
@@ -66,7 +67,7 @@ impl<'library> DsparkWeights<'library> {
         self.tensor("mtp.2.norm.weight")?;
         let local_head = head.map(|weights| -> Result<_> {
             ensure!(weights.device_id() == library.cuda_get_device()?, "dSpark head device differs");
-            let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+            let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::drafter_workspace("v41/draft-terminal"))?;
             let kernel = unsafe { library.v41_vocabulary_head(workspace.buffer)? };
             let fp8_scratch = crate::families::deepseek_v41::v41_tensors::fp8_scratch(library, weights.copy(),
                 capacity * self.draft_width, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
@@ -75,7 +76,7 @@ impl<'library> DsparkWeights<'library> {
         Ok(DsparkTerminal {
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-terminal")?,
             local_head,
-            normalized: DeviceAllocation::new(library, capacity * self.draft_width * 10240)?,
+            normalized: DeviceAllocation::new(library, capacity * self.draft_width * 10240, Tag::drafter_workspace("v41/draft-terminal"))?,
             weights: self,
             stream: LoadStream {
                 library,
@@ -86,15 +87,15 @@ impl<'library> DsparkWeights<'library> {
                 .confidence(capacity * self.draft_width, DsparkConfidence::device_bytes(capacity * self.draft_width)?)?,
             sample: library.v41_draft_step()?,
             hc: library.v41_hc()?,
-            residual: DeviceAllocation::new(library, capacity * self.draft_width * 40960)?,
-            pre_mix: DeviceAllocation::new(library, capacity * self.draft_width * 16)?,
-            shared_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4)?,
-            adjusted_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4)?,
-            rng: DeviceAllocation::new(library, capacity * 16)?,
+            residual: DeviceAllocation::new(library, capacity * self.draft_width * 40960, Tag::drafter_workspace("v41/draft-terminal"))?,
+            pre_mix: DeviceAllocation::new(library, capacity * self.draft_width * 16, Tag::drafter_workspace("v41/draft-terminal"))?,
+            shared_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
+            adjusted_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
+            rng: DeviceAllocation::new(library, capacity * 16, Tag::drafter_workspace("v41/draft-terminal"))?,
             sampling_requests: None,
-            sampling_staging: HostAllocation::new(library, capacity * 20)?,
-            temperatures: DeviceAllocation::new(library, capacity * 4)?,
-            tokens: DeviceAllocation::new(library, capacity * (self.draft_width + 1) * 4)?,
+            sampling_staging: HostAllocation::new(library, capacity * 20, Tag::staging("v41/draft-terminal"))?,
+            temperatures: DeviceAllocation::new(library, capacity * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
+            tokens: DeviceAllocation::new(library, capacity * (self.draft_width + 1) * 4, Tag::drafter_workspace("v41/draft-terminal"))?,
             capacity,
             width: self.draft_width,
             graph: BindingGraphs::new(library)?,

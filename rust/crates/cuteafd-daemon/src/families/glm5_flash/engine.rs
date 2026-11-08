@@ -50,7 +50,7 @@ use crate::shared::target_head::TargetHead as TargetHeadRoute;
 use crate::shared::speculation::dflash::TargetHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, Tag};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding, TokenSelector};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead};
@@ -76,8 +76,8 @@ struct Dev<'a> {
     _owner: Rc<DeviceAllocation<'a>>,
 }
 impl<'a> Dev<'a> {
-    fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        let owner = Rc::new(DeviceAllocation::new(library, bytes)?);
+    fn new(library: &'a NativeLibrary, bytes: usize, tag: Tag) -> Result<Self> {
+        let owner = Rc::new(DeviceAllocation::new(library, bytes, tag)?);
         Ok(Self { buffer: owner.buffer, _owner: owner })
     }
     fn view(owner: Rc<DeviceAllocation<'a>>, offset: usize, bytes: usize) -> Result<Self> {
@@ -1018,19 +1018,19 @@ impl<'a> StepPlan<'_, 'a> {
         if rank == 0 { self.shape } else { GlmfStepShape { lead: false, local_experts: false, spark: false, ..self.shape } }
     }
 
-    fn alloc(&self, bytes: u64) -> Result<Dev<'a>> {
-        Dev::new(self.library, usize::try_from(bytes)?.max(256))
+    fn alloc(&self, bytes: u64, tag: Tag) -> Result<Dev<'a>> {
+        Dev::new(self.library, usize::try_from(bytes)?.max(256), tag)
     }
 
-    fn zeroed(&self, bytes: u64) -> Result<Dev<'a>> {
-        let allocation = self.alloc(bytes)?;
+    fn zeroed(&self, bytes: u64, tag: Tag) -> Result<Dev<'a>> {
+        let allocation = self.alloc(bytes, tag)?;
         self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
         Ok(allocation)
     }
 
     /// Rank `rank`'s temporaries for steps of up to `rows` rows, on the current device.
     fn temporaries(&self, rank: usize, rows: usize, decode: bool) -> Result<Temporaries<'a>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
+        let tag = Tag::workspace("glmf/temporaries");
         let shape = self.shape(rank);
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
@@ -1040,20 +1040,20 @@ impl<'a> StepPlan<'_, 'a> {
             scratch.programs = scratch.programs.max(self.shared_records);
         }
         let bytes = glmf_temporary_bytes(self.cfg, rows as u64, decode, &shape, scratch);
-        let head_workspace = self.alloc(bytes.head_workspace)?;
+        let head_workspace = self.alloc(bytes.head_workspace, tag)?;
         Ok(Temporaries {
             rows,
-            query: self.alloc(bytes.query)?,
-            q_resid: self.alloc(bytes.q_resid)?,
-            latent: self.alloc(bytes.latent)?,
-            q_fp8: self.alloc(bytes.q_fp8)?,
-            head_weights: self.alloc(bytes.head_weights)?,
-            pools: self.alloc(bytes.pools)?,
-            indices: self.alloc(bytes.indices)?,
-            lengths: self.alloc(bytes.lengths)?,
-            scratch: self.alloc(bytes.scratch)?,
-            topk_scratch: self.zeroed(bytes.topk_scratch)?,
-            logits: self.alloc(bytes.logits)?,
+            query: self.alloc(bytes.query, tag)?,
+            q_resid: self.alloc(bytes.q_resid, tag)?,
+            latent: self.alloc(bytes.latent, tag)?,
+            q_fp8: self.alloc(bytes.q_fp8, tag)?,
+            head_weights: self.alloc(bytes.head_weights, tag)?,
+            pools: self.alloc(bytes.pools, tag)?,
+            indices: self.alloc(bytes.indices, tag)?,
+            lengths: self.alloc(bytes.lengths, tag)?,
+            scratch: self.alloc(bytes.scratch, tag)?,
+            topk_scratch: self.zeroed(bytes.topk_scratch, tag)?,
+            logits: self.alloc(bytes.logits, tag)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: if shape.lead {
                 Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, self.cfg.hidden as u32,
@@ -1067,15 +1067,15 @@ impl<'a> StepPlan<'_, 'a> {
 
     /// Rank `rank`'s lane buffers for steps of up to `rows` rows over `temps`, on the current device.
     fn lane(&self, rank: usize, rows: usize, decode: bool, temps: Rc<Temporaries<'a>>) -> Result<Workspace<'a>> {
-        self.slot(rank, rows, decode, temps, &mut |bytes| self.alloc(bytes))
+        self.slot(rank, rows, decode, temps, &mut |bytes| self.alloc(bytes, Tag::workspace("glmf/lane")))
     }
 
     /// All live prefill rows share one allocation; hook-local scratch stays separate.
     fn slots(&self, rank: usize, rows: usize, count: usize) -> Result<Vec<Workspace<'a>>> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let bytes = glmf_lane_bytes(self.cfg, rows as u64, false, &self.shape(rank)).arena_bytes();
         let owner = Rc::new(DeviceAllocation::new(self.library,
-            usize::try_from(bytes)?.checked_mul(count).context("prefill arena overflow")?)?);
+            usize::try_from(bytes)?.checked_mul(count).context("prefill arena overflow")?,
+            Tag::workspace("glmf/prefill-slots"))?);
         let temps = Rc::new(self.temporaries(rank, rows, false)?);
         let mut offset = 0;
         (0..count).map(|_| self.slot(rank, rows, false, temps.clone(), &mut |bytes| {
@@ -1088,7 +1088,6 @@ impl<'a> StepPlan<'_, 'a> {
 
     fn slot(&self, rank: usize, rows: usize, decode: bool, temps: Rc<Temporaries<'a>>,
         alloc: &mut impl FnMut(u64) -> Result<Dev<'a>>) -> Result<Workspace<'a>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         ensure!(rows <= temps.rows, "a lane of {rows} rows over temporaries of {}", temps.rows);
         let bytes = glmf_lane_bytes(self.cfg, rows as u64, decode, &self.shape(rank));
         Ok(Workspace {
@@ -1141,7 +1140,7 @@ impl<'a> DenseNvfp4<'a> {
     /// Loads the package at `directory` with scratch, ids and weights for `rows` rows.
     pub fn load(library: &'a NativeLibrary, directory: &std::path::Path, cfg: &GlmNextConfig, rows: usize)
         -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights/dense-nvfp4");
+        let tag = Tag::workspace("glmf/dense-nvfp4");
         // SAFETY: a trusted package for the current device; the engine drains its
         // stream before dropping it.
         let module = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(directory) }
@@ -1152,10 +1151,10 @@ impl<'a> DenseNvfp4<'a> {
             && matches!(info.weights, cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4),
             "{} ({info:?}) is not the dense NVFP4 MLP package", directory.display());
         let top = info.capacity_for(rows).with_context(|| format!("dense NVFP4 package has no capacity for {rows} rows"))?;
-        let scratch = crate::shared::memory::DeviceAllocation::new(library, module.scratch_bytes(top)?.max(256))?;
-        let ids = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+        let scratch = crate::shared::memory::DeviceAllocation::new(library, module.scratch_bytes(top)?.max(256), tag)?;
+        let ids = crate::shared::memory::DeviceAllocation::new(library, rows * 4, tag)?;
         library.copy_h2d(ids.buffer, &vec![0u8; rows * 4])?;
-        let weights = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+        let weights = crate::shared::memory::DeviceAllocation::new(library, rows * 4, tag)?;
         let ones: Vec<u8> = (0..rows).flat_map(|_| 1f32.to_le_bytes()).collect();
         library.copy_h2d(weights.buffer, &ones)?;
         Ok(Self { module, scratch, ids, weights })
@@ -1254,8 +1253,8 @@ impl<'a> Caches<'a> {
     fn new(library: &'a NativeLibrary, cfg: &GlmNextConfig, layers: &[GlmfLayer<'_>], pages: usize, pool_pages: usize,
         slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, pool_marks: bool) -> Result<Self> {
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = Dev::new(library, bytes.max(256))?;
+        let zeroed = |bytes: usize, tag: Tag| -> Result<Dev<'a>> {
+            let allocation = Dev::new(library, bytes.max(256), tag)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1272,10 +1271,10 @@ impl<'a> Caches<'a> {
                         index.push(None);
                         continue;
                     }
-                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
+                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES, Tag::kv("glmf/kv-records"))?));
                     index.push(Some(IndexLayer {
-                        keys: if keys { Some(zeroed(pages * PAGE_ROWS * KEY_BYTES)?) } else { None },
-                        pools: zeroed(pool_pages * PAGE_ROWS * 132)?,
+                        keys: if keys { Some(zeroed(pages * PAGE_ROWS * KEY_BYTES, Tag::kv("glmf/index-keys"))?) } else { None },
+                        pools: zeroed(pool_pages * PAGE_ROWS * 132, Tag::kv("glmf/pool-keys"))?,
                     }));
                     mla_layers += 1;
                 }
@@ -1287,7 +1286,8 @@ impl<'a> Caches<'a> {
             }
         }
         let index_tails = compact_index_extents(index_cache, mla_layers, slots, decode_rows)
-            .map(|(tails, replay)| -> Result<_> { Ok((zeroed(tails)?, zeroed(replay)?)) }).transpose()?;
+            .map(|(tails, replay)| -> Result<_> { Ok((zeroed(tails, Tag::kv("glmf/index-tails"))?,
+                zeroed(replay, Tag::workspace("glmf/index-replay"))?)) }).transpose()?;
         let mark_geometry = cuteafd_loader::serving_capacity::RankCacheGeometry {
             persistent_unit_bytes: (mla_layers * (UNIT_ROWS * (RECORD_BYTES + if keys { KEY_BYTES } else { 0 })
                 + PAGE_ROWS * 132)) as u64,
@@ -1296,8 +1296,8 @@ impl<'a> Caches<'a> {
         };
         let pool_mark_unit_bytes = usize::try_from(mark_geometry.glmf_pool_mark_backing_unit_bytes(pool_marks))?;
         let pool_mark_backing = if pool_mark_unit_bytes > 0 {
-            let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix/KDA-only pool marks");
-            Some(zeroed(pool_pages.checked_mul(pool_mark_unit_bytes).context("KDA pool backing overflow")?)?)
+            Some(zeroed(pool_pages.checked_mul(pool_mark_unit_bytes).context("KDA pool backing overflow")?,
+                Tag::prefix("glmf/prefix-pool-marks"))?)
         } else { None };
         let replay = kda_layers * replay;
         let (kda_replay, owner) = match records {
@@ -1309,15 +1309,16 @@ impl<'a> Caches<'a> {
                     RecordsOwner::Shared { _temporaries: temps })
             }
             None => {
-                let own = zeroed(replay)?;
+                let own = zeroed(replay, Tag::workspace("glmf/kda-replay"))?;
                 (own.buffer, RecordsOwner::Own { _records: own })
             }
         };
         let mla_ordinal = local_mla_ordinals(layers.iter().map(|layer| (layer.attention, layer.attention_share)));
-        Ok(Self { kv, index, mla_ordinal, kda_state: zeroed(kda_layers * slots * state)?,
-            kda_conv: zeroed(kda_layers * slots * conv)?,
+        Ok(Self { kv, index, mla_ordinal, kda_state: zeroed(kda_layers * slots * state, Tag::kv("glmf/kda-state"))?,
+            kda_conv: zeroed(kda_layers * slots * conv, Tag::kv("glmf/kda-conv"))?,
             kda_replay, _kda_replay_owner: owner, index_tails,
-            commit_tables: zeroed(3 * decode_rows * 4)?, pool_logical: zeroed(pool_pages * 4)?,
+            commit_tables: zeroed(3 * decode_rows * 4, Tag::workspace("glmf/commit-tables"))?,
+            pool_logical: zeroed(pool_pages * 4, Tag::kv("glmf/pool-map"))?,
             pool_marks, pool_mark_backing, pool_mark_unit_bytes, kda_heads })
     }
 }
@@ -1727,7 +1728,6 @@ impl<'a> GlmfEngine<'a> {
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool,
         execution: &cuteafd_loader::placement::LayerExecutionPlan, step_experts: StepExperts) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
         ensure!(decode_rows == DECODE_ROWS || decode_rows == WIDE_DECODE_ROWS,
@@ -2508,8 +2508,9 @@ impl<'a> GlmfEngine<'a> {
         for &layer in &tp2.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.topk * 8;
-                checks.insert((layer, lane), (rows, [self.on(0, || HostAllocation::new(self.library, bytes))?,
-                    self.on(1, || HostAllocation::new(self.library, bytes))?]));
+                checks.insert((layer, lane), (rows, [
+                    self.on(0, || HostAllocation::new(self.library, bytes, Tag::staging("glmf/tp2-route-checks")))?,
+                    self.on(1, || HostAllocation::new(self.library, bytes, Tag::staging("glmf/tp2-route-checks")))?]));
             }
         }
         Ok(())
@@ -2526,8 +2527,9 @@ impl<'a> GlmfEngine<'a> {
             for &layer in &tp2.layers {
                 let bytes = self.prefill_rows * self.cfg.topk * 8;
                 layers.insert(layer, RouteHosts { hosts: [
-                    self.on(0, || HostAllocation::new(self.library, bytes))?,
-                    self.on(1, || HostAllocation::new(self.library, bytes))?], collected: [false; 2] });
+                    self.on(0, || HostAllocation::new(self.library, bytes, Tag::staging("glmf/tp2-unit-checks")))?,
+                    self.on(1, || HostAllocation::new(self.library, bytes, Tag::staging("glmf/tp2-unit-checks")))?],
+                    collected: [false; 2] });
             }
             storage.push(layers);
         }
@@ -2781,7 +2783,6 @@ impl<'a> GlmfEngine<'a> {
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             // Its own and the shares' programs.
             self.programs.load_matching(|name| super::glmf_startup_program(name, true, self.decode_rows > DECODE_ROWS))?;
-            let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let local = if self.context_mode.is_some() { 2 } else { 1 };
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages / local, self.pool_pages / local,
                 self.slots, self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None,
@@ -2813,13 +2814,14 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn warm_mla_prefill_width(&self, rank: usize, heads: usize, kernel: i32) -> Result<()> {
-        let q = self.alloc(heads * self.cfg.kv_lora_rank * 2)?;
-        let kv = self.alloc(PAGE_ROWS * RECORD_BYTES)?;
-        let indices = self.alloc(SPARSE_TOPK * 4)?;
+        let tag = Tag::workspace("glmf/mla-warmup");
+        let q = self.alloc(heads * self.cfg.kv_lora_rank * 2, tag)?;
+        let kv = self.alloc(PAGE_ROWS * RECORD_BYTES, tag)?;
+        let indices = self.alloc(SPARSE_TOPK * 4, tag)?;
         self.library.copy_h2d(indices.buffer, &vec![0xFFu8; SPARSE_TOPK * 4])?;
-        let lengths = self.alloc(4)?;
+        let lengths = self.alloc(4, tag)?;
         self.library.cuda_zero_bytes(lengths.buffer, 256)?;
-        let out = self.alloc(heads * self.cfg.kv_lora_rank * 2)?;
+        let out = self.alloc(heads * self.cfg.kv_lora_rank * 2, tag)?;
         // SAFETY: every buffer above is live and sized for one row of `heads` heads; the
         // stream drains before they drop.
         unsafe {
@@ -3144,8 +3146,8 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        Dev::new(self.library, bytes.max(256))
+    fn alloc(&self, bytes: usize, tag: Tag) -> Result<Dev<'a>> {
+        Dev::new(self.library, bytes.max(256), tag)
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -5610,8 +5612,8 @@ mod tp2_tests {
             std::fs::write(std::env::var("CUTEAFD_GLMF_FATAL_RANK_EVIDENCE")?,
                 fixture.directory().join("events").to_str().context("fixture evidence path")?)?;
             let library = fixture.load()?;
-            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256)?,
-                Allocation::new(Device { library: &library, id: 1 }, 256)?];
+            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?,
+                Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?];
             fixture.configure_pack(&library, 0, 1)?;
             fixture.configure_drain_after(&library, after.parse()?)?;
             let result = drain_ranks(2, |rank| Device { library: &library, id: rank as i32 }.run(|| {
@@ -5645,8 +5647,8 @@ mod tp2_tests {
         use crate::shared::memory::device::{Allocation, Device};
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
-        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256)?,
-            Allocation::new(Device { library: &library, id: 1 }, 256)?];
+        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, crate::shared::memory::TEST)?,
+            Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?];
         fixture.configure_pack(&library, 0, 0)?;
         library.cuda_set_device(1)?;
         crate::shared::decode_graph::fatal_drain(drain_ranks(2, |rank|

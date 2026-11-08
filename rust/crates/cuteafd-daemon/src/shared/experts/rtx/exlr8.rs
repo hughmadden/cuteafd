@@ -1,4 +1,5 @@
 //! Native EXLR8 routed experts on one RTX or the shared paired-expert executor.
+use crate::shared::memory::Tag;
 use super::native::RankCompletion;
 use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxShard};
 use crate::shared::experts::exlr8::{grouped_decode_from_row, view, Exlr8Execution, Exlr8PrefillActivations, Exlr8Weights};
@@ -150,7 +151,7 @@ impl<'a> Exlr8RtxWeights<'a> {
             Ok(executions)
         })?;
         let completion = RankCompletion::new(Event::new(device)?);
-        let output = Allocation::new(device, self.max_rows * self.hidden * 2)?;
+        let output = Allocation::new(device, self.max_rows * self.hidden * 2, Tag::workspace("experts/rtx-exlr8-output"))?;
         let sm_copy = device.run(|| device.library.v41_peer_copy())?;
         Ok(Exlr8Rtx { completion, owner: self, executions, output, sm_copy })
     }

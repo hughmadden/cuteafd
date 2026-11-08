@@ -6,6 +6,7 @@ use anyhow::Result;
 use cuteafd_ffi::programs::Programs;
 use cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract;
 use std::rc::Rc;
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(super) struct LayerTables<'a> {
     pub attention: Rc<Table<'a>>,
@@ -47,7 +48,7 @@ impl<'a> TargetTables<'a> {
             prefix,
             available,
             reservations,
-            |name, bytes| weight_allocation(device, arena, name, bytes),
+            |name, bytes| weight_allocation(device, arena, name, bytes, ArenaTag::weights("step5/target")),
         )?;
         let layers = contract
             .layers

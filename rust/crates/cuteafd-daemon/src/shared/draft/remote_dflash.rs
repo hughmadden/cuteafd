@@ -13,6 +13,7 @@ use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::programs::VocabularyHead;
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 
 fn tap_frontier(rows: &[ContextRow]) -> Result<Option<(usize, usize)>> {
@@ -57,7 +58,7 @@ impl<'a> RemoteDflash<'a> {
             let _scope = cuteafd_ffi::memory_ledger::scope("drafter/bridge");
             let alloc = |name| -> Result<Allocation<'a>> {
                 let bytes = inventory.demands.iter().find(|d| d.group == name).unwrap().bytes;
-                Allocation::new(device, usize::try_from(bytes)?)
+                Allocation::new(device, usize::try_from(bytes)?, Tag::drafter_workspace("shared/dflash-bridge"))
             };
             let workspace = alloc("DFlash bridge head scratch")?;
             // SAFETY: this owner retains the scratch until after the head drops.
@@ -311,7 +312,7 @@ mod tests {
             && head_tensor.meta.dtype == cuteafd_core::DType::Bf16, "component target head geometry/dtype");
         let (embedding, ()) = TokenEmbedding::load(&library, EmbedSource::new(&target_path,
             &embedding_tensor.shard, &embedding_tensor.meta, cfg.hidden)?, EmbedPlacement::Gpu, || Ok(()))?;
-        let head = DeviceAllocation::new(&library, usize::try_from(head_tensor.meta.byte_length)?)?;
+        let head = DeviceAllocation::new(&library, usize::try_from(head_tensor.meta.byte_length)?, crate::shared::memory::TEST)?;
         let mut head_bytes = vec![0; head.buffer.bytes];
         std::fs::File::open(target_path.join(&head_tensor.shard))?
             .read_exact_at(&mut head_bytes, head_tensor.meta.byte_offset)?;

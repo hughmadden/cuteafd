@@ -1,5 +1,6 @@
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::DsparkWeights;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41DsparkConfidence};
@@ -34,9 +35,9 @@ impl<'library> DsparkWeights<'library> {
         self.tensor("mtp.2.confidence_head.proj.weight")?;
         Ok(DsparkConfidence {
             standalone: &self.standalone,
-            hidden: DeviceAllocation::new(library, capacity * 10240)?,
-            markov: DeviceAllocation::new(library, capacity * 512)?,
-            output: DeviceAllocation::new(library, capacity * 4)?,
+            hidden: DeviceAllocation::new(library, capacity * 10240, Tag::drafter_workspace("v41/draft-confidence"))?,
+            markov: DeviceAllocation::new(library, capacity * 512, Tag::drafter_workspace("v41/draft-confidence"))?,
+            output: DeviceAllocation::new(library, capacity * 4, Tag::drafter_workspace("v41/draft-confidence"))?,
             kernel,
             weights: self,
             graph: BindingGraphs::new(library)?,

@@ -20,6 +20,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use crate::shared::memory::weight_arena::ReadyArena;
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) fn validate_reply_formats(format: ExpertFormat,
     replies: cuteafd_core::spark_reply::SparkReplyFormats) -> Result<()> {
@@ -615,7 +616,7 @@ impl<'a> Fp8Weights<'a> {
             Ok(layout)
         }).collect::<Result<Vec<_>>>()?;
         let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
-            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout))
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout, ArenaTag::experts("experts/fp8-pair")))
             .collect::<Result<Vec<_>>>()?;
         for &layer in layers {
             for rank in 0..2 {
@@ -858,7 +859,7 @@ impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> Fp8Experts<'a, W> {
 
 impl<'a, W> Fp8Experts<'a, W> {
     fn allocate_scratch(library: &'a NativeLibrary, bytes: usize) -> Result<DeviceAllocation<'a>> {
-        DeviceAllocation::named(library, bytes, "experts/workspace/native_scratch")
+        DeviceAllocation::new(library, bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/native_scratch"))
     }
     pub fn scratch_bytes(&self) -> usize { self.scratch.buffer.bytes }
 }

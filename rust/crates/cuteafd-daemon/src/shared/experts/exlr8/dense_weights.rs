@@ -5,6 +5,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_loader::plan::exlr8::dense::{DenseComponent, DenseEncoding, DenseRecord,
     DenseTransform, KvBLayout};
 use std::collections::HashMap;
+use crate::shared::memory::Tag;
 
 // Records and their exact allocation requests are loader recipes, so
 // admission charges the arena this loader binds. This file binds them only.
@@ -53,7 +54,7 @@ pub(crate) fn landed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name:
     transform: DenseTransform, stream: *mut std::ffi::c_void) -> Result<DeviceAllocation<'a>> {
     let device = Device { library, id: library.cuda_get_device()? };
     landed_with(library, load, name, component, transform, stream,
-        |_, bytes| Allocation::new(device, bytes))
+        |_, bytes| Allocation::new(device, bytes, Tag::weights("shared/exlr8-dense")))
 }
 
 pub(crate) fn landed_with<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str,
@@ -145,7 +146,7 @@ pub(crate) fn layer_requests<'a>(records: &'a LayerRecords, packs: &'a [PlainPac
 pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
     packs: &[PlainPack], stream: *mut std::ffi::c_void) -> Result<HashMap<String, DeviceAllocation<'a>>> {
     let device = Device { library, id: library.cuda_get_device()? };
-    load_layer_packed_with(library, load, records, packs, stream, |_, bytes| Allocation::new(device, bytes))
+    load_layer_packed_with(library, load, records, packs, stream, |_, bytes| Allocation::new(device, bytes, Tag::weights("shared/exlr8-dense")))
 }
 
 pub(crate) fn load_layer_packed_with<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
@@ -458,7 +459,7 @@ pub(crate) mod tests {
             use crate::shared::memory::{weight_arena::DeviceWeightArena, receipts::Inventory};
             use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Phase};
             let arena = DeviceWeightArena::new(Device { library: &library, id: 0 },
-                cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/exlr8", named.clone())?)?;
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/exlr8", named.clone())?, crate::shared::memory::TEST_ARENA)?;
             let load = if recording { DenseLoad::push(&library) } else { DenseLoad::mount(&library) };
             let mut called = BTreeMap::new();
             let packed = load_layer_packed_with(&library, &load, &records, &packs, std::ptr::null_mut(), |name, bytes| {

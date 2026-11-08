@@ -8,6 +8,7 @@ use cuteafd_loader::{families::qwen3_5::Qwen35Config, serving_capacity::WeightAr
 #[cfg(test)]
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::{collections::HashMap, ffi::c_void};
+use cuteafd_core::memory_layout::{arena_class, ArenaTag};
 
 const PREFIX: &str = "model.language_model.";
 
@@ -64,8 +65,8 @@ pub(crate) struct ScopeArena<'a> {
 }
 
 impl<'a> ScopeArena<'a> {
-    pub(crate) fn new(device: Device<'a>, layout: WeightArenaLayout) -> Result<Self> {
-        Ok(Self { arena: DeviceWeightArena::new(device, layout)?, taken: Default::default() })
+    pub(crate) fn new(device: Device<'a>, layout: WeightArenaLayout, tag: ArenaTag<arena_class::Immutable>) -> Result<Self> {
+        Ok(Self { arena: DeviceWeightArena::new(device, layout, tag)?, taken: Default::default() })
     }
 
     pub(crate) fn allocate(&self, name: &str, bytes: usize) -> Result<Allocation<'a>> {
@@ -263,7 +264,6 @@ mod tests {
 
     #[test]
     fn native_arena_admission_equals_loaded_target_and_mtp_backings() -> Result<()> {
-        use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::{families::qwen3_5::{self, DenseFacts, DrafterBytes, NativeBuffers, NativeWeights},
             planner::{CoordinatorDevices, Lifetime, Operation, Phase, Pin, Request}};
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
@@ -300,11 +300,14 @@ mod tests {
                     quota_bytes: 0, chunk_bytes: 0 }, verify_check: false })?;
             device.run(|| -> Result<()> {
                 let reader = WeightReader { library: &library, checkpoint: &checkpoint };
-                for (layout, lifetime) in [(target, Lifetime::RESIDENT), (mtp,
-                    Lifetime { first: Phase::DraftLoad, last: Phase::Growth })] {
-                    let arena = ScopeArena::new(device, layout)?;
+                for (layout, lifetime, tag) in [(target, Lifetime::RESIDENT,
+                    ArenaTag::weights("qwen35/target")), (mtp,
+                    Lifetime { first: Phase::DraftLoad, last: Phase::Growth },
+                    ArenaTag::drafter_weights("qwen35/mtp"))] {
+                    let kind = tag.kind();
+                    let arena = ScopeArena::new(device, layout, tag)?;
                     let mut inventory = Inventory::new(CoordinatorDevices::new(&[0])?, "test", lifetime,
-                        Category::Weights, "native weights");
+                        kind.category(), "native weights");
                     if lifetime == Lifetime::RESIDENT {
                         let weights = reader.dense_native(&cfg, DType::Bf16, format,
                             &mut |name: &str, bytes: usize| arena.allocate(name, bytes))?;

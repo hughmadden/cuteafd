@@ -1,6 +1,7 @@
 //! Target mHC/norm on RTX1 followed by the per-lane split vocabulary head.
 use super::*;
 use super::distributed::DistributedVocabularyWave;
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Device, DeviceOwner, Stream};
 use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
@@ -19,7 +20,7 @@ fn part(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<Cute
 impl<'w, 'a> Normalize<'w, 'a> {
     fn new(weights: &'w TargetHeadWeights<'a>, capacity: usize) -> Result<Self> {
         let lib = weights.library;
-        let buffers = INPUT_STRIDES.into_iter().map(|stride| DeviceAllocation::new(lib, stride * capacity))
+        let buffers = INPUT_STRIDES.into_iter().map(|stride| DeviceAllocation::new(lib, stride * capacity, Tag::workspace("v41/target-norm")))
             .collect::<Result<Vec<_>>>()?;
         ensure!(weights.norm.get("norm.weight")?.device_id == buffers[0].buffer.device_id, "target norm device differs");
         Ok(Self { stream: LoadStream { library: lib, raw: lib.cuda_stream_create()? },
@@ -175,13 +176,13 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
             [budgets[0], budgets[1] - capacity * INPUT_STRIDES.iter().sum::<usize>() - sampler_bytes])?;
         vocabulary.use_fp8(crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?;
         let sampler = HeadSampler {
-            assembled: devices[1].own(|| DeviceAllocation::new(devices[1].library, capacity * 129280 * 4))?,
+            assembled: devices[1].own(|| DeviceAllocation::new(devices[1].library, capacity * 129280 * 4, Tag::workspace("v41/target-sampler")))?,
             wave: devices[1].own(|| TargetSamplingWave::new(devices[1].library, capacity, 129280))?,
             stream: Stream::new(devices[1])?,
             download: devices[1].own(|| crate::shared::memory::RowDownload::new(devices[1].library, capacity * 129280 * 4))?,
         };
         Ok(Self { sampler, normalize, vocabulary, download: Stream::new(devices[1])?,
-            staging: HostAllocation::new(devices[1].library, capacity * 8)?, rank_downloads, capacity,
+            staging: HostAllocation::new(devices[1].library, capacity * 8, Tag::staging("v41/target-sampler"))?, rank_downloads, capacity,
             binding: None, selected: Vec::with_capacity(capacity), tokens: Vec::with_capacity(capacity),
             greedy: Vec::with_capacity(capacity) })
     }
@@ -346,8 +347,8 @@ mod tests {
         let mut baseline = devices[1].own(|| norm.wave(&full, 6, TargetHeadWave::device_bytes(6)?))?;
         let mut head = DistributedTargetHead::new(devices, &norm, [&a, &b], 6,
             DistributedTargetHead::device_bytes(6, 64640)?)?;
-        let residual = Allocation::new(devices[1], 6 * 40960)?;
-        let pre = Allocation::new(devices[1], 6 * 16)?;
+        let residual = Allocation::new(devices[1], 6 * 40960, crate::shared::memory::TEST)?;
+        let pre = Allocation::new(devices[1], 6 * 16, crate::shared::memory::TEST)?;
         let data: Vec<u8> = (0..6 * 20480).flat_map(|i| {
             let x = ((i * 13 % 131) as f32 - 65.) / 64.;
             ((x.to_bits() >> 16) as u16).to_ne_bytes()

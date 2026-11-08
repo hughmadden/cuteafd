@@ -14,7 +14,8 @@ MIB = 1 << 20
 
 def report(used, tracked, scopes):
     value = {"stage": "coordinator", "devices": [{"device": 0, "tracked": tracked, "peak": tracked, "scopes": scopes,
-                                                  "used": used, "total": 96 << 30, "untracked": used - tracked}],
+                                                  "used": used, "total": 96 << 30, "untracked": used - tracked,
+                                                  "by_kind": {"kinds": scopes, "untagged": 0}}],
              "pinned": {"tracked": 0, "peak": 0, "scopes": {}}, "weights": [], "dual_formats": [], "host": {}}
     return "2026-10-10T00:00:00Z INFO cuteafd::memory: memory ledger report=" + json.dumps(value) + "\n"
 
@@ -206,9 +207,8 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     assert re.findall(r"(\w+)\s*:\s*usize", signature) == ["rows", "page_lists", "members"]
     body = enclosed(engine.split("fn step_buffers", 1)[1], "{", "}")
     allocation = enclosed(body.split("c4_page_table:", 1)[1], "{", "}")
-    assert 'scope("kv/records")' in allocation
-    assert allocation.index('scope("kv/records")') < allocation.index("ints(")
-    assert re.search(r"ints\s*\(\s*page_lists\s*\*\s*\(\s*self\.shape\.units\s*\+\s*if\s+members\s*>\s*1\s*\{\s*3\s*\}\s*else\s*\{\s*0\s*\}\s*\)\s*\)", allocation)
+    assert 'const KV_RECORDS: Tag = Tag::kv("v4/kv/records")' in engine
+    assert re.search(r"self\.alloc\(page_lists\s*\*\s*\(self\.shape\.units\s*\+\s*if\s+members\s*>\s*1\s*\{\s*3\s*\}\s*else\s*\{\s*0\s*\}\s*\)\s*\*\s*4,\s*KV_RECORDS\)", allocation)
     call = enclosed(engine.split("self.step_buffers", 1)[1], "(", ")")
     branches = re.findall(r"if\s+shared_page_list\s*\{\s*([\w:]+)\s*\}\s*else\s*\{\s*(\w+)\s*\}", call)
     assert re.match(r"\s*t\s*,", call)
@@ -219,7 +219,7 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     table_bytes = waves * members * (units + 3) * 4 + decode_rows * units * 4
     log = tmp_path / "coordinator.log"
     log.write_text(report(1000 * MIB + table_bytes, 900 * MIB + table_bytes,
-                          {"weights": 900 * MIB, "kv/records": table_bytes}))
+                          {"weights": 900 * MIB, "kv": table_bytes}))
     categories = memory_audit.summarize(next(memory_audit.reports(str(log))))["devices"][0]["categories"]
     assert categories["kv"] == table_bytes
     assert categories.get("workspace", 0) == 0
@@ -258,12 +258,12 @@ def test_v4_admits_tables_and_frozen_prefix_quota_before_first_reservation():
     assert "prefix_cache(engine, prefix, host_config)?" in serve
 
 
-def test_glmf_kda_only_pool_backing_uses_the_planners_prefix_scope():
+def test_glmf_kda_only_pool_backing_has_a_prefix_kind():
     source = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
     allocation = source.split("let pool_mark_backing = if pool_mark_unit_bytes > 0 {", 1)[1].split("} else { None };", 1)[0]
-    assert 'scope("prefix/KDA-only pool marks")' in allocation.split("Some(zeroed(", 1)[0]
+    assert 'Tag::prefix("glmf/prefix-pool-marks")' in allocation
     assert 'pool_pages.checked_mul(pool_mark_unit_bytes)' in allocation
-    assert memory_audit.category("prefix/KDA-only pool marks") == "prefix"
+    assert memory_audit.kind_categories({"kinds": {"prefix": 1}}) == {"prefix": 1}
 
 
 def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
@@ -276,7 +276,7 @@ def test_tp2_expert_loaders_scope_both_parent_and_parallel_rank_allocations():
         assert 'scope_owned(&label)' in parent.split("synchronized_load::load_pair", 1)[0]
         parallel = parent.split("synchronized_load::load_pair", 1)[1]
         assert 'scope_owned(&label)' in parallel.split("Ok(vec![", 1)[0]
-    assert memory_audit.category("experts/TP2 expert layer halves 0..36") == "experts"
+    assert memory_audit.kind_categories({"kinds": {"experts": 1}}) == {"experts": 1}
 
 
 def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
@@ -285,15 +285,32 @@ def test_fp8_tp2_pair_scopes_its_bf16_output_with_the_expert_arena():
     pair = source.split("pub(crate) fn load_pair(", 1)[1].split("fn log_pair_load", 1)[0]
     scope = 'scope("experts/TP2 FP8 expert layer halves")'
     assert scope in pair.split("Fp8Experts::load_pair", 1)[0]
-    assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes)")
-    assert memory_audit.category("experts/TP2 FP8 expert layer halves") == "experts"
+    assert pair.index(scope) < pair.index("Allocation::new(devices[rank], plans[rank].output_bytes,")
+    assert memory_audit.kind_categories({"kinds": {"experts": 1}}) == {"experts": 1}
 
 
 def test_raw_cuda_audit_labels_gb10_reclaimable_cache(capsys):
     scope = "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache; host MemAvailable is allocatable headroom"
     report = {"stage": "ready", "devices": [{"device": 0, "tracked": 0, "peak": 0,
-        "cuda_memory_scope": scope, "scopes": {}}], "host": {"MemAvailable": 45 * 2**30}}
+        "cuda_memory_scope": scope, "scopes": {}, "by_kind": {"kinds": {}, "untagged": 0}}], "host": {"MemAvailable": 45 * 2**30}}
     memory_audit.render("spark.log", memory_audit.summarize(report))
     output = capsys.readouterr().out
     assert scope in output
     assert "MemAvailable 45.00" in output
+
+
+def test_typed_reports_use_kinds_not_scope_names():
+    # A misleading scope name must not decide the category once allocations carry kinds.
+    device = {"device": 0, "tracked": 700, "peak": 700, "used": 800, "total": 1000, "untracked": 100,
+              "scopes": {"weights/misleading": 700},
+              "by_kind": {"kinds": {"kv": 400, "drafter_workspace": 200}, "untagged": 50},
+              "managed_by_kind": {"kinds": {"staging": 50}, "untagged": 0}}
+    summary = memory_audit.summarize({"stage": "ready", "devices": [device], "weights": []})
+    cats = summary["devices"][0]["categories"]
+    assert cats == {"kv": 400, "drafter": 200, "untagged": 50, "staging": 50, "runtime": 100}
+
+
+def test_kind_category_mirrors_every_memory_kind():
+    source = (Path(__file__).parents[2] / "rust/crates/cuteafd-core/src/memory_layout.rs").read_text()
+    labels = re.findall(r'Self::\w+ => "(\w+)",', source.split("pub const fn label(self)", 1)[1].split("}", 1)[0])
+    assert sorted(labels) == sorted(memory_audit.KIND_CATEGORY)

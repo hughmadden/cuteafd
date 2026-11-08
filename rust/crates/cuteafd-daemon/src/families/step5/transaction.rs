@@ -4,7 +4,7 @@ use super::{
     cache::CacheRank,
     prefix::{Frontier, Placement, Step5Prefix},
 };
-use crate::shared::memory::device::{Allocation, Device, Stream};
+use crate::shared::memory::{device::{Allocation, Device, Stream}, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_engine::prefix::{PrefixCache, RefPagePool};
 use cuteafd_ffi::{
@@ -130,7 +130,6 @@ impl<'a> Staging<'a> {
         device: Device<'a>, programs: &'a Programs<'a>, cache: &CacheRank<'a>,
         available: usize, sequences: usize, unit_rows: usize,
     ) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-transaction");
         ensure!((1..=4096).contains(&unit_rows) && unit_rows as u64 <= cache.layout().ring.step,
             "Step-5 staging unit capacity");
         ensure!(sequences <= usize::try_from(cache.sequences())?,
@@ -158,9 +157,9 @@ impl<'a> Staging<'a> {
             let compress = device.run(|| programs.program("step5_region_compress",
                 &["keys", "logits", "starts", "counts", "output", "unrounded"]))?;
             Some(RegionScratch {
-                starts: Allocation::new(device, (regions * 4).max(256))?,
-                counts: Allocation::new(device, (regions * 4).max(256))?,
-                unrounded: Allocation::new(device, (regions * 256 * 4).max(256))?,
+                starts: Allocation::new(device, (regions * 4).max(256), Tag::staging("step5/staging-regions"))?,
+                counts: Allocation::new(device, (regions * 4).max(256), Tag::staging("step5/staging-regions"))?,
+                unrounded: Allocation::new(device, (regions * 256 * 4).max(256), Tag::staging("step5/staging-regions"))?,
                 compress,
             })
         };
@@ -169,8 +168,8 @@ impl<'a> Staging<'a> {
             .iter()
             .map(|_| {
                 Ok((
-                    Allocation::new(device, retained * 256 * 2)?,
-                    Allocation::new(device, retained * 256 * 2)?,
+                    Allocation::new(device, retained * 256 * 2, Tag::staging("step5/staging-raw"))?,
+                    Allocation::new(device, retained * 256 * 2, Tag::staging("step5/staging-raw"))?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -181,7 +180,8 @@ impl<'a> Staging<'a> {
             let heads = state.sliding.iter().filter(|s| !s.mtp).map(|s| s.query_heads)
                 .chain(state.regions.iter().map(|s| s.query_heads)).collect::<BTreeSet<_>>()
                 .into_iter().collect::<Vec<_>>();
-            Some(CompactKv::new(device, programs, unit_rows, &heads, sizes, None)?)
+            Some(CompactKv::new(device, programs, unit_rows, &heads, sizes, None,
+                Tag::staging("step5/staging-compact-kv"))?)
         };
         let stream = Rc::new(Stream::new(device)?);
         cache.register_lane(&stream)?;
@@ -190,10 +190,10 @@ impl<'a> Staging<'a> {
             raw,
             sparse,
             compact,
-            positions: Allocation::new(device, (rows * 8).max(256))?,
-            requests: Allocation::new(device, (rows * 4).max(256))?,
-            ring_table: Allocation::new(device, (table_width * 4).max(256))?,
-            page_table: Allocation::new(device, (table_width * 4).max(256) * sequences)?,
+            positions: Allocation::new(device, (rows * 8).max(256), Tag::staging("step5/staging-metadata"))?,
+            requests: Allocation::new(device, (rows * 4).max(256), Tag::staging("step5/staging-metadata"))?,
+            ring_table: Allocation::new(device, (table_width * 4).max(256), Tag::staging("step5/staging-metadata"))?,
+            page_table: Allocation::new(device, (table_width * 4).max(256) * sequences, Tag::staging("step5/staging-metadata"))?,
             table_width,
             sequences,
             rows,
@@ -1556,7 +1556,7 @@ pub(super) mod tests {
         for (pass, (counts, accepted)) in [([7usize, 3], [7usize, 3]), ([17, 5], [9, 4])].into_iter().enumerate() {
             let total: usize = counts.iter().sum();
             let make = |stride: usize, start: usize, rows: usize, salt: usize| -> Result<Allocation<'_>> {
-                let allocation = Allocation::new(device, (rows * stride).max(256))?;
+                let allocation = Allocation::new(device, (rows * stride).max(256), crate::shared::memory::TEST)?;
                 let bytes: Vec<u8> = (start..start + rows).flat_map(|row|
                     std::iter::repeat_n(((row + pass * 13 + salt) % 31 + 1) as u8, stride)).collect();
                 device.run(|| library.copy_h2d(allocation.buffer, &bytes))?;
@@ -1674,7 +1674,7 @@ pub(super) mod tests {
             None,
         )?);
         let input = |bytes| -> Result<Allocation<'_>> {
-            let allocation = Allocation::new(device, bytes)?;
+            let allocation = Allocation::new(device, bytes, crate::shared::memory::TEST)?;
             // BF16 1.0, valid for both raw projections and compressor logits.
             let data: Vec<u8> = [0x80, 0x3f].into_iter().cycle().take(bytes).collect();
             device.run(|| library.copy_h2d(allocation.buffer, &data))?;

@@ -10,6 +10,7 @@ use cuteafd_loader::plan::exlr8::dense::{
     DenseEncoding, DensePlan, DenseRange, DenseRecord, DenseSelection, DenseSlice, ShardSide,
 };
 use cuteafd_loader::plan::exlr8::dense::requests::row_requests;
+use crate::shared::memory::Tag;
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
 const HEAD: &str = "lm_head.weight";
@@ -200,7 +201,7 @@ impl<'a> NativeVocabulary<'a> {
     ) -> Result<Option<Self>> {
         Self::load_inner(library, programs, plan, embedding_device,
             Some((host_available, device_reserved, host_reserved)), &mut |_, bytes| {
-                Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+                Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes, Tag::weights("shared/vocabulary"))
             })
     }
 
@@ -209,7 +210,7 @@ impl<'a> NativeVocabulary<'a> {
     ) -> Result<Option<Self>> {
         admission.validate_vocabulary(plan.staging_bytes() as u64)?;
         Self::load_inner(library, programs, plan, library.cuda_get_device()?, None, &mut |_, bytes| {
-            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes, Tag::weights("shared/vocabulary"))
         })
     }
 
@@ -217,7 +218,7 @@ impl<'a> NativeVocabulary<'a> {
     pub(crate) fn load_prepared(library: &'a NativeLibrary, programs: &'a Programs<'a>,
         plan: VocabularyPlan, staging_bytes: u64, embedding_device: i32) -> Result<Option<Self>> {
         Self::load_prepared_with(library, programs, plan, staging_bytes, embedding_device, |_, bytes| {
-            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+            Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes, Tag::weights("shared/vocabulary"))
         })
     }
 
@@ -275,7 +276,7 @@ impl<'a> NativeVocabulary<'a> {
                 host_available, device_reserved, host_reserved)?;
         }
         let mut staging =
-            HostAllocation::named(library, plan.staging_bytes(), "native-vocabulary-staging")?;
+            HostAllocation::new(library, plan.staging_bytes(), crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "native-vocabulary-staging"))?;
         let embedding = Device { library, id: embedding_device }
             .run(|| load_rows_with(library, &plan.dense.tensors[0], &mut staging, "embedding", &mut *allocate))?;
         let head = load_rows_with(library, &plan.dense.tensors[1], &mut staging, "head", allocate)?;
@@ -384,7 +385,7 @@ fn load_rows<'a>(
     staging: &mut HostAllocation<'a>,
 ) -> Result<RowFp8Weights<'a>> {
     load_rows_with(library, slice, staging, &slice.tensor, |_, bytes| {
-        Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes)
+        Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes, Tag::weights("shared/vocabulary"))
     })
 }
 
@@ -448,7 +449,7 @@ mod tests {
         let plan = DensePlan::for_rank(&[record], 1, 0)?;
         let slice = &plan.tensors[0];
         let requests = row_requests(slice)?;
-        let mut staging = HostAllocation::new(&library, plan.read_staging_bytes.max(256))?;
+        let mut staging = HostAllocation::new(&library, plan.read_staging_bytes.max(256), crate::shared::memory::TEST)?;
         let weights = load_rows(&library, slice, &mut staging)?;
         let expected = requests.into_iter().map(|(_, bytes)| bytes).collect::<Vec<_>>();
         assert_eq!(expected, [weights.payload().bytes, weights.scales().bytes]);
@@ -500,7 +501,7 @@ mod tests {
             .context("standalone vocabulary")?;
         let arena = DeviceWeightArena::new(Device { library: &library, id: 0 }, WeightArenaLayout::new("test/vocabulary",
             [("embedding.payload".into(), 32768), ("embedding.scales".into(), 1024),
-                ("head.payload".into(), 32768), ("head.scales".into(), 1024), ("embedding.table".into(), 256)])?)?;
+                ("head.payload".into(), 32768), ("head.scales".into(), 1024), ("embedding.table".into(), 256)])?, crate::shared::memory::TEST_ARENA)?;
         let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared_with(&library, &programs, plan()?,
             plan()?.staging_bytes() as u64, 0, |name, bytes| arena.view(name, bytes))?.context("packed vocabulary")?);
         let embedding = TokenEmbedding::row_fp8_with(&library, EmbedSource {
@@ -729,7 +730,7 @@ mod tests {
         bytes.extend((0..256).flat_map(|i| [0.5f32, 1.00390625, -2.0][i % 3].to_le_bytes()));
         std::fs::write(&item.components[0].source.path, &bytes)?;
         let slice = item.slice(0, 256)?;
-        let mut staging = HostAllocation::named(&library, 1536, "mask-row-test")?;
+        let mut staging = HostAllocation::new(&library, 1536, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "mask-row-test"))?;
         let mounted = load_rows(&library, &slice, &mut staging)?;
         let ((recorded, rows), records) = dense::recording(|| {
             let recorded = load_rows(&library, &slice, &mut staging)?;
@@ -987,7 +988,7 @@ mod tests {
             )?
             .is_none()
         );
-        let ids = DeviceAllocation::new(&library, 5 * 4)?;
+        let ids = DeviceAllocation::new(&library, 5 * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(
             ids.buffer,
             &[0i32, (N - 1) as i32, 17, -1, N as i32]
@@ -995,10 +996,10 @@ mod tests {
                 .flat_map(i32::to_le_bytes)
                 .collect::<Vec<_>>(),
         )?;
-        let output = DeviceAllocation::new(&library, 5 * K * 2)?;
-        let x = DeviceAllocation::new(&library, K * 2)?;
+        let output = DeviceAllocation::new(&library, 5 * K * 2, crate::shared::memory::TEST)?;
+        let x = DeviceAllocation::new(&library, K * 2, crate::shared::memory::TEST)?;
         library.copy_h2d(x.buffer, &0x3f80u16.to_le_bytes().repeat(K))?;
-        let logits = DeviceAllocation::new(&library, N * 4)?;
+        let logits = DeviceAllocation::new(&library, N * 4, crate::shared::memory::TEST)?;
         let mut embedding = vec![0; 5 * K * 2];
         let mut scores = vec![0; N * 4];
         // SAFETY: all operands match the validated ABI and survive the explicit device drain.
@@ -1048,7 +1049,7 @@ mod tests {
         drop(owner);
         let stream = crate::shared::memory::device::Stream::new(
             crate::shared::memory::device::Device { library: &library, id: 0 })?;
-        let expanded = DeviceAllocation::new(&library, 5 * 4 * K * 2)?;
+        let expanded = DeviceAllocation::new(&library, 5 * 4 * K * 2, crate::shared::memory::TEST)?;
         for embedding_device in [0, 1] {
             if embedding_device == 1 {
                 stream.device.run(|| library.cuda_enable_peer(1))?;

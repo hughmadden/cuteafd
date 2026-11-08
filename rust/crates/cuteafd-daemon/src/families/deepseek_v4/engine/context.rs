@@ -39,6 +39,11 @@ use cuteafd_loader::placement::families::deepseek_v4::{context_buffers, context_
     V4Context};
 use super::metadata::{c4_context_commits, c4_context_prefill_tables, c4_context_tables, C4Shard};
 
+/// Per-unit context split scratch: candidate merges, top-k, gather tables and commit lists.
+const CONTEXT_WORKSPACE: Tag = Tag::workspace("v4/context/workspace");
+/// Per-layer staged C4 and index pages copied into the owning pools.
+const CONTEXT_STAGING: Tag = Tag::staging("v4/context/staging");
+
 /// C4 compressed rows per unit page (64 groups of four tokens).
 const C4_ROWS: usize = 64;
 
@@ -121,7 +126,7 @@ impl<'a> V4ContextSplit<'a> {
                         .context("partial program of another family")?.to_string();
                 }
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
-                let mut allocations = list.iter().map(|&(_, bytes)| engine.alloc(bytes as usize))
+                let mut allocations = list.iter().map(|&(_, bytes)| engine.alloc(bytes as usize, CONTEXT_WORKSPACE))
                     .collect::<Result<Vec<_>>>()?.into_iter();
                 let mut next = || allocations.next().context("V4 context workspace list");
                 let (candidates, own, peer, topk_scratch, partial_scratch, gather, local_lengths, empty_window) =
@@ -134,7 +139,7 @@ impl<'a> V4ContextSplit<'a> {
                 }
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-staging");
                 let view = staging_units * (metadata::compressed_page_bytes(4) + INDEX_PAGE_BYTES);
-                let staging = [engine.alloc(view)?, engine.alloc(view)?];
+                let staging = [engine.alloc(view, CONTEXT_STAGING)?, engine.alloc(view, CONTEXT_STAGING)?];
                 let half = staging_units.div_ceil(2);
                 engine.reserve_upload(gather.buffer)?;
                 for slot in 0..lanes as usize {

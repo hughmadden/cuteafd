@@ -3,31 +3,45 @@
 use super::device::{Allocation, Device};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
+use cuteafd_core::memory_layout::{arena_class, ArenaTag, Tag};
 use std::{collections::BTreeMap, ops::Range};
+
+/// One physical backing of a single kind, cut into named views at the
+/// layout's aligned offsets. The class `C` fixes which kinds the arena can
+/// hold ([`ArenaTag`]), and every view inherits the arena's tag: there is no
+/// way to ask an arena for a view of another kind (the compile-fail proofs
+/// live on `cuteafd_core::memory_layout::arena_class`).
+pub(crate) struct DeviceArena<'a, C: arena_class::Class> {
+    layout: cuteafd_loader::serving_capacity::WeightArenaLayout,
+    allocation: std::rc::Rc<Allocation<'a>>,
+    tag: ArenaTag<C>,
+}
 
 /// Static coordinator weights. Every tensor view retains the physical owner,
 /// independently of the loader; graph capture never changes their addresses.
-pub(crate) struct DeviceWeightArena<'a> {
-    layout: cuteafd_loader::serving_capacity::WeightArenaLayout,
-    allocation: std::rc::Rc<Allocation<'a>>,
-}
-impl<'a> DeviceWeightArena<'a> {
-    pub fn new(device: Device<'a>, layout: cuteafd_loader::serving_capacity::WeightArenaLayout) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("weights/coordinator arena");
+pub(crate) type DeviceWeightArena<'a> = DeviceArena<'a, arena_class::Immutable>;
+
+impl<'a, C: arena_class::Class> DeviceArena<'a, C> {
+    #[track_caller]
+    pub fn new(device: Device<'a>, layout: cuteafd_loader::serving_capacity::WeightArenaLayout,
+        tag: ArenaTag<C>) -> Result<Self> {
+        // The failure dump's arena registry reads the same kind the ledger records.
         let registration = cuteafd_ffi::memory_ledger::fault::register_arena(cuteafd_ffi::memory_ledger::fault::Arena {
-            id: layout.id().into(), kind: cuteafd_core::memory_layout::Category::Weights,
+            id: layout.id().into(), kind: tag.kind(),
             device: device.id, bytes: layout.bytes(), padding_bytes: layout.padding_bytes(), tail_bytes: None,
             views: layout.views().iter().map(|(name, view)| cuteafd_ffi::memory_ledger::fault::ArenaView {
                 name: name.clone(), offset: view.offset(), bytes: view.bytes(),
             }).collect(),
         });
-        let mut allocation = Allocation::weight_arena(device, layout.bytes(), layout.id())?;
+        let mut allocation = Allocation::weight_arena(device, layout.bytes(), layout.id(), tag.tag())?;
         registration.bind(allocation.buffer.ptr as usize);
         allocation.register_weight_arena(registration);
         let allocation = std::rc::Rc::new(allocation);
         ensure!(allocation.buffer.bytes == layout.bytes(), "weight arena allocation differs from admitted backing");
-        Ok(Self { layout, allocation })
+        Ok(Self { layout, allocation, tag })
     }
+    /// The one tag every view of this arena carries.
+    pub fn tag(&self) -> Tag { self.tag.tag() }
     pub fn layout(&self) -> &cuteafd_loader::serving_capacity::WeightArenaLayout { &self.layout }
     pub fn view(&self, name: &str, bytes: usize) -> Result<Allocation<'a>> {
         let view = self.layout.view(name).with_context(|| format!("{} lacks weight {name}", self.layout.id()))?;
@@ -38,8 +52,11 @@ impl<'a> DeviceWeightArena<'a> {
 
 /// Named immutable weights only; scratch, staging and temporary representations
 /// keep their own allocations and retirement. Nonadopted scopes stay standalone.
+/// With an arena, the view carries the arena's tag (a view never chooses its
+/// own kind); without one, the standalone allocation carries `standalone`.
+#[track_caller]
 pub(crate) fn weight_allocation<'a>(device: Device<'a>, arena: Option<&DeviceWeightArena<'a>>,
-    name: &str, bytes: usize) -> Result<Allocation<'a>> {
+    name: &str, bytes: usize, standalone: ArenaTag<arena_class::Immutable>) -> Result<Allocation<'a>> {
     ensure!(!name.is_empty() && bytes > 0, "empty named weight allocation");
     match arena {
         Some(arena) => {
@@ -47,7 +64,7 @@ pub(crate) fn weight_allocation<'a>(device: Device<'a>, arena: Option<&DeviceWei
                 && std::ptr::eq(device.library, arena.allocation.device.library), "weight arena device mismatch");
             arena.view(name, bytes)
         }
-        None => Allocation::new(device, bytes),
+        None => Allocation::new(device, bytes, standalone.tag()),
     }
 }
 
@@ -437,10 +454,12 @@ fn slice(buffer: CuteafdDeviceBuffer, range: Range<usize>) -> Result<CuteafdDevi
 }
 
 impl<'a> LoadingArena<'a> {
+    #[track_caller]
     pub fn new(
         device: Device<'a>,
         layout: ArenaLayout,
         expected: ExpectedCoverage,
+        tag: ArenaTag<arena_class::Immutable>,
     ) -> Result<Self> {
         ensure!(
             expected.end() <= layout.logical_bytes() as u64,
@@ -449,7 +468,7 @@ impl<'a> LoadingArena<'a> {
         ensure!(layout.generated.iter().all(|r| !expected.overlaps(r.start as u64, r.end as u64)),
             "generated region overlaps delivered source bytes");
         let validation = vec![0; layout.validation_bytes];
-        let allocation = Allocation::new(device, layout.bytes())?;
+        let allocation = Allocation::new(device, layout.bytes(), tag.tag())?;
         let initialized = if layout.generated.is_empty() { Ok(()) } else { device.run(|| {
             let queued = layout.generated.iter().try_for_each(|range| {
                 let buffer = slice(allocation.buffer, range.clone())?;
@@ -730,8 +749,8 @@ mod tests {
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
         let layout = ArenaLayout::new([512], 512)?.with_generated(vec![256..512])?;
-        assert!(LoadingArena::new(device, layout.clone(), expected(512)?).is_err());
-        let mut loading = LoadingArena::new(device, layout, expected(16)?)?;
+        assert!(LoadingArena::new(device, layout.clone(), expected(512)?, crate::shared::memory::TEST_ARENA).is_err());
+        let mut loading = LoadingArena::new(device, layout, expected(16)?, crate::shared::memory::TEST_ARENA)?;
         let generated = loading.destination(256, 256)?;
         let mut bytes = vec![0xff; 256];
         library.copy_d2h(&mut bytes, generated)?;
@@ -759,7 +778,7 @@ mod tests {
         };
         fixture.configure_memory(&library, 1, 4096)?;
         let mut loading =
-            LoadingArena::new(device, ArenaLayout::new([256, 256], 512)?, expected(16)?)?;
+            LoadingArena::new(device, ArenaLayout::new([256, 256], 512)?, expected(16)?, crate::shared::memory::TEST_ARENA)?;
         let base = loading.destination(0, 16)?.ptr;
         assert!(loading.destination(510, 4).is_err());
         loading.copied(0, 8)?;
@@ -794,7 +813,7 @@ mod tests {
         let footprint = ExpectedCoverage::spans(&[(0, 4), (256, 4)]);
         let layout = ArenaLayout::new([256], 256)?.with_validation(4, 4)?;
         assert!(ArenaLayout::new([256], 256)?.with_validation(4, 3).is_err());
-        let mut loading = LoadingArena::new(device, layout, footprint)?;
+        let mut loading = LoadingArena::new(device, layout, footprint, crate::shared::memory::TEST_ARENA)?;
         assert!(loading.copied(16, 4).is_err()); // Equal-size padding is not planned payload.
         assert!(loading.copied(256, 4).is_err()); // No device copy to host tail.
         loading.copied(0, 4)?;
@@ -821,10 +840,10 @@ mod tests {
             library: &library,
             id: 0,
         };
-        let loading = LoadingArena::new(device, ArenaLayout::new([256], 256)?, expected(4)?)?;
+        let loading = LoadingArena::new(device, ArenaLayout::new([256], 256)?, expected(4)?, crate::shared::memory::TEST_ARENA)?;
         assert!(loading.done().is_err());
         let delivered =
-            LoadingArena::new(device, ArenaLayout::new([256], 256)?, expected(0)?)?.done()?;
+            LoadingArena::new(device, ArenaLayout::new([256], 256)?, expected(0)?, crate::shared::memory::TEST_ARENA)?.done()?;
         assert!(delivered
             .initialize(|_| anyhow::bail!("semantic check failed"))
             .is_err());

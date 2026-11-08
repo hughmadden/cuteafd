@@ -17,6 +17,7 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
 use cuteafd_transport::expert::{BackboneRequest, SparkWorld};
 use std::{path::PathBuf, sync::{mpsc, Arc}, thread};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> {
     tracing::info!(target: "cuteafd::fabric", source = "sparknest", status = cuteafd_transport::traffic::storage_status(), "local storage traffic source");
@@ -224,7 +225,7 @@ fn load_weights<'a>(
     admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
     let remaining = config.device_budget.checked_sub(layout.bytes())
         .context("native mount arena exceeds device budget")?;
-    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, ArenaTag::experts("experts/spark-native"))?;
     let weights = super::load_in_rank_order(&layers, config.rank, |_, layer| {
         let started = std::time::Instant::now();
         let weight = ExpertWeights::load_into(

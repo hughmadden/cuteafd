@@ -7,6 +7,9 @@ use cuteafd_ffi::{
 };
 use std::{ffi::c_void, time::Duration};
 
+/// Scratch allocated by this integration test.
+const TEST: cuteafd_ffi::memory_ledger::Tag = cuteafd_ffi::memory_ledger::Tag::workspace("test/scratch");
+
 struct Fixture<'a> {
     library: &'a NativeLibrary,
     device: i32,
@@ -18,7 +21,7 @@ impl Fixture<'_> {
     fn upload(&mut self, data: &[u32]) -> Result<CuteafdDeviceBuffer> {
         self.library.cuda_set_device(self.device)?;
         let bytes: Vec<u8> = data.iter().flat_map(|n| n.to_ne_bytes()).collect();
-        let buffer = self.library.alloc_device_buffer(bytes.len())?;
+        let buffer = self.library.alloc_device_buffer(bytes.len(), TEST)?;
         self.buffers.push(buffer);
         self.library.copy_h2d(buffer, &bytes)?;
         Ok(buffer)

@@ -85,7 +85,7 @@ impl Source {
         let loaded=layout.pack(module,|name|read(&path,name))?;
         let weights=layout.upload(device,loaded)?;
         let program=device.run(||Projection::load(programs,shape,&self.book,rows,TrellisDType::Bf16))?;
-        let scratch=ProjectionLayout::new(&program.program,rows)?.allocate(device)?;
+        let scratch=ProjectionLayout::new(&program.program,rows)?.allocate(device, crate::shared::memory::TEST)?;
         Ok(OwnedProjection{program,weights,scratch})
     }
 }
@@ -100,7 +100,7 @@ impl<'a> OwnedProjection<'a> {
     }
 }
 fn upload<'a>(device:Device<'a>,bytes:&[u8])->Result<Allocation<'a>> {
-    let allocation=Allocation::new(device,bytes.len().max(16))?;
+    let allocation=Allocation::new(device,bytes.len().max(16), crate::shared::memory::TEST)?;
     device.run(||device.library.copy_h2d(allocation.buffer,bytes))?;Ok(allocation)
 }
 fn zero<'a>(device:Device<'a>,bytes:usize)->Result<Allocation<'a>> {upload(device,&vec![0;bytes])}

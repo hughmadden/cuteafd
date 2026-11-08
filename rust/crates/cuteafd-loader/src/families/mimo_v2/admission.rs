@@ -164,6 +164,7 @@ pub fn draft_rank_reservations_with(
     let layout = cfg.runtime_layout(mode, capacity)?;
     layout.weights.loading_peak_bytes()?;
     let arena = super::capacity::MimoWeightArena {
+        kind: cuteafd_core::memory_layout::MemoryKind::DrafterWeights,
         layout: super::weight_arena::dflash_arena_requests(source_cfg, mode, rank, ranks)?,
         lifetime: crate::placement::planner::Lifetime {
             first: crate::placement::planner::Phase::DraftLoad,

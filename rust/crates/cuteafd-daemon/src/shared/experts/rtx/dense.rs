@@ -17,6 +17,7 @@
 #[path = "dense/records.rs"]
 mod records;
 pub(crate) use records::*;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{device::Device, push_consumer::PushDestination,
     weight_arena::{Coverage, ExpectedCoverage}, HostAllocation};
 use crate::shared::fp8_load_quant::LoadKernels;
@@ -356,7 +357,7 @@ impl PushDestination for DenseArena<'_> {
                     ensure!(self.held + need as u64 <= self.layout.host_staging.staging_bytes as u64,
                         "dense rank GPU {} needs {} pinned staging bytes, beyond admitted ring/step bound {}",
                         self.device.id, self.held + need as u64, self.layout.host_staging.staging_bytes);
-                    let allocation = HostAllocation::named(self.device.library, need, "staging/coordinator-dense")?;
+                    let allocation = HostAllocation::new(self.device.library, need, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense"))?;
                     self.held += need as u64;
                     self.peak_held = self.peak_held.max(self.held);
                     allocation
@@ -636,7 +637,7 @@ pub(crate) mod testing {
         let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, rank as u32)?;
         device.run(|| -> Result<()> {
             let ring = cuteafd_ffi::push_ring::RegisteredRing::new(device.library, 8,
-                cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
+                cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, crate::shared::memory::TEST)?;
             let fake = FakeRank::new(&checked, root, rank as u32, &ring)?;
             let arena = super::DenseArena::new(device, layout, expected)?;
             crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)

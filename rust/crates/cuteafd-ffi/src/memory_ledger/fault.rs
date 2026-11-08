@@ -2,7 +2,7 @@
 use super::{state, Context, Space, CONTEXT};
 use serde::{ser::{SerializeMap, SerializeSeq}, Serialize, Serializer};
 use std::{cell::{Cell, RefCell}, ffi::{c_char, CStr}, fs::{File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock}};
-use cuteafd_core::memory_layout::Category;
+use cuteafd_core::memory_layout::{Category, MemoryKind};
 
 const LIMITS: &[&str] = &[
     "plan: unavailable: accepted-plan registration not captured in this version",
@@ -31,7 +31,7 @@ pub struct FailureReport { pub path: PathBuf, pub summary: String, pub complete:
 pub struct ArenaView { pub name: String, pub offset: usize, pub bytes: usize }
 #[derive(Debug, Serialize)]
 pub struct Arena {
-    pub id: String, pub kind: Category, pub device: i32, pub bytes: usize,
+    pub id: String, pub kind: MemoryKind, pub device: i32, pub bytes: usize,
     pub padding_bytes: usize, pub tail_bytes: Option<usize>, pub views: Vec<ArenaView>,
 }
 #[derive(Default)]
@@ -160,24 +160,46 @@ fn sanitize(text: &str) -> String { text.chars().map(|c| if c.is_ascii_alphanume
 
 /// Install after loading each native DSO; old native binaries remain usable but
 /// explicitly lack the pre-cleanup hook.
+type LastTag = unsafe extern "C" fn(*mut u32, *mut c_char, usize, *mut usize) -> i32;
+/// Resolved once at install: failure records read the attempted tag without allocating.
+static LAST_TAG: OnceLock<LastTag> = OnceLock::new();
+
+/// The tag the failing thread last attempted: kind label, owner (in `buffer`),
+/// and whether that owner exceeded the fixed failure-path buffer.
+fn attempted_tag(buffer: &mut [u8; 512]) -> (Option<&'static str>, Option<&str>, bool) {
+    let Some(last) = LAST_TAG.get() else { return (None, None, false) };
+    let (mut kind, mut required) = (0u32, 0usize);
+    // SAFETY: native writes the kind, the required size and at most `buffer.len()` bytes.
+    let status = unsafe { last(&mut kind, buffer.as_mut_ptr().cast(), buffer.len(), &mut required) };
+    let kind = MemoryKind::from_raw(kind).map(MemoryKind::label);
+    if status != 0 { return (kind, None, required > buffer.len()); }
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(0);
+    (kind, std::str::from_utf8(&buffer[..end]).ok().filter(|o| !o.is_empty()), false)
+}
+
 pub(crate) fn install(library: &libloading::Library) {
+    // SAFETY: optional versioned export; a library without it reports no attempted tag.
+    if let Ok(last) = unsafe { library.get::<LastTag>(b"cuteafd_last_allocation_tag") } { let _ = LAST_TAG.set(*last); }
     type Install = unsafe extern "C" fn(extern "C" fn(*const NativeFailure));
     // SAFETY: optional symbol implements the bundled POD callback ABI. The
     // callback is process-static and never unwinds into the native caller.
     let _ = cuda_queries();
-    type Events = unsafe extern "C" fn(extern "C" fn(i32, usize, usize, i32, *const c_char, i32));
-    // SAFETY: bundled callback takes scalar values only, and stays process-live.
-    if let Ok(events) = unsafe { library.get::<Events>(b"cuteafd_set_memory_event_callback_v2") } {
+    type Events = unsafe extern "C" fn(extern "C" fn(i32, usize, usize, i32, *const c_char, i32, u32, *const c_char));
+    // SAFETY: bundled callback takes scalars and synchronously-copied strings, and stays process-live.
+    if let Ok(events) = unsafe { library.get::<Events>(b"cuteafd_set_memory_event_callback_v3") } {
         unsafe { events(event_callback); }
     } else {
-        tracing::warn!(target: "cuteafd::memory", "native private-backing events unavailable: source-location event ABI unsupported");
+        tracing::warn!(target: "cuteafd::memory", "native private-backing events unavailable: tagged event ABI unsupported");
     }
     match unsafe { library.get::<Install>(b"cuteafd_set_memory_failure_callback") } {
         Ok(install) => unsafe { install(callback) },
         Err(_) => tracing::warn!(target: "cuteafd::memory", "failure capture unavailable: native pre-cleanup callback unsupported"),
     }
 }
-extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released: i32, file: *const c_char, line: i32) {
+/// A native event names the tag native allocated under; the owner is copied
+/// (interned) here, never retained. Invalid tags violate the bundled native ABI.
+extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released: i32, file: *const c_char, line: i32,
+    kind: u32, owner: *const c_char) {
     let _ = std::panic::catch_unwind(|| {
         if released != 0 { super::record_free(address); return; }
         let space = match space { 1 => Space::Pinned, 2 => Space::Managed, 3 => Space::Host, _ => Space::Device };
@@ -186,7 +208,15 @@ extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released:
             // SAFETY: valid stack output, query does not select a device.
             unsafe { (q.get)(&mut device); }
         } }
-        super::record_native_alloc(space, device, address, bytes, &format!("{}:{line}", native_text(file)));
+        let tag = MemoryKind::from_raw(kind).zip((!owner.is_null()).then(|| native_text(owner)))
+            .filter(|(_, owner)| !owner.is_empty()).map(|(kind, owner)| super::tag(kind, &owner));
+        let Some(tag) = tag else {
+            // A callback cannot return an error. Never hide owned backing by
+            // silently discarding a malformed native allocation event.
+            eprintln!("invalid native allocation tag at {}:{line}: kind={kind}", native_text(file));
+            std::process::abort();
+        };
+        super::record_native_alloc(space, device, address, bytes, &format!("{}:{line}", native_text(file)), tag);
     });
 }
 extern "C" fn callback(trigger: *const NativeFailure) {
@@ -228,10 +258,14 @@ fn trigger_record(raw: &NativeFailure, id: u64, linked: Option<u64>, status: &st
     let mut out = io::Cursor::new(bytes.as_mut_slice());
     #[derive(Serialize)]
     struct Record<'a> { sequence: u64, linked_to: Option<u64>, api: &'a str, domain: &'a str,
-        code: i32, requested_bytes: Option<usize>, status: &'a str }
+        code: i32, requested_bytes: Option<usize>, status: &'a str,
+        attempted_kind: Option<&'static str>, attempted_owner: Option<&'a str>, attempted_owner_truncated: bool }
+    let mut owner = [0u8; 512];
+    let (attempted_kind, attempted_owner, attempted_owner_truncated) = attempted_tag(&mut owner);
     let record = Record { sequence: id, linked_to: linked, api: native_text(raw.api),
         domain: native_text(raw.domain), code: raw.code,
-        requested_bytes: (raw.bytes_known != 0).then_some(raw.bytes), status };
+        requested_bytes: (raw.bytes_known != 0).then_some(raw.bytes), status,
+        attempted_kind, attempted_owner, attempted_owner_truncated };
     if serde_json::to_writer(&mut out, &record).is_ok() && out.write_all(b"\n").is_ok() {
         let length = out.position() as usize;
         // SAFETY: file is preopened append-only and bytes is live stack storage.
@@ -278,11 +312,14 @@ impl Serialize for LiveRows<'_> {
         for (address, live) in &self.0.live {
             #[derive(Serialize)]
             struct Row<'a> { address: Hex, bytes: usize, device: i32, space: &'a str, scope: &'a str,
+                kind: MemoryKind, component: &'a str,
                 category: Category, owner: Option<&'a str>, tensor: Option<&'a str>, tensor_stem: Option<&'a str>,
                 format: Option<&'a str>, site: DisplayValue<&'a std::panic::Location<'static>>, native_site: Option<&'a str> }
             seq.serialize_element(&Row { address: Hex(*address), bytes: live.bytes,
                 device: live.key.device, space: live.key.space.label(), scope: live.key.scope,
-                category: Category::of_scope(live.key.scope), owner: live.key.owner, tensor: live.name,
+                kind: live.key.tag.kind, component: live.key.tag.owner,
+                category: live.key.tag.kind.category(),
+                owner: live.key.owner, tensor: live.name,
                 tensor_stem: live.key.tensor, format: live.key.format, site: DisplayValue(live.site), native_site: live.native_site })?;
         }
         seq.end()
@@ -536,11 +573,13 @@ fn summary(stage: &str, sticky: bool) -> String {
         let observed = observe(device, sticky);
         let _ = writeln!(out, "device={device} free={} total={} tracked={tracked} residual={} status={}",
             optional(observed.free_bytes), optional(observed.total_bytes), optional(observed.total_bytes.zip(observed.free_bytes).map(|(t,f)| t as i128-f as i128-tracked as i128)), observed.status);
-        let mut categories = std::collections::BTreeMap::new();
-        for row in &snapshot.rows { if row.key.device == device {
-            *categories.entry(Category::of_scope(row.key.scope).label()).or_insert(0usize) += row.bytes;
-        } }
-        let _ = writeln!(out, "device={device} categories={categories:?}");
+        // Every owned backing has a kind; the census counter stays zero by construction.
+        let (mut kinds, mut untagged) = snapshot.by_kind(Space::Device, device);
+        let (managed, managed_untagged) = snapshot.by_kind(Space::Managed, device);
+        for (kind, bytes) in managed { *kinds.entry(kind).or_default() += bytes; }
+        untagged += managed_untagged;
+        let kinds = kinds.into_iter().map(|(kind, bytes)| (kind.label(), bytes)).collect::<std::collections::BTreeMap<_, _>>();
+        let _ = writeln!(out, "device={device} kinds={kinds:?} untagged={untagged}");
     }
     let data = attachments().lock().unwrap_or_else(|e| e.into_inner());
     for arena in data.arenas.values().take(20) { let _ = writeln!(out, "arena={} kind={} device={} bytes={} padding={} tail={} views={}",
@@ -578,9 +617,11 @@ mod tests {
         setup();
         let _scope = super::super::scope("workspace/fault-fixture");
         let address = 0x7800_0000_0000;
-        event_callback(0, address, 4096, 0, c"fake-native.cc".as_ptr(), 1);
+        event_callback(0, address, 4096, 0, c"fake-native.cc".as_ptr(), 1,
+            MemoryKind::Transport.as_raw(), c"test/native-event".as_ptr());
+        assert_eq!(super::super::tag_of(address), Some(super::super::Tag::transport("test/native-event")));
         callback(&fixture(c"cudaMalloc", c"cuda", 2, Some(8192), 0));
-        event_callback(0, address, 0, 1, std::ptr::null(), 0);
+        event_callback(0, address, 0, 1, std::ptr::null(), 0, 0, std::ptr::null());
         let report = take_failure().unwrap();
         let data: serde_json::Value = serde_json::from_slice(&std::fs::read(&report.path).unwrap()).unwrap();
         assert_eq!(data["trigger"]["code"], 2);
@@ -603,10 +644,25 @@ mod tests {
         std::fs::remove_file(&report.path).unwrap();
     }
     #[test]
+    fn ready_summary_kinds_include_managed_and_device_backings_once() {
+        let _guard = super::super::test_guard();
+        let address = 0x7900_0000_0000;
+        super::super::record_tagged(Space::Device, 91, address, 1024, super::super::Tag::weights("test/summary"));
+        super::super::record_tagged(Space::Managed, 91, address + 0x1000, 2048, super::super::Tag::weights("test/summary"));
+        super::super::record_tagged(Space::Managed, 91, address + 0x2000, 512, super::super::Tag::kv("test/summary"));
+        let text = compact_summary("ready");
+        super::super::record_released(address);
+        super::super::record_released(address + 0x1000);
+        super::super::record_released(address + 0x2000);
+        assert!(text.lines().any(|line| line.starts_with("device=91 ") && line.contains("tracked=3584")), "{text}");
+        assert!(text.lines().any(|line| line == "device=91 kinds={\"kv\": 512, \"weights\": 3072} untagged=0"), "{text}");
+    }
+
+    #[test]
     fn ready_summary_with_ten_arenas_is_compact_and_registrations_retire() {
         let _guard = super::super::test_guard();
         let arenas: Vec<_> = (0..10).map(|i| register_arena(Arena { id: format!("arena-{i}"),
-            kind: Category::Weights, device: 0, bytes: 512, padding_bytes: 0, tail_bytes: None,
+            kind: MemoryKind::Weights, device: 0, bytes: 512, padding_bytes: 0, tail_bytes: None,
             views: vec![ArenaView { name: "weight".into(), offset: 0, bytes: 512 }] })).collect();
         let text = compact_summary("ready");
         assert!(text.lines().count() < 60, "{text}");
@@ -617,9 +673,9 @@ mod tests {
     #[test]
     fn borrowed_trigger_strings_first_token_and_pending_arena_are_retained() {
         let _guard = super::super::test_guard(); setup(); clear_failure();
-        let pending = register_arena(Arena { id: "pending-fixture".into(), kind: Category::Weights,
+        let pending = register_arena(Arena { id: "pending-fixture".into(), kind: MemoryKind::Weights,
             device: 1, bytes: 64, padding_bytes: 0, tail_bytes: None, views: vec![] });
-        let live = register_arena(Arena { id: "live-fixture".into(), kind: Category::Weights,
+        let live = register_arena(Arena { id: "live-fixture".into(), kind: MemoryKind::Weights,
             device: 1, bytes: 64, padding_bytes: 0, tail_bytes: Some(0), views: vec![] });
         live.bind(0x1234);
         {
@@ -683,7 +739,7 @@ mod tests {
         let old = { let mut data = attachments().lock().unwrap(); std::mem::take(&mut data.inputs) };
         set_inputs(serde_json::Value::Object((0..35).map(|i| (format!("input-{i}"), serde_json::json!(i))).collect()));
         let mut arenas: Vec<_> = (0..25).map(|i| register_arena(Arena { id: format!("bounded-{i}"),
-            kind: Category::Weights, device: 1, bytes: 64, padding_bytes: 0, tail_bytes: None, views: vec![] })).collect();
+            kind: MemoryKind::Weights, device: 1, bytes: 64, padding_bytes: 0, tail_bytes: None, views: vec![] })).collect();
         let text = compact_summary("ready");
         assert_eq!(text.lines().filter(|line| line.starts_with("arena=")).count(), 20);
         assert!(text.contains("+5 more arenas (320 bytes)"));

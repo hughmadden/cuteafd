@@ -994,7 +994,7 @@ impl Recipe for QwenDual<'_> {
         // so no placement choice gates them.
         for (rank, layout) in inputs.arenas {
             components.extend(weight_arena_components(layout, Location::coordinator(*rank as u8),
-                PlanLifetime::RESIDENT, self.maximum_pages)?);
+                PlanLifetime::RESIDENT, self.maximum_pages, if layout.id().contains("/mtp/") { cuteafd_core::memory_layout::MemoryKind::DrafterWeights } else { cuteafd_core::memory_layout::MemoryKind::Weights })?);
         }
         let complete = compute(a.layers, a.mtp)?.ranks[0];
         // Both ranks allocate full-width page tables; owner0 alone owns pool
@@ -1159,10 +1159,13 @@ mod tests {
             assert_eq!(arenas.len(), 2 + usize::from(mtp));
             for (rank, layout) in &arenas {
                 let components = weight_arena_components(layout, Location::coordinator(*rank as u8),
-                    PlanLifetime::RESIDENT, 64).unwrap();
+                    PlanLifetime::RESIDENT, 64, if layout.id().contains("/mtp/") { cuteafd_core::memory_layout::MemoryKind::DrafterWeights } else { cuteafd_core::memory_layout::MemoryKind::Weights }).unwrap();
                 // Root B (payload + padding, never the payload alone), its claim, one tail.
                 let ComponentKind::Allocation { template, .. } = &components[0].kind else { panic!("root") };
                 assert_eq!((template.id.as_str(), template.bytes), (layout.id(), layout.bytes() as u64));
+                assert_eq!(template.category, if layout.id().contains("/mtp/") {
+                    cuteafd_core::memory_layout::MemoryKind::DrafterWeights.category()
+                } else { Category::Weights });
                 assert_eq!(template.bytes, (layout.payload_bytes() + layout.padding_bytes()) as u64);
                 let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("tail") };
                 assert_eq!(tail.requests(), [layout.bytes() as u64]);

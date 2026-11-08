@@ -9,6 +9,8 @@ use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, programs::Programs, Bf16F32Add,
     dense_trellis::{DenseTrellisBuffers, DenseTrellisDispatch, DenseTrellisPolicy,
         TrellisDType, GroupedWorkspace, GROUPS}};
 use std::{collections::BTreeMap, ffi::c_void};
+use crate::shared::memory::Tag;
+use cuteafd_core::memory_layout::ArenaTag;
 
 /// Native bytes remain compressed on device; admission precedes allocation.
 /// The caller selects ownership from the shared layer placement before packing.
@@ -69,7 +71,7 @@ impl CoreWeightLayout {
     pub(crate) fn load_recorded<'a>(&self, device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
         dense: &crate::shared::experts::rtx::dense::DenseLoad<'a>, stream: *mut c_void) -> Result<CoreWeights<'a>> {
         self.load_recorded_with(device, checkpoint, dense, stream,
-            |name, bytes| crate::shared::memory::weight_arena::weight_allocation(device, None, name, bytes))
+            |name, bytes| crate::shared::memory::weight_arena::weight_allocation(device, None, name, bytes, ArenaTag::weights("shared/k6-core")))
     }
 
     /// The shared mount/push recipe; only final named storage is injected.
@@ -161,7 +163,7 @@ impl CoreWeightLayout {
     }
     pub(crate) fn upload<'a>(&self,device:Device<'a>,loaded:cuteafd_loader::formats::dense_trellis::LoadedDenseTrellis)
         -> Result<CoreWeights<'a>> {
-        self.upload_with(device, loaded, |_, bytes| Allocation::new(device, bytes))
+        self.upload_with(device, loaded, |_, bytes| Allocation::new(device, bytes, Tag::weights("shared/k6-core")))
     }
     pub(crate) fn upload_with<'a>(&self,device:Device<'a>,loaded:LoadedDenseTrellis,
         mut allocate:impl FnMut(&str,usize)->Result<Allocation<'a>>) -> Result<CoreWeights<'a>> {
@@ -219,12 +221,12 @@ impl ProjectionLayout {
     pub(crate) fn demand(&self,device:u8,name:&str)->Result<Demand> {
         Ok(Demand::new(device,Category::Workspace,name,self.bytes()? as u64,Basis::Exact))
     }
-    pub(crate) fn allocate<'a>(&self,device:Device<'a>)->Result<ProjectionScratch<'a>> {
+    pub(crate) fn allocate<'a>(&self,device:Device<'a>,tag:Tag)->Result<ProjectionScratch<'a>> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/native-projection");
         let storage=ProjectionScratchLayout {
             extents:self.extents.clone(),rows:self.rows }.storage()?;
         let mut owners=BTreeMap::new();
-        for (&name,&bytes) in &storage.owners {owners.insert(name,Allocation::new(device,bytes)?);}
+        for (&name,&bytes) in &storage.owners {owners.insert(name,Allocation::new(device,bytes,tag)?);}
         let mut buffers=BTreeMap::new();
         for (&name,&bytes) in &self.extents {
             let buffer=if let Some(&offset)=storage.route_offsets.get(name) {
@@ -309,7 +311,7 @@ mod retained_tests {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
-        let allocation = Allocation::new(Device { library: &library, id: 1 }, 1024)?;
+        let allocation = Allocation::new(Device { library: &library, id: 1 }, 1024, crate::shared::memory::TEST)?;
         let owner = allocation.buffer;
         let view = Buffer { ptr: (owner.ptr as usize + 128) as *mut c_void, bytes: 256, ..owner };
         let mut scratch = ProjectionScratch { _owners: BTreeMap::from([("workspace", allocation)]),
@@ -463,7 +465,7 @@ impl<'a> CoreHead<'a> {
 
     pub(crate) fn new(programs: &'a Programs<'a>, weights: &CoreWeights<'a>, rows: usize,
         device: Device<'a>, stream: *mut c_void,
-        admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout) -> Result<Self> {
+        admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout, tag: Tag) -> Result<Self> {
         ensure!(weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Output,
             "GLM K6 head must be whole on rank 0");
         let projection = device.run(|| Projection::load_geometry_bits(programs, weights.shape[1], weights.shape[0],
@@ -471,7 +473,7 @@ impl<'a> CoreHead<'a> {
         let layout = ProjectionLayout::new(&projection.program, rows)?;
         ensure!(admitted.rows == layout.rows && admitted.extents == layout.extents,
             "GLM K6 head scratch differs from admission");
-        let scratch = layout.allocate(device)?;
+        let scratch = layout.allocate(device, tag)?;
         Ok(Self { projection, scratch, device, stream, rows })
     }
 
@@ -530,7 +532,7 @@ mod upload_tests {
                 suh:(0..256).map(|i| (i as u8).wrapping_add(7)).collect(),
                 svh:(0..512).map(|i| (i as u8).wrapping_mul(17)).collect() } };
             let baseline = layout.upload(device,loaded())?;
-            let arena = DeviceWeightArena::new(device,WeightArenaLayout::new(format!("test/k{bits}"),requests.clone())?)?;
+            let arena = DeviceWeightArena::new(device,WeightArenaLayout::new(format!("test/k{bits}"),requests.clone())?, crate::shared::memory::TEST_ARENA)?;
             let mut requested = Vec::new();
             let actual = layout.upload_with(device,loaded(),|name,bytes| {
                 requested.push((name.to_owned(),bytes)); arena.view(name,bytes)

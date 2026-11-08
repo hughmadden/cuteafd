@@ -173,7 +173,7 @@ impl<'a> TargetHeadOwner<'a> {
                     plan.layout.core[name].shape, plan.kernel_rows)?;
                 let linear = std::rc::Rc::try_unwrap(layer.linears.remove(name).context("native head")?)
                     .map_err(|_| anyhow::anyhow!("native head aliased"))?;
-                Ok((linear, super::native::NativeScratch::allocate(device, &layout)?))
+                Ok((linear, super::native::NativeScratch::allocate(device, &layout, if plan.predictor { crate::shared::memory::Tag::drafter_workspace("step5/mtp-head-projection") } else { crate::shared::memory::Tag::workspace("step5/head-projection") })?))
             }).transpose()?;
             Self::workspace(device, plan.rows, std::rc::Rc::new(HeadWeights {
                 norm, weights, native, epsilon: plan.epsilon, predictor: plan.predictor, kernel_rows: plan.kernel_rows,
@@ -189,7 +189,8 @@ impl<'a> TargetHeadOwner<'a> {
     fn workspace(device: Device<'a>, rows: usize,
         immutable: std::rc::Rc<HeadWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         device.run(|| {
-            let planes = scratch::planes(device, &HeadPlan::plane_bytes(rows)?, arena)?;
+            let planes = scratch::planes(device, &HeadPlan::plane_bytes(rows)?, arena,
+                crate::shared::memory::Tag::workspace("step5/target-scratch"))?;
             // SAFETY: private workspace survives the private handle on this device.
             let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
                 H as u32, rows as u32, V as u32)? };

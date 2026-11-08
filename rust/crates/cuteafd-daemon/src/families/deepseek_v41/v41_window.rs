@@ -11,6 +11,7 @@ use std::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
+use crate::shared::memory::Tag;
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 mod prefix;
 pub(crate) mod replica;
@@ -89,9 +90,9 @@ impl<'a> WindowState<'a> {
             "window state exceeds budget"
         );
         let value = Self {
-            values: DeviceAllocation::attention_plane(library, slots * 128, 512, "window cache values")?,
-            scales: DeviceAllocation::attention_plane(library, slots * 128, 16, "window cache scales")?,
-            ends: DeviceAllocation::new(library, slots * 8)?,
+            values: DeviceAllocation::attention_plane(library, slots * 128, 512, "window cache values", Tag::kv("v41/window-cache"))?,
+            scales: DeviceAllocation::attention_plane(library, slots * 128, 16, "window cache scales", Tag::kv("v41/window-cache"))?,
+            ends: DeviceAllocation::new(library, slots * 8, Tag::kv("v41/window-cache"))?,
             slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             writing: Default::default(),
             slot_count: slots,
@@ -338,8 +339,8 @@ impl<'a> WindowWeights<'a> {
             norm: self.library.v41_attention_ops()?,
             kv: self.library.v41_kv()?,
             weights: self,
-            staging: HostAllocation::new(self.library, unit * 8)?,
-            commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit))?,
+            staging: HostAllocation::new(self.library, unit * 8, Tag::staging("v41/window-proposal"))?,
+            commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit), Tag::staging("v41/window-proposal"))?,
             capacity: unit,
             graph: None,
             graphs: GraphBank::new(None),
@@ -478,18 +479,18 @@ impl<'a> WindowStorage<'a> {
         let value = Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             commit_stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            scratch: DeviceAllocation::new(library, fp8.info().scratch_bytes as usize)?,
-            alpha: DeviceAllocation::new(library, 4)?,
-            input: DeviceAllocation::new(library, unit * 10240)?,
-            projected: DeviceAllocation::new(library, unit * 1024)?,
-            normalized: DeviceAllocation::new(library, unit * 1024)?,
-            positions: DeviceAllocation::new(library, unit * 8)?,
-            frequencies: DeviceAllocation::new(library, unit * 256)?,
+            scratch: DeviceAllocation::new(library, fp8.info().scratch_bytes as usize, Tag::workspace("v41/window-proposal"))?,
+            alpha: DeviceAllocation::new(library, 4, Tag::workspace("v41/window-proposal"))?,
+            input: DeviceAllocation::new(library, unit * 10240, Tag::workspace("v41/window-proposal"))?,
+            projected: DeviceAllocation::new(library, unit * 1024, Tag::workspace("v41/window-proposal"))?,
+            normalized: DeviceAllocation::new(library, unit * 1024, Tag::workspace("v41/window-proposal"))?,
+            positions: DeviceAllocation::new(library, unit * 8, Tag::workspace("v41/window-proposal"))?,
+            frequencies: DeviceAllocation::new(library, unit * 256, Tag::workspace("v41/window-proposal"))?,
             planes: layers.iter().map(|&layer| Ok(WindowPlanes {
                 layer,
-                values: DeviceAllocation::attention_plane(library, rows, 512, "window proposal values")?,
-                scales: DeviceAllocation::attention_plane(library, rows, 16, "window proposal scales")?,
-                destinations: DeviceAllocation::new(library, rows * 8)?,
+                values: DeviceAllocation::attention_plane(library, rows, 512, "window proposal values", Tag::workspace("v41/window-proposal"))?,
+                scales: DeviceAllocation::attention_plane(library, rows, 16, "window proposal scales", Tag::workspace("v41/window-proposal"))?,
+                destinations: DeviceAllocation::new(library, rows * 8, Tag::workspace("v41/window-proposal"))?,
             })).collect::<Result<Vec<_>>>()?,
             fp8,
             rows,

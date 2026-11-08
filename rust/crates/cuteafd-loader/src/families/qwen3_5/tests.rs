@@ -459,8 +459,17 @@ fn full_prefill_planner_equals_runtime_recipe_for_each_kv_format() {
                 ("exact retained prefix marks", buffers.prefix),
                 ("block verify marks, logits and taps", buffers.verify.iter().sum::<usize>()),
             ] {
-                let item = device.items.iter().find(|i| i.group == group).unwrap();
-                assert_eq!(item.bytes, bytes as u64, "full={full}, kv={kv}, {group}");
+                let bytes_by_group = device.items.iter().filter(|item| item.group == group)
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(bytes_by_group, bytes as u64, "full={full}, kv={kv}, {group}");
+            }
+            for (category, bytes) in [
+                (cuteafd_core::memory_layout::Category::Kv, buffers.verify[0]),
+                (cuteafd_core::memory_layout::Category::Workspace, buffers.verify[1..].iter().sum()),
+            ] {
+                let item = device.items.iter().find(|item| item.group == "block verify marks, logits and taps"
+                    && item.category == category).unwrap();
+                assert_eq!(item.bytes, bytes as u64, "full={full}, kv={kv}, {category:?}");
             }
             let bytes = device.used_bytes();
             if let Some(narrow_bytes) = previous {

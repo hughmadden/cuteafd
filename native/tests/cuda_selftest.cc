@@ -630,7 +630,7 @@ CpuSampleRows cpu_lm_head_sample_topk_topp_bf16(const std::vector<uint16_t>& hid
 
 cuteafd_device_buffer_t device_buffer(size_t bytes) {
   cuteafd_device_buffer_t buffer = {};
-  require_status(cuteafd_alloc_device_buffer(bytes, &buffer), "cuteafd_alloc_device_buffer");
+  require_status(cuteafd_alloc_device_buffer(bytes, &buffer, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"), "cuteafd_alloc_device_buffer");
   return buffer;
 }
 

@@ -497,7 +497,7 @@ impl<'a> SwaLayer<'a> {
             (None, _) => None,
             (Some(_), Some(shared)) => Some(shared),
             (Some(native), None) => Some(std::rc::Rc::new(super::native::NativeScratch::allocate(device,
-                &native.scratch_layout(rows)?)?)),
+                &native.scratch_layout(rows)?, crate::shared::memory::Tag::workspace("step5/native-projection"))?)),
         };
         Ok(owner)
     }
@@ -512,7 +512,8 @@ impl<'a> SwaLayer<'a> {
 
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<SwaWeights<'a>>, mut ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
-        let planes = scratch::planes(device, &admission.planes, arena)?;
+        let planes = scratch::planes(device, &admission.planes, arena,
+            crate::shared::memory::Tag::workspace("step5/target-scratch"))?;
         let stream = scratch::standalone(device, arena);
         if let Some(ffn) = &mut ffn { ffn.share_standalone(stream.clone()); }
         let rows = admission.rows;
@@ -1066,7 +1067,7 @@ mod tests {
         let dense = cuteafd_loader::plan::families::step5::native::dense_planes(513)?;
         let bytes = SwaLayer::workspace_bytes(513)?
             + cuteafd_loader::plan::families::step5::native::plane_bytes(&dense)?;
-        let arena = Arena::new(device, usize::try_from(bytes)?)?;
+        let arena = Arena::new(device, usize::try_from(bytes)?, crate::shared::memory::TEST)?;
         for &layer in layers {
             native_swa_component(device, &programs, &checkpoint, &arena, layer)?;
         }
@@ -1439,10 +1440,10 @@ mod tests {
                 committed: 0,
             })?
             .placement;
-        let key = Allocation::new(device, 64 * KV * 2)?;
-        let value = Allocation::new(device, 64 * KV * 2)?;
-        let ik = Allocation::new(device, 64 * 512)?;
-        let iz = Allocation::new(device, 64 * 512)?;
+        let key = Allocation::new(device, 64 * KV * 2, crate::shared::memory::TEST)?;
+        let value = Allocation::new(device, 64 * KV * 2, crate::shared::memory::TEST)?;
+        let ik = Allocation::new(device, 64 * 512, crate::shared::memory::TEST)?;
+        let iz = Allocation::new(device, 64 * 512, crate::shared::memory::TEST)?;
         // Deliberately cross partial pages, the 512-token window, and the 576-row ring.
         for end in [
             7, 8, 63, 64, 128, 192, 256, 320, 384, 448, 511, 512, 575, 576, 640, 704, 768, total,

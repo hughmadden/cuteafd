@@ -126,7 +126,7 @@ impl<'a> LoadKernels<'a> {
         -> Result<()> {
         if slot.as_ref().is_none_or(|a| a.buffer.bytes < bytes) {
             drop(slot.take());
-            *slot = Some(HostAllocation::named(library, bytes.max(1 << 20), scope)?);
+            *slot = Some(HostAllocation::new(library, bytes.max(1 << 20), crate::shared::memory::Tag::staging(scope))?);
         }
         Ok(())
     }

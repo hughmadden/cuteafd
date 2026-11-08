@@ -102,7 +102,7 @@ impl Census {
                     && retained.address == receipt.address
                     && retained.allocation.location == receipt.allocation.location
                     && retained.allocation.bytes == receipt.allocation.bytes
-                    && retained.allocation.category == Category::Weights && receipt.allocation.category == Category::Weights
+                    && retained.allocation.category == receipt.allocation.category
                     && retained.allocation.group == "weight arena" && receipt.allocation.group == "weight arena",
                     "conflicting repeated backing {}", receipt.allocation.id);
                 let lifetime = receipt.allocation.lifetime;
@@ -200,7 +200,7 @@ impl<'a> Inventory<'a> {
     pub(crate) fn lifetime(&self) -> Lifetime { self.lifetime }
     pub(crate) fn extend(&mut self, receipts: Vec<Receipt>) -> Result<()> {
         let arenas = receipts.iter().filter(|r| r.allocation.view.is_none()
-            && r.allocation.category == Category::Weights && r.allocation.group == "weight arena")
+            && r.allocation.group == "weight arena")
             .map(|r| r.allocation.id.clone()).collect::<std::collections::BTreeSet<_>>();
         for mut receipt in receipts {
             let arena = arenas.contains(&receipt.allocation.id);
@@ -241,7 +241,7 @@ impl<'a> Inventory<'a> {
                 "weight arena {} changed backing", backing.id);
         } else {
             self.receipts.push(Receipt { allocation: Allocation::buffer(backing.id, location,
-                owner.bytes as u64, self.lifetime, Category::Weights, "weight arena"), address: owner.ptr as u64 });
+                owner.bytes as u64, self.lifetime, backing.kind.category(), "weight arena"), address: owner.ptr as u64 });
         }
         self.device(name, buffer)?;
         self.receipts.last_mut().unwrap().allocation.view = Some(View { backing: backing.id.into(), offset });
@@ -355,6 +355,34 @@ mod tests {
     }
 
     #[test]
+    fn drafter_arena_plan_and_runtime_receipts_share_category_and_one_backing() -> Result<()> {
+        use cuteafd_core::memory_layout::{ArenaTag, MemoryKind};
+        use cuteafd_loader::placement::planner::{weight_arena_components, ComponentKind};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 20)?;
+        let device = super::super::device::Device { library: &library, id: 0 };
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("glm/draft/0",
+            [("tensor".into(), 1024)])?;
+        let components = weight_arena_components(&layout, Location::coordinator(0),
+            Lifetime::RESIDENT, 1, MemoryKind::DrafterWeights)?;
+        let ComponentKind::Allocation { template: planned, .. } = &components[0].kind else { panic!("arena root") };
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout,
+            ArenaTag::drafter_weights("fixture/drafter"))?;
+        let tensor = arena.view("tensor", 1024)?;
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&[0])?, "fixture",
+            Lifetime::RESIDENT, MemoryKind::DrafterWeights.category(), "draft owners");
+        inventory.weight_view("tensor", tensor.buffer, tensor.weight_backing().context("arena backing")?)?;
+        let roots = inventory.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].allocation, *planned);
+        assert_eq!(roots[0].allocation.category, Category::Drafter);
+        assert_eq!(tensor.tag().context("backing tag")?.kind, MemoryKind::DrafterWeights);
+        assert_eq!(inventory.receipts[1].allocation.view.as_ref().unwrap().backing, planned.id);
+        Ok(())
+    }
+
+    #[test]
     fn census_combines_independent_inventories_without_double_charge() -> Result<()> {
         let mut census = Census::default();
         let late = Lifetime { first: cuteafd_loader::placement::planner::Phase::Warmup,
@@ -424,7 +452,7 @@ mod tests {
     fn mapped_pinned_census_uses_whole_backing_without_native_work() -> Result<()> {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
-        let owner = crate::shared::memory::HostAllocation::new(&library, 1024)?;
+        let owner = crate::shared::memory::HostAllocation::new(&library, 1024, crate::shared::memory::TEST)?;
         library.cuda_set_device(1)?;
         let devices = [1, 0];
         let devices = CoordinatorDevices::new(&devices)?;
@@ -453,7 +481,7 @@ mod tests {
     fn ordered_upload_census_is_absent_until_reserved_and_never_resizes() -> Result<()> {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
-        let mut buffer = library.alloc_device_buffer(1024)?;
+        let mut buffer = library.alloc_device_buffer(1024, crate::shared::memory::TEST)?;
         let physical = [1, 0];
         let devices = CoordinatorDevices::new(&physical)?;
         let stream = 17;

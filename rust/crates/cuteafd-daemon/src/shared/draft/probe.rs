@@ -22,6 +22,7 @@ use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::Result;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// GLM Flash router ids are plain expert indices (no flag bits).
 const ROUTE_MASK: u32 = u32::MAX;
@@ -76,8 +77,8 @@ impl<'a> RoundProbe<'a> {
     pub fn new(library: &'a NativeLibrary, dense: Vec<bool>, topk: usize, capacity: usize) -> Result<Self> {
         let layers = dense.len();
         let bytes = layers * capacity * topk * 4;
-        let ring = HostAllocation::new(library, bytes)?;
-        let device_ring = DeviceAllocation::new(library, bytes)?;
+        let ring = HostAllocation::new(library, bytes, Tag::staging("shared/route-probe"))?;
+        let device_ring = DeviceAllocation::new(library, bytes, Tag::workspace("shared/route-probe"))?;
         // Initialize padding once: the single contiguous download includes unused row slots.
         library.cuda_zero_bytes(device_ring.buffer, bytes)?;
         let last_owned = dense.iter().rposition(|&dense| !dense);
@@ -274,7 +275,7 @@ mod tests {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
-        let ids = DeviceAllocation::new(&library, 4)?;
+        let ids = DeviceAllocation::new(&library, 4, crate::shared::memory::TEST)?;
         library.copy_h2d(ids.buffer, &7u32.to_le_bytes())?;
         let mut probe = RoundProbe::new(&library, vec![false; 2], 1, 1)?;
         probe.collect_timing = true;
@@ -318,7 +319,7 @@ mod tests {
         let _owner = memory_ledger::owner(&tag);
         let pinned = || memory_ledger::snapshot().by_owner(Space::Pinned, -1)
             .get(tag.as_str()).copied().unwrap_or(0);
-        let target = DeviceAllocation::new(&library, 256)?;
+        let target = DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?;
         library.copy_h2d(target.buffer, &[1; 128])?;
         // SAFETY: the fixture retains this destination and its ordered source until the drain below.
         unsafe { library.copy_h2d_ordered(target.buffer, &[2; 256], 1usize as *mut c_void)?; }

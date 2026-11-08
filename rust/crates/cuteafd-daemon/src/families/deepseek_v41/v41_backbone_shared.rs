@@ -4,6 +4,7 @@ pub(crate) mod tp2;
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::FfnInput;
 use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_shared_ffn::{SharedFfn, SharedFfnStorage};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -43,8 +44,8 @@ impl<'a> BackboneSharedStorage<'a> {
         Ok(Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             inner: SharedFfnStorage::new(library, unit)?,
-            input: DeviceAllocation::new(library, input)?,
-            result: DeviceAllocation::new(library, result)?, rows, unit,
+            input: DeviceAllocation::new(library, input, Tag::workspace("v41/backbone-shared"))?,
+            result: DeviceAllocation::new(library, result, Tag::workspace("v41/backbone-shared"))?, rows, unit,
         }))
     }
 }
@@ -498,7 +499,7 @@ mod shared_storage_tests {
                 let f = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
                 ((f.to_bits() >> 16) as u16).to_ne_bytes()
             }).collect();
-            let source = DeviceAllocation::new(&lib, hidden.len())?;
+            let source = DeviceAllocation::new(&lib, hidden.len(), crate::shared::memory::TEST)?;
             lib.copy_h2d(source.buffer, &hidden)?; Ok(source)
         }).into_iter().collect::<Result<Vec<_>>>()?;
         let read = |buffer| -> Result<Vec<u8>> {

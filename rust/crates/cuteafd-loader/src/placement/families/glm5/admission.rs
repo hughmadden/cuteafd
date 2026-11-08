@@ -605,10 +605,10 @@ impl DraftFacts {
             // One contract covers push and mount, so include that Load overlap.
             let lifetime = Lifetime::RESIDENT;
             let mut components = weight_arena_extent_components(&id, arena.bytes() as u64,
-                location, lifetime, maximum_pages)?;
+                location, lifetime, maximum_pages, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?;
             components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
             let root = Allocation::buffer(&id, location, arena.bytes() as u64,
-                lifetime, cuteafd_core::memory_layout::Category::Weights, "weight arena");
+                lifetime, cuteafd_core::memory_layout::Category::Drafter, "weight arena");
             components.push(Component::resident_weight(ResidentWeight::from_allocation(&root,
                 crate::placement::ResidentWeights(self.arena_weights)),
                 ByteCurve::fixed(self.arena_weights, maximum_pages)));

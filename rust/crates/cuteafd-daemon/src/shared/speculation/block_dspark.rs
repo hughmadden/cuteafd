@@ -15,6 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
+use crate::shared::memory::Tag;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
@@ -470,8 +471,8 @@ impl<'a> DsparkDrafter<'a> {
             library.copy_h2d(allocation.buffer, data)?;
             Ok(allocation)
         };
-        let zeroed = |n: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, n.max(256))?;
+        let zeroed = |n: usize, tag: Tag| -> Result<Dev<'a>> {
+            let allocation = DeviceAllocation::new(library, n.max(256), tag)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -481,8 +482,8 @@ impl<'a> DsparkDrafter<'a> {
         let layers = weights.layers.into_iter().map(|layer| -> Result<_> {
             Ok(DraftLayer { input_norm: layer.input_norm, post_norm: layer.post_norm, qkv: layer.qkv,
                 q_norm: layer.q_norm, k_norm: layer.k_norm, o: layer.o, gate_up: layer.gate_up, down: layer.down,
-                k_ring: zeroed(cache_rows * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
-                v_ring: zeroed(cache_rows * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))? })
+                k_ring: zeroed(cache_rows * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim), Tag::drafter_kv("shared/dspark-rings"))?,
+                v_ring: zeroed(cache_rows * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim), Tag::drafter_kv("shared/dspark-rings"))? })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
         let fp8_workspace = match representation {
@@ -512,7 +513,7 @@ impl<'a> DsparkDrafter<'a> {
                     pool: cuteafd_engine::prefix::DraftPagePool::new(target_tokens, slots,
                         context_capacity, identity.finish())?, bindings: vec![None; slots] };
                 for slot in 0..slots { state.bindings[slot] = Some(state.pool.bind(slot, 0)?); }
-                Some(PagedContext { tables: zeroed(cache_layout.page_table_bytes as usize)?,
+                Some(PagedContext { tables: zeroed(cache_layout.page_table_bytes as usize, Tag::drafter_workspace("shared/dspark-page-tables"))?,
                     layout: cache_layout, state: RefCell::new(state) })
             } else { None },
             inv_freq: cfg.rotary.as_ref().map(|plan| upload("inv_freq", bytes_of(&plan.inv_freq))).transpose()?,
@@ -520,12 +521,12 @@ impl<'a> DsparkDrafter<'a> {
             markov_w1: weights.markov_w1, markov_w2: weights.markov_w2, markov_norms,
             confidence_w: weights.confidence_w, confidence_b: weights.confidence_b,
             layers,
-            taps: zeroed(TAP_ROWS * taps * 2)?,
-            fused: zeroed(TAP_ROWS * h * 2)?,
-            fused_norm: zeroed(TAP_ROWS * h * 2)?,
-            context_kv: zeroed(TAP_ROWS * 2 * kv * 2)?,
-            context_positions: zeroed(TAP_ROWS * 8)?,
-            context_slots: zeroed(TAP_ROWS * 4)?,
+            taps: zeroed(TAP_ROWS * taps * 2, Tag::drafter_workspace("shared/dspark-taps"))?,
+            fused: zeroed(TAP_ROWS * h * 2, Tag::drafter_workspace("shared/dspark-context-update"))?,
+            fused_norm: zeroed(TAP_ROWS * h * 2, Tag::drafter_workspace("shared/dspark-context-update"))?,
+            context_kv: zeroed(TAP_ROWS * 2 * kv * 2, Tag::drafter_workspace("shared/dspark-context-update"))?,
+            context_positions: zeroed(TAP_ROWS * 8, Tag::drafter_workspace("shared/dspark-context-update"))?,
+            context_slots: zeroed(TAP_ROWS * 4, Tag::drafter_workspace("shared/dspark-context-update"))?,
             mask_row,
             workspace: RefCell::new(None),
             projections, representation,
@@ -902,7 +903,7 @@ impl<'a> DsparkDrafter<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;
         let rows = sequences * c.block;
-        let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
+        let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256), Tag::drafter_workspace("shared/dspark"));
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
@@ -926,7 +927,7 @@ impl<'a> DsparkDrafter<'a> {
             ids: alloc(rows * 4)?,
             tokens: alloc(rows * 4)?,
             confidence: alloc(rows * 4)?,
-            landing: crate::shared::memory::HostAllocation::new(self.library, rows * 8)?,
+            landing: crate::shared::memory::HostAllocation::new(self.library, rows * 8, Tag::staging("shared/dspark-landing"))?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             attention_workspace,
@@ -1236,7 +1237,7 @@ mod tests {
                         prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("prefetch panic"))?? };
                     let mut allocate = |id,name:&str,bytes| {
                         assert_eq!(id,device.id); requested.borrow_mut().push((name.to_owned(),bytes));
-                        weight_allocation(device,arena,name,bytes)
+                        weight_allocation(device,arena,name,bytes, crate::shared::memory::TEST_ARENA)
                     };
                     let cfg = DsparkConfig::read(snapshot)?;
                     let drafter = device.run(|| if cfg.window.is_some() {
@@ -1262,7 +1263,7 @@ mod tests {
                 };
                 let wanted = digest(&baseline)?;
                 for recorded in [false,true] {
-                    let arena = DeviceWeightArena::new(device,WeightArenaLayout::new("test/block",expected.clone())?)?;
+                    let arena = DeviceWeightArena::new(device,WeightArenaLayout::new("test/block",expected.clone())?, crate::shared::memory::TEST_ARENA)?;
                     let actual = if recorded {
                         let (draft,records) = dense::recording(|| run(device,&programs,&snapshot,representation,Some(&arena),&expected))?;
                         let sockets=tempfile::tempdir()?;

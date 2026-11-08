@@ -337,7 +337,7 @@ impl WeightInventory {
                     usize::try_from(owner.allocation.bytes).map_err(|_| Refusal::Overflow("GLM arena view"))?)))
                     .collect::<Result<Vec<_>, Refusal>>()?)
                 .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
-            let mut components = weight_arena_components(&layout, location, Lifetime::RESIDENT, maximum_pages)?;
+            let mut components = weight_arena_components(&layout, location, Lifetime::RESIDENT, maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?;
             components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
             let root = Allocation::buffer(layout.id(), location, layout.bytes() as u64,
                 Lifetime::RESIDENT, Category::Weights, "weight arena");
@@ -357,7 +357,7 @@ impl WeightInventory {
             Device::Coordinator(_)) || owner.allocation.id.contains(".shared.layer.")) {
             if matches!(owner.allocation.location.device, Device::Coordinator(_)) {
                 out.extend(weight_arena_extent_components(&owner.allocation.id, owner.allocation.bytes,
-                    owner.allocation.location, owner.allocation.lifetime, maximum_pages)?);
+                    owner.allocation.location, owner.allocation.lifetime, maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?);
             } else {
                 out.extend(Self::standalone_components(std::slice::from_ref(owner), maximum_pages));
             }

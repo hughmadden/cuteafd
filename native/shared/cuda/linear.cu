@@ -888,6 +888,7 @@ cuteafd_status_t ensure_cuda_driver_context() {
   }
   CUcontext context = nullptr;
   if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr) {
+    // Third-party residual: CUDA context storage, not an owned backing.
     if (cudaFree(nullptr) != cudaSuccess ||
         cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr) {
       return CUTEAFD_STATUS_INTERNAL_ERROR;
@@ -914,6 +915,7 @@ cuteafd_status_t triton_driver_kernel(const char* cubin_path,
     return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   TritonDriverKernel loaded;
+  // Third-party residual: driver-owned module/code storage, retained by the kernel cache.
   if (cuModuleLoad(&loaded.module, cubin_path) != CUDA_SUCCESS ||
       cuModuleGetFunction(&loaded.function, loaded.module, kernel_name) !=
           CUDA_SUCCESS) {
@@ -946,6 +948,7 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out, cudaStream_t stream = nullpt
   if (device_status != cudaSuccess) {
     return status_from_cuda(device_status);
   }
+  // Third-party residual: cuBLAS internal context/workspace bytes; handle ownership is unchanged.
   // A thread can launch target and remote-drafter work on different devices.
   static thread_local std::unordered_map<int, cublasHandle_t> handles;
   auto found = handles.find(device);

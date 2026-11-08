@@ -36,7 +36,7 @@ struct Fixture<'a> {
 impl Fixture<'_> {
     fn upload(&mut self, words: &[u32]) -> Result<CuteafdDeviceBuffer> {
         let bytes = words.iter().flat_map(|n| n.to_ne_bytes()).collect::<Vec<_>>();
-        let buffer = self.library.alloc_device_buffer(bytes.len())?;
+        let buffer = self.library.alloc_device_buffer(bytes.len(), crate::shared::memory::TEST)?;
         self.buffers.push(buffer);
         self.library.copy_h2d(buffer, &bytes)?;
         Ok(buffer)
@@ -81,7 +81,7 @@ fn glm_ml4_known_routes_packed_padding_warmup_replay_phase_and_devices() -> Resu
                 ensure!(records.len() == 1 && records[0].bytes == 3 * 8 * 16, "owner mismatch {name}");
                 if suffix != "pinned" { ensure!(records[0].key.device == cuda, "physical owner mismatch"); }
             }
-            let lookup = HostAllocation::new(&library, cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES)?;
+            let lookup = HostAllocation::new(&library, cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES, crate::shared::memory::TEST)?;
             // SAFETY: freshly allocated pinned storage holds the complete immutable lookup.
             unsafe { std::ptr::copy_nonoverlapping(usage_lookup().as_ptr(), lookup.buffer.ptr.cast(), lookup.buffer.bytes / 4); }
             // Declared after usage: errors drain fixture streams before counters retire.

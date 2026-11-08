@@ -745,11 +745,11 @@ mod tests {
             let mode = if options.mimo_draft_bf16 { draft_representation::MimoDraftRepresentation::Bf16Only }
                 else { draft_representation::MimoDraftRepresentation::Fp8Only };
             for rank in 0..2 {
-                let mut runtime = vec![MimoWeightArena { layout: layouts.target[rank].clone().unwrap(), lifetime: Lifetime::RESIDENT }];
+                let mut runtime = vec![MimoWeightArena { kind: cuteafd_core::memory_layout::MemoryKind::Weights, layout: layouts.target[rank].clone().unwrap(), lifetime: Lifetime::RESIDENT }];
                 if rank == 0 {
-                    runtime.extend(layouts.mtp.iter().cloned().map(|layout| MimoWeightArena { layout, lifetime: Lifetime::RESIDENT }));
+                    runtime.extend(layouts.mtp.iter().cloned().map(|layout| MimoWeightArena { kind: cuteafd_core::memory_layout::MemoryKind::DrafterWeights, layout, lifetime: Lifetime::RESIDENT }));
                 }
-                runtime.push(MimoWeightArena { layout: dflash_arena_requests(&draft, mode, rank, 2)?,
+                runtime.push(MimoWeightArena { kind: cuteafd_core::memory_layout::MemoryKind::DrafterWeights, layout: dflash_arena_requests(&draft, mode, rank, 2)?,
                     lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth } });
                 assert_eq!(profiles.weight_arenas[rank], runtime);
                 assert!(profiles.steady.devices[rank].reservations.iter().all(|owner|

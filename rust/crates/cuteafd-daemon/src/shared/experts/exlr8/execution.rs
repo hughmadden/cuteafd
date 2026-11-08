@@ -372,7 +372,7 @@ impl<'a> Exlr8Execution<'a> {
         let group_cta_limit = limit(group.spec())?;
         let l2_bytes = i32::try_from(library.l2_cache_bytes()?).context("EXLR8 runtime L2 exceeds int32")?;
         ensure!(l2_bytes > 0, "EXLR8 runtime L2 must be positive");
-        let arena = DeviceAllocation::named(library, layout.bytes, "experts/workspace/exlr8")?;
+        let arena = DeviceAllocation::new(library, layout.bytes, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Workspace, "experts/workspace/exlr8"))?;
         Ok(Self {
             group,
             k1,

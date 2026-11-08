@@ -97,6 +97,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use crate::shared::memory::Tag;
 
 /// Builds a wave's request on the transport worker from its staged route
 /// entries and its hidden payload (a view of the slot's staging arena).
@@ -1024,7 +1025,7 @@ impl Intake {
 fn warm_reducer(library: &NativeLibrary, intake: &Intake) -> Result<()> {
     let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
     for (pointer, plane) in pointers.iter_mut().zip(&intake.slot_planes(0)) { *pointer = plane.ptr.cast(); }
-    let output = crate::shared::memory::DeviceAllocation::new(library, intake.row_bytes.max(256))?;
+    let output = crate::shared::memory::DeviceAllocation::new(library, intake.row_bytes.max(256), Tag::workspace("shared/reducer-warm"))?;
     let stream = crate::shared::spark_intake::WarmStream::new(library)?;
     // SAFETY: slot 0's planes and the output hold one row; the stream is
     // drained (finish) before either can be released.
@@ -1070,8 +1071,8 @@ impl<'a> ExchangeStorage<'a> {
         let pinned = intake.pinned() != 0;
         let format = intake.reply_format();
         let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-        let control = HostAllocation::new(library, Counter::words(slots) * LINE)?;
-        let pull_block = pinned.then(|| HostAllocation::new(library, Pulls::bytes(slots))).transpose()?;
+        let control = HostAllocation::new(library, Counter::words(slots) * LINE, Tag::transport("shared/spark-wave-control"))?;
+        let pull_block = pinned.then(|| HostAllocation::new(library, Pulls::bytes(slots), Tag::transport("shared/spark-wave-pulls"))).transpose()?;
         if let Some(block) = &pull_block {
             let alias = library.cuda_host_buffer_device_alias(block.buffer)?;
             ensure!(alias.ptr == block.buffer.ptr,

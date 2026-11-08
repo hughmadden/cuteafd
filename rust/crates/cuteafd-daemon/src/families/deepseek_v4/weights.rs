@@ -12,6 +12,7 @@ use cuteafd_loader::OfficialV41Catalog;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) struct LayerWeights<'a> {
     pub ratio: usize,
@@ -150,7 +151,7 @@ impl<'a> WeightLoader<'a, '_> {
             self.target_arenas.get(rank).context("V4 target arena absent")?
         };
         Ok(DeviceAllocation::from_allocation(crate::shared::memory::weight_arena::weight_allocation(
-            device, Some(arena), name, bytes)?))
+            device, Some(arena), name, bytes, ArenaTag::weights("v4/target"))?))
     }
 
     fn rectangles(&self, names: &[String], kind: Share, rank: usize) -> Result<Vec<Rect>> {

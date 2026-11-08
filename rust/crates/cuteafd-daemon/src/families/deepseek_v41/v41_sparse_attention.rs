@@ -3,6 +3,7 @@ use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput;
 use crate::families::deepseek_v41::v41_compressor::IndexProposal;
 use crate::families::deepseek_v41::v41_index_selection::IndexSelectionOutput;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LayerStaging, LoadStream};
 use crate::families::deepseek_v41::v41_window::WindowProposal;
 use anyhow::{ensure, Context, Result};
@@ -90,9 +91,9 @@ impl<'a, const HEADS: usize> SparseAttentionStorage<'a, HEADS> {
         Ok(std::rc::Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             kernel: if HEADS == 64 { library.v41_sparse_attention()? } else { library.v41_sparse_attention_heads32()? },
-            query: DeviceAllocation::new(library, query)?, output: DeviceAllocation::new(library, output)?,
-            split_scratch: DeviceAllocation::new(library, split)?, descriptors: DeviceAllocation::new(library, descriptors)?,
-            replay_begins: DeviceAllocation::new(library, replay)?, metadata: DeviceAllocation::new(library, metadata)?,
+            query: DeviceAllocation::new(library, query, Tag::workspace("v41/sparse-attention"))?, output: DeviceAllocation::new(library, output, Tag::workspace("v41/sparse-attention"))?,
+            split_scratch: DeviceAllocation::new(library, split, Tag::workspace("v41/sparse-attention"))?, descriptors: DeviceAllocation::new(library, descriptors, Tag::workspace("v41/sparse-attention"))?,
+            replay_begins: DeviceAllocation::new(library, replay, Tag::workspace("v41/sparse-attention"))?, metadata: DeviceAllocation::new(library, metadata, Tag::workspace("v41/sparse-attention"))?,
             guard: crate::shared::memory::row_window::ScratchGuard::new(library, readers)?, unit,
         }))
     }
@@ -183,9 +184,9 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let capacity = storage.unit;
         let batch = capacity.min(cuteafd_core::V41_VERIFY_ROWS);
         Ok(Self {
-            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(batch)?, 40)?,
-            staging: LayerStaging::new(library, capacity * 80, 40)?,
-            replay_staging: LayerStaging::new(library, capacity * 8, 40)?,
+            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(batch)?, 40, "v41/sparse-descriptors")?,
+            staging: LayerStaging::new(library, capacity * 80, 40, "v41/sparse-attention")?,
+            replay_staging: LayerStaging::new(library, capacity * 8, 40, "v41/sparse-replay")?,
             storage, window: crate::shared::memory::row_window::RowWindow::NONE,
             capacity, batch_rows: batch, attention_plan: None, decode: false,
             graphs: GraphBank::new(None), graph_limit: 1, warmed_kernels: 0, cold: None,
@@ -225,10 +226,10 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         if rows <= self.batch_rows { return Ok(()); }
         ensure!(self.attention_plan.is_none(), "attention workspace is immutable after plan admission");
         let library = self.storage.stream.library;
-        let scratch = DeviceAllocation::new(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS)?;
+        let scratch = DeviceAllocation::new(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS, Tag::workspace("v41/sparse-attention"))?;
         let bytes = V41SparseAttention::batch_descriptor_bytes(rows)?;
-        let descriptors = DeviceAllocation::new(library, bytes)?;
-        let staging = LayerStaging::new(library, bytes, 40)?;
+        let descriptors = DeviceAllocation::new(library, bytes, Tag::workspace("v41/sparse-attention"))?;
+        let staging = LayerStaging::new(library, bytes, 40, "v41/sparse-decode-rows")?;
         let additional_device_bytes = scratch.buffer.bytes + descriptors.buffer.bytes
             - self.storage.split_scratch.buffer.bytes - self.storage.descriptors.buffer.bytes;
         let storage = std::rc::Rc::get_mut(&mut self.storage).context("cannot resize shared sparse storage")?;
@@ -991,9 +992,9 @@ mod shared_storage_tests {
         let storage = SparseAttentionStorage::<HEADS>::new(&lib, 4, &[0,1])?;
         let mut slots = [LocalSparseAttentionWave::on_storage(storage.clone())?, LocalSparseAttentionWave::on_storage(storage.clone())?];
         for (i,slot) in slots.iter_mut().enumerate() { slot.select_window(crate::shared::memory::row_window::RowWindow::within(i*4..i*4+4,8)?)?; }
-        let scales=Allocation::new(device,128*16)?; let end=Allocation::new(device,8)?;
-        let sink=Allocation::new(device,HEADS*4)?;
-        let sources=[Allocation::new(device,128*512)?,Allocation::new(device,128*512)?];
+        let scales=Allocation::new(device,128*16, crate::shared::memory::TEST)?; let end=Allocation::new(device,8, crate::shared::memory::TEST)?;
+        let sink=Allocation::new(device,HEADS*4, crate::shared::memory::TEST)?;
+        let sources=[Allocation::new(device,128*512, crate::shared::memory::TEST)?,Allocation::new(device,128*512, crate::shared::memory::TEST)?];
         lib.copy_h2d(sources[0].buffer,&vec![0x38;128*512])?;
         lib.copy_h2d(sources[1].buffer,&vec![0x40;128*512])?;
         lib.copy_h2d(scales.buffer,&vec![127;128*16])?;lib.copy_h2d(end.buffer,&[0;8])?;
@@ -1023,7 +1024,7 @@ mod shared_storage_tests {
             lib.cuda_stream_synchronize(private.stream.raw)?; }
         let mut want=vec![0;output_bytes];lib.copy_d2h(&mut want,private.output.buffer)?;
         for seed in 0..2 { enqueue(&slots[seed],seed)?; unsafe { lib.cuda_stream_synchronize(storage.stream.raw)?; } }
-        let reader=Stream::new(device)?;let saved=Allocation::new(device,output_bytes)?;
+        let reader=Stream::new(device)?;let saved=Allocation::new(device,output_bytes, crate::shared::memory::TEST)?;
         unsafe { lib.copy_d2d_async(saved.buffer,storage.output.buffer,output_bytes,reader.raw)?; }
         reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];

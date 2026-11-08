@@ -20,7 +20,7 @@
 //! each logical page consists of disjoint owner-local layer records across both GPUs; tail
 //! copies and the host tier preserve all those segments without replicating any layer.
 use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_BYTES};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, Tag};
 use crate::shared::prefix::{view, PrefixCopies, Reader};
 use anyhow::Result;
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PageOwners, PrefixFamily, ReuseRule,
@@ -121,7 +121,6 @@ pub(crate) fn draft_mark_bytes(windows_only: bool, window_bytes: usize) -> usize
 impl<'e, 'a> NativePrefix<'e, 'a> {
     /// `mark_slots`: the prefix arena's slots, each holding a window-ring drafter's windows.
     pub fn new(engine: &'e GlmEngine<'a>, partial: bool, mark_slots: usize) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |(records, index)| (rank, records, index)))
             .collect();
@@ -142,14 +141,17 @@ impl<'e, 'a> NativePrefix<'e, 'a> {
                     .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
                 // Marks snapshot the drafter's rings and live on its admitted GPU.
                 let storage = match drafter.device() {
-                    Some(device) => device.run(|| DeviceAllocation::new(engine.library, bytes.max(256)))?,
-                    None => DeviceAllocation::new(engine.library, bytes.max(256))?,
+                    Some(device) => device.run(|| DeviceAllocation::new(engine.library, bytes.max(256),
+                        Tag::prefix("glm/prefix-draft-marks")))?,
+                    None => DeviceAllocation::new(engine.library, bytes.max(256),
+                        Tag::prefix("glm/prefix-draft-marks"))?,
                 };
                 Some(DraftMarks { storage, windows, slots: mark_slots })
             }
             _ => None,
         };
-        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)?, copies, draft_marks })
+        Ok(Self { engine, paged, partial, copies, draft_marks,
+            scratch: DeviceAllocation::new(engine.library, 256, Tag::prefix("glm/prefix-tail"))? })
     }
 
     pub(crate) fn allocation_receipts(&self,

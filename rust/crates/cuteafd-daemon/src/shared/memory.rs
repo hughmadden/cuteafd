@@ -1,6 +1,14 @@
 //! Native device/pinned allocation and stream owners shared by model components.
 use anyhow::Result;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
+pub(crate) use cuteafd_ffi::memory_ledger::{tag, MemoryKind, Tag};
+/// Scratch allocated by this crate's tests; absent from every non-test build.
+#[cfg(test)]
+pub(crate) const TEST: Tag = Tag::workspace("test/scratch");
+/// An immutable arena tag for this crate's tests; absent from every non-test build.
+#[cfg(test)]
+pub(crate) const TEST_ARENA: cuteafd_core::memory_layout::ArenaTag<cuteafd_core::memory_layout::arena_class::Immutable> =
+    cuteafd_core::memory_layout::ArenaTag::weights("test/arena");
 use std::ffi::c_void;
 
 #[path = "memory/receipts.rs"]
@@ -66,28 +74,30 @@ impl<'a> DeviceAllocation<'a> {
         }
     }
 
-    pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope(scope);
-        Self::new(library, bytes)
-    }
-
     /// Attention value/scale planes retain 16-byte alignment under every row slice.
     pub(crate) fn attention_plane(library: &'a NativeLibrary, rows: usize, stride: usize,
-        name: &str) -> Result<Self> {
+        name: &str, tag: Tag) -> Result<Self> {
         let bytes = rows.checked_mul(stride).ok_or_else(|| anyhow::anyhow!("attention plane size overflow"))?;
-        let allocation = Self::new(library, bytes)?;
+        let allocation = Self::new(library, bytes, tag)?;
         anyhow::ensure!(allocation.buffer.ptr as usize % 16 == 0 && stride % 16 == 0,
             "V4.1 BF16 AOT attention load: {name} shape=[{rows},{stride}] on GPU {} requires 16-byte aligned base and row stride",
             allocation.buffer.device_id);
         Ok(allocation)
     }
 
-    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        Ok(Self {
-            library,
-            buffer: library.alloc_device_buffer(bytes)?,
-            backing: None,
-        })
+    /// Device memory on the current device holding `tag`.
+    #[track_caller]
+    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, tag: Tag) -> Result<Self> {
+        Ok(Self { library, buffer: library.alloc_device_buffer(bytes, tag)?, backing: None })
+    }
+
+    /// Kind and owner as the ledger recorded them (`None` for empty backing).
+    pub(crate) fn tag(&self) -> Option<Tag> {
+        match &self.backing { Some(allocation) => allocation.tag(), None => self.tag_of_buffer() }
+    }
+
+    fn tag_of_buffer(&self) -> Option<Tag> {
+        cuteafd_ffi::memory_ledger::tag_of(self.buffer.ptr as usize)
     }
 }
 impl Drop for DeviceAllocation<'_> {
@@ -108,16 +118,14 @@ pub(crate) struct HostAllocation<'a> {
     pub(crate) buffer: CuteafdHostBuffer,
 }
 impl<'a> HostAllocation<'a> {
-    pub(crate) fn named(library: &'a NativeLibrary, bytes: usize, scope: &'static str) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope(scope);
-        Self::new(library, bytes)
+    /// Zeroed pinned, device-mapped host memory holding `tag`.
+    #[track_caller]
+    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, tag: Tag) -> Result<Self> {
+        Self::zeroed(library, library.alloc_host_buffer(bytes, tag)?, bytes)
     }
 
-    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        let value = Self {
-            library,
-            buffer: library.alloc_host_buffer(bytes)?,
-        };
+    fn zeroed(library: &'a NativeLibrary, buffer: CuteafdHostBuffer, bytes: usize) -> Result<Self> {
+        let value = Self { library, buffer };
         // Padding must also be initialized before copying the contiguous arena.
         unsafe {
             std::ptr::write_bytes(value.buffer.ptr.cast::<u8>(), 0, bytes);
@@ -161,13 +169,15 @@ pub(crate) enum ResidentWeight<'a> {
     Host { storage: HostAllocation<'a>, alias: CuteafdDeviceBuffer },
 }
 impl<'a> ResidentWeight<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, host: bool) -> Result<Self> {
+    /// `tag` must be an immutable kind: the same bytes serve from either placement.
+    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, host: bool,
+        tag: cuteafd_core::memory_layout::ArenaTag<cuteafd_core::memory_layout::arena_class::Immutable>) -> Result<Self> {
         if host {
-            let storage = HostAllocation::new(library, bytes)?;
+            let storage = HostAllocation::new(library, bytes, tag.tag())?;
             let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
             Ok(Self::Host { storage, alias })
         } else {
-            Ok(Self::Device(DeviceAllocation::new(library, bytes)?))
+            Ok(Self::Device(DeviceAllocation::new(library, bytes, tag.tag())?))
         }
     }
     pub(crate) fn buffer(&self) -> CuteafdDeviceBuffer {
@@ -188,9 +198,10 @@ pub(crate) struct LayerStaging<'a> {
     regions: usize,
 }
 impl<'a> LayerStaging<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary, region: usize, layers: usize) -> Result<Self> {
+    pub(crate) fn new(library: &'a NativeLibrary, region: usize, layers: usize, owner: &'static str) -> Result<Self> {
         let regions = layers.max(1);
-        Ok(Self { allocation: HostAllocation::new(library, region.max(1) * regions)?, region: region.max(1), regions })
+        let tag = Tag::new(MemoryKind::Staging, owner);
+        Ok(Self { allocation: HostAllocation::new(library, region.max(1) * regions, tag)?, region: region.max(1), regions })
     }
     /// Layer `layer`'s region: its host buffer and bytes.
     pub(crate) fn region(&mut self, layer: usize) -> (CuteafdHostBuffer, &mut [u8]) {
@@ -402,8 +413,8 @@ mod load_stream_lifetime_tests {
             std::fs::write(std::env::var("CUTEAFD_FATAL_LOAD_STREAM_EVIDENCE")?,
                 fixture.directory().join("events").to_str().unwrap())?;
             let library = fixture.load()?;
-            let weights = [DeviceAllocation::new(&library, 256)?, DeviceAllocation::new(&library, 256)?];
-            let staging = [HostAllocation::new(&library, 256)?, HostAllocation::new(&library, 256)?];
+            let weights = [DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?, DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?];
+            let staging = [HostAllocation::new(&library, 256, crate::shared::memory::TEST)?, HostAllocation::new(&library, 256, crate::shared::memory::TEST)?];
             fixture.configure_pack(&library, 0, 1)?;
             match path.as_str() {
                 "drop" => drop(LoadStream { library: &library, raw: std::ptr::null_mut() }),

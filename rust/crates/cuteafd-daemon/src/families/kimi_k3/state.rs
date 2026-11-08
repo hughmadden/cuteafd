@@ -1,6 +1,6 @@
 //! Exact TP2 KDA state owners. Replay is private to each independently queued
 //! lane; active recurrent slots and immutable prefix marks are shared by lanes.
-use crate::shared::{memory::device::{Allocation, Device, Stream}, prefix::view};
+use crate::shared::{memory::{device::{Allocation, Device, Stream}, Tag}, prefix::view};
 use anyhow::{ensure, Context, Result};
 
 use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaGeometry};
@@ -202,19 +202,18 @@ impl KdaLayout {
             .all(|previous| !Rc::ptr_eq(previous, stream))), "Kimi KDA lanes share a stream owner");
         let stream = Stream::new(device)?;
         let [state, conv, replay, marks] = self.extents()?;
-        let allocate = |bytes, category| -> Result<Rc<Allocation<'a>>> {
-            let _scope = cuteafd_ffi::memory_ledger::scope(category);
-            let allocation = Rc::new(Allocation::new(device, bytes)?);
+        let allocate = |bytes, tag| -> Result<Rc<Allocation<'a>>> {
+            let allocation = Rc::new(Allocation::new(device, bytes, tag)?);
             ensure!(allocation.buffer.device_id == device.id && allocation.buffer.bytes == bytes,
                 "Kimi KDA allocation differs from admitted device/extent");
             Ok(allocation)
         };
-        let state = allocate(state, "kv/kimi KDA state")?;
-        let conv = allocate(conv, "kv/kimi KDA convolution")?;
-        let marks = (marks > 0).then(|| allocate(marks, "prefix/kimi KDA marks")).transpose()?;
-        let replay = (0..self.lanes).map(|_| allocate(replay, "workspace/kimi KDA replay"))
+        let state = allocate(state, Tag::kv("kimi/kda-state"))?;
+        let conv = allocate(conv, Tag::kv("kimi/kda-conv"))?;
+        let marks = (marks > 0).then(|| allocate(marks, Tag::prefix("kimi/kda-marks"))).transpose()?;
+        let replay = (0..self.lanes).map(|_| allocate(replay, Tag::workspace("kimi/kda-replay")))
             .collect::<Result<Vec<_>>>()?;
-        let tables = (0..self.lanes).map(|_| allocate(self.slots * 3 * 4, "workspace/kimi KDA commit tables"))
+        let tables = (0..self.lanes).map(|_| allocate(self.slots * 3 * 4, Tag::workspace("kimi/kda-commit-tables")))
             .collect::<Result<Vec<_>>>()?;
         // Keep the initialized bank intact on error: its stream drains first.
         let bank = KdaBank { stream, readers, state, conv, marks, replay, tables, layout: self.clone() };
@@ -354,7 +353,7 @@ mod tests {
             Ok(bytes)
         };
         let upload = |bytes: &[u8]| -> Result<Allocation<'_>> {
-            let allocation = Allocation::new(device, bytes.len())?;
+            let allocation = Allocation::new(device, bytes.len(), crate::shared::memory::TEST)?;
             device.run(|| library.copy_h2d(allocation.buffer, bytes))?;
             Ok(allocation)
         };
@@ -389,9 +388,9 @@ mod tests {
                 let first = upload(&first.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
                 let input = bf16_ones(rows * 7168)?;
                 let projected = (0..4).map(|_| bf16_ones(rows * width)).collect::<Result<Vec<_>>>()?;
-                let output = Allocation::new(device, rows * width * 2)?;
+                let output = Allocation::new(device, rows * width * 2, crate::shared::memory::TEST)?;
                 let kernel = &kernels[usize::from(rows > 64)];
-                let scratch = Allocation::new(device, kernel.scratch_bytes())?;
+                let scratch = Allocation::new(device, kernel.scratch_bytes(), crate::shared::memory::TEST)?;
                 for (lane, stream) in readers.iter().enumerate() {
                     let [state, conv_state, replay] = bank.layer(0, lane)?;
                     device.run(|| Ok(kernel.launch(weights, KimiKdaCoreBatch { rows, sequences,
@@ -523,7 +522,7 @@ mod tests {
         let reader = || Rc::new(Stream { device, raw: std::ptr::null_mut() });
         let readers = vec![reader(), reader()];
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let allocation = || Allocation::new(device, 16).map(Rc::new);
+        let allocation = || Allocation::new(device, 16, crate::shared::memory::TEST).map(Rc::new);
         let bank = KdaBank { stream: Stream { device, raw: std::ptr::null_mut() }, readers: readers.clone(),
             state: allocation()?, conv: allocation()?, marks: Some(allocation()?),
             replay: vec![allocation()?, allocation()?], tables: vec![allocation()?, allocation()?],

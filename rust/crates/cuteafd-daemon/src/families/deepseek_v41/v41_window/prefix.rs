@@ -126,7 +126,7 @@ mod tests {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&lib)?;
         let mut state = device.own(|| WindowState::new(&lib, 20, 2, usize::MAX))?;
-        let saved = DeviceAllocation::new(&lib, WINDOW_PREFIX_BYTES)?;
+        let saved = DeviceAllocation::new(&lib, WINDOW_PREFIX_BYTES, crate::shared::memory::TEST)?;
         let stream = LoadStream {
             library: &lib,
             raw: lib.cuda_stream_create()?,

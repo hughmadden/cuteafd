@@ -13,6 +13,7 @@ use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
+use crate::shared::memory::Tag;
 
 /// Staging slot order produced by `V41Nvfp4Staging`.
 const SLOT_UP_WEIGHT: usize = 0;
@@ -181,9 +182,9 @@ impl<'a> Nvfp4Side<'a> {
         let down_alphas = DeviceAllocation::from_allocation(arena.view(&super::super::weight_layout::name(layer, 5), experts * 4)?);
         let input_scales_device = DeviceAllocation::from_allocation(arena.view(&super::super::weight_layout::name(layer, 6), experts * 4)?);
         let down_input_scales_device = DeviceAllocation::from_allocation(arena.view(&super::super::weight_layout::name(layer, 7), experts * 4)?);
-        let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes)?;
+        let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes, Tag::staging("experts/nvfp4-load"))?;
         let mut hosts = (0..EXPERT_READ_LANES)
-            .map(|_| HostAllocation::new(library, budget.pinned_host_bytes / EXPERT_READ_LANES))
+            .map(|_| HostAllocation::new(library, budget.pinned_host_bytes / EXPERT_READ_LANES, Tag::staging("experts/nvfp4-load")))
             .collect::<Result<Vec<_>>>()?;
         let mut read_scratch = (0..EXPERT_READ_LANES)
             .map(|_| vec![0; budget.read_scratch_bytes / EXPERT_READ_LANES])
@@ -355,7 +356,7 @@ impl<'a> Nvfp4Side<'a> {
             // Each async copy owns a distinct pinned source range until the
             // stream drains; rewriting one shared source races the copy engine.
             let vector_bytes = experts * 4;
-            let mut host = HostAllocation::new(library, vector_bytes * 4)?;
+            let mut host = HostAllocation::new(library, vector_bytes * 4, Tag::staging("experts/nvfp4-vectors"))?;
             let vectors = [
                 (&alpha_values, alphas.buffer),
                 (&down_alpha_values, down_alphas.buffer),

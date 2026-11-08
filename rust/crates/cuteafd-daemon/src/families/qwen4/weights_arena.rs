@@ -2,6 +2,7 @@
 use super::*;
 use crate::shared::memory::weight_arena::DeviceWeightArena;
 use std::{collections::BTreeMap, rc::Rc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) struct Arenas<'a> {
     target: BTreeMap<i32, DeviceWeightArena<'a>>,
@@ -14,7 +15,7 @@ impl<'a> Qwen4Loader<'a> {
         let arenas = self.arenas.as_ref().context("Qwen weights require planned arenas")?;
         let arena = if name.starts_with("mtp.") { arenas.draft.as_ref() }
             else { arenas.target.get(&device.id) }.context("Qwen weight arena device/scope")?;
-        crate::shared::memory::weight_arena::weight_allocation(device, Some(arena), name, bytes)
+        crate::shared::memory::weight_arena::weight_allocation(device, Some(arena), name, bytes, ArenaTag::weights("qwen4/target"))
     }
 
     pub(crate) fn embedding_allocation(&self, name: &str, bytes: usize) -> Result<Allocation<'a>> {
@@ -55,7 +56,7 @@ impl<'a> Qwen4Loader<'a> {
         let mut draft = None;
         for (rank, layout) in layouts {
             let is_draft = layout.id().contains("/mtp/");
-            let arena = DeviceWeightArena::new(ranks[rank].0, layout)?;
+            let arena = DeviceWeightArena::new(ranks[rank].0, layout, if is_draft { ArenaTag::drafter_weights("qwen4/mtp") } else { ArenaTag::weights("qwen4/target") })?;
             if is_draft { draft = Some(arena); }
             else { target.insert(ranks[rank].0.id, arena); }
         }

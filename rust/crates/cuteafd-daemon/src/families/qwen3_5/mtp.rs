@@ -103,7 +103,8 @@ impl<'a> Mtp<'a> {
             hidden_bytes: cfg.hidden * 2 };
         // Native MTP is its own retired scope: one arena, borrowing only the target embedding/head.
         let arena = super::super::weights::ScopeArena::new(device,
-            super::super::weights::mtp_arena(reader.checkpoint, &cfg, format)?)?;
+            super::super::weights::mtp_arena(reader.checkpoint, &cfg, format)?,
+            cuteafd_core::memory_layout::ArenaTag::drafter_weights("qwen35/mtp"))?;
         let mut allocate = |name: &str, bytes| arena.allocate(name, bytes);
         let bf16 = |name: &str| reader.bf16_with(name, name, &mut |name: &str, bytes| arena.allocate(name, bytes));
         let (fc, norm_hidden, norm_embedding, norm) = (bf16("mtp.fc.weight")?, bf16("mtp.pre_fc_norm_hidden.weight")?,
@@ -117,11 +118,12 @@ impl<'a> Mtp<'a> {
             library: device.library, stream: engine.stream.raw,
             projection: cuteafd_ffi::draft_projection::DraftProjections::load(engine.programs, &[(2 * cfg.hidden, cfg.hidden)], HEAD_ROWS)?,
             layer, fc, norm_hidden, norm_embedding, norm,
-            concat: Allocation::new(device, HEAD_ROWS * 2 * cfg.hidden * 2)?,
-            hidden: Allocation::new(device, ROWS * cfg.hidden * 2)?,
-            logits: Allocation::new(device, HEAD_ROWS * cfg.vocab * 4)?,
-            kv: Allocation::new(device, engine.pool_tokens * layout.record_bytes)?,
-            sidecars: Allocation::new(device, engine.pool_tokens.div_ceil(64) * layout.hidden_bytes)?,
+            concat: Allocation::new(device, HEAD_ROWS * 2 * cfg.hidden * 2, Tag::drafter_workspace("qwen35/mtp-concat"))?,
+            hidden: Allocation::new(device, ROWS * cfg.hidden * 2, Tag::drafter_workspace("qwen35/mtp-hidden"))?,
+            logits: Allocation::new(device, HEAD_ROWS * cfg.vocab * 4, Tag::drafter_workspace("qwen35/mtp-logits"))?,
+            kv: Allocation::new(device, engine.pool_tokens * layout.record_bytes, Tag::drafter_kv("qwen35/mtp-kv"))?,
+            sidecars: Allocation::new(device, engine.pool_tokens.div_ceil(64) * layout.hidden_bytes,
+                Tag::drafter_kv("qwen35/mtp-sidecars"))?,
             layout, programs, cfg, homes, pool, binding, bindings,
         };
         let actual = out.layer.bytes() + [&out.fc, &out.norm_hidden, &out.norm_embedding, &out.norm, &out.concat,
@@ -621,7 +623,7 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
         Some(demand), 1, None, args.kv_cache, false, None, false)?;
     ensure!(engine.planes.scratch.bytes >= admitted.scratch_bytes, "MTP scratch exceeds shared target admission");
-    let input = Allocation::new(engine.stream.device, HEAD_ROWS * width)?;
+    let input = Allocation::new(engine.stream.device, HEAD_ROWS * width, Tag::workspace("qwen35/mtp-oracle"))?;
     let mut mtp = Mtp::load(&engine, &reader, format, admitted, fixed)?;
     mtp.pool.admit(mtp.binding, rows, HEAD_ROWS)?;
     let (mut hidden_cos, mut logit_cos, mut agree, mut nll) = (Vec::new(), Vec::new(), 0usize, 0.);
@@ -739,7 +741,7 @@ mod tests {
             Some(crate::shared::prefix::MarkRule { lanes: 2, entries: 2, budget_bytes: 1 << 30, host: false }),
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false, None, false)?);
         let mut mtp = Mtp::load(&engine.borrow(), &reader, format, admitted, fixed)?;
-        let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes)?;
+        let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes, crate::shared::memory::TEST)?;
         let selector = RefCell::new(crate::shared::token_io::TokenSelector::new(&library,
             crate::shared::token_io::SelectPlacement::Device, cfg.vocab, 1)?);
         let family = prefix::DensePrefix::new(&engine)?;

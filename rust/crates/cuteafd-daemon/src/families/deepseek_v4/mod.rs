@@ -601,11 +601,11 @@ pub(crate) fn with_engine<T>(
             "V4 selected weight arenas differ from the admitted layouts");
         let target_arenas = devices.iter().zip(target_layouts).map(|(&id, layout)|
             crate::shared::memory::weight_arena::DeviceWeightArena::new(
-                crate::shared::memory::device::Device { library: &loaded.library, id }, layout))
+                crate::shared::memory::device::Device { library: &loaded.library, id }, layout, cuteafd_core::memory_layout::ArenaTag::weights("v4/target")))
             .collect::<Result<Vec<_>>>()?;
         let draft_arena = draft_layout.map(|layout|
             crate::shared::memory::weight_arena::DeviceWeightArena::new(
-                crate::shared::memory::device::Device { library: &loaded.library, id: args.device }, layout)).transpose()?;
+                crate::shared::memory::device::Device { library: &loaded.library, id: args.device }, layout, cuteafd_core::memory_layout::ArenaTag::drafter_weights("v4/mtp"))).transpose()?;
         let loader = weights::WeightLoader {
             library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
             device: args.device, target_arenas: &target_arenas, draft_arena: draft_arena.as_ref(),

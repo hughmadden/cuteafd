@@ -24,6 +24,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::placement::{hop_buffer_bytes, Hop, HopSpec, HopStorage, HOP_SLOTS};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// One directed transfer stream per request lane. No intermediate device or
 /// host buffer is needed: copies land in the destination's existing inputs.
@@ -191,7 +192,7 @@ impl<'a> HopLink<'a> {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 library.peer_exchange_initialize()?;
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
-                    let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+                    let allocation = DeviceAllocation::new(library, bytes.max(256), Tag::transport("shared/residual-hops"))?;
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                     Ok(allocation)
                 };
@@ -457,7 +458,7 @@ mod cuda_tests {
                     let from = usize::from(hop.from);
                     let pattern: Vec<u8> = (0..bytes).map(|i| (i * 7 + lane * 13 + index * 31) as u8).collect();
                     let source = on_device(&library, from as i32, || {
-                        let source = DeviceAllocation::new(&library, bytes)?;
+                        let source = DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?;
                         library.copy_h2d(source.buffer, &pattern)?;
                         Ok(source)
                     })?;

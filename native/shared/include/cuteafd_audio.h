@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "cuteafd_media_backings.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,7 +39,7 @@ typedef struct {
  * dedicated encoder thread as vision. All work drains on error and destroy. */
 int32_t cuteafd_audio_required(const cuteafd_audio_spec*, cuteafd_audio_ledger*);
 int32_t cuteafd_audio_create(const cuteafd_audio_spec*, int32_t device,
-                            uint64_t admitted_bytes, void** owner);
+                            uint64_t admitted_bytes, const cuteafd_media_tags* tags, void** owner);
 /* All four table pointers NULL select the attested build-time tables. A full
  * non-NULL set is a qualification-only oracle override; partial sets fail.
  * Upload synchronizes before returning, so host inputs may then be released. */
@@ -65,6 +66,11 @@ int32_t cuteafd_audio_encode(void*, const float* pcm, uint32_t samples,
 int32_t cuteafd_audio_get_ledger(void*, cuteafd_audio_ledger*);
 int32_t cuteafd_audio_backend(char* out, uint64_t capacity);
 int32_t cuteafd_audio_destroy(void*);
+// Passive: the owner's two device backings; no device change or synchronization.
+int32_t cuteafd_audio_get_backings(void* owner, cuteafd_media_backings* out);
+// Destroy, reporting which backings were freed (CUTEAFD_MEDIA_RELEASED_*). A
+// backing whose free failed stays live and its bit stays clear.
+int32_t cuteafd_audio_destroy_backings(void* owner, uint32_t* released);
 #ifdef __cplusplus
 }
 #endif

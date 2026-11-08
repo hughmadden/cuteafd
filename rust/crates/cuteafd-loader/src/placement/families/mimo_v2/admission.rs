@@ -615,7 +615,7 @@ impl Recipe for MimoRecipe<'_> {
                 arena_names.insert(arena.layout.id().to_owned());
                 arena_names.insert(format!("{}.tail", arena.layout.id()));
                 contract.components.extend(crate::placement::planner::weight_arena_components(
-                    &arena.layout, Location::coordinator(rank as u8), arena.lifetime, maximum)?);
+                    &arena.layout, Location::coordinator(rank as u8), arena.lifetime, maximum, arena.kind)?);
             }
         }
         // Media towers already in the baseline and separately managed expert

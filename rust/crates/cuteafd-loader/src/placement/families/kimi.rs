@@ -518,7 +518,7 @@ impl KimiRecipe {
                 anyhow::ensure!(fixed.checked_add(attention) == Some(layout.payload_bytes() as u64),
                     "Kimi arena differs from selected native payload");
                 let mut components = weight_arena_components(&layout, Location::coordinator(rank as u8),
-                    Lifetime::RESIDENT, self.maximum_pages)?;
+                    Lifetime::RESIDENT, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?;
                 if profiled {
                     for component in &mut components { component.activation = Activation::choice(0, option); }
                 }
@@ -858,7 +858,7 @@ impl Recipe for KimiRecipe {
             // already exists throughout Load (unlike post-target GQA drafters).
             let lifetime = Lifetime::RESIDENT;
             if let Some((gpu, arena)) = &draft.arena {
-                contract.components.extend(weight_arena_components(arena, Location::coordinator(*gpu), lifetime, self.maximum_pages)?);
+                contract.components.extend(weight_arena_components(arena, Location::coordinator(*gpu), lifetime, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?);
             }
             for (index, owner) in draft.owners.iter().enumerate() {
                 let allocation = Allocation::buffer(format!("draft.{index}"),
@@ -1040,7 +1040,7 @@ mod tests {
                 }).sum();
                 if bytes == 0 { continue; }
                 let mut components = weight_arena_extent_components(&format!("kimi/coordinator/{rank}"), bytes,
-                    Location::coordinator(rank as u8), Lifetime::RESIDENT, recipe.maximum_pages).unwrap();
+                    Location::coordinator(rank as u8), Lifetime::RESIDENT, recipe.maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights).unwrap();
                 if profiled { for component in &mut components { component.activation = Activation::choice(0, option); } }
                 recipe.owners.extend(components);
             }

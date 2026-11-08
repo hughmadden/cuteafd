@@ -405,7 +405,7 @@ impl<'a> RoutedFfn<'a> {
                 scratch_out = Some(match native_scratch {
                     Some(scratch) => scratch,
                     None => std::rc::Rc::new(super::native::NativeScratch::allocate(device,
-                        &core.scratch_layout(plan.admission.rows)?.context("native shared scratch")?)?),
+                        &core.scratch_layout(plan.admission.rows)?.context("native shared scratch")?, crate::shared::memory::Tag::workspace("step5/native-projection"))?),
                 });
                 let mut take = |name: &str| -> Result<super::native::NativeLinear<'a>> {
                     std::rc::Rc::try_unwrap(core.linears.remove(name).context("native shared operand")?)
@@ -442,7 +442,8 @@ impl<'a> RoutedFfn<'a> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-routed");
         let spans = cuteafd_loader::plan::families::step5::native::routed_layout(admission.rows,
             admission.span, admission.full)?;
-        let planes = scratch::region_planes(device, &spans, arena)?;
+        let planes = scratch::region_planes(device, &spans, arena,
+            crate::shared::memory::Tag::workspace("step5/routed-scratch"))?;
         let stream = scratch::standalone(device, arena);
         Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }

@@ -118,11 +118,11 @@ impl Recipe for DenseFacts<'_> {
         let maximum = token_capacity / PAGE_ROWS;
         let mut contract = Contract::fixed(PAGE_ROWS, maximum, 1, self.owner_templates(1)?);
         let gpu = Location::coordinator(0);
-        contract.components.extend(weight_arena_components(self.target_arena, gpu, Lifetime::RESIDENT, maximum)?);
+        contract.components.extend(weight_arena_components(self.target_arena, gpu, Lifetime::RESIDENT, maximum, cuteafd_core::memory_layout::MemoryKind::Weights)?);
         let draft_start = contract.components.len();
         if let Some((id, bytes)) = self.drafter.and_then(|draft| draft.weight_arena) {
             contract.components.extend(weight_arena_extent_components(id, bytes, gpu,
-                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, maximum)?);
+                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, maximum, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?);
         }
         contract.variables = self.cfg.attention.iter().enumerate()
             .map(|(layer, _)| Variable::Attention { layer, values: vec![WHOLE] })
@@ -200,7 +200,7 @@ impl DenseFacts<'_> {
             Lifetime::TARGET, Category::Staging, "ordered GDN commit staging");
         for (index, bytes) in self.buffers.verify.into_iter().enumerate() {
             add(format!("verify.{index}"), gpu, bytes as u64, Lifetime::TARGET,
-                Category::Workspace, "block verify marks, logits and taps");
+                if index == 0 { Category::Kv } else { Category::Workspace }, "block verify marks, logits and taps");
         }
         let layers = self.cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
         let conv_slot = ((self.cfg.gdn.conv_kernel - 1) * self.cfg.gdn.conv_width() * 2) as u64;

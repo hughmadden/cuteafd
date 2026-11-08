@@ -403,7 +403,7 @@ impl<'a> DenseFfn<'a> {
             let scratch = match native_scratch {
                 Some(scratch) => scratch,
                 None => std::rc::Rc::new(super::native::NativeScratch::allocate(device,
-                    &core.scratch_layout(admission.rows)?.context("native dense scratch")?)?),
+                    &core.scratch_layout(admission.rows)?.context("native dense scratch")?, crate::shared::memory::Tag::workspace("step5/native-projection"))?),
             };
             ensure!(scratch.scratch.rows >= admission.rows, "Step-5 native dense scratch rows");
             let take = |core: &mut super::native::NativeLayer<'a>, name: &str| -> Result<super::native::NativeLinear<'a>> {
@@ -463,7 +463,8 @@ impl<'a> DenseFfn<'a> {
         let spans = cuteafd_loader::plan::families::step5::native::dense_layout(admission.rows, admission.span)?;
         ensure!(spans.iter().zip(&admission.planes).all(|(span, &bytes)| span.1 == bytes),
             "Step-5 dense region layout differs from admission");
-        let planes = scratch::region_planes(device, &spans, arena)?;
+        let planes = scratch::region_planes(device, &spans, arena,
+            crate::shared::memory::Tag::workspace("step5/dense-scratch"))?;
         let stream = scratch::standalone(device, arena);
         Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }
@@ -830,7 +831,7 @@ mod tests {
             Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
         let planes = cuteafd_loader::plan::families::step5::native::dense_planes(128)?;
         let bytes = cuteafd_loader::plan::families::step5::native::plane_bytes(&planes)?;
-        let arena = Arena::new(device, usize::try_from(bytes)?)?;
+        let arena = Arena::new(device, usize::try_from(bytes)?, crate::shared::memory::TEST)?;
         for &layer in layers {
             native_dense_component(device, &programs, &checkpoint, &arena, layer)?;
         }

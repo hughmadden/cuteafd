@@ -3,6 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::serving_capacity::WeightArenaLayout;
 use crate::shared::memory::{device::Device, weight_arena::DeviceWeightArena};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) fn name(layer: super::layer::ExpertLayer, plane: usize) -> String {
     format!("{layer:?}.{plane}")
@@ -10,7 +11,7 @@ pub(crate) fn name(layer: super::layer::ExpertLayer, plane: usize) -> String {
 
 pub(crate) fn arena<'a>(device: Device<'a>, format: &str,
     regions: impl IntoIterator<Item = (String, usize)>) -> Result<DeviceWeightArena<'a>> {
-    DeviceWeightArena::new(device, layout(device.id, format, regions)?)
+    DeviceWeightArena::new(device, layout(device.id, format, regions)?, ArenaTag::experts("experts/rtx-onboard"))
 }
 
 pub(crate) fn layout(device: i32, format: &str,
@@ -26,7 +27,7 @@ pub(crate) fn assert_receipts(receipts: &[cuteafd_loader::placement::planner::Re
     use cuteafd_core::memory_layout::Category;
     use std::collections::BTreeMap;
     let roots = receipts.iter().filter(|receipt| receipt.allocation.view.is_none()
-        && receipt.allocation.category == Category::Weights && receipt.allocation.group == "weight arena")
+        && receipt.allocation.category == Category::Experts && receipt.allocation.group == "weight arena")
         .map(|receipt| (receipt.allocation.id.as_str(), receipt.allocation.bytes)).collect::<Vec<_>>();
     let actual = roots.iter().copied().collect::<BTreeMap<_, _>>();
     let expected = layouts.iter().map(|layout| (layout.id(), layout.bytes() as u64)).collect::<BTreeMap<_, _>>();

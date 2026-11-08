@@ -6,7 +6,7 @@ use anyhow::{bail, ensure, Context, Result};
 use cuteafd_ffi::{programs::Programs, Bf16Add, KimiExpertInput, KimiFfn, KimiFfnBatch,
     KimiKda, KimiKdaCommit, KimiLatent, KimiMlaMode, KimiPrefixMode, KimiResidual,
     KimiResidualBatch, KimiResidualSite, KimiRmsNorm, KimiRouter};
-use crate::shared::{memory::device::{Allocation, Device, DeviceOwner, Stream}, prefix::view};
+use crate::shared::{memory::{device::{Allocation, Device, DeviceOwner, Stream}, Tag}, prefix::view};
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::VocabularyHead};
 use std::rc::Rc;
 use super::weights::GlobalWeights;
@@ -406,16 +406,15 @@ impl LaneLayout {
     pub(super) fn allocate_on<'a>(&self, device: Device<'a>, stream: Rc<Stream<'a>>) -> Result<Lane<'a>> {
         ensure!(stream.device.id == device.id && std::ptr::eq(stream.device.library, device.library),
             "Kimi admitted lane stream differs from device");
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi lane");
-        let arena = Allocation::new(device, self.arena_bytes)?;
+        let arena = Allocation::new(device, self.arena_bytes, Tag::workspace("kimi/lane"))?;
         let operands = self.operands.iter().filter(|(name, _)| !self.arena_offsets.contains_key(*name))
             .map(|(name, bytes)| {
-                let allocation = Allocation::new(device, *bytes)?;
+                let allocation = Allocation::new(device, *bytes, Tag::workspace("kimi/lane"))?;
                 ensure!(allocation.buffer.bytes == *bytes && allocation.buffer.device_id == device.id,
                     "Kimi allocated lane operand {name} differs from admitted extent/device");
                 Ok((*name, allocation))
             }).collect::<Result<BTreeMap<_, _>>>()?;
-        let core = self.core.as_ref().map(|layout| layout.allocate(device)).transpose()?;
+        let core = self.core.as_ref().map(|layout| layout.allocate(device, Tag::workspace("kimi/lane-projection"))).transpose()?;
         let lane = Lane { stream, operands, arena: Some(arena), layout: self.clone(), window: None, metadata_bank: 0, core };
         lane.prime_attention()?;
         Ok(lane)
@@ -1795,11 +1794,10 @@ impl IoLayout {
         ensure!(weights.core_head.is_some()==self.core_head,"Kimi head storage differs from admitted IO format");
         if self.rank == 0 { weights.buffer("embedding")?; }
         if self.rank == self.ranks - 1 && !self.core_head { weights.buffer("head")?; }
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi token IO");
         let [ids, logits, workspace] = self.extents();
         let allocate = |bytes| -> Result<Option<Allocation<'a>>> {
             if bytes == 0 { return Ok(None); }
-            let allocation = Allocation::new(device, bytes)?;
+            let allocation = Allocation::new(device, bytes, Tag::workspace("kimi/token-io"))?;
             ensure!(allocation.buffer.bytes == bytes && allocation.buffer.device_id == device.id,
                 "Kimi IO allocation differs from admitted extent/device");
             Ok(Some(allocation))
@@ -2398,7 +2396,7 @@ mod tests {
         layout.arena_offsets.clear();
         layout.arena_bytes = 0;
         let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
-            Ok((name, Allocation::new(device, bytes)?))).collect::<Result<BTreeMap<_, _>>>())?;
+            Ok((name, Allocation::new(device, bytes, crate::shared::memory::TEST)?))).collect::<Result<BTreeMap<_, _>>>())?;
         let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, arena: None, layout,
             window: None, metadata_bank: 0, core: None };
         lane.prime_attention()?;
@@ -2472,8 +2470,8 @@ mod tests {
         let device = Device { library: &library, id: 1 };
         let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
         let lane = Lane { stream: stream.clone(),
-            operands: BTreeMap::from([("delta", Allocation::new(device, 16)?)]),
-            arena: Some(Allocation::new(device, 32)?),
+            operands: BTreeMap::from([("delta", Allocation::new(device, 16, crate::shared::memory::TEST)?)]),
+            arena: Some(Allocation::new(device, 32, crate::shared::memory::TEST)?),
             layout: LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout {
                 rows: 1, unit: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
                 arena_offsets: BTreeMap::new(), arena_bytes: 32 }, core: None }, window: None, metadata_bank: 0, core: None };
@@ -3081,7 +3079,7 @@ mod expert_usage_tests {
         impl Fixture<'_> {
             fn upload(&mut self, words: &[u32]) -> Result<CuteafdDeviceBuffer> {
                 let bytes = words.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
-                let buffer = self.library.alloc_device_buffer(bytes.len())?;
+                let buffer = self.library.alloc_device_buffer(bytes.len(), crate::shared::memory::TEST)?;
                 self.buffers.push(buffer);
                 self.library.copy_h2d(buffer, &bytes)?;
                 Ok(buffer)

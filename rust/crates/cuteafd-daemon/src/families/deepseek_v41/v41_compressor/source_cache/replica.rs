@@ -1,6 +1,7 @@
 //! Peer FP4 payload storage. Page ownership remains with the authoritative cache.
 use super::*;
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 
 pub(crate) struct SourceCacheReplica<'a> {
     pub storage: Rc<SourceReplica<'a>>,
@@ -65,13 +66,13 @@ impl<'a> SourceReplica<'a> {
         ensure!(source.writing.get() == 0 && source.pages.iter().all(Vec::is_empty),
             "source replica requires an empty source pool");
         device.run(|| device.library.cuda_enable_peer(source.kv_values.buffer.device_id))?;
-        let lengths = Allocation::new(device, source.lengths.buffer.bytes)?;
+        let lengths = Allocation::new(device, source.lengths.buffer.bytes, Tag::kv("v41/compressed-cache-replica"))?;
         device.run(|| device.library.copy_h2d(lengths.buffer, &vec![0; lengths.buffer.bytes]))?;
         Ok(Self {
             copy: device.run(|| device.library.v41_peer_copy())?,
-            values: Allocation::attention_plane(device, source.capacity, KV_VALUES, "peer compressed cache values")?,
-            scales: Allocation::attention_plane(device, source.capacity, KV_SCALES, "peer compressed cache scales")?,
-            pages: Allocation::new(device, source.page_table.buffer.bytes)?,
+            values: Allocation::attention_plane(device, source.capacity, KV_VALUES, "peer compressed cache values", Tag::kv("v41/compressed-cache-replica"))?,
+            scales: Allocation::attention_plane(device, source.capacity, KV_SCALES, "peer compressed cache scales", Tag::kv("v41/compressed-cache-replica"))?,
+            pages: Allocation::new(device, source.page_table.buffer.bytes, Tag::kv("v41/compressed-cache-replica"))?,
             lengths, owner: source.writing.clone(), capacity: source.capacity, stride: source.stride,
         })
     }

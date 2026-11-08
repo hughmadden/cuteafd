@@ -13,6 +13,7 @@ use cuteafd_loader::plan::families::step5::coordinator::{
     RankWeightLayout, WeightOperand, WeightSlice,
 };
 use std::collections::BTreeMap;
+use cuteafd_core::memory_layout::ArenaTag;
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
 
@@ -111,7 +112,7 @@ pub(super) fn load_operand<'a>(
     } else if operand.dtype == DType::F8E4M3 { "fp8-block128" } else {
         "f32"
     });
-    let allocation = weight_allocation(device, arena, &operand.name, usize::try_from(operand.allocation_bytes)?)?;
+    let allocation = weight_allocation(device, arena, &operand.name, usize::try_from(operand.allocation_bytes)?, ArenaTag::weights("step5/target"))?;
     if operand.dtype == DType::F8E4M3 {
         use crate::shared::{native_attention::{attention_records, AttentionRecord}, experts::rtx::dense::DenseLoad};
         let native = operand.native_layout(layout.rank, layout.ranks)?;
@@ -255,7 +256,7 @@ impl<'a> RankWeights<'a> {
             .first()
             .context("Step-5 embedding source")?;
         let embedding = EmbedSource::new(&checkpoint.snapshot, &source.shard, &source.meta, 4096)?;
-        let arena = DeviceWeightArena::new(device, packed)?;
+        let arena = DeviceWeightArena::new(device, packed, ArenaTag::weights("step5/target"))?;
         device.run(|| {
             let (embedding, operands) =
                 TokenEmbedding::load_with(device.library, embedding, EmbedPlacement::Gpu, || {
@@ -270,7 +271,7 @@ impl<'a> RankWeights<'a> {
                         );
                     }
                     Ok(operands)
-                }, |name, bytes| weight_allocation(device, Some(&arena), name, bytes))?;
+                }, |name, bytes| weight_allocation(device, Some(&arena), name, bytes, ArenaTag::weights("step5/target")))?;
             Ok(Self {
                 embedding,
                 operands,

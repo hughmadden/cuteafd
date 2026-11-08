@@ -1,5 +1,5 @@
 //! Stable per-rank scratch views; each layer retires before the next reuses them.
-use crate::shared::memory::device::{Allocation, Device, Stream};
+use crate::shared::memory::{device::{Allocation, Device, Stream}, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use std::rc::Rc;
@@ -22,9 +22,8 @@ impl BufferOwner for Plane<'_> {
 #[derive(Clone)]
 pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<crate::shared::memory::StandaloneStream<'a>>);
 impl<'a> Arena<'a> {
-    pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-scratch");
-        Ok(Self(Rc::new(Allocation::new(device, bytes)?), Rc::new(crate::shared::memory::StandaloneStream::new(device))))
+    pub fn new(device: Device<'a>, bytes: usize, tag: Tag) -> Result<Self> {
+        Ok(Self(Rc::new(Allocation::new(device, bytes, tag)?), Rc::new(crate::shared::memory::StandaloneStream::new(device))))
     }
 
     pub(super) fn standalone(&self) -> Rc<crate::shared::memory::StandaloneStream<'a>> {
@@ -66,7 +65,8 @@ pub(super) struct CompactKv<'a> {
 }
 impl<'a> CompactKv<'a> {
     pub(super) fn new(device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
-        rows: usize, heads: &[usize], sizes: [usize; 2], arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
+        rows: usize, heads: &[usize], sizes: [usize; 2], arena: Option<(&Arena<'a>, usize)>,
+        tag: Tag) -> Result<Self> {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
         ensure!(rows > 0 && !heads.is_empty(), "Step-5 compact producer capacity");
         let writers = heads.iter().copied().map(|heads| {
@@ -84,7 +84,7 @@ impl<'a> CompactKv<'a> {
                 "{name}: compact producer ABI/geometry/capacity");
             Ok((heads, device.run(|| programs.program(name, &["x", "out"]))?))
         }).collect::<Result<Vec<_>>>()?;
-        Ok(Self { planes: planes(device, &sizes, arena)?, writers, device, rows })
+        Ok(Self { planes: planes(device, &sizes, arena, tag)?, writers, device, rows })
     }
 
     pub(super) fn enqueue(&self, stream: &Stream<'a>, sources: [CuteafdDeviceBuffer; 2],
@@ -134,7 +134,7 @@ mod tests {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
-        let arena = Arena::new(device, 256)?;
+        let arena = Arena::new(device, 256, crate::shared::memory::TEST)?;
         let first = standalone(device, Some((&arena, 0)));
         let second = standalone(device, Some((&arena, 128)));
         assert!(Rc::ptr_eq(&first, &second));
@@ -266,9 +266,9 @@ mod tests {
 /// FFN planes at the shared region offsets (`native::dense_layout`/`routed_layout`)
 /// when arena-backed, so every FFN kind keeps its live planes at common offsets.
 pub(super) fn region_planes<'a>(device: Device<'a>, spans: &[(usize, usize)],
-    arena: Option<(&Arena<'a>, usize)>) -> Result<Vec<Plane<'a>>> {
+    arena: Option<(&Arena<'a>, usize)>, tag: Tag) -> Result<Vec<Plane<'a>>> {
     let Some((arena, base)) = arena else {
-        return planes(device, &spans.iter().map(|&(_, bytes)| bytes).collect::<Vec<_>>(), None);
+        return planes(device, &spans.iter().map(|&(_, bytes)| bytes).collect::<Vec<_>>(), None, tag);
     };
     ensure!(device.id == arena.0.device.id && std::ptr::eq(device.library, arena.0.device.library),
         "Step-5 scratch device mismatch");
@@ -282,10 +282,10 @@ pub(super) fn region_planes<'a>(device: Device<'a>, spans: &[(usize, usize)],
 }
 
 pub(super) fn planes<'a>(device: Device<'a>, sizes: &[usize],
-    arena: Option<(&Arena<'a>, usize)>) -> Result<Vec<Plane<'a>>> {
+    arena: Option<(&Arena<'a>, usize)>, tag: Tag) -> Result<Vec<Plane<'a>>> {
     if let Some((arena, offset)) = arena { return arena.planes(device, sizes, offset); }
     sizes.iter().map(|&bytes| {
-        let owner = Rc::new(Allocation::new(device, bytes)?);
+        let owner = Rc::new(Allocation::new(device, bytes, tag)?);
         Ok(Plane { buffer: owner.buffer, _owner: owner })
     }).collect()
 }

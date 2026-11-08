@@ -4131,7 +4131,9 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
         };
         let bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout, rank, category| memory.devices.iter()
             .filter(|d| d.kind == DeviceKind::Rtx && d.index == rank).flat_map(|d| &d.items)
-            .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash linear/attention scratch"))
+            .filter(|i| i.category == category && (if category == Category::Drafter {
+                i.group != "weight arena" && i.group != crate::placement::planner::ALLOCATION_GRANULARITY_GROUP
+            } else { i.group == "DFlash linear/attention scratch" }))
             .map(|i| i.bytes).sum::<u64>();
         let (native_draft, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
             &[170,188],GlmDraftRepresentation::Fp8Only,2, draft_kv_cache).unwrap();
@@ -4376,20 +4378,23 @@ fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
     assert!(report.fits, "{:?}", report.hints);
     let gpu = gpu_report.memory_layout.unwrap();
     let host = report.memory_layout.unwrap();
-    // The embedding is an alias inside the target root, not a separate charge.
-    assert_eq!(gpu.devices[0].by_category()[&Category::Weights]
-        - host.devices[0].by_category()[&Category::Weights], bytes);
+    // Refused plans retain named fixed reservations rather than solved root groups.
+    // Compare backing extents in either report, excluding derived allocation tails.
+    let weight_bytes = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
+        .filter(|item| item.category == Category::Weights
+            && item.group != crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
+        .map(|item| item.bytes).sum::<u64>();
+    assert_eq!(weight_bytes(&gpu.devices[0]) - weight_bytes(&host.devices[0]), bytes);
     assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={} host_notes={:?} gpu_notes={:?}",
         host.pool_tokens, gpu.pool_tokens, host.notes, gpu.notes);
-    assert_eq!(host.devices[1].by_category().get(&Category::Weights), gpu.devices[1].by_category().get(&Category::Weights));
+    assert_eq!(weight_bytes(&host.devices[1]), weight_bytes(&gpu.devices[1]));
     assert!(host.notes.iter().any(|n| n.contains(&format!("{bytes} device bytes freed"))));
     config["tie_word_embeddings"] = json!(true);
     write_snapshot(dir.path(), &config, &tensors, Some(8));
     let tied = plan(dir.path(), &options).unwrap();
     assert!(!tied.fits);
     assert!(tied.hints.iter().any(|h| h.what.contains("tie_word_embeddings")));
-    assert_eq!(tied.memory_layout.unwrap().devices[0].by_category()[&Category::Weights],
-        gpu.devices[0].by_category()[&Category::Weights]);
+    assert_eq!(weight_bytes(&tied.memory_layout.unwrap().devices[0]), weight_bytes(&gpu.devices[0]));
 }
 
 #[test]
@@ -4415,8 +4420,10 @@ fn mimo_small_card_auto_embedding_and_full_context() {
     let gpu_report = plan(dir.path(), &options).unwrap();
     let embedding = component(&gpu_report, Component::Embedding).bytes;
     let gpu = gpu_report.memory_layout.unwrap();
-    assert_eq!(gpu.devices[0].by_category()[&Category::Weights]
-        - base.devices[0].by_category()[&Category::Weights], embedding);
+    let weight_bytes = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
+        .filter(|item| item.category == Category::Weights && item.group == "weight arena")
+        .map(|item| item.bytes).sum::<u64>();
+    assert_eq!(weight_bytes(&gpu.devices[0]) - weight_bytes(&base.devices[0]), embedding);
 }
 
 #[test]
@@ -5988,7 +5995,8 @@ fn glm_tied_embedding_keeps_device_owner_in_shared_admission() {
     assert_eq!(embedding.allocation.location, crate::placement::planner::Location::coordinator(0));
     let arenas = weights.coordinator_arenas().unwrap();
     assert_eq!(arenas[0].view(&embedding.allocation.id).unwrap().bytes() as u64, embedding.allocation.bytes);
-    testing::assert_weight_arena_items(&memory.devices[0], &arenas);
+    testing::assert_weight_arena_items(&memory.devices[0], &arenas.iter()
+        .map(|arena| (arena, cuteafd_core::memory_layout::MemoryKind::Weights)).collect::<Vec<_>>());
     assert!(!memory.devices[0].items.iter().any(|item| item.category == Category::Embedding
         || item.group == "GLM target weights"));
     assert!(report.host_ledger.is_none());

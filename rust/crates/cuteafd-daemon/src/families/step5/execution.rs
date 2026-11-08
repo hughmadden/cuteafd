@@ -3,7 +3,7 @@ use super::{scratch::Arena, cache::CacheRank, csa::CsaLayer, ffn::{DenseFfn, Den
     rope::TargetTables, routed::{RoutedFfn, RoutedPlan}, swa::SwaLayer,
     transaction::{Staging, Step}};
 use crate::shared::{experts::{rtx::pair::{self, SubmissionScope}, staging::RouteStaging},
-    memory::device::{Allocation, Device, DeviceOwner},
+    memory::{device::{Allocation, Device, DeviceOwner}, Tag},
     peer_split::{PeerExchange, RankDevice, attention::{self, AttentionStateOwners,
         HeadKernels, HeadMerge, HeadPrecision, HeadProjection, HeadSequence,
         LaneOrder, LayerKernels, LayerProtocol, PipelineKernels}, hop::{HopLink, HopTicket}, TerminalState}, spark_intake::SparkLink};
@@ -18,6 +18,7 @@ use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry,
     ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
     expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use std::{cell::{Cell, RefCell}, ffi::c_void, rc::Rc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 const H: usize = 4096;
 
@@ -159,9 +160,11 @@ impl<'a> NativeOwners<'a> {
                 let (_, rank_layout) = plan.layer(rank, 0)?;
                 let native_layout = native_scratch_layout(rank_layout, rows, count)?;
                 let native_bytes = native_layout.as_ref().map(|l| l.bytes()).transpose()?.unwrap_or(0);
-                // The arena holds attention and FFN regions; the native scratch is its own admitted owner.
-                let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes)?;
-                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout)
+                // The arena holds the sequential attention/FFN regions and, after they
+                // retire, the MTP stage scratch. One backing keeps one kind and charge.
+                let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes,
+                    Tag::workspace("step5/sequential-scratch"))?;
+                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout, crate::shared::memory::Tag::workspace("step5/native-projection"))
                     .map(Rc::new)).transpose()?;
                 let rope = Rc::new(TargetTables::load_in(device, programs, &contract, super::weights::ROPE_PREFIX,
                     available[rank], &[], Some(&weight_arenas[rank]))?);
@@ -486,7 +489,7 @@ impl<'e, 'a> Execution<'e, 'a> {
             None => {
                 owned = devices.iter().enumerate().map(|(rank, &device)| DeviceWeightArena::new(device,
                     super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
-                        device.id, count, false)?))
+                        device.id, count, false)?, ArenaTag::weights("step5/target")))
                     .collect::<Result<Vec<_>>>()?;
                 &owned
             }
@@ -688,7 +691,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             ensure!(link.device.id == devices[entry].id, "Step-5 main intake must be on the entry GPU");
             link.installed_grouping()?;
         }
-        let routed_reply = Allocation::new(devices[entry], rows * H * 2)?;
+        let routed_reply = Allocation::new(devices[entry], rows * H * 2, Tag::transport("step5/routed-reply"))?;
         let mut native = native;
         let tp2 = match native.onboarded_tp2.take() {
             None => None,
@@ -709,17 +712,23 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 let streams = std::array::from_fn(|rank| RankDevice { device: devices[rank].id, stream: stages[rank].stream.raw });
                 let pair = devices[0].run(|| Pair::new_with_wire(devices[0].library, streams, ranks, H, 8, unit, rows.min(64), lanes,
                     exchange_dtype, true))?;
-                let plane = |rank: usize, bytes: usize| Allocation::new(devices[rank], bytes.max(256));
+                let plane = |rank: usize, bytes: usize, tag: Tag| {
+                    Allocation::new(devices[rank], bytes.max(256), tag)
+                };
                 let section = unit * 8 * 4;
                 let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
                 let scratch = routes + unit * kind.input_row_bytes(H);
                 let partial = lanes * unit * H * kind.partial_bytes();
                 let onboard = Tp2Onboard {
                     pair,
-                    partial: [plane(0, partial)?, plane(1, partial)?],
-                    incoming: [plane(0, partial)?, plane(1, partial)?],
-                    owner_incoming: [plane(0, partial)?, plane(1, partial)?],
-                    scratch: [plane(0, lanes * scratch)?, plane(1, lanes * scratch)?],
+                    partial: [plane(0, partial, Tag::transport("step5/tp2-partial"))?,
+                        plane(1, partial, Tag::transport("step5/tp2-partial"))?],
+                    incoming: [plane(0, partial, Tag::transport("step5/tp2-incoming"))?,
+                        plane(1, partial, Tag::transport("step5/tp2-incoming"))?],
+                    owner_incoming: [plane(0, partial, Tag::transport("step5/tp2-owner-incoming"))?,
+                        plane(1, partial, Tag::transport("step5/tp2-owner-incoming"))?],
+                    scratch: [plane(0, lanes * scratch, Tag::workspace("step5/tp2-scratch"))?,
+                        plane(1, lanes * scratch, Tag::workspace("step5/tp2-scratch"))?],
                     broadcast_logged: (0..count).map(|_| Cell::new(false)).collect(),
                 };
                 let charged = tp2_exchange_bytes(unit, lanes, kind)?;
@@ -1706,7 +1715,7 @@ mod tests {
                 assert_eq!(admitted.weight_arenas[0].0, served);
                 let components = cuteafd_loader::placement::planner::weight_arena_components(
                     &served, cuteafd_loader::placement::planner::Location::coordinator(rank as u8),
-                    cuteafd_loader::placement::planner::Lifetime::RESIDENT, 1)?;
+                    cuteafd_loader::placement::planner::Lifetime::RESIDENT, 1, cuteafd_core::memory_layout::MemoryKind::Weights)?;
                 let charge = components.iter().filter(|component| !matches!(component.kind,
                     cuteafd_loader::placement::planner::ComponentKind::ResidentWeight(_)))
                     .map(|component| component.bytes.at(1)).collect::<Result<Vec<_>, _>>()?

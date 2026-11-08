@@ -1,6 +1,6 @@
 //! Once-per-rank context storage. Decode lanes and gathered prefill borrow the
 //! same owner; no context allocation belongs to a request or graph variant.
-use crate::shared::{memory::device::{Allocation, Stream}, peer_split::{context::ContextExchange, RankDevice}};
+use crate::shared::{memory::{device::{Allocation, Stream}, Tag}, peer_split::{context::ContextExchange, RankDevice}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::kimi_k3::context::ContextLayout;
@@ -86,7 +86,7 @@ impl<'a> Rank<'a> {
         ensure!(streams.iter().all(|s| s.device.id == device.id
             && std::ptr::eq(s.device.library, device.library)), "Kimi context stream device mismatch");
         let workspace = layout.workspace().into_iter().map(|(name, bytes)| -> Result<_> {
-            let allocation = Allocation::new(device, bytes)?;
+            let allocation = Allocation::new(device, bytes, Tag::workspace("kimi/context"))?;
             ensure!(allocation.buffer.bytes == bytes && allocation.buffer.device_id == device.id,
                 "Kimi context {name} allocation differs from admission");
             Ok((name, allocation))
@@ -94,7 +94,8 @@ impl<'a> Rank<'a> {
         let buffers = layout.buffers();
         let bytes = usize::try_from(buffers.compiled_extent.div_ceil(buffers.staging_unit_rows)
             .checked_mul(buffers.staging_unit_bytes).context("Kimi context staging overflow")?)?;
-        let staging = [Allocation::new(device, bytes)?, Allocation::new(device, bytes)?];
+        let staging = [Allocation::new(device, bytes, Tag::workspace("kimi/context-staging"))?,
+            Allocation::new(device, bytes, Tag::workspace("kimi/context-staging"))?];
         let owner = Self { streams, workspace, staging, layout: layout.clone() };
         let (_, stride) = owner.layout.metadata_extent("context slots", 0)?;
         let banks = owner.buffer("context slots")?.bytes / stride;

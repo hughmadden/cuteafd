@@ -7,6 +7,7 @@ use anyhow::{bail, ensure, Context, Result};
 use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeMetadata, Fp8MoeWeights};
 use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Slicing};
 use std::{ffi::c_void, path::{Path, PathBuf}};
+use crate::shared::memory::Tag;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Fp8MoeTp2Plan {
@@ -134,9 +135,9 @@ impl<'a> Fp8MoeTp2<'a> {
             "FP8 MoE TP2 static allocation plan disagrees with runtime");
         let scratch = {
             let _scope = cuteafd_ffi::memory_ledger::scope("experts/workspace/native_scratch");
-            Allocation::new(device, plan.scratch_bytes)?
+            Allocation::new(device, plan.scratch_bytes, Tag::workspace("experts/fp8moe-scratch"))?
         };
-        let output = Allocation::new(device, plan.output_bytes)?;
+        let output = Allocation::new(device, plan.output_bytes, Tag::workspace("experts/fp8moe-output"))?;
         Ok(Self { completion, device, rank: rank as u8, layers, max_rows,
             workspace_bytes: plan.workspace_bytes, experts, scratch, output })
     }
@@ -178,9 +179,9 @@ impl<'a> Fp8MoeTp2<'a> {
                 "FP8 MoE TP2 static pair allocation plan disagrees with runtime");
             let scratch = {
                 let _scope = cuteafd_ffi::memory_ledger::scope("experts/workspace/native_scratch");
-                Allocation::new(devices[rank], plans[rank].scratch_bytes)?
+                Allocation::new(devices[rank], plans[rank].scratch_bytes, Tag::workspace("experts/fp8moe-scratch"))?
             };
-            let output = Allocation::new(devices[rank], plans[rank].output_bytes)?;
+            let output = Allocation::new(devices[rank], plans[rank].output_bytes, Tag::workspace("experts/fp8moe-output"))?;
             Ok(Self { completion, device: devices[rank], rank: rank as u8, layers: layers.clone(), max_rows,
                 workspace_bytes: plans[rank].workspace_bytes, experts, scratch, output })
         };

@@ -123,9 +123,9 @@ impl<'a> GlmContextSplit<'a> {
                     unsafe { engine.library.reserve_h2d_ordered(table.buffer, engine.stream_of(rank))?; }
                 }
                 engine.library.cuda_zero_bytes(topk_scratch.buffer, topk_scratch.buffer.bytes)?;
-                let _scope = cuteafd_ffi::memory_ledger::scope("context-staging");
                 let view = staging_pages * (record_page_bytes(cfg) as usize + INDEX_PAGE_BYTES);
-                let staging = [engine.alloc(view)?, engine.alloc(view)?];
+                let staging = [engine.alloc_tagged(view, Tag::staging("glm/context-staging"))?,
+                    engine.alloc_tagged(view, Tag::staging("glm/context-staging"))?];
                 // The sink operand is never read (no sink): a 256-byte floor allocation, uncharged.
                 let sink = engine.alloc(0)?;
                 Ok((ContextRank { candidates, own, peer, topk_scratch, partial_scratch, gather, commit, staging }, sink))

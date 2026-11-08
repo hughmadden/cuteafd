@@ -15,7 +15,7 @@
 //! - `consumed`: after `RankDevice::combine`, the slot's planes are released.
 use super::experts::{wave_request, wire_plan, CombineTables, LandedWave, ReplyPlanView, SparkExperts, Wave, WaveSegment, WaveStep,
     MAX_RANKS, TOPK, WIDTH, WIRE_ROW_BYTES};
-use crate::shared::{experts::staging::RouteStaging, memory::device::{Allocation, Stream}, spark_intake::SparkLink,
+use crate::shared::{experts::staging::RouteStaging, memory::{device::{Allocation, Stream}, Tag}, spark_intake::SparkLink,
     spark_waves::WaveTicket};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::families::muse_spark::replies::{Cutoff, ReplyPlan};
@@ -97,8 +97,7 @@ impl<'a> MuseSparkPath<'a> {
         let library = library_owner.as_ref();
         let layout = CombineTables { capacity: unit };
         let tables = {
-            let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse combine tables");
-            Allocation::new(stream.device, layout.bytes() * waves)?
+            Allocation::new(stream.device, layout.bytes() * waves, Tag::workspace("muse/combine-tables"))?
         };
         let mut link = stream.device.run(|| SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config,
             intake_row_bytes, waves, u32::try_from(unit)?))?;

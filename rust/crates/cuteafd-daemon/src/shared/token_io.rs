@@ -19,6 +19,8 @@ use cuteafd_loader::SafetensorsTensorMetadata;
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use crate::shared::memory::Tag;
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(crate) use crate::shared::memory::EmbedPlacement;
 
@@ -189,7 +191,7 @@ impl<'a> TokenEmbedding<'a> {
         Self::load_with(library, source, placement, during, |_, bytes| {
             crate::shared::memory::device::Allocation::new(crate::shared::memory::device::Device {
                 library, id: library.cuda_get_device()?,
-            }, bytes)
+            }, bytes, Tag::embedding("shared/embedding"))
         })
     }
 
@@ -210,7 +212,7 @@ impl<'a> TokenEmbedding<'a> {
         } else { cuteafd_loader::placement::planner::EmbeddingHome::Device(0) };
         let request = source.allocation_request("embedding.table", home)?;
         let mut table = if placement == EmbedPlacement::Host {
-            ResidentWeight::new(library, usize::try_from(request.bytes)?, true)?
+            ResidentWeight::new(library, usize::try_from(request.bytes)?, true, ArenaTag::embedding("shared/embedding"))?
         } else {
             let owner = allocate("embedding.table", usize::try_from(request.bytes)?)?;
             ensure!(std::ptr::eq(owner.device.library, library), "embedding allocation library mismatch");
@@ -255,7 +257,7 @@ impl<'a> TokenEmbedding<'a> {
         Self::row_fp8_with(library, source, owner, |_, bytes| {
             crate::shared::memory::device::Allocation::new(crate::shared::memory::device::Device {
                 library, id: library.cuda_get_device()?,
-            }, bytes)
+            }, bytes, Tag::embedding("shared/embedding"))
         })
     }
 
@@ -764,8 +766,8 @@ impl<'a> TokenSelector<'a> {
     /// A selector for up to `capacity` rows of `vocab` logits.
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");
-        Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12)?,
-            landing: HostAllocation::new(library, capacity * 12)?, wave: None, landed: crate::shared::memory::BlockingWait::new(library), counts: [0; 3] })
+        Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12, Tag::workspace("shared/token-out"))?,
+            landing: HostAllocation::new(library, capacity * 12, Tag::staging("shared/token-out"))?, wave: None, landed: crate::shared::memory::BlockingWait::new(library), counts: [0; 3] })
     }
 
     /// Waits until `stream` passed the work queued on it so far (the
@@ -827,7 +829,7 @@ impl<'a> TokenSelector<'a> {
     fn bind_device(&mut self, owner: i32) -> Result<()> {
         let previous = self.out.buffer.device_id;
         if previous != owner {
-            let out = DeviceAllocation::new(self.library, self.capacity * 12)?;
+            let out = DeviceAllocation::new(self.library, self.capacity * 12, Tag::workspace("shared/token-out"))?;
             let old = std::mem::replace(&mut self.out, out);
             let wave = self.wave.take();
             crate::shared::memory::device::Device { library: self.library, id: previous }.run(|| {
@@ -986,8 +988,8 @@ pub(crate) fn gate(library: &NativeLibrary, embedding: &TokenEmbedding<'_>, firs
         }).collect();
         sample.extend([0, vocab as u32 - 1, sample[3], sample[3]]);
         let row = embedding.hidden() * 2;
-        let (ids, out) = (DeviceAllocation::new(library, sample.len() * 4)?,
-            DeviceAllocation::new(library, sample.len() * 4 * row)?);
+        let (ids, out) = (DeviceAllocation::new(library, sample.len() * 4, Tag::workspace("shared/embedding-check"))?,
+            DeviceAllocation::new(library, sample.len() * 4 * row, Tag::workspace("shared/embedding-check"))?);
         let stream = library.cuda_stream_create()?;
         let checked = (|| -> Result<()> {
             embedding.embed(&sample, ids.buffer, 4, out.buffer, stream)?;
@@ -1055,7 +1057,7 @@ fn sample_check(library: &NativeLibrary, selector: &mut TokenSelector<'_>, row: 
     -> Result<()> {
     let vocab = row.len();
     let rows = 64usize;
-    let buffer = DeviceAllocation::new(library, rows * vocab * 4)?;
+    let buffer = DeviceAllocation::new(library, rows * vocab * 4, Tag::workspace("shared/sampler-check"))?;
     let bytes: Vec<u8> = (0..rows).flat_map(|_| row.iter().flat_map(|v| v.to_le_bytes())).collect();
     library.copy_h2d(buffer.buffer, &bytes)?;
     let stream = library.cuda_stream_create()?;
@@ -1309,7 +1311,7 @@ mod tests {
         let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
             crate::shared::memory::device::Device { library: &library, id: 0 },
             cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/embedding",
-                [("embedding.table".into(), payload.len())])?)?;
+                [("embedding.table".into(), payload.len())])?, crate::shared::memory::TEST_ARENA)?;
         let (packed, ()) = TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu,
             || Ok(()), |name, bytes| arena.view(name, bytes))?;
         let ((recorded, ()), packed_records) = dense::recording(||
@@ -1346,7 +1348,7 @@ mod tests {
         let load = dense::DenseLoad::push(&library);
         let ((peer_embedding, model), mut combined) = dense::recording(|| devices[1].run(||
             TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || devices[0].run(|| {
-                let model = DeviceAllocation::new(&library, source.bytes())?;
+                let model = DeviceAllocation::new(&library, source.bytes(), crate::shared::memory::TEST)?;
                 load.operand(dense::Operand { device: 0, buffer: model.buffer, bytes: source.bytes(),
                     lands: vec![(dense::Rect { name: "model.weight".into(), path: path.clone(), base: 7,
                         row_bytes: source.bytes(), rows: 0..1, cols: 0..source.bytes() }, 0)] })?;

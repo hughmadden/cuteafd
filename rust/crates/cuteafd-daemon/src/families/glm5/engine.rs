@@ -12,7 +12,7 @@
 //! wave stays in flight while the other lane's GPU layers run.
 use super::weights::{GlmLayer, GlmWeights};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, Tag};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLink};
 use cuteafd_transport::expert::{
@@ -76,7 +76,7 @@ pub(crate) fn resident_expert_weights(
         if let Some(view) = &allocation.view {
             let root = owners.get(view.backing.as_str()).context("missing GLM expert weight backing")?;
             ensure!(root.view.is_none() && root.location == allocation.location
-                && (weight_name(&root.id) || (root.category == Category::Weights && root.group == "weight arena")),
+                && (weight_name(&root.id) || (root.category == Category::Experts && root.group == "weight arena")),
                 "invalid GLM expert weight backing {}", view.backing);
             weights.insert(root.id.clone());
         }
@@ -673,9 +673,8 @@ pub(crate) struct GlmEngine<'a> {
 fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize,
     rope_alpha: Option<&[f32]>)
     -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
-    let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
     let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-        let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+        let allocation = DeviceAllocation::new(library, bytes.max(256), Tag::kv("glm/kv-pools"))?;
         library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
         Ok(allocation)
     };
@@ -705,7 +704,7 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
     }
     table
     };
-    let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
+    let cos_sin = DeviceAllocation::new(library, table.len() * 4, Tag::weights("glm/rope"))?;
     library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
     Ok((kv, index, cos_sin))
 }
@@ -793,7 +792,8 @@ impl<'a> GlmEngine<'a> {
         self.expert_usage = Some(cuteafd_ffi::expert_usage::ExpertUsage::new(self.library, geometry,
             &[cuteafd_ffi::expert_usage::UsageDevice { logical: 0, cuda: self.device }], reader)?);
         let _owner = cuteafd_ffi::memory_ledger::owner("glm.usage.lookup");
-        let lookup = HostAllocation::new(self.library, cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES)?;
+        let lookup = HostAllocation::new(self.library,
+            cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES, Tag::staging("glm/usage-lookup"))?;
         // SAFETY: fresh pinned owner is private; all later readers see immutable row pairs.
         unsafe { std::ptr::copy_nonoverlapping(usage_lookup().as_ptr(), lookup.buffer.ptr.cast(),
             cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES / 4); }
@@ -837,7 +837,8 @@ impl<'a> GlmEngine<'a> {
             self.target_core_head = Some(Rc::new(super::core_runtime::CoreHead::new(self.programs, weights, DECODE_ROWS,
                 crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
                 admission.as_ref().and_then(|a| a.ranks[0].target_head.as_ref())
-                    .context("GLM K6 target head has no admitted scratch")?)?));
+                    .context("GLM K6 target head has no admitted scratch")?,
+                Tag::workspace("glm/target-head-projection"))?));
         }
         self.core_admission = admission;
         Ok(())
@@ -850,7 +851,8 @@ impl<'a> GlmEngine<'a> {
             self.draft_core_head = Some(super::core_runtime::CoreHead::new(self.programs, weights, rows,
                 crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
                 self.core_admission.as_ref().and_then(|a| a.ranks[0].draft_head.as_ref())
-                    .context("GLM K6 drafter head has no admitted scratch")?)?);
+                    .context("GLM K6 drafter head has no admitted scratch")?,
+                Tag::drafter_workspace("glm/draft-head-projection"))?);
         }
         Ok(())
     }
@@ -1052,8 +1054,14 @@ impl<'a> GlmEngine<'a> {
         self.skip.is_some()
     }
 
+    /// Step scratch on the current device; a caller with a different kind
+    /// (context staging) states it through [`Self::alloc_tagged`].
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        DeviceAllocation::new(self.library, bytes.max(256))
+        self.alloc_tagged(bytes, Tag::workspace("glm/step-scratch"))
+    }
+
+    fn alloc_tagged(&self, bytes: usize, tag: Tag) -> Result<Dev<'a>> {
+        DeviceAllocation::new(self.library, bytes.max(256), tag)
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -1129,7 +1137,6 @@ impl<'a> GlmEngine<'a> {
     /// workspace, the EXLR8 shared-expert execution, native dense scratch and
     /// the pinned router staging. Shared by every prefill slot on the GPU.
     fn shared_here(&self, rank: usize, t: usize, decode: bool) -> Result<SharedStep<'a>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
@@ -1173,7 +1180,6 @@ impl<'a> GlmEngine<'a> {
 
     fn rows_slots_here(&self, rank: usize, rows: usize, logits: usize, tables: usize, slots: usize, decode: bool)
         -> Result<StepRows<'a>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let lead = rank == 0;
         let split = self.weights.layers.first().is_some_and(|l| l.split);
         let whole = self.weights.layers.iter().any(|layer| layer.attention_owner.is_some());
@@ -2354,7 +2360,7 @@ impl<'a> GlmEngine<'a> {
         let route_bytes = layout.route_bytes;
         let mut staging = w.router_host.borrow_mut();
         if staging.as_ref().is_none_or(|pinned| pinned.buffer.bytes < layout.bytes) {
-            *staging = Some(HostAllocation::new(w.x._owner.library, layout.bytes)?);
+            *staging = Some(HostAllocation::new(w.x._owner.library, layout.bytes, Tag::staging("glm/route-staging"))?);
         }
         let staging = staging.as_ref().context("GLM diagnostic route staging")?;
         let timer = std::time::Instant::now();
@@ -2365,7 +2371,7 @@ impl<'a> GlmEngine<'a> {
         let sample = match cuteafd_transport::route_log::input_sample() {
             Some(ordinal) => {
                 let rows = t.min(cuteafd_transport::route_log::SAMPLE_ROWS);
-                let pinned = HostAllocation::new(self.library, rows * h * 2)?;
+                let pinned = HostAllocation::new(self.library, rows * h * 2, Tag::staging("glm/route-sample"))?;
                 // SAFETY: `x` holds this layer-step's `t` >= `rows` BF16 rows in stream order; the sync below completes it.
                 unsafe { self.library.copy_d2h_host_buffer_async(pinned.buffer, w.x.buffer, rows * h * 2, self.stream)?; }
                 Some((ordinal, rows, pinned))
@@ -2438,8 +2444,8 @@ impl<'a> GlmEngine<'a> {
         let Some(ordinal) = cuteafd_transport::route_log::input_sample() else { return Ok(()) };
         let h = self.cfg.hidden;
         let rows = t.min(cuteafd_transport::route_log::SAMPLE_ROWS);
-        let pinned = HostAllocation::new(self.library, rows * h * 2)?;
-        let ids = HostAllocation::new(self.library, rows * self.cfg.topk * 8)?;
+        let pinned = HostAllocation::new(self.library, rows * h * 2, Tag::staging("glm/route-sample"))?;
+        let ids = HostAllocation::new(self.library, rows * self.cfg.topk * 8, Tag::staging("glm/route-sample"))?;
         // SAFETY: `x`, ids and weights hold this layer-step's rows in stream
         // order; the event below completes the copies (diagnostic only).
         unsafe {
@@ -3538,7 +3544,7 @@ mod prefill_unit_tests {
             .split("fn ").next().unwrap();
         assert!(shared.contains("router_host: Rc::new(RefCell::new(None))"));
         let stage = source.split("fn moe_stage(").nth(1).unwrap().split("fn moe_wave(").next().unwrap();
-        assert!(stage.contains("HostAllocation::new(w.x._owner.library, layout.bytes)?"));
+        assert!(stage.contains("HostAllocation::new(w.x._owner.library, layout.bytes, Tag::staging(\"glm/route-staging\"))?"));
     }
 
     #[test]

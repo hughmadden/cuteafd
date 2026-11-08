@@ -292,7 +292,30 @@ int cuteafd_fp8moe_launch_segments_core(void *ctx, void **ptrs, int rows, void *
     return reply_core(ptrs, rows, 1);
 }
 
-int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out) {
+/* Mirrors the native ABI: every allocation names a kind (1..12) and an owner,
+ * and the attempted tag is retained (owner copied) for failure reports. */
+static __thread uint32_t attempted_kind;
+static __thread char *attempted_owner;
+static int valid_tag(uint32_t kind, const char *owner) {
+    if (!(kind >= 1 && kind <= 12 && owner && owner[0])) return 0;
+    attempted_kind = kind;
+    free(attempted_owner);
+    attempted_owner = strdup(owner);
+    return attempted_owner != NULL;
+}
+/* Native returns 2 (CUTEAFD_STATUS_BUFFER_TOO_SMALL) with the required size. */
+int cuteafd_last_allocation_tag(uint32_t *kind, char *owner, size_t owner_bytes, size_t *required) {
+    if (!kind || !required || (!owner && owner_bytes)) return 1;
+    const char *value = attempted_owner ? attempted_owner : "";
+    *kind = attempted_kind;
+    *required = strlen(value) + 1;
+    if (*required > owner_bytes) return 2;
+    memcpy(owner, value, *required);
+    return 0;
+}
+
+int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out, uint32_t kind, const char *owner) {
+    if (!valid_tag(kind, owner)) return 1;
     out->ptr = malloc(bytes);
     if (!out->ptr) return 1;
     out->bytes = bytes;
@@ -331,7 +354,8 @@ int cuteafd_cuda_dmabuf_allocation_granularity(size_t *out) {
     return 0;
 }
 
-int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
+int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out, uint32_t kind, const char *owner) {
+    if (!valid_tag(kind, owner)) return 1;
     if (extent_only) {
         out->ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -367,7 +391,8 @@ int cuteafd_free_device_buffer(struct device_buffer *buffer) {
     return 0;
 }
 
-int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out) {
+int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out, uint32_t kind, const char *owner) {
+    if (!valid_tag(kind, owner)) return 1;
     // Host-resident managed pages deliberately do not reduce physical free.
     out->ptr = malloc(bytes);
     if (!out->ptr) return 1;
@@ -507,8 +532,8 @@ static void finish_uploads(struct upload_event *upload) {
     upload->copies = NULL;
     upload->count = 0;
 }
-int cuteafd_register_host_mapping(void *ptr, size_t bytes) {
-    if (!ptr || !bytes) return 1;
+int cuteafd_register_host_mapping(void *ptr, size_t bytes, uint32_t kind, const char *owner) {
+    if (!ptr || !bytes || !valid_tag(kind, owner)) return 1;
     event('G'); return 0;
 }
 int cuteafd_unregister_host_mapping(void *ptr) {
@@ -1026,4 +1051,51 @@ int cuteafd_packed_head_linear(const void *x, void *const *planes, void *out,
         int f32, int rows, int k, int n, int coarse, void *scratch, size_t bytes, void *stream) {
     (void)planes; (void)coarse;
     return cuteafd_fp8_w8a16_linear(x, NULL, NULL, out, f32, rows, k, n, scratch, bytes, stream);
+}
+
+/* A fake media tower honouring the native create contract: its two backings
+ * go through the tagged allocator; a failed create keeps the owner only when a
+ * backing could not be freed. fixture_media_free_fails makes every free fail. */
+struct media_backings { void *weights; uint64_t weight_bytes; void *workspace; uint64_t workspace_bytes; };
+struct media_tags { uint32_t weight_kind; const char *weight_owner; uint32_t workspace_kind; const char *workspace_owner; };
+struct fixture_media { void *weights, *workspace; uint64_t weight_bytes, workspace_bytes; };
+static int media_free_fails, media_fail_after_weights;
+void fixture_media_configure(int free_fails, int fail_after_weights) {
+    media_free_fails = free_fails; media_fail_after_weights = fail_after_weights;
+}
+static uint32_t media_release(struct fixture_media *o) {
+    uint32_t released = 0;
+    if (o->weights && !media_free_fails) { free(o->weights); o->weights = NULL; released |= 1; }
+    if (o->workspace && !media_free_fails) { free(o->workspace); o->workspace = NULL; released |= 2; }
+    return released;
+}
+int cuteafd_fixture_media_create(uint64_t weight_bytes, uint64_t workspace_bytes,
+        const struct media_tags *tags, void **out) {
+    *out = NULL;
+    struct fixture_media *o = calloc(1, sizeof *o);
+    if (!o) return 2;
+    if (!valid_tag(tags->weight_kind, tags->weight_owner) || !(o->weights = malloc(weight_bytes))) { free(o); return 2; }
+    o->weight_bytes = weight_bytes;
+    /* As native: the tag is checked and retained before the allocation that fails. */
+    if (!valid_tag(tags->workspace_kind, tags->workspace_owner) || media_fail_after_weights
+            || !(o->workspace = malloc(workspace_bytes))) {
+        media_release(o);
+        if (o->weights || o->workspace) *out = o; else free(o);
+        return 2;
+    }
+    o->workspace_bytes = workspace_bytes;
+    *out = o;
+    return 0;
+}
+int cuteafd_fixture_media_get_backings(void *p, struct media_backings *out) {
+    struct fixture_media *o = p;
+    *out = (struct media_backings){ o->weights, o->weights ? o->weight_bytes : 0,
+        o->workspace, o->workspace ? o->workspace_bytes : 0 };
+    return 0;
+}
+int cuteafd_fixture_media_destroy_backings(void *p, uint32_t *released) {
+    struct fixture_media *o = p;
+    *released = media_release(o);
+    if (!o->weights && !o->workspace) free(o);
+    return media_free_fails ? 1 : 0;
 }

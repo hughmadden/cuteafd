@@ -101,7 +101,8 @@ impl EngramBatchStaging {
     pub fn payload_bytes(rows: usize) -> usize { rows * (24 * (256 + 8) + 1) }
     pub fn new_pinned(library: &cuteafd_ffi::NativeLibrary, capacity: usize) -> Result<Self> {
         Self::storage_bytes(capacity)?;
-        Ok(Self { capacity, payload: StagingBytes::Pinned(library.pinned_bytes(Self::payload_bytes(capacity))?),
+        Ok(Self { capacity, payload: StagingBytes::Pinned(library.pinned_bytes(Self::payload_bytes(capacity),
+            cuteafd_ffi::memory_ledger::Tag::new(cuteafd_ffi::memory_ledger::MemoryKind::Staging, "v41/engram-staging"))?),
             first: std::collections::HashMap::with_capacity(capacity * 24),
             dups: Vec::with_capacity(capacity * 24), ready: None })
     }

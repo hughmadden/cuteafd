@@ -1,7 +1,7 @@
 //! Native projections share the neutral K6 owners; only Flash stage wiring lives here.
 use super::*;
 use crate::shared::{dense_trellis::{CoreHead, CoreWeights, Projection, ProjectionLayout, ProjectionScratch, codebook, retain_partial},
-    memory::device::{Allocation, Device}};
+    memory::{device::{Allocation, Device}, Tag}};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, Bf16F32Add, F32Bf16Narrow};
 use cuteafd_loader::families::glm5_flash::core_admission::{CoreCharges, CoreRankLayout, CoreStageLayout, route_stage_names, fp8_projection_name};
 use std::collections::BTreeMap;
@@ -73,7 +73,7 @@ impl<'a> Rank<'a> {
                 if let Some(actual) = &mut actual { actual.merge(&next)?; } else { actual = Some(next); }
             }
             ensure!(actual.as_ref() == Some(expected), "Flash K6 loaded/admitted projection scratch mismatch");
-            let projection = ProjectionLayout { rows: expected.rows, extents: expected.extents.clone() }.allocate(device)?;
+            let projection = ProjectionLayout { rows: expected.rows, extents: expected.extents.clone() }.allocate(device, crate::shared::memory::Tag::workspace("glmf/native-projection"))?;
             let whole = engine.weights.layers.iter().chain(engine.peer.iter().flat_map(|p| p.layers.iter()))
                 .any(|l| l.attention == GlmNextAttention::Mla && !l.attention_share.split());
             let owned = cuteafd_loader::families::glm5_flash::core_admission::owned_mla(
@@ -96,7 +96,8 @@ impl<'a> Rank<'a> {
             ensure!(admission.stages.as_ref().context("Flash K6 stages not admitted")?[index] == actual_stage,
                 "Flash K6 loaded/admitted stage extents mismatch");
             let stages = actual_stage.extents.iter()
-                .map(|(&n, &b)| Ok((n, Allocation::new(device, b)?))).collect::<Result<_>>()?;
+                .map(|(&n, &b)| Ok((n, Allocation::new(device, b, Tag::workspace("glmf/core-stages"))?)))
+                .collect::<Result<_>>()?;
             Ok(Some(Rc::new(Scratch { projection, stages })))
         };
         let shapes = layers.iter().flat_map(|l| l.attention_native.values())
@@ -111,7 +112,7 @@ impl<'a> Rank<'a> {
         let device = Device { library: engine.library, id: if rank == 0 { engine.device } else { engine.peer()?.device } };
         ensure!(rows == scratch.projection.rows, "Flash K6 retained slot capacity differs from scratch");
         let bytes = retained_bytes(rows, engine.cfg.hidden)?;
-        let allocate = |width| Allocation::new(device, bytes * width);
+        let allocate = |width| Allocation::new(device, bytes * width, Tag::workspace("glmf/core-retained"));
         Ok(Some(Slot { scratch: scratch.clone(), retained: [allocate(1)?, allocate(1)?, allocate(2)?], lane }))
     }
 }
@@ -155,7 +156,8 @@ impl<'a> GlmfEngine<'a> {
         if let GlmfHead::K6(weights) = &self.weights.head {
             let layout = admitted.ranks[0].target_head.as_ref().context("Flash K6 target head not admitted")?;
             self.core_head = Some(CoreHead::new(self.programs, weights, layout.rows,
-                Device { library: self.library, id: self.device }, self.stream, layout)?);
+                Device { library: self.library, id: self.device }, self.stream, layout,
+                crate::shared::memory::Tag::workspace("glmf/target-head-projection"))?);
         }
         self.core_admission = admission;
         Ok(())
@@ -166,7 +168,8 @@ impl<'a> GlmfEngine<'a> {
             let layout = self.core_admission.as_ref().and_then(|a| a.ranks[0].draft_head.as_ref())
                 .context("Flash K6 draft head scratch not admitted")?;
             self.draft_core_head = Some(CoreHead::new(self.programs, weights, rows,
-                Device { library: self.library, id: self.device }, self.stream, layout)?);
+                Device { library: self.library, id: self.device }, self.stream, layout,
+                crate::shared::memory::Tag::drafter_workspace("glmf/draft-head-projection"))?);
         }
         Ok(())
     }

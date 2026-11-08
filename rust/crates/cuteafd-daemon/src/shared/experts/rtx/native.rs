@@ -11,6 +11,7 @@ use cuteafd_ffi::{
     V41Tp2ExpertReducer,
 };
 use std::{ffi::c_void, rc::Rc};
+use crate::shared::memory::Tag;
 
 pub(crate) fn kernel_capacities(max_rows: usize, exports: &[u32]) -> Result<Vec<u32>> {
     ensure!((1..=4096).contains(&max_rows), "invalid TP2 rank capacity");
@@ -705,8 +706,8 @@ impl<'a> NativeTp2<'a> {
             .unwrap();
         let [scratch_bytes, partial_bytes] = Self::allocation_sizes(
             scratch_bytes, geometry, max_rows, output_policy, nvfp4)?;
-        let scratch = Allocation::new(device, scratch_bytes)?;
-        let output = Allocation::new(device, partial_bytes)?;
+        let scratch = Allocation::new(device, scratch_bytes, Tag::workspace("experts/rtx-native-scratch"))?;
+        let output = Allocation::new(device, partial_bytes, Tag::workspace("experts/rtx-native-output"))?;
         let stream = Stream::new(device)?;
         let states = device.own(|| {
             let mut states = Vec::with_capacity(kernels.len());

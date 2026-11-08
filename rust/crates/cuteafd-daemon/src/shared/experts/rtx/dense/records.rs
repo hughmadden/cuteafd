@@ -9,6 +9,7 @@ use crate::shared::fp8_load_quant::{LoadKernels, Target};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::{ffi::c_void, ops::Range, os::unix::fs::FileExt, path::PathBuf};
+use crate::shared::memory::Tag;
 
 /// The most bytes one step stages (one or more whole scale units).
 pub(crate) use cuteafd_loader::shared::dense_read::STEP_BYTES;
@@ -235,7 +236,7 @@ impl Finish {
                     && k_major.is_none_or(|b| b.bytes >= rows * kb * 4 && b.device_id == grid.device_id)
                     && index.iter().all(|&r| r == u32::MAX || (r as usize + 1) * grid_cols * 4 <= grid.bytes),
                     "scale gather outside its operands");
-                let staged = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+                let staged = crate::shared::memory::DeviceAllocation::new(library, rows * 4, Tag::staging("experts/dense-scale-index"))?;
                 let bytes: Vec<u8> = index.iter().flat_map(|r| r.to_le_bytes()).collect();
                 library.copy_h2d(staged.buffer, &bytes)?;
                 // SAFETY: every buffer is live on the current device and sized as
@@ -366,8 +367,7 @@ impl Step {
         let mut device_copy = |scratch: &mut Option<crate::shared::memory::DeviceAllocation<'l>>| -> Result<*const u8> {
             if let Some(ptr) = on_device { return Ok(ptr); }
             if scratch.is_none() {
-                *scratch = Some(crate::shared::memory::DeviceAllocation::named(library, STEP_BYTES,
-                    "staging/coordinator-dense-device")?);
+                *scratch = Some(crate::shared::memory::DeviceAllocation::new(library, STEP_BYTES, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense-device"))?);
             }
             let buffer = scratch.as_ref().context("dense device scratch")?.buffer;
             load_timing::upload(self.bytes(), || library.copy_h2d(buffer, &staged[..self.bytes()]))?;
@@ -410,7 +410,7 @@ impl Step {
                     let bytes = self.bytes();
                     ensure!(bytes > 0 && bytes % 8 == 0 && dst.bytes >= bytes / 2,
                         "I64 narrowing outside its operands");
-                    let status = HostAllocation::named(library, 4, "staging/coordinator-dense-status")?;
+                    let status = HostAllocation::new(library, 4, crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense-status"))?;
                     let alias = library.cuda_host_buffer_device_alias(status.buffer)?;
                     // SAFETY: pinned staging, aligned status and I32 destination
                     // remain live through the drain before status is inspected.
@@ -918,7 +918,7 @@ impl<'a> Mount<'a> {
     fn grow(&mut self, bytes: usize) -> Result<()> {
         if self.staging.as_ref().is_none_or(|s| s.buffer.bytes < bytes) {
             drop(self.staging.take());
-            self.staging = Some(HostAllocation::named(self.library, bytes.max(PINNED_FLOOR_BYTES), "staging/coordinator-dense")?);
+            self.staging = Some(HostAllocation::new(self.library, bytes.max(PINNED_FLOOR_BYTES), crate::shared::memory::tag(crate::shared::memory::MemoryKind::Staging, "staging/coordinator-dense"))?);
         }
         Ok(())
     }
@@ -986,7 +986,7 @@ mod window_tests {
         let bytes = (0..1024).map(|i| (i * 29 % 251) as u8).collect::<Vec<_>>();
         std::fs::write(&path, &bytes)?;
         // No arenas: reproduce the shared mount lifetime on two physical devices.
-        let outputs = (0..2).map(|id| Allocation::new(Device { library: &library, id }, bytes.len()))
+        let outputs = (0..2).map(|id| Allocation::new(Device { library: &library, id }, bytes.len(), crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
         let steps = outputs.iter().map(|output| Step {
             device: output.device.id,
@@ -1064,9 +1064,9 @@ mod window_tests {
         for id in 0..2 { fixture.configure_memory(&library, id, 1 << 30)?; }
         fixture.immediate_copies(&library)?;
         let source = Device { library: &library, id: 1 }.run(||
-            crate::shared::memory::DeviceAllocation::new(&library, 256))?;
+            crate::shared::memory::DeviceAllocation::new(&library, 256, crate::shared::memory::TEST))?;
         let destination = Device { library: &library, id: 0 }.run(||
-            crate::shared::memory::DeviceAllocation::new(&library, 256))?;
+            crate::shared::memory::DeviceAllocation::new(&library, 256, crate::shared::memory::TEST))?;
         let bytes: Vec<_> = (0..256).map(|i| (i as u8).wrapping_mul(29)).collect();
         let untouched = vec![0xa5; 256];
         library.copy_h2d(source.buffer, &bytes)?;
@@ -1173,7 +1173,7 @@ mod absorb_fp8_tests {
             vec![i64::from(i32::MAX) + 1], vec![i64::from(i32::MIN) - 1]] {
             let valid = values.iter().all(|&value| i32::try_from(value).is_ok());
             std::fs::write(&path, values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>())?;
-            let output = crate::shared::memory::DeviceAllocation::new(&library, values.len() * 4)?;
+            let output = crate::shared::memory::DeviceAllocation::new(&library, values.len() * 4, crate::shared::memory::TEST)?;
             let rect = Rect { name: "router".into(), path: path.clone(), base: 0,
                 row_bytes: 8, rows: 0..values.len(), cols: 0..8 };
             let step = Step { device: 0, rects: vec![rect], jobs: vec![Job::NarrowI64I32 { dst: output.buffer }] };
@@ -1202,9 +1202,9 @@ mod absorb_fp8_tests {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         fixture.configure_memory(&library, 0, 1 << 30)?;
-        let mut source = HostAllocation::new(&library, 8)?;
+        let mut source = HostAllocation::new(&library, 8, crate::shared::memory::TEST)?;
         source.bytes_mut().copy_from_slice(&1i64.to_le_bytes());
-        let output = crate::shared::memory::DeviceAllocation::new(&library, 4)?;
+        let output = crate::shared::memory::DeviceAllocation::new(&library, 4, crate::shared::memory::TEST)?;
         let step = Step { device: 0, rects: vec![Rect { name: "router".into(),
             path: fixture.directory().join("unused"), base: 0, row_bytes: 8, rows: 0..1, cols: 0..8 }],
             jobs: vec![Job::NarrowI64I32 { dst: output.buffer }] };
@@ -1246,7 +1246,7 @@ mod absorb_fp8_tests {
         std::fs::write(&path, [kv_b.as_slice(), grid_bytes.as_slice()].concat())?;
         let (share, rank) = (heads / 2, 1usize);
         let first = rank * share * (nope + v);
-        let alloc = |bytes: usize| crate::shared::memory::DeviceAllocation::new(&library, bytes);
+        let alloc = |bytes: usize| crate::shared::memory::DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST);
         let (uk, uk_s) = (alloc(share * lat * nope)?, alloc(share * lat * (nope / 64) * 4)?);
         let (uv, uv_s) = (alloc(share * v * lat)?, alloc(share * v * (lat / 64) * 4)?);
         let values = Rect { name: "kv_b".into(), path: path.clone(), base: 0, row_bytes: lat,

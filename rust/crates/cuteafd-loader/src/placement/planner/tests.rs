@@ -389,8 +389,9 @@ fn shared_draft_arena_reconciliation_maps_roots_views_and_derived_references() -
                 let id = format!("{prefix}{rank}");
                 let location = Location::coordinator(rank as u8);
                 let components = weight_arena_extent_components(&id, 3 << 20, location,
-                    Lifetime::RESIDENT, contract.maximum_pages)?;
+                    Lifetime::RESIDENT, contract.maximum_pages, MemoryKind::DrafterWeights)?;
                 let ComponentKind::Allocation { template, .. } = &components[0].kind else { unreachable!() };
+                assert_eq!(template.category, MemoryKind::DrafterWeights.category());
                 let address = 0x1000000 + rank as u64 * 0x1000000;
                 runtime.push(Receipt { allocation: Allocation { id: format!("{prefix}{ordinal}"), ..template.clone() }, address });
                 let mut alias = Allocation::buffer(format!("draft.{rank}.tensor"), location, 257,
@@ -432,6 +433,42 @@ fn shared_draft_arena_reconciliation_maps_roots_views_and_derived_references() -
 }
 
 #[test]
+fn drafter_kv_root_does_not_remap_as_an_immutable_arena() -> anyhow::Result<()> {
+    assert_eq!(MemoryKind::DrafterWeights.category(), MemoryKind::DrafterKv.category());
+    assert_ne!(MemoryKind::DrafterWeights.behaviour(), MemoryKind::DrafterKv.behaviour());
+    let devices = CoordinatorDevices::new(&[1])?;
+    for kind in [MemoryKind::DrafterKv, MemoryKind::DrafterWorkspace] {
+        let root = Allocation::buffer("glm/draft/0", Location::coordinator(0), 1024,
+            Lifetime::RESIDENT, kind.category(), "drafter state");
+        assert_eq!(devices.remap_weight_arenas(&[root.clone()])?, [root]);
+    }
+    Ok(())
+}
+
+#[test]
+fn arena_tail_report_inherits_category_without_reforecasting_grouped_requests() -> anyhow::Result<()> {
+    let mut p = plan(vec![]);
+    p.facts.allocations.push(Allocation::buffer("draft", Location::coordinator(0), (3 << 20) + 1,
+        Lifetime::RESIDENT, MemoryKind::DrafterWeights.category(), "weight arena"));
+    p.facts.allocation_granularity.push(granular_owner("draft.tail", "draft", vec![(3 << 20) + 1], Lifetime::RESIDENT));
+    let mut grouped = granular_owner("legacy.tail", "a", vec![1 << 20], Lifetime::RESIDENT);
+    grouped.backings.push(GranularityBacking { backing: "b".into(), requests: vec![1 << 20] });
+    for id in ["a", "b"] {
+        p.facts.allocations.push(Allocation::buffer(id, Location::coordinator(0), 1 << 20,
+            Lifetime::RESIDENT, Category::Workspace, "legacy"));
+    }
+    assert_eq!(grouped.bytes()?, 0);
+    p.facts.allocation_granularity.push(grouped);
+    let items = p.items(Location::coordinator(0))?;
+    let tails = items.iter().filter(|item| item.group == ALLOCATION_GRANULARITY_GROUP).collect::<Vec<_>>();
+    assert_eq!(tails.len(), 2);
+    assert_eq!(tails[0].category, MemoryKind::DrafterWeights.category());
+    assert_eq!(tails[0].bytes, (1 << 20) - 1);
+    assert_eq!(tails[1].bytes, 0, "do not round the two small backings independently");
+    Ok(())
+}
+
+#[test]
 fn shared_arena_reconciliation_maps_physical_ids_without_changing_the_plan() -> anyhow::Result<()> {
     use crate::serving_capacity::{expert_weight_arena_id, WeightArenaLayout};
     for physical in [&[1][..], &[0, 1], &[1, 0]] {
@@ -445,7 +482,7 @@ fn shared_arena_reconciliation_maps_physical_ids_without_changing_the_plan() -> 
                 let layout = WeightArenaLayout::new(expert_weight_arena_id("exl3", rank as i32, &selection)?, selection.clone())?;
                 let physical_id = expert_weight_arena_id("exl3", ordinal, &selection)?;
                 let root = Allocation::buffer(layout.id(), location, layout.bytes() as u64,
-                    Lifetime::TARGET, Category::Weights, "weight arena");
+                    Lifetime::TARGET, Category::Experts, "weight arena");
                 let address = 0x10000 + rank as u64 * 0x10000 + if label == "draft" { 0x8000 } else { 0 };
                 planned.push(root.clone());
                 runtime.push(Receipt { allocation: Allocation { id: physical_id.clone(), ..root }, address });
@@ -542,7 +579,7 @@ fn shared_arena_remap_preserves_derived_backings_and_all_owner_scopes() -> anyho
                         let selection = vec![(label.into(), bytes as usize)];
                         let id = expert_weight_arena_id("exl3", ordinal, &selection)?;
                         let root = Allocation::buffer(&id, location, bytes, lifetime,
-                            Category::Weights, "weight arena");
+                            Category::Experts, "weight arena");
                         if scope == 2 {
                             sequential.push(root);
                             continue;

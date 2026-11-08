@@ -375,11 +375,11 @@ cudaError_t setup(Side& side, int device, uint64_t bytes) {
   CHECK(cudaEventCreate(&side.start));
   CHECK(cudaEventCreate(&side.stop));
   CHECK(cudaEventCreateWithFlags(&side.mark, cudaEventDisableTiming));
-  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.buffer, bytes, 0, cudaMalloc(&side.buffer, bytes)));
-  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.recv, bytes, 0, cudaMalloc(&side.recv, bytes)));
+  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.buffer, bytes, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "native/peer-probe", cudaMalloc(&side.buffer, bytes)));
+  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.recv, bytes, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "native/peer-probe", cudaMalloc(&side.recv, bytes)));
   CHECK(cudaMemset(side.buffer, 1 + device, bytes));
   CHECK(cudaMemset(side.recv, 0, bytes));
-  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.control, 64, 0, cudaMalloc(&side.control, 64)));
+  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.control, 64, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "native/peer-probe", cudaMalloc(&side.control, 64)));
   CHECK(cudaMemset(side.control, 0, 64));
   return cudaDeviceSynchronize();
 }
@@ -552,7 +552,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
   CHECK(setup(sa, a, bytes));
   CHECK(setup(sb, b, bytes));
   Pinned bounce;
-  if (test == 3) CHECK(CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &bounce.p, bytes, 1, cudaHostAlloc(&bounce.p, bytes, cudaHostAllocPortable)));
+  if (test == 3) CHECK(CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &bounce.p, bytes, 1, CUTEAFD_MEMORY_KIND_STAGING, "native/peer-probe-bounce", cudaHostAlloc(&bounce.p, bytes, cudaHostAllocPortable)));
   const uint64_t units = bytes / 16;
   const unsigned grid = default_blocks(units, blocks);
   auto u4 = [](uint8_t* p) { return reinterpret_cast<uint4*>(p); };
@@ -617,6 +617,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
       cudaGraph_t graph = nullptr;
       CHECK(cudaSetDevice(a));
       CHECK(cudaStreamEndCapture(sa.stream, &graph));
+      // Third-party residual: CUDA graph executable bytes; cudaGraphExecDestroy retires them.
       const cudaError_t status = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&sa.graph, graph, 0), 0, 0, graph);
       cudaGraphDestroy(graph);
       CHECK(status);
@@ -633,6 +634,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
         }
         cudaGraph_t graph = nullptr;
         CHECK(cudaStreamEndCapture(side.stream, &graph));
+        // Third-party residual: CUDA graph executable bytes; cudaGraphExecDestroy retires them.
         const cudaError_t status = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&side.graph, graph, 0), 0, 0, graph);
         cudaGraphDestroy(graph);
         CHECK(status);
@@ -656,12 +658,12 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
   Pinned ingress_host;
   const uint64_t ingress_bytes = 256ull << 20;
   if (ingress) {
-    CHECK(CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &ingress_host.p, ingress_bytes, 1, cudaHostAlloc(&ingress_host.p, ingress_bytes, cudaHostAllocPortable)));
+    CHECK(CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &ingress_host.p, ingress_bytes, 1, CUTEAFD_MEMORY_KIND_WORKSPACE, "native/peer-probe", cudaHostAlloc(&ingress_host.p, ingress_bytes, cudaHostAllocPortable)));
     for (Side* side : {&sa, &sb}) {
       if (!(ingress & (side == &sa ? 1u : 2u))) continue;
       CHECK(cudaSetDevice(side->device));
       CHECK(cudaStreamCreateWithFlags(&side->ingress, cudaStreamNonBlocking));
-      CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side->ingress_device, ingress_bytes, 0, cudaMalloc(&side->ingress_device, ingress_bytes)));
+      CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side->ingress_device, ingress_bytes, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "native/peer-probe", cudaMalloc(&side->ingress_device, ingress_bytes)));
     }
   }
   // A host thread per loaded device keeps two copies queued until stopped.

@@ -10,6 +10,7 @@ use crate::shared::inventory::{InventoryPhase, RuntimeInventory};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::families::muse_spark::{core::CoreInventory, MuseSparkConfig};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -303,7 +304,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                 let layers = built.layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
                 crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
                     cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(
-                        rank, gpus, &built.global, &layers)?)
+                        rank, gpus, &built.global, &layers)?, ArenaTag::weights("muse/target"))
             }).collect::<Result<Vec<_>>>()?;
             let (embedding, ranks) = devices[0].run(|| crate::shared::token_io::TokenEmbedding::load_with(&library, source.clone(),
                 crate::shared::memory::EmbedPlacement::Gpu, || {
@@ -313,7 +314,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                             unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
                         .collect::<Result<Vec<_>>>()
                 }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(
-                    devices[0], Some(&arenas[0]), name, bytes)))?;
+                    devices[0], Some(&arenas[0]), name, bytes, ArenaTag::weights("muse/target"))))?;
             // Admission names the drafter's home; it joins that GPU's dense
             // rank before the one target/expert push group is planned.
             let draft = match (args.draft.as_deref(), &built.drafter) {

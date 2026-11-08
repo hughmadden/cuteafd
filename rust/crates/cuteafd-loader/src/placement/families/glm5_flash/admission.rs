@@ -437,9 +437,9 @@ fn add_demand(contract: &mut p::Contract, demand: &Demand, id: String,
 }
 
 fn add_arena(contract: &mut p::Contract, layout: &crate::serving_capacity::WeightArenaLayout,
-    gpu: usize, lifetime: p::Lifetime, activation: &p::Activation) -> Result<(), p::Refusal> {
+    gpu: usize, lifetime: p::Lifetime, activation: &p::Activation, kind: cuteafd_core::memory_layout::MemoryKind) -> Result<(), p::Refusal> {
     for mut owner in p::weight_arena_components(layout, p::Location::coordinator(gpu as u8),
-        lifetime, contract.maximum_pages)? {
+        lifetime, contract.maximum_pages, kind)? {
         owner.activation = activation.clone();
         contract.components.push(owner);
     }
@@ -716,7 +716,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
             }
             add_arena(&mut contract, &process.draft_arenas[rank], rank,
-                p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }, &p::Activation::always())?;
+                p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }, &p::Activation::always(), cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?;
         }
         if let Some(draft) = &process.draft_push {
             for owner in draft.allocations(0)? {
@@ -769,7 +769,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     for (home, layouts) in target_arenas.iter().enumerate() {
         let activation = p::Activation::choice(embedding_variable, home);
         for (rank, layout) in layouts.iter().enumerate() {
-            add_arena(&mut contract, layout, rank, p::Lifetime::RESIDENT, &activation)?;
+            add_arena(&mut contract, layout, rank, p::Lifetime::RESIDENT, &activation, cuteafd_core::memory_layout::MemoryKind::Weights)?;
             for (name, view) in layout.views().iter().filter(|(name, _)|
                 name.as_str() == "embedding.table" && embedding > 0 && process.shared_arenas.is_empty()
                     || name.starts_with("embedding.") && name.as_str() != "embedding.table") {
@@ -786,7 +786,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     for (rank, layouts) in process.shared_arenas.iter().enumerate() {
         for (id, bytes) in layouts {
             contract.components.extend(p::weight_arena_extent_components(id, *bytes,
-                p::Location::coordinator(rank as u8), p::Lifetime::RESIDENT, maximum)?);
+                p::Location::coordinator(rank as u8), p::Lifetime::RESIDENT, maximum, cuteafd_core::memory_layout::MemoryKind::Weights)?);
         }
     }
     for (index, row) in facts.fixed.iter().enumerate() {
@@ -856,7 +856,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 lifetime: p::Lifetime { first: p::Phase::Warmup, last: p::Phase::Growth },
                 activation: activation.clone() });
             add_arena(&mut contract, &draft_arenas[usize::from(gpu)], usize::from(gpu),
-                p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }, &activation)?;
+                p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }, &activation, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?;
             add_demand(&mut contract, &Demand::new(gpu, Category::Drafter, "DFlash", nonweights,
                 Basis::Exact), format!("glmf.draft.{gpu}"), activation.clone())?;
             add_demand(&mut contract, &Demand::new(gpu, Category::Workspace, "DFlash linear/attention scratch", i.drafter_scratch[usize::from(gpu)],

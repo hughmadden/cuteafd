@@ -157,7 +157,7 @@ mod tests {
         for id in [0, 1, 0] {
             Device { library: &lib, id }.run(|| {
                 let fill = |bytes: &[u8]| -> Result<DeviceAllocation<'_>> {
-                    let allocation = DeviceAllocation::new(&lib, bytes.len())?;
+                    let allocation = DeviceAllocation::new(&lib, bytes.len(), crate::shared::memory::TEST)?;
                     lib.copy_h2d(allocation.buffer, bytes)?;
                     Ok(allocation)
                 };
@@ -176,7 +176,7 @@ mod tests {
                 let lengths = fill(&u64s(&[256]))?;
                 let metadata = fill(&u64s(&[0, 256, 256, 0, 0, 1]))?;
                 let positions = fill(&u64s(&[0, 255, 256, u64::MAX]))?;
-                let output = DeviceAllocation::new(&lib, 16)?;
+                let output = DeviceAllocation::new(&lib, 16, crate::shared::memory::TEST)?;
                 let stream = LoadStream {
                     library: &lib,
                     raw: lib.cuda_stream_create()?,

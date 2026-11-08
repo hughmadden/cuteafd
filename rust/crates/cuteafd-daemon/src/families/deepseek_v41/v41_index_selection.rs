@@ -2,6 +2,7 @@
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_compressor::{IndexBinding, IndexProposal, IndexScoreGeometry};
 use crate::families::deepseek_v41::v41_index_query::{IndexQueryOutput, IndexQueryGeometry};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LayerStaging, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
@@ -54,11 +55,11 @@ impl<'a> AsyncAudit<'a> {
         }
         let score_bytes = capacity * AUDIT_WIDTH * 4;
         Ok(Some(Self {
-            metadata: DeviceAllocation::new(library, capacity * 48)?,
-            scores: DeviceAllocation::new(library, score_bytes)?,
+            metadata: DeviceAllocation::new(library, capacity * 48, Tag::workspace("v41/index-audit"))?,
+            scores: DeviceAllocation::new(library, score_bytes, Tag::workspace("v41/index-audit"))?,
             layers: (0..8).map(|_| Ok(AsyncAuditRow {
                 host: HostAllocation::new(library, score_bytes * 2 + capacity * 48
-                    + AUDIT_SOURCE_BYTES * 2 + 32768)?, pending: None,
+                    + AUDIT_SOURCE_BYTES * 2 + 32768, Tag::staging("v41/index-audit"))?, pending: None,
             })).collect::<Result<_>>()?,
             score_bytes,
         }))
@@ -269,7 +270,7 @@ impl<'a> IndexSelectionWave<'a> {
                     9 => rows * 2048,
                     12 => rows * 8192,
                     _ => bytes,
-                }).map(Rc::new)
+                }, Tag::workspace("v41/index-selection")).map(Rc::new)
             }).collect::<Result<_>>()?,
             score: library.v41_index_scores()?, top: library.v41_index_topk()?,
             candidates: library.v41_candidate_blocks()?, rows, unit,
@@ -282,7 +283,7 @@ impl<'a> IndexSelectionWave<'a> {
             "index selection storage device differs");
         Ok(Self {
             storage, window: RowWindow::NONE, shared_scratch_busy: None,
-            staging: LayerStaging::new(library, metadata_staging_bytes(capacity), 40)?, capacity,
+            staging: LayerStaging::new(library, metadata_staging_bytes(capacity), 40, "v41/index-metadata")?, capacity,
             graph: None, graphs: crate::shared::decode_graph::GraphBank::new(None),
             retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
             ready: None, pending: None, in_flight: false,
@@ -307,7 +308,7 @@ impl<'a> IndexSelectionWave<'a> {
             "shared index workspace device differs");
         let buffers = source.buffers.iter().enumerate().map(|(i, allocation)| {
             if [9, 12].contains(&i) { DeviceAllocation::new(library,
-                if i == 9 { source.rows * 2048 } else { source.unit * 8192 }).map(Rc::new) }
+                if i == 9 { source.rows * 2048 } else { source.unit * 8192 }, Tag::workspace("v41/index-selection")).map(Rc::new) }
             else { Ok(allocation.clone()) }
         }).collect::<Result<_>>()?;
         Ok(Rc::new(IndexSelectionStorage {
@@ -952,7 +953,7 @@ impl<'a> IndexSelectionWave<'a> {
         let pooled = read(slice(self.b(4), 0, rows * width * 4))?;
         let mut metadata = read(slice(self.b(0), 0, rows * 48))?;
         for row in metadata.chunks_exact_mut(48) { row[..8].fill(0); }
-        let local = DeviceAllocation::new(library, metadata.len())?;
+        let local = DeviceAllocation::new(library, metadata.len(), Tag::workspace("v41/index-audit"))?;
         library.copy_h2d(local.buffer, &metadata)?;
         let mut offset = 0;
         for (request, r) in requests.iter().enumerate() {

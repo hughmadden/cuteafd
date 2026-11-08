@@ -7,7 +7,7 @@
 use super::{DraftInventory, ExpertCost};
 use crate::placement::{AttentionPlacement, Demand, FfnMode, ItemLifetime, LayerMode, MovableId,
     ResidentWeights, planner::*};
-use cuteafd_core::memory_layout::{Basis, Category};
+use cuteafd_core::memory_layout::{Basis, Category, MemoryKind};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,7 +40,7 @@ pub struct Owner {
     pub lifetime: Lifetime,
     /// An immutable weight arena: `bytes` and `resident` are its physical
     /// extent B, charged once with its single SM120 tail (no per-tensor payload).
-    pub arena: Option<crate::serving_capacity::WeightArenaLayout>,
+    pub arena: Option<(crate::serving_capacity::WeightArenaLayout, MemoryKind)>,
 }
 
 impl Owner {
@@ -50,9 +50,9 @@ impl Owner {
     }
 
     /// One preplanned weight arena on `gpu`, live from Load for the whole run.
-    pub fn arena(gpu: u8, layout: crate::serving_capacity::WeightArenaLayout) -> Self {
+    pub fn arena(gpu: u8, layout: crate::serving_capacity::WeightArenaLayout, kind: MemoryKind) -> Self {
         let bytes = layout.bytes() as u64;
-        Self { arena: Some(layout), ..Self::weights(gpu, Category::Weights, "weight arena", bytes) }
+        Self { arena: Some((layout, kind)), ..Self::weights(gpu, kind.category(), "weight arena", bytes) }
     }
 
     /// A transient allocation that is not retained checkpoint weights.
@@ -160,7 +160,7 @@ fn byte_component(template: Allocation, curve: ByteCurve, maximum: u64) -> Resul
 fn owner_components(prefix: &str, owners: &[Owner], maximum: u64) -> Result<Vec<Component>, Refusal> {
     let mut out = Vec::new();
     for (index, owner) in owners.iter().enumerate() {
-        if let Some(layout) = &owner.arena {
+        if let Some((layout, kind)) = &owner.arena {
             // Root B, its resident claim and one separate tail; the shared
             // helper replaces any payload, padding or per-tensor forecast.
             if owner.bytes != layout.bytes() as u64 || owner.resident != owner.bytes || owner.deferred {
@@ -168,11 +168,11 @@ fn owner_components(prefix: &str, owners: &[Owner], maximum: u64) -> Result<Vec<
             }
             // The resident-weight budget keeps counting logical payload P, not
             // the physical extent; the root and tail carry the physical charge.
-            let mut components = weight_arena_components(layout, owner.location, owner.lifetime, maximum)?;
+            let mut components = weight_arena_components(layout, owner.location, owner.lifetime, maximum, *kind)?;
             components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
             let payload = u64::try_from(layout.payload_bytes()).map_err(|_| Refusal::Overflow("V4.1 arena payload"))?;
             let root = Allocation::buffer(layout.id(), owner.location, owner.bytes, owner.lifetime,
-                Category::Weights, "weight arena");
+                kind.category(), "weight arena");
             out.extend(components);
             out.push(Component::resident_weight(ResidentWeight::from_allocation(&root, ResidentWeights(payload)),
                 ByteCurve::fixed(payload, maximum)));
@@ -1060,7 +1060,7 @@ impl<'a> ProductionInput<'a> {
             if layout.bytes() as u64 != owner.bytes || owner.resident != owner.bytes {
                 return Err(invalid("weight arena owner differs from its layout"));
             }
-            owners.push(Owner { arena: Some(layout.clone()), ..owner.clone() });
+            owners.push(Owner { arena: Some((layout.clone(), MemoryKind::Weights)), ..owner.clone() });
         }
         if arenas.values().any(Option::is_some) { return Err(invalid("weight arena layout without an owner")); }
         recipe.owners.push(Case {
@@ -1140,7 +1140,7 @@ pub fn draft_owners(draft: &DraftInventory, gpus: usize) -> Result<Vec<Owner>, R
         // The dense arena is part of `resident`; the rest is routed experts.
         experts = experts.checked_sub(dense.bytes() as u64)
             .ok_or_else(|| invalid("dSpark dense arena exceeds its retained weights"))?;
-        owners.push(Owner::arena(home, dense.clone()));
+        owners.push(Owner::arena(home, dense.clone(), MemoryKind::DrafterWeights));
     }
     if experts > 0 { owners.push(Owner::weights(home, Category::Drafter, "dSpark experts", experts)); }
     if draft.marks > 0 {
@@ -1443,10 +1443,10 @@ impl Recipe for V41Recipe<'_> {
                             let id = format!("v41.encoder.{option}.{copy}.weights");
                             let extent = u64::try_from(layout.bytes()).map_err(|_| Refusal::Overflow("V4.1 vision arena"))?;
                             let root = Allocation::buffer(&id, location, extent, Lifetime::RESIDENT,
-                                Category::Weights, "weight arena");
+                                MemoryKind::Weights.category(), "weight arena");
                             if matches!(location.device, Device::Coordinator(_)) {
                                 let mut arena = weight_arena_extent_components(&id, extent, location,
-                                    Lifetime::RESIDENT, self.maximum_pages)?;
+                                    Lifetime::RESIDENT, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?;
                                 arena.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
                                 components.extend(arena);
                             } else {

@@ -128,7 +128,7 @@ mod tests {
             eprintln!("PASS distributed runtime requests_per_lane={count}: identical proposals/confidence and independent polling");
         }
         let saved = devices[1].run(|| crate::shared::memory::DeviceAllocation::new(&lib,
-            crate::families::deepseek_v41::v41_native_serve::speculative::DRAFT_MARK_BYTES))?;
+            crate::families::deepseek_v41::v41_native_serve::speculative::DRAFT_MARK_BYTES, crate::shared::memory::TEST))?;
         actual.queue_mark(0, 1000, 8, saved.buffer)?;
         while !actual.mark_ready(0)? { std::thread::yield_now(); }
         actual.release(1000)?;

@@ -995,9 +995,9 @@ extern "C" int32_t cuteafd_glm_mla_prefill_check(const void* q, const void* kv, 
   const int64_t n = int64_t(rows) * heads * kD;
   void *ref = nullptr, *out = nullptr;
   double* dev = nullptr;
-  cudaError_t e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &ref, n * 2, 0, cudaMalloc(&ref, n * 2));
-  if (e == cudaSuccess) e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &out, n * 2, 0, cudaMalloc(&out, n * 2));
-  if (e == cudaSuccess) e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &dev, 3 * sizeof(double), 0, cudaMalloc(&dev, 3 * sizeof(double)));
+  cudaError_t e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &ref, n * 2, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "glm/mla-prefill-check", cudaMalloc(&ref, n * 2));
+  if (e == cudaSuccess) e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &out, n * 2, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "glm/mla-prefill-check", cudaMalloc(&out, n * 2));
+  if (e == cudaSuccess) e = CUTEAFD_TRACK_ALLOC("cudaMalloc", &dev, 3 * sizeof(double), 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "glm/mla-prefill-check", cudaMalloc(&dev, 3 * sizeof(double)));
   if (e == cudaSuccess) {
     e = cudaError_t(cuteafd_glm_mla_prefill(q, kv, indices, lengths, ref, rows, heads, topk, record_bytes, scale_log2,
                                             4, stream));

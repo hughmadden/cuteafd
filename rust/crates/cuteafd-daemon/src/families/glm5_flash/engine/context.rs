@@ -32,6 +32,7 @@
 //! **Tables.** Stream-ordered uploads retain their pinned sources until completion. Gather
 //! maps grow by identical prefixes; commit maps belong to each retained live-unit slot.
 use super::*;
+use crate::shared::memory::Tag;
 use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner,
     CommitPlane, ContextExchange};
 use cuteafd_ffi::CuteafdDeviceBuffer;
@@ -108,8 +109,8 @@ impl<'a> GlmfContextSplit<'a> {
                     manifest, "glmf", begin, DECODE_ROWS, sms, &engine.attention_plan));
                 let [a, b] = partial;
                 let partial = [a?, b?];
-                let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
-                let mut allocations = list.iter().map(|&(_, bytes)| engine.alloc(bytes as usize))
+                let mut allocations = list.iter()
+                    .map(|&(_, bytes)| engine.alloc(bytes as usize, Tag::workspace("glmf/context")))
                     .collect::<Result<Vec<_>>>()?.into_iter();
                 let mut next = || allocations.next().context("context workspace list");
                 let (candidates, local, own, peer, topk_scratch, partial_scratch, gather) =
@@ -119,11 +120,11 @@ impl<'a> GlmfContextSplit<'a> {
                 engine.library.cuda_zero_bytes(topk_scratch.buffer, topk_scratch.buffer.bytes)?;
                 let map: Vec<i32> = (0..staging_units as i32).collect();
                 engine.library.copy_h2d(view(&identity, 0, map.len() * 4)?, bytes_of(&map))?;
-                let _scope = cuteafd_ffi::memory_ledger::scope("context-staging");
                 let unit = UNIT_RECORD_BYTES + POOL_PAGE_BYTES;
-                let staging = [engine.alloc(staging_units * unit)?, engine.alloc(staging_units * unit)?];
+                let staging = [engine.alloc(staging_units * unit, Tag::staging("glmf/context-staging"))?,
+                    engine.alloc(staging_units * unit, Tag::staging("glmf/context-staging"))?];
                 // The sink operand is never read (no sink): a 256-byte floor allocation, uncharged.
-                let sink = engine.alloc(0)?;
+                let sink = engine.alloc(0, Tag::workspace("glmf/context"))?;
                 Ok((ContextRank { candidates, local, own, peer, topk_scratch, partial_scratch, gather, commit, identity,
                     staging },
                     sink, partial))

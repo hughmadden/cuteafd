@@ -11,6 +11,7 @@ use cuteafd_loader::formats::mapped_table::lookahead::{LookaheadHandle, RowSourc
 use cuteafd_loader::formats::mapped_table::token_table::{TokenTable, TokenTableLookahead};
 use cuteafd_loader::shared::token_table::TablePipeline;
 use std::{cell::{Cell, RefCell}, ffi::c_void, sync::{Arc, Mutex}, time::Duration};
+use crate::shared::memory::Tag;
 pub(crate) trait RowSource: Send + Sync {
     fn units(&self) -> usize;
     fn rows(&self, unit: usize) -> &[i64];
@@ -66,7 +67,7 @@ impl<'a> MappedTableDevice<'a> {
         let table = TokenTable::new(table, shares, rows_per_token)?;
         let pipeline = |rows: usize, slots: usize, suffix: &str, priority: ReadPriority| -> Result<Arc<Pipeline>> {
             let table = Arc::clone(&table);
-            let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes())? }))
+            let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes(), Tag::staging("shared/mapped-table-rows"))? }))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(TablePipeline::new(&format!("{name}-{suffix}"), storage, move |slot: &mut RowSlot, job: &RowJob| {
                 let ids = job.batch.source.rows(job.unit);

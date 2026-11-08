@@ -478,7 +478,7 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
                 inputs.rows, inputs.logit_rows())?;
             if rank == usize::from(ownership.execution().spec().head_gpu) {
                 native.resident_weights = native.resident_weights.checked_add(ResidentWeights(weights))?;
-                native.weight_arenas.push((predictor.mtp_arena(rank as i32)?, ResidentWeights(weights)));
+                native.weight_arenas.push((predictor.mtp_arena(rank as i32)?, ResidentWeights(weights), cuteafd_core::memory_layout::MemoryKind::DrafterWeights));
                 native.immutable = native.immutable.checked_add(immutable)
                     .context("Step-5 predictor weight forecast overflow")?;
                 native.workspace = native.workspace.max(workspace);

@@ -40,12 +40,49 @@ pub struct MlaDflashConfig {
     pub markov_rank: usize,
 }
 
-/// Named immutable allocation recipe. Admission and device storage consume the
-/// same byte counts; embedding, mask row and vocabulary weights belong to target.
+/// Named allocation recipe. Admission and device storage consume the same byte
+/// counts; embedding, mask row and vocabulary weights belong to target. `kind`
+/// is what the buffer holds, stated where the recipe names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftBuffer {
     pub name: String,
     pub bytes: usize,
+    pub kind: cuteafd_core::memory_layout::MemoryKind,
+}
+
+impl MlaDraftBuffer {
+    /// The kind of every recipe name this module emits; `None` for a name no
+    /// rule covers, so a new buffer cannot inherit a kind by default. Only the
+    /// paged per-layer cache is retained request state; per-batch page tables,
+    /// slots, positions, lengths and the context exchange are rebuilt every
+    /// launch; RoPE inverse frequencies and Markov norms are written once at
+    /// load; only the Context peer landings are Transport (producer scratch that is
+    /// later copied to a peer stays the drafter's workspace).
+    pub fn kind_of(name: &str) -> Option<cuteafd_core::memory_layout::MemoryKind> {
+        use cuteafd_core::memory_layout::MemoryKind::*;
+        if let Some(rest) = name.strip_prefix("layer.") {
+            let (index, field) = rest.split_once('.')?;
+            index.parse::<usize>().ok()?;
+            return match field { "cache" => Some(DrafterKv), "page_table" => Some(DrafterWorkspace), _ => None };
+        }
+        Some(match name {
+            "inverse_frequencies" | "markov_norms" => DrafterWeights,
+            // Peer landings the lead's partial reply is pushed into.
+            "received_partial" | "received_lse" => Transport,
+            "taps" | "fused" | "fused_norm" | "context_positions" | "context_slots" | "query" | "attention"
+            | "lse" | "native_scratch" | "lengths" | "query_offsets" | "native_slots" | "native_positions"
+            | "head_workspace" | "h" | "n" | "delta" | "gate_up" | "act" | "logits" | "markov_workspace"
+            | "anchors" | "ids" | "tokens" | "positions" | "candidates" | "conv" | "dynamic" | "features"
+            | "fp8_scratch" | "projected" | "q_residual" | "topk_workspace" | "unary" | "page_table"
+            | "intervals" | "partial" | "scratch" | "producer_cache" | "producer_slots" | "sink" => DrafterWorkspace,
+            _ => return None,
+        })
+    }
+
+    fn named(name: String, bytes: usize) -> Result<Self> {
+        let kind = Self::kind_of(&name).ok_or_else(|| unsupported("MLA draft buffer has no memory kind rule"))?;
+        Ok(Self { name, bytes, kind })
+    }
 }
 
 /// Placement-independent owner facts. Device ordinals are bound by the caller;
@@ -232,7 +269,10 @@ impl MlaDraftRuntimeLayout {
     pub fn device_buffers(&self) -> Vec<MlaDraftBuffer> {
         if self.owners.is_empty() { return self.buffers.clone(); }
         self.owners.iter().filter(|o| o.domain == MlaDraftDomain::Device)
-            .map(|o| MlaDraftBuffer { name: o.id.clone(), bytes: o.bytes }).collect()
+            .map(|o| MlaDraftBuffer { name: o.id.clone(), bytes: o.bytes,
+                kind: if o.resident_weights.0 > 0 { cuteafd_core::memory_layout::MemoryKind::DrafterWeights }
+                    else { MlaDraftBuffer::kind_of(&o.id).expect("every runtime owner was built through MlaDraftBuffer::named") } })
+            .collect()
     }
     pub fn allocate_device_with<T, E>(&self, mut allocate: impl FnMut(&MlaDraftBuffer) -> std::result::Result<T, E>)
         -> std::result::Result<Vec<T>, E> {
@@ -321,33 +361,34 @@ impl MlaDraftRuntimeLayout {
         let page_bytes = self.paged_cache.page_rows.checked_mul(self.paged_cache.record_bytes)
             .ok_or_else(|| unsupported("Context draft page extent overflow"))?;
         for rank in 0..2 {
-            let mut add = |name: String, bytes: usize| {
-                buffers[rank].push(MlaDraftBuffer { name, bytes: bytes.max(256) });
+            let mut add = |name: String, bytes: usize| -> Result<()> {
+                buffers[rank].push(MlaDraftBuffer::named(name, bytes.max(256))?);
+                Ok(())
             };
             for (layer, &bytes) in self.paged_cache.layer_bytes.iter().enumerate() {
                 if bytes % page_bytes != 0 { return Err(unsupported("Context draft cache is not page aligned")); }
                 let pages = bytes / page_bytes;
                 let owned = pages / 2 + usize::from(rank == 0 && pages % 2 != 0);
                 add(format!("layer.{layer}.cache"), owned.checked_mul(page_bytes)
-                    .ok_or_else(|| unsupported("Context draft local cache overflow"))?);
+                    .ok_or_else(|| unsupported("Context draft local cache overflow"))?)?;
             }
             let width = self.cache.layers.iter().map(|layer| layer.table_width).max().unwrap_or(0);
             // Pool IDs have arbitrary parity. A table can contain only one
             // owner's pages, so its capacity is not half the logical width.
             add("page_table".into(), 64usize.checked_mul(width).and_then(|n| n.checked_mul(4))
-                .ok_or_else(|| unsupported("Context draft compact table overflow"))?);
-            add("intervals".into(), 64 * 2 * 4);
-            add("query_offsets".into(), 65 * 4);
-            add("partial".into(), 64 * 64 * 512 * 2);
-            add("lse".into(), 64 * 64 * 4);
-            add("scratch".into(), 67_371_008);
-            if rank == 0 { add("query".into(), 64 * 64 * 576 * 2); }
+                .ok_or_else(|| unsupported("Context draft compact table overflow"))?)?;
+            add("intervals".into(), 64 * 2 * 4)?;
+            add("query_offsets".into(), 65 * 4)?;
+            add("partial".into(), 64 * 64 * 512 * 2)?;
+            add("lse".into(), 64 * 64 * 4)?;
+            add("scratch".into(), 67_371_008)?;
+            if rank == 0 { add("query".into(), 64 * 64 * 576 * 2)?; }
             else {
-                add("producer_cache".into(), page_bytes);
-                add("producer_slots".into(), 64 * 8);
-                add("received_partial".into(), 64 * 64 * 512 * 2);
-                add("received_lse".into(), 64 * 64 * 4);
-                add("sink".into(), 64 * 4);
+                add("producer_cache".into(), page_bytes)?;
+                add("producer_slots".into(), 64 * 8)?;
+                add("received_partial".into(), 64 * 64 * 512 * 2)?;
+                add("received_lse".into(), 64 * 64 * 4)?;
+                add("sink".into(), 64 * 4)?;
             }
         }
         Ok(MlaDraftContextLayout { buffers })
@@ -1113,7 +1154,7 @@ impl MlaDflashConfig {
         let mut add = |name: String, dimensions: &[usize]| -> Result<()> {
             let bytes = dimensions.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("MLA draft arena multiplication overflow"))?.max(256);
-            buffers.push(MlaDraftBuffer { name, bytes });
+            buffers.push(MlaDraftBuffer::named(name, bytes)?);
             Ok(())
         };
         for (index, layer) in cache.layers.iter().enumerate() {
@@ -1209,7 +1250,7 @@ impl MlaDflashConfig {
                 resident_weights: crate::placement::ResidentWeights::default(),
                 alignment: 256, dtype, shape: dimensions.to_vec(), lifetime: MlaDraftLifetime::Runtime,
                 shared_key: None, staging_for: None, on_use: false });
-            buffers.push(MlaDraftBuffer { name, bytes });
+            buffers.push(MlaDraftBuffer::named(name, bytes)?);
             Ok(())
         };
         use MlaDraftDtype::{Bytes, Bf16, F32, I32, U32, I64};
@@ -1513,6 +1554,52 @@ mod tests {
                 "selector_top_k":16, "target_layer_ids":[19,37,66,78,90], "mask_token_id":163592}})
     }
 
+    /// Every buffer each real layout emits is classified by rule: only the
+    /// retained paged cache is KV, per-batch tables and context-update planes
+    /// are scratch, the RoPE table is a constant and only peer landings are Transport.
+    #[test]
+    fn every_draft_buffer_kind_is_stated_by_its_recipe() {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation::*};
+        use cuteafd_core::memory_layout::MemoryKind::*;
+        let cfg = MlaDflashConfig::from_json(&config()).unwrap();
+        let ml4 = MlaDflashConfig { mla: MlaGeometry { hidden: 6144, heads: 64, q_rank: 0,
+            kv_rank: 512, nope: 64, rope: 64, value: 128 }, intermediate: 24576, eps: 1e-5,
+            block: 3, group: 0, selector_rank: 512, selector_top_k: 0, taps: vec![1,18,36,54,71],
+            vocab: 204800, mask_token: 0, max_context: 1 << 20, windows: vec![Some(2048); 3],
+            rotary: DsparkRotaryPlan { inv_freq: vec![1.;32], attention_factor: 1., softmax_factor: 1. },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: 512 };
+        let capacity = GlmDraftCapacity::new(8, 8, 8).unwrap();
+        let layouts = [
+            cfg.runtime_layout(Bf16Only, capacity, 8192, 4096, 188, 0, MlaCacheFormat::Bf16).unwrap(),
+            cfg.runtime_layout(Fp8Only, capacity, 8192, 4096, 188, 0, MlaCacheFormat::Fp8).unwrap(),
+            ml4.runtime_layout(Bf16Only, GlmDraftCapacity::new(5, 1, 3).unwrap(), 1 << 20, 1 << 21, 188, 0, MlaCacheFormat::Fp8).unwrap(),
+        ];
+        for layout in &layouts {
+            let mut buffers = layout.device_buffers();
+            if let Ok(split) = layout.clone().with_context_split(true) {
+                buffers.extend(split.context_layout().unwrap().buffers.into_iter().flatten());
+            }
+            for buffer in &buffers {
+                let expected = if layout.weight_destinations().iter().any(|w| w.owner == buffer.name) { Some(DrafterWeights) }
+                    else { MlaDraftBuffer::kind_of(&buffer.name) };
+                assert_eq!(Some(buffer.kind), expected, "{}", buffer.name);
+            }
+            let kind = |name: &str| buffers.iter().find(|b| b.name == name).map(|b| b.kind);
+            assert_eq!(kind("layer.0.cache"), Some(DrafterKv));
+            assert_eq!(kind("layer.0.page_table"), Some(DrafterWorkspace));
+            assert_eq!(kind("inverse_frequencies"), Some(DrafterWeights));
+            for name in ["context_slots", "context_positions", "taps", "fused", "fused_norm", "lengths"] {
+                assert_eq!(kind(name), Some(DrafterWorkspace), "{name}");
+            }
+        }
+        let split = layouts[0].clone().with_context_split(true).unwrap().context_layout().unwrap();
+        let rank1 = |name: &str| split.buffers[1].iter().find(|b| b.name == name).unwrap().kind;
+        assert_eq!((rank1("received_partial"), rank1("received_lse")), (Transport, Transport));
+        assert_eq!((rank1("producer_cache"), rank1("scratch"), rank1("sink")), (DrafterWorkspace, DrafterWorkspace, DrafterWorkspace));
+        assert_eq!(MlaDraftBuffer::kind_of("unruled"), None);
+        assert_eq!(MlaDraftBuffer::kind_of("layer.x.cache"), None);
+    }
+
     #[test]
     fn context_draft_recipe_charges_physical_cache_and_exchange_owners() {
         use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
@@ -1552,7 +1639,7 @@ mod tests {
                 assert!(facts.owners.iter().all(|owner| owner.group != "MLA DFlash owned weights"
                     && owner.weights_at_first == 0 && owner.weights_per_page == 0));
                 use crate::placement::planner::{ComponentKind, Lifetime, Location, weight_arena_components};
-                let components = weight_arena_components(arena, Location::coordinator(*gpu), Lifetime::RESIDENT, 16).unwrap();
+                let components = weight_arena_components(arena, Location::coordinator(*gpu), Lifetime::RESIDENT, 16, cuteafd_core::memory_layout::MemoryKind::DrafterWeights).unwrap();
                 let ComponentKind::Allocation { template: root, .. } = &components[0].kind else { panic!("arena root") };
                 let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("arena tail") };
                 assert_eq!(root.bytes, arena.bytes() as u64);

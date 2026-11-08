@@ -392,7 +392,7 @@ mod draft_cli_tests {
         let _owner = memory_ledger::owner(&tag);
         let staging_bytes = || memory_ledger::snapshot().by_owner(Space::Pinned, -1)
             .get(tag.as_str()).copied().unwrap_or(0);
-        let mut target = DeviceAllocation::new(&library, 512)?;
+        let mut target = DeviceAllocation::new(&library, 512, crate::shared::memory::TEST)?;
         library.copy_h2d(target.buffer, &[1; 64])?;
         assert_eq!(staging_bytes(), 64);
         assert_eq!(fixture.events()?, "DAH");
@@ -415,11 +415,11 @@ mod draft_cli_tests {
         }, |_| {
             assert_eq!(staging_bytes(), 0, "first prime must not retain loader staging");
             assert!(fixture.events()?.ends_with("HF"), "release must follow the last upload");
-            let prime = DeviceAllocation::new(&library, 16)?;
+            let prime = DeviceAllocation::new(&library, 16, crate::shared::memory::TEST)?;
             drop(prime);
             with_startup_graphs(false, Some((1, draft)), (1, false), |_, _| {
                 assert_eq!(staging_bytes(), 0);
-                let warm = DeviceAllocation::new(&library, 16)?;
+                let warm = DeviceAllocation::new(&library, 16, crate::shared::memory::TEST)?;
                 drop(warm);
                 Ok(())
             }, || unreachable!("no TP2 diagnostics in this fixture"), || {
@@ -2394,7 +2394,7 @@ impl Opened {
                 args.kda_output_shard, args.fp8_head, embedding)?
         };
         let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {
-            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(*device, layout)?))
+            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(*device, layout, cuteafd_core::memory_layout::ArenaTag::weights("glmf/target"))?))
         }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
         let loader = weights::GlmfLoader { arenas: std::rc::Rc::new(arenas), ..loader };
         let plan_dense = |sparks: usize| -> Result<_> {
@@ -2404,10 +2404,7 @@ impl Opened {
             let ((embedding, model), mut records) = crate::shared::experts::rtx::dense::recording(|| {
                 embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(
                     &self.library, embed.as_ref().context("legacy Flash embedding source")?.clone(), args.token_io.embed_placement, || {
-                        devices[0].run(|| {
-                            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                            planning.model(&self.cfg, &execution)
-                        })
+                        devices[0].run(|| planning.model(&self.cfg, &execution))
                     }, |name, bytes| planning.allocate(embedding_device.id, name, bytes)))
             })?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
@@ -2659,10 +2656,8 @@ impl Opened {
                 None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     embed.as_ref().context("legacy Flash embedding source")?.clone(),
                     args.token_io.embed_placement, || {
-                        crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(|| {
-                            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                            loader.model(&self.cfg, &execution)
-                        })
+                        crate::shared::memory::device::Device { library: &self.library, id: args.device }
+                            .run(|| loader.model(&self.cfg, &execution))
                     }, |name, bytes| loader.allocate(embedding_device.id, name, bytes)))?),
             };
             let tp2 = if tp2_layers.is_empty() { pushed_whole = pushed; None }

@@ -1,7 +1,7 @@
 //! Owned compressed EXL3 device residency. The native execution adapter binds
 //! these buffers only after loading completes and must retain them for graphs.
 use super::layer::{ExpertLayer, ExpertLoadBudget, EXPERT_READ_LANES};
-use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{OfficialV41Catalog, V41Exl3Layer, V41Exl3Residency};
@@ -126,7 +126,7 @@ impl<'a> Exl3Weights<'a> {
             if let Some(backing) = owner.backing.as_ref().and_then(|a| a.weight_backing()) {
                 for (index, buffer) in self.buffers.iter().enumerate() {
                     inventory.weight_view(&format!("{name}.{index}"), buffer.buffer,
-                        crate::shared::memory::device::WeightArenaBacking { id: backing.id, buffer: backing.buffer })?;
+                        crate::shared::memory::device::WeightArenaBacking { id: backing.id, buffer: backing.buffer, kind: backing.kind })?;
                 }
                 return Ok(());
             }
@@ -205,7 +205,7 @@ impl<'a> Exl3Weights<'a> {
             Ok(layout)
         }).collect::<Result<Vec<_>>>()?;
         let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
-            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout))
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/exl3-tp2")))
             .collect::<Result<Vec<_>>>()?;
         let mut full_bytes = 0;
         let mut pinned_admitted = 0;
@@ -393,7 +393,7 @@ impl<'a> Exl3Weights<'a> {
         let mut hosts = (0..BANKS)
             .map(|_| {
                 (0..EXPERT_READ_LANES)
-                    .map(|_| HostAllocation::new(library, per_host))
+                    .map(|_| HostAllocation::new(library, per_host, Tag::staging("experts/exl3-load")))
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;

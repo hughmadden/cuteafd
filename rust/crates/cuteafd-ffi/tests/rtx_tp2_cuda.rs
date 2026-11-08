@@ -6,6 +6,9 @@ use cuteafd_ffi::{
 };
 use std::ffi::c_void;
 
+/// Scratch allocated by this integration test.
+const TEST: cuteafd_ffi::memory_ledger::Tag = cuteafd_ffi::memory_ledger::Tag::workspace("test/scratch");
+
 struct Arena<'a> {
     library: &'a NativeLibrary,
     device: i32,
@@ -24,7 +27,7 @@ impl<'a> Arena<'a> {
     }
     fn alloc(&mut self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         self.library.cuda_set_device(self.device)?;
-        let buffer = self.library.alloc_device_buffer(bytes)?;
+        let buffer = self.library.alloc_device_buffer(bytes, TEST)?;
         self.buffers.push(buffer);
         Ok(buffer)
     }

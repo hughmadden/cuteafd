@@ -1,6 +1,7 @@
 //! Real backbone low-rank query projection, normalization and rotary graphs.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -144,18 +145,18 @@ impl<'a> AttentionQueryWeights<'a> {
             .collect::<Result<Vec<_>>>()?;
         let scratch = kernels
             .iter()
-            .map(|k| DeviceAllocation::new(self.library, k.info().scratch_bytes as usize))
+            .map(|k| DeviceAllocation::new(self.library, k.info().scratch_bytes as usize, Tag::workspace("v41/attention-query")))
             .collect::<Result<Vec<_>>>()?;
         let storage = AttentionQueryStorage {
             stream,
             kernels,
             scratch,
-            alpha: DeviceAllocation::new(self.library, 4)?,
+            alpha: DeviceAllocation::new(self.library, 4, Tag::workspace("v41/attention-query"))?,
             buffers: ROW_BYTES
                 .into_iter().enumerate()
                 .map(|(i, n)| {
                     if i == 4 && !cfg!(test) { Ok(None) }
-                    else { DeviceAllocation::new(self.library, n * unit as usize).map(Some) }
+                    else { DeviceAllocation::new(self.library, n * unit as usize, Tag::workspace("v41/attention-query")).map(Some) }
                 })
                 .collect::<Result<Vec<_>>>()?,
             guard: crate::shared::memory::row_window::ScratchGuard::new(self.library, readers)?,
@@ -177,7 +178,7 @@ impl<'a> AttentionQueryWeights<'a> {
     pub fn on_storage(&self, storage: std::rc::Rc<AttentionQueryStorage<'a>>) -> Result<AttentionQueryWave<'_, 'a>> {
         ensure!(storage.kernels.len() == self.scales.len(), "attention query storage plans differ from the weights");
         let value = AttentionQueryWave {
-            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8)?,
+            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8, Tag::staging("v41/attention-query"))?,
             norm: self.library.v41_attention_ops()?,
             weights: self,
             capacity: storage.unit,
@@ -772,7 +773,7 @@ mod tp2_tests {
                 Weights::load_peak_device_bytes(Kind::QueryB))?]];
             let mut projection=Wave::new([&halves[0],&halves[1]],capacity,owner,
                 Wave::device_bytes(&library,Kind::QueryB,capacity,owner)?)?;
-            let input=Allocation::new(device,capacity as usize*10240)?;
+            let input=Allocation::new(device,capacity as usize*10240, crate::shared::memory::TEST)?;
             query.enable_small_graph_shapes();
             for (cycle,rows) in [1,6,16,6,1].into_iter().enumerate() {
                 let host:Vec<u8>=(0..capacity as usize*5120).flat_map(|i| {
@@ -863,7 +864,7 @@ mod guarded_scratch_tests {
         }).collect() };
         let tokens = |seed: usize| -> Vec<u64> { (0..rows).map(|i| (seed * 4096 + i * 3) as u64).collect() };
         let sources = [input(0), input(1)].map(|host| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
-            let buffer = crate::shared::memory::DeviceAllocation::new(&library, host.len())?;
+            let buffer = crate::shared::memory::DeviceAllocation::new(&library, host.len(), crate::shared::memory::TEST)?;
             library.copy_h2d(buffer.buffer, &host)?;
             Ok(buffer)
         }).into_iter().collect::<Result<Vec<_>>>()?;
@@ -871,7 +872,7 @@ mod guarded_scratch_tests {
         let reader = Stream::new(Device { library: &library, id: reader_device })?;
         let rotated_bytes = rows * ROW_BYTES[3];
         library.cuda_set_device(reader_device)?;
-        let copy = crate::shared::memory::DeviceAllocation::new(&library, rotated_bytes)?;
+        let copy = crate::shared::memory::DeviceAllocation::new(&library, rotated_bytes, crate::shared::memory::TEST)?;
         library.cuda_set_device(0)?;
         let chains = [StageChain::on_devices(&library, &devices)?, StageChain::on_devices(&library, &devices)?];
         for chain in &chains { chain.set_device_order(true); }

@@ -158,7 +158,7 @@ mod tests {
         for (rows, topk, lanes) in [(u64::MAX, 8, 3), (64, u64::MAX, 3), (64, 8, u64::MAX)] {
             assert!(route_exchange_bytes(rows, topk, lanes).is_err());
         }
-        assert_eq!(cuteafd_core::memory_layout::Category::of_scope("peer-split"), Category::Transport);
+        assert_eq!(cuteafd_core::memory_layout::Tag::transport("test/peer-split").kind.category(), Category::Transport);
     }
 
     #[test]
@@ -241,9 +241,9 @@ mod tests {
         let (cfg, spark, no_spark) = fixture(2, 4096);
         let mut facts = input(&cfg, &spark, &no_spark, 2, 4096);
         let arenas = (0..2).map(|rank| vec![
-            MimoWeightArena { layout: WeightArenaLayout::new(format!("mimo.target.rank{rank}"),
+            MimoWeightArena { kind: cuteafd_core::memory_layout::MemoryKind::Weights, layout: WeightArenaLayout::new(format!("mimo.target.rank{rank}"),
                 [("payload".into(), (3 << 20) + 1), ("norm".into(), 17)]).unwrap(), lifetime: Lifetime::RESIDENT },
-            MimoWeightArena { layout: WeightArenaLayout::new(format!("mimo.dflash.rank{rank}"),
+            MimoWeightArena { kind: cuteafd_core::memory_layout::MemoryKind::DrafterWeights, layout: WeightArenaLayout::new(format!("mimo.dflash.rank{rank}"),
                 [("draft.payload".into(), (5 << 20) + 1)]).unwrap(),
                 lifetime: Lifetime { first: Phase::DraftLoad, last: Phase::Growth } },
         ]).collect::<Vec<_>>();
@@ -282,6 +282,7 @@ mod tests {
                 assert_eq!(root.location, Location::coordinator(rank as u8));
                 assert_eq!(root.bytes, arena.layout.bytes() as u64);
                 assert_eq!(root.lifetime, arena.lifetime);
+                assert_eq!(root.category, arena.kind.category());
                 let tails = contract.components.iter().filter_map(|component| match &component.kind {
                     ComponentKind::AllocationGranularity(tail) if tail.id == format!("{}.tail", root.id) => Some(tail),
                     _ => None,

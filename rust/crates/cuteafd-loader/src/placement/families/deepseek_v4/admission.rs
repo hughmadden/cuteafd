@@ -918,11 +918,11 @@ impl Recipe for PreparedV4<'_> {
         // Load (allocated before KV) until Growth, like the runtime receipts.
         for (gpu, arena) in inputs.weights.target.iter().enumerate() {
             owners.components.extend(weight_arena_components(arena, Location::coordinator(gpu as u8),
-                Lifetime::RESIDENT, self.maximum_pages)?);
+                Lifetime::RESIDENT, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?);
         }
         if let Some(arena) = &inputs.weights.draft {
             owners.components.extend(weight_arena_components(arena, Location::coordinator(0),
-                Lifetime::RESIDENT, self.maximum_pages)?);
+                Lifetime::RESIDENT, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?);
         }
         // Context staging, exchange and workspace exist only under a split.
         if self.attention == AttentionPlacement::Context {

@@ -204,9 +204,20 @@ extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd
   size_t blas_bytes=(s->abi_version==2 && s->reserved==5) ? 0 : BLAS_BYTES;
   *out={s->weight_bytes,bytes-blas_bytes,blas_bytes,0,0}; return 0;
 }
-extern "C" int32_t cuteafd_vision_destroy(void* owner) {
-  if(!owner)return cudaErrorInvalidValue;
+extern "C" int32_t cuteafd_vision_get_backings(void* owner, cuteafd_media_backings* out) {
+  if(!owner || !out)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(owner);
+  *out={o->weights, o->weights ? o->ledger.weights : 0, o->arena,
+    o->arena ? o->ledger.scratch+o->ledger.blas_workspace : 0};
+  return 0;
+}
+extern "C" int32_t cuteafd_vision_destroy(void* owner) {
+  uint32_t released=0; return cuteafd_vision_destroy_backings(owner, &released);
+}
+// Release everything releasable, nulling exactly what was freed; the owner and
+// any backing whose free failed are kept for a later attempt.
+static int32_t release_owner(Owner* o, uint32_t* released) {
+  *released=0;
   // Restore the owning device before draining/releasing all storage.
   int previous=-1; cudaGetDevice(&previous); cudaSetDevice(o->device);
   int first=o->stream ? drain(o,0) : 0;
@@ -214,15 +225,26 @@ extern "C" int32_t cuteafd_vision_destroy(void* owner) {
   if(o->window_attention) { int rc=cuteafd_vision_attention_destroy(o->window_attention);if(!first)first=rc; }
   if(o->attention) { int rc=cuteafd_vision_attention_destroy(o->attention);if(!first)first=rc; }
 #endif
-  if(o->blas)cublasDestroy(o->blas);
-  if(o->weights)CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));
-  if(o->arena)CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));
-  if(o->stream)cudaStreamDestroy(o->stream);
+  o->window_attention=nullptr; o->attention=nullptr;
+  if(o->blas) { cublasDestroy(o->blas); o->blas=nullptr; }
+  if(o->weights) { int rc=cudaFree(o->weights); if(rc==0){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;} else if(!first)first=rc; }
+  if(o->arena) { int rc=cudaFree(o->arena); if(rc==0){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;} else if(!first)first=rc; }
+  if(o->stream) { int rc=cudaStreamDestroy(o->stream); if(!first)first=rc; o->stream=nullptr; }
   if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
-  delete o; return first;
+  return first;
 }
-extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t device, uint64_t admitted, void** out) {
-  if(!out)return cudaErrorInvalidValue; *out=nullptr;
+extern "C" int32_t cuteafd_vision_destroy_backings(void* owner, uint32_t* released) {
+  if(!owner || !released)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(owner);
+  int first=release_owner(o,released);
+  // A backing still held after a failed free keeps its owner alive so the
+  // caller's ledger entry stays true; retrying destroy frees it later.
+  if(!o->weights && !o->arena) delete o;
+  return first;
+}
+extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t device, uint64_t admitted,
+    const cuteafd_media_tags* tags, void** out) {
+  if(!out || !tags)return cudaErrorInvalidValue; *out=nullptr;
   cuteafd_vision_ledger ledger{}; int e=cuteafd_vision_required(s,&ledger);
   if(e)return e;
   if(admitted < ledger.weights+ledger.scratch+ledger.blas_workspace)return cudaErrorMemoryAllocation;
@@ -231,11 +253,14 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   // Registration owns all per-layer metadata before the Rust borrow ends.
   if(!copy_spec(*o,*s)){delete o;return cudaErrorMemoryAllocation;}
   o->ledger=ledger; o->device=device;
-  auto fail=[&](int rc){cuteafd_vision_destroy(o);return rc;};
+  // Failure returns the owner only when a backing could not be freed, holding
+  // exactly the still-live backings the caller must record and destroy later.
+  auto fail=[&](int rc){uint32_t released=0; release_owner(o,&released);
+    if(o->weights || o->arena) *out=o; else delete o; return rc;};
   int low,high; e=cudaDeviceGetStreamPriorityRange(&low,&high);if(e)return fail(e);
   e=cudaStreamCreateWithPriority(&o->stream,cudaStreamNonBlocking,low);if(e)return fail(e);
-  e=CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&o->weights), s->weight_bytes, 0, cudaMalloc(reinterpret_cast<void**>(&o->weights),s->weight_bytes));if(e)return fail(e);++o->ledger.device_allocations;
-  e=CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&o->arena), ledger.scratch+ledger.blas_workspace, 0, cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+ledger.blas_workspace));if(e)return fail(e);++o->ledger.device_allocations;
+  e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->weights),s->weight_bytes,tags->weight_kind,tags->weight_owner);if(e)return fail(e);++o->ledger.device_allocations;
+  e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->arena),ledger.scratch+ledger.blas_workspace,tags->workspace_kind,tags->workspace_owner);if(e)return fail(e);++o->ledger.device_allocations;
   scratch_tower(o);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s->abi_version==2) {
@@ -252,6 +277,7 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   }
 #endif
   if(ledger.blas_workspace) {
+    // Third-party residual: cuBLAS internal context/workspace bytes; handle ownership is unchanged.
     e=blas_status(CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&o->blas), 0, 0, nullptr));if(e)return fail(e);
     e=blas_status(cublasSetMathMode(o->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));if(e)return fail(e);
     e=blas_status(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);

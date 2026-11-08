@@ -158,7 +158,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
             let layers = built.layouts.iter().map(|per_rank| &per_rank[rank]).collect::<Vec<_>>();
             crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
                 cuteafd_loader::families::muse_spark::weight_layout::coordinator_arena(
-                    rank, GPUS, &built.global, &layers)?)
+                    rank, GPUS, &built.global, &layers)?, crate::shared::memory::TEST_ARENA)
         }).collect::<Result<Vec<_>>>()?;
         devices[0].run(|| TokenEmbedding::load_with(&library, source.clone(),
             crate::shared::memory::EmbedPlacement::Gpu, || {
@@ -170,7 +170,7 @@ fn dump_max_group_plan_from_installed_headers() -> Result<()> {
                 }
                 Ok(loaded)
             }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(
-                devices[0], Some(&arenas[0]), name, bytes)))
+                devices[0], Some(&arenas[0]), name, bytes, crate::shared::memory::TEST_ARENA)))
     })?;
     let summary = records.summary();
     eprintln!("coordinator records: class2 {} B in {} operands; class3 {} B in {} steps \

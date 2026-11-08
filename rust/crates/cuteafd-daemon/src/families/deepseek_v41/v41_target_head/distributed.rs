@@ -1,5 +1,6 @@
 //! Per-lane vocabulary projection on two GPUs, with compact GPU winner merging.
 use super::*;
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Device, DeviceOwner, Stream, Allocation};
 use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
@@ -26,16 +27,16 @@ fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<Cut
 }
 impl<'w, 'a> Rank<'w, 'a> {
     fn new(library: &'a NativeLibrary, weights: &'w VocabularyShard<'a>, capacity: usize) -> Result<Self> {
-        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/target-head"))?;
         let projection = unsafe { library.v41_vocabulary_shard(workspace.buffer, weights.tokens().len())? };
-        let input = DeviceAllocation::new(library, capacity * 10240)?;
+        let input = DeviceAllocation::new(library, capacity * 10240, Tag::workspace("v41/target-head"))?;
         ensure!(input.buffer.device_id == weights.device_id(), "vocabulary rank weight device differs");
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             draft_timing: None,
             projection, _workspace: workspace, input,
-            logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4)?,
-            candidates: DeviceAllocation::new(library, capacity * 8)?,
+            logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4, Tag::workspace("v41/target-head"))?,
+            candidates: DeviceAllocation::new(library, capacity * 8, Tag::workspace("v41/target-head"))?,
             weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity)), fp8_scratch: None,
             sm: Some(library.v41_peer_copy()?),
         })
@@ -201,8 +202,8 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
             ranks: [devices[0].own(|| Rank::new(devices[0].library, weights[0], capacity))?,
                 devices[1].own(|| Rank::new(devices[1].library, weights[1], capacity))?],
             merge_stream: Stream::new(devices[1])?,
-            remote: Allocation::new(devices[1], capacity * 8)?,
-            merged: Allocation::new(devices[1], capacity * 8)?,
+            remote: Allocation::new(devices[1], capacity * 8, Tag::transport("v41/target-merge"))?,
+            merged: Allocation::new(devices[1], capacity * 8, Tag::workspace("v41/target-merge"))?,
             capacity, split, ready: None, greedy_ready: false, pending_logits: None, copy_pending: false,
         })
     }
@@ -491,17 +492,17 @@ mod tests {
         let a = devices[0].own(|| VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?;
         let b = devices[1].own(|| VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?;
         let full = devices[1].own(|| VocabularyHead::load(&lib, &catalog, 2 << 30, 16 << 20))?;
-        let workspace = Allocation::new(devices[1], V41VocabularyProjection::WORKSPACE_BYTES)?;
+        let workspace = Allocation::new(devices[1], V41VocabularyProjection::WORKSPACE_BYTES, crate::shared::memory::TEST)?;
         let projection = devices[1].own(|| unsafe { lib.v41_vocabulary_head(workspace.buffer) })?;
         let full_stream = Stream::new(devices[1])?;
-        let full_logits = Allocation::new(devices[1], 80 * 129280 * 4)?;
-        let input = Allocation::new(devices[1], 80 * 10240)?;
+        let full_logits = Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?;
+        let input = Allocation::new(devices[1], 80 * 10240, crate::shared::memory::TEST)?;
         let values: Vec<u8> = (0..80 * 5120).flat_map(|i| {
             let value = ((i * 17 % 127) as f32 - 63.) / 128.;
             ((value.to_bits() >> 16) as u16).to_ne_bytes()
         }).collect();
         devices[1].run(|| lib.copy_h2d(input.buffer, &values))?;
-        let other_input = Allocation::new(devices[1], 80 * 10240)?;
+        let other_input = Allocation::new(devices[1], 80 * 10240, crate::shared::memory::TEST)?;
         let other_values: Vec<u8> = (0..80 * 5120).flat_map(|i| {
             let value = ((i * 19 % 127) as f32 - 61.) / 64.;
             ((value.to_bits() >> 16) as u16).to_ne_bytes()
@@ -510,8 +511,8 @@ mod tests {
         let budgets = DistributedVocabularyWave::device_bytes(80, 64640)?;
         let mut first = DistributedVocabularyWave::new(devices, [&a, &b], 80, budgets)?;
         let mut second = DistributedVocabularyWave::new(devices, [&a, &b], 80, budgets)?;
-        let assembled = [Allocation::new(devices[1], 80 * 129280 * 4)?,
-            Allocation::new(devices[1], 80 * 129280 * 4)?];
+        let assembled = [Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?,
+            Allocation::new(devices[1], 80 * 129280 * 4, crate::shared::memory::TEST)?];
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         for rows in [1, 3, 16, 40, 80, 3] {
             let mut references = Vec::new();
