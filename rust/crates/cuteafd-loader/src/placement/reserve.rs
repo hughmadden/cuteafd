@@ -28,8 +28,16 @@ pub const KIMI_K3: u64 = 0;
 /// 160 MiB `GPU_RUNTIME` estimate. Placeholder for measurement.
 pub const MUSE_SPARK: u64 = 0;
 /// Step-5. Inherited: 2 GiB headroom (`families/step5/serve.rs:317`, dev
-/// `3ce3fbd19`). Probably covered allocator slack and runtime growth (Step-5
-/// captures no graphs). Placeholder for measurement.
+/// `3ce3fbd19`), covering allocator slack and runtime growth; Step-5 captures
+/// no graphs. Measured 0 on 2026-11-09: one RTX PRO 6000 plus ostrich, dodo
+/// and emu; HQA EXL3 K4/K6 core, MTP3; full-device cap, 50 MiB padding,
+/// `FAMILY_RESERVE=0`, KV target = max = 100M. Ready charged named owners
+/// 101,905,094,192 B against 101,907,496,960 B CUDA used (+2,402,768 B,
+/// 2.29 MiB, inside the release padding) and 0 B allocated after Ready. The
+/// same 2,402,768 B appears at the shipping-default pool, so it is independent
+/// of pool size. Every owner is charged from `placement/families/step5.rs`:
+/// weight arenas, SM120 allocation tails, BLAS handles per device and thread,
+/// measured peak-live-stream slabs, and driver page tables for pinned host.
 pub const STEP5: u64 = 0;
 /// Qwen MoE (qwen4). Inherited: max(2 GiB, 3 GiB) = 3 GiB headroom
 /// (`families/qwen4/admission.rs:80`, `dual.rs:93`, dev `3ce3fbd19`). Probably
