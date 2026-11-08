@@ -170,7 +170,7 @@ def test_wip_forwards_both_switches_to_both_legs_and_the_build_key():
     assert 'VISION_ATTENTION_AOT V41_AOT CARGO_FEATURES; do' in wip
 
 
-def native_key(source, tmp_path):
+def native_key(source, tmp_path, *, families='', bf16='', tp_roles='', exl3='ON', nvfp4='ON'):
     """build-wip-artifacts.sh's wip_native_key over SOURCE (environment held fixed)."""
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     start = script.index('wip_native_key() {')
@@ -179,10 +179,13 @@ def native_key(source, tmp_path):
     # As in a real build, the environment carries keyed scope switches.
     env = {**clean, 'CUTEAFD_WIP_DEV_IMAGE_ID': 'sha256:fixture', 'CUTEAFD_WIP_HOST_ISA': 'x86-64-v4',
            'CUTEAFD_WIP_KIMIK3_AOT': 'ON', 'role': 'coordinator', 'cuda_arch': '120',
-           'source_dir': str(source), 'audio_aot': 'OFF', 'exl3_aot': 'ON', 'nvfp4_aot': 'ON',
+           'source_dir': str(source), 'audio_aot': 'OFF', 'exl3_aot': exl3, 'nvfp4_aot': nvfp4,
+           'expert_families': families, 'bf16_families': bf16, 'spark_tp_roles': tp_roles,
            'coordinator_aot': 'ON', 'xgrammar': 'ON', 'v41_expert_aot': 'OFF', 'v41_coordinator_aot': 'OFF',
            'v41_nvfp4_aot': 'OFF', 'vision_attention_aot': 'OFF'}
-    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + function + 'wip_native_key\n'],
+    command = ('set -euo pipefail\nsource "$source_dir/scripts/build/wip-native-store.sh"\n'
+               'host_isas=(x86-64-v4)\n' + function + 'wip_native_key\n')
+    result = subprocess.run(['bash', '-c', command],
                             env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
@@ -192,6 +195,7 @@ def native_key(source, tmp_path):
 def source_copy(tmp_path):
     source = tmp_path / 'source'
     files = ['scripts/build/kernel-input-rules.json', 'scripts/build/native-key-files.py',
+             'scripts/build/wip-native-store.sh',
              'scripts/build/kernel-records.py', 'scripts/build/compare-sm-exports.py',
              'scripts/build/export-placement-inputs.py', 'scripts/build/build-wip-artifacts.sh',
              'python/tools/aot/export_b12x_dsv4_aot.py', 'python/tools/lib/spark_packages.py',
@@ -228,6 +232,14 @@ def test_exporter_and_build_inputs_change_the_native_key(source_copy, tmp_path, 
     with (source_copy / name).open('a') as handle:
         handle.write('\n')
     assert native_key(source_copy, tmp_path) != before
+
+
+@pytest.mark.parametrize('scope', [dict(families='qwen4:exl3-k4'), dict(families='qwen4:fp8'),
+                                  dict(families='qwen4:fp8', bf16='qwen4'), dict(tp_roles='tp6'),
+                                  dict(exl3='OFF'), dict(nvfp4='OFF')])
+def test_native_key_binds_resolved_export_scope(source_copy, tmp_path, scope):
+    # These are resolved shell variables, not CUTEAFD_WIP_* environment values.
+    assert native_key(source_copy, tmp_path, **scope) != native_key(source_copy, tmp_path)
 
 
 def test_native_key_covers_every_rust_source_the_native_build_reads():
