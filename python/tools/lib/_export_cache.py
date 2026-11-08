@@ -300,7 +300,7 @@ class Recorder:
             self.unknown.add("read:" + name)
             return
         if kind == "temp":
-            if name not in self.temp_written and os.path.isfile(name):
+            if not self._temp_made_here(name) and os.path.isfile(name):
                 with self.lock:
                     self.temp_read.add(name)
                     for scope in self.scopes:  # a program cannot wait for the merge
@@ -312,6 +312,18 @@ class Recorder:
         if resolved in self.written or not os.path.isfile(resolved):
             return
         self._observe("file|" + name, lambda: file_digest(resolved))
+
+    def _temp_made_here(self, path: str) -> bool:
+        """A temporary file this process wrote, or one inside a directory it created
+        (a compiler writing its object into our mkdtemp directory from C)."""
+        if path in self.temp_written:
+            return True
+        parent = os.path.dirname(path)
+        while parent and parent not in self.roots.temporary and parent != "/":
+            if parent in self.temp_written:
+                return True
+            parent = os.path.dirname(parent)
+        return False
 
     def note_write(self, path) -> None:
         kind, name = self.roots.classify(path)
@@ -711,8 +723,15 @@ def merge_records(directory: Path) -> dict | None:
             merged["checks"].setdefault(check, value)
     # A temporary file is an intermediate only if some process of this export
     # wrote it; one that was already there is an input nothing recorded.
-    for path in sorted(temp_read - temp_written):
-        merged["unknown"].add("read-temporary:" + path)
+    def made(path):
+        while path and path != "/":
+            if path in temp_written:
+                return True
+            path = os.path.dirname(path)
+        return False
+    for path in sorted(temp_read):
+        if not made(path):
+            merged["unknown"].add("read-temporary:" + path)
     return {key: sorted(value) if isinstance(value, set) else value for key, value in merged.items()}
 
 

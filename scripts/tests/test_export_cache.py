@@ -52,6 +52,14 @@ elif args.mode == "spawn":
     subprocess.run(["true"], check=True)
 elif args.mode == "unseen":
     os.system("echo x > " + str(args.output_dir / "native.bin"))
+elif args.mode == "ctemp":
+    # A compiler library writing its object into our temporary directory from C.
+    import ctypes, tempfile
+    libc = ctypes.CDLL(None)
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "module.o").encode()
+        handle = libc.fopen(target, b"w"); libc.fputs(b"obj", handle); libc.fclose(handle)
+        open(target, "rb").read()
 elif args.mode == "child":
     import subprocess
     subprocess.run([sys.executable, "-I", "-c", "print(1)"], check=True)
@@ -135,6 +143,11 @@ def test_unrecordable_exports_are_never_stored(tree, tmp_path, mode, reason):
     event, detail = run(tree, env={"FOREIGN": str(foreign)}, mode=mode)
     assert event == "uncacheable" and reason in detail, detail
     assert run(tree, env={"FOREIGN": str(foreign)}, mode=mode)[0] == "uncacheable"
+
+
+def test_reading_back_a_temporary_directory_the_export_created_is_cacheable(tree):
+    assert run(tree, mode="ctemp")[0] == "miss"
+    assert run(tree, mode="ctemp")[0] == "hit"
 
 
 def test_known_compilers_and_shells_with_unknown_programs_fail_closed(tree):
