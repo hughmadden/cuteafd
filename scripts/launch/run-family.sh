@@ -2049,12 +2049,40 @@ fi
 if [[ $family == glm5_flash ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
+  # GLM5_FLASH_KDA_EXACT: kx7 keeps the KDA q/k/v/o as exact KX7 packs of the checkpoint's BF16
+  # (v1.1, about 7.5 bits a weight, admitted at 8; packed and verified at load), off (default) leaves
+  # them to GLM5_FLASH_KDA_FP8. kx7 needs the BF16 projections (GLM5_FLASH_KDA_FP8 auto resolves
+  # to off; row128/channel are refused) and one GPU (refused with the two-GPU head split).
+  kda_exact="$(get GLM5_FLASH_KDA_EXACT off)"
+  case "$kda_exact" in
+    ""|off) kda_exact=off ;;
+    kx7)
+      if [[ $head_split != 0 ]]; then
+        echo "GLM5_FLASH_KDA_EXACT=kx7 packs the KDA projections on one GPU; the two-GPU head split takes off (or set RTX_GPUS=1)" >&2
+        exit 2
+      fi ;;
+    *) echo "GLM5_FLASH_KDA_EXACT must be off or kx7" >&2; exit 2 ;;
+  esac
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
-    ""|auto) kda_fp8=row128 ;;
+    ""|auto) if [[ $kda_exact == kx7 ]]; then kda_fp8=off; else kda_fp8=row128; fi ;;
     off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
+  if [[ $kda_exact == kx7 && $kda_fp8 != off ]]; then
+    echo "GLM5_FLASH_KDA_EXACT=kx7 holds the BF16 KDA projections exactly; set GLM5_FLASH_KDA_FP8=off (or auto), not $kda_fp8" >&2
+    exit 2
+  fi
+  [[ $kda_exact == off ]] || family_args+=(--kda-exact "$kda_exact")
+  if [[ $kda_exact == kx7 ]]; then
+    # Verified packs persist across launches, keyed by each matrix's BF16 bytes: a relaunch
+    # reads them instead of encoding and checking 136 matrices again.
+    kx7_cache="$HOME/.cache/cuteafd/kx7"
+    release_require_owned_state "$kx7_cache"
+    mkdir -p "$kx7_cache"
+    release_require_writable_state "$kx7_cache"
+    kx7_cache_args=(-v "$kx7_cache:/run/cuteafd/kx7" -e CUTEAFD_KX7_CACHE=/run/cuteafd/kx7)
+  fi
   # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
   glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
@@ -2385,6 +2413,7 @@ audio_encoder_hash=""
   if [[ "$family" == glm5_flash ]]; then
     case "$fp8_head" in on) plan_head=true ;; packed) plan_head=packed ;; *) plan_head=false ;; esac
     plan_draft_args+=(--kda-fp8 "$kda_fp8" --kda-state "${kda_state:-f32}" --fp8-head "$plan_head")
+    [[ "${kda_exact:-off}" == off ]] || plan_draft_args+=(--kda-exact "$kda_exact")
     [[ "${target_head:-auto}" == auto || -z "${target_head:-}" ]] || plan_draft_args+=(--target-head "$target_head")
     # Draft-head arithmetic borrows the same target weight, not a second resident head.
     plan_draft_args+=(--draft-head exact)
@@ -2878,7 +2907,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   "${generic_worker_mounts[@]}" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
-  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${memory_policy_args[@]}" $serve --snapshot "$snapshot" \
+  ${kx7_cache_args[@]+"${kx7_cache_args[@]}"} "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${memory_policy_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output-tokens "$(get MAX_OUTPUT_TOKENS 131072)" "${kv_reserve_args[@]}" "${dspark_args[@]}" \

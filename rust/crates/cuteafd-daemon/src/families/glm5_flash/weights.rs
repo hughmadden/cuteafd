@@ -8,7 +8,9 @@
 //! (`--kda-fp8 row128|channel`: E4M3 with per-row x 128-K scales stored
 //! K-block major, `w_in_fp8`/`w_in_kscale`, `w_o_fp8`/`w_o_kscale`, no BF16
 //! `w_in`/`w_o`) and the LM head (`--fp8-head`, [`super::head::GlmfHead::Fp8`]).
-//! One resident copy each.
+//! One resident copy each. `--kda-exact kx7` holds the KDA q/k/v/o instead as exact KX7 packs
+//! of their BF16 ([`GlmfLayer::kx7`], packed and verified on the host, the BF16 never uploaded)
+//! beside the staged path's gates `w_aux = [f_a; g_a; b]` (see [`super::kx7`]).
 //! Packing (see the glmf program docstrings): KDA `w_in = [q; k; v; f_a; g_a;
 //! b]`, `w_fg = [f_b; g_b]`, `conv_w` FP32 `[3D, 4]`; MLA `w_qkv_a = [q_a;
 //! kv_a]`, `kv_b` split per head into `w_uk [N, 512, 256]` (transposed key
@@ -58,6 +60,9 @@ pub(crate) struct GlmfLayer<'a> {
     pub(crate) attention_native: std::collections::BTreeMap<String, NativeAttentionWeights<'a>>,
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
     pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
+    /// `--kda-exact kx7`: the KDA layer's q/k/v/o projections as exact KX7 packs, keyed as the
+    /// staged path names them (`super::kx7::PROJECTIONS`); empty otherwise.
+    pub(crate) kx7: std::collections::BTreeMap<&'static str, crate::shared::kx7::Kx7Weights<'a>>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -110,6 +115,7 @@ impl GlmfLayer<'_> {
             + self.native.values().map(|w| w.buffer.bytes).sum::<usize>()
             + self.attention_native.values().map(|w| w.values.buffer.bytes
                 + w.scales.as_ref().map_or(0, |s| s.buffer.bytes)).sum::<usize>()
+            + self.kx7.values().map(crate::shared::kx7::Kx7Weights::bytes).sum::<usize>()
     }
 
     pub fn native(&self, key: &str) -> Result<CuteafdDeviceBuffer> {
@@ -132,6 +138,10 @@ pub(crate) struct GlmfWeights<'a> {
 pub(crate) struct Residency {
     pub kda_bf16: usize,
     pub kda_fp8: usize,
+    /// KX7 KDA packs: their device bytes, their admitted bound and the BF16 bytes they hold.
+    pub kda_kx7: usize,
+    pub kda_kx7_bound: usize,
+    pub kda_kx7_source: usize,
     pub head_bf16: usize,
     /// The FP8 head, or a native checkpoint's own (K6, row-FP8) head.
     pub head_fp8: usize,
@@ -162,6 +172,12 @@ impl GlmfWeights<'_> {
             r.kda_bf16 += ["w_in", "w_o"].iter().filter_map(|n| layer.range(n)).map(|(_, b)| b).sum::<usize>();
             r.kda_fp8 += ["w_in_fp8", "w_in_kscale", "w_o_fp8", "w_o_kscale"].iter()
                 .filter_map(|n| layer.range(n)).map(|(_, b)| b).sum::<usize>();
+            for weights in layer.kx7.values() {
+                r.kda_kx7 += weights.bytes();
+                r.kda_kx7_bound += cuteafd_loader::families::glm5_flash::resident::kx7_projection_bytes(weights.n, weights.k)
+                    .map_or(usize::MAX, |b| b as usize);
+                r.kda_kx7_source += weights.n * weights.k * 2;
+            }
         }
         match &self.head {
             super::head::GlmfHead::Bf16(w) => r.head_bf16 = w.buffer.bytes,
@@ -173,14 +189,20 @@ impl GlmfWeights<'_> {
 
     /// Single residency: no KDA layer holds both a BF16 and an FP8 copy, the head is one
     /// allocation set of one form, and the selected representations are the ones resident.
-    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, head: super::head::GlmfHeadFormat)
-        -> Result<Residency> {
+    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, kda_exact: super::kx7::KdaExact,
+        head: super::head::GlmfHeadFormat) -> Result<Residency> {
         for (index, layer) in self.layers.iter().enumerate().filter(|(_, l)| l.attention == GlmNextAttention::Kda) {
             let (bf16, fp8) = (layer.has("w_in") || layer.has("w_o"), layer.has("w_in_fp8") || layer.has("w_o_fp8"));
             ensure!(!(bf16 && fp8), "KDA layer {index} holds BF16 and FP8 in/out projections");
             let native = layer.core.contains_key("self_attn.q_proj") || layer.native_projections.contains_key("q");
             ensure!(!native || !(bf16 || fp8), "KDA layer {index} has native and converted copies");
-            ensure!(native || fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
+            let kx7 = !layer.kx7.is_empty();
+            ensure!(!kx7 || (!(bf16 || fp8 || native) && super::kx7::PROJECTIONS.iter().all(|p| layer.kx7.contains_key(p))),
+                "KDA layer {index} holds KX7 packs beside other projection copies, or not all four");
+            ensure!(native || kx7 == (kda_exact == super::kx7::KdaExact::Kx7),
+                "KDA layer {index}: --kda-exact {} but {} KX7 packs are resident", kda_exact.setting(),
+                if kx7 { "its" } else { "no" });
+            ensure!(native || kx7 || fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
                 "KDA layer {index}: --kda-fp8 {kda_fp8:?} but {} projections are resident", if fp8 { "FP8" } else { "BF16" });
         }
         ensure!(self.head.format().is_none_or(|resident| resident == head),
@@ -196,6 +218,8 @@ pub(crate) struct GlmfLoader<'a> {
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
     pub kda_fp8: super::fp8::KdaFp8,
+    /// `--kda-exact`: with `kx7`, every KDA layer's q/k/v/o packed exactly on the host (one GPU).
+    pub kda_exact: super::kx7::KdaExact,
     /// Replicate FP8 KDA output weights for token-row sharding; requires two GPUs and FP8 KDA.
     pub kda_output_shard: bool,
     pub fp8_head: bool,
@@ -872,7 +896,7 @@ impl<'a> GlmfLoader<'a> {
             let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
                 .collect::<Result<_>>()?;
             Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands, attention_native,
-                native: HashMap::new(), native_projections: HashMap::new() })
+                native: HashMap::new(), native_projections: HashMap::new(), kx7: Default::default() })
         }).collect()
     }
 
@@ -900,7 +924,32 @@ impl<'a> GlmfLoader<'a> {
         ops.insert("input_norm", self.one(&format!("{p}.input_layernorm.weight"))?);
         ops.insert("post_norm", self.one(&format!("{p}.post_attention_layernorm.weight"))?);
         let a = |name: &str| format!("{p}.self_attn.{name}");
+        let mut kx7 = std::collections::BTreeMap::new();
         match attention {
+            GlmNextAttention::Kda if self.kda_exact == super::kx7::KdaExact::Kx7 => {
+                // Exact KX7 packs of q/k/v/o, made from the checkpoint's BF16 on the host (never
+                // uploaded), and the staged path's gates [f_a; g_a; b] in BF16.
+                ensure!(self.kda_fp8 == super::fp8::KdaFp8::Off && self.kda_nvfp4.is_none(),
+                    "--kda-exact kx7 packs the BF16 KDA projections; it takes --kda-fp8 off and no NVFP4 gate");
+                let mut sources = Vec::with_capacity(super::kx7::PROJECTIONS.len());
+                for key in super::kx7::PROJECTIONS {
+                    let name = format!("{p}.{key}.weight");
+                    let (bytes, dtype, shape) = self.raw(&name)?;
+                    sources.push((key, name, bytes, dtype, shape));
+                }
+                for (key, image) in super::kx7::pack_layer(cfg, sources)? {
+                    // Each pack lands in the arena views its layout reserved at the pack's bound.
+                    let views = crate::shared::kx7::arena_views(&format!("{p}.{key}"), image.n, image.k)?;
+                    let weights = self.on_rank(0, || crate::shared::kx7::Kx7Weights::upload_with(self.library, &image,
+                        |buffer, _| self.allocation(0, &views[buffer].0, views[buffer].1)))?;
+                    kx7.insert(key, weights);
+                }
+                ops.insert("w_aux", self.rows_on(0, &[a("f_a_proj.weight"), a("g_a_proj.weight"), a("b_proj.weight")])?);
+                for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,
+                    KdaOperand::DtBias, KdaOperand::ONorm] {
+                    ops.insert(operand.name(), self.kda_upload(cfg, &p, operand)?);
+                }
+            }
             GlmNextAttention::Kda => {
                 let w_in: Vec<_> = Self::kda_geometry(cfg).roles(KdaOperand::WIn).into_iter()
                     .map(|role| Self::kda_name(&p, role)).collect();
@@ -966,7 +1015,8 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
         Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole,
-            core: Default::default(), attention_native: Default::default(), operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
+            core: Default::default(), attention_native: Default::default(), operands: ops, native: HashMap::new(),
+            native_projections: HashMap::new(), kx7 })
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -1224,6 +1274,8 @@ impl<'a> GlmfLoader<'a> {
         if ranks == 1 {
             return Ok(vec![self.layer(cfg, layer)?]);
         }
+        ensure!(self.kda_exact == super::kx7::KdaExact::Off,
+            "--kda-exact kx7 packs the KDA projections on one GPU; the head split is not supported yet");
         ensure!(self.kda_nvfp4.is_none(), "the KDA NVFP4 numerics gate runs without a head split");
         ensure!(cfg.heads % ranks == 0 && cfg.kda_heads % ranks == 0, "{} MLA / {} KDA heads do not split over {ranks} \
             GPUs", cfg.heads, cfg.kda_heads);
@@ -1364,7 +1416,7 @@ impl<'a> GlmfLoader<'a> {
         }
         Ok(ops.into_iter().zip(attention_shares).map(|(operands, attention_share)|
             GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(), attention_native: Default::default(), operands,
-                native: HashMap::new(), native_projections: HashMap::new() }).collect())
+                native: HashMap::new(), native_projections: HashMap::new(), kx7: Default::default() }).collect())
     }
 
     /// EXLR8 operands follow the shared native records and the admitted layer owners.
@@ -1440,7 +1492,7 @@ impl<'a> GlmfLoader<'a> {
                     }
                     Ok(GlmfLayer { attention, dense, split: self.ranks() == 2, attention_share, operands, native,
                         native_projections: source.projections.iter().map(|(&name, (projection, _))| (name, projection.clone())).collect(),
-                        core: Default::default(), attention_native: Default::default() })
+                        core: Default::default(), attention_native: Default::default(), kx7: Default::default() })
                 })?;
                 share.push(part);
             }
@@ -1470,6 +1522,7 @@ impl<'a> GlmfLoader<'a> {
             validate_kda_output_shard(self.ranks(), self.kda_fp8, self.kda_output_shard)?;
         }
         let split = crate::shared::memory::load_timing::Split::start();
+        let packs = crate::shared::kx7::PackSplit::start();
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         ensure!(plan.modes().len() <= cfg.layers, "attention plan exceeds checkpoint layers");
         for (layer, &mode) in plan.modes().iter().enumerate() {
@@ -1501,6 +1554,7 @@ impl<'a> GlmfLoader<'a> {
         // The pinned GPU-quantization source and tables live only for the load.
         self.dense.release();
         split.log(if self.dense.pushing() { "glm5_flash dense planning" } else { "glm5_flash dense" });
+        packs.log("glm5_flash KDA projections (--kda-exact kx7)");
         Ok((weights, shares.collect()))
     }
 }

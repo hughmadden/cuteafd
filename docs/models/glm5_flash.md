@@ -179,7 +179,14 @@ current names take precedence over deprecated names. `GLM5_FLASH_FP8_HEAD=packed
 (`--fp8-head packed`, as `V41_FP8_HEAD=packed`) keeps instead the exact 12-bit
 copy of the BF16 head, packed and verified at load, then the BF16 released
 (956 MB resident against 1,269 MB BF16 and 654 MB FP8): target logits read it
-exactly, the drafter its coarse plane; one GPU only (a head split refuses it). The DFlash2 drafter
+exactly, the drafter its coarse plane; one GPU only (a head split refuses it).
+`GLM5_FLASH_KDA_EXACT=kx7` (`--kda-exact kx7`) keeps the KDA q/k/v/o as exact
+KX7 v1.1 packs of their BF16 values (`cuteafd_core::kx7`: two-class code, about
+7.5 bits a weight; admitted at 8 bits, 4.66 GB against 9.13 GB BF16 for the 34
+layers), packed and verified on the host at load: the layers run the staged
+KDA path, v0 decoding each projection into a 64 MiB workspace for the BF16
+GEMM (outputs as the BF16 GEMM's over the same weights). It takes the BF16
+projections (`GLM5_FLASH_KDA_FP8=auto` resolves to `off`) and one GPU. The DFlash2 drafter
 defaults to FP8 on both layouts; `SPECULATOR_FP8=off` keeps it BF16.
 
 Matched recheck, 2026-10-04: GLM 5.3 Flash EXL3 K3.25, RTX PRO 6000 at

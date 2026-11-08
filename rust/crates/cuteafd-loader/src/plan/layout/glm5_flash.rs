@@ -150,8 +150,17 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let core = if exlr8.is_some() { crate::families::glm5_flash::core::CoreInventory::default() }
             else { crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint)? };
         let native = exlr8.is_some() || !core.projections.is_empty();
-        let native_mask = if exlr8.is_some() { crate::serving_capacity::GlmfCoreScratch { kda: true, mla: true, ffn: true } }
+        // KX7 KDA (`--kda-exact kx7`) packs the checkpoint's BF16 q/k/v/o and runs them staged, as
+        // native K6 KDA runs: the fused KDA programs' scratch is not charged.
+        let kx7 = options.glmf_representation.kda_kx7 && !native;
+        if options.glmf_representation.kda_kx7 && native {
+            notes.push("--kda-exact kx7 does not apply to native K6/EXLR8 KDA projections".into());
+        }
+        anyhow::ensure!(!kx7 || (ranks == 1 && !options.glmf_representation.kda_fp8),
+            "--kda-exact kx7 packs the BF16 KDA projections on one GPU: it takes --kda-fp8 off and no head split");
+        let mut native_mask = if exlr8.is_some() { crate::serving_capacity::GlmfCoreScratch { kda: true, mla: true, ffn: true } }
             else { core.scratch_mask(&cfg, cfg.layers) };
+        native_mask.kda |= kx7;
         let native_kda = native_mask.kda;
         let whole_mla = |first: usize| {
             let mut next = first;
@@ -171,13 +180,15 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             representation.output_shard = false;
         }
         if native { representation.head = resident::GlmfHeadFormat::Bf16; }
+        representation.kda_kx7 = kx7;
         let state = options.glmf_kda_state;
         anyhow::ensure!(!native || state == crate::serving_capacity::GlmfKdaState::F32,
             "native Flash requires F32 KDA state programs");
         anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || ranks == 1,
             "BF16 KDA state needs one GPU; head-split BF16 state is not yet qualified");
         notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
-            if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else if representation.kda_fp8 { "FP8" } else { "BF16" },
+            if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else if kx7 { "KX7 exact (bound 8 bits/weight)" }
+                else if representation.kda_fp8 { "FP8" } else { "BF16" },
             if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else { representation.head.name() }));
         let mut resident = if exlr8.is_some() { native_resident(attention.first_owner as usize)? }
             else { resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
@@ -288,16 +299,26 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 cfg.layers, ranks, owners.as_deref(), rows as usize, lanes as usize,
                 decode_rows as usize, draft_rows, ranks == 2 && representation.output_shard,
                 manifest.ok_or_else(|| anyhow::anyhow!("Flash K6 requires PROGRAMS.json with native exports"))?)?)
+        } else if kx7 {
+            if manifest.is_none() {
+                notes.push("KX7 KDA stage scratch needs PROGRAMS.json; charged without the core programs' scratch".into());
+            }
+            crate::families::glm5_flash::core_admission::CoreCharges::kx7_kda(&cfg, cfg.layers, ranks, rows as usize,
+                decode_rows as usize, state, |name| manifest.map_or(Ok(0),
+                    |m| crate::families::glm5_flash::core_admission::kx7_manifest_scratch(m, name)))?
         } else { None };
         if let Some(charge) = &core_charge {
             let bytes = charge.bytes(cfg.hidden)?;
+            let label = if charge.kx7() { "KX7 KDA stages" } else { "native K6 core" };
             for profile in [&mut workspace, &mut local_workspace] {
                 for (rank, &bytes) in bytes.iter().enumerate() {
                     profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, rank as u8,
-                        Category::Workspace, "native K6 core", bytes, Basis::Exact));
+                        Category::Workspace, label, bytes, Basis::Exact));
                 }
             }
-            notes.push("native K6 body and head; exact compressed owners and projection scratch".into());
+            notes.push(if charge.kx7() {
+                "KX7 KDA: staged q/k/v/o with one decode workspace of the largest projection".into()
+            } else { "native K6 body and head; exact compressed owners and projection scratch".into() });
         }
         let native_charge = exlr8.map(|(facts, _)| crate::plan::exlr8::native::FlashCharges::from_manifest(
             facts, &cfg, &whole_mla(attention.first_owner as usize), rows as usize, lanes as usize,
@@ -324,7 +345,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 let allowance = placement::inventory::loaded_code_allowance("glmf", package,
                     ranks == 2, rank as u8, &arch, Some(&set));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
-            } else if let (Some(charge), Some(manifest)) = (&core_charge, manifest) {
+            } else if let (Some(charge), Some(manifest)) = (core_charge.as_ref().filter(|c| !c.kx7()), manifest) {
                 let mut set = placement::ProgramSet::from_manifest(manifest, &["glmf", "glmf2"]);
                 set.names.extend(charge.programs.iter().cloned()); set.names.sort(); set.names.dedup();
                 let arch = placement::ArchContext::coordinator(total, None);
@@ -600,7 +621,7 @@ mod tests {
                 assert_eq!(context.partial_scratch, expected_context);
                 let planned = glmf_step_workspace(&selected, &checkpoint, &ExpertPlacement::Local, 1,
                     4096, 1 << 20, 64, 0, true, true,
-                    resident::GlmfRepresentation { kda_fp8: false, head: resident::GlmfHeadFormat::Bf16, output_shard: false }, false, true, false,
+                    resident::GlmfRepresentation { kda_fp8: false, head: resident::GlmfHeadFormat::Bf16, output_shard: false, kda_kx7: false }, false, true, false,
                     crate::serving_capacity::GlmfKdaState::F32, Some(native)).unwrap();
                 // Runtime narrows individual specs, independently of the planner's manifest adapter.
                 let lookup = |name: &str| {

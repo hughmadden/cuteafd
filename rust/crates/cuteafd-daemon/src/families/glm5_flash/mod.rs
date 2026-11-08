@@ -7,6 +7,7 @@ pub(crate) use crate::shared::draft::resource as draft_binding;
 use crate::shared::draft::probe as draft_probe;
 pub(crate) mod engine;
 pub(crate) mod fp8;
+pub(crate) mod kx7;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod media;
@@ -197,6 +198,14 @@ pub(crate) struct EngineArgs {
     /// output under speculation; opt-in.
     #[arg(long, value_enum, default_value = "off")]
     pub kda_fp8: fp8::KdaFp8,
+    /// KDA q/k/v/o held exactly: `off` (default; as --kda-fp8 selects) or `kx7`, the checkpoint's
+    /// BF16 values as exact KX7 v1.1 packs (two-class code, about 7.5 bits a weight, 9.13 -> ~4.3 GB;
+    /// admitted at 8 bits a weight), packed and verified on the host at load, the BF16 never resident. KX7
+    /// layers run the staged KDA path (KX7 linear into the stage buffers, the staged KDA core
+    /// program, KX7 o_proj); v0's linear decodes into one 64 MiB workspace and runs the BF16 GEMM.
+    /// Needs --kda-fp8 off and one GPU (no --split-device); any --kda-state.
+    #[arg(long, value_enum, default_value = "off")]
+    pub kda_exact: kx7::KdaExact,
     /// KDA recurrent state storage: `f32` (default), or `bf16`: computed in FP32 and rounded to
     /// nearest even after every decode, verify and commit row (after the row's read-out, so a
     /// verify committed at k rows stores the bits of k serial steps) and where each chunked-prefill
@@ -620,6 +629,7 @@ mod draft_cli_tests {
         let mut ordinary = parse(&[]);
         let mut converted = ordinary.clone();
         converted.kda_fp8 = fp8::KdaFp8::Row128;
+        converted.kda_exact = kx7::KdaExact::Kx7;
         converted.head_format = head::GlmfHeadFormat::Packed;
         converted.kda_fp32_partials = true;
         converted.kda_output_shard = true;
@@ -634,6 +644,7 @@ mod draft_cli_tests {
             assert_eq!(settings[key], "false");
         }
         assert_eq!(settings["kda-fp8"], "off");
+        assert_eq!(settings["kda-exact"], "off");
         assert_eq!(settings["fp8-prefill"], "none");
         let demands = |args: &EngineArgs| -> Result<Vec<_>> {
             check_options(args)?;
@@ -668,6 +679,28 @@ mod draft_cli_tests {
         assert!(dense_pushable(&parse(&[])));
         assert!(dense_pushable(&parse(&["--kda-fp8", "row128", "--kda-output-shard"])));
         assert!(!dense_pushable(&parse(&["--kda-fp8", "off", "--kda-nvfp4-gate", "rtn"])));
+    }
+
+    #[test]
+    fn kda_exact_kx7_takes_the_bf16_projections_on_one_gpu() {
+        assert_eq!(parse(&[]).kda_exact, kx7::KdaExact::Off);
+        for state in ["f32", "bf16", "bf16-tile"] {
+            let args = parse(&["--kda-exact", "kx7", "--kda-state", state]);
+            assert_eq!(args.kda_exact, kx7::KdaExact::Kx7);
+            check_options(&args).unwrap();
+        }
+        check_options(&parse(&["--kda-exact", "off", "--kda-fp8", "row128"])).unwrap();
+        for (extra, message) in [(&["--kda-fp8", "row128"][..], "--kda-fp8 off"), (&["--kda-fp8", "channel"][..], "--kda-fp8 off"),
+            (&["--split-device", "1"][..], "head split"), (&["--kda-nvfp4-gate", "rtn"][..], "--kda-exact off")] {
+            let error = check_options(&parse(&[&["--kda-exact", "kx7"][..], extra].concat())).unwrap_err().to_string();
+            assert!(error.contains(message), "{extra:?}: {error}");
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--kda-exact", "kx8"]).is_err());
+        let settings: std::collections::BTreeMap<_, _> = native::resolved_settings(&parse(&["--kda-exact", "kx7"]))
+            .into_iter().collect();
+        assert_eq!(settings["kda-exact"], "kx7");
+        assert!(dense_pushable(&parse(&["--kda-exact", "kx7"])), "KX7 packs upload beside the pushed operands");
     }
 
     #[test]
@@ -1574,6 +1607,14 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     ensure!(args.head_format != head::GlmfHeadFormat::Packed || args.split_device.is_none(),
         "--fp8-head packed keeps one exact 12-bit head on one GPU; the two-GPU head split (--split-device) \
          is not supported yet: use --fp8-head true or false");
+    if args.kda_exact == kx7::KdaExact::Kx7 {
+        ensure!(args.kda_fp8 == fp8::KdaFp8::Off, "--kda-exact kx7 holds the checkpoint's BF16 KDA projections \
+            exactly; it takes --kda-fp8 off, not {:?}", args.kda_fp8);
+        ensure!(args.split_device.is_none(), "--kda-exact kx7 packs the KDA projections on one GPU; the two-GPU \
+            head split (--split-device) is not supported yet: use --kda-exact off");
+        ensure!(args.kda_nvfp4_gate.is_none(), "--kda-nvfp4-gate rounds the BF16 KDA projections; it takes \
+            --kda-exact off");
+    }
     Ok(())
 }
 
@@ -1828,7 +1869,15 @@ impl Opened {
         if self.native { return Ok(None); }
         let headers = Checkpoint::coordinator_view(&self.view, false, false)?;
         let core = CoreInventory::from_checkpoint(&self.cfg, &headers)?;
-        if core.projections.is_empty() { return Ok(None); }
+        if core.projections.is_empty() {
+            if args.kda_exact != kx7::KdaExact::Kx7 { return Ok(None); }
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+            return CoreCharges::kx7_kda(&self.cfg, layers, ranks, args.prefill_rows, args.decode_rows,
+                args.kda_state.into(), |name| cuteafd_loader::families::glm5_flash::core_admission::kx7_manifest_scratch(
+                    &manifest, name));
+        }
+        ensure!(args.kda_exact == kx7::KdaExact::Off, "--kda-exact kx7 packs BF16 KDA projections; this checkpoint \
+            has a native K6 core");
         ensure!(args.kda_state == engine::KdaState::F32, "native K6 requires F32 KDA state programs");
         let owners = (attention.mode == cuteafd_loader::placement::AttentionPlacement::Layers).then(|| {
             let mut next = attention.first_owner as u8;
@@ -1909,13 +1958,14 @@ impl Opened {
         let pending_code = inventory.gpus.iter().enumerate().map(|(rank, sample)| {
             let arch = placement::ArchContext::for_device(&sample.arch, sample.total_bytes);
             let code = placement::inventory::loaded_code_allowance(
-                if core_charge.is_some() { "glmf-k6" } else { "glmf" }, code_package,
+                if core_charge.as_ref().is_some_and(|c| !c.kx7()) { "glmf-k6" } else { "glmf" }, code_package,
                 split, rank as u8, arch, Some(&program_set));
             code.pending(sample.context_bytes, arch.context_bytes)
         }).collect();
         let headers = Checkpoint::coordinator_view(&self.view, false, false)?;
         let representation = GlmfRepresentation { kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off,
-            head: args.head_format, output_shard: args.kda_output_shard };
+            head: args.head_format, output_shard: args.kda_output_shard,
+            kda_kx7: args.kda_exact == kx7::KdaExact::Kx7 };
         let resident = if let Some(native) = native_admission { native.resident.clone() } else {
             runtime_resident_weights(&headers, &self.cfg, layers, devices.len(), representation,
                 args.token_io.embed_placement, attention)? };
@@ -1928,8 +1978,10 @@ impl Opened {
             kda_state: args.kda_state.into() };
         let core = if self.native { Default::default() } else {
             cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&self.cfg, &headers)? };
-        let native = if self.native { cuteafd_loader::serving_capacity::GlmfCoreScratch { kda: true, mla: true, ffn: true } }
+        let mut native = if self.native { cuteafd_loader::serving_capacity::GlmfCoreScratch { kda: true, mla: true, ffn: true } }
             else { core.scratch_mask(&self.cfg, layers) };
+        // KX7 layers run the staged KDA (charged with the core stages), never the fused programs.
+        native.kda |= representation.kda_kx7;
         let decode = glmf_core_step_scratch(lookup, &self.cfg, scratch, args.decode_rows as u64, true, native)?;
         let mut prefill = glmf_core_step_scratch(lookup, &self.cfg, scratch, args.prefill_rows as u64, false, native)?;
         if args.replay_records == engine::ReplayRecords::Shared {
@@ -1948,7 +2000,8 @@ impl Opened {
             for profile in [&mut workspace, &mut local_workspace] {
                 for (rank, bytes) in core.bytes(self.cfg.hidden)?.into_iter().enumerate() {
                     profile.push(admission::GlmfBufferDemand::new(admission::GlmfComponent::Always, rank as u8,
-                        cuteafd_core::memory_layout::Category::Workspace, "native K6 core", bytes,
+                        cuteafd_core::memory_layout::Category::Workspace,
+                        if core.kx7() { "KX7 KDA stages" } else { "native K6 core" }, bytes,
                         cuteafd_core::memory_layout::Basis::Exact));
                 }
             }
@@ -2110,6 +2163,11 @@ impl Opened {
         let core = if self.native { Default::default() } else {
             cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&self.cfg, &self.checkpoint)? };
         if self.native { native::normalize(&mut resolved); }
+        if args.kda_exact != kx7::KdaExact::Off && (self.native || !core.projections.is_empty()) {
+            tracing::warn!(requested = args.kda_exact.setting(),
+                "--kda-exact does not apply to native K6/EXLR8 checkpoints; serving their own projections");
+            resolved.kda_exact = kx7::KdaExact::Off;
+        }
         if core.scratch_mask(&self.cfg, layers).kda {
             // Native K6 reduces unrotated F32 cores, not FP8 KDA partials.
             resolved.kda_fp8 = fp8::KdaFp8::Off;
@@ -2174,6 +2232,20 @@ impl Opened {
                 self.library.packed_head_workspace(cuteafd_core::packed_head::PASS_ROWS as usize, self.cfg.hidden,
                     self.cfg.vocab_size)).context("--fp8-head packed needs the shared packed head kernels \
                 (cuteafd_packed_head_*); this native library predates them")?;
+        }
+        if args.kda_exact == kx7::KdaExact::Kx7 {
+            // The staged KDA core programs of this state, and the native KX7 kernels.
+            for decode in [true, false] {
+                for name in cuteafd_loader::families::glm5_flash::core_admission::kx7_stage_names(
+                    args.kda_state.into(), decode, args.decode_rows) {
+                    programs.spec(&name).with_context(|| format!("--kda-exact kx7 runs the staged KDA core {name}; \
+                        this build does not export it (it needs the glmf_stage programs)"))?;
+                }
+            }
+            let [n, k] = kx7::shape(&self.cfg, "self_attn.q_proj");
+            crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(||
+                self.library.kx7_workspace(1, n, k)).context("--kda-exact kx7 needs the native KX7 kernels \
+                (cuteafd_kx7_*); this native library predates them")?;
         }
         let compact = args.index_cache == engine::IndexCache::Compact;
         if compact && !self.native {
@@ -2287,7 +2359,7 @@ impl Opened {
         let mark_slots = args.mark_arena.slots_placed(&self.cfg, layers, index_cache, args.kda_state,
             context_mode.is_some())?;
         let loader = weights::GlmfLoader { arenas: Default::default(), library: &self.library, checkpoint: &self.checkpoint, stream,
-            kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
+            kda_fp8: args.kda_fp8, kda_exact: args.kda_exact, kda_output_shard: args.kda_output_shard,
             // A packed head lands as BF16 and packs once every operand has landed (below).
             fp8_head: args.head_format == head::GlmfHeadFormat::Fp8,
             packed_head: args.head_format == head::GlmfHeadFormat::Packed,
@@ -2443,7 +2515,7 @@ impl Opened {
                 .then(|| embed.as_ref().context("Flash embedding source").and_then(|source|
                     source.allocation_request("embedding.table", cuteafd_loader::placement::planner::EmbeddingHome::Device(embedding_rank as u8))))
                 .transpose()?.map(|request| (embedding_rank, request.bytes as usize));
-            weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8,
+            weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8, args.kda_exact,
                 args.kda_output_shard, args.head_format, embedding)?
         };
         let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {
@@ -2752,7 +2824,7 @@ impl Opened {
         } else { model };
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
-        let single = model.check_single_residency(args.kda_fp8, args.head_format)?;
+        let single = model.check_single_residency(args.kda_fp8, args.kda_exact, args.head_format)?;
         // Header-only resident inventory uses the actual loader flags, not launcher defaults.
         if native_admission.is_none() && args.kda_nvfp4_gate.is_none() {
             let headers = cuteafd_loader::plan::Checkpoint::coordinator_view(&self.view, false, false)?;
@@ -2760,13 +2832,23 @@ impl Opened {
                 &headers, &self.cfg, layers, 1 + usize::from(peer_stream.is_some()),
                 cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != fp8::KdaFp8::Off, head: args.head_format,
-                    output_shard: args.kda_output_shard,
+                    output_shard: args.kda_output_shard, kda_kx7: args.kda_exact == kx7::KdaExact::Kx7,
                 }, attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)?;
             let actual = resident + model.norm.buffer.bytes + model.head.bytes();
             let peer_expected = expected.get(1).map_or(0, |r| r.weights);
-            ensure!(expected[0].weights == actual as u64 && peer_expected == peer_resident as u64,
-                "GLM Flash uploaded weights differ from admission: lead {} versus {} bytes; peer {} versus {} bytes",
-                actual, expected[0].weights, peer_resident, peer_expected);
+            // KX7 packs are admitted at their 8-bit bound and known only once packed: the lead may
+            // hold less than admitted, by exactly the packs' slack.
+            let slack = (single.kda_kx7_bound as u64).saturating_sub(single.kda_kx7 as u64);
+            ensure!(expected[0].weights == actual as u64 + slack && single.kda_kx7 <= single.kda_kx7_bound
+                && peer_expected == peer_resident as u64,
+                "GLM Flash uploaded weights differ from admission: lead {} versus {} bytes (KX7 slack {slack}); \
+                peer {} versus {} bytes", actual, expected[0].weights, peer_resident, peer_expected);
+            if single.kda_kx7 > 0 {
+                tracing::info!(admitted_bytes = single.kda_kx7_bound, packed_bytes = single.kda_kx7,
+                    slack_bytes = slack, bf16_bytes = single.kda_kx7_source,
+                    bits_per_weight = single.kda_kx7 as f64 * 16.0 / single.kda_kx7_source.max(1) as f64,
+                    "GLM Flash KX7 KDA projections against their admitted bound");
+            }
             tracing::info!(planned_lead_bytes = expected[0].weights, resident_lead_bytes = actual,
                 planned_peer_bytes = peer_expected, resident_peer_bytes = peer_resident,
                 "GLM Flash shared resident inventory versus uploaded operands");
@@ -2776,7 +2858,8 @@ impl Opened {
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             split_gib = peer_resident as f64 / (1u64 << 30) as f64,
             kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
-            kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
+            kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8), kda_kx7_mib = mib(single.kda_kx7),
+            kda_exact = args.kda_exact.setting(),
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8 + single.head_packed),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "GLM 5.3 Flash coordinator weights validated after Spark admission (one copy each; elapsed includes wait)");

@@ -1,5 +1,5 @@
 //! Final, header-derived requests for the independently retired target weight set.
-use super::{weights::PREFIX, fp8::KdaFp8, head::GlmfHeadFormat};
+use super::{weights::PREFIX, fp8::KdaFp8, head::GlmfHeadFormat, kx7::KdaExact};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::{families::glm5_flash::{GlmNextAttention, GlmNextConfig, core::CoreInventory},
@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 pub(super) fn joined(names: &[String]) -> String { names.join("+") }
 
 pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
-    ranks: usize, kda_fp8: KdaFp8, output_shard: bool, head: GlmfHeadFormat,
+    ranks: usize, kda_fp8: KdaFp8, kda_exact: KdaExact, output_shard: bool, head: GlmfHeadFormat,
     embedding: Option<(usize, usize)>) -> Result<Vec<WeightArenaLayout>> {
     ensure!(matches!(ranks, 1 | 2) && modes.len() <= cfg.layers, "Flash arena rank/layer extent");
     let core = CoreInventory::from_checkpoint(cfg, checkpoint)?;
@@ -92,6 +92,20 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
                     if native {
                         insert(out, format!("{p}.w_aux"), (elements(&a("f_a_proj.weight"))?
                             + elements(&a("g_a_proj.weight"))? + elements(&a("b_proj.weight"))?/ranks)*2)?;
+                    } else if kda_exact == KdaExact::Kx7 {
+                        // Exact KX7 packs of q/k/v/o at their admission bounds, and the staged
+                        // path's gates [f_a; g_a; b] in BF16 (one GPU).
+                        ensure!(ranks == 1 && kda_fp8 == KdaFp8::Off, "--kda-exact kx7 serves one GPU over BF16 KDA");
+                        for key in super::kx7::PROJECTIONS {
+                            let shape = &tensor(&format!("{p}.{key}.weight"))?.meta.shape;
+                            ensure!(shape.len() == 2, "Flash KX7 projection shape: {p}.{key}");
+                            for (name, bytes) in crate::shared::kx7::arena_views(&format!("{p}.{key}"), shape[0], shape[1])? {
+                                insert(out, name, bytes)?;
+                            }
+                        }
+                        let gates = [a("f_a_proj.weight"), a("g_a_proj.weight"), a("b_proj.weight")];
+                        let bytes = gates.iter().map(|name| elements(name)).collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>() * 2;
+                        insert(out, joined(&gates), bytes)?;
                     } else {
                         let inputs = ["q_proj.weight", "k_proj.weight", "v_proj.weight", "f_a_proj.weight", "g_a_proj.weight", "b_proj.weight"]
                             .map(|leaf| a(leaf)).to_vec();
@@ -184,21 +198,23 @@ mod tests {
         write_snapshot(root.path(), &config, &glm5_flash_tensors(&config), None);
         let checkpoint = Checkpoint::open(root.path())?;
         let cfg = GlmNextConfig::from_hf(&config)?;
-        for ranks in [1, 2] { for kda_fp8 in [KdaFp8::Off, KdaFp8::Row128, KdaFp8::Channel] {
+        for ranks in [1, 2] { for kda_fp8 in [KdaFp8::Off, KdaFp8::Row128, KdaFp8::Channel] { for kda_exact in [KdaExact::Off, KdaExact::Kx7] {
             for head in [GlmfHeadFormat::Bf16, GlmfHeadFormat::Fp8, GlmfHeadFormat::Packed] { for output_shard in [false, true] {
                 if output_shard && (ranks == 1 || kda_fp8 == KdaFp8::Off) { continue; }
                 if head == GlmfHeadFormat::Packed && ranks == 2 { continue; }
-                let repr = GlmfRepresentation { kda_fp8: kda_fp8 != KdaFp8::Off, head, output_shard };
+                if kda_exact == KdaExact::Kx7 && (ranks == 2 || kda_fp8 != KdaFp8::Off) { continue; }
+                let repr = GlmfRepresentation { kda_fp8: kda_fp8 != KdaFp8::Off, head, output_shard,
+                    kda_kx7: kda_exact == KdaExact::Kx7 };
                 let old = resident_weights(&checkpoint, &cfg, cfg.layers, ranks, repr).map_err(anyhow::Error::msg)?;
                 let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
-                    kda_fp8, output_shard, head, Some((0, old[0].embedding as usize)))?;
+                    kda_fp8, kda_exact, output_shard, head, Some((0, old[0].embedding as usize)))?;
                 for (rank, layout) in layouts.iter().enumerate() {
                     check(layout);
                     assert_eq!(layout.payload_bytes() as u64, old[rank].embedding + old[rank].weights,
                         "rank={rank} ranks={ranks} repr={repr:?}");
                 }
             }}
-        }}
+        }}}
         Ok(())
     }
 
@@ -238,7 +254,7 @@ mod tests {
             }).collect::<Vec<_>>();
             let old = resident_weights_placed(&checkpoint, &cfg, cfg.layers, ranks,
                 GlmfRepresentation::default(), attention, first_owner).map_err(anyhow::Error::msg)?;
-            let layouts = target(&checkpoint, &cfg, &modes, ranks, KdaFp8::Row128, false, GlmfHeadFormat::Fp8, None)?;
+            let layouts = target(&checkpoint, &cfg, &modes, ranks, KdaFp8::Row128, KdaExact::Off, false, GlmfHeadFormat::Fp8, None)?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 assert_eq!(layout.payload_bytes() as u64, old[rank].weights, "native rank {rank}/{ranks}");
@@ -261,7 +277,7 @@ mod tests {
             let embedding = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}embed_tokens.weight"))
                 .context("installed embedding header")?.meta.byte_length as usize;
             let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
-                KdaFp8::Row128, ranks == 2, GlmfHeadFormat::Fp8, Some((0, embedding)))?;
+                KdaFp8::Row128, KdaExact::Off, ranks == 2, GlmfHeadFormat::Fp8, Some((0, embedding)))?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();

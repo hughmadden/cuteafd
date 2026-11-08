@@ -8,9 +8,23 @@ pub struct GlmfRepresentation {
     pub kda_fp8: bool,
     pub head: GlmfHeadFormat,
     pub output_shard: bool,
+    /// `--kda-exact kx7`: the KDA q/k/v/o projections as exact KX7 packs of their BF16 (one GPU,
+    /// without `kda_fp8`), charged at [`kx7_projection_bytes`]'s 8-bit bound.
+    pub kda_kx7: bool,
 }
 impl Default for GlmfRepresentation {
-    fn default() -> Self { Self { kda_fp8: true, head: GlmfHeadFormat::Fp8, output_shard: true } }
+    fn default() -> Self { Self { kda_fp8: true, head: GlmfHeadFormat::Fp8, output_shard: true, kda_kx7: false } }
+}
+
+/// Device bytes admitted for one KX7 KDA projection `[n, k]` (`--kda-exact kx7`, format v1.1),
+/// as the loader allocates its four buffers (each at least 256 bytes): the streams' bound of 8
+/// bits a weight plus the read-ahead, the exact stream offsets and lengths, and the two-class
+/// decode tables of either resident code (the two-class code, or the Huffman fallback of a
+/// matrix whose ESC cannot fit; `cuteafd_core::kx7::resident_bound`). The size is known only after
+/// packing (FP8-born BF16 takes about 7.5 bits a weight in v1.1); the loader logs the slack and
+/// refuses a pack above the bound.
+pub fn kx7_projection_bytes(n: usize, k: usize) -> Result<u64, String> {
+    Ok(cuteafd_core::kx7::resident_bound(n, k).map_err(|e| e.to_string())?.total(256))
 }
 
 /// The one resident form of the vocabulary head `lm_head.weight` [vocab, hidden] that target
@@ -193,6 +207,21 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
                         let aux = elements(&a("f_a_proj.weight"))? + elements(&a("g_a_proj.weight"))?
                             + elements(&a("b_proj.weight"))? / ranks as u64;
                         bytes += (aux * 2).max(256);
+                    } else if repr.kda_kx7 {
+                        // KX7: q, k, v and o packed from their BF16 at the admission bound, and the
+                        // staged gates [f_a; g_a; b] in BF16, as the native stage path holds them.
+                        if ranks != 1 { return Err("KX7 KDA projections serve one coordinator GPU".into()); }
+                        for leaf in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                            let t = tensor(&a(&format!("{leaf}.weight")))?;
+                            match (&t.meta.dtype, t.meta.shape.as_slice()) {
+                                (DType::Bf16, &[n, k]) => bytes += kx7_projection_bytes(n, k)?,
+                                _ => return Err(format!("--kda-exact kx7 packs BF16 [n, k] KDA projections; {} is {:?} {:?}",
+                                    t.meta.name, t.meta.dtype, t.meta.shape)),
+                            }
+                        }
+                        let aux = elements(&a("f_a_proj.weight"))? + elements(&a("g_a_proj.weight"))?
+                            + elements(&a("b_proj.weight"))?;
+                        bytes += (aux * 2).max(256);
                     } else {
                         let inputs: Vec<_> = ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj"]
                             .iter().map(|s| a(&format!("{s}.weight"))).collect();
@@ -339,6 +368,42 @@ mod tests {
         }
     }
 
+    /// `--kda-exact kx7` charges every KDA layer's q, k, v and o at the 8-bit bound in place of
+    /// their BF16 (34 layers of GLM 5.3 Flash's [8192, 4096] q/k/v and [4096, 8192] o: 4.66 GB
+    /// against 9.13 GB), keeps every other operand, and serves one GPU.
+    #[test]
+    fn kx7_kda_charges_the_bound_in_place_of_bf16() {
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        let (q, o) = (kx7_projection_bytes(8192, 4096).unwrap(), kx7_projection_bytes(4096, 8192).unwrap());
+        assert_eq!((q, o), (34_406_420, 34_013_204));
+        assert_eq!(34 * (3 * q + o), 4_665_903_776);
+        assert_eq!(34 * 4 * 8192 * 4096 * 2u64, 9_126_805_504);
+        let dir = tempfile::tempdir().unwrap();
+        let config = glm5_flash_config(6);
+        write_snapshot(dir.path(), &config, &glm5_flash_tensors(&config), None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let bf16 = GlmfRepresentation { kda_fp8: false, ..Default::default() };
+        let kx7 = GlmfRepresentation { kda_kx7: true, ..bf16 };
+        let shape = |layer: usize, leaf: &str| checkpoint.tensors.iter()
+            .find(|t| t.meta.name == format!("model.language_model.layers.{layer}.self_attn.{leaf}.weight")).unwrap()
+            .meta.shape.clone();
+        let layer = cfg.attention.iter().position(|a| *a == GlmNextAttention::Kda).unwrap();
+        // BF16: w_in [q; k; v; f_a; g_a; b] and w_o. KX7: four packs and w_aux [f_a; g_a; b].
+        let saved: u64 = ["q_proj", "k_proj", "v_proj", "o_proj"].iter().map(|leaf| {
+            let s = shape(layer, leaf);
+            (s[0] * s[1] * 2) as u64 - kx7_projection_bytes(s[0], s[1]).unwrap()
+        }).sum();
+        for layers in [layer + 1, 6] {
+            let kda = cfg.attention[..layers].iter().filter(|a| **a == GlmNextAttention::Kda).count() as u64;
+            let base = resident_weights(&checkpoint, &cfg, layers, 1, bf16).unwrap();
+            let packed = resident_weights(&checkpoint, &cfg, layers, 1, kx7).unwrap();
+            assert_eq!(base[0].weights - packed[0].weights, kda * saved);
+            assert_eq!(base[0].embedding, packed[0].embedding);
+        }
+        assert!(resident_weights(&checkpoint, &cfg, 6, 2, kx7).unwrap_err().contains("one coordinator GPU"));
+    }
+
     #[test]
     fn owned_mla_inventory_preserves_kda_ffn_and_global_operands() {
         use crate::placement::AttentionPlacement::{Context, Heads, Layers};
@@ -450,6 +515,13 @@ mod tests {
             let packed = GlmfRepresentation { head: GlmfHeadFormat::Packed, ..Default::default() };
             let packed = resident_weights(&checkpoint, &cfg, cfg.layers, 1, packed).unwrap();
             assert_eq!(packed[0].weights, 8_956_184_320 - 654_213_120 + 956_074_752, "{model}");
+            // KX7 KDA: each layer's BF16 q, k, v and o at their packs' 8-bit bound.
+            let bf16 = GlmfRepresentation { kda_fp8: false, ..Default::default() };
+            let kx7 = GlmfRepresentation { kda_kx7: true, ..bf16 };
+            let (bf16, kx7) = (resident_weights(&checkpoint, &cfg, cfg.layers, 1, bf16).unwrap(),
+                resident_weights(&checkpoint, &cfg, cfg.layers, 1, kx7).unwrap());
+            let kda = cfg.attention.iter().filter(|a| **a == GlmNextAttention::Kda).count() as u64;
+            assert_eq!(bf16[0].weights - kx7[0].weights, kda * (4 * 67_108_864 - 3 * 34_406_420 - 34_013_204), "{model}");
             let split = resident_weights(&checkpoint, &cfg, cfg.layers, 2, Default::default()).unwrap();
             assert_eq!((split[0].weights, split[1].weights),
                 (5_660_947_200, 4_907_587_072 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");
