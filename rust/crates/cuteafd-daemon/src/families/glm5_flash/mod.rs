@@ -865,7 +865,7 @@ mod draft_cli_tests {
     #[test]
     fn fp8_head_selects_bf16_fp8_or_the_packed_head_on_one_gpu() {
         use head::GlmfHeadFormat::{Bf16, Fp8, Packed};
-        for (extra, format) in [(&[][..], Bf16), (&["--fp8-head"][..], Fp8), (&["--fp8-head", "true"][..], Fp8),
+        for (extra, format) in [(&[][..], head::GlmfHeadFormat::Auto), (&["--fp8-head"][..], Fp8), (&["--fp8-head", "true"][..], Fp8),
             (&["--fp8-head", "on"][..], Fp8), (&["--fp8-head", "false"][..], Bf16), (&["--fp8-head", "bf16"][..], Bf16),
             (&["--fp8-head", "packed"][..], Packed), (&["--fp8-head", "--kda-fp8", "row128"][..], Fp8)] {
             let args = parse(extra);

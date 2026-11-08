@@ -463,7 +463,8 @@ mod tests {
             let checkpoint = Checkpoint::open(&path).unwrap();
             let cfg = GlmNextConfig::from_hf(&checkpoint.config).unwrap();
             let single = resident_weights(&checkpoint, &cfg, cfg.layers, 1, Default::default()).unwrap();
-            assert_eq!((single[0].embedding, single[0].weights), (1_268_776_960, 8_956_184_320), "{model}");
+            assert_eq!((single[0].embedding, single[0].weights),
+                (1_268_776_960, 8_956_184_320 - 654_213_120 + 956_074_752), "{model}");
             let packed = GlmfRepresentation { head: GlmfHeadFormat::Packed, ..Default::default() };
             let packed = resident_weights(&checkpoint, &cfg, cfg.layers, 1, packed).unwrap();
             assert_eq!(packed[0].weights, 8_956_184_320 - 654_213_120 + 956_074_752, "{model}");
