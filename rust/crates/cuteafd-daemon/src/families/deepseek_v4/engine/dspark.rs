@@ -240,11 +240,17 @@ impl<'a> Engine<'a> {
             ("norm", dspark.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", w.y.buffer.ptr),
         ], &[scalar])?;
         let rank = self.cfg.dspark_markov_rank;
+        // The draft block's logits come from the same head handle the target uses, so they must
+        // take its configured route: the handle is created for `TargetHead::configured()`, and the
+        // pedantic GEMM entry point refuses a tensor-core handle (and the reverse) with a CUDA
+        // invalid-value error. The Markov head then picks drafts greedily from these rows, which
+        // the target verifies; the invariant route costs one fixed tile at draft row counts.
         // SAFETY: y, head weights, logits, Markov weights, tokens and the
         // argmax workspace are live buffers of these shapes.
         unsafe {
-            w.head.as_ref().context("LM head")?.launch(w.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
-                w.vocab_logits.buffer.ptr.cast(), rows as u32, self.stream)?;
+            crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
+                w.head.as_ref().context("LM head")?, w.y.buffer.ptr.cast_const(),
+                self.weights.head.buffer.ptr.cast_const(), w.vocab_logits.buffer.ptr.cast(), rows, self.stream)?;
             self.library.dsv4_markov_drafts(w.vocab_logits.buffer.ptr, dspark.markov_w1.buffer.ptr,
                 dspark.markov_w2.buffer.ptr, w.first_tokens.buffer.ptr, w.drafts.buffer.ptr, w.markov.buffer.ptr,
                 requests.len(), block, self.cfg.vocab_size, rank, self.stream)?;
