@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -112,7 +113,7 @@ int32_t blas_status(cublasStatus_t status) { return status == CUBLAS_STATUS_SUCC
 static cublasStatus_t create_tensor_plan(MarkovHandle* handle) {
   auto& plan = handle->tensor;
   const int width = handle->width, vocab = handle->vocab_rows;
-  auto status = cublasLtCreate(&plan.blas);
+  auto status = CUTEAFD_CHECK_MEMORY("cublasLtCreate", "cublas", cublasLtCreate(&plan.blas), 0, 0, nullptr);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
   status = cublasLtMatmulDescCreate(&plan.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
@@ -186,7 +187,7 @@ static int32_t create_head(void* workspace, uint64_t bytes, void** output, int w
   if (!handle) return cudaErrorMemoryAllocation;
   auto status = cudaGetDevice(&handle->device);
   if (status != cudaSuccess) { delete handle; return status; }
-  auto created = cublasCreate(&handle->blas);
+  auto created = CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&handle->blas), 0, 0, nullptr);
   if (created != CUBLAS_STATUS_SUCCESS) { delete handle; return blas_status(created); }
   handle->workspace = workspace;
   handle->width = width;

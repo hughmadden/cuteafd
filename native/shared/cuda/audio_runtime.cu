@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 // FP32 native MiMo audio qualification path. CUDA library plans and caller-
 // admitted CuTe modules are resolved once; encode owns no allocation/capture.
 #include "cuteafd_audio.h"
@@ -246,8 +247,8 @@ extern "C" int32_t cuteafd_audio_destroy(void* opaque) {
   if(o->support) { int e=cuteafd_audio_support_destroy(o->support);if(!first)first=e; }
   if(o->fft) { int e=fs(cufftDestroy(o->fft));if(!first)first=e; }
   if(o->blas) { int e=bs(cublasDestroy(o->blas));if(!first)first=e; }
-  if(o->weights) { int e=cudaFree(o->weights);if(!first)first=e; }
-  if(o->arena) { int e=cudaFree(o->arena);if(!first)first=e; }
+  if(o->weights) { int e=CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));if(!first)first=e; }
+  if(o->arena) { int e=CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));if(!first)first=e; }
   if(o->stream) { int e=cudaStreamDestroy(o->stream);if(!first)first=e; }
   if(previous>=0 && previous!=o->device)cudaSetDevice(previous);
   delete o;return first;
@@ -266,11 +267,11 @@ extern "C" int32_t cuteafd_audio_create(const cuteafd_audio_spec* s,int32_t devi
   auto fail=[&](int rc){cuteafd_audio_destroy(o);return rc;};
   int low,high;e=cudaDeviceGetStreamPriorityRange(&low,&high);if(e)return fail(e);
   e=cudaStreamCreateWithPriority(&o->stream,cudaStreamNonBlocking,low);if(e)return fail(e);
-  e=cudaMalloc(reinterpret_cast<void**>(&o->weights),ledger.weights);if(e)return fail(e);++o->ledger.device_allocations;
-  e=cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+BLAS_BYTES+FFT_BYTES);if(e)return fail(e);++o->ledger.device_allocations;
+  e=CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&o->weights), ledger.weights, 0, cudaMalloc(reinterpret_cast<void**>(&o->weights),ledger.weights));if(e)return fail(e);++o->ledger.device_allocations;
+  e=CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&o->arena), ledger.scratch+BLAS_BYTES+FFT_BYTES, 0, cudaMalloc(reinterpret_cast<void**>(&o->arena),ledger.scratch+BLAS_BYTES+FFT_BYTES));if(e)return fail(e);++o->ledger.device_allocations;
   scratch(o);
   e=cuteafd_audio_support_create(&o->support);if(e)return fail(e);
-  e=bs(cublasCreate(&o->blas));if(e)return fail(e);
+  e=bs(CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&o->blas), 0, 0, nullptr));if(e)return fail(e);
   e=bs(cublasSetMathMode(o->blas,CUBLAS_PEDANTIC_MATH));if(e)return fail(e);
   e=bs(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);
   e=bs(cublasSetStream(o->blas,o->stream));if(e)return fail(e);

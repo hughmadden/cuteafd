@@ -7,6 +7,8 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+FAILURE_STUB = ('#include "' + str(ROOT / "native/shared/include/memory_failure.h") + '"\n'
+                'extern "C" void cuteafd_memory_failure(const cuteafd_memory_failure_t*) {}\n')
 SOURCE = ROOT / "native/shared/src/tp2_kernel_inventory.cc"
 ABI = """#pragma once
 #include <cstdint>
@@ -350,7 +352,7 @@ int main() {
 }
 '''
     fixture = tmp_path / "blas_handles.cc"
-    fixture.write_text(mock + "cuteafd_status_t cublas_handle(" + helper + main)
+    fixture.write_text(FAILURE_STUB + mock + "cuteafd_status_t cublas_handle(" + helper + main)
     executable = tmp_path / "blas_handles"
     subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
                     str(fixture), "-o", str(executable)], check=True, capture_output=True)
@@ -499,7 +501,7 @@ int main() {
 }
 '''
     fixture = tmp_path / "capture_blas.cc"
-    fixture.write_text(mock + helper + prepare + capture + launch + main)
+    fixture.write_text(FAILURE_STUB + mock + helper + prepare + capture + launch + main)
     executable = tmp_path / "capture_blas"
     built = subprocess.run([compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
                             str(fixture), "-o", str(executable)], capture_output=True, text=True)

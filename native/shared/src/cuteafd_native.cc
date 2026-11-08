@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "cuteafd_native.h"
 #include "graph_census_path.h"
 #include "rdma_endpoint_destroy.h"
@@ -34,6 +35,23 @@
 #include <nccl.h>
 #endif
 
+namespace {
+std::atomic<cuteafd_memory_failure_callback_t> memory_failure_callback{nullptr};
+std::atomic<cuteafd_memory_event_callback_t> memory_event_callback{nullptr};
+}
+extern "C" void cuteafd_set_memory_failure_callback(cuteafd_memory_failure_callback_t callback) {
+  memory_failure_callback.store(callback, std::memory_order_release);
+}
+extern "C" void cuteafd_memory_failure(const cuteafd_memory_failure_t* failure) {
+  if (const auto callback = memory_failure_callback.load(std::memory_order_acquire)) callback(failure);
+}
+
+extern "C" void cuteafd_set_memory_event_callback(cuteafd_memory_event_callback_t callback) {
+  memory_event_callback.store(callback, std::memory_order_release);
+}
+extern "C" void cuteafd_memory_event(int32_t space, uintptr_t ptr, size_t bytes, int32_t released) {
+  if (const auto callback = memory_event_callback.load(std::memory_order_acquire)) callback(space, ptr, bytes, released);
+}
 namespace {
 
 thread_local std::string g_last_error;
@@ -496,10 +514,10 @@ bool destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   if ((endpoint->host_buffer_flags & CUTEAFD_HOST_BUFFER_FLAG_PINNED) != 0) {
     if (endpoint->send_buffer != nullptr) {
-      cudaFreeHost(endpoint->send_buffer);
+      CUTEAFD_TRACK_FREE(endpoint->send_buffer, cudaFreeHost(endpoint->send_buffer));
     }
     if (endpoint->recv_buffer != nullptr) {
-      cudaFreeHost(endpoint->recv_buffer);
+      CUTEAFD_TRACK_FREE(endpoint->recv_buffer, cudaFreeHost(endpoint->recv_buffer));
     }
   } else {
     std::free(endpoint->send_buffer);
@@ -960,7 +978,7 @@ extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_de
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   void* ptr = nullptr;
-  cudaError_t err = cudaMalloc(&ptr, bytes);
+  cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaMalloc", "cuda", cudaMalloc(&ptr, bytes), bytes, 1, nullptr);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaMalloc failed", err);
   }
@@ -996,7 +1014,7 @@ extern "C" cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes,
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   void* ptr = nullptr;
-  cudaError_t err = cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal);
+  cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaMallocManaged", "cuda", cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal), bytes, 1, nullptr);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaMallocManaged failed", err);
   }
@@ -1043,7 +1061,7 @@ extern "C" cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t byte
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "empty host mapping");
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  cudaError_t err = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
+  cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaHostRegister", "cuda", cudaHostRegister(ptr, bytes, cudaHostRegisterPortable), bytes, 1, nullptr);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaHostRegister failed", err);
   }
@@ -1077,7 +1095,7 @@ extern "C" cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   void* ptr = nullptr;
   cudaError_t err =
-      cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+      CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped), bytes, 1, nullptr);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaHostAlloc failed", err);
   }
@@ -1137,7 +1155,7 @@ extern "C" cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf)
   }
   if (buf->ptr != nullptr) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-    cudaError_t err = cudaFreeHost(buf->ptr);
+    cudaError_t err = CUTEAFD_TRACK_FREE(buf->ptr, cudaFreeHost(buf->ptr));
     if (err != cudaSuccess) {
       return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaFreeHost failed", err);
     }
@@ -1157,7 +1175,7 @@ extern "C" cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* 
   }
   if (buf->ptr != nullptr) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-    cudaError_t err = cudaFree(buf->ptr);
+    cudaError_t err = CUTEAFD_TRACK_FREE(buf->ptr, cudaFree(buf->ptr));
     if (err != cudaSuccess) {
       return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaFree failed", err);
     }
@@ -1679,7 +1697,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
   size_t before_free = 0, after_free = 0, total = 0;
   const bool census = graph_census_enabled();
   const cudaError_t before_status = census ? cudaMemGetInfo(&before_free, &total) : cudaSuccess;
-  err = cudaGraphInstantiate(&graph_exec, graph, 0);
+  err = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&graph_exec, graph, 0), 0, 0, graph);
   const cudaError_t after_status = census ? cudaMemGetInfo(&after_free, &total) : cudaSuccess;
   if (err != cudaSuccess) {
     cudaGraphDestroy(graph);
@@ -3481,22 +3499,24 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
   if (host_buffer_flags == kMappedHostFlags) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
     void* send_buffer = nullptr;
-    cudaError_t cuda_status = cudaHostAlloc(
-        &send_buffer, send_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+    cudaError_t cuda_status = CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(
+        &send_buffer, send_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped), send_registered_span_bytes, 1, nullptr);
     if (cuda_status != cudaSuccess) {
       destroy_rdma_rc_endpoint(endpoint);
       return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
                        "cudaHostAlloc RDMA RC endpoint send buffer failed", cuda_status);
     }
+    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(send_buffer), send_registered_span_bytes, 0);
     endpoint->send_buffer = static_cast<unsigned char*>(send_buffer);
     void* recv_buffer = nullptr;
-    cuda_status = cudaHostAlloc(
-        &recv_buffer, recv_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped);
+    cuda_status = CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(
+        &recv_buffer, recv_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped), recv_registered_span_bytes, 1, nullptr);
     if (cuda_status != cudaSuccess) {
       destroy_rdma_rc_endpoint(endpoint);
       return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
                        "cudaHostAlloc RDMA RC endpoint recv buffer failed", cuda_status);
     }
+    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(recv_buffer), recv_registered_span_bytes, 0);
     endpoint->recv_buffer = static_cast<unsigned char*>(recv_buffer);
 #endif
   } else {
@@ -4052,9 +4072,9 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
     if (cq != nullptr) ibv_destroy_cq(cq);
     if (pd != nullptr) ibv_dealloc_pd(pd);
     if (context != nullptr) ibv_close_device(context);
-    if (send != nullptr) cudaFreeHost(send);
-    if (recv != nullptr) cudaFreeHost(recv);
-    if (gpu != nullptr) cudaFree(gpu);
+    if (send != nullptr) CUTEAFD_TRACK_FREE(send, cudaFreeHost(send));
+    if (recv != nullptr) CUTEAFD_TRACK_FREE(recv, cudaFreeHost(recv));
+    if (gpu != nullptr) CUTEAFD_TRACK_FREE(gpu, cudaFree(gpu));
   };
   auto bail = [&](cuteafd_status_t status, const std::string& message) {
     cleanup();
@@ -4066,9 +4086,9 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
       (cq = ibv_create_cq(context, 16, nullptr, nullptr, 0)) == nullptr) {
     return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RDMA device setup failed for the landing probe");
   }
-  if (cudaMalloc(&gpu, bytes) != cudaSuccess ||
-      cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable) != cudaSuccess ||
-      cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable) != cudaSuccess) {
+  if (CUTEAFD_CHECK_MEMORY("cudaMalloc", "cuda", cudaMalloc(&gpu, bytes), bytes, 1, nullptr) != cudaSuccess ||
+      CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable), frame, 1, nullptr) != cudaSuccess ||
+      CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable), frame, 1, nullptr) != cudaSuccess) {
     return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, "GPU landing probe allocation failed");
   }
   const cuteafd_status_t registered = register_device_dmabuf(pd, gpu, bytes, &gpu_mr);

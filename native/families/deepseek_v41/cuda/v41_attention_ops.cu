@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 #include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -116,7 +117,7 @@ extern "C" int32_t cuteafd_v41_grouped_output_create(void* workspace, uint64_t b
   if (!h) return cudaErrorMemoryAllocation;
   auto status=cudaGetDevice(&h->device);
   if(status!=cudaSuccess) {delete h;return status;}
-  auto result=cublasCreate(&h->blas);
+  auto result=CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&h->blas), 0, 0, nullptr);
   if(result!=CUBLAS_STATUS_SUCCESS) {delete h;return blas_status(result);}
   // Prevent reduced-precision intermediate reductions before the final BF16 output.
   result=cublasSetMathMode(h->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);

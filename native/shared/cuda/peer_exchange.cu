@@ -1,3 +1,4 @@
+#include "memory_failure.h"
 // Two-GPU exchange over peer memory (see cuteafd_peer_exchange.h) and the
 // `cuteafd fabric --p2p` probe that measures it against the copy engine and a
 // pinned-host bounce.
@@ -345,7 +346,7 @@ struct Side {
     for (auto* event : {start, stop, mark}) if (event) cudaEventDestroy(event);
     for (auto* s : {stream, ingress}) if (s) cudaStreamDestroy(s);
     for (void* p : {static_cast<void*>(buffer), static_cast<void*>(recv), static_cast<void*>(ingress_device),
-         static_cast<void*>(control)}) if (p) cudaFree(p);
+         static_cast<void*>(control)}) if (p) CUTEAFD_TRACK_FREE(p, cudaFree(p));
   }
   uint32_t* flag() const { return control; }
   uint32_t* send() const { return control + 1; }
@@ -354,7 +355,7 @@ struct Side {
 
 struct Pinned {
   void* p = nullptr;
-  ~Pinned() { if (p) cudaFreeHost(p); }
+  ~Pinned() { if (p) CUTEAFD_TRACK_FREE(p, cudaFreeHost(p)); }
 };
 
 cudaError_t enable_peer(int device, int peer) {
@@ -374,11 +375,11 @@ cudaError_t setup(Side& side, int device, uint64_t bytes) {
   CHECK(cudaEventCreate(&side.start));
   CHECK(cudaEventCreate(&side.stop));
   CHECK(cudaEventCreateWithFlags(&side.mark, cudaEventDisableTiming));
-  CHECK(cudaMalloc(&side.buffer, bytes));
-  CHECK(cudaMalloc(&side.recv, bytes));
+  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.buffer, bytes, 0, cudaMalloc(&side.buffer, bytes)));
+  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.recv, bytes, 0, cudaMalloc(&side.recv, bytes)));
   CHECK(cudaMemset(side.buffer, 1 + device, bytes));
   CHECK(cudaMemset(side.recv, 0, bytes));
-  CHECK(cudaMalloc(&side.control, 64));
+  CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side.control, 64, 0, cudaMalloc(&side.control, 64)));
   CHECK(cudaMemset(side.control, 0, 64));
   return cudaDeviceSynchronize();
 }
@@ -551,7 +552,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
   CHECK(setup(sa, a, bytes));
   CHECK(setup(sb, b, bytes));
   Pinned bounce;
-  if (test == 3) CHECK(cudaHostAlloc(&bounce.p, bytes, cudaHostAllocPortable));
+  if (test == 3) CHECK(CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &bounce.p, bytes, 1, cudaHostAlloc(&bounce.p, bytes, cudaHostAllocPortable)));
   const uint64_t units = bytes / 16;
   const unsigned grid = default_blocks(units, blocks);
   auto u4 = [](uint8_t* p) { return reinterpret_cast<uint4*>(p); };
@@ -616,7 +617,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
       cudaGraph_t graph = nullptr;
       CHECK(cudaSetDevice(a));
       CHECK(cudaStreamEndCapture(sa.stream, &graph));
-      const cudaError_t status = cudaGraphInstantiate(&sa.graph, graph, 0);
+      const cudaError_t status = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&sa.graph, graph, 0), 0, 0, graph);
       cudaGraphDestroy(graph);
       CHECK(status);
     } else {
@@ -632,7 +633,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
         }
         cudaGraph_t graph = nullptr;
         CHECK(cudaStreamEndCapture(side.stream, &graph));
-        const cudaError_t status = cudaGraphInstantiate(&side.graph, graph, 0);
+        const cudaError_t status = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&side.graph, graph, 0), 0, 0, graph);
         cudaGraphDestroy(graph);
         CHECK(status);
       }
@@ -655,12 +656,12 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
   Pinned ingress_host;
   const uint64_t ingress_bytes = 256ull << 20;
   if (ingress) {
-    CHECK(cudaHostAlloc(&ingress_host.p, ingress_bytes, cudaHostAllocPortable));
+    CHECK(CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &ingress_host.p, ingress_bytes, 1, cudaHostAlloc(&ingress_host.p, ingress_bytes, cudaHostAllocPortable)));
     for (Side* side : {&sa, &sb}) {
       if (!(ingress & (side == &sa ? 1u : 2u))) continue;
       CHECK(cudaSetDevice(side->device));
       CHECK(cudaStreamCreateWithFlags(&side->ingress, cudaStreamNonBlocking));
-      CHECK(cudaMalloc(&side->ingress_device, ingress_bytes));
+      CHECK(CUTEAFD_TRACK_ALLOC("cudaMalloc", &side->ingress_device, ingress_bytes, 0, cudaMalloc(&side->ingress_device, ingress_bytes)));
     }
   }
   // A host thread per loaded device keeps two copies queued until stopped.
