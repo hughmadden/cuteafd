@@ -129,7 +129,7 @@ extern "C" int32_t cuteafd_v41_vision_create(void* workspace,uint64_t bytes,void
   if(bytes<workspace_bytes || !valid(workspace,workspace_bytes,256))return cudaErrorInvalidValue;
   auto* h=new(std::nothrow)Handle{};if(!h)return cudaErrorMemoryAllocation;
   auto result=cudaGetDevice(&h->device);if(result){delete h;return result;}
-  auto s=cuteafd::borrow_blas(false,h->owner);if(s){delete h;return status(s);}
+  auto s=cuteafd::borrow_blas(false,h->owner,"v41/blas/media");if(s){delete h;return status(s);}
   h->blas=h->owner->gemm;
   h->workspace=workspace;*output=h;return 0;
 }

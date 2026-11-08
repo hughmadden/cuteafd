@@ -118,7 +118,7 @@ extern "C" int32_t cuteafd_v41_grouped_output_create(void* workspace, uint64_t b
   if (!h) return cudaErrorMemoryAllocation;
   auto status=cudaGetDevice(&h->device);
   if(status!=cudaSuccess) {delete h;return status;}
-  auto result=cuteafd::borrow_blas(false,h->owner);
+  auto result=cuteafd::borrow_blas(false,h->owner,"v41/blas/grouped-output");
   if(result==CUBLAS_STATUS_SUCCESS)h->blas=h->owner->gemm;
   if(result!=CUBLAS_STATUS_SUCCESS) {delete h;return blas_status(result);}
   h->workspace=workspace;*out=h;return 0;

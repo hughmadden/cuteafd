@@ -425,9 +425,15 @@ def test_compiled_bf16_blas_handles_follow_device_and_retry_failed_creation(tmp_
 std::shared_ptr<cuteafd::BlasOwner> other_borrower(bool lt);
 int main() {
   cublasHandle_t first = nullptr, second = nullptr, again = nullptr;
+  std::shared_ptr<cuteafd::BlasOwner> invalid;
+  assert(cuteafd::borrow_blas(false, invalid, "") == 7 && creates == 0);
   assert(cublas_handle(nullptr) == 1 && creates == 0);
   assert(cublas_handle(&first) == 0 && first->device == 0);
+  uint32_t kind = 0; char name[128] = {}; size_t required = 0;
+  assert(cuteafd_last_allocation_tag(&kind, name, sizeof(name), &required) == 0);
+  assert(kind == CUTEAFD_MEMORY_KIND_WORKSPACE && std::string(name) == "shared/blas/linear");
   auto shared = other_borrower(false);
+  assert(shared->gemm_owner == "shared/blas/linear");
   assert(shared->gemm == first && creates == 1);
   assert(other_borrower(true) == shared && lt_creates == 1);
   void* workspace = first->workspace;
@@ -459,7 +465,7 @@ int main() {
 """, r"""
 std::shared_ptr<cuteafd::BlasOwner> other_borrower(bool lt) {
   std::shared_ptr<cuteafd::BlasOwner> owner;
-  assert(cuteafd::borrow_blas(lt, owner) == 0);
+  assert(cuteafd::borrow_blas(lt, owner, "test/blas/serving") == 0);
   return owner;
 }
 """)

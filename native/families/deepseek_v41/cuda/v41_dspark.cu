@@ -115,7 +115,7 @@ int32_t blas_status(cublasStatus_t status) { return status == CUBLAS_STATUS_SUCC
 static cublasStatus_t create_tensor_plan(MarkovHandle* handle) {
   auto& plan = handle->tensor;
   const int width = handle->width, vocab = handle->vocab_rows;
-  auto status = cuteafd::borrow_blas(true, handle->owner);
+  auto status = cuteafd::borrow_blas(true, handle->owner, "shared/blas/vocabulary");
   if (status == CUBLAS_STATUS_SUCCESS) plan.blas = handle->owner->lt;
   if (status != CUBLAS_STATUS_SUCCESS) return status;
   status = cublasLtMatmulDescCreate(&plan.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
@@ -192,7 +192,7 @@ static int32_t create_head(void* workspace, uint64_t bytes, void** output, int w
   if (status != cudaSuccess) { delete handle; return status; }
   handle->mode = mode;
   if (mode == 0) {
-    const auto created = cuteafd::borrow_blas(false, handle->owner);
+    const auto created = cuteafd::borrow_blas(false, handle->owner, width == 256 ? "v41/blas/markov" : "shared/blas/vocabulary");
     if (created != CUBLAS_STATUS_SUCCESS) { delete handle; return blas_status(created); }
     handle->blas = handle->owner->gemm;
   }

@@ -281,7 +281,7 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   }
 #endif
   if(ledger.blas_workspace) {
-    e=blas_status(cuteafd::borrow_blas(false,o->blas_owner));if(e)return fail(e);
+    e=blas_status(cuteafd::borrow_blas(false,o->blas_owner,"shared/blas/media"));if(e)return fail(e);
     o->blas=o->blas_owner->gemm;
     e=blas_status(cublasSetMathMode(o->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));if(e)return fail(e);
     e=blas_status(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);

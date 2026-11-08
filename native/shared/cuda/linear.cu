@@ -965,11 +965,11 @@ cuteafd_status_t cublas_handle(cublasHandle_t* out, cudaStream_t stream = nullpt
         cuteafd_set_last_error_message(message.c_str());
         return CUTEAFD_STATUS_CAPTURE_REQUIRES_PREPARE;
       }
-      auto status = cuteafd::borrow_blas(false, state.owner);
+      auto status = cuteafd::borrow_blas(false, state.owner, "shared/blas/linear");
       if (status != CUBLAS_STATUS_SUCCESS) return status_from_cublas(status);
       // Insert first: a host allocation failure must not leak device scratch.
       auto slot = state.workspaces.emplace(stream, nullptr);
-      cuda_status = CUTEAFD_TRACK_ALLOC("cudaMalloc", &slot.first->second, kLinearBlasWorkspace, 0,
+      cuda_status = CUTEAFD_TRACK_ALLOC("cudaMalloc", &slot.first->second, kLinearBlasWorkspace, 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "shared/blas/linear",
           cudaMalloc(&slot.first->second, kLinearBlasWorkspace));
       if (cuda_status != cudaSuccess) {
         state.workspaces.erase(slot.first);

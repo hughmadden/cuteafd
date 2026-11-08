@@ -135,8 +135,9 @@ def test_blas_handle_diagnostics_log_only_after_successful_creation():
     owner = (ROOT / "native/shared/include/blas_owner.h").read_text()
     assert "pthread_getname_np" in owner and "SYS_gettid" in owner
     assert "thread_id=%ld thread_name=%s owner=%p" in owner
-    assert 'if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", "gemm")' in owner
-    assert 'if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", "lt")' in owner
+    assert 'if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", tensor ? "lt" : "gemm")' in owner
+    assert 'cuteafd_tag_check(CUTEAFD_MEMORY_KIND_WORKSPACE, allocation_owner)' in owner
+    assert 'kind=workspace allocation_owner=%s' in owner
     assert "static thread_local" in owner
     bind = owner.split("inline cublasStatus_t bind_blas(", 1)[1]
     assert bind.index("cublasSetStream") < bind.index("cublasSetWorkspace")

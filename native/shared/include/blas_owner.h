@@ -8,6 +8,7 @@
 #include <new>
 #include <pthread.h>
 #include <sys/syscall.h>
+#include <string>
 #include <unistd.h>
 #include <thread>
 #include <unordered_map>
@@ -22,12 +23,15 @@ struct BlasOwner {
   const long thread_id = syscall(SYS_gettid);
   cublasHandle_t gemm = nullptr;
   cublasLtHandle_t lt = nullptr;
+  std::string gemm_owner;
+  std::string lt_owner;
   explicit BlasOwner(int id) : device(id) {}
   void log(const char* event, const char* backend) const noexcept {
     char name[16] = {};
     pthread_getname_np(pthread_self(), name, sizeof(name));
-    std::fprintf(stderr, "blas_owner event=%s backend=%s device=%d thread_id=%ld thread_name=%s owner=%p\n",
-        event, backend, device, thread_id, name, static_cast<const void*>(this));
+    const auto& allocation_owner = backend[0] == 'g' ? gemm_owner : lt_owner;
+    std::fprintf(stderr, "blas_owner event=%s backend=%s device=%d thread_id=%ld thread_name=%s owner=%p kind=workspace allocation_owner=%s\n",
+        event, backend, device, thread_id, name, static_cast<const void*>(this), allocation_owner.c_str());
   }
   ~BlasOwner() {
     int previous = -1;
@@ -43,7 +47,8 @@ inline cublasStatus_t check_blas_owner(const std::shared_ptr<BlasOwner>& owner) 
   if (cudaGetDevice(&device) != cudaSuccess) return CUBLAS_STATUS_NOT_INITIALIZED;
   return device == owner->device ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
 }
-inline cublasStatus_t borrow_blas(bool tensor, std::shared_ptr<BlasOwner>& out) noexcept {
+inline cublasStatus_t borrow_blas(bool tensor, std::shared_ptr<BlasOwner>& out,
+    const char* allocation_owner) noexcept {
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess) return CUBLAS_STATUS_NOT_INITIALIZED;
   try {
@@ -52,12 +57,17 @@ inline cublasStatus_t borrow_blas(bool tensor, std::shared_ptr<BlasOwner>& out) 
     auto owner = slot.lock();
     if (!owner) owner = std::make_shared<BlasOwner>(device);
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
-    if (tensor && !owner->lt) {
-      status = CUTEAFD_CHECK_MEMORY("cublasLtCreate", "cublas", cublasLtCreate(&owner->lt), 0, 0, nullptr);
-      if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", "lt");
-    } else if (!tensor && !owner->gemm) {
-      status = CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&owner->gemm), 0, 0, nullptr);
-      if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", "gemm");
+    if ((tensor && !owner->lt) || (!tensor && !owner->gemm)) {
+      // cuBLAS owns opaque device allocations. Retain their attempted tag for
+      // faults; the calibrated admission owner, not a fake pointer, prices them.
+      if (!cuteafd_tag_check(CUTEAFD_MEMORY_KIND_WORKSPACE, allocation_owner))
+        return CUBLAS_STATUS_INVALID_VALUE;
+      auto& name = tensor ? owner->lt_owner : owner->gemm_owner;
+      name = allocation_owner;
+      status = tensor
+          ? CUTEAFD_CHECK_MEMORY("cublasLtCreate", "cublas", cublasLtCreate(&owner->lt), 0, 0, nullptr)
+          : CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&owner->gemm), 0, 0, nullptr);
+      if (status == CUBLAS_STATUS_SUCCESS) owner->log("create", tensor ? "lt" : "gemm");
     }
     if (status != CUBLAS_STATUS_SUCCESS) return status;
     slot = owner;

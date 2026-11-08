@@ -307,7 +307,7 @@ extern "C" int32_t cuteafd_audio_create(const cuteafd_audio_spec* s,int32_t devi
   e=cuteafd_media_allocate(reinterpret_cast<void**>(&o->arena),ledger.scratch+BLAS_BYTES+FFT_BYTES,tags->workspace_kind,tags->workspace_owner);if(e)return fail(e);++o->ledger.device_allocations;
   scratch(o);
   e=cuteafd_audio_support_create(&o->support);if(e)return fail(e);
-  e=bs(cuteafd::borrow_blas(false,o->blas_owner));if(e)return fail(e);
+  e=bs(cuteafd::borrow_blas(false,o->blas_owner,"shared/blas/media"));if(e)return fail(e);
   o->blas=o->blas_owner->gemm;
   e=bs(cublasSetMathMode(o->blas,CUBLAS_PEDANTIC_MATH));if(e)return fail(e);
   e=bs(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);
