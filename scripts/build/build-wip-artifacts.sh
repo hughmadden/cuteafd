@@ -339,6 +339,7 @@ cmake \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$v41_coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$v41_coordinator_aot" \
   -DCUTEAFD_ENABLE_RDMA=ON \
+  -DCUTEAFD_EXPORT_LINEINFO="${CUTEAFD_WIP_EXPORT_LINEINFO:-OFF}" \
   -DCUTEAFD_HOST_ISA="${host_isa_cmake:-}" \
   -DCUTEAFD_SPARKINFER_SOURCE_DIR="$source_dir/third_party/sparkinfer" \
   -DCUTEAFD_SPARKINFER_LOCK_FILE="$source_dir/third_party/sparkinfer.lock.json" \
