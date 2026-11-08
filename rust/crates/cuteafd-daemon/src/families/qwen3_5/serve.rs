@@ -645,10 +645,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                     Ok(())
                 })
         })();
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(anyhow::anyhow!("dense initialization failed: {:#}", result.as_ref().unwrap_err())));
-        }
-        result
+        crate::shared::serve::forward_initialization(result, ready.is_some(), "dense initialization failed", |error| {
+            ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+        })
     });
     let max_context = ready_rx.await.context("dense engine failed before readiness")??;
     let limits = args.prefix.reserve.limits(max_context)?;

@@ -184,6 +184,7 @@ impl VisionLedger {
 #[derive(Debug)]
 pub enum VisionError {
     Native(i32),
+    Failure(anyhow::Error),
     InvalidInput(&'static str),
     Runtime(String),
     Library(libloading::Error),
@@ -191,6 +192,7 @@ pub enum VisionError {
 impl fmt::Display for VisionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Failure(error) => std::fmt::Display::fmt(error, f),
             Self::Native(status) => write!(f, "vision native status {status}"),
             Self::InvalidInput(reason) => f.write_str(reason),
             Self::Runtime(reason) => f.write_str(reason),
@@ -198,7 +200,11 @@ impl fmt::Display for VisionError {
         }
     }
 }
-impl std::error::Error for VisionError {}
+impl std::error::Error for VisionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self { Self::Failure(error) => Some(error.as_ref()), _ => None }
+    }
+}
 impl From<libloading::Error> for VisionError {
     fn from(e: libloading::Error) -> Self {
         Self::Library(e)
@@ -206,9 +212,10 @@ impl From<libloading::Error> for VisionError {
 }
 fn check(status: i32) -> Result<(), VisionError> {
     if status == 0 {
+        crate::memory_ledger::fault::clear_failure();
         Ok(())
     } else {
-        Err(VisionError::Native(status))
+        Err(VisionError::Failure(crate::memory_ledger::capture_failure(anyhow::Error::new(VisionError::Native(status)))))
     }
 }
 
@@ -252,6 +259,7 @@ impl NativeVision {
         // SAFETY: trusted library and versioned header ABI; query initializes no CUDA state.
         unsafe {
             let library = Library::new(crate::host_isa::native_library(path))?;
+            crate::memory_ledger::fault::install(&library);
             let required = library.get::<Required>(b"cuteafd_vision_required")?;
             let mut ledger = VisionLedger::default();
             check(required(&spec.raw()?, &mut ledger))?;
@@ -301,6 +309,7 @@ impl NativeVision {
         // versioned header's exact ABI; the library outlives the native owner.
         unsafe {
             let library = Library::new(crate::host_isa::native_library(path))?;
+            crate::memory_ledger::fault::install(&library);
             let required = *library.get::<Required>(b"cuteafd_vision_required")?;
             let create = *library.get::<Create>(b"cuteafd_vision_create")?;
             let upload = *library.get::<Upload>(b"cuteafd_vision_upload")?;

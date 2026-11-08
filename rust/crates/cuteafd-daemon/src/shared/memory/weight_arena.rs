@@ -22,6 +22,7 @@ impl<'a> DeviceWeightArena<'a> {
             }).collect(),
         });
         let mut allocation = Allocation::weight_arena(device, layout.bytes(), layout.id())?;
+        registration.bind(allocation.buffer.ptr as usize);
         allocation.register_weight_arena(registration);
         let allocation = std::rc::Rc::new(allocation);
         ensure!(allocation.buffer.bytes == layout.bytes(), "weight arena allocation differs from admitted backing");

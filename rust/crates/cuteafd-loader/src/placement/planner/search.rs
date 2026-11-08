@@ -1024,11 +1024,8 @@ pub fn solve(
             }
         }
     }
-    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
-        "kv_geometry": {"pages": pages, "tokens_per_page": page,
-            "capacity_tokens": pages.checked_mul(page), "status": "resolved planner geometry; live pool occupancy not captured"}
-    }));
     Ok(ResolvedPlan {
+        pool_page_rows: page,
         encoder_diagnostics,
         request,
         decisions,

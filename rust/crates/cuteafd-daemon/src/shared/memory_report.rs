@@ -26,6 +26,21 @@ pub(crate) fn register_inputs(matches: &clap::ArgMatches, policy: &cuteafd_core:
     memory_ledger::fault::set_inputs(Value::Object(inputs));
 }
 
+/// Reuse the launcher's existing instance/run mounts; never write into source cwd.
+pub(crate) fn dump_location(matches: &clap::ArgMatches) -> Option<(String, std::path::PathBuf)> {
+    dump_location_with(matches, std::env::var_os("CUTEAFD_PROFILE_DIR").map(std::path::PathBuf::from))
+}
+fn dump_location_with(matches: &clap::ArgMatches, profile: Option<std::path::PathBuf>) -> Option<(String, std::path::PathBuf)> {
+    let (command, args) = matches.subcommand()?;
+    let role = if command == "expertd-native" {
+        format!("rank{}", args.try_get_one::<u32>("rank").ok().flatten().copied().unwrap_or(0))
+    } else if command.starts_with("serve") { "coordinator".into() }
+    else { return None };
+    let directory = profile
+        .or_else(|| args.try_get_one::<std::path::PathBuf>("usage_dir").ok().flatten().map(|dir| dir.join("memory")))?;
+    Some((role, directory))
+}
+
 fn meminfo() -> Value {
     let Ok(text) = std::fs::read_to_string("/proc/meminfo") else { return Value::Null };
     let mut out = Map::new();
@@ -42,11 +57,9 @@ fn meminfo() -> Value {
     Value::Object(out)
 }
 
-/// Builds one report. Queries each device on the calling thread and restores
-/// nothing: call it from a thread that does not launch work, or restore the
-/// device afterwards (see [`log`]).
+/// Query active primary contexts only, restoring the exact prior driver context.
 pub(crate) fn report(stage: &str) -> Value {
-    report_snapshot(stage, &memory_ledger::snapshot(), &memory_ledger::device_memory)
+    report_snapshot(stage, &memory_ledger::snapshot(), &memory_ledger::fault::device_memory)
 }
 
 fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
@@ -98,7 +111,6 @@ pub(crate) fn log(stage: &str) {
         memory_ledger::fault::ready();
         let summary = memory_ledger::fault::compact_summary(stage);
         tracing::info!(target: "cuteafd::memory", "{summary}");
-        return;
     }
     let stage = stage.to_owned();
     let value = std::thread::spawn(move || report(&stage)).join();
@@ -228,6 +240,55 @@ mod budget_tests {
         assert!(text.contains(r#""stage":"failure""#), "{text}");
         assert!(text.contains("startup fixture failure"), "{text}");
         assert!(text.contains(r#""pre_unwind":true"#), "{text}");
+    }
+
+    #[test]
+    fn readiness_forwarding_keeps_snapshot_and_emits_both_ready_outputs() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)] struct Output(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let output = Output(Arc::new(Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log("ready");
+            let (send, receive) = std::sync::mpsc::channel();
+            let error = anyhow::Error::new(memory_ledger::FailureSnapshot::new(
+                anyhow::anyhow!("original typed failure"), memory_ledger::Snapshot::default(), BTreeMap::new()));
+            crate::shared::serve::forward_initialization(Err(error), true, "fixture startup", |error|
+                send.send(error).map_err(|error| error.0)).unwrap();
+            let error = receive.recv().unwrap();
+            assert!(error.chain().any(|cause| cause.is::<memory_ledger::FailureSnapshot>()));
+            assert!(finish::<()>(Err(error)).is_err());
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("memory summary stage=ready"), "{text}");
+        assert!(text.contains(r#""stage":"ready""#), "{text}");
+        assert!(text.contains(r#""pre_unwind":true"#), "{text}");
+        assert!(text.contains("original typed failure"), "{text}");
+    }
+
+    #[test]
+    fn dump_location_requires_serving_and_an_existing_output_contract() {
+        use clap::{Arg, Command};
+        use std::path::PathBuf;
+        let command = || Command::new("fixture")
+            .subcommand(Command::new("serve-step5").arg(Arg::new("usage_dir").long("usage-dir").value_parser(clap::value_parser!(PathBuf))))
+            .subcommand(Command::new("expertd-native").arg(Arg::new("rank").long("rank").value_parser(clap::value_parser!(u32))))
+            .subcommand(Command::new("plan"));
+        let serve = command().try_get_matches_from(["fixture", "serve-step5", "--usage-dir", "/instance/usage"]).unwrap();
+        assert_eq!(dump_location_with(&serve, None), Some(("coordinator".into(), "/instance/usage/memory".into())));
+        let worker = command().try_get_matches_from(["fixture", "expertd-native", "--rank", "3"]).unwrap();
+        assert_eq!(dump_location_with(&worker, Some("/run/output".into())), Some(("rank3".into(), "/run/output".into())));
+        assert!(dump_location_with(&worker, None).is_none());
+        let plan = command().try_get_matches_from(["fixture", "plan"]).unwrap();
+        assert!(dump_location_with(&plan, Some("/run/output".into())).is_none());
     }
 
     #[test]

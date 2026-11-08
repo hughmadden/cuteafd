@@ -44,12 +44,12 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     let Http { api, listen, snapshot, reserve, http_queue_wait, console_hub, expert_usage } = http.expect("serving start loads the API");
     let (vision_health, served_context) = readiness
         .await
-        .context("native target startup stopped")?
-        .map_err(anyhow::Error::msg)?;
+        .context("native target startup stopped")??;
     let limits = reserve.limits(served_context as usize)?;
     cuteafd_bench::context::phase("engine loaded");
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     cuteafd_bench::ready(&listener);
+    crate::shared::memory_report::log("ready");
     tracing::info!(%listen,"native V4.1 target API ready");
     profile.vision_health = vision_health;
     profile.expert_usage = expert_usage;
@@ -105,7 +105,7 @@ fn expert_usage<'a>(library: &'a NativeLibrary, args: &crate::cli::NativeServeAr
     }).transpose()
 }
 
-type Readiness = std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), String>;
+type Readiness = std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), anyhow::Error>;
 type Stats = std::sync::Arc<std::sync::Mutex<serde_json::Value>>;
 
 /// What the HTTP API needs, loaded in the launch's original order.
@@ -144,7 +144,7 @@ impl WorkerHandle {
 pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
     -> Result<(mpsc::Sender<NativeRequest>, WorkerHandle)> {
     let Started { send, readiness, worker_thread, .. } = start(args, false)?;
-    readiness.blocking_recv().context("native target startup stopped")?.map_err(anyhow::Error::msg)?;
+    readiness.blocking_recv().context("native target startup stopped")??;
     Ok((send, WorkerHandle { worker_thread }))
 }
 
@@ -208,13 +208,9 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
             }
             let mut ready = Some(ready);
             let result = crate::shared::api::catch_scheduler_panic(|| worker(args, receive, &mut ready, worker_stats));
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(Err(result
-                    .as_ref()
-                    .err()
-                    .map(|e| format!("{e:#}"))
-                    .unwrap_or_else(|| "worker stopped during startup".into())));
-            }
+            let result = crate::shared::serve::forward_initialization(result, ready.is_some(), "V4.1 initialization failed", |error| {
+                ready.take().expect("pending readiness").send(Err(error)).map_err(|result| match result { Err(error) => error, Ok(_) => unreachable!("sent an error") })
+            });
             let reason = result.err().map(|error| format!("scheduler stopped: {error:#}"))
                 .unwrap_or_else(|| "scheduler stopped".into());
             tracing::error!(%reason, "native target worker stopped");
@@ -387,7 +383,7 @@ mod graph_startup_tests {
 fn worker(
     mut args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
-    ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), String>>>,
+    ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), anyhow::Error>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
     graph_startup_prototype(&args)?;

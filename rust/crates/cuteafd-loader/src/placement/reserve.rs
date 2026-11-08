@@ -200,6 +200,9 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
     let Ok(kv) = policy.kv(smallest, plan.request.context.maximum) else { return };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: plan.pool_tokens };
     cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "kv_geometry": {"pages": plan.pool_tokens.checked_div(plan.pool_page_rows),
+            "tokens_per_page": plan.pool_page_rows, "capacity_tokens": plan.pool_tokens,
+            "status": "admitted planner geometry; live pool occupancy not captured"},
         "family": family, "context_tokens": plan.served_context(), "pool_tokens": plan.pool_tokens,
         "kv_target_tokens": kv.target, "kv_min_tokens": kv.min, "kv_max_tokens": kv.max,
         "prefill_rows": plan.decisions.prefill.rows, "prefill_waves": plan.decisions.prefill.waves,

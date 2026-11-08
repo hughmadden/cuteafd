@@ -12,7 +12,7 @@ use std::rc::Rc;
 use crate::families::deepseek_v41::v41_projection_tp2::Kind;
 
 pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), String>>>,
+    ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), anyhow::Error>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
     let startup_prototype = super::graph_startup_prototype(&args)?;
     // `all` becomes the expert inventory's exact count inside admission; this
@@ -603,7 +603,7 @@ mod tests {
         let (ready, mut readiness) = oneshot::channel();
             let stats = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
             super::super::worker(args, receive, &mut Some(ready), stats)?;
-        readiness.try_recv()?.map_err(anyhow::Error::msg)?;
+        readiness.try_recv()??;
         for (i, mut output) in outputs.into_iter().enumerate() {
             let mut ready = 0;
             let mut finish = 0;

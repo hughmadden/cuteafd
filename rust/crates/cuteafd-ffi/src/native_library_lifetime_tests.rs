@@ -45,7 +45,7 @@ fn rdma_ring_ledger_uses_native_backing_and_retires_only_after_destroy() -> Resu
     assert_eq!(fixture.events()?, format!("{before}X"));
     drop(owner);
     let events = audit.finish().events.into_iter().filter(|event| match event {
-        AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) | AllocationEvent::UnobservedRelease(r) =>
+        AllocationEvent::Allocated(r) | AllocationEvent::Freed(r) | AllocationEvent::Enriched(r) | AllocationEvent::UnobservedRelease(r) =>
             r.key.owner == Some("fixture.rdma.rings"),
     }).collect::<Vec<_>>();
     assert_eq!(events.len(), 8);

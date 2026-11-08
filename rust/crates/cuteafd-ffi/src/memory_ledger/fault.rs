@@ -10,7 +10,7 @@ const LIMITS: &[&str] = &[
     "inputs: partial: daemon values; launcher provenance and unresolved family defaults not captured in this version",
     "kv: partial: resolved planner capacity/page geometry in inputs where available; live pool occupancy not captured in this version",
     "memory: partial: CUDA physical free/total and current-pool telemetry; opaque library allocations cannot be enumerated",
-    "capture: partial: eight preopened reports per process; concurrent capture may retain only a stderr trigger; interrupted/disk-full files may be incomplete",
+    "capture: partial: eight preopened reports per process; busy/exhausted captures retain an append-only fixed-size trigger record; interrupted/disk-full files may be incomplete",
     "identity: partial: host/role/thread/PID recorded; build/checkpoint/UUID provenance not captured in this version",
     "trigger: partial: raw native API code recorded; translated ABI status remains in typed error chain, not the pre-cleanup JSON",
     "memory: unavailable: NVML/graph/host extensions not captured in this version",
@@ -25,7 +25,7 @@ pub(crate) struct NativeFailure {
 }
 
 #[derive(Debug)]
-pub struct FailureReport { pub path: PathBuf, pub summary: String, pub complete: bool, pub raw_code: i32, pub domain: String, pub api: String }
+pub struct FailureReport { pub path: PathBuf, pub summary: String, pub complete: bool, pub sequence: u64, pub raw_code: i32, pub domain: String, pub api: String }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ArenaView { pub name: String, pub offset: usize, pub bytes: usize }
@@ -35,7 +35,7 @@ pub struct Arena {
     pub padding_bytes: usize, pub tail_bytes: Option<usize>, pub views: Vec<ArenaView>,
 }
 #[derive(Default)]
-struct Attachments { arenas: std::collections::BTreeMap<u64, Arc<Arena>>, inputs: serde_json::Value }
+struct Attachments { arenas: std::collections::BTreeMap<u64, Arc<Arena>>, inputs: serde_json::Value, backings: std::collections::BTreeMap<u64, usize> }
 fn attachments() -> &'static Mutex<Attachments> {
     static DATA: OnceLock<Mutex<Attachments>> = OnceLock::new(); DATA.get_or_init(Default::default)
 }
@@ -43,6 +43,11 @@ fn attachments() -> &'static Mutex<Attachments> {
 /// outlive DeviceWeightArena and must keep its diagnostic registration alive.
 #[derive(Debug)]
 pub struct ArenaRegistration(u64);
+impl ArenaRegistration {
+    pub fn bind(&self, address: usize) {
+        attachments().lock().unwrap_or_else(|e| e.into_inner()).backings.insert(self.0, address);
+    }
+}
 pub fn register_arena(arena: Arena) -> ArenaRegistration {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -50,7 +55,7 @@ pub fn register_arena(arena: Arena) -> ArenaRegistration {
     ArenaRegistration(id)
 }
 impl Drop for ArenaRegistration {
-    fn drop(&mut self) { attachments().lock().unwrap_or_else(|e| e.into_inner()).arenas.remove(&self.0); }
+    fn drop(&mut self) { let mut data = attachments().lock().unwrap_or_else(|e| e.into_inner()); data.arenas.remove(&self.0); data.backings.remove(&self.0); }
 }
 pub fn set_inputs(inputs: serde_json::Value) {
     let mut data = attachments().lock().unwrap_or_else(|e| e.into_inner());
@@ -65,6 +70,18 @@ pub fn set_inputs(inputs: serde_json::Value) {
 
 struct Service { spools: Vec<(File, PathBuf)>, directory: PathBuf, host: String, role: String, scratch: Box<[u8; 65536]> }
 static SERVICE: OnceLock<Mutex<Service>> = OnceLock::new();
+static TRIGGERS: OnceLock<(File, PathBuf)> = OnceLock::new();
+/// Remove only this process's unused private spools on ordinary shutdown.
+pub fn shutdown() {
+    if let Some(service) = SERVICE.get() {
+        let mut service = service.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, path) in service.spools.drain(..) { let _ = std::fs::remove_file(path); }
+        if let Some((file, path)) = TRIGGERS.get() {
+            if file.metadata().is_ok_and(|metadata| metadata.len() == 0) { let _ = std::fs::remove_file(path); }
+        }
+    }
+}
+
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
     static PENDING: RefCell<Option<Arc<FailureReport>>> = const { RefCell::new(None) };
@@ -75,14 +92,24 @@ thread_local! {
 pub fn initialize(directory: &Path, host: &str, role: &str) -> io::Result<()> {
     if SERVICE.get().is_some() { return Ok(()); }
     std::fs::create_dir_all(directory)?;
+    let trigger_path = directory.join(format!("memory-triggers-{}-{}-{}.jsonl", sanitize(host), sanitize(role), std::process::id()));
+    let trigger_file = OpenOptions::new().append(true).create_new(true).mode(0o600).open(&trigger_path)?;
     let mut spools = Vec::new();
     for index in 0..8 {
         let path = directory.join(format!(".memory-spool-{}-{index}", std::process::id()));
-        let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+        let file = match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                for (_, path) in spools { let _ = std::fs::remove_file(path); }
+                let _ = std::fs::remove_file(trigger_path);
+                return Err(error);
+            }
+        };
         spools.push((file, path));
     }
     let service = Service { spools, directory: directory.into(),
-        host: sanitize(host), role: sanitize(role), scratch: Box::new([0; 65536]) };
+        host: host.into(), role: sanitize(role), scratch: Box::new([0; 65536]) };
+    let _ = TRIGGERS.set((trigger_file, trigger_path));
     let _ = SERVICE.set(Mutex::new(service));
     Ok(())
 }
@@ -96,17 +123,19 @@ pub(crate) fn install(library: &libloading::Library) {
     // SAFETY: optional symbol implements the bundled POD callback ABI. The
     // callback is process-static and never unwinds into the native caller.
     let _ = cuda_queries();
-    type Events = unsafe extern "C" fn(extern "C" fn(i32, usize, usize, i32));
+    type Events = unsafe extern "C" fn(extern "C" fn(i32, usize, usize, i32, *const c_char, i32));
     // SAFETY: bundled callback takes scalar values only, and stays process-live.
-    if let Ok(events) = unsafe { library.get::<Events>(b"cuteafd_set_memory_event_callback") } {
+    if let Ok(events) = unsafe { library.get::<Events>(b"cuteafd_set_memory_event_callback_v2") } {
         unsafe { events(event_callback); }
+    } else {
+        tracing::warn!(target: "cuteafd::memory", "native private-backing events unavailable: source-location event ABI unsupported");
     }
     match unsafe { library.get::<Install>(b"cuteafd_set_memory_failure_callback") } {
         Ok(install) => unsafe { install(callback) },
         Err(_) => tracing::warn!(target: "cuteafd::memory", "failure capture unavailable: native pre-cleanup callback unsupported"),
     }
 }
-extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released: i32) {
+extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released: i32, file: *const c_char, line: i32) {
     let _ = std::panic::catch_unwind(|| {
         if released != 0 { super::record_free(address); return; }
         let space = match space { 1 => Space::Pinned, 2 => Space::Managed, 3 => Space::Host, _ => Space::Device };
@@ -115,7 +144,7 @@ extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released:
             // SAFETY: valid stack output, query does not select a device.
             unsafe { (q.get)(&mut device); }
         } }
-        super::record_alloc(space, device, address, bytes);
+        super::record_native_alloc(space, device, address, bytes, &format!("{}:{line}", native_text(file)));
     });
 }
 extern "C" fn callback(trigger: *const NativeFailure) {
@@ -124,7 +153,12 @@ extern "C" fn callback(trigger: *const NativeFailure) {
         // SAFETY: native wrapper retains the POD and its literal strings for
         // this synchronous callback; no pointer escapes the callback.
         let trigger = unsafe { &*trigger };
-        if let Some(report) = capture(trigger, true) { PENDING.with(|pending| *pending.borrow_mut() = Some(report)); }
+        let first = PENDING.with(|pending| pending.borrow().as_ref().map(|report| report.sequence));
+        if let Some(first) = first {
+            trigger_record(trigger, sequence(), Some(first), "linked: later failure before ABI return");
+        } else if let Some(report) = capture(trigger, true) {
+            PENDING.with(|pending| *pending.borrow_mut() = Some(report));
+        }
     });
     ACTIVE.with(|active| active.set(false));
     if result.is_err() { eprintln!("memory failure capture unavailable: callback panicked; original native error retained"); }
@@ -133,8 +167,36 @@ pub(crate) fn fallback() -> Option<Arc<FailureReport>> {
     capture(&NativeFailure { api: c"Rust error boundary".as_ptr(), domain: c"unavailable: no native callback".as_ptr(),
         file: c"unavailable".as_ptr(), line: 0, code: 0, bytes: 0, bytes_known: 0, handle: 0 }, false)
 }
+/// Scope the few native constructors which may tolerate an allocation failure
+/// and return success (for example a pageable fallback). Cleanup stays inside
+/// this boundary, so it cannot overwrite or prematurely clear the first token.
+#[must_use]
+pub(crate) struct Boundary;
+pub(crate) fn boundary() -> Boundary { clear_failure(); Boundary }
+impl Drop for Boundary { fn drop(&mut self) { clear_failure(); } }
 pub(crate) fn clear_failure() { PENDING.with(|pending| { pending.borrow_mut().take(); }); }
 pub(crate) fn take_failure() -> Option<Arc<FailureReport>> { PENDING.with(|pending| pending.borrow_mut().take()) }
+
+/// Reserved append-only evidence remains writable after detailed spools run out.
+/// A bounded record is emitted in one write, without formatting heap buffers.
+fn trigger_record(raw: &NativeFailure, id: u64, linked: Option<u64>, status: &str) {
+    use std::os::fd::AsRawFd;
+    let Some((file, _)) = TRIGGERS.get() else { return };
+    let mut bytes = [0u8; 2048];
+    let mut out = io::Cursor::new(bytes.as_mut_slice());
+    #[derive(Serialize)]
+    struct Record<'a> { sequence: u64, linked_to: Option<u64>, api: &'a str, domain: &'a str,
+        code: i32, requested_bytes: Option<usize>, status: &'a str }
+    let record = Record { sequence: id, linked_to: linked, api: native_text(raw.api),
+        domain: native_text(raw.domain), code: raw.code,
+        requested_bytes: (raw.bytes_known != 0).then_some(raw.bytes), status };
+    if serde_json::to_writer(&mut out, &record).is_ok() && out.write_all(b"\n").is_ok() {
+        let length = out.position() as usize;
+        // SAFETY: file is preopened append-only and bytes is live stack storage.
+        let written = unsafe { libc::write(file.as_raw_fd(), bytes.as_ptr().cast(), length) };
+        if written != length as isize { eprintln!("memory trigger record partial: write failed"); }
+    } else { eprintln!("memory trigger record partial: trigger exceeds reserved buffer"); }
+}
 
 struct Buffered<'a> { file: &'a mut File, buffer: &'a mut [u8], used: usize }
 impl Write for Buffered<'_> {
@@ -175,11 +237,11 @@ impl Serialize for LiveRows<'_> {
             #[derive(Serialize)]
             struct Row<'a> { address: Hex, bytes: usize, device: i32, space: &'a str, scope: &'a str,
                 category: Category, owner: Option<&'a str>, tensor: Option<&'a str>, tensor_stem: Option<&'a str>,
-                format: Option<&'a str>, site: DisplayValue<&'a std::panic::Location<'static>> }
+                format: Option<&'a str>, site: DisplayValue<&'a std::panic::Location<'static>>, native_site: Option<&'a str> }
             seq.serialize_element(&Row { address: Hex(*address), bytes: live.bytes,
                 device: live.key.device, space: live.key.space.label(), scope: live.key.scope,
                 category: Category::of_scope(live.key.scope), owner: live.key.owner, tensor: live.name,
-                tensor_stem: live.key.tensor, format: live.key.format, site: DisplayValue(live.site) })?;
+                tensor_stem: live.key.tensor, format: live.key.format, site: DisplayValue(live.site), native_site: live.native_site })?;
         }
         seq.end()
     }
@@ -195,6 +257,7 @@ impl Serialize for Growth<'_> {
             fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 let mut map = serializer.serialize_map(None)?;
                 for (site, bytes) in &self.0.post_ready_sites { map.serialize_entry(&DisplayValue(*site), bytes)?; }
+                for (site, bytes) in &self.0.post_ready_native_sites { map.serialize_entry(site, bytes)?; }
                 map.end()
             }
         }
@@ -203,21 +266,43 @@ impl Serialize for Growth<'_> {
 }
 
 type GetDevice = unsafe extern "C" fn(*mut i32) -> i32;
-type SetDevice = unsafe extern "C" fn(i32) -> i32;
-type MemInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
 type GetPool = unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> i32;
 type PoolAttribute = unsafe extern "C" fn(*mut std::ffi::c_void, i32, *mut std::ffi::c_void) -> i32;
-struct CudaQueries { get: GetDevice, set: SetDevice, info: MemInfo, pool: Option<GetPool>, attribute: Option<PoolAttribute> }
+type GetContext = unsafe extern "C" fn(*mut *mut std::ffi::c_void) -> i32;
+type SetContext = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
+type PrimaryState = unsafe extern "C" fn(i32, *mut u32, *mut i32) -> i32;
+type Retain = unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> i32;
+type Release = unsafe extern "C" fn(i32) -> i32;
+type MemInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+struct CudaQueries { get: GetDevice, current: GetContext, select: SetContext,
+    state: PrimaryState, retain: Retain, release: Release, info: MemInfo,
+    pool: Option<GetPool>, attribute: Option<PoolAttribute> }
 fn cuda_queries() -> Option<&'static CudaQueries> {
     static QUERIES: OnceLock<CudaQueries> = OnceLock::new();
+    static DRIVER: OnceLock<libloading::os::unix::Library> = OnceLock::new();
     if let Some(queries) = QUERIES.get() { return Some(queries); }
     let runtime = super::loaded_cuda_runtime()?;
-    // SAFETY: symbols are the documented CUDA runtime query signatures and the
-    // already-loaded DSO is retained for the lifetime of the process.
-    let queries = unsafe { CudaQueries { get: *runtime.get::<GetDevice>(b"cudaGetDevice").ok()?,
-        set: *runtime.get::<SetDevice>(b"cudaSetDevice").ok()?, info: *runtime.get::<MemInfo>(b"cudaMemGetInfo").ok()?,
+    // SAFETY: NOLOAD binds the already-loaded driver; never initializes CUDA.
+    let driver = match DRIVER.get() {
+        Some(driver) => driver,
+        None => {
+            // SAFETY: NOLOAD refuses to initialize a driver not already loaded.
+            let found = unsafe { libloading::os::unix::Library::open(Some("libcuda.so.1"), 2 | 0x4).ok()? };
+            DRIVER.get_or_init(|| found)
+        }
+    };
+    // SAFETY: documented driver/runtime query ABIs; both libraries stay live.
+    let queries = unsafe { CudaQueries {
+        get: *driver.get::<GetDevice>(b"cuCtxGetDevice").ok()?,
+        current: *driver.get::<GetContext>(b"cuCtxGetCurrent").ok()?,
+        select: *driver.get::<SetContext>(b"cuCtxSetCurrent").ok()?,
+        state: *driver.get::<PrimaryState>(b"cuDevicePrimaryCtxGetState").ok()?,
+        retain: *driver.get::<Retain>(b"cuDevicePrimaryCtxRetain").ok()?,
+        release: *driver.get::<Release>(b"cuDevicePrimaryCtxRelease_v2").ok()?,
+        info: *driver.get::<MemInfo>(b"cuMemGetInfo_v2").ok()?,
         pool: runtime.get::<GetPool>(b"cudaDeviceGetMemPool").ok().map(|symbol| *symbol),
-        attribute: runtime.get::<PoolAttribute>(b"cudaMemPoolGetAttribute").ok().map(|symbol| *symbol) } };
+        attribute: runtime.get::<PoolAttribute>(b"cudaMemPoolGetAttribute").ok().map(|symbol| *symbol),
+    } };
     Some(QUERIES.get_or_init(|| queries))
 }
 #[derive(Serialize)]
@@ -232,41 +317,65 @@ fn observe(device: i32, sticky: bool) -> Observation {
     let unavailable = |reason| Observation { device, free_bytes: None, total_bytes: None, status: reason, raw_status: None, cuda_current_pool: PoolObservation::unavailable() };
     if sticky { return unavailable("unavailable: context lost or sticky CUDA error; follow-up skipped"); }
     let Some(q) = cuda_queries() else { return unavailable("unavailable: CUDA runtime query API unsupported or not loaded"); };
-    let (mut previous, mut free, mut total) = (-1, 0, 0);
+    observe_with(q, device)
+}
+fn observe_with(q: &CudaQueries, device: i32) -> Observation {
+    let unavailable = |reason, raw_status| Observation { device, free_bytes: None, total_bytes: None,
+        status: reason, raw_status, cuda_current_pool: PoolObservation::unavailable() };
+    let (mut previous, mut primary) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let (mut flags, mut active, mut free, mut total) = (0, 0, 0, 0);
     let mut pool = PoolObservation::unavailable();
-    // SAFETY: stack outputs are valid; only current/already-ledger-tracked
-    // devices are queried. Restore selection even when the query fails.
+    // SAFETY: stack outputs match the documented driver ABI. Inactive primary
+    // contexts are never retained. Restore the exact saved context, including NULL.
     unsafe {
-        let status = (q.get)(&mut previous);
-        if status != 0 { return Observation { raw_status: Some(status), ..unavailable("unavailable: cudaGetDevice failed") }; }
-        let status = if device == previous { 0 } else { (q.set)(device) };
-        let status = if status == 0 { (q.info)(&mut free, &mut total) } else { status };
+        let status = (q.current)(&mut previous);
+        if status != 0 { return unavailable("unavailable: cuCtxGetCurrent failed", Some(status)); }
+        let status = (q.state)(device, &mut flags, &mut active);
+        if status != 0 { return unavailable("unavailable: primary-context state query failed", Some(status)); }
+        if active == 0 { return unavailable("unavailable: primary context inactive; query skipped", None); }
+        let status = (q.retain)(&mut primary, device);
+        if status != 0 { return unavailable("unavailable: active primary-context retain failed", Some(status)); }
+        let selected = (q.select)(primary);
+        let status = if selected == 0 { (q.info)(&mut free, &mut total) } else { selected };
         if status == 0 { if let (Some(get_pool), Some(attribute)) = (q.pool, q.attribute) {
             let mut handle = std::ptr::null_mut();
-            if get_pool(&mut handle, device) == 0 && !handle.is_null() {
+            let pool_status = get_pool(&mut handle, device);
+            if pool_status == 0 && !handle.is_null() {
                 for (index, id) in [5, 6, 7, 8].into_iter().enumerate() {
                     let mut bytes = 0u64;
-                    let status = attribute(handle, id, (&mut bytes as *mut u64).cast());
-                    pool.raw_status[index] = Some(status);
-                    pool.bytes[index] = (status == 0).then_some(bytes);
+                    let result = attribute(handle, id, (&mut bytes as *mut u64).cast());
+                    pool.raw_status[index] = Some(result);
+                    pool.bytes[index] = (result == 0).then_some(bytes);
                 }
-                pool.status = if pool.bytes.iter().all(Option::is_some) { "available: reserved_current,reserved_high,used_current,used_high bytes; physical telemetry, not additional ownership" }
-                    else { "partial: CUDA pool attribute query failed; null means unknown" };
-            }
+                pool.status = "available/partial: reserved_current,reserved_high,used_current,used_high bytes; null means unknown; physical telemetry, not ownership";
+            } else { pool.raw_status[0] = Some(pool_status); }
         } }
-        let restored = if device != previous { (q.set)(previous) } else { 0 };
-        if status != 0 || restored != 0 { return Observation { raw_status: Some(if status != 0 { status } else { restored }), ..unavailable("unavailable: CUDA memory query or selection restore failed") }; }
+        let restored = (q.select)(previous);
+        let released = (q.release)(device);
+        if status != 0 || restored != 0 || released != 0 {
+            return unavailable("unavailable: CUDA memory query/context restore/release failed",
+                Some(if status != 0 { status } else if restored != 0 { restored } else { released }));
+        }
     }
     Observation { device, free_bytes: Some(free), total_bytes: Some(total), status: "available: raw cudaMemGetInfo; device-wide, includes other processes; GB10 reclaimable page cache is not allocatable headroom here", raw_status: Some(0), cuda_current_pool: pool }
 }
 
+pub fn device_memory(device: i32) -> Option<(usize, usize)> {
+    let value = observe(device, false);
+    value.free_bytes.zip(value.total_bytes)
+}
+
 fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureReport>> {
+    let id = sequence();
+    trigger_record(raw, id, None, "capture attempted");
     let Some(service) = SERVICE.get() else { eprintln!("memory failure dump unavailable: spool initialization not completed"); return None; };
-    let Ok(mut service) = service.try_lock() else { eprintln!("memory failure dump partial: concurrent capture busy; trigger domain={} code={} api={}", native_text(raw.domain), raw.code, native_text(raw.api)); return None; };
+    let Ok(mut service) = service.try_lock() else { trigger_record(raw, id, None, "detailed capture busy"); eprintln!("memory failure dump partial: concurrent capture busy; trigger domain={} code={} api={}", native_text(raw.domain), raw.code, native_text(raw.api)); return None; };
     let timestamp = utc_timestamp();
-    let path = service.directory.join(format!("memory-failure-{timestamp}-{}-{}-{}-{}.json", service.host, service.role, std::process::id(), sequence()));
-    let Some((mut file, spool_path)) = service.spools.pop() else { eprintln!("memory failure dump unavailable: preopened spool exhausted; original error retained"); return None; };
-    let sticky = native_text(raw.domain) == "cuda" && raw.code >= 700;
+    let census = native_text(raw.domain) == "requested census";
+    let prefix = if census { "memory-census" } else { "memory-failure" };
+    let path = service.directory.join(format!("{prefix}-{timestamp}-{}-{}-{}-{}.json", sanitize(&service.host), service.role, std::process::id(), id));
+    let Some((mut file, spool_path)) = service.spools.pop() else { trigger_record(raw, id, None, "detailed spools exhausted"); eprintln!("memory failure dump unavailable: preopened spool exhausted; original error retained"); return None; };
+    let sticky = native_text(raw.domain) == "cuda" && matches!(raw.code, 700 | 709 | 710 | 714 | 715 | 716 | 717 | 718 | 719);
     let mut devices = [-1i32; 32];
     let mut device_count = 0;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -277,10 +386,10 @@ fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureRepor
             let ledger = state().lock().map_err(|_| io::Error::other("ledger lock poisoned"))?;
             let data = attachments().lock().map_err(|_| io::Error::other("attachments lock poisoned"))?;
             out.write_all(b"{\"schema_version\":1,\"identity\":")?;
-            #[derive(Serialize)] struct ThreadIdentity<'a> { utc: &'a str, pid: u32, host: &'a str, role: &'a str, thread: u64, pre_native_cleanup: bool }
+            #[derive(Serialize)] struct ThreadIdentity<'a> { sequence: u64, utc: &'a str, pid: u32, host: &'a str, role: &'a str, thread: u64, pre_native_cleanup: bool }
             // SAFETY: gettid reads the calling Linux thread's identity without allocation.
             let thread = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
-            serde_json::to_writer(&mut out, &ThreadIdentity { utc: &timestamp, pid: std::process::id(), host, role, thread, pre_native_cleanup: before_cleanup })?;
+            serde_json::to_writer(&mut out, &ThreadIdentity { sequence: id, utc: &timestamp, pid: std::process::id(), host, role, thread, pre_native_cleanup: before_cleanup })?;
             out.write_all(b",\"trigger\":")?;
             CONTEXT.with(|context| -> Result<(), serde_json::Error> {
                 let context = context.borrow();
@@ -292,7 +401,14 @@ fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureRepor
             impl Serialize for Arenas<'_> {
                 fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                     let mut seq = serializer.serialize_seq(Some(self.0.arenas.len()))?;
-                    for arena in self.0.arenas.values() { seq.serialize_element(arena.as_ref())?; }
+                    for (id, arena) in &self.0.arenas {
+                        #[derive(Serialize)] struct Registered<'a> {
+                            #[serde(flatten)] arena: &'a Arena, state: &'static str, backing_address: Option<Hex>,
+                        }
+                        let address = self.0.backings.get(id).copied();
+                        seq.serialize_element(&Registered { arena, state: if address.is_some() { "live" } else { "pending" },
+                            backing_address: address.map(Hex) })?;
+                    }
                     seq.end()
                 }
             }
@@ -315,9 +431,11 @@ fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureRepor
             // SAFETY: runtime writes one valid stack output.
             unsafe { (q.get)(&mut current); }
         } }
-        if current >= 0 { seq.serialize_element(&observe(current, sticky))?; }
-        for &device in &devices[..device_count] { if device != current { seq.serialize_element(&observe(device, sticky))?; } }
-        if current < 0 { seq.serialize_element(&observe(-1, true))?; }
+        if current >= 0 && !devices[..device_count].contains(&current) && device_count < devices.len() {
+            devices[device_count] = current; device_count += 1;
+        }
+        for &device in &devices[..device_count] { seq.serialize_element(&observe(device, sticky))?; }
+        if device_count == 0 { seq.serialize_element(&observe(-1, sticky))?; }
         SerializeSeq::end(seq)?;
         out.write_all(b",\"capture\":{\"complete\":true,\"pre_rust_unwind\":true}}\n")?; out.flush()?;
         Ok(())
@@ -328,9 +446,10 @@ fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureRepor
         eprintln!("memory failure dump unavailable: cannot publish spool {}: {error}", spool_path.display()); return None;
     }
     drop(service);
-    let summary = summary("failure", sticky);
-    tracing::error!(target: "cuteafd::memory", path = %path.display(), api = native_text(raw.api), domain = native_text(raw.domain), code = raw.code, complete, "memory failure dump\n{summary}");
-    Some(Arc::new(FailureReport { path, summary, complete, raw_code: raw.code, domain: native_text(raw.domain).into(), api: native_text(raw.api).into() }))
+    let summary = summary(if census { "census" } else { "failure" }, sticky);
+    if census { tracing::info!(target: "cuteafd::memory", path = %path.display(), "requested memory census\n{summary}"); }
+    else { tracing::error!(target: "cuteafd::memory", path = %path.display(), api = native_text(raw.api), domain = native_text(raw.domain), code = raw.code, complete, "memory failure dump\n{summary}"); }
+    Some(Arc::new(FailureReport { path, summary, complete, sequence: id, raw_code: raw.code, domain: native_text(raw.domain).into(), api: native_text(raw.api).into() }))
 }
 fn trigger<'a>(raw: &'a NativeFailure, context: &'a Context) -> Trigger<'a> {
     Trigger { api: native_text(raw.api), domain: native_text(raw.domain), code: raw.code,
@@ -364,6 +483,8 @@ pub fn compact_summary(stage: &str) -> String { summary(stage, false) }
 /// Available byte inputs are numbers; absent optional inputs stay explicitly
 /// unresolved rather than being silently represented as zero.
 
+fn optional(value: Option<impl std::fmt::Display>) -> String { value.map(|value| value.to_string()).unwrap_or_else(|| "unknown".into()) }
+
 fn summary(stage: &str, sticky: bool) -> String {
     use std::fmt::Write as _;
     let snapshot = super::snapshot();
@@ -371,8 +492,8 @@ fn summary(stage: &str, sticky: bool) -> String {
     for device in snapshot.devices() {
         let tracked = snapshot.total(Space::Device, device) + snapshot.total(Space::Managed, device);
         let observed = observe(device, sticky);
-        let _ = writeln!(out, "device={device} free={:?} total={:?} tracked={tracked} residual={:?} status={}",
-            observed.free_bytes, observed.total_bytes, observed.total_bytes.zip(observed.free_bytes).map(|(t,f)| t as i128-f as i128-tracked as i128), observed.status);
+        let _ = writeln!(out, "device={device} free={} total={} tracked={tracked} residual={} status={}",
+            optional(observed.free_bytes), optional(observed.total_bytes), optional(observed.total_bytes.zip(observed.free_bytes).map(|(t,f)| t as i128-f as i128-tracked as i128)), observed.status);
         let mut categories = std::collections::BTreeMap::new();
         for row in &snapshot.rows { if row.key.device == device {
             *categories.entry(Category::of_scope(row.key.scope).label()).or_insert(0usize) += row.bytes;
@@ -380,9 +501,16 @@ fn summary(stage: &str, sticky: bool) -> String {
         let _ = writeln!(out, "device={device} categories={categories:?}");
     }
     let data = attachments().lock().unwrap_or_else(|e| e.into_inner());
-    for arena in data.arenas.values() { let _ = writeln!(out, "arena={} kind={} device={} bytes={} padding={} tail={:?} views={}",
-        arena.id, arena.kind.label(), arena.device, arena.bytes, arena.padding_bytes, arena.tail_bytes, arena.views.len()); }
-    if let Some(inputs) = data.inputs.as_object() { for (name, value) in inputs { let _ = writeln!(out, "{name} = {} ({})", value["value"], value["source"]); } }
+    for arena in data.arenas.values().take(20) { let _ = writeln!(out, "arena={} kind={} device={} bytes={} padding={} tail={} views={}",
+        arena.id, arena.kind.label(), arena.device, arena.bytes, arena.padding_bytes, optional(arena.tail_bytes), arena.views.len()); }
+    if data.arenas.len() > 20 { let _ = writeln!(out, "+{} more arenas ({} bytes); full views in failure dump",
+        data.arenas.len()-20, data.arenas.values().skip(20).map(|arena| arena.bytes).sum::<usize>()); }
+    if let Some(inputs) = data.inputs.as_object() {
+        for (index, (name, value)) in inputs.iter().enumerate() {
+            let _ = write!(out, "{name} = {} ({}){}", value["value"], value["source"], if index % 2 == 1 { "\n" } else { "; " });
+        }
+        if inputs.len() % 2 != 0 { out.push('\n'); }
+    }
     drop(data);
     let ledger = state().lock().unwrap_or_else(|e| e.into_inner());
     let _ = writeln!(out, "post_ready ready={} allocated_bytes={}", ledger.ready, ledger.post_ready_bytes);
@@ -408,9 +536,9 @@ mod tests {
         setup();
         let _scope = super::super::scope("workspace/fault-fixture");
         let address = 0x7800_0000_0000;
-        event_callback(0, address, 4096, 0);
+        event_callback(0, address, 4096, 0, c"fake-native.cc".as_ptr(), 1);
         callback(&fixture(c"cudaMalloc", c"cuda", 2, Some(8192), 0));
-        event_callback(0, address, 0, 1);
+        event_callback(0, address, 0, 1, std::ptr::null(), 0);
         let report = take_failure().unwrap();
         let data: serde_json::Value = serde_json::from_slice(&std::fs::read(&report.path).unwrap()).unwrap();
         assert_eq!(data["trigger"]["code"], 2);
@@ -433,19 +561,6 @@ mod tests {
         std::fs::remove_file(&report.path).unwrap();
     }
     #[test]
-    fn graph_failure_is_captured_before_descriptor_cleanup() {
-        let _guard = super::super::test_guard(); setup();
-        let mut graph_alive = true;
-        callback(&fixture(c"cudaGraphInstantiate", c"cuda", 2, None, 0x1234));
-        let report = take_failure().unwrap();
-        assert!(graph_alive);
-        graph_alive = false;
-        let data: serde_json::Value = serde_json::from_slice(&std::fs::read(&report.path).unwrap()).unwrap();
-        assert_eq!(data["trigger"]["handle"], "0x1234");
-        assert_eq!(data["identity"]["pre_native_cleanup"], true);
-        assert!(!graph_alive); std::fs::remove_file(&report.path).unwrap();
-    }
-    #[test]
     fn ready_summary_with_ten_arenas_is_compact_and_registrations_retire() {
         let _guard = super::super::test_guard();
         let arenas: Vec<_> = (0..10).map(|i| register_arena(Arena { id: format!("arena-{i}"),
@@ -457,6 +572,168 @@ mod tests {
         drop(arenas);
         assert!(!compact_summary("failure").contains("arena=arena-"));
     }
+    #[test]
+    fn borrowed_trigger_strings_first_token_and_pending_arena_are_retained() {
+        let _guard = super::super::test_guard(); setup(); clear_failure();
+        let pending = register_arena(Arena { id: "pending-fixture".into(), kind: Category::Weights,
+            device: 1, bytes: 64, padding_bytes: 0, tail_bytes: None, views: vec![] });
+        let live = register_arena(Arena { id: "live-fixture".into(), kind: Category::Weights,
+            device: 1, bytes: 64, padding_bytes: 0, tail_bytes: Some(0), views: vec![] });
+        live.bind(0x1234);
+        {
+            let owner = String::from("temporary-owner");
+            let _owner = super::super::owner(&owner);
+            let api = std::ffi::CString::new("temporary-api").unwrap();
+            let domain = std::ffi::CString::new("cublas").unwrap();
+            let file = std::ffi::CString::new("temporary-file").unwrap();
+            callback(&NativeFailure { api: api.as_ptr(), domain: domain.as_ptr(), file: file.as_ptr(),
+                code: 3, line: 71, bytes: 42, bytes_known: 1, handle: 0 });
+        }
+        callback(&fixture(c"later", c"cuda", 2, Some(99), 0));
+        let first = take_failure().unwrap();
+        assert_eq!(first.api, "temporary-api");
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&first.path).unwrap()).unwrap();
+        assert_eq!(value["trigger"]["file"], "temporary-file");
+        assert_eq!(value["trigger"]["owner"], "temporary-owner");
+        assert!(value["arenas"].as_array().unwrap().iter().any(|a| a["id"] == "pending-fixture" && a["state"] == "pending"));
+        assert!(value["arenas"].as_array().unwrap().iter().any(|a| a["id"] == "live-fixture" && a["backing_address"] == "0x1234"));
+        let (_, path) = TRIGGERS.get().unwrap();
+        let triggers = std::fs::read_to_string(path).unwrap();
+        assert!(triggers.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|v| v["linked_to"] == first.sequence && v["api"] == "later"));
+        let _ = std::fs::remove_file(first.path.clone());
+        drop((pending, live));
+        assert!(take_failure().is_none());
+    }
+
+    #[test]
+    fn nonmemory_status_does_not_spend_spools_and_boundary_retires_tolerated_failure() {
+        let _guard = super::super::test_guard(); setup(); clear_failure();
+        let count = SERVICE.get().unwrap().lock().unwrap().spools.len();
+        let error = super::super::capture_failure(anyhow::Error::new(crate::NativeStatusError {
+            context: "probe".into(), status: crate::CUTEAFD_STATUS_RDMA_UNAVAILABLE, detail: "unsupported".into() }));
+        let snapshot = error.chain().find_map(|e| e.downcast_ref::<super::super::FailureSnapshot>()).unwrap();
+        assert!(snapshot.report.is_none());
+        assert_eq!(SERVICE.get().unwrap().lock().unwrap().spools.len(), count);
+        {
+            let _boundary = boundary();
+            callback(&fixture(c"fallback", c"cuda", 2, Some(1), 0));
+        }
+        assert!(take_failure().is_none());
+    }
+
+    #[test]
+    fn logical_budget_refusal_retains_a_detailed_report() {
+        let _guard = super::super::test_guard(); setup(); clear_failure();
+        let error = super::super::capture_failure(anyhow::Error::new(
+            cuteafd_core::serving_capacity::CapacityError::GpuBudgetExceeded {
+                device: 1, required: 2, budget: 1, shortfall: 1 }));
+        let snapshot = error.chain().find_map(|e| e.downcast_ref::<super::super::FailureSnapshot>()).unwrap();
+        let report = snapshot.report.as_ref().unwrap();
+        assert_eq!(report.api, "Rust error boundary");
+        assert!(error.chain().any(|e| e.is::<cuteafd_core::serving_capacity::CapacityError>()));
+        let _ = std::fs::remove_file(&report.path);
+    }
+
+    #[test]
+    fn arena_summary_is_bounded_with_realistic_inputs() {
+        let _guard = super::super::test_guard();
+        let old = { let mut data = attachments().lock().unwrap(); std::mem::take(&mut data.inputs) };
+        set_inputs(serde_json::Value::Object((0..35).map(|i| (format!("input-{i}"), serde_json::json!(i))).collect()));
+        let mut arenas: Vec<_> = (0..25).map(|i| register_arena(Arena { id: format!("bounded-{i}"),
+            kind: Category::Weights, device: 1, bytes: 64, padding_bytes: 0, tail_bytes: None, views: vec![] })).collect();
+        let text = compact_summary("ready");
+        assert_eq!(text.lines().filter(|line| line.starts_with("arena=")).count(), 20);
+        assert!(text.contains("+5 more arenas (320 bytes)"));
+        arenas.truncate(10);
+        let text = compact_summary("ready");
+        assert!(text.lines().count() < 60, "{text}");
+        drop(arenas);
+        attachments().lock().unwrap().inputs = old;
+    }
+
+    #[test]
+    fn guarded_driver_queries_restore_null_and_do_not_touch_inactive_devices() {
+        thread_local! { static CALLS: RefCell<Vec<(char, usize)>> = const { RefCell::new(Vec::new()) }; }
+        unsafe extern "C" fn get(_: *mut i32) -> i32 { 0 }
+        unsafe extern "C" fn current(out: *mut *mut std::ffi::c_void) -> i32 {
+            // SAFETY: fixture receives a valid stack output.
+            unsafe { *out = std::ptr::null_mut(); } 0
+        }
+        unsafe extern "C" fn state(device: i32, _: *mut u32, active: *mut i32) -> i32 {
+            CALLS.with(|c| c.borrow_mut().push(('s', device as usize)));
+            // SAFETY: fixture receives a valid stack output.
+            unsafe { *active = i32::from(device == 1); } 0
+        }
+        unsafe extern "C" fn retain(out: *mut *mut std::ffi::c_void, device: i32) -> i32 {
+            CALLS.with(|c| c.borrow_mut().push(('r', device as usize)));
+            // SAFETY: fixture receives a valid stack output, pointer is never dereferenced.
+            unsafe { *out = 17usize as *mut _; } 0
+        }
+        unsafe extern "C" fn select(ptr: *mut std::ffi::c_void) -> i32 {
+            CALLS.with(|c| c.borrow_mut().push(('c', ptr as usize))); 0
+        }
+        unsafe extern "C" fn release(device: i32) -> i32 {
+            CALLS.with(|c| c.borrow_mut().push(('d', device as usize))); 0
+        }
+        unsafe extern "C" fn failed(_: *mut usize, _: *mut usize) -> i32 { 719 }
+        let q = CudaQueries { get, current, select, state, retain, release, info: failed, pool: None, attribute: None };
+        let observation = observe_with(&q, 0);
+        assert!(observation.free_bytes.is_none());
+        assert_eq!(CALLS.with(|c| std::mem::take(&mut *c.borrow_mut())), vec![('s', 0)]);
+        let observation = observe_with(&q, 1);
+        assert_eq!(observation.raw_status, Some(719));
+        assert_eq!(CALLS.with(|c| std::mem::take(&mut *c.borrow_mut())), vec![('s', 1), ('r', 1), ('c', 17), ('c', 0), ('d', 1)]);
+        unsafe extern "C" fn info(free: *mut usize, total: *mut usize) -> i32 {
+            // SAFETY: fixture outputs are valid stack addresses.
+            unsafe { *free = 2048; *total = 4096; } 0
+        }
+        unsafe extern "C" fn nonnull(out: *mut *mut std::ffi::c_void) -> i32 {
+            // SAFETY: fixture pointer is an opaque context handle, never dereferenced.
+            unsafe { *out = 33usize as *mut _; } 0
+        }
+        let q = CudaQueries { current: nonnull, info, ..q };
+        let observation = observe_with(&q, 1);
+        assert_eq!(observation.free_bytes, Some(2048));
+        assert_eq!(observation.total_bytes, Some(4096));
+        assert_eq!(CALLS.with(|c| std::mem::take(&mut *c.borrow_mut())), vec![('s', 1), ('r', 1), ('c', 17), ('c', 33), ('d', 1)]);
+    }
+
+    #[test]
+    fn busy_and_exhausted_dumps_keep_reserved_triggers() {
+        let _guard = super::super::test_guard(); setup();
+        let service = SERVICE.get().unwrap();
+        let mut locked = service.lock().unwrap();
+        let raw = fixture(c"busy-fixture", c"cuda", 2, Some(123), 0);
+        assert!(capture(&raw, true).is_none());
+        let spools = std::mem::take(&mut locked.spools);
+        drop(locked);
+        let raw = fixture(c"exhausted-fixture", c"cuda", 2, Some(456), 0);
+        assert!(capture(&raw, true).is_none());
+        service.lock().unwrap().spools = spools;
+        let (_, path) = TRIGGERS.get().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("detailed capture busy"));
+        assert!(text.contains("detailed spools exhausted"));
+    }
+
+    #[test]
+    fn unused_spools_and_empty_trigger_file_are_removed_at_shutdown() {
+        const CHILD: &str = "CUTEAFD_TEST_SPOOL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            setup();
+            let directory = SERVICE.get().unwrap().lock().unwrap().directory.clone();
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 9);
+            shutdown();
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+            return;
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "memory_ledger::fault::tests::unused_spools_and_empty_trigger_file_are_removed_at_shutdown"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
+    }
+
     #[test]
     fn unsupported_api_is_unknown_not_zero() {
         let value = observe(0, true);

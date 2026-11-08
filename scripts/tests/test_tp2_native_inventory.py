@@ -7,8 +7,8 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-FAILURE_STUB = ('#include "' + str(ROOT / "native/shared/include/memory_failure.h") + '"\n'
-                'extern "C" void cuteafd_memory_failure(const cuteafd_memory_failure_t*) {}\n')
+FAILURE_HEADER = '#include "' + str(ROOT / "native/shared/include/memory_failure.h") + '"\n'
+CALLBACK_SOURCE = ROOT / "native/shared/src/memory_failure.cc"
 SOURCE = ROOT / "native/shared/src/tp2_kernel_inventory.cc"
 ABI = """#pragma once
 #include <cstdint>
@@ -352,10 +352,10 @@ int main() {
 }
 '''
     fixture = tmp_path / "blas_handles.cc"
-    fixture.write_text(FAILURE_STUB + mock + "cuteafd_status_t cublas_handle(" + helper + main)
+    fixture.write_text(FAILURE_HEADER + mock + "cuteafd_status_t cublas_handle(" + helper + main)
     executable = tmp_path / "blas_handles"
     subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                    str(fixture), "-o", str(executable)], check=True, capture_output=True)
+                    str(fixture), str(CALLBACK_SOURCE), "-I", str(ROOT / "native/shared/include"), "-o", str(executable)], check=True, capture_output=True)
     subprocess.run([str(executable)], check=True, capture_output=True)
 
 
@@ -501,10 +501,10 @@ int main() {
 }
 '''
     fixture = tmp_path / "capture_blas.cc"
-    fixture.write_text(FAILURE_STUB + mock + helper + prepare + capture + launch + main)
+    fixture.write_text(FAILURE_HEADER + mock + helper + prepare + capture + launch + main)
     executable = tmp_path / "capture_blas"
     built = subprocess.run([compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
-                            str(fixture), "-o", str(executable)], capture_output=True, text=True)
+                            str(fixture), str(CALLBACK_SOURCE), "-I", str(ROOT / "native/shared/include"), "-o", str(executable)], capture_output=True, text=True)
     assert built.returncode == 0, built.stderr
     ran = subprocess.run([str(executable)], capture_output=True, text=True)
     assert ran.returncode == 0, ran.stderr

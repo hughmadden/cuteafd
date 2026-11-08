@@ -60,9 +60,10 @@ type Ledger = unsafe extern "C" fn(*mut c_void, *mut PcmLedger) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
 fn check(code: i32) -> Result<(), AudioError> {
     if code == 0 {
+        crate::memory_ledger::fault::clear_failure();
         Ok(())
     } else {
-        Err(AudioError::Native(code))
+        Err(AudioError::Failure(crate::memory_ledger::capture_failure(anyhow::Error::new(AudioError::Native(code)))))
     }
 }
 pub struct NativePcmAudio {
@@ -82,6 +83,7 @@ impl NativePcmAudio {
         // output ledger is writable for its exact C layout.
         unsafe {
             let library = Library::new(path)?;
+            crate::memory_ledger::fault::install(&library);
             let required: Required = *library.get(b"cuteafd_pcm_required\0")?;
             let mut ledger = PcmLedger::default();
             check(required(spec, &mut ledger))?;
@@ -125,6 +127,7 @@ impl NativePcmAudio {
         // until the owner has drained and destroyed all of its CUDA work.
         unsafe {
             let library = Library::new(path)?;
+            crate::memory_ledger::fault::install(&library);
             let required: Required = *library.get(b"cuteafd_pcm_required\0")?;
             let create: Create = *library.get(b"cuteafd_pcm_create\0")?;
             let upload: Upload = *library.get(b"cuteafd_pcm_upload\0")?;

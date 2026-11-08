@@ -446,12 +446,6 @@ release_require_owned_state "$bench_dir" "$fidelity_cache"
 mkdir -p "$fidelity_cache" "$bench_dir"
 release_require_writable_state "$bench_dir" "$fidelity_cache"
 api_args=() api_mount_args=()
-local memory_dump_dir="$HOME/.cache/cuteafd/instances/$api_instance/memory"
-release_require_owned_state "$memory_dump_dir"
-mkdir -p "$memory_dump_dir"
-release_require_writable_state "$memory_dump_dir"
-api_mount_args+=(-v "$memory_dump_dir:/run/cuteafd/memory"
-  -e CUTEAFD_MEMORY_DUMP_DIR=/run/cuteafd/memory -e "CUTEAFD_PROFILE_HOST=$(hostname -s)")
 API_KEY_FILE="$(get API_KEY_FILE "${API_KEY_FILE:-}")"
 ENABLE_BENCH="$(get ENABLE_BENCH off)"
 release_prepare_api_key "$ENABLE_BENCH" "$api_instance"

@@ -591,6 +591,7 @@ pub struct ResolvedPlan {
     pub request: Request,
     pub decisions: Decisions,
     pub pool_tokens: u64,
+    pub pool_page_rows: u64,
     pub budgets: Vec<Budget>,
     pub facts: Facts,
     pub phases: Vec<PhaseBudget>,

@@ -362,15 +362,10 @@ fn main() -> Result<()> {
         .init();
     tracing::info!("{host_isa}");
     tracing::info!("{malloc}");
-    let dump_dir = std::env::var_os("CUTEAFD_MEMORY_DUMP_DIR").map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("CUTEAFD_PROFILE_DIR").map(std::path::PathBuf::from))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let host = std::env::var("CUTEAFD_PROFILE_HOST").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
-    if let Err(error) = cuteafd_ffi::memory_ledger::fault::initialize(&dump_dir, &host, "coordinator") {
-        tracing::error!(%error, directory = %dump_dir.display(), "memory failure dump unavailable: cannot preopen spool");
-    }
-    shared::memory_report::finish(
-        tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run()))
+    let result = shared::memory_report::finish(
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run()));
+    cuteafd_ffi::memory_ledger::fault::shutdown();
+    result
 }
 
 async fn run() -> Result<()> {
@@ -405,6 +400,16 @@ async fn run() -> Result<()> {
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
             initial_wait, initial_reply, initial_weight_budget),
     };
+    if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {
+        let host = std::env::var("CUTEAFD_PROFILE_HOST").unwrap_or_else(|_| {
+            std::env::var("HOSTNAME").map(|name| format!("container {name}")).unwrap_or_else(|_| "unknown".into())
+        });
+        if let Err(error) = cuteafd_ffi::memory_ledger::fault::initialize(&directory, &host, &role) {
+            tracing::error!(%error, directory = %directory.display(), "memory failure dump unavailable: cannot preopen spool");
+        }
+    } else if matches.subcommand_name().is_some_and(|name| name == "expertd-native" || name.starts_with("serve")) {
+        tracing::warn!("memory failure dump unavailable: no configured instance usage directory or profile output directory");
+    }
     select_command_attention(&mut command, selected_view)?;
     cuteafd_core::spark_reply::set_requested(cuteafd_core::spark_reply::SparkReplyFormats {
         prefill: family_reply.prefill.or(initial_reply.prefill),
