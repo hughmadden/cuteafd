@@ -442,7 +442,8 @@ impl<'a> RoutedFfn<'a> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-routed");
         let spans = cuteafd_loader::plan::families::step5::native::routed_layout(admission.rows,
             admission.span, admission.full)?;
-        let planes = scratch::region_planes(device, &spans, arena)?;
+        let planes = scratch::region_planes(device, &spans, arena,
+            crate::shared::memory::Tag::workspace("step5/routed-scratch"))?;
         let stream = scratch::standalone(device, arena);
         Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }

@@ -3,7 +3,7 @@ use super::{scratch::Arena, cache::CacheRank, csa::CsaLayer, ffn::{DenseFfn, Den
     rope::TargetTables, routed::{RoutedFfn, RoutedPlan}, swa::SwaLayer,
     transaction::{Staging, Step}};
 use crate::shared::{experts::{rtx::pair::{self, SubmissionScope}, staging::RouteStaging},
-    memory::device::{Allocation, Device, DeviceOwner},
+    memory::{device::{Allocation, Device, DeviceOwner}, Tag},
     peer_split::{PeerExchange, RankDevice, attention::{self, AttentionStateOwners,
         HeadKernels, HeadMerge, HeadPrecision, HeadProjection, HeadSequence,
         LaneOrder, LayerKernels, LayerProtocol, PipelineKernels}, hop::{HopLink, HopTicket}, TerminalState}, spark_intake::SparkLink};
@@ -161,7 +161,8 @@ impl<'a> NativeOwners<'a> {
                 let native_layout = native_scratch_layout(rank_layout, rows, count)?;
                 let native_bytes = native_layout.as_ref().map(|l| l.bytes()).transpose()?.unwrap_or(0);
                 // The arena holds attention and FFN regions; the native scratch is its own admitted owner.
-                let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes)?;
+                let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes,
+                    Tag::workspace("step5/target-scratch"))?;
                 let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout)
                     .map(Rc::new)).transpose()?;
                 let rope = Rc::new(TargetTables::load_in(device, programs, &contract, super::weights::ROPE_PREFIX,
@@ -689,7 +690,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             ensure!(link.device.id == devices[entry].id, "Step-5 main intake must be on the entry GPU");
             link.installed_grouping()?;
         }
-        let routed_reply = Allocation::untagged(devices[entry], rows * H * 2)?;
+        let routed_reply = Allocation::new(devices[entry], rows * H * 2, Tag::transport("step5/routed-reply"))?;
         let mut native = native;
         let tp2 = match native.onboarded_tp2.take() {
             None => None,
@@ -710,17 +711,23 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 let streams = std::array::from_fn(|rank| RankDevice { device: devices[rank].id, stream: stages[rank].stream.raw });
                 let pair = devices[0].run(|| Pair::new_with_wire(devices[0].library, streams, ranks, H, 8, unit, rows.min(64), lanes,
                     exchange_dtype, true))?;
-                let plane = |rank: usize, bytes: usize| Allocation::untagged(devices[rank], bytes.max(256));
+                let plane = |rank: usize, bytes: usize, tag: Tag| {
+                    Allocation::new(devices[rank], bytes.max(256), tag)
+                };
                 let section = unit * 8 * 4;
                 let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
                 let scratch = routes + unit * kind.input_row_bytes(H);
                 let partial = lanes * unit * H * kind.partial_bytes();
                 let onboard = Tp2Onboard {
                     pair,
-                    partial: [plane(0, partial)?, plane(1, partial)?],
-                    incoming: [plane(0, partial)?, plane(1, partial)?],
-                    owner_incoming: [plane(0, partial)?, plane(1, partial)?],
-                    scratch: [plane(0, lanes * scratch)?, plane(1, lanes * scratch)?],
+                    partial: [plane(0, partial, Tag::transport("step5/tp2-partial"))?,
+                        plane(1, partial, Tag::transport("step5/tp2-partial"))?],
+                    incoming: [plane(0, partial, Tag::transport("step5/tp2-incoming"))?,
+                        plane(1, partial, Tag::transport("step5/tp2-incoming"))?],
+                    owner_incoming: [plane(0, partial, Tag::transport("step5/tp2-owner-incoming"))?,
+                        plane(1, partial, Tag::transport("step5/tp2-owner-incoming"))?],
+                    scratch: [plane(0, lanes * scratch, Tag::workspace("step5/tp2-scratch"))?,
+                        plane(1, lanes * scratch, Tag::workspace("step5/tp2-scratch"))?],
                     broadcast_logged: (0..count).map(|_| Cell::new(false)).collect(),
                 };
                 let charged = tp2_exchange_bytes(unit, lanes, kind)?;

@@ -1,7 +1,7 @@
 //! Shared scheduler adapter; a native Step is the only pending verify evidence.
 use super::{cache::CacheRank, execution::Execution, prefix::{Frontier, Placement, Step5Prefix},
     transaction::{Pending, SequenceRows, Step}};
-use crate::shared::{draft::routes::RoundRoutes, memory::device::{Allocation, Device},
+use crate::shared::{draft::routes::RoundRoutes, memory::{device::{Allocation, Device}, Tag},
     prefix::{CudaCopyEngine, PrefixArgs, Toggle}, qwen::scheduler::{self, Backend},
     token_io::{DeviceLogits, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
@@ -122,11 +122,10 @@ impl<'a> Inputs<'a> {
     }
 
     pub(super) fn allocate(device: Device<'a>, rows: usize, available: u64) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-input");
         ensure!(Self::bytes(rows)? <= available, "Step-5 input storage exceeds admission");
-        Ok(Self { ids: Allocation::untagged(device, rows * 4)?,
-            bf16: Allocation::untagged(device, rows * H * 2)?,
-            residual: Allocation::untagged(device, rows * H * 4)?, rows })
+        Ok(Self { ids: Allocation::new(device, rows * 4, Tag::workspace("step5/inputs"))?,
+            bf16: Allocation::new(device, rows * H * 2, Tag::workspace("step5/inputs"))?,
+            residual: Allocation::new(device, rows * H * 4, Tag::workspace("step5/inputs"))?, rows })
     }
 }
 
