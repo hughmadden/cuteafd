@@ -1497,7 +1497,8 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
         filesystem if name == 'placement_filesystem' else real_load(name, path))
     jobs = [("programs", "export_b12x_dsv4_aot.py", []),
             ("exl3/exl3-glm-k45", "package_exl3_aot.py", []),
-            ("fp8/fp8-mimop", "package_fp8_moe_aot.py", [])]
+            ("fp8/fp8-mimop", "package_fp8_moe_aot.py", []),
+            *[job for job in publisher.export_jobs() if job[0] in publisher.V41_MANIFESTS]]
     monkeypatch.setattr(publisher, 'export_jobs', lambda: jobs)
     calls = []
 
@@ -1523,6 +1524,9 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
                 {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 123},
                 {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 456},
                 {'layout': 'tp2', 'capacity': 4096, 'scratch_bytes': 789}]}))
+        elif output.name in publisher.V41_MANIFESTS:
+            source, _ = publisher.V41_MANIFESTS[output.name]
+            (output / source).write_text('{"compiler":true,"scratch_bytes":123}')
         else:
             (output / 'dsv4_programs.json').write_text('{"compiler":true}')
     monkeypatch.setattr(publisher.subprocess, 'run', compile_export)
@@ -1544,7 +1548,10 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
     metadata = json.loads((target / 'INPUTS.json').read_text())
     assert metadata['engine_commit'] == 'a' * 40
     assert metadata['engine_sources_sha256'] == publisher.source_hashes()
-    assert len(calls) == len(metadata['exports']) == 3
+    assert len(calls) == len(metadata['exports']) == len(jobs)
+    for name, (source, installed) in publisher.V41_MANIFESTS.items():
+        assert (target / installed).read_bytes() == (staging / name / source).read_bytes()
+        assert installed in metadata['files']
     assert (target / 'PROGRAMS.json').read_bytes() == (staging / 'programs/dsv4_programs.json').read_bytes()
     assert (target / 'exl3/exl3-glm-k45/rtx-tp2/m2752/v41_exl3.json').read_bytes() == b'{"scratch":123,"compiler":true}'
     fp8 = json.loads((target / 'fp8/fp8-mimop/manifest.json').read_text())
@@ -1564,6 +1571,13 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
     assert {'exl3/exl3-glm-k45', 'exl3/exl3-glmf-k34', 'exl3/exl3-kimik3-k23',
             'exl3/exl3-step5-k46', 'exl3/exl3-muse-k45', 'exl3/exl3-ml4-k45',
             'exl3/exl3-qwen4-k45', 'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
+    assert set(publisher.V41_MANIFESTS) <= names
+    for name, exporter, extra in jobs:
+        if name.startswith('v41-'):
+            assert extra[extra.index('--rows') + 1] == (
+                compare_sm.V41_PROJECTION_CAPACITIES if name == 'v41-fp8' else
+                compare_sm.V41_DRAFT_CAPACITIES if name in ('v41-experts', 'v41-dspark_tp2') else
+                compare_sm.V41_CAPACITIES)
     assert not any('nvfp4' in name for name in names)
     # Step-5 FP8 is retired for v5 (TJ 2026-10-31), so its packages are not exported.
     assert not any(name.startswith('fp8/fp8-step5') for name in names)

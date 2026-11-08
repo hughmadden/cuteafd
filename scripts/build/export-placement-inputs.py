@@ -32,6 +32,15 @@ def load(name, path):
 compare = load("placement_compare", ROOT / "scripts/build/compare-sm-exports.py")
 kernel_records = load("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
 
+# Installed names match build-{wip,release}-artifacts.sh. These are allocation
+# inputs to the native planner, not optional release-only executable artifacts.
+V41_MANIFESTS = {
+    "v41-fp8": ("v41_fp8.json", "V41_FP8_AOT.json"),
+    "v41-experts": ("v41_experts.json", "V41_EXPERT_AOT.json"),
+    **{f"v41-{role}": ("v41_experts.json", f"V41_EXPERT_WORKSPACES/mxfp4_{role}.json")
+       for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2")},
+}
+
 
 def live_configs(root=ROOT):
     retired = {entry["config"] for entry in json.loads((root / "benchmarks/current-matrix.json").read_text())["retired"]}
@@ -81,6 +90,15 @@ def export_jobs():
             jobs.append((f"fp8/fp8-{family}{suffix}", "package_fp8_moe_aot.py", [
                 "--geometry", geometry, "--capacities", compare.EXL3_CAPACITIES,
                 "--layouts", "tp1,tp2", "--role", "coordinator"]))
+    jobs.extend([
+        ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", compare.V41_PROJECTION_CAPACITIES]),
+        ("v41-experts", "export_b12x_v41_experts_aot.py",
+         ["--role", "coordinator", "--input-format", "bf16", "--rows", compare.V41_DRAFT_CAPACITIES]),
+    ])
+    for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
+        jobs.append((f"v41-{role}", "export_b12x_slices_aot.py", [
+            "--role", role, "--rows", compare.V41_DRAFT_CAPACITIES if role == "dspark_tp2" else compare.V41_CAPACITIES,
+            "--width", "192", "--standard-names"]))
     return jobs
 
 
@@ -271,7 +289,12 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
     shutil.copy2(staging / "programs/dsv4_programs.json", destination / "PROGRAMS.json")
     for name, exporter, _ in jobs[1:]:
         target = destination / name
-        if exporter == "package_exl3_aot.py":
+        if name in V41_MANIFESTS:
+            source, installed = V41_MANIFESTS[name]
+            target = destination / installed
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(staging / name / source, target)
+        elif exporter == "package_exl3_aot.py":
             for source in (staging / name).rglob("v41_exl3.json"):
                 copied = target / source.relative_to(staging / name)
                 copied.parent.mkdir(parents=True, exist_ok=True)
@@ -373,6 +396,14 @@ def publication_records(staging, jobs):
                     record["planner_metadata"] = {key: value for key, value in program.items()
                                                   if key not in ("object_sha256", "card_plans")}
                     record["planner_metadata"]["plan"] = plan
+        elif name in V41_MANIFESTS:
+            manifest = json.loads((directory / V41_MANIFESTS[name][0]).read_text())
+            metadata = {key: value for key, value in manifest.items()
+                        if key not in ("artifacts", "device", "physical_sms", "sparkinfer_revision")}
+            # Bind allocation-only changes to the job without repeating the
+            # complete manifest for every quantizer/projection object.
+            if job_records:
+                job_records[min(job_records)]["planner_metadata"] = metadata
         elif name.startswith("fp8/"):
             for program in json.loads((directory / "routed.json").read_text())["programs"]:
                 job_records[program["name"] + ".o"]["scratch_bytes_at_capacity"] = {

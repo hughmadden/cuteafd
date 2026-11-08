@@ -727,6 +727,20 @@ fn v41_sim5090_overlay_preserves_1m_pool_for_all_and_packed() {
     assert_v41_sim5090_head_pools(&root, snapshot.path(), &programs, snapshot.path());
 }
 
+#[test]
+fn installed_v41_sim5090_head_pools_preserve_1m() {
+    let hf_home = require_installed_hf_home(
+        "installed_v41_sim5090_head_pools_preserve_1m",
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let programs = installed_example_programs(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into), &home);
+    let snapshot = require_installed_snapshot("V4.1 sim5090",
+        "deepseek-ai/DeepSeek-V4.1-Flash", None, &hf_home);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    assert_v41_sim5090_head_pools(&root, &snapshot, &programs, &hf_home);
+}
+
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
     root: &std::path::Path) {
