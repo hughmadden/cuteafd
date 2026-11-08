@@ -68,6 +68,20 @@ fn paged_backings_round_each_backing_independently() {
 }
 
 #[test]
+fn requests_at_or_below_one_mib_share_blocks_instead_of_rounding() {
+    let granularity = SM120_ALLOCATION_GRANULARITY_BYTES;
+    for (bytes_at_first, expected) in [(1 << 20, 1 << 20), ((1 << 20) + 1, granularity),
+        (granularity, granularity), (granularity + 1, 2 * granularity)] {
+        let curve = ByteCurve::linear_rounded(bytes_at_first, 0, 4, granularity);
+        assert_eq!(curve.at(1).unwrap(), expected, "bytes_at_first={bytes_at_first}");
+    }
+    // A page-scaled owner crosses the shared-block threshold as its pool grows.
+    let curve = ByteCurve::linear_rounded(1 << 19, 1 << 19, 8, granularity);
+    assert_eq!(curve.at(2).unwrap(), 1 << 20);
+    assert_eq!(curve.at(3).unwrap(), granularity);
+}
+
+#[test]
 fn rounded_affine_search_matches_exact_independent_backings_and_mixed_slopes() {
     let maximum = 32;
     let rounded = |bytes_at_first, bytes_per_page| ByteCurve(vec![BytePiece {
