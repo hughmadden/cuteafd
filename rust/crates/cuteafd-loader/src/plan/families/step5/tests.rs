@@ -170,7 +170,8 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 .map(|owner| owner.bytes).sum::<u64>();
             let per_stage = planes[..4].iter().sum::<usize>() + planes[2] + 8;
             assert_eq!(uploads, (depth * (per_stage + 8)) as u64);
-            let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
+            let contract = coordinator::CoordinatorContract::from_checkpoint(&cp)?;
+            let weights = coordinator::RankWeightLayout::mtp_weight_charge(&cp, &contract, depth)?;
             for rank in 0..2 {
                 let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 let item = |group| admitted.fixed.iter().find(|item| item.gpu == rank as u8 && item.group == group)
@@ -2097,7 +2098,7 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
                 assert_eq!(target.resident_weights.0, resident);
                 let head = rank == usize::from(admitted.ownership.execution().spec().head_gpu);
                 let expected_resident = resident + if head { mtp.resident_bytes } else { 0 };
-                let predictor = if head { mtp.resident_bytes
+                let predictor = if head { coordinator::RankWeightLayout::mtp_weight_charge(&checkpoint, &contract, depth)?
                     + native::mtp_native_scratch_from_contract(&checkpoint, &contract, depth, 64)? } else { 0 };
                 let owner = admitted.fixed.iter().find(|owner| owner.gpu == rank as u8
                     && owner.group == "Step-5 native target and head").expect("named weight owner");

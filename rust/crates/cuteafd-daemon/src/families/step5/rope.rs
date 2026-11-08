@@ -1,5 +1,6 @@
 //! Step-5 selects checkpoint recipes; shared code owns and initializes storage.
-use crate::shared::memory::device::Device;
+use crate::shared::memory::{device::Device, receipts::Inventory,
+    weight_arena::{DeviceWeightArena, weight_allocation}};
 use crate::shared::rope::{RotaryTables, Table};
 use anyhow::Result;
 use cuteafd_ffi::programs::Programs;
@@ -25,13 +26,28 @@ impl<'a> TargetTables<'a> {
         available: u64,
         reservations: &[u64],
     ) -> Result<Self> {
-        let tables = RotaryTables::load(
+        Self::load_in(device, programs, contract, prefix, available, reservations, None)
+    }
+
+    /// Rotary planes are immutable target weights; on a coordinator rank they
+    /// are views of that rank's arena.
+    pub fn load_in(
+        device: Device<'a>,
+        programs: &Programs<'a>,
+        contract: &CoordinatorContract,
+        prefix: &str,
+        available: u64,
+        reservations: &[u64],
+        arena: Option<&DeviceWeightArena<'a>>,
+    ) -> Result<Self> {
+        let tables = RotaryTables::load_with(
             device,
             programs,
             contract.rope_tables.clone(),
             prefix,
             available,
             reservations,
+            |name, bytes| weight_allocation(device, arena, name, bytes),
         )?;
         let layers = contract
             .layers
@@ -47,6 +63,16 @@ impl<'a> TargetTables<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { tables, layers })
+    }
+
+    /// Each distinct recipe's cos/sin planes once, however many layers share it.
+    pub(super) fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
+        for (index, recipe) in self.tables.plan.recipes.iter().enumerate() {
+            let table = self.tables.get(*recipe)?;
+            table.cos.inventory(inventory, &format!("{prefix}.rotary.{index}.cos"))?;
+            table.sin.inventory(inventory, &format!("{prefix}.rotary.{index}.sin"))?;
+        }
+        Ok(())
     }
 }
 

@@ -388,8 +388,8 @@ fn with_backend<T>(args: &ServeArgs,
             .map(|range| usize::try_from(range.peak_bytes)).transpose()?.map(OnboardBudget::Whole),
     };
     let predictor_budget = if args.mtp > 0 {
-        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_from_contract(
-            &checkpoint, &native_plan.contract, usize::from(args.mtp))?.resident_bytes;
+        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_weight_charge(
+            &checkpoint, &native_plan.contract, usize::from(args.mtp))?;
         let total = admission.placement.items[head_rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
             .context("Step-5 solved predictor allocation overflow")?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
@@ -415,14 +415,22 @@ fn with_backend<T>(args: &ServeArgs,
     use crate::shared::experts::rtx::{dense, push::{CoordinatorPush, PushPolicy}};
     let native_start = std::time::Instant::now();
     let policy = PushPolicy::for_snapshot(&args.snapshot)?;
-    let load = || TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
+    // One arena per coordinator GPU: target operands, trellis cores and, on the
+    // entry rank, the embedding table.
+    let entry = usize::from(ownership.execution().spec().entry_gpu);
+    let weight_arenas = devices.iter().enumerate().map(|(rank, &device)|
+        crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+            super::weights::target_arena(&native_plan.layouts[rank], Some(&native_plan.contract.rope_tables),
+                device.id, 92, rank == entry)?))
+        .collect::<Result<Vec<_>>>()?;
+    let load = || TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
         let native = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan)?;
+            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan, Some(&weight_arenas))?;
         let mtp = predictor_budget.map(|(available, reserved)| native.load_predictor(
             &programs, &checkpoint, &caches[head_rank].borrow(), stages[head_rank].stream.clone(),
             usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
         Ok((native, mtp))
-    });
+    }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(devices[entry], Some(&weight_arenas[entry]), name, bytes));
     let planned = policy.plan(|| -> Result<_> {
         ensure!(spark_admission.as_ref().is_none_or(|plan| plan.coordinator_pushes()), "Step-5 Spark admission did not select required push");
         let recorder = dense::Recorder::start(true)?.context("dense recorder")?;
@@ -496,6 +504,20 @@ fn with_backend<T>(args: &ServeArgs,
     })?;
     tracing::info!(elapsed_s = push_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup weight delivery complete");
+    if crate::shared::inventory::startup_probe_enabled() {
+        // Arena receipts exist from Load: one backing per GPU plus a view per owner.
+        use crate::shared::memory::receipts::{Census, Inventory};
+        let coordinator = cuteafd_loader::placement::planner::CoordinatorDevices::new(&ids)?;
+        let mut weights = Inventory::new(coordinator, "step5.target", cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+            cuteafd_core::memory_layout::Category::Weights, "step5 weights");
+        native.inventory(&mut weights)?;
+        if let Some(mtp) = &mtp { mtp.inventory(&mut weights)?; }
+        let mut census = Census::default();
+        census.owners(weights.receipts);
+        census.owners(embedding.allocation_receipts(coordinator, "step5.embedding")?);
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/weights-loaded",
+            crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+    }
     let bind_start = std::time::Instant::now();
     if !spark_working.spark_layers.is_empty() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;

@@ -8,6 +8,7 @@ use crate::shared::{experts::{rtx::pair::{self, SubmissionScope}, staging::Route
         HeadKernels, HeadMerge, HeadPrecision, HeadProjection, HeadSequence,
         LaneOrder, LayerKernels, LayerProtocol, PipelineKernels}, hop::{HopLink, HopTicket}, TerminalState}, spark_intake::SparkLink};
 use anyhow::{ensure, Context, Result};
+use crate::shared::memory::weight_arena::DeviceWeightArena;
 use cuteafd_loader::families::qwen4::Qwen4KvCache;
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_hostcache::copy::CopyEngine;
@@ -127,7 +128,7 @@ impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize, span: usize, logits: usize,
         count: usize, available: &[u64], reservations: &[u64], depth: usize, kv_format: Qwen4KvCache,
-        plan: &NativePlan) -> Result<Self> {
+        plan: &NativePlan, weight_arenas: &[DeviceWeightArena<'a>]) -> Result<Self> {
         validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
         ensure!(matches!(count, 1 | 92), "Step-5 native layer inventory");
         let head_rank = ownership.execution().spec().head_gpu as usize;
@@ -143,6 +144,7 @@ impl<'a> NativeOwners<'a> {
                     cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
             }
         }
+        ensure!(weight_arenas.len() == devices.len(), "Step-5 target arena rank inventory");
         let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog_view(
             checkpoint.view.as_ref().context("Step-5 execution requires its selected checkpoint view")?)).transpose()?;
         admit_native(&admission, available, reservations, || {
@@ -161,18 +163,19 @@ impl<'a> NativeOwners<'a> {
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes)?;
                 let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout)
                     .map(Rc::new)).transpose()?;
-                let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
+                let rope = Rc::new(TargetTables::load_in(device, programs, &contract, super::weights::ROPE_PREFIX,
+                    available[rank], &[], Some(&weight_arenas[rank]))?);
                 tables.push(rope.clone());
                 for layer in 0..count {
                     if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
                     let attention = if contract.layers[layer].sliding.is_some() {
                         Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
                             rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format,
-                            native_scratch.clone(), contract, rank_layout)?)
+                            native_scratch.clone(), contract, rank_layout, &weight_arenas[rank])?)
                     } else {
                         Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
                             rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format,
-                            native_scratch.clone(), contract, rank_layout)?)
+                            native_scratch.clone(), contract, rank_layout, &weight_arenas[rank])?)
                     };
                     // Every FFN kind lives in one region after this rank's largest
                     // attention region: no attention or other FFN kind overwrites a
@@ -182,7 +185,7 @@ impl<'a> NativeOwners<'a> {
                         let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership, contract, rank_layout)?
                             .with_span(span)?;
                         Ffn::Dense(DenseFfn::load_plan_shared(device, programs, checkpoint, plan, Some((&arena, offset)),
-                            native_scratch.clone())?)
+                            native_scratch.clone(), Some(&weight_arenas[rank]))?)
                     } else {
                         let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership, contract, rank_layout)?
                             .with_span(span)?
@@ -191,14 +194,14 @@ impl<'a> NativeOwners<'a> {
                                 super::experts::StepExperts::from_catalog(catalog)?.layer_bf16_input(catalog, layer)?
                             });
                         Ffn::Routed(RoutedFfn::load_shared(device, programs, checkpoint, layer, plan, Some((&arena, offset)),
-                            native_scratch.clone())?)
+                            native_scratch.clone(), Some(&weight_arenas[rank]))?)
                     };
                     ranks[rank].push(Some(Layer { attention, ffn }));
                 }
                 arenas.push(arena);
             }
             let head = head_plan.map(|plan| super::head::TargetHeadOwner::load_in(devices[head_rank],
-                programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)))).transpose()?;
+                programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)), Some(&weight_arenas[head_rank]))).transpose()?;
             Ok(Self { contract: plan.contract.clone(), ranks, head, arenas, rope: tables, onboarded: None, onboarded_tp2: None })
         })
     }
@@ -353,10 +356,17 @@ impl<'e, 'a> Execution<'e, 'a> {
         plan: &NativePlan) -> Result<RankAdmission> {
         ensure!((1..=span).contains(&logits), "Step-5 head rows outside the span");
         let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, span, 92, plan)?;
-        if rank == ownership.execution().spec().head_gpu as usize {
+        let admission = if rank == ownership.execution().spec().head_gpu as usize {
             admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership,
-                &plan.layouts[rank])?)
-        } else { Ok(admission) }
+                &plan.layouts[rank])?)?
+        } else { admission };
+        // The arena serve allocates for this rank: its inter-view padding is the
+        // one owner its payload owners do not already hold.
+        let entry = rank == usize::from(ownership.execution().spec().entry_gpu);
+        let padding = super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
+            rank as i32, 92, entry)?.padding_bytes() as u64;
+        Ok(RankAdmission { immutable: admission.immutable.checked_add(padding)
+            .context("Step-5 target arena padding overflow")?, ..admission })
     }
 
     fn rank_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -440,14 +450,14 @@ impl<'e, 'a> Execution<'e, 'a> {
         rows: usize, span: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize) -> Result<LoadedNative<'a>> {
         let plan = NativePlan::new(checkpoint, ownership, Rc::new(CoordinatorContract::from_checkpoint(checkpoint)?))?;
         Self::load_native_with_plan(programs, checkpoint, ownership, caches, stages, rows, span,
-            logits, available, reservations, count, &plan)
+            logits, available, reservations, count, &plan, None)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_native_with_plan(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, caches: &[&'e RefCell<CacheRank<'a>>], stages: &[&'e Staging<'a>],
         rows: usize, span: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize,
-        plan: &NativePlan) -> Result<LoadedNative<'a>> {
+        plan: &NativePlan, weight_arenas: Option<&[DeviceWeightArena<'a>]>) -> Result<LoadedNative<'a>> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         ensure!(rows <= span && (1..=span).contains(&logits), "Step-5 unit or head rows outside the span");
         validate_rank_inventory(ownership.ranks(), &[caches.len(), stages.len(), available.len(), reservations.len()])?;
@@ -465,8 +475,21 @@ impl<'e, 'a> Execution<'e, 'a> {
                 && devices[..rank].iter().all(|other| other.id != device.id)), "Step-5 rank devices/library differ");
         let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
             .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
+        // Standalone diagnostics own their arenas; serve passes the arenas that
+        // also hold the entry embedding.
+        let owned;
+        let weight_arenas = match weight_arenas {
+            Some(arenas) => arenas,
+            None => {
+                owned = devices.iter().enumerate().map(|(rank, &device)| DeviceWeightArena::new(device,
+                    super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
+                        device.id, count, false)?))
+                    .collect::<Result<Vec<_>>>()?;
+                &owned
+            }
+        };
         Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, span, logits, count, available,
-            reservations, depth, kv_format, plan)?))
+            reservations, depth, kv_format, plan, weight_arenas)?))
     }
 
     /// Binds loaded native owners to the caches and the (now connected) transport.
@@ -486,6 +509,32 @@ impl<'e, 'a> Execution<'e, 'a> {
 pub(super) struct LoadedNative<'a>(NativeOwners<'a>);
 
 impl<'a> LoadedNative<'a> {
+    /// Every retained target weight on every rank: attention, FFN and head
+    /// operands plus native trellis owners, each a view of its rank's arena.
+    pub(super) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for (rank, layers) in self.0.ranks.iter().enumerate() {
+            for (layer, owner) in layers.iter().enumerate() {
+                let Some(owner) = owner else { continue };
+                let prefix = format!("gpu.{rank}.layer.{layer}");
+                match &owner.attention {
+                    Attention::Sliding(attention) => attention.inventory(inventory, &prefix)?,
+                    Attention::Sparse(attention) => attention.inventory(inventory, &prefix)?,
+                }
+                match &owner.ffn {
+                    Ffn::Dense(ffn) => ffn.inventory(inventory, &format!("{prefix}.ffn"))?,
+                    Ffn::Routed(ffn) => ffn.inventory(inventory, &format!("{prefix}.ffn"))?,
+                }
+            }
+        }
+        if let Some(head) = &self.0.head {
+            head.inventory(inventory, &format!("device.{}.head", head.device().id))?;
+        }
+        for (rank, rope) in self.0.rope.iter().enumerate() {
+            rope.inventory(inventory, &format!("gpu.{rank}"))?;
+        }
+        Ok(())
+    }
+
     /// Predictor weights share the target's admitted owners before publication.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_predictor(&self, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -1610,6 +1659,67 @@ mod tests {
             theta: vec![], rotary: vec![], rope_scaling: None, scale_full: false,
             scale_sliding: false, activation: vec![], shared_activation: vec![] }
     }
+    /// Planner == runtime for packed weights: the planner's rank charge exceeds
+    /// its payload by exactly the padding of the arena serve allocates, the
+    /// predictor charge is exactly its arena, and the loader's rotary planes
+    /// are the views RotaryTables::load_with requests.
+    #[test]
+    fn planned_arena_padding_equals_the_served_arenas() -> Result<()> {
+        use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
+        let fixture = tempfile::tempdir()?;
+        testing::write_step5_exl3_snapshot(fixture.path());
+        let checkpoint = Checkpoint::coordinator(fixture.path(), false, true)?;
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let manifest = testing::step5_native_manifest(fixture.path());
+        let rope = crate::shared::rope::RotaryTables::arena_requests(&contract.rope_tables, super::super::weights::ROPE_PREFIX)?;
+        for (ranks, sparks) in [(1, 3), (2, 6)] {
+            let report = testing::plan(fixture.path(), &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(sparks),
+                draft_ownership: Some(plan::spec::DraftOwnership::NativeMtp),
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                    rtx_bytes: vec![96 << 30; ranks], workspace_manifest: Some(manifest.clone()),
+                    context_tokens: 1 << 20, ..Default::default() }), ..Default::default()
+            })?;
+            let placement = report.solver_placement.as_ref().context("arena-test placement")?;
+            let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
+                rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+            let ownership = ExecutionOwnership::new(&cfg, ranks, LayerExecutionPlan::new(placement, spec)?)?;
+            let plan = NativePlan::new(&checkpoint, &ownership, Rc::new(contract.clone()))?;
+            for rank in 0..ranks {
+                let layout = &plan.layouts[rank];
+                let entry = rank == usize::from(ownership.execution().spec().entry_gpu);
+                let served = super::super::weights::target_arena(layout, Some(&contract.rope_tables),
+                    rank as i32, 92, entry)?;
+                // Rotary views are exactly the daemon's requests.
+                for (name, bytes) in &rope {
+                    assert_eq!(served.view(name).map(|v| v.bytes()), Some(*bytes), "rank {rank} {name}");
+                }
+                let admitted = cuteafd_loader::plan::families::step5::native::rank_admission_for_layout(
+                    &contract, &cfg, layout, &ownership, rank, 64, 64, 1)?;
+                // Payload the rank charges under immutable: target owners (not the
+                // embedding, which its own owner charges) and the rotary planes.
+                let payload = admitted.resident_weights.0 + contract.rope_tables.allocation_bytes;
+                let head = rank == usize::from(ownership.execution().spec().head_gpu);
+                let head_scratch = if head { layout.core.get("lm_head.weight").map(|core|
+                    cuteafd_loader::formats::head::native_private_scratch(core.shape, 64)?.bytes())
+                    .transpose()?.unwrap_or(0) as u64 } else { 0 };
+                assert_eq!(admitted.immutable - payload - head_scratch, served.padding_bytes() as u64,
+                    "ranks {ranks} rank {rank}: planner padding differs from the served arena");
+                let embedding = layout.operands.iter().find(|o| o.name == "model.embed_tokens.weight")
+                    .map_or(0, |o| o.allocation_bytes);
+                assert_eq!(served.payload_bytes() as u64, admitted.resident_weights.0 + contract.rope_tables.allocation_bytes
+                    + if entry { embedding } else { 0 }, "ranks {ranks} rank {rank}: served payload owners");
+            }
+        }
+        for depth in 1..=cfg.mtp {
+            let layout = RankWeightLayout::mtp_from_contract(&checkpoint, &contract, depth)?;
+            assert_eq!(RankWeightLayout::mtp_weight_charge(&checkpoint, &contract, depth)?,
+                layout.mtp_arena(0)?.bytes() as u64, "predictor depth {depth}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn whole_model_native_context_constructs_headers_once() -> Result<()> {
         use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
