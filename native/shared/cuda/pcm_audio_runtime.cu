@@ -91,8 +91,8 @@ static int32_t release_owner(Owner* o,uint32_t* released){
   auto save=[&](int e){if(!first)first=e;};
   if(o->stream)save(cudaStreamSynchronize(o->stream));
   if(o->modules){save(cuteafd_pcm_support_destroy(o->modules));o->modules=nullptr;}
-  if(o->arena){int e=CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;}save(e);}
-  if(o->weights){int e=CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;}save(e);}
+  if(o->arena){int e=cudaFree(o->arena);if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;o->arena=nullptr;}save(e);}
+  if(o->weights){int e=cudaFree(o->weights);if(!e){*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;o->weights=nullptr;}save(e);}
   if(o->stream){save(cudaStreamDestroy(o->stream));o->stream=nullptr;}
   return first;
 }

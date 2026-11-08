@@ -26,6 +26,10 @@ typedef struct cuteafd_media_tags {
   uint32_t workspace_kind;
   const char* workspace_owner;
 } cuteafd_media_tags;
+// The ledger has one recorder per backing: Rust records both tower backings
+// (get_backings, after create, including a partial owner create returns) and
+// retires each on its released bit, so tower allocations and frees emit no
+// native memory events.
 // The tagged native allocator the towers use (cudaError_t status). The tag is
 // validated and retained as this thread's attempted tag before cudaMalloc.
 int32_t cuteafd_media_allocate(void** ptr, size_t bytes, uint32_t kind, const char* owner);

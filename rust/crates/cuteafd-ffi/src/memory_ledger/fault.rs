@@ -160,24 +160,46 @@ fn sanitize(text: &str) -> String { text.chars().map(|c| if c.is_ascii_alphanume
 
 /// Install after loading each native DSO; old native binaries remain usable but
 /// explicitly lack the pre-cleanup hook.
+type LastTag = unsafe extern "C" fn(*mut u32, *mut c_char, usize, *mut usize) -> i32;
+/// Resolved once at install: failure records read the attempted tag without allocating.
+static LAST_TAG: OnceLock<LastTag> = OnceLock::new();
+
+/// The tag the failing thread last attempted: kind label, owner (in `buffer`),
+/// and whether that owner exceeded the fixed failure-path buffer.
+fn attempted_tag(buffer: &mut [u8; 512]) -> (Option<&'static str>, Option<&str>, bool) {
+    let Some(last) = LAST_TAG.get() else { return (None, None, false) };
+    let (mut kind, mut required) = (0u32, 0usize);
+    // SAFETY: native writes the kind, the required size and at most `buffer.len()` bytes.
+    let status = unsafe { last(&mut kind, buffer.as_mut_ptr().cast(), buffer.len(), &mut required) };
+    let kind = MemoryKind::from_raw(kind).map(MemoryKind::label);
+    if status != 0 { return (kind, None, required > buffer.len()); }
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(0);
+    (kind, std::str::from_utf8(&buffer[..end]).ok().filter(|o| !o.is_empty()), false)
+}
+
 pub(crate) fn install(library: &libloading::Library) {
+    // SAFETY: optional versioned export; a library without it reports no attempted tag.
+    if let Ok(last) = unsafe { library.get::<LastTag>(b"cuteafd_last_allocation_tag") } { let _ = LAST_TAG.set(*last); }
     type Install = unsafe extern "C" fn(extern "C" fn(*const NativeFailure));
     // SAFETY: optional symbol implements the bundled POD callback ABI. The
     // callback is process-static and never unwinds into the native caller.
     let _ = cuda_queries();
-    type Events = unsafe extern "C" fn(extern "C" fn(i32, usize, usize, i32, *const c_char, i32));
-    // SAFETY: bundled callback takes scalar values only, and stays process-live.
-    if let Ok(events) = unsafe { library.get::<Events>(b"cuteafd_set_memory_event_callback_v2") } {
+    type Events = unsafe extern "C" fn(extern "C" fn(i32, usize, usize, i32, *const c_char, i32, u32, *const c_char));
+    // SAFETY: bundled callback takes scalars and synchronously-copied strings, and stays process-live.
+    if let Ok(events) = unsafe { library.get::<Events>(b"cuteafd_set_memory_event_callback_v3") } {
         unsafe { events(event_callback); }
     } else {
-        tracing::warn!(target: "cuteafd::memory", "native private-backing events unavailable: source-location event ABI unsupported");
+        tracing::warn!(target: "cuteafd::memory", "native private-backing events unavailable: tagged event ABI unsupported");
     }
     match unsafe { library.get::<Install>(b"cuteafd_set_memory_failure_callback") } {
         Ok(install) => unsafe { install(callback) },
         Err(_) => tracing::warn!(target: "cuteafd::memory", "failure capture unavailable: native pre-cleanup callback unsupported"),
     }
 }
-extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released: i32, file: *const c_char, line: i32) {
+/// A native event names the tag native allocated under; the owner is copied
+/// (interned) here, never retained. Kind 0 or no owner is an untagged native site.
+extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released: i32, file: *const c_char, line: i32,
+    kind: u32, owner: *const c_char) {
     let _ = std::panic::catch_unwind(|| {
         if released != 0 { super::record_free(address); return; }
         let space = match space { 1 => Space::Pinned, 2 => Space::Managed, 3 => Space::Host, _ => Space::Device };
@@ -186,7 +208,9 @@ extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released:
             // SAFETY: valid stack output, query does not select a device.
             unsafe { (q.get)(&mut device); }
         } }
-        super::record_native_alloc(space, device, address, bytes, &format!("{}:{line}", native_text(file)), None);
+        let tag = MemoryKind::from_raw(kind).zip((!owner.is_null()).then(|| native_text(owner)))
+            .filter(|(_, owner)| !owner.is_empty()).map(|(kind, owner)| super::tag(kind, &owner));
+        super::record_native_alloc(space, device, address, bytes, &format!("{}:{line}", native_text(file)), tag);
     });
 }
 extern "C" fn callback(trigger: *const NativeFailure) {
@@ -228,10 +252,14 @@ fn trigger_record(raw: &NativeFailure, id: u64, linked: Option<u64>, status: &st
     let mut out = io::Cursor::new(bytes.as_mut_slice());
     #[derive(Serialize)]
     struct Record<'a> { sequence: u64, linked_to: Option<u64>, api: &'a str, domain: &'a str,
-        code: i32, requested_bytes: Option<usize>, status: &'a str }
+        code: i32, requested_bytes: Option<usize>, status: &'a str,
+        attempted_kind: Option<&'static str>, attempted_owner: Option<&'a str>, attempted_owner_truncated: bool }
+    let mut owner = [0u8; 512];
+    let (attempted_kind, attempted_owner, attempted_owner_truncated) = attempted_tag(&mut owner);
     let record = Record { sequence: id, linked_to: linked, api: native_text(raw.api),
         domain: native_text(raw.domain), code: raw.code,
-        requested_bytes: (raw.bytes_known != 0).then_some(raw.bytes), status };
+        requested_bytes: (raw.bytes_known != 0).then_some(raw.bytes), status,
+        attempted_kind, attempted_owner, attempted_owner_truncated };
     if serde_json::to_writer(&mut out, &record).is_ok() && out.write_all(b"\n").is_ok() {
         let length = out.position() as usize;
         // SAFETY: file is preopened append-only and bytes is live stack storage.
@@ -580,9 +608,11 @@ mod tests {
         setup();
         let _scope = super::super::scope("workspace/fault-fixture");
         let address = 0x7800_0000_0000;
-        event_callback(0, address, 4096, 0, c"fake-native.cc".as_ptr(), 1);
+        event_callback(0, address, 4096, 0, c"fake-native.cc".as_ptr(), 1,
+            MemoryKind::Transport.as_raw(), c"test/native-event".as_ptr());
+        assert_eq!(super::super::tag_of(address), Some(super::super::Tag::transport("test/native-event")));
         callback(&fixture(c"cudaMalloc", c"cuda", 2, Some(8192), 0));
-        event_callback(0, address, 0, 1, std::ptr::null(), 0);
+        event_callback(0, address, 0, 1, std::ptr::null(), 0, 0, std::ptr::null());
         let report = take_failure().unwrap();
         let data: serde_json::Value = serde_json::from_slice(&std::fs::read(&report.path).unwrap()).unwrap();
         assert_eq!(data["trigger"]["code"], 2);

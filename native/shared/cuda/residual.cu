@@ -1609,7 +1609,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_summarize_bf16(const uint16_t* input, s
 
   cuteafd_bf16_summary_t* device_out = nullptr;
   cudaError_t err =
-      CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&device_out), sizeof(cuteafd_bf16_summary_t), 0, cudaMalloc(reinterpret_cast<void**>(&device_out), sizeof(cuteafd_bf16_summary_t)));
+      CUTEAFD_TRACK_ALLOC("cudaMalloc", reinterpret_cast<void**>(&device_out), sizeof(cuteafd_bf16_summary_t), 0, CUTEAFD_MEMORY_KIND_WORKSPACE, "native/bf16-summary", cudaMalloc(reinterpret_cast<void**>(&device_out), sizeof(cuteafd_bf16_summary_t)));
   if (err != cudaSuccess) {
     return CUTEAFD_STATUS_ALLOCATION_FAILED;
   }
