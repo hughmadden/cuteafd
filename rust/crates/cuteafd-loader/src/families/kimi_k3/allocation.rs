@@ -271,6 +271,21 @@ pub const CONTEXT_MEASURED: &str = "CUDA context and loaded modules";
 /// the synchronized capture at Ready is the exact owner.
 pub const GRAPH_CENSUS_BYTES: u64 = 530_579_456;
 pub const GRAPH_CENSUS_EXECUTABLES: u64 = 3_961;
+/// The same capture on two coordinator GPUs (2026-11-09 2x census), as
+/// `(bytes, executables)` per rank. A rank's kernels differ from the other
+/// rank's, so each rank keeps its own observation; one shared ratio would
+/// under-reserve the higher rank.
+pub const GRAPH_CENSUS_TP2: [(u64, u64); 2] = [(761_266_176, 5_367), (763_363_328, 5_377)];
+
+/// The measured `(bytes, executables)` startup capture for `rank` of a
+/// `ranks`-GPU coordinator layout.
+pub fn graph_census(ranks: usize, rank: usize) -> (u64, u64) {
+    match (ranks, rank) {
+        (2, 0) => GRAPH_CENSUS_TP2[0],
+        (2, _) => GRAPH_CENSUS_TP2[1],
+        _ => (GRAPH_CENSUS_BYTES, GRAPH_CENSUS_EXECUTABLES),
+    }
+}
 pub const GRAPH_ROWS: [usize; 5] = [1, 4, 16, 64, 4096];
 
 /// Speculative verify rows replay at their exact flattened batch width (no
@@ -337,10 +352,11 @@ pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, sl
         }
         *count *= lanes as u64;
     }
-    let ranks = counts.iter().map(|&count| GraphRank::estimate(count, GRAPH_CENSUS_BYTES,
-        GRAPH_CENSUS_EXECUTABLES).map_err(|error| anyhow::anyhow!(error)))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(GraphSet { ranks, lifetime: Lifetime::Startup, shapes: counts.iter().sum() })
+    let inventory = counts.iter().enumerate().map(|(rank, &count)| {
+        let (observed_bytes, observed_executables) = graph_census(ranks, rank);
+        GraphRank::estimate(count, observed_bytes, observed_executables).map_err(|error| anyhow::anyhow!(error))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(GraphSet { ranks: inventory, lifetime: Lifetime::Startup, shapes: counts.iter().sum() })
 }
 
 pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
@@ -560,6 +576,24 @@ mod tests {
         }
         assert!(expert_package_for_ranks(&manifest, 0).is_err());
         assert!(expert_workspace_for_ranks(root.path(), 128, 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_graph_census_keeps_a_separate_observation_per_rank() -> Result<()> {
+        assert_eq!(graph_census(1, 0), (GRAPH_CENSUS_BYTES, GRAPH_CENSUS_EXECUTABLES));
+        assert_eq!(graph_census(2, 0), GRAPH_CENSUS_TP2[0]);
+        assert_eq!(graph_census(2, 1), GRAPH_CENSUS_TP2[1]);
+        // The first 2x launch scaled the 1x ratio by both ranks' executable
+        // count and under-reserved rank 0 by 5.9%; each rank now keeps its own.
+        let (bytes, executions) = graph_census(2, 0);
+        let shared = GraphRank::estimate(executions, GRAPH_CENSUS_BYTES, GRAPH_CENSUS_EXECUTABLES)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let observed = GraphRank::estimate(executions, bytes, executions)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        assert!(shared.bytes < bytes, "shared ratio under-reserves the lead rank");
+        assert_eq!(observed.bytes, bytes);
+        assert_eq!(observed.basis, Basis::Estimated);
         Ok(())
     }
 
