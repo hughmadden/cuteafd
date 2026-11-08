@@ -574,7 +574,10 @@ fn summary(stage: &str, sticky: bool) -> String {
         let _ = writeln!(out, "device={device} free={} total={} tracked={tracked} residual={} status={}",
             optional(observed.free_bytes), optional(observed.total_bytes), optional(observed.total_bytes.zip(observed.free_bytes).map(|(t,f)| t as i128-f as i128-tracked as i128)), observed.status);
         // Every owned backing has a kind; the census counter stays zero by construction.
-        let (kinds, untagged) = snapshot.by_kind(Space::Device, device);
+        let (mut kinds, mut untagged) = snapshot.by_kind(Space::Device, device);
+        let (managed, managed_untagged) = snapshot.by_kind(Space::Managed, device);
+        for (kind, bytes) in managed { *kinds.entry(kind).or_default() += bytes; }
+        untagged += managed_untagged;
         let kinds = kinds.into_iter().map(|(kind, bytes)| (kind.label(), bytes)).collect::<std::collections::BTreeMap<_, _>>();
         let _ = writeln!(out, "device={device} kinds={kinds:?} untagged={untagged}");
     }
@@ -640,6 +643,21 @@ mod tests {
         assert!(format!("{error:#}").contains("ABI status -3"));
         std::fs::remove_file(&report.path).unwrap();
     }
+    #[test]
+    fn ready_summary_kinds_include_managed_and_device_backings_once() {
+        let _guard = super::super::test_guard();
+        let address = 0x7900_0000_0000;
+        super::super::record_tagged(Space::Device, 91, address, 1024, super::super::Tag::weights("test/summary"));
+        super::super::record_tagged(Space::Managed, 91, address + 0x1000, 2048, super::super::Tag::weights("test/summary"));
+        super::super::record_tagged(Space::Managed, 91, address + 0x2000, 512, super::super::Tag::kv("test/summary"));
+        let text = compact_summary("ready");
+        super::super::record_released(address);
+        super::super::record_released(address + 0x1000);
+        super::super::record_released(address + 0x2000);
+        assert!(text.lines().any(|line| line.starts_with("device=91 ") && line.contains("tracked=3584")), "{text}");
+        assert!(text.lines().any(|line| line == "device=91 kinds={\"kv\": 512, \"weights\": 3072} untagged=0"), "{text}");
+    }
+
     #[test]
     fn ready_summary_with_ten_arenas_is_compact_and_registrations_retire() {
         let _guard = super::super::test_guard();

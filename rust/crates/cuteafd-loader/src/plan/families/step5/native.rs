@@ -17,7 +17,7 @@ const SELECT: usize = 4 * 4104;
 pub struct RankAdmission {
     pub resident_weights: crate::placement::ResidentWeights,
     /// Independently retired backings and their logical weight-budget payloads.
-    pub weight_arenas: Vec<(crate::serving_capacity::WeightArenaLayout, crate::placement::ResidentWeights)>,
+    pub weight_arenas: Vec<(crate::serving_capacity::WeightArenaLayout, crate::placement::ResidentWeights, cuteafd_core::memory_layout::MemoryKind)>,
     /// Private scratch only; immutable weight storage is charged by `weight_arenas`.
     pub immutable: u64,
     pub workspace: u64,
@@ -456,7 +456,7 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
     }
     Ok(RankAdmission {
         resident_weights: crate::placement::ResidentWeights(weights),
-        weight_arenas: vec![(arena, crate::placement::ResidentWeights(logical))],
+        weight_arenas: vec![(arena, crate::placement::ResidentWeights(logical), cuteafd_core::memory_layout::MemoryKind::Weights)],
         immutable,
         workspace,
     })

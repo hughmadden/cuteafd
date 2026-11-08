@@ -425,7 +425,7 @@ impl<'a> ProductionInput<'a> {
             let rank_layers = layouts.iter().map(|ranks| &ranks[gpu]).collect::<Vec<_>>();
             let arena = crate::families::muse_spark::weight_layout::coordinator_arena(
                 gpu, gpus, &global, &rank_layers).map_err(anyhow_refusal)?;
-            components.extend(weight_arena_components(&arena, location, Lifetime::RESIDENT, maximum_pages)?);
+            components.extend(weight_arena_components(&arena, location, Lifetime::RESIDENT, maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)?);
             let mount = crate::families::muse_spark::weight_layout::native_mount_load(
                 layouts.iter().flat_map(|ranks| ranks[gpu].native.values())).map_err(anyhow_refusal)?;
             for owner in mount.allocations(&format!("muse.native.load.{gpu}")) {
@@ -876,7 +876,7 @@ impl Recipe for MuseRecipe<'_> {
                 let gpu = if ranks == 1 { home } else { (1 - rank) as u8 };
                 let arena = drafter.arena(rank, gpu).map_err(anyhow_refusal)?;
                 for mut component in weight_arena_components(&arena, Location::coordinator(gpu),
-                    lifetime, self.maximum_pages)? {
+                    lifetime, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)? {
                     component.activation = activation.clone();
                     contract.components.push(component);
                 }

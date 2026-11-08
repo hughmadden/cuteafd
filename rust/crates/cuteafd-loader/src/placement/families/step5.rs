@@ -287,10 +287,10 @@ impl<'a> Step5Recipe<'a> {
         for rank in 0..ranks {
             let reservation =
                 Reservation::new(&cache, rank, inputs.sequences as u64, marks, 1, usize::MAX)?;
-            for (arena, logical) in &native[rank].weight_arenas {
+            for (arena, logical, kind) in &native[rank].weight_arenas {
                 ensure!(logical.0 <= arena.bytes() as u64, "Step-5 logical weights exceed arena");
                 let mut components = weight_arena_components(arena, Location::coordinator(rank as u8),
-                    Lifetime::RESIDENT, maximum_pages)?;
+                    Lifetime::RESIDENT, maximum_pages, *kind)?;
                 components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
                 let owner = components.iter().find_map(|component| match &component.kind {
                     ComponentKind::Allocation { template, .. } => Some(template),

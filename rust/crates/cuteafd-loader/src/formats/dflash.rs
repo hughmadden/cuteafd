@@ -1639,7 +1639,7 @@ mod tests {
                 assert!(facts.owners.iter().all(|owner| owner.group != "MLA DFlash owned weights"
                     && owner.weights_at_first == 0 && owner.weights_per_page == 0));
                 use crate::placement::planner::{ComponentKind, Lifetime, Location, weight_arena_components};
-                let components = weight_arena_components(arena, Location::coordinator(*gpu), Lifetime::RESIDENT, 16).unwrap();
+                let components = weight_arena_components(arena, Location::coordinator(*gpu), Lifetime::RESIDENT, 16, cuteafd_core::memory_layout::MemoryKind::DrafterWeights).unwrap();
                 let ComponentKind::Allocation { template: root, .. } = &components[0].kind else { panic!("arena root") };
                 let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("arena tail") };
                 assert_eq!(root.bytes, arena.bytes() as u64);

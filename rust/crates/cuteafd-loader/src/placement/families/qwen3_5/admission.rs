@@ -118,11 +118,11 @@ impl Recipe for DenseFacts<'_> {
         let maximum = token_capacity / PAGE_ROWS;
         let mut contract = Contract::fixed(PAGE_ROWS, maximum, 1, self.owner_templates(1)?);
         let gpu = Location::coordinator(0);
-        contract.components.extend(weight_arena_components(self.target_arena, gpu, Lifetime::RESIDENT, maximum)?);
+        contract.components.extend(weight_arena_components(self.target_arena, gpu, Lifetime::RESIDENT, maximum, cuteafd_core::memory_layout::MemoryKind::Weights)?);
         let draft_start = contract.components.len();
         if let Some((id, bytes)) = self.drafter.and_then(|draft| draft.weight_arena) {
             contract.components.extend(weight_arena_extent_components(id, bytes, gpu,
-                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, maximum)?);
+                Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, maximum, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?);
         }
         contract.variables = self.cfg.attention.iter().enumerate()
             .map(|(layer, _)| Variable::Attention { layer, values: vec![WHOLE] })

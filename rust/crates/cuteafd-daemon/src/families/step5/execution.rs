@@ -1715,7 +1715,7 @@ mod tests {
                 assert_eq!(admitted.weight_arenas[0].0, served);
                 let components = cuteafd_loader::placement::planner::weight_arena_components(
                     &served, cuteafd_loader::placement::planner::Location::coordinator(rank as u8),
-                    cuteafd_loader::placement::planner::Lifetime::RESIDENT, 1)?;
+                    cuteafd_loader::placement::planner::Lifetime::RESIDENT, 1, cuteafd_core::memory_layout::MemoryKind::Weights)?;
                 let charge = components.iter().filter(|component| !matches!(component.kind,
                     cuteafd_loader::placement::planner::ComponentKind::ResidentWeight(_)))
                     .map(|component| component.bytes.at(1)).collect::<Result<Vec<_>, _>>()?

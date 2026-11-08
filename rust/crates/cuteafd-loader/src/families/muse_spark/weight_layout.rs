@@ -310,7 +310,7 @@ mod tests {
                 assert_eq!((arena.bytes(), rounding(arena.bytes())), expected);
                 use crate::placement::planner::{weight_arena_components, ComponentKind, Lifetime, Location};
                 let components = weight_arena_components(&arena, Location::coordinator(rank as u8),
-                    Lifetime::RESIDENT, 1)?;
+                    Lifetime::RESIDENT, 1, cuteafd_core::memory_layout::MemoryKind::Weights)?;
                 assert_eq!(components.iter().filter(|component| matches!(component.kind,
                     ComponentKind::Allocation { .. })).count(), 1);
                 assert_eq!(components.iter().filter(|component| matches!(component.kind,

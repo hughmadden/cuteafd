@@ -355,6 +355,34 @@ mod tests {
     }
 
     #[test]
+    fn drafter_arena_plan_and_runtime_receipts_share_category_and_one_backing() -> Result<()> {
+        use cuteafd_core::memory_layout::{ArenaTag, MemoryKind};
+        use cuteafd_loader::placement::planner::{weight_arena_components, ComponentKind};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 20)?;
+        let device = super::super::device::Device { library: &library, id: 0 };
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("glm/draft/0",
+            [("tensor".into(), 1024)])?;
+        let components = weight_arena_components(&layout, Location::coordinator(0),
+            Lifetime::RESIDENT, 1, MemoryKind::DrafterWeights)?;
+        let ComponentKind::Allocation { template: planned, .. } = &components[0].kind else { panic!("arena root") };
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout,
+            ArenaTag::drafter_weights("fixture/drafter"))?;
+        let tensor = arena.view("tensor", 1024)?;
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&[0])?, "fixture",
+            Lifetime::RESIDENT, MemoryKind::DrafterWeights.category(), "draft owners");
+        inventory.weight_view("tensor", tensor.buffer, tensor.weight_backing().context("arena backing")?)?;
+        let roots = inventory.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].allocation, *planned);
+        assert_eq!(roots[0].allocation.category, Category::Drafter);
+        assert_eq!(tensor.tag().context("backing tag")?.kind, MemoryKind::DrafterWeights);
+        assert_eq!(inventory.receipts[1].allocation.view.as_ref().unwrap().backing, planned.id);
+        Ok(())
+    }
+
+    #[test]
     fn census_combines_independent_inventories_without_double_charge() -> Result<()> {
         let mut census = Census::default();
         let late = Lifetime { first: cuteafd_loader::placement::planner::Phase::Warmup,

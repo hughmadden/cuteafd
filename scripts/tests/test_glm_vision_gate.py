@@ -164,7 +164,8 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     # Every workspace buffer comes from the loader's arithmetic, which the reserve charges: a lane's
     # own buffers over its GPU's shared temporaries.
     temporaries = source.split("fn temporaries(", 1)[1].split("fn lane(", 1)[0]
-    assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch)" in temporaries
+    assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch, tag)" in temporaries
+    assert 'let tag = Tag::workspace("glmf/temporaries")' in temporaries
     lane = source.split("fn lane(", 1)[1].split("/// ModelOpt NVFP4 dense MLPs", 1)[0]
     assert "glmf_lane_bytes(" in lane and "streams: [alloc(bytes.streams)?" in lane
     assert "fn workspace_reserve(" not in source

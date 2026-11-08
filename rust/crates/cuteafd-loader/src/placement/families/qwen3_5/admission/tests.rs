@@ -167,7 +167,9 @@ fn padded_weight_backings_replace_payload_and_activate_with_their_single_tails()
         Lifetime { first: Phase::DraftLoad, last: Phase::Growth });
     assert_eq!(plan.facts.allocation_granularity.len(), 2);
     assert_eq!(plan.facts.allocations.iter().filter(|owner| owner.location == Location::coordinator(0)
-        && owner.category == Category::Weights).map(|owner| owner.bytes).sum::<u64>(), arena.bytes() as u64 + 1280);
+        && owner.category == Category::Weights).map(|owner| owner.bytes).sum::<u64>(), arena.bytes() as u64);
+    assert_eq!(plan.facts.allocations.iter().find(|owner| owner.id == "qwen3_5/mtp/gpu0").unwrap().category,
+        cuteafd_core::memory_layout::MemoryKind::DrafterWeights.category());
     assert_eq!(plan.facts.allocations.iter().find(|owner| owner.id == "draft.runtime").unwrap().bytes, 3072);
     let mut missing = input;
     missing.drafter.as_mut().unwrap().weight_arena = None;

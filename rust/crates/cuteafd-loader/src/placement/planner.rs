@@ -1,7 +1,7 @@
 //! Pure, phase-aware allocation planning. Recipes describe one legal candidate;
 //! policy, exact pins and allocation reconciliation belong here, not in families.
 use super::{LayerMode, ResidentWeights};
-use cuteafd_core::{spark_reply::SparkReplyFormats, memory_layout::{Basis, Category, Item, DRIVER_PAGE_TABLES_GROUP}};
+use cuteafd_core::{spark_reply::SparkReplyFormats, memory_layout::{Basis, Behaviour, Category, Item, MemoryKind, DRIVER_PAGE_TABLES_GROUP}};
 pub use cuteafd_core::memory_layout::DriverPageTableModel;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -176,7 +176,8 @@ impl<'a> CoordinatorDevices<'a> {
         }
         let draft_prefixes = ["qwen3_5/dspark/gpu", "glm/draft/", "glm5_flash/draft/", "kimi/draft/"];
         for allocation in allocations.iter().filter(|a| a.view.is_none()
-            && a.category == Category::Weights && a.group == "weight arena") {
+            && a.group == "weight arena" && MemoryKind::ALL.into_iter().any(|kind|
+                kind.behaviour() == Behaviour::Immutable && kind.category() == a.category)) {
             let Some(prefix) = draft_prefixes.into_iter().find(|prefix| allocation.id.starts_with(prefix))
                 else { continue; };
             let Device::Coordinator(rank) = allocation.location.device else {
@@ -648,7 +649,15 @@ impl ResolvedPlan {
             .map(|mapping| Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, mapping.source(), mapping.bytes(), Basis::Calibrated)));
         for owner in self.facts.allocation_granularity.iter().filter(|owner|
             owner.location == location && owner.lifetime.contains(Phase::Ready, self.facts.phase_order)) {
-            items.push(Item::new(Category::Runtime, ALLOCATION_GRANULARITY_GROUP,
+            // Arena tails inherit the root's kind. Legacy request groups keep
+            // their aggregate forecast: small requests share driver blocks.
+            let category = if let [backing] = owner.backings.as_slice() {
+                let root = self.facts.allocations.iter().chain(&self.facts.deferred)
+                    .find(|root| root.id == backing.backing)
+                    .ok_or_else(|| Refusal::InvalidFact(format!("missing tail backing {}", backing.backing)))?;
+                if root.view.is_none() && root.group == "weight arena" { root.category } else { Category::Runtime }
+            } else { Category::Runtime };
+            items.push(Item::new(category, ALLOCATION_GRANULARITY_GROUP,
                 owner.source(), owner.bytes()?, owner.basis()));
         }
         Ok(items)

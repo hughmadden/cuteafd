@@ -186,13 +186,14 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 let mut arenas = target.weight_arenas.clone();
                 if rank == usize::from(admitted.ownership.execution().spec().head_gpu) && depth > 0 {
                     let predictor = coordinator::RankWeightLayout::mtp_from_contract(&cp, &contract, depth)?;
-                    arenas.push((predictor.mtp_arena(rank as i32)?, ResidentWeights(predictor.resident_bytes)));
+                    arenas.push((predictor.mtp_arena(rank as i32)?, ResidentWeights(predictor.resident_bytes), cuteafd_core::memory_layout::MemoryKind::DrafterWeights));
                 }
-                for (arena, logical) in arenas {
+                for (arena, logical, kind) in arenas {
                     let roots = admitted.solved.facts.allocations.iter().filter(|owner| owner.id == arena.id())
                         .collect::<Vec<_>>();
                     assert_eq!(roots.len(), 1, "one backing per arena");
                     assert_eq!(roots[0].bytes, arena.bytes() as u64);
+                    assert_eq!(roots[0].category, kind.category());
                     let tail = admitted.solved.facts.allocation_granularity.iter()
                         .find(|owner| owner.id == format!("{}.tail", arena.id())).expect("arena tail");
                     assert_eq!(tail.requests(), [arena.bytes() as u64]);
@@ -2128,12 +2129,13 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
                 assert_eq!(owner.resident_weights.0, 0);
                 assert_eq!(owner.bytes, target.immutable + predictor);
                 let mut arenas = target.weight_arenas.clone();
-                if head && depth > 0 { arenas.push((mtp.mtp_arena(rank as i32)?, crate::placement::ResidentWeights(mtp.resident_bytes))); }
-                for (arena, logical) in arenas {
+                if head && depth > 0 { arenas.push((mtp.mtp_arena(rank as i32)?, crate::placement::ResidentWeights(mtp.resident_bytes), cuteafd_core::memory_layout::MemoryKind::DrafterWeights)); }
+                for (arena, logical, kind) in arenas {
                     let facts = &admitted.solved.facts;
                     let roots = facts.allocations.iter().filter(|owner| owner.id == arena.id()).collect::<Vec<_>>();
                     assert_eq!(roots.len(), 1);
                     assert_eq!(roots[0].bytes, arena.bytes() as u64);
+                    assert_eq!(roots[0].category, kind.category());
                     assert_eq!(roots[0].lifetime, crate::placement::planner::Lifetime::RESIDENT);
                     assert_eq!(facts.resident_weights.iter().find(|owner| owner.id == arena.id()).unwrap().weights, logical);
                     let tail = facts.allocation_granularity.iter().find(|owner| owner.id == format!("{}.tail", arena.id())).unwrap();

@@ -1133,7 +1133,7 @@ pub(super) mod tests {
             allocations: vec![], deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
             driver_page_tables: vec![], allocation_granularity: vec![] };
         let mut contract = Contract::fixed(64, 1, usize::from(rank) + 1, facts);
-        contract.components = planner::weight_arena_components(layout, Location::coordinator(rank), Lifetime::RESIDENT, 1)?;
+        contract.components = planner::weight_arena_components(layout, Location::coordinator(rank), Lifetime::RESIDENT, 1, cuteafd_core::memory_layout::MemoryKind::Weights)?;
         contract.variables = vec![planner::Variable::Prefill(vec![planner::PrefillShape { rows: 64, waves: 1 }]),
             planner::Variable::Lanes(vec![1])];
         contract.facts(&[0, 0], 1).map_err(Into::into)
@@ -1190,7 +1190,7 @@ pub(super) mod tests {
             for rank in 0..2 {
                 let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("kimi/coordinator/{rank}"),
                     [("a_log".into(), bytes), ("next".into(), 256)])?;
-                let mut components = planner::weight_arena_components(&layout, Location::coordinator(rank), Lifetime::RESIDENT, 1)?;
+                let mut components = planner::weight_arena_components(&layout, Location::coordinator(rank), Lifetime::RESIDENT, 1, cuteafd_core::memory_layout::MemoryKind::Weights)?;
                 for component in &mut components { component.activation = Activation::choice(0, option); }
                 contract.components.extend(components);
             }

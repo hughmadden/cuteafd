@@ -63,6 +63,7 @@ pub struct MimoCapacityProfiles {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MimoWeightArena {
     pub layout: WeightArenaLayout,
+    pub kind: cuteafd_core::memory_layout::MemoryKind,
     pub lifetime: Lifetime,
 }
 
@@ -126,10 +127,10 @@ pub fn mimo_capacity_profiles(
             name: "MiMo weight arenas".into(), what: error.to_string(),
         })?;
     let mut weight_arenas = layouts.target.into_iter().map(|layout| layout.into_iter()
-        .map(|layout| MimoWeightArena { layout, lifetime: Lifetime::RESIDENT }).collect::<Vec<_>>())
+        .map(|layout| MimoWeightArena { layout, kind: cuteafd_core::memory_layout::MemoryKind::Weights, lifetime: Lifetime::RESIDENT }).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     if let Some(layout) = layouts.mtp {
-        weight_arenas[0].push(MimoWeightArena { layout, lifetime: Lifetime::RESIDENT });
+        weight_arenas[0].push(MimoWeightArena { layout, kind: cuteafd_core::memory_layout::MemoryKind::DrafterWeights, lifetime: Lifetime::RESIDENT });
     }
     let cache = mimo_cache_geometry(
         cfg,

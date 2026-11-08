@@ -119,7 +119,7 @@ pub(crate) fn admit_host_memory_with_resident_formulas(cache: u64, tables: &[(&s
 }
 
 /// Pinned bytes by ledger label, each with its kind's planner category: the
-/// recorded tag when there is one, else the legacy scope-root mapping.
+/// recorded tag is mandatory for every physical backing.
 fn pinned_by_label(snapshot: &cuteafd_ffi::memory_ledger::Snapshot)
     -> std::collections::BTreeMap<&'static str, (cuteafd_core::memory_layout::Category, usize)> {
     use cuteafd_core::memory_layout::Category;
