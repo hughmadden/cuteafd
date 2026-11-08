@@ -107,39 +107,71 @@ mod tests {
     }
 
     /// The admission switch on the installed checkpoint: every shipped layout
-    /// charges each arena as exactly its root B, a resident claim of B and one
+    /// charges each arena as exactly its root B, a logical payload claim P and one
     /// tail, and the arena holds exactly the device weights the old per-tensor
     /// charge priced (so B+tail replaces, never stacks on, the payload).
     #[test]
     fn installed_arena_charges_replace_per_tensor_weights() -> Result<()> {
-        use cuteafd_loader::placement::families::deepseek_v41::{owners, resident};
-        use cuteafd_loader::placement::planner::{allocation_granularity_forecast, weight_arena_components,
-            ComponentKind, Lifetime, Location};
+        use cuteafd_loader::placement::families::deepseek_v41::{admission, owners, resident,
+            Bytes2, DraftInventory, ExpertCost};
+        use cuteafd_loader::placement::planner::{allocation_granularity_forecast,
+            ComponentKind, Lifetime, Operation, PrefillShape};
         let Some(snapshot) = super::super::coordinator_golden_tests::snapshot() else { return Ok(()) };
         let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
         let config = serde_json::from_slice(&std::fs::read(catalog.snapshot().join("config.json"))?)?;
-        let charge = |layout: &cuteafd_loader::serving_capacity::WeightArenaLayout, gpu: u8| -> Result<(u64, u64)> {
-            let components = weight_arena_components(layout, Location::coordinator(gpu), Lifetime::RESIDENT, 1)
-                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-            ensure!(components.len() == 3, "one root, one claim, one tail");
-            let ComponentKind::Allocation { template: root, deferred, .. } = &components[0].kind else { anyhow::bail!("root") };
-            let ComponentKind::ResidentWeight(claim) = &components[1].kind else { anyhow::bail!("claim") };
-            let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { anyhow::bail!("tail") };
+        let charge = |layout: &cuteafd_loader::serving_capacity::WeightArenaLayout, ranks: usize,
+            gpu: u8, draft: bool| -> Result<(u64, u64)> {
+            let demand = owners::arena_demand(gpu, layout);
+            let prepared = admission::ProductionInput {
+                expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
+                prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
+                replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
+                experts: vec![ExpertCost { whole: Bytes2 { resident: 0, staging: 0 },
+                    half: [Bytes2 { resident: 0, staging: 0 }; 2], tp2: ranks == 2,
+                    whole_supported: true, spark_ok: true }; 40], workspace: 0,
+                owners: if draft { vec![] } else { vec![admission::Owner::from_demand(&demand)] },
+                weight_arenas: if draft { vec![] } else { vec![layout.clone()] },
+                startup: vec![], allowances: vec![],
+                draft: draft.then(|| DraftInventory { resident: layout.bytes() as u64,
+                    dense: Some(layout.clone()), ..Default::default() }),
+                encoders: vec![], media_cache_bytes: 0, resident_weight_limit: u64::MAX,
+                spark_reply_formats: Default::default(), operation: Operation::Serving,
+                budgets: admission::live_budgets(&vec![(96 << 30, 96 << 30, 96 << 30); ranks],
+                    &[64 << 30; 4])?,
+            }.prepare()?;
+            // Inspect the actual production cases after ID binding and draft
+            // decomposition, not the shared helper's default B claim.
+            let components = prepared.recipe.owners.iter().flat_map(|case| &case.value).collect::<Vec<_>>();
+            ensure!(components.len() == 3, "old weight/padding owners survived arena replacement");
+            let roots = components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::Allocation { template, deferred, .. } => Some((template, deferred)), _ => None,
+            }).collect::<Vec<_>>();
+            let claims = components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::ResidentWeight(claim) => Some(claim), _ => None,
+            }).collect::<Vec<_>>();
+            let tails = components.iter().filter_map(|component| match &component.kind {
+                ComponentKind::AllocationGranularity(tail) => Some(tail), _ => None,
+            }).collect::<Vec<_>>();
+            ensure!(roots.len() == 1 && claims.len() == 1 && tails.len() == 1);
+            let (root, deferred) = roots[0];
+            let claim = claims[0];
+            let tail = tails[0];
             let b = layout.bytes() as u64;
             ensure!(root.id == layout.id() && root.bytes == b && root.view.is_none() && !deferred
-                && root.lifetime == Lifetime::RESIDENT && claim.id == root.id
-                && claim.weights == cuteafd_loader::placement::ResidentWeights(b)
+                && root.location == cuteafd_loader::placement::planner::Location::coordinator(gpu)
+                && root.group == "weight arena" && root.lifetime == Lifetime::RESIDENT && claim.id == root.id
+                && claim.weights == cuteafd_loader::placement::ResidentWeights(layout.payload_bytes() as u64)
                 && tail.id == format!("{}.tail", layout.id()) && tail.requests() == [b]
-                && tail.backings[0].backing == root.id, "arena components differ from the layout");
-            let tail = tail.bytes().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-            ensure!(tail == allocation_granularity_forecast(&[b]).map_err(|e| anyhow::anyhow!("{e:?}"))?);
+                && tail.backings[0].backing == root.id, "production arena components differ from the layout");
+            let tail = tail.bytes()?;
+            ensure!(tail == allocation_granularity_forecast(&[b])?);
             Ok((b, tail))
         };
         for (ranks, gpu_embedding) in [(1, false), (1, true), (2, true), (2, false)] {
             let placement = (ranks == 2).then(CachePlacement::encoder_decoder);
-            for head in [Fp8Head::All, Fp8Head::Off] {
-                // Fp8Head::configured() fixes the old charge's head format.
-                if head != Fp8Head::configured() && head != Fp8Head::All { continue; }
+            for head in [Fp8Head::configured()] {
+                // Only same-mode old/new charges belong in the admission table;
+                // the separate inventory test covers every vocabulary geometry.
                 let layout = target_layout(&catalog, placement, gpu_embedding, head, false, false)?;
                 let old = resident::resident_headers(&config, catalog.tensors().iter().map(|t| &t.metadata), ranks, false)
                     .ok_or_else(|| anyhow::anyhow!("unsupported residency"))?;
@@ -147,14 +179,12 @@ mod tests {
                     let old_bytes = old[rank].iter().filter(|i| owners::is_arena_weight(i)
                         && (gpu_embedding || i.category != cuteafd_core::memory_layout::Category::Embedding))
                         .map(|i| i.bytes).sum::<u64>();
-                    let (b, tail) = charge(arena, rank as u8)?;
+                    let (b, tail) = charge(arena, ranks, rank as u8, false)?;
                     // The arena holds the old charge's device weights: the same
                     // payload, laid out with alignment; nothing extra, nothing missing.
-                    if head == Fp8Head::configured() {
-                        ensure!(arena.payload_bytes() as u64 == old_bytes,
-                            "TP{ranks} gpu{rank} embedding={gpu_embedding}: arena payload {} != old charge {old_bytes}",
-                            arena.payload_bytes());
-                    }
+                    ensure!(arena.payload_bytes() as u64 == old_bytes,
+                        "TP{ranks} gpu{rank} embedding={gpu_embedding}: arena payload {} != old charge {old_bytes}",
+                        arena.payload_bytes());
                     eprintln!("V41_CHARGE layout=target TP{ranks} gpu{rank} embedding={gpu_embedding} head={head:?} \
                         old={old_bytes} new={} B={b} tail={tail} padding={} delta={} rounding=no",
                         b + tail, arena.padding_bytes(), (b + tail) as i128 - old_bytes as i128);
@@ -169,7 +199,7 @@ mod tests {
             // #1501 added the padding item, so its old charge already equalled B.
             let old_payload = items[ranks - 1].iter().filter(|i| i.group == "dspark-auxiliary" && i.format != "arena-padding")
                 .map(|i| i.bytes).sum::<u64>();
-            let (b, tail) = charge(&draft, (ranks - 1) as u8)?;
+            let (b, tail) = charge(&draft, ranks, (ranks - 1) as u8, true)?;
             ensure!(draft.payload_bytes() as u64 == old_payload, "dSpark dense payload differs from its old charge");
             eprintln!("V41_CHARGE layout=dspark-dense TP{ranks} gpu{} old_payload={old_payload} old_with_padding={} \
                 new={} B={b} tail={tail} padding={} delta_vs_payload={} delta_vs_padded={} rounding=no",
@@ -185,7 +215,7 @@ mod tests {
         let source = names.iter().map(|n| catalog.tensor(n).map(|t| t.metadata.byte_length))
             .collect::<Result<Vec<_>>>()?.into_iter().sum::<u64>();
         ensure!(vision.payload_bytes() as u64 == source, "vision payload differs from its source tensors");
-        let (b, tail) = charge(&vision, 0)?;
+        let (b, tail) = charge(&vision, 1, 0, false)?;
         eprintln!("V41_CHARGE layout=vision gpu0 old_planner={source} old_serving_weights={b} new={} B={b} \
             tail={tail} padding={} delta_vs_planner={} delta_vs_serving={tail} rounding=no",
             b + tail, vision.padding_bytes(), (b + tail) as i128 - source as i128);

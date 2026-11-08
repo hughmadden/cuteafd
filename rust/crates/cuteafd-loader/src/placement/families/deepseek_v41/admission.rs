@@ -720,7 +720,7 @@ pub struct V41Recipe<'a> {
     pub arena_resident: Vec<[u64; 2]>,
     pub encoders: Vec<crate::plan::encoder::EncoderPlacement>,
     /// The bundled tower's exact arena (`weight_layout::vision_layout_from_headers`),
-    /// charged whenever an encoder option places it on a coordinator GPU.
+    /// charged wherever an encoder option places it (Managed has no SM120 tail).
     pub vision_arena: Option<crate::serving_capacity::WeightArenaLayout>,
     pub media_cache_bytes: u64,
     pub concurrency: u64,
