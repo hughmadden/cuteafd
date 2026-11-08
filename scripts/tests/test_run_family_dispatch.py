@@ -3089,6 +3089,8 @@ def test_glmf_kda_exact_reaches_serve_and_plan_on_one_gpu(tmp_path, keys, kda, s
     assert "--kda-exact kx7" in launch and launch.count("--kda-exact") == 1, launch
     assert f"--kda-fp8 {kda}" in launch and launch.count("--kda-fp8") == 1, launch
     assert ("--kda-state bf16" in launch) == bool(state), launch
+    # The verified packs persist in the host's KX7 pack cache across launches.
+    assert "/.cache/cuteafd/kx7:/run/cuteafd/kx7" in launch and "CUTEAFD_KX7_CACHE=/run/cuteafd/kx7" in launch, launch
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
     assert plans and all("--kda-exact kx7" in plan and plan.count("--kda-exact") == 1
                          and "--kda-fp8 off" in plan for plan in plans), plans
@@ -3100,6 +3102,7 @@ def test_glmf_kda_exact_off_forwards_nothing(tmp_path, keys):
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert "--kda-exact" not in launch and "--kda-fp8 row128" in launch, launch
+    assert "CUTEAFD_KX7_CACHE" not in launch, launch
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
     assert plans and not any("--kda-exact" in plan for plan in plans), plans
 

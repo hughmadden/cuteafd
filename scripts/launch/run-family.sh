@@ -2074,6 +2074,15 @@ if [[ $family == glm5_flash ]]; then
     exit 2
   fi
   [[ $kda_exact == off ]] || family_args+=(--kda-exact "$kda_exact")
+  if [[ $kda_exact == kx7 ]]; then
+    # Verified packs persist across launches, keyed by each matrix's BF16 bytes: a relaunch
+    # reads them instead of encoding and checking 136 matrices again.
+    kx7_cache="$HOME/.cache/cuteafd/kx7"
+    release_require_owned_state "$kx7_cache"
+    mkdir -p "$kx7_cache"
+    release_require_writable_state "$kx7_cache"
+    kx7_cache_args=(-v "$kx7_cache:/run/cuteafd/kx7" -e CUTEAFD_KX7_CACHE=/run/cuteafd/kx7)
+  fi
   # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
   glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
@@ -2898,7 +2907,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   "${generic_worker_mounts[@]}" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
-  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${memory_policy_args[@]}" $serve --snapshot "$snapshot" \
+  ${kx7_cache_args[@]+"${kx7_cache_args[@]}"} "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${memory_policy_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output-tokens "$(get MAX_OUTPUT_TOKENS 131072)" "${kv_reserve_args[@]}" "${dspark_args[@]}" \

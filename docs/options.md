@@ -260,7 +260,7 @@ weights and scratch alongside the KV pool and routed experts.
 | `GLM5_FLASH_FP8_HEAD` (alias `GLMF_FP8_HEAD`) | `auto` = `on` | `auto`, `on`, `off`, `packed` | GLM Flash head: FP8 copy, BF16, or the exact 12-bit copy (one GPU). |
 | `GLM5_FLASH_FP8_PREFILL` (alias `GLMF_FP8_PREFILL`) | unset | pass list (`kda-o`, …) | GLM Flash prefill layers run W8A8. |
 | `GLM5_FLASH_KDA_FP8` (alias `GLMF_KDA_FP8`) | `auto` | `auto`, `off`, `row128`, `channel` | GLM Flash KDA FP8 granularity. |
-| `GLM5_FLASH_KDA_EXACT` | `off` | `off`, `kx7` | GLM Flash KDA q/k/v/o as exact KX7 packs of the BF16 (one GPU; KDA FP8 auto resolves to off). |
+| `GLM5_FLASH_KDA_EXACT` | `off` | `off`, `kx7` | GLM Flash KDA q/k/v/o as exact KX7 packs of the BF16 (one GPU; KDA FP8 auto resolves to off). Verified packs persist in `~/.cache/cuteafd/kx7` (`CUTEAFD_KX7_CACHE` in the container), keyed by each matrix's BF16 bytes. |
 | `GLM5_FLASH_KDA_SPLIT` | `auto` | `auto`, `partials` | GLM Flash KDA split output. |
 | `GLM5_FLASH_TARGET_HEAD` | `auto` | `auto`, `tensor`, `exact` | GLM Flash's `TARGET_HEAD` spelling. |
 | `TP2_ATTENTION`, `TP2_QUERY_PROJECTION`, `TP2_OUTPUT_PROJECTION` | `off` | `on`, `off` | V4.1 TP2 projections on the RTX pair. |

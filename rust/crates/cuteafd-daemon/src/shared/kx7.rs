@@ -79,6 +79,42 @@ impl Kx7Image {
 /// matrices), verifies each against its source and checks it against its bound. Counted as the
 /// load's quantization time and in this thread's [`PackSplit`].
 pub(crate) fn pack(matrices: &[(String, Vec<u8>, usize, usize)]) -> Result<Vec<Kx7Image>> {
+    let Some(cache) = PackCache::from_env() else { return pack_uncached(matrices) };
+    let started = Instant::now();
+    let keys = parallel(matrices, |(_, bytes, n, k)| PackCache::key(bytes, *n, *k));
+    let mut images = parallel(&keys.iter().zip(matrices).collect::<Vec<_>>(), |(key, (name, _, n, k))|
+        match cache.get(key, name, *n, *k) {
+            Ok(image) => image,
+            Err(error) => { tracing::warn!(matrix = name.as_str(), %error, "KX7 cache entry refused; packing again"); None }
+        });
+    let missing: Vec<usize> = (0..matrices.len()).filter(|&i| images[i].is_none()).collect();
+    let hits = (matrices.len() - missing.len()) as u64;
+    let lookup = started.elapsed().as_secs_f64();
+    if !missing.is_empty() {
+        let fresh = pack_uncached(&missing.iter().map(|&i| matrices[i].clone()).collect::<Vec<_>>())?;
+        for (&i, image) in missing.iter().zip(fresh) {
+            if let Err(error) = cache.put(&keys[i], &image) {
+                tracing::warn!(matrix = matrices[i].0.as_str(), %error, "KX7 cache write failed");
+            }
+            images[i] = Some(image);
+        }
+    }
+    let mut stats = STATS.with(Cell::get);
+    stats.cache_hits += hits;
+    stats.cache_seconds += lookup;
+    for i in (0..matrices.len()).filter(|i| !missing.contains(i)) {
+        let (image, (_, _, n, k)) = (images[i].as_ref().context("KX7 cache image")?, &matrices[i]);
+        stats.matrices += 1;
+        stats.bf16_bytes += (n * k * 2) as u64;
+        stats.device_bytes += image.device_bytes().total(FLOOR);
+        stats.bound_bytes += resident_bound(*n, *k)?.total(FLOOR);
+    }
+    STATS.with(|cell| cell.set(stats));
+    images.into_iter().map(|image| image.context("KX7 image")).collect()
+}
+
+/// [`pack`] without the cache: encode, verify and bound every matrix.
+fn pack_uncached(matrices: &[(String, Vec<u8>, usize, usize)]) -> Result<Vec<Kx7Image>> {
     let started = Instant::now();
     let bf16: usize = matrices.iter().map(|(_, bytes, _, _)| bytes.len()).sum();
     let images = crate::shared::memory::load_timing::quantize(bf16, || -> Result<Vec<Kx7Image>> {
@@ -120,11 +156,14 @@ pub(crate) struct PackStats {
     pub device_bytes: u64,
     pub bound_bytes: u64,
     pub seconds: f64,
+    /// Matrices loaded from the pack cache (hashing, lookup and payload checks in `cache_seconds`).
+    pub cache_hits: u64,
+    pub cache_seconds: f64,
 }
 
 thread_local! {
     static STATS: Cell<PackStats> = const { Cell::new(PackStats { matrices: 0, bf16_bytes: 0, device_bytes: 0,
-        bound_bytes: 0, seconds: 0.0 }) };
+        bound_bytes: 0, seconds: 0.0, cache_hits: 0, cache_seconds: 0.0 }) };
 }
 
 /// Brackets one load on this thread and reports the packs made inside it.
@@ -138,7 +177,8 @@ impl PackSplit {
         let now = STATS.with(Cell::get);
         PackStats { matrices: now.matrices - self.0.matrices, bf16_bytes: now.bf16_bytes - self.0.bf16_bytes,
             device_bytes: now.device_bytes - self.0.device_bytes, bound_bytes: now.bound_bytes - self.0.bound_bytes,
-            seconds: now.seconds - self.0.seconds }
+            seconds: now.seconds - self.0.seconds, cache_hits: now.cache_hits - self.0.cache_hits,
+            cache_seconds: now.cache_seconds - self.0.cache_seconds }
     }
 
     /// Logs the bracket's packs, if any.
@@ -149,8 +189,8 @@ impl PackSplit {
                 packed_bytes = stats.device_bytes, admitted_bytes = stats.bound_bytes,
                 slack_bytes = stats.bound_bytes.saturating_sub(stats.device_bytes),
                 bits_per_weight = stats.device_bytes as f64 * 16.0 / stats.bf16_bytes.max(1) as f64,
-                pack_seconds = stats.seconds,
-                "KX7 exact packs made and verified on the host (BF16 never resident)");
+                pack_seconds = stats.seconds, cache_hits = stats.cache_hits, cache_seconds = stats.cache_seconds,
+                "KX7 exact packs made and verified on the host, or read from the pack cache (BF16 never resident)");
         }
         stats
     }
@@ -178,15 +218,9 @@ pub(crate) struct Kx7Weights<'a> {
 }
 
 impl<'a> Kx7Weights<'a> {
-    /// Uploads `image` to the current device (each buffer at least [`FLOOR`] bytes; device
-    /// allocations are 256-byte aligned, as the streams' 16-byte quad loads need).
-    pub fn upload(library: &'a NativeLibrary, image: &Kx7Image) -> Result<Self> {
-        Self::upload_with(library, image, |_, bytes| DeviceAllocation::new(library, (bytes as u64).max(FLOOR) as usize))
-    }
-
-    /// [`Self::upload`] into allocations `allocate(buffer, bytes)` gives (buffer 0..4 in
-    /// tables, offsets, lengths, streams order; at least `bytes` each), such as the weight
-    /// arena's [`arena_views`].
+    /// Uploads `image` into the allocations `allocate(buffer, bytes)` gives (buffer 0..4 in
+    /// tables, offsets, lengths, streams order; at least `bytes` each, 256-byte aligned as the
+    /// streams' 16-byte quad loads need), such as the weight arena's [`arena_views`].
     pub fn upload_with(library: &'a NativeLibrary, image: &Kx7Image,
         mut allocate: impl FnMut(usize, usize) -> Result<DeviceAllocation<'a>>) -> Result<Self> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("kx7");
@@ -234,6 +268,113 @@ impl<'a> Kx7Weights<'a> {
         // SAFETY: the caller's contract; the pack names this matrix's live allocations.
         unsafe { library.kx7_linear(x, &pack, out, rows, workspace.ptr, workspace.bytes, stream) }
     }
+}
+
+/// The identity of the packer a cached image came from: a cached pack is reused only by a packer
+/// that would make the same bytes (v1.1 layout, the two-class code or its Huffman fallback at
+/// the resident table limit). Change it whenever the encoder's output could change.
+const CACHE_FORMAT: &str = "cuteafd-kx7-cache 1; layout v1.1 lane16 ksplit4 ragged8; two-class 11+12, huffman fallback <= 16384 words";
+const CACHE_MAGIC: &[u8] = b"CUTEAFD-KX7-CACHE 1\n";
+
+/// A host directory of verified packs, one file per source matrix, named by the SHA-256 of the
+/// packer identity, the shape and the matrix's BF16 bytes: a hit is the pack of exactly those
+/// weights, so loading it skips the encode and its decode check. `CUTEAFD_KX7_CACHE` names the
+/// directory (`off` or unset: no cache). Files carry a digest of their payload, checked on every
+/// read; a file that fails it, or any other read error, is a miss (and is rewritten).
+pub(crate) struct PackCache {
+    dir: std::path::PathBuf,
+}
+
+impl PackCache {
+    pub fn from_env() -> Option<Self> {
+        let dir = std::env::var_os("CUTEAFD_KX7_CACHE")?;
+        (!dir.is_empty() && dir != "off").then(|| Self { dir: dir.into() })
+    }
+
+    /// The cache key of an [n, k] BF16 source.
+    pub fn key(bytes: &[u8], n: usize, k: usize) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(CACHE_FORMAT.as_bytes());
+        hash.update((n as u64).to_le_bytes());
+        hash.update((k as u64).to_le_bytes());
+        hash.update(bytes);
+        hex(&hash.finalize())
+    }
+
+    fn path(&self, key: &str) -> std::path::PathBuf { self.dir.join(&key[..2]).join(format!("{key}.kx7")) }
+
+    /// The cached image for `key`, if a valid one is there.
+    pub fn get(&self, key: &str, name: &str, n: usize, k: usize) -> Result<Option<Kx7Image>> {
+        let bytes = match std::fs::read(self.path(key)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let body = bytes.strip_prefix(CACHE_MAGIC).context("KX7 cache file without its magic")?;
+        let end = body.iter().position(|&b| b == b'\n').context("KX7 cache header")?;
+        let header: serde_json::Value = serde_json::from_slice(&body[..end])?;
+        let payload = &body[end + 1..];
+        let field = |key: &str| header[key].as_u64().with_context(|| format!("KX7 cache header {key}"));
+        ensure!(header["format"] == CACHE_FORMAT && header["key"] == key, "KX7 cache header of another packer or key");
+        ensure!(field("n")? == n as u64 && field("k")? == k as u64, "KX7 cache shape");
+        let lengths = header["lengths"].as_array().context("KX7 cache lengths")?
+            .iter().map(|v| v.as_u64().map(|l| l as usize)).collect::<Option<Vec<_>>>().context("KX7 cache lengths")?;
+        ensure!(lengths.len() == 4 && lengths.iter().sum::<usize>() == payload.len(), "KX7 cache payload length");
+        ensure!(header["payload_sha256"] == hex(&{ use sha2::{Digest, Sha256}; Sha256::digest(payload) }),
+            "KX7 cache payload digest");
+        let code = match header["code"].as_str() {
+            Some("huffman") => CodeKind::Huffman,
+            Some("two-class") => CodeKind::TwoClass { pbits: field("pbits")? as u32, rare_bits: field("rare_bits")? as u32 },
+            _ => anyhow::bail!("KX7 cache code"),
+        };
+        let mut at = 0;
+        let buffers: [Vec<u8>; 4] = std::array::from_fn(|i| { let b = payload[at..at + lengths[i]].to_vec(); at += lengths[i]; b });
+        let image = Kx7Image { name: name.into(), n, k, code, esc_len: field("esc_len")? as u32,
+            table_words: field("table_words")? as usize, buffers };
+        ensure!(image.table_words * 4 == image.buffers[0].len() && image.device_bytes().within(&resident_bound(n, k)?),
+            "KX7 cache image outside its bound");
+        ensure!(image.buffers[3].len() >= READ_AHEAD_BYTES
+            && image.buffers[3][image.buffers[3].len() - READ_AHEAD_BYTES..].iter().all(|&b| b == 0), "KX7 cache streams tail");
+        Ok(Some(image))
+    }
+
+    /// Stores `image` (verified against its source) under `key`, atomically.
+    pub fn put(&self, key: &str, image: &Kx7Image) -> Result<()> {
+        let path = self.path(key);
+        let parent = path.parent().context("KX7 cache path")?;
+        std::fs::create_dir_all(parent)?;
+        let mut payload = Vec::with_capacity(image.buffers.iter().map(Vec::len).sum());
+        for buffer in &image.buffers { payload.extend_from_slice(buffer); }
+        let (code, pbits, rare_bits) = match image.code {
+            CodeKind::Huffman => ("huffman", 0, 0),
+            CodeKind::TwoClass { pbits, rare_bits } => ("two-class", pbits, rare_bits),
+        };
+        let header = serde_json::json!({"format": CACHE_FORMAT, "key": key, "n": image.n, "k": image.k,
+            "code": code, "pbits": pbits, "rare_bits": rare_bits, "esc_len": image.esc_len,
+            "table_words": image.table_words, "lengths": image.buffers.iter().map(Vec::len).collect::<Vec<_>>(),
+            "payload_sha256": hex(&{ use sha2::{Digest, Sha256}; Sha256::digest(&payload) })});
+        let temporary = parent.join(format!(".{key}.{}.tmp", std::process::id()));
+        let mut file = std::fs::File::create(&temporary)?;
+        use std::io::Write;
+        file.write_all(CACHE_MAGIC)?;
+        file.write_all(serde_json::to_string(&header)?.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+}
+
+fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+
+/// `f` over `items` on up to `items.len()` scoped threads, in order.
+fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items.iter().map(|item| scope.spawn(|| f(item))).collect();
+        handles.into_iter().map(|h| h.join().expect("KX7 cache worker")).collect()
+    })
 }
 
 #[cfg(test)]
@@ -353,4 +494,33 @@ mod tests {
             assert!(pack.code().n_rare() > 0, "{name} exercises the ESC path");
         }
     }
+
+    #[test]
+    fn pack_cache_round_trips_and_refuses_corruption() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = PackCache { dir: dir.path().into() };
+        let (n, k) = (64, 4096);
+        let le = |v: Vec<u16>| v.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        let source = le(fp8_born(n, k, 7, 4));
+        let image = pack_uncached(&[("m".into(), source.clone(), n, k)])?.remove(0);
+        let key = PackCache::key(&source, n, k);
+        assert!(cache.get(&key, "m", n, k)?.is_none(), "an empty cache misses");
+        cache.put(&key, &image)?;
+        let back = cache.get(&key, "m", n, k)?.expect("a stored pack hits");
+        assert_eq!(back.buffers, image.buffers);
+        assert_eq!((back.code, back.esc_len, back.table_words), (image.code, image.esc_len, image.table_words));
+        // Another source, shape or packer identity is another key.
+        assert_ne!(PackCache::key(&le(fp8_born(n, k, 8, 4)), n, k), key);
+        assert_ne!(PackCache::key(&source, n / 2, k * 2), key);
+        assert!(cache.get(&key, "m", n, k * 2).is_err(), "a key read at another shape is refused");
+        // One flipped payload byte fails the digest.
+        let path = cache.path(&key);
+        let mut bytes = std::fs::read(&path)?;
+        let last = bytes.len() - READ_AHEAD_BYTES - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&path, &bytes)?;
+        assert!(cache.get(&key, "m", n, k).is_err(), "a corrupted pack is refused");
+        Ok(())
+    }
+
 }
