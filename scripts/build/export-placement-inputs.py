@@ -183,7 +183,8 @@ def check_job_sm170(job, staging, previous, timeout, env, verify_all=False):
         return {"sm170_seconds": 0, "sm170_programs": 0}
     records = json.loads(records_path.read_text())
     current = publication_records(staging, [job])
-    old = publication_records(previous / ".workers", [job]) if previous else {}
+    prior_records = json.loads((previous / "INPUTS.json").read_text())["program_records"] if previous else {}
+    old = {path: record for path, record in prior_records.items() if path.startswith(name + "/")}
     report = kernel_records.change_report(old, current)
     selected = {entry["program"].removeprefix(name + "/")
                 for category in ("added", "changed") for entry in report[category]}
