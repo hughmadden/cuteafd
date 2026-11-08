@@ -276,7 +276,7 @@ pub(crate) unsafe fn project_vocabulary(library: &NativeLibrary, projection: &cu
             weight.apply(library, input.ptr, logits.ptr, true, rows, 0, weight.n, &scratch.allocation, stream)
         },
         HeadCopy::Packed(head) => unsafe {
-            head.apply(library, input.ptr, logits.ptr, true, rows, scratch.coarse, &scratch.allocation, stream)
+            head.apply(library, input.ptr, logits.ptr, true, rows, scratch.coarse, scratch.allocation.buffer, stream)
         },
     }
 }
@@ -317,7 +317,9 @@ pub(crate) fn fp8_scratch<'a>(library: &'a NativeLibrary, copy: Option<HeadCopy<
     let (n, k) = copy.shape();
     let allocation = match copy {
         HeadCopy::Fp8(_) => crate::shared::fp8_linear::scratch(library, rows, &[(k, n)])?,
-        HeadCopy::Packed(_) => crate::shared::packed_head::scratch(library, rows, &[(k, n)])?,
+        HeadCopy::Packed(_) => crate::shared::packed_head::scratch(library, rows, &[(k, n)],
+            if coarse { Tag::drafter_workspace("v41/draft-head-projection") }
+            else { Tag::workspace("v41/target-head-projection") })?,
     };
     Ok(Some(HeadScratch { allocation, coarse }))
 }

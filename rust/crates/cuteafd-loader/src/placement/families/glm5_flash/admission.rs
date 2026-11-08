@@ -405,6 +405,44 @@ fn invalid(error: impl std::fmt::Display) -> p::Refusal {
     p::Refusal::InvalidFact(error.to_string())
 }
 
+/// What the exact 12-bit head (`--fp8-head packed`) owns beside its resident bytes, which
+/// `i.resident` already holds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PackedHeadOwners {
+    /// The landed BF16 head it packs from on GPU 0, released once the pack verifies.
+    pub source: Option<p::Allocation>,
+    /// The drafter's coarse-plane GEMV scratch, from the drafter's load on.
+    pub draft_scratch: u64,
+}
+
+/// [`PackedHeadOwners`] of `i` on an `sms`-SM coordinator (none for the other head forms).
+/// Target logits run the GEMV in each lead step workspace's head workspace
+/// ([`cache::GLMF_HEAD_WORKSPACE`], which only the BF16 head's cuBLAS route uses), so the
+/// GEMV's scratch must fit it; the packed head serves one coordinator GPU.
+pub(crate) fn packed_head_owners(i: &GlmfInputs<'_>, sms: usize) -> Result<PackedHeadOwners, p::Refusal> {
+    use crate::families::glm5_flash::resident::GlmfHeadFormat;
+    let head = i.representation.head;
+    if head != GlmfHeadFormat::Packed { return Ok(PackedHeadOwners::default()); }
+    if i.gpus.len() != 1 {
+        return Err(invalid("the exact 12-bit head (--fp8-head packed) serves one coordinator GPU; \
+            a head split keeps the BF16 or FP8 head"));
+    }
+    let (vocab, hidden, sms) = (i.cfg.vocab_size as u64, i.cfg.hidden as u64, sms as u64);
+    let target = head.scratch_bytes(i.prefill_rows.max(i.decode_rows), vocab, hidden, sms);
+    if target > cache::GLMF_HEAD_WORKSPACE {
+        return Err(invalid(format!("the exact 12-bit head's GEMV needs {target} bytes of scratch on {sms} SMs, \
+            more than the step workspaces' {}-byte head workspace", cache::GLMF_HEAD_WORKSPACE)));
+    }
+    let source = p::Allocation::buffer("glmf.load.head.bf16", p::Location::coordinator(0),
+        head.load_source_bytes(vocab, hidden), p::Lifetime { first: p::Phase::Load, last: p::Phase::Load },
+        Category::Staging, "BF16 head packed at load");
+    // The drafter's rows run in GEMV passes: one pass's scratch serves every row count.
+    let draft_scratch = if i.drafter_bytes > 0 {
+        head.scratch_bytes(cuteafd_core::packed_head::PASS_ROWS, vocab, hidden, sms)
+    } else { 0 };
+    Ok(PackedHeadOwners { source: Some(source), draft_scratch })
+}
+
 fn component(id: impl Into<String>, gpu: u8, category: Category, group: &str,
     bytes: p::ByteCurve, lifetime: p::Lifetime, maximum: u64) -> Result<p::Component, p::Refusal> {
     let allocation = p::Allocation::buffer(id, p::Location::coordinator(gpu), bytes.at(1)?,
@@ -534,6 +572,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     if i.shared_replay && (gpus != 1 || i.spark_ranks == 0 || !process.remote_experts) {
         return Err(invalid("--replay-records shared needs one coordinator GPU with Spark experts"));
     }
+    let head = packed_head_owners(i, sms)?;
     for profile in [&i.workspace, &i.local_workspace] {
         if profile.iter().any(|row| usize::from(row.demand.gpu) >= gpus)
             || (0..gpus).any(|rank| !profile.iter().any(|row|
@@ -690,7 +729,8 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     }
     for owner in process.allocations.iter().cloned().chain(process.native_load.iter()
         .flat_map(|load| load.allocations(process.push_host.is_some())))
-        .chain(process.mount_load.iter().flat_map(|load| load.allocations("glmf.load.mount"))) {
+        .chain(process.mount_load.iter().flat_map(|load| load.allocations("glmf.load.mount")))
+        .chain(head.source.clone()) {
         let bytes = p::ByteCurve::fixed(owner.bytes, maximum);
         contract.components.push(p::Component::allocation(owner, bytes, false, maximum));
     }
@@ -861,6 +901,10 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 Basis::Exact), format!("glmf.draft.{gpu}"), activation.clone())?;
             add_demand(&mut contract, &Demand::new(gpu, Category::Workspace, "DFlash linear/attention scratch", i.drafter_scratch[usize::from(gpu)],
                 Basis::Formula), format!("glmf.draft.scratch.{gpu}"), activation.clone())?;
+            if head.draft_scratch > 0 {
+                add_demand(&mut contract, &Demand::new(gpu, Category::Workspace, "packed head draft scratch",
+                    head.draft_scratch, Basis::Formula), format!("glmf.draft.head.{gpu}"), activation.clone())?;
+            }
             if gpu != 0 {
                 blas.push(p::serving::BlasOwners { name: "GLM Flash remote drafter bridge head".into(), process: "coordinator".into(),
                     location: p::Location::coordinator(0), cublas_handles: 1, lt_handles: 1,

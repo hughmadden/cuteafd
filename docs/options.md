@@ -262,7 +262,7 @@ weights and scratch alongside the KV pool and routed experts.
 | `QWEN_FP8_HEAD` | unset | `on`, `off` | Qwen head target to resident E4M3. |
 | `MIMO_FP8_HEAD` | `auto` | `auto`, `on`, `off` | MiMo FP8 head. |
 | `MIMO_FP8_O_PROJ` | `auto` | `auto`, `on`, `off` | MiMo FP8 output projection. |
-| `GLM5_FLASH_FP8_HEAD` (alias `GLMF_FP8_HEAD`) | `auto` = `on` | `auto`, `on`, `off` | GLM Flash FP8 head. |
+| `GLM5_FLASH_FP8_HEAD` (alias `GLMF_FP8_HEAD`) | `auto` = `packed` (1 GPU), `on` (2 GPUs) | `auto`, `on`, `off`, `packed` | GLM Flash BF16 checkpoint head: FP8 copy, BF16, or an exact 12-bit operand copy (one GPU). Native K6/EXLR8 heads ignore this conversion setting. |
 | `GLM5_FLASH_FP8_PREFILL` (alias `GLMF_FP8_PREFILL`) | unset | pass list (`kda-o`, …) | GLM Flash prefill layers run W8A8. |
 | `GLM5_FLASH_KDA_FP8` (alias `GLMF_KDA_FP8`) | `auto` | `auto`, `off`, `row128`, `channel` | GLM Flash KDA FP8 granularity. |
 | `GLM5_FLASH_KDA_SPLIT` | `auto` | `auto`, `partials` | GLM Flash KDA split output. |

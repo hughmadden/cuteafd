@@ -22,13 +22,22 @@ pub(super) fn prefill_activations(value: &str)
 
 pub(super) fn normalize(args: &mut EngineArgs) {
     args.kda_fp8 = fp8::KdaFp8::Off;
-    args.fp8_head = false;
+    args.head_format = super::head::GlmfHeadFormat::Bf16;
     args.kda_fp32_partials = false;
     args.kda_output_shard = false;
     args.kda_prefill_expanded = false;
     args.kda_nvfp4_gate = None;
     args.fp8_prefill.clear();
     args.fp8_prefill.push(super::Fp8PrefillGroup::None);
+}
+
+pub(super) fn normalize_head(args: &mut EngineArgs, native_head: bool) {
+    if native_head {
+        if args.head_format != super::head::GlmfHeadFormat::Bf16 {
+            tracing::warn!(requested = args.head_format.setting(), "--fp8-head does not apply to the native K6 head");
+        }
+    }
+    args.head_format = args.head_format.resolve(native_head, 1 + usize::from(args.split_device.is_some()));
 }
 
 pub(super) fn publish_resolved(args: &EngineArgs) {
@@ -39,7 +48,7 @@ pub(super) fn resolved_settings(args: &EngineArgs) -> Vec<(&'static str, String)
     vec![("kda-output-shard", args.kda_output_shard.to_string()),
         ("kda-prefill-expanded", args.kda_prefill_expanded.to_string()),
         ("kda-fp32-partials", args.kda_fp32_partials.to_string()),
-        ("fp8-head", args.fp8_head.to_string()),
+        ("fp8-head", args.head_format.setting().into()),
         ("kda-fp8", match args.kda_fp8 { fp8::KdaFp8::Off => "off", fp8::KdaFp8::Channel => "channel", fp8::KdaFp8::Row128 => "row128" }.into()),
         ("kda-nvfp4-gate", args.kda_nvfp4_gate.clone().unwrap_or_else(|| "off".into())),
         ("fp8-prefill", { use clap::ValueEnum; args.fp8_prefill.iter().map(|value| value.to_possible_value().unwrap().get_name().to_owned()).collect::<Vec<_>>().join(",") })]

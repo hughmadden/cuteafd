@@ -56,8 +56,8 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
   drafting admissions that found no ring, and must read 0.
 - Dense NVFP4 MLPs run natively on a ModelOpt release; its per-tensor FP8
   dense MLPs prefill as static W8A8 on their own scales; BF16 attention,
-  indexer and shared experts quantize to FP8 blocks at load by default
-  (`CUTEAFD_GLM_BF16=native` keeps them BF16 at a coordinator-step cost).
+  indexer and shared experts quantize to FP8 blocks at load (GLM Flash has
+  no BF16 path for them; `CUTEAFD_GLM_BF16=native` is the GLM 5.3 family's).
 - KV format: FP8 MLA latent record on the MLA+DSA layers; a recurrent FP32
   state per KDA layer plus short-convolution state. `GLM5_FLASH_KDA_STATE=bf16`
   (`--kda-state bf16`, opt-in; BF16 KDA projections on one GPU) stores the
@@ -94,13 +94,14 @@ placeholder Spark hosts and addresses): Official FP8 [min](../../examples/config
   decode schedule) and, at m80, 64x128 tiles at two CTAs per SM. On a GB10,
   an expert call at 1-80 rows took 1.4-11.2% less time than the default's.
 - Target head on tensor cores (Hugh Madden, #102; every family since #119's
-  follow-on): with the BF16 head (`GLM5_FLASH_FP8_HEAD=off`; the launcher's
-  `auto` head is FP8), the target's logits run as a BF16 tensor-core GEMM with
+  follow-on): with the BF16 head (`GLM5_FLASH_FP8_HEAD=off`; `auto` selects
+  packed on TP1 and FP8 on TP2 for BF16 checkpoint heads), the target's logits
+  run as a BF16 tensor-core GEMM with
   FP32 accumulation at every row count, one read of the head (the shared route
   for every family, launcher key `TARGET_HEAD`). `GLM5_FLASH_TARGET_HEAD=exact`
   or `TARGET_HEAD=exact` keeps the pedantic FP32 GEMM as a diagnostic. With the
-  FP8 head the setting does not apply, and an explicit `tensor` there is
-  refused.
+  FP8 or packed head the setting does not apply, and an explicit `tensor` there
+  is refused.
 - 128-row decode and verify steps: `GLM5_FLASH_DECODE_ROWS=auto` keeps `64`;
   explicit `128` (`--decode-rows 128`) remains opt-in on one GPU. Builds with
   `CUTEAFD_GLMF_WIDE_DECODE_ROWS=128` run steps of 65-128 rows on the
@@ -169,14 +170,29 @@ reserve unit 0 outside the admitted token count and enable
 
 ## Default precision (single residency)
 
-Every weight has one resident format. The launcher resolves precision after
-it chooses the serving layout: with one coordinator GPU,
-`GLM5_FLASH_KDA_FP8=auto` (including unset) selects `row128` and
-`GLM5_FLASH_FP8_HEAD=auto` selects `on`; with the two-GPU head split they
-select `off` (BF16 KDA and head). Explicit `off/row128/channel` KDA and
-`on/off` head settings always win, including the deprecated `GLMF_*` keys;
-current names take precedence over deprecated names. The DFlash2 drafter
-defaults to FP8 on both layouts; `SPECULATOR_FP8=off` keeps it BF16.
+Every weight has one resident format. The launcher passes the head setting to
+one shared checkpoint/topology resolver used by plan and serve:
+`GLM5_FLASH_FP8_HEAD=auto` (including unset) selects `packed` for BF16-head
+checkpoints on one coordinator GPU and `on` (FP8) on a two-GPU head split.
+Native K6 and EXLR8 heads retain their checkpoint representation first and
+ignore conversion settings. KDA auto remains `row128` on both layouts.
+Explicit `on` (FP8), `off` (BF16), and `packed` head choices remain available.
+Existing `GLMF_*` aliases retain their precedence rules.
+
+The packed BF12 head uses the shared `V41_FP8_HEAD=packed` mechanism on
+BF16-head checkpoints, including official FP8 and EXL3 K3.25-Core-FP8 releases.
+Normal coordinator dense push delivers one BF16 source directly into transient
+`staging/glmf.load.head.bf16`, not a second checkpoint read. After the group
+commits, it packs into the target weight arena, verifies every operand bit for
+bit and releases the source before drafter load. Admission charges source
+staging only during Load, and the retained packed arena exactly once.
+For [154880, 4096], payload is 911.784 MiB: 298.216 MiB less than BF16 but
+287.878 MiB more than FP8 (arena tails and scratch excluded). Target projection
+reconstructs original BF16 operands; reduction order need not produce
+cuBLAS-identical logits. The drafter reads the coarse plane. Explicit packed
+on a two-GPU split is refused; auto falls back to FP8 so existing split layouts
+keep working. DFlash2 defaults to FP8 on both layouts;
+`SPECULATOR_FP8=off` keeps it BF16.
 
 Matched recheck, 2026-10-04: GLM 5.3 Flash EXL3 K3.25, RTX PRO 6000 at
 325 W, fixed code prompts/nonces, one warm batch per concurrency, 512
@@ -389,9 +405,6 @@ of every quant, mixed placement or hardware combination.
   BF16 block projections quantize to FP8 at load, including the two-GPU
   split; native NVFP4 dense and routed experts retain their own format.
   Dated cards below describe their original checkpoint/precision recipes.
-- Running BF16 attention natively (`CUTEAFD_GLM_BF16=native`) costs a
-  meaningful coordinator-step slowdown versus the default FP8-block path;
-  use it only when the extra precision is worth it.
 - Original column-split FP8 KDA/head misses the nominal paired top-1 bar
   on the two-GPU layout. Its large single-pair C4/prefill losses were not
   stable across warmed launches. Full-K KDA token rows pass component
@@ -417,6 +430,7 @@ of every quant, mixed placement or hardware combination.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| dev | 2026-11-08 | Hugh Madden's exact packed/BF12 head is the TP1 default for BF16 checkpoint heads; TP2 auto stays FP8 and native K6/EXLR8 stays native. Packing preserves the original BF16 operands, not cross-kernel logit byte identity; one normal push source is verified, drained and retired before the retained arena census. | Same-session EXL3 K3.25 min (1 RTX PRO 6000 + 2 Sparks, DFlash2, warmed C1/C16): FP8 to packed NLL 0.148232 to 0.147859, official BF16-root KL 0.036194 to 0.036123; both quick fidelity gates pass. Ready 31.86 to 26.64 s, unchanged 2,097,152-token pool. Speed roughly neutral: C1 108.01 to 104.17 tok/s (0.964x), C16 aggregate 282.26 to 286.97 tok/s (1.017x). Baseline host reclaim makes the runner's aggregate verdict `rerun`, not a clean speed win; adaptive draft policy host-timing variance (#1555) is the likely source of the C1 spread, with the earlier separate-session +4% directional only. Timed C1/C16: no power-cap or thermal slowdown, 450 W; max 67 C, minimum T.Limit headroom 27 C. TP2 auto-to-FP8 short C1 decode passes. [Qualification receipts](https://github.com/tpurtell/cuteafd/pull/1562#issuecomment-6722181272). |
 | v2 | 2026-10-09 | Bundled vision auto admission; Hugh Madden ports #14-#29 (pooled prefix marks/pinned host tier, graph accounting, shared lane workspaces, compact-index/BF16-state/GB10-schedule opt-ins); unified SM120 and small-card planning. #25-#29 included; opt-in modes retain separate gates; rc3: compact index cache, shared replay records, tensor draft head and W8A8 drafter on by default where they apply (128 rows opt-in). | <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-rc3-sim5090/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-rc3-sim5090/card.svg" width="360" alt="GLM-5.3-Flash (fp8-block128x128/f32) (5090)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-min-rc3/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-min-rc3/card.svg" width="360" alt="GLM-5.3-Flash (fp8-block128x128/f32) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max-rc3/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max-rc3/card.svg" width="360" alt="GLM-5.3-Flash (fp8-block128x128/f32) (2× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-rc3-sim5090/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-rc3-sim5090/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-v1 (exl3-k3+exl3-k4) (5090)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min-rc3/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min-rc3/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-v1 (exl3-k3+exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-4spark-glm53f-exl3-max-rc3/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-4spark-glm53f-exl3-max-rc3/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-v1 (exl3-k3+exl3-k4) (2× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-rc3-sim5090/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-rc3-sim5090/card.svg" width="360" alt="GLM-5.3-Flash-NVFP4 (nvfp4-g16) (5090)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min-rc3/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min-rc3/card.svg" width="360" alt="GLM-5.3-Flash-NVFP4 (nvfp4-g16) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-glm53f-nvfp4-max-rc3/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-glm53f-nvfp4-max-rc3/card.svg" width="360" alt="GLM-5.3-Flash-NVFP4 (nvfp4-g16) (2× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-rc3-sim5090/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-rc3-sim5090/card.svg" width="360" alt="GLM-5.3-Flash-tr3-4bpw (exl3-k4) (5090)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min-rc3/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min-rc3/card.svg" width="360" alt="GLM-5.3-Flash-tr3-4bpw (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-tr3-4bpw-2rtx-4spark-glm53f-tr3-max-rc3/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-09-smoke-glm-5-3-flash-tr3-4bpw-2rtx-4spark-glm53f-tr3-max-rc3/card.svg" width="360" alt="GLM-5.3-Flash-tr3-4bpw (exl3-k4) (2× RTX)"></a> |
 | v4.1 | 2026-10-31 | Spark EXL3 FC1 rotation in-tile on DGX Spark (#913): min and 5090 8K prefill +7-15%. | <a href="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-Core-FP8 (exl3-k3+exl3-k4) (5090)"></a> <a href="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-min/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-min/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-Core-FP8 (exl3-k3+exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-2rtx-glm53f-exl3-max/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-2rtx-glm53f-exl3-max/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-Core-FP8 (exl3-k3+exl3-k4) (2× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K4-Core-K6 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090/card.svg" width="360" alt="GLM-5.3-Flash-NVFP4 (nvfp4-g16) (5090)"></a> <a href="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/card.svg" width="360" alt="GLM-5.3-Flash-NVFP4 (nvfp4-g16) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090/card.svg" width="360" alt="GLM-5.3-Flash-tr3-4bpw (exl3-k4) (5090)"></a> <a href="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/card.svg" width="360" alt="GLM-5.3-Flash-tr3-4bpw (exl3-k4) (1× RTX)"></a> |
 | v4 | 2026-10-30 | Published benchmarks | <a href="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-Core-FP8 (exl3-k3+exl3-k4) (5090)"></a> <a href="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-min/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-min/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-Core-FP8 (exl3-k3+exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-2rtx-glm53f-exl3-max/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-2rtx-glm53f-exl3-max/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-Core-FP8 (exl3-k3+exl3-k4) (2× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K4-Core-K6 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> |

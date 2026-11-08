@@ -440,6 +440,8 @@ impl SharedPolicy {
             "GLM Flash shared draft policy geometry");
         let policy = length.policy(geometry, super::draft_binding::seed(), drafter.drafts())?;
         engine.arm_draft_probe(engine.decode_rows)?;
+        // Drafts through a launcher (the FP8 head, or the packed head's coarse plane, whose E4M3-like
+        // numerics have no prior of their own) take the FP8 head's selector prior.
         let fp8_head = matches!(engine.draft_head(), crate::shared::speculation::dflash::TargetHead::Launch(_));
         let trace = crate::shared::speculation_trace::Trace::open()?.is_some();
         Ok(Self { policy, prior: drafter.draft_prior(fp8_head)?, observed: 0, skipped: 0, trace, decision: None })

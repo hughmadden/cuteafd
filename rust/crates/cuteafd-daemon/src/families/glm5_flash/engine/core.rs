@@ -171,6 +171,13 @@ impl<'a> GlmfEngine<'a> {
                 Device { library: self.library, id: self.device }, self.stream, layout,
                 crate::shared::memory::Tag::drafter_workspace("glmf/draft-head-projection"))?);
         }
+        // A packed head's drafter reads the coarse plane in scratch of its own (admitted beside the
+        // drafter's scratch); the drafter launches it on its own stream.
+        if let (Some(drafter), GlmfHead::Packed { .. }) = (&self.drafter, &self.weights.head) {
+            let rows = drafter.block().checked_mul(drafter.max_batch_sequences()).context("packed draft rows overflow")?;
+            let library = self.library;
+            Device { library, id: self.device }.run(|| self.weights.head.bind_draft(library, rows))?;
+        }
         Ok(())
     }
     pub(super) fn core_slot(&self, rank: usize, w: &mut Workspace<'a>, decode: bool, lane: usize) -> Result<()> {

@@ -836,7 +836,8 @@ struct Temporaries<'a> {
     logits: Dev<'a>,
     /// The LM head (rank 0 only).
     head: Option<VocabularyHead<'a>>,
-    _head_workspace: Dev<'a>,
+    /// The BF16 head's cuBLAS workspace, or the packed head's GEMV scratch (rank 0 only).
+    head_workspace: Dev<'a>,
 }
 
 impl<'a> std::ops::Deref for Workspace<'a> {
@@ -1061,7 +1062,7 @@ impl<'a> StepPlan<'_, 'a> {
             } else {
                 None
             },
-            _head_workspace: head_workspace,
+            head_workspace,
         })
     }
 
@@ -4470,8 +4471,9 @@ impl<'a> GlmfEngine<'a> {
 
     /// The vocabulary projection of the last `logit_rows` normalized rows into
     /// `w.logits` through the one resident head: BF16 (the shared target-head route: tensor
-    /// cores at every row count, or `--target-head exact`'s pedantic GEMM), or the FP8 head
-    /// (--fp8-head) in 16-row spans for every row count.
+    /// cores at every row count, or `--target-head exact`'s pedantic GEMM), the FP8 head
+    /// (--fp8-head) in 16-row spans for every row count, or the packed head's exact GEMV
+    /// (--fp8-head packed) in the workspace's head workspace, which no cuBLAS route then uses.
     fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, _decode: bool) -> Result<()> {
         ensure!(logit_rows <= t && t <= w.rows, "head input exceeds admitted rows");
         ensure!(logit_rows <= units::logits_capacity(w.logits.buffer.bytes, self.cfg.vocab_size)?,
@@ -4494,6 +4496,13 @@ impl<'a> GlmfEngine<'a> {
                 // FP32 logits (the workspace's logit capacity); the engine stream orders them.
                 unsafe { self.weights.head.launch_fp8(self.programs, x, w.logits.buffer.ptr.cast(), logit_rows, h,
                     self.cfg.vocab_size, self.stream) }
+            }),
+            GlmfHead::Packed { .. } => self.timed("glmf_head_packed", || {
+                // SAFETY: `x` holds `logit_rows` normalized rows, `w.logits` their FP32 logits and the
+                // lead workspace's head workspace the GEMV's scratch (checked at pack time and by the
+                // native launch); the engine stream orders them.
+                unsafe { self.weights.head.launch_packed(self.library, x, w.logits.buffer.ptr.cast(), logit_rows,
+                    false, Some(w.head_workspace.buffer), self.stream) }
             }),
             // SAFETY: the head's input and operands are live buffers of these shapes.
             GlmfHead::Bf16(head) => unsafe {
@@ -4519,6 +4528,13 @@ impl<'a> GlmfEngine<'a> {
                 // SAFETY: the drafter passes its live normalized rows and logits
                 // workspace for `rows` rows, on the stream it launches the head on.
                 unsafe { fp8.launch_fp8(self.programs, x, logits, rows, self.cfg.hidden, self.cfg.vocab_size, stream) }
+            })),
+            // Drafts read the coarse plane (as V4.1's dSpark drafter does) in the scratch the drafter
+            // bound ([`GlmfHead::bind_draft`]); the target verifies every proposal exactly.
+            packed @ GlmfHead::Packed { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+                // SAFETY: the drafter passes its live normalized rows and logits workspace for `rows`
+                // rows, on the stream it launches the head on; the bound scratch lives with the head.
+                unsafe { packed.launch_packed(self.library, x, logits, rows, true, None, stream) }
             })),
         }
     }
