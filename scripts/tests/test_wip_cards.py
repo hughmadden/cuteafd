@@ -1,4 +1,5 @@
 import importlib.util
+from http.client import IncompleteRead
 import json
 import os
 import re
@@ -3399,7 +3400,112 @@ def test_spark_memory_phase(monkeypatch, phase, gauges, active, expected):
         return ({'starting': phase == 'starting', 'g': gauges} if path.endswith('snapshot')
                 else {'active': active})
     monkeypatch.setattr(cards, 'http', http)
-    assert cards.spark_memory_phase('http://localhost') == expected
+    diagnostics = []
+    assert cards.spark_memory_phase('http://localhost', diagnostics) == expected
+    assert diagnostics
+    assert all(row['status'] == 'ok' and row['exception_type'] is None for row in diagnostics)
+    assert all(row['timeout_s'] == .5 and row['elapsed_s'] >= 0 for row in diagnostics)
+
+
+@pytest.mark.parametrize('endpoint', ['/v1/console/snapshot', '/v1/bench/status'])
+def test_spark_memory_phase_timeout_diagnostics(monkeypatch, endpoint):
+    calls = []
+    def http(url, path, **kwargs):
+        calls.append(path)
+        assert kwargs['timeout'] == .5
+        if path == endpoint:
+            raise TimeoutError('timed out')
+        return {'g': {}}
+    monkeypatch.setattr(cards, 'http', http)
+    ticks = iter([10., 10.5, 11., 11.5])
+    monkeypatch.setattr(cards.time, 'monotonic', lambda: next(ticks))
+    diagnostics = []
+    assert cards.spark_memory_phase('http://localhost', diagnostics) == 'unavailable'
+    assert calls[-1] == endpoint
+    request = next(row for row in diagnostics if row.get('endpoint') == endpoint)
+    assert request == dict(endpoint=endpoint, timeout_s=.5, elapsed_s=.5,
+                           status='unavailable', exception_type='TimeoutError', error='timed out')
+    assert diagnostics[-1]['source'] == 'phase-classification'
+
+
+@pytest.mark.parametrize('endpoint', ['/v1/console/snapshot', '/v1/bench/status'])
+@pytest.mark.parametrize('boundary', ['ready', 'post-sweep'])
+@pytest.mark.parametrize('error', [TimeoutError('timed out'), IncompleteRead(b'{', 20)])
+def test_spark_memory_boundary_preserves_ready_on_telemetry_failure(entry, tmp_path, monkeypatch, endpoint, boundary, error):
+    job = cards.generate(entry, 'probe', dict(instance='boundary', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, {'memory'}, None, 1)
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
+    def http(url, path, **kwargs):
+        assert kwargs['timeout'] == 3.
+        if path == endpoint:
+            raise error
+        return {'g': {}}
+    monkeypatch.setattr(cards, 'http', http)
+    sampled = []
+    def run(command, **kwargs):
+        rank = len(sampled)
+        host = job['entry']['sparks'][rank]
+        sampled.append(host)
+        return SimpleNamespace(stdout=json.dumps(dict(rank=rank, host=host, mem={'MemAvailable': 2**30})))
+    # A single worker makes the mocked sampling order deterministic.
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(cards.concurrent.futures, 'ThreadPoolExecutor', lambda **kwargs: ThreadPoolExecutor(max_workers=1))
+    monkeypatch.setattr(cards, 'run', run)
+    if boundary == 'ready':
+        cards.precheck(job)
+        assert json.loads((Path(job['state']) / 'precheck.json').read_text())['status'] == 'pass'
+    else:
+        cards.spark_memory_boundary(job, boundary)
+    assert sampled == job['entry']['sparks']
+    evidence = json.loads((Path(job['state']) / f'memory-phase-{boundary}.json').read_text())
+    assert evidence['ready'] is True and evidence['boundary'] == boundary
+    assert evidence['phase'] == 'unavailable'
+    assert any(row.get('endpoint') == endpoint and row['exception_type'] == type(error).__name__
+               for row in evidence['telemetry'])
+    for rank in range(len(sampled)):
+        row = json.loads((Path(job['state']) / f'memory-spark-rank{rank}-{boundary}.jsonl').read_text())
+        assert all(row[key] == value for key, value in evidence.items())
+        assert row['mem']['MemAvailable'] == 2**30
+
+
+@pytest.mark.parametrize('failure', ['sampling', 'identity', 'guard'])
+def test_spark_memory_boundary_real_failures_stay_hard(entry, tmp_path, monkeypatch, failure):
+    entry['sparks'] = ['ostrich']
+    job = cards.generate(entry, 'probe', dict(instance='boundary', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, {'memory'}, None, 1)
+    job['memory_guard_bytes'] = 512 * 1024 * 1024
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
+    def http(*args, **kwargs):
+        raise TimeoutError('timed out')
+    monkeypatch.setattr(cards, 'http', http)
+    stopped = []
+    monkeypatch.setattr(cards, 'stop_memory_worker', lambda job, host: stopped.append(host))
+    def run(command, **kwargs):
+        if failure == 'sampling':
+            raise subprocess.TimeoutExpired(command, 8)
+        return SimpleNamespace(stdout=json.dumps(dict(rank=0, host='foreign' if failure == 'identity' else 'ostrich',
+                                                      mem={'MemAvailable': 1})))
+    monkeypatch.setattr(cards, 'run', run)
+    with pytest.raises((subprocess.TimeoutExpired, ValueError, RuntimeError)):
+        cards.precheck(job)
+    assert json.loads((Path(job['state']) / 'precheck.json').read_text())['status'] == 'failed'
+    assert stopped == (['ostrich'] if failure == 'guard' else [])
+    assert json.loads((Path(job['state']) / 'memory-phase-ready.json').read_text())['ready'] is True
+
+
+def test_launch_and_preflight_refuse_unconfirmed_cleanup_marker(tmp_path):
+    home = tmp_path / 'home'
+    marker = home / '.cache/cuteafd/instances/failed/unconfirmed-containers.json'
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps([dict(host='kiwi', container='cuteafd-spark-expert-kiwi-19441')]))
+    # The marker is checked before configs, checkpoints or Docker are touched,
+    # including the launcher's CPU-only dry-run used by card preflight.
+    for args in ([], ['--dry-run', '--total-capacity']):
+        result = subprocess.run(['bash', str(ROOT / 'scripts/launch/run-family.sh'), *args],
+                                env={**os.environ, 'HOME': str(home)}, capture_output=True, text=True, timeout=5)
+        assert result.returncode != 0
+        assert str(marker) in result.stderr and 'kiwi' in result.stderr
+        assert 'unconfirmed container teardown' in result.stderr
 
 
 def test_spark_memory_stream_has_bytes_no_cuda_and_stops_on_eof():
@@ -3529,7 +3635,7 @@ def test_memory_observer_samples_selected_hosts_and_closes_streams(entry, tmp_pa
         children.append(child)
         return child
 
-    def phase(url):
+    def phase(url, diagnostics):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             if all((Path(job['state']) / f'memory-spark-rank{r}.jsonl').stat().st_size for r in range(len(hosts))):
@@ -3620,7 +3726,7 @@ def test_spark_memory_boundaries_are_wired_and_merged(entry, tmp_path, monkeypat
     assert close['timeout_s'] == 32
     monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost')
     phases = iter(['loading', 'ready-idle'])
-    monkeypatch.setattr(cards, 'spark_memory_phase', lambda url: next(phases))
+    monkeypatch.setattr(cards, 'spark_memory_phase', lambda url, diagnostics, timeout: next(phases))
     real_run = subprocess.run
     commands = []
     def run(command, **kwargs):
