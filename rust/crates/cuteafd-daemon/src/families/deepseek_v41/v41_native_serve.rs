@@ -739,9 +739,18 @@ fn worker(
         if local_layers > 0 {
             let loaded = match pushed.take() {
                 Some(weights) => weights,
-                None => (0..local_layers).map(|layer| ExpertWeights::load(&lib, &catalog,
-                    ExpertLayer::BackboneFull { layer }, budgets[layer].peak_device_bytes()?))
-                    .collect::<Result<Vec<_>>>()?,
+                None => {
+                    let device = crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? };
+                    let selections = selected.iter().map(|(layer, _)| *layer).collect::<Vec<_>>();
+                    let layout = ExpertWeights::arena_layout(device, &catalog, selections.iter().copied())?;
+                    crate::shared::experts::weight_layout::admit(&layout,
+                        budgets.iter().map(|b| b.device_staging_bytes).max().unwrap_or(0),
+                        per_slot * slots + per_decode * 2, usize::try_from(admitted_experts.peak_bytes)?)?;
+                    let arena = ExpertWeights::arena(device, &catalog, selections.iter().copied())?;
+                    selections.into_iter().enumerate().map(|(index, layer)| ExpertWeights::load_into(
+                        &lib, &catalog, layer, budgets[index].peak_device_bytes()?, &arena))
+                        .collect::<Result<Vec<_>>>()?
+                },
             };
             let weights = std::rc::Rc::new(loaded);
             for (_, transport) in &mut prefill_slots.slots {

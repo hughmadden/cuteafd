@@ -210,26 +210,31 @@ fn load_weights<'a>(
     // Every layout admits the unified-pool peak before allocation. Pinned host
     // staging, read scratch and exchange storage compete with device weights on
     // GB10.
-    let budget = spark_admission_budget(config, resident, staging, pinned_host,
-        read_scratch, workspace)?;
-    admit_worker_peak(library, config.rank, budget.load_peak, budget.serve_peak)?;
     if let Some(stream) = push {
         if let Some(weights) = push_native::load(library, catalog, config, resident, stream)? {
             return Ok((backend::Weights::Full(weights), config.device_budget - resident));
         }
     }
-    let mut remaining = config.device_budget;
+    let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
+    let layout = ExpertWeights::arena_layout(device, catalog,
+        layers.iter().map(|&layer| config.selection(layer)).collect::<Result<Vec<_>>>()?)?;
+    let peak = spark_admission_budget(config, layout.bytes(), staging, pinned_host, read_scratch, workspace)?;
+    ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
+        "physical expert arena startup peak exceeds configured device budget");
+    admit_worker_peak(library, config.rank, peak.load_peak, peak.serve_peak)?;
+    let remaining = config.device_budget.checked_sub(layout.bytes())
+        .context("native mount arena exceeds device budget")?;
+    let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?;
     let weights = super::load_in_rank_order(&layers, config.rank, |_, layer| {
         let started = std::time::Instant::now();
-        let weight = ExpertWeights::load(
+        let weight = ExpertWeights::load_into(
             library,
             catalog,
             config.selection(layer)?,
-            remaining,
+            config.device_budget,
+            &arena,
         )?;
-        remaining = remaining
-            .checked_sub(weight.budget().resident_bytes)
-            .context("resident budget exhausted")?;
+
         tracing::info!(
             rank = config.rank,
             layer,
