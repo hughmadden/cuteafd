@@ -12,7 +12,7 @@
 pub mod fault;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use cuteafd_core::memory_layout::{MemoryKind, Tag};
@@ -555,7 +555,7 @@ impl Snapshot {
         (kinds, 0)
     }
 
-    /// Bytes by [`owner`] tag for one pool and device (untagged rows omitted).
+    /// Bytes by accounting [`owner`] guard for one pool and device.
     pub fn by_owner(&self, space: Space, device: i32) -> BTreeMap<&'static str, usize> {
         let mut out = BTreeMap::new();
         for row in self.rows.iter().filter(|r| r.key.space == space && r.key.device == device) {

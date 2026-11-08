@@ -207,9 +207,8 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     assert re.findall(r"(\w+)\s*:\s*usize", signature) == ["rows", "page_lists", "members"]
     body = enclosed(engine.split("fn step_buffers", 1)[1], "{", "}")
     allocation = enclosed(body.split("c4_page_table:", 1)[1], "{", "}")
-    assert 'scope("kv/records")' in allocation
-    assert allocation.index('scope("kv/records")') < allocation.index("ints(")
-    assert re.search(r"ints\s*\(\s*page_lists\s*\*\s*\(\s*self\.shape\.units\s*\+\s*if\s+members\s*>\s*1\s*\{\s*3\s*\}\s*else\s*\{\s*0\s*\}\s*\)\s*\)", allocation)
+    assert 'const KV_RECORDS: Tag = Tag::kv("v4/kv/records")' in engine
+    assert re.search(r"self\.alloc\(page_lists\s*\*\s*\(self\.shape\.units\s*\+\s*if\s+members\s*>\s*1\s*\{\s*3\s*\}\s*else\s*\{\s*0\s*\}\s*\)\s*\*\s*4,\s*KV_RECORDS\)", allocation)
     call = enclosed(engine.split("self.step_buffers", 1)[1], "(", ")")
     branches = re.findall(r"if\s+shared_page_list\s*\{\s*([\w:]+)\s*\}\s*else\s*\{\s*(\w+)\s*\}", call)
     assert re.match(r"\s*t\s*,", call)
@@ -220,7 +219,7 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     table_bytes = waves * members * (units + 3) * 4 + decode_rows * units * 4
     log = tmp_path / "coordinator.log"
     log.write_text(report(1000 * MIB + table_bytes, 900 * MIB + table_bytes,
-                          {"weights": 900 * MIB, "kv/records": table_bytes}))
+                          {"weights": 900 * MIB, "kv": table_bytes}))
     categories = memory_audit.summarize(next(memory_audit.reports(str(log))))["devices"][0]["categories"]
     assert categories["kv"] == table_bytes
     assert categories.get("workspace", 0) == 0
@@ -259,10 +258,10 @@ def test_v4_admits_tables_and_frozen_prefix_quota_before_first_reservation():
     assert "prefix_cache(engine, prefix, host_config)?" in serve
 
 
-def test_glmf_kda_only_pool_backing_uses_the_planners_prefix_scope():
+def test_glmf_kda_only_pool_backing_has_a_prefix_kind():
     source = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
     allocation = source.split("let pool_mark_backing = if pool_mark_unit_bytes > 0 {", 1)[1].split("} else { None };", 1)[0]
-    assert 'scope("prefix/KDA-only pool marks")' in allocation.split("Some(zeroed(", 1)[0]
+    assert 'Tag::prefix("glmf/prefix-pool-marks")' in allocation
     assert 'pool_pages.checked_mul(pool_mark_unit_bytes)' in allocation
     assert memory_audit.kind_categories({"kinds": {"prefix": 1}}) == {"prefix": 1}
 

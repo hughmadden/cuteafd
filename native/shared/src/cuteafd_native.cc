@@ -941,6 +941,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* o
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA && CUTEAFD_NATIVE_ENABLE_RDMA
   int device = -1;
+  // Third-party residual: CUDA context storage, not an owned backing.
   if (cudaGetDevice(&device) != cudaSuccess || cudaFree(nullptr) != cudaSuccess) {
     return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "no current CUDA device for dma-buf allocation");
   }
@@ -1713,6 +1714,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
   size_t before_free = 0, after_free = 0, total = 0;
   const bool census = graph_census_enabled();
   const cudaError_t before_status = census ? cudaMemGetInfo(&before_free, &total) : cudaSuccess;
+  // Third-party residual: CUDA owns graph executable storage, retired by cudaGraphExecDestroy.
   err = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&graph_exec, graph, 0), 0, 0, graph);
   const cudaError_t after_status = census ? cudaMemGetInfo(&after_free, &total) : cudaSuccess;
   if (err != cudaSuccess) {
@@ -3515,26 +3517,24 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
   if (host_buffer_flags == kMappedHostFlags) {
 #if CUTEAFD_NATIVE_ENABLE_CUDA
     void* send_buffer = nullptr;
-    cudaError_t cuda_status = CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(
-        &send_buffer, send_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped), send_registered_span_bytes, 1, nullptr);
+    cudaError_t cuda_status = CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &send_buffer,
+        send_registered_span_bytes, 1, CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings",
+        cudaHostAlloc(&send_buffer, send_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
     if (cuda_status != cudaSuccess) {
       destroy_rdma_rc_endpoint(endpoint);
       return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
                        "cudaHostAlloc RDMA RC endpoint send buffer failed", cuda_status);
     }
-    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(send_buffer), send_registered_span_bytes, 0, __FILE__, __LINE__,
-                         CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings");
     endpoint->send_buffer = static_cast<unsigned char*>(send_buffer);
     void* recv_buffer = nullptr;
-    cuda_status = CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(
-        &recv_buffer, recv_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped), recv_registered_span_bytes, 1, nullptr);
+    cuda_status = CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &recv_buffer,
+        recv_registered_span_bytes, 1, CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings",
+        cudaHostAlloc(&recv_buffer, recv_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
     if (cuda_status != cudaSuccess) {
       destroy_rdma_rc_endpoint(endpoint);
       return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
                        "cudaHostAlloc RDMA RC endpoint recv buffer failed", cuda_status);
     }
-    cuteafd_memory_event(1, reinterpret_cast<uintptr_t>(recv_buffer), recv_registered_span_bytes, 0, __FILE__, __LINE__,
-                         CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings");
     endpoint->recv_buffer = static_cast<unsigned char*>(recv_buffer);
 #endif
   } else {
@@ -4041,6 +4041,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
     return status == CUTEAFD_STATUS_OK ? ok() : fail(status, message);
   };
   int cuda_device = 0;
+  // Third-party residual: CUDA context storage, not an owned backing.
   if (cudaGetDevice(&cuda_device) != cudaSuccess || cudaFree(nullptr) != cudaSuccess) {
     return finish(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "no CUDA device for the GPU landing probe");
   }
@@ -4104,9 +4105,12 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
       (cq = ibv_create_cq(context, 16, nullptr, nullptr, 0)) == nullptr) {
     return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RDMA device setup failed for the landing probe");
   }
-  if (CUTEAFD_CHECK_MEMORY("cudaMalloc", "cuda", cudaMalloc(&gpu, bytes), bytes, 1, nullptr) != cudaSuccess ||
-      CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable), frame, 1, nullptr) != cudaSuccess ||
-      CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable), frame, 1, nullptr) != cudaSuccess) {
+  if (CUTEAFD_TRACK_ALLOC("cudaMalloc", &gpu, bytes, 0, CUTEAFD_MEMORY_KIND_TRANSPORT,
+          "native/rdma-landing-probe", cudaMalloc(&gpu, bytes)) != cudaSuccess ||
+      CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &send, frame, 1, CUTEAFD_MEMORY_KIND_STAGING,
+          "native/rdma-landing-probe-send", cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable)) != cudaSuccess ||
+      CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &recv, frame, 1, CUTEAFD_MEMORY_KIND_STAGING,
+          "native/rdma-landing-probe-recv", cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable)) != cudaSuccess) {
     return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, "GPU landing probe allocation failed");
   }
   const cuteafd_status_t registered = register_device_dmabuf(pd, gpu, bytes, &gpu_mr);

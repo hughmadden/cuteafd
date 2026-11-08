@@ -617,6 +617,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
       cudaGraph_t graph = nullptr;
       CHECK(cudaSetDevice(a));
       CHECK(cudaStreamEndCapture(sa.stream, &graph));
+      // Third-party residual: CUDA graph executable bytes; cudaGraphExecDestroy retires them.
       const cudaError_t status = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&sa.graph, graph, 0), 0, 0, graph);
       cudaGraphDestroy(graph);
       CHECK(status);
@@ -633,6 +634,7 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
         }
         cudaGraph_t graph = nullptr;
         CHECK(cudaStreamEndCapture(side.stream, &graph));
+        // Third-party residual: CUDA graph executable bytes; cudaGraphExecDestroy retires them.
         const cudaError_t status = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&side.graph, graph, 0), 0, 0, graph);
         cudaGraphDestroy(graph);
         CHECK(status);

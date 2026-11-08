@@ -138,7 +138,7 @@ impl<'a> CorePrograms<'a> {
             (Some(required), Some(admitted)) => {
                 ensure!(required.extents == admitted.extents && required.rows == admitted.rows,
                     "Muse K6 program scratch differs from admission");
-                Some(required.allocate(device)?)
+                Some(required.allocate(device, crate::shared::memory::Tag::workspace("muse/native-projection"))?)
             }
             _ => anyhow::bail!("Muse K6 programs and admitted scratch disagree on presence"),
         };

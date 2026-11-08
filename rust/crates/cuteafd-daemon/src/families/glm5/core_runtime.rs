@@ -145,7 +145,7 @@ impl<'a> CorePrograms<'a> {
         let index = usize::from(!decode);
         let layout = &self.layouts[index];
         ensure!(rows == layout.rows, "GLM K6 scratch differs from admitted row capacity");
-        let projection = layout.allocate(device)?;
+        let projection = layout.allocate(device, crate::shared::memory::Tag::workspace("glm/native-projection"))?;
         let stages = self.stages[index].extents.iter().map(|(&name, &bytes)|
             Ok((name, Allocation::new(device, bytes, Tag::workspace("glm/core-scratch"))?))).collect::<Result<_>>()?;
         let native = (self.native_scratch[index] > 0)

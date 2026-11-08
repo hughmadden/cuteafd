@@ -465,7 +465,7 @@ impl<'a> CoreHead<'a> {
 
     pub(crate) fn new(programs: &'a Programs<'a>, weights: &CoreWeights<'a>, rows: usize,
         device: Device<'a>, stream: *mut c_void,
-        admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout) -> Result<Self> {
+        admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout, tag: Tag) -> Result<Self> {
         ensure!(weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Output,
             "GLM K6 head must be whole on rank 0");
         let projection = device.run(|| Projection::load_geometry_bits(programs, weights.shape[1], weights.shape[0],
@@ -473,7 +473,7 @@ impl<'a> CoreHead<'a> {
         let layout = ProjectionLayout::new(&projection.program, rows)?;
         ensure!(admitted.rows == layout.rows && admitted.extents == layout.extents,
             "GLM K6 head scratch differs from admission");
-        let scratch = layout.allocate(device)?;
+        let scratch = layout.allocate(device, tag)?;
         Ok(Self { projection, scratch, device, stream, rows })
     }
 

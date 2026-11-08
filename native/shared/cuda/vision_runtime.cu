@@ -277,6 +277,7 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   }
 #endif
   if(ledger.blas_workspace) {
+    // Third-party residual: cuBLAS internal context/workspace bytes; handle ownership is unchanged.
     e=blas_status(CUTEAFD_CHECK_MEMORY("cublasCreate", "cublas", cublasCreate(&o->blas), 0, 0, nullptr));if(e)return fail(e);
     e=blas_status(cublasSetMathMode(o->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));if(e)return fail(e);
     e=blas_status(cublasSetAtomicsMode(o->blas,CUBLAS_ATOMICS_NOT_ALLOWED));if(e)return fail(e);

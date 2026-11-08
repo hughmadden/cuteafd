@@ -73,7 +73,7 @@ impl<'a> Rank<'a> {
                 if let Some(actual) = &mut actual { actual.merge(&next)?; } else { actual = Some(next); }
             }
             ensure!(actual.as_ref() == Some(expected), "Flash K6 loaded/admitted projection scratch mismatch");
-            let projection = ProjectionLayout { rows: expected.rows, extents: expected.extents.clone() }.allocate(device)?;
+            let projection = ProjectionLayout { rows: expected.rows, extents: expected.extents.clone() }.allocate(device, crate::shared::memory::Tag::workspace("glmf/native-projection"))?;
             let whole = engine.weights.layers.iter().chain(engine.peer.iter().flat_map(|p| p.layers.iter()))
                 .any(|l| l.attention == GlmNextAttention::Mla && !l.attention_share.split());
             let owned = cuteafd_loader::families::glm5_flash::core_admission::owned_mla(
@@ -156,7 +156,8 @@ impl<'a> GlmfEngine<'a> {
         if let GlmfHead::K6(weights) = &self.weights.head {
             let layout = admitted.ranks[0].target_head.as_ref().context("Flash K6 target head not admitted")?;
             self.core_head = Some(CoreHead::new(self.programs, weights, layout.rows,
-                Device { library: self.library, id: self.device }, self.stream, layout)?);
+                Device { library: self.library, id: self.device }, self.stream, layout,
+                crate::shared::memory::Tag::workspace("glmf/target-head-projection"))?);
         }
         self.core_admission = admission;
         Ok(())
@@ -167,7 +168,8 @@ impl<'a> GlmfEngine<'a> {
             let layout = self.core_admission.as_ref().and_then(|a| a.ranks[0].draft_head.as_ref())
                 .context("Flash K6 draft head scratch not admitted")?;
             self.draft_core_head = Some(CoreHead::new(self.programs, weights, rows,
-                Device { library: self.library, id: self.device }, self.stream, layout)?);
+                Device { library: self.library, id: self.device }, self.stream, layout,
+                crate::shared::memory::Tag::drafter_workspace("glmf/draft-head-projection"))?);
         }
         Ok(())
     }

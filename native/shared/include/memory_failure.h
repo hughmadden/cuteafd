@@ -58,6 +58,8 @@ inline Status cuteafd_checked_memory_call(const char* api, const char* domain,
 template <typename Pointer, typename Call>
 inline auto cuteafd_tracked_alloc(Pointer ptr, size_t bytes, int space, uint32_t kind, const char* owner,
     Call call, const char* api, const char* file, int line) {
+  // Validate and retain the attempted tag before the allocation can fail.
+  if (!cuteafd_tag_check(kind, owner)) return static_cast<decltype(call())>(1);
   const auto status = cuteafd_checked_memory_call(api, "cuda", call(), bytes, 1, 0, file, line);
   if (static_cast<int>(status) == 0)
     cuteafd_memory_event(space, reinterpret_cast<uintptr_t>(*ptr), bytes, 0, file, line, kind, owner);
@@ -87,6 +89,7 @@ inline void* cuteafd_checked_malloc(size_t bytes, const char* file, int line) {
   return ptr;
 }
 inline void* cuteafd_tracked_malloc(size_t bytes, uint32_t kind, const char* owner, const char* file, int line) {
+  if (!cuteafd_tag_check(kind, owner)) return nullptr;
   void* ptr = cuteafd_checked_malloc(bytes, file, line);
   if (ptr) cuteafd_memory_event(3, reinterpret_cast<uintptr_t>(ptr), bytes, 0, file, line, kind, owner);
   return ptr;

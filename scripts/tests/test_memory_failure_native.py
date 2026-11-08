@@ -47,8 +47,15 @@ int main() {
   cuteafd_set_memory_failure_callback(failure);
   void* first = nullptr;
   void* second = nullptr;
+  assert(CUTEAFD_TRACK_ALLOC("cudaMalloc", &first, 4096, 0, 0, "test/kv", allocate(&first)) == 1);
+  assert(CUTEAFD_TRACK_ALLOC("cudaMalloc", &first, 4096, 0, CUTEAFD_MEMORY_KIND_KV, "", allocate(&first)) == 1);
+  assert(calls == 0 && first == nullptr && live == 0);
+  assert(CUTEAFD_TRACK_MALLOC(64, 0, "test/kv") == nullptr);
   assert(CUTEAFD_TRACK_ALLOC("cudaMalloc", &first, 4096, 0, CUTEAFD_MEMORY_KIND_KV, "test/kv", allocate(&first)) == 0);
   assert(CUTEAFD_TRACK_ALLOC("cudaMalloc", &second, 8192, 0, CUTEAFD_MEMORY_KIND_KV, "test/kv", allocate(&second)) == 2);
+  uint32_t kind = 0; char owner[32] = {}; size_t required = 0;
+  assert(cuteafd_last_allocation_tag(&kind, owner, sizeof(owner), &required) == 0);
+  assert(kind == CUTEAFD_MEMORY_KIND_KV && std::strcmp(owner, "test/kv") == 0);
   assert(calls == 2 && captured_live == 1 && code == 2);
   assert(CUTEAFD_TRACK_FREE(first, 0) == 0 && live == 0);
   assert(graph_failure() == 2);

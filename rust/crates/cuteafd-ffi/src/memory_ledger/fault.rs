@@ -573,7 +573,7 @@ fn summary(stage: &str, sticky: bool) -> String {
         let observed = observe(device, sticky);
         let _ = writeln!(out, "device={device} free={} total={} tracked={tracked} residual={} status={}",
             optional(observed.free_bytes), optional(observed.total_bytes), optional(observed.total_bytes.zip(observed.free_bytes).map(|(t,f)| t as i128-f as i128-tracked as i128)), observed.status);
-        // Typed kinds; legacy untagged bytes are their own bucket until the fan-out ends.
+        // Every owned backing has a kind; the census counter stays zero by construction.
         let (kinds, untagged) = snapshot.by_kind(Space::Device, device);
         let kinds = kinds.into_iter().map(|(kind, bytes)| (kind.label(), bytes)).collect::<std::collections::BTreeMap<_, _>>();
         let _ = writeln!(out, "device={device} kinds={kinds:?} untagged={untagged}");

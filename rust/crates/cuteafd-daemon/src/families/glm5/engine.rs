@@ -837,7 +837,8 @@ impl<'a> GlmEngine<'a> {
             self.target_core_head = Some(Rc::new(super::core_runtime::CoreHead::new(self.programs, weights, DECODE_ROWS,
                 crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
                 admission.as_ref().and_then(|a| a.ranks[0].target_head.as_ref())
-                    .context("GLM K6 target head has no admitted scratch")?)?));
+                    .context("GLM K6 target head has no admitted scratch")?,
+                Tag::workspace("glm/target-head-projection"))?));
         }
         self.core_admission = admission;
         Ok(())
@@ -850,7 +851,8 @@ impl<'a> GlmEngine<'a> {
             self.draft_core_head = Some(super::core_runtime::CoreHead::new(self.programs, weights, rows,
                 crate::shared::memory::device::Device { library: self.library, id: self.device }, self.stream,
                 self.core_admission.as_ref().and_then(|a| a.ranks[0].draft_head.as_ref())
-                    .context("GLM K6 drafter head has no admitted scratch")?)?);
+                    .context("GLM K6 drafter head has no admitted scratch")?,
+                Tag::drafter_workspace("glm/draft-head-projection"))?);
         }
         Ok(())
     }
