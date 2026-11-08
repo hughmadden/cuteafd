@@ -751,8 +751,15 @@ mod tests {
                     .try_fold(0u64, |total, owner| -> Result<u64> {
                         total.checked_add(owner.bytes()?).context("Step-5 test physical tails overflow")
                     })?;
+                let allowances = admission.solved.facts.allowances.iter()
+                    .filter(|owner| owner.location == crate::placement::planner::Location::coordinator(rank as u8))
+                    .collect::<Vec<_>>();
+                assert_eq!(allowances.len(), 1);
+                assert!(allowances[0].source.starts_with("step5/driver-stream-slabs/"));
+                assert_eq!(allowances[0].bytes, 4 << 20);
+                assert!(!allowances[0].assumed);
                 let payload = admission.reservations[rank].pages as u64;
-                assert_eq!(charged, fixed + hops[rank] + payload + tails);
+                assert_eq!(charged, fixed + hops[rank] + payload + tails + allowances[0].bytes);
             }
             assert_eq!(admission.ownership.execution().mode(3)?, WHOLE0);
             if ranks == 2 {
