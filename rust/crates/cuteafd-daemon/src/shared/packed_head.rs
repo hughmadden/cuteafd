@@ -170,6 +170,7 @@ mod tests {
             |name, bytes| arena.view(name, bytes)))?;
         assert!(packed.status.get().is_none());
         let scratch = device.run(|| super::scratch(&library, 1, &[(k,n)]))?;
+        // SAFETY: initialization is checked before operands; this must reject without dereferencing them.
         assert!(unsafe { packed.apply(&library, std::ptr::null(), std::ptr::null_mut(), true, 1,
             false, &scratch, std::ptr::null_mut()) }.is_err());
         device.run(|| packed.initialize(source.buffer.ptr, std::ptr::null_mut()))?;

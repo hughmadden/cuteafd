@@ -130,7 +130,6 @@ impl<'a> VocabularyShard<'a> {
                 }
             }
         };
-        let _ = staging_bytes;
         let (exceptions, row_exceptions) = packed.as_ref().map_or((0, 0), |head| head.exceptions());
         tracing::info!(device_id, rows = tokens.len(), bf16_bytes = allocation.as_ref().map_or(0, |a| a.buffer.bytes),
             fp8_bytes = fp8.as_ref().map_or(0, |w| w.bytes()), packed12_bytes = packed.as_ref().map_or(0, |h| h.bytes()),
