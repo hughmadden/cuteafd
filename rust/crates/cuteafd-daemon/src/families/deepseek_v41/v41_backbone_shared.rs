@@ -43,8 +43,8 @@ impl<'a> BackboneSharedStorage<'a> {
         Ok(Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             inner: SharedFfnStorage::new(library, unit)?,
-            input: DeviceAllocation::new(library, input)?,
-            result: DeviceAllocation::new(library, result)?, rows, unit,
+            input: DeviceAllocation::untagged(library, input)?,
+            result: DeviceAllocation::untagged(library, result)?, rows, unit,
         }))
     }
 }
@@ -498,7 +498,7 @@ mod shared_storage_tests {
                 let f = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
                 ((f.to_bits() >> 16) as u16).to_ne_bytes()
             }).collect();
-            let source = DeviceAllocation::new(&lib, hidden.len())?;
+            let source = DeviceAllocation::new(&lib, hidden.len(), cuteafd_ffi::memory_ledger::TEST)?;
             lib.copy_h2d(source.buffer, &hidden)?; Ok(source)
         }).into_iter().collect::<Result<Vec<_>>>()?;
         let read = |buffer| -> Result<Vec<u8>> {

@@ -100,8 +100,8 @@ impl<'a> IndexQueryWeights<'a> {
     pub fn storage(&self, rows: u32, unit: u32, readers: &[i32]) -> Result<Rc<IndexQueryStorage<'a>>> {
         ensure!(unit > 0 && unit <= rows, "index query unit outside reserve");
         let fp8 = self.library.v41_fp8_matrix_plan(unit, 1280, 4096)?;
-        let scratch = DeviceAllocation::new(self.library, fp8.info().scratch_bytes as usize)?;
-        let workspace = DeviceAllocation::new(self.library, V41Compressor::WORKSPACE_BYTES)?;
+        let scratch = DeviceAllocation::untagged(self.library, fp8.info().scratch_bytes as usize)?;
+        let workspace = DeviceAllocation::untagged(self.library, V41Compressor::WORKSPACE_BYTES)?;
         ensure!(workspace.buffer.device_id == self.tensors.get(&self.names[0])?.device_id,
             "index query weight device differs");
         // SAFETY: workspace is retained by storage until its stream drains.
@@ -109,16 +109,16 @@ impl<'a> IndexQueryWeights<'a> {
         let storage = IndexQueryStorage {
             stream: LoadStream { library: self.library, raw: self.library.cuda_stream_create()? },
             fp8, dense, _workspace: workspace, scratch,
-            alpha: DeviceAllocation::new(self.library, 4)?,
-            qr: DeviceAllocation::new(self.library, unit as usize * 2560)?,
-            hidden: DeviceAllocation::new(self.library, unit as usize * 10240)?,
-            positions: DeviceAllocation::new(self.library, unit as usize * 8)?,
-            frequencies: DeviceAllocation::new(self.library, unit as usize * 256)?,
-            projected: DeviceAllocation::new(self.library, unit as usize * 8192)?,
-            head_projected: DeviceAllocation::new(self.library, unit as usize * 64)?,
-            packed: DeviceAllocation::new(self.library, unit as usize * 2048)?,
-            scales: DeviceAllocation::new(self.library, unit as usize * 128)?,
-            head_weights: DeviceAllocation::new(self.library, unit as usize * 64)?,
+            alpha: DeviceAllocation::untagged(self.library, 4)?,
+            qr: DeviceAllocation::untagged(self.library, unit as usize * 2560)?,
+            hidden: DeviceAllocation::untagged(self.library, unit as usize * 10240)?,
+            positions: DeviceAllocation::untagged(self.library, unit as usize * 8)?,
+            frequencies: DeviceAllocation::untagged(self.library, unit as usize * 256)?,
+            projected: DeviceAllocation::untagged(self.library, unit as usize * 8192)?,
+            head_projected: DeviceAllocation::untagged(self.library, unit as usize * 64)?,
+            packed: DeviceAllocation::untagged(self.library, unit as usize * 2048)?,
+            scales: DeviceAllocation::untagged(self.library, unit as usize * 128)?,
+            head_weights: DeviceAllocation::untagged(self.library, unit as usize * 64)?,
             guard: ScratchGuard::new(self.library, readers)?, rows, unit,
         };
         // SAFETY: scratch and alpha belong to this stream and outlive initialization.

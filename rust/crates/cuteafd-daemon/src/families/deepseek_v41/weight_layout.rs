@@ -3,6 +3,7 @@ use super::{v41_backbone_cache::CachePlacement, v41_tensors::Fp8Head};
 use anyhow::{ensure, Result};
 use cuteafd_loader::OfficialV41Catalog;
 use crate::shared::memory::{device::Device, weight_arena::DeviceWeightArena};
+use cuteafd_core::memory_layout::ArenaTag;
 pub(crate) use super::v41_tensors::allocation;
 pub(crate) use cuteafd_loader::placement::families::deepseek_v41::weight_layout::{
     TargetLayout, packed_scale_name,
@@ -45,7 +46,7 @@ impl<'a> TargetArenas<'a> {
         }
         let arenas = layout.ranks.into_iter().enumerate().map(|(rank, layout)| {
             let id = if count == 1 { original } else { rank as i32 };
-            Ok((id, DeviceWeightArena::new(Device { library, id }, layout)?))
+            Ok((id, DeviceWeightArena::new(Device { library, id }, layout, ArenaTag::weights("v41/target"))?))
         }).collect::<Result<_>>()?;
         Ok(Self { arenas })
     }

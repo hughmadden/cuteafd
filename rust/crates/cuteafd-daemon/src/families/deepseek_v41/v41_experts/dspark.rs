@@ -33,6 +33,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
+use cuteafd_core::memory_layout::ArenaTag;
 mod expert_backend;
 mod tp2;
 use expert_backend::DraftExperts;
@@ -500,7 +501,7 @@ impl<'library> DsparkWeights<'library> {
         ensure!(layout.bytes() <= device_budget.checked_sub(resident).context("dSpark auxiliary budget underflow")?,
             "dSpark dense arena exceeds remaining admission");
         let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
-            crate::shared::memory::device::Device { library, id: library.cuda_get_device()? }, layout)?;
+            crate::shared::memory::device::Device { library, id: library.cuda_get_device()? }, layout, ArenaTag::drafter_weights("v41/dspark"))?;
         let auxiliary = NativeRtxTensors::load_in(
             library, catalog, &Self::auxiliary_names(catalog),
             budget.auxiliary_resident_bytes, pinned_staging_bytes, Some(&arena),

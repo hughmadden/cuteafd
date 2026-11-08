@@ -137,13 +137,13 @@ impl<'a> AttentionOutputWeights<'a> {
         let storage = AttentionOutputStorage {
             stream,
             grouped,
-            grouped_scratch: DeviceAllocation::new(self.library, grouped_bytes)?,
-            scratch: kernel.as_ref().map(|_|DeviceAllocation::new(self.library, down_bytes)).transpose()?,
+            grouped_scratch: DeviceAllocation::untagged(self.library, grouped_bytes)?,
+            scratch: kernel.as_ref().map(|_|DeviceAllocation::untagged(self.library, down_bytes)).transpose()?,
             kernel,
-            alpha: DeviceAllocation::new(self.library, alpha_bytes)?,
+            alpha: DeviceAllocation::untagged(self.library, alpha_bytes)?,
             buffers: planes
                 .into_iter()
-                .map(|n| DeviceAllocation::new(self.library, n))
+                .map(|n| DeviceAllocation::untagged(self.library, n))
                 .collect::<Result<Vec<_>>>()?,
             rows,
             unit,
@@ -163,7 +163,7 @@ impl<'a> AttentionOutputWeights<'a> {
         ensure!(storage.kernel.is_some() == self.scales.is_some(), "attention output storage plans differ from the weights");
         let value = AttentionOutputWave {
             norm: self.library.v41_attention_ops()?,
-            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8)?,
+            position_staging: HostAllocation::untagged(self.library, storage.unit as usize * 8)?,
             weights: self,
             capacity: storage.unit,
             graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
@@ -805,7 +805,7 @@ mod tp2_tests {
                 Weights::load_peak_device_bytes(Kind::OutputB))?]];
             let mut projection=Wave::new([&halves[0],&halves[1]],capacity,owner,
                 Wave::device_bytes(&library,Kind::OutputB,capacity,owner)?)?;
-            let input=Allocation::new(device,capacity as usize*ROW_BYTES[0])?;
+            let input=Allocation::new(device,capacity as usize*ROW_BYTES[0], cuteafd_ffi::memory_ledger::TEST)?;
             let read=|buffer:CuteafdDeviceBuffer|->Result<Vec<u8>> {
                 let mut bytes=vec![0;buffer.bytes];device.run(||library.copy_d2h(&mut bytes,buffer))?;Ok(bytes)
             };

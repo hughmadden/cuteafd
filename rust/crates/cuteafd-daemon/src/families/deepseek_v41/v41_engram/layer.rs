@@ -173,13 +173,13 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let storage = EngramGateStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             guard: ScratchGuard::new(library, &[library.cuda_get_device()?])?,
-            output: DeviceAllocation::new(library, unit * 40960)?,
-            residual: DeviceAllocation::new(library, unit * 40960)?,
-            embeddings: DeviceAllocation::new(library, unit * 24 * 512)?,
-            text_mask: DeviceAllocation::new(library, unit)?,
-            projected: DeviceAllocation::new(library, unit * 51200)?,
-            scratch: DeviceAllocation::new(library, scratch_bytes)?,
-            alpha: DeviceAllocation::new(library, 4)?, kernel, rows, unit,
+            output: DeviceAllocation::untagged(library, unit * 40960)?,
+            residual: DeviceAllocation::untagged(library, unit * 40960)?,
+            embeddings: DeviceAllocation::untagged(library, unit * 24 * 512)?,
+            text_mask: DeviceAllocation::untagged(library, unit)?,
+            projected: DeviceAllocation::untagged(library, unit * 51200)?,
+            scratch: DeviceAllocation::untagged(library, scratch_bytes)?,
+            alpha: DeviceAllocation::untagged(library, 4)?, kernel, rows, unit,
         };
         // SAFETY: workspace is owned by storage and initialization drains here.
         unsafe { storage.kernel.initialize_scratch(storage.scratch.buffer,
