@@ -202,3 +202,16 @@ def test_build_containers_mount_one_host_store_per_architecture():
     assert 'leaf("export-cache", root / "export-cache" / arch' in plan
     build = (ROOT / "scripts/build/build-wip-artifacts.sh").read_text()
     assert 'export CUTEAFD_EXPORT_IMAGE_ID="$CUTEAFD_WIP_DEV_IMAGE_ID"' in build
+
+
+def test_republish_workers_drop_path_dependent_line_info():
+    # #1485: the same commit in two checkouts must export identical bytes. The live
+    # check: compare-sm-exports.py --groups exl3-routes-ml4,draft-bf16
+    # --baseline-source OTHER_WORKTREE --require-identical (scripts/build/cuteafd-dev.sh cpu).
+    compare = (ROOT / "scripts/build/compare-sm-exports.py").read_text()
+    assert 'os.environ["TRITON_DISABLE_LINE_INFO"] = "1"' in compare
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("kernel_records_lineinfo", ROOT / "scripts/build/kernel-records.py")
+    records = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(records)
+    assert records.export_environment()["TRITON_DISABLE_LINE_INFO"] == "1"

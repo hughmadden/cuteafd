@@ -1588,8 +1588,6 @@ def main() -> None:
     program_cache = _export_cache.ProgramCache(output) if _export_cache else None
     if program_cache is not None:
         program_cache.start()
-    recipe_arguments = {key: value for key, value in sorted(vars(args).items())
-                        if key not in ("output_dir", "geometry", "only")}
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
@@ -1609,11 +1607,20 @@ def main() -> None:
             label = stem if sms is None else f"{stem}_sm{sms}"
             if object_selection is not None and label not in object_selection:
                 continue
+            # What this program compiles: its recipe's captured values (code is a
+            # recorded read), never which other programs the scope requested.
+            try:
+                recipe = _export_cache.recipe_identity(thunk) if program_cache is not None else None
+            except _export_cache.Unidentifiable as error:
+                recipe = None
+                program_cache.unidentified.append(f"{label}: {error}")
             identity = {"exporter": "export_b12x_dsv4_aot.py", "family": family, "suffix": suffix, "op": op,
                         "params": params, "label": label, "plan_sms": sms, "capacity": capacity,
                         "device": [props.major, props.minor, props.multi_processor_count],
-                        "diagnostic": selected is not None, "arguments": recipe_arguments}
-            reused = program_cache.lookup(identity) if program_cache is not None and object_selection is None else None
+                        "diagnostic": selected is not None, "recipe": recipe,
+                        "build_kind": os.environ.get("CUTEAFD_BUILD_KIND", "development")}
+            cacheable = program_cache is not None and object_selection is None and recipe is not None
+            reused = program_cache.lookup(identity) if cacheable else None
             if reused is not None:
                 geometry, plan_scratch, program_abi, checked = (
                     reused["geometry"], reused["scratch"], reused["abi"], reused["checked"])
@@ -1640,7 +1647,7 @@ def main() -> None:
             kinds, public_scalars = native_scalar_abi(stem, geometry, abi["scalars"])
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
                 raise ValueError(f"{label}: header argument count disagrees with the ABI")
-            if reused is None and program_cache is not None:
+            if reused is None and cacheable:
                 program_cache.store_program(identity, scope, [f"{label}.o", f"{label}.h"], {
                     "geometry": geometry, "scratch": plan_scratch, "checked": checked, "abi": abi})
             for key, size in plan_scratch.items():

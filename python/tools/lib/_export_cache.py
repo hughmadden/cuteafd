@@ -856,6 +856,7 @@ class ProgramCache:
         self.output = Path(output_dir).resolve()
         self.prelude: set[str] = set()
         self.hits = self.misses = self.uncacheable = 0
+        self.unidentified: list[str] = []
 
     def start(self) -> None:
         if self.enabled:
@@ -916,4 +917,58 @@ class ProgramCache:
 
     def report(self) -> None:
         if self.enabled:
-            stats("programs", layer="program", hits=self.hits, misses=self.misses, uncacheable=self.uncacheable)
+            stats("programs", layer="program", hits=self.hits, misses=self.misses, uncacheable=self.uncacheable,
+                  unidentified=len(self.unidentified),
+                  **({"example": self.unidentified[0].replace(" ", "_")} if self.unidentified else {}))
+
+
+class Unidentifiable(Exception):
+    """A recipe captured a value the cache cannot name; that program is never reused."""
+
+
+def recipe_identity(value, depth=0):
+    """A stable description of what a program recipe (a closure) captured.
+
+    Functions and classes are named, not hashed: their code is a recorded file
+    read. Plain data, dataclasses, enums, dtypes and partials are described by
+    value. Anything else (an object whose repr is an address) is unidentifiable.
+    """
+    import dataclasses
+    import enum
+    import functools
+    import types
+    if depth > 12:
+        raise Unidentifiable("recipe nesting too deep")
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return [type(value).__name__, value if not isinstance(value, bytes) else value.hex()]
+    if isinstance(value, (list, tuple, frozenset, set)):
+        items = [recipe_identity(item, depth + 1) for item in value]
+        return [type(value).__name__, sorted(items, key=stable) if isinstance(value, (set, frozenset)) else items]
+    if isinstance(value, dict):
+        return ["dict", sorted(([recipe_identity(k, depth + 1), recipe_identity(v, depth + 1)]
+                                for k, v in value.items()), key=stable)]
+    if isinstance(value, enum.Enum):
+        return ["enum", type(value).__module__ + "." + type(value).__qualname__, value.name]
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return ["dataclass", type(value).__module__ + "." + type(value).__qualname__,
+                [[field.name, recipe_identity(getattr(value, field.name), depth + 1)]
+                 for field in dataclasses.fields(value)]]
+    if isinstance(value, functools.partial):
+        return ["partial", recipe_identity(value.func, depth + 1), recipe_identity(value.args, depth + 1),
+                recipe_identity(value.keywords, depth + 1)]
+    if isinstance(value, types.MethodType):
+        return ["method", recipe_identity(value.__func__, depth + 1), recipe_identity(value.__self__, depth + 1)]
+    if isinstance(value, types.FunctionType):
+        closure = [recipe_identity(cell.cell_contents, depth + 1) for cell in (value.__closure__ or ())]
+        return ["function", value.__module__, value.__qualname__, closure,
+                recipe_identity(value.__defaults__, depth + 1), recipe_identity(value.__kwdefaults__, depth + 1)]
+    if isinstance(value, (type, types.ModuleType, types.BuiltinFunctionType)):
+        return ["named", getattr(value, "__module__", None) or "", getattr(value, "__qualname__", None) or value.__name__]
+    text = repr(value)
+    if " at 0x" in text or text.startswith("<"):
+        # torch dtypes and similar print by name; anything address-like is not a value.
+        module = type(value).__module__
+        if module.startswith("torch") and text.startswith("torch."):
+            return ["repr", text]
+        raise Unidentifiable(f"recipe captured an unnamed {type(value).__qualname__}")
+    return ["repr", type(value).__module__ + "." + type(value).__qualname__, text]
