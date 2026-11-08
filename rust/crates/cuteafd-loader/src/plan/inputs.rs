@@ -101,7 +101,10 @@ pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<P
     let regenerate = "regenerate with scripts/build/cuteafd-dev.sh cpu -- python3 scripts/build/export-placement-inputs.py --output <NVMe>/placement-inputs/<sha> --staging <NVMe>/placement-inputs/staging-<sha>";
     (|| -> anyhow::Result<PublishedPlacementInputs> {
         anyhow::ensure!(manifest.is_file(), "required PROGRAMS.json missing: {}", manifest.display());
-        let root = manifest.parent().context("PROGRAMS.json parent")?;
+        let share = manifest.parent().context("PROGRAMS.json parent")?;
+        anyhow::ensure!(share.file_name().is_some_and(|name| name == "share"),
+            "placement manifest must use share/PROGRAMS.json");
+        let root = share.parent().context("placement publication root")?;
         let metadata: Value = serde_json::from_slice(&fs::read(root.join("INPUTS.json"))
             .with_context(|| format!("missing placement provenance {}", root.join("INPUTS.json").display()))?)?;
         let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
@@ -119,7 +122,7 @@ pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<P
             && export["source_tree_sha256"] == lock["source_tree_sha256"]
             && export["cuda_initialized"] == false), "placement worker provenance mismatch");
         let files = metadata["files"].as_object().context("missing placement file inventory")?;
-        let name = manifest.file_name().context("PROGRAMS.json filename")?.to_str().context("manifest UTF-8 filename")?;
+        let name = "share/PROGRAMS.json";
         anyhow::ensure!(files.contains_key(name), "PROGRAMS.json missing from placement provenance");
         let mut checksums = std::collections::BTreeMap::new();
         for (path, expected) in files {
@@ -207,7 +210,7 @@ pub(crate) fn write_test_publication(root: &std::path::Path, files: &[(&str, &[u
         "exports": [{"sparkinfer_revision": lock["revision"],
             "source_tree_sha256": lock["source_tree_sha256"], "cuda_initialized": false}], "files": checksums});
     fs::write(root.join("INPUTS.json"), metadata.to_string()).unwrap();
-    root.join("PROGRAMS.json")
+    root.join("share/PROGRAMS.json")
 }
 
 #[cfg(test)]
@@ -271,7 +274,9 @@ mod tests {
     fn published_placement_inputs_fail_closed_for_missing_stale_and_modified_files() {
         use sha2::{Digest, Sha256};
         let directory = tempfile::tempdir().unwrap();
-        let manifest = directory.path().join("PROGRAMS.json");
+        let share = directory.path().join("share");
+        fs::create_dir(&share).unwrap();
+        let manifest = share.join("PROGRAMS.json");
         let metadata_path = directory.path().join("INPUTS.json");
         assert!(format!("{:#}", validate_placement_inputs(&manifest).unwrap_err()).contains("PROGRAMS.json missing"));
         fs::write(&manifest, r#"{"programs":[]}"#).unwrap();
@@ -284,7 +289,7 @@ mod tests {
             "engine_sources_sha256": placement_input_source_hashes(&root).unwrap(),
             "exports": [{"sparkinfer_revision": lock["revision"],
                 "source_tree_sha256": lock["source_tree_sha256"], "cuda_initialized": false}],
-            "files": {"PROGRAMS.json": format!("{:x}", Sha256::digest(fs::read(&manifest).unwrap()))}});
+            "files": {"share/PROGRAMS.json": format!("{:x}", Sha256::digest(fs::read(&manifest).unwrap()))}});
         fs::write(&metadata_path, valid.to_string()).unwrap();
         validate_placement_inputs(&manifest).unwrap();
         for (field, value, expected) in [
@@ -308,22 +313,22 @@ mod tests {
     fn published_reads_recheck_returned_bytes_and_refuse_unlisted_paths() {
         let directory = tempfile::tempdir().unwrap();
         let bytes = b"published programs";
-        let manifest = write_test_publication(directory.path(), &[("PROGRAMS.json", bytes.as_slice())]);
+        let manifest = write_test_publication(directory.path(), &[("share/PROGRAMS.json", bytes.as_slice())]);
         let publication = validate_placement_inputs(&manifest).unwrap();
-        assert_eq!(publication.read("PROGRAMS.json").unwrap(), bytes);
+        assert_eq!(publication.read("share/PROGRAMS.json").unwrap(), bytes);
         assert_eq!(publication.fork_revision().len(), 40);
         assert_eq!(publication.fork_tree_sha256().len(), 64);
         for name in ["", "unlisted.json", "../PROGRAMS.json", "/PROGRAMS.json"] {
             assert!(publication.read(name).unwrap_err().to_string().contains("absent from placement provenance"));
         }
         fs::write(&manifest, "changed after validation").unwrap();
-        assert!(publication.read("PROGRAMS.json").unwrap_err().to_string().contains("checksum mismatch"));
+        assert!(publication.read("share/PROGRAMS.json").unwrap_err().to_string().contains("checksum mismatch"));
     }
 
     #[test]
     fn published_inputs_reject_escaping_and_empty_inventory_paths() {
         let directory = tempfile::tempdir().unwrap();
-        let manifest = write_test_publication(directory.path(), &[("PROGRAMS.json", b"programs")]);
+        let manifest = write_test_publication(directory.path(), &[("share/PROGRAMS.json", b"programs")]);
         let metadata = directory.path().join("INPUTS.json");
         let valid: Value = serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
         for name in ["", "../escape", "/absolute"] {

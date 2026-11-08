@@ -431,7 +431,7 @@ fn installed_kimi_mla_projection_recipe_matches_native_manifest() -> Result<()> 
         &installed_snapshot("lightseekorg/kimi-k3-dflash2")?)?;
     let path = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME"))
-            .join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
+            .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
     let shapes = std::cell::RefCell::new(std::collections::BTreeSet::new());
     super::super::weights::mla_weight_recipe(&cfg, |_| Ok(()), |parts, k| {

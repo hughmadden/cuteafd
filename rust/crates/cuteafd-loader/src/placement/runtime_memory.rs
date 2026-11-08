@@ -261,7 +261,7 @@ impl PublishedRuntimeMemory {
             serde_json::from_slice(&bytes).map_err(RuntimeMemoryError::Json)?;
         inputs.validate(expected, publication.checksums())?;
         publication
-            .read("PROGRAMS.json")
+            .read("share/PROGRAMS.json")
             .map_err(|error| RuntimeMemoryError::Publication(format!("{error:#}")))?;
         let mut evidence = BTreeSet::new();
         for record in &inputs.records {
@@ -334,7 +334,7 @@ impl RuntimeMemoryInputs {
             })?;
             build.validate()?;
             require(
-                files.get("PROGRAMS.json") == Some(&build.programs_sha256),
+                files.get("share/PROGRAMS.json") == Some(&build.programs_sha256),
                 "program manifest identity",
             )?;
             record.validate(build, files)?;

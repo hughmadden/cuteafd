@@ -319,7 +319,7 @@ def test_installed_deployment_inventory_is_enabled_for_both_tiers(tmp_path, monk
     assert result['status'] == 'pass'
     assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME') == expected
     manifest = env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
-                       str(tmp_path / '.cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json'))
+                       str(tmp_path / '.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json'))
     assert all(call['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] == manifest for call in calls)
     assert result['deployment_test_programs'] == manifest
     assert calls[1].get('CUTEAFD_TEST_PYTHON') == ('/gate-venv/bin/python' if full else None)
@@ -773,7 +773,7 @@ def test_gate_requirements_check_prefers_gate_venv_and_fails_fast_on_mismatch(tm
 def test_missing_installed_programs_manifest_surfaces_in_receipt_error(tmp_path, monkeypatch, nextest):
     (tmp_path / 'logs').mkdir()
     test_id = 'shared::experts::rtx::local_physical_tests::installed_glm_local_physical_equals_serving'
-    reason = f'required installed PROGRAMS.json missing: {tmp_path}/placement-inputs/current/PROGRAMS.json'
+    reason = f'required installed PROGRAMS.json missing: {tmp_path}/placement-inputs/current/share/PROGRAMS.json'
     failed = f'test {test_id} ... FAILED\nError: {reason}\ntest result: FAILED. 8 passed; 1 failed; 0 ignored\n'
     _fake(monkeypatch, [(0, BUILD_OK), (101, failed),
                         (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])

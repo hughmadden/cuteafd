@@ -176,7 +176,7 @@ fn fixture() -> (
     };
     let expected = BTreeMap::from([(record.id.clone(), build.clone())]);
     let files = BTreeMap::from([
-        ("PROGRAMS.json".into(), build.programs_sha256),
+        ("share/PROGRAMS.json".into(), build.programs_sha256),
         (reference.path, reference.sha256),
     ]);
     (
@@ -282,7 +282,7 @@ fn refuses_schema_identity_coverage_and_all_stale_build_dimensions() {
         assert!(modified.validate(&expected, &files).is_err(), "{field}");
     }
     let mut no_programs = files.clone();
-    no_programs.remove("PROGRAMS.json");
+    no_programs.remove("share/PROGRAMS.json");
     assert!(inputs.validate(&expected, &no_programs).is_err());
 }
 
@@ -508,13 +508,13 @@ fn publication_load_rechecks_runtime_evidence_and_program_bytes() {
     for (path, bytes) in [
         ("RUNTIME_MEMORY.json", runtime.as_slice()),
         ("evidence/startup.jsonl", EVIDENCE),
-        ("PROGRAMS.json", PROGRAMS),
+        ("share/PROGRAMS.json", PROGRAMS),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let manifest = write_test_publication(
             directory.path(),
             &[
-                ("PROGRAMS.json", PROGRAMS),
+                ("share/PROGRAMS.json", PROGRAMS),
                 ("RUNTIME_MEMORY.json", &runtime),
                 ("evidence/startup.jsonl", EVIDENCE),
             ],
@@ -549,7 +549,7 @@ fn checked_publication_rejects_matching_but_wrong_fork_and_unlisted_runtime_file
     let manifest = write_test_publication(
         directory.path(),
         &[
-            ("PROGRAMS.json", PROGRAMS),
+            ("share/PROGRAMS.json", PROGRAMS),
             ("RUNTIME_MEMORY.json", &runtime),
             ("evidence/startup.jsonl", EVIDENCE),
         ],

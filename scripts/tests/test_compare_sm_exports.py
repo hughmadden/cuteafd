@@ -1189,7 +1189,7 @@ def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
 def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, monkeypatch, indirect):
     from contextlib import nullcontext
 
-    geometry = SimpleNamespace(weights="fp8")
+    geometry = SimpleNamespace(weights="fp8", hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048)
     calls = []
     program = SimpleNamespace(export_to_c=lambda *args: None)
 
@@ -1227,6 +1227,9 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
                       indirect, "auto")]
     records = json.loads((tmp_path / "routed.json").read_text())["programs"]
     assert len(records) == 1
+    assert json.loads((tmp_path / "routed.json").read_text())["layouts"]["tp1"] == {
+        "tp": 1, "hidden": 4096, "slice": 2048, "experts": 256, "top_k": 8,
+        "intermediate": 2048, "weights": "fp8", "input": "wire" if indirect else "bf16"}
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
 
 
@@ -1255,7 +1258,7 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
     from contextlib import nullcontext
     package = compare_sm.load_file("core_set_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
-    geometry = SimpleNamespace(weights=weights)
+    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048)
     calls = []
     def compile_program(g, **kwargs):
         calls.append(kwargs)
@@ -1520,7 +1523,8 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
             directory.mkdir(parents=True)
             (directory / 'v41_exl3.json').write_text('{"scratch":123,"compiler":true}')
         elif payload['exporter'] == 'package_fp8_moe_aot.py':
-            (output / 'routed.json').write_text(json.dumps({'programs': [
+            (output / 'routed.json').write_text(json.dumps({'layouts': {'tp1': {'tp': 1, 'hidden': 4096, 'input': 'bf16'},
+                             'tp2': {'tp': 2, 'hidden': 4096, 'input': 'bf16'}}, 'programs': [
                 {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 123},
                 {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 456},
                 {'layout': 'tp2', 'capacity': 4096, 'scratch_bytes': 789}]}))
@@ -1550,11 +1554,15 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
     assert metadata['engine_sources_sha256'] == publisher.source_hashes()
     assert len(calls) == len(metadata['exports']) == len(jobs)
     for name, (source, installed) in publisher.V41_MANIFESTS.items():
-        assert (target / installed).read_bytes() == (staging / name / source).read_bytes()
-        assert installed in metadata['files']
-    assert (target / 'PROGRAMS.json').read_bytes() == (staging / 'programs/dsv4_programs.json').read_bytes()
-    assert (target / 'exl3/exl3-glm-k45/rtx-tp2/m2752/v41_exl3.json').read_bytes() == b'{"scratch":123,"compiler":true}'
-    fp8 = json.loads((target / 'fp8/fp8-mimop/manifest.json').read_text())
+        assert (target / 'share' / installed).read_bytes() == (staging / name / source).read_bytes()
+        assert 'share/' + installed in metadata['files']
+    assert (target / 'share/PROGRAMS.json').read_bytes() == (staging / 'programs/dsv4_programs.json').read_bytes()
+    assert not (target / 'PROGRAMS.json').exists()
+    assert (target / 'share/exl3/exl3-glm-k45/rtx-tp2/m2752/v41_exl3.json').read_bytes() == b'{"scratch":123,"compiler":true}'
+    fp8 = json.loads((target / 'lib/fp8/fp8-mimop/manifest.json').read_text())
+    assert (target / 'lib/fp8/fp8-mimop/tp1').is_dir()
+    assert fp8['layouts']['tp1']['input'] == 'bf16'
+    assert fp8['layouts']['tp2']['tp'] == 2
     assert fp8['layouts']['tp1']['capacities'] == [{'capacity': 2752, 'scratch_bytes': 456}]
     assert fp8['layouts']['tp2']['capacities'] == [{'capacity': 4096, 'scratch_bytes': 789}]
     for path, checksum in metadata['files'].items():
@@ -1656,7 +1664,8 @@ def test_placement_publication_rsync_host_syncs_directory_and_current_symlink(tm
     with pytest.raises(ValueError, match='missing published placement input'):
         publisher.rsync_publication(published, ['maxq'], timeout=30)
     (published / 'INPUTS.json').write_text('{}')
-    (published / 'PROGRAMS.json').write_text('{}')
+    (published / 'share').mkdir()
+    (published / 'share/PROGRAMS.json').write_text('{}')
     rsync_calls = []
 
     def fake_run(cmd, **kwargs):

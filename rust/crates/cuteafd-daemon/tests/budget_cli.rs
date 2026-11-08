@@ -324,7 +324,7 @@ fn installed_example_inventory_detects_absent_checkpoints_and_revisions() {
 }
 
 fn installed_example_programs(override_path: Option<std::path::PathBuf>, home: &std::path::Path) -> std::path::PathBuf {
-    let manifest = override_path.unwrap_or_else(|| home.join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
+    let manifest = override_path.unwrap_or_else(|| home.join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
     cuteafd_loader::plan::inputs::validate_placement_inputs(&manifest)
         .unwrap_or_else(|error| panic!("{error:#}"));
     manifest
@@ -333,7 +333,7 @@ fn installed_example_programs(override_path: Option<std::path::PathBuf>, home: &
 #[test]
 fn installed_example_programs_fail_on_missing_override_or_published_default() {
     let home = tempfile::tempdir().unwrap();
-    let absent = home.path().join("absent/PROGRAMS.json");
+    let absent = home.path().join("absent/share/PROGRAMS.json");
     for path in [None, Some(absent.clone())] {
         let failed = std::panic::catch_unwind(|| installed_example_programs(path, home.path()));
         let error = failed.unwrap_err();
@@ -742,6 +742,32 @@ fn installed_v41_sim5090_head_pools_preserve_1m() {
     let snapshot = require_installed_snapshot("V4.1 sim5090", config["MODEL_ID"],
         config.get("MODEL_REVISION").copied(), &hf_home);
     assert_v41_sim5090_head_pools(&root, &snapshot, &programs, &hf_home);
+}
+
+#[test]
+fn installed_mimo_min_onboarding_is_eligible() {
+    let hf_home = require_installed_hf_home("installed_mimo_min_onboarding_is_eligible",
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let programs = installed_example_programs(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into), &home);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let example = root.join("examples/configs/mimo-v26-flash-mxfp4-min.config");
+    let raw = std::fs::read_to_string(&example).unwrap();
+    let config = raw.lines().filter_map(|line| line.split_once('='))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let snapshot = require_installed_snapshot("MiMo min", config["MODEL_ID"],
+        config.get("MODEL_REVISION").copied(), &hf_home);
+    let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+        .arg(snapshot).args(["--deployment", "--config"]).arg(example)
+        .args(["--rtx", "1", "--spark-ranks", "2", "--pool-tokens", "0", "--native-mtp-layers", "0",
+            "--speculator", "dflash2", "--vision", "auto", "--audio", "auto", "--workspace-manifest"])
+        .arg(programs).output().unwrap();
+    assert!(output.status.success(), "MiMo installed package: {}", String::from_utf8_lossy(&output.stderr));
+    let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(deployment["report"]["fits"], true, "{deployment}");
+    assert!(deployment["report"]["onboard_layers"].as_u64().unwrap() > 0,
+        "published native package must not silently disable MiMo onboarding: {deployment}");
 }
 
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,

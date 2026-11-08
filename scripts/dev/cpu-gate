@@ -10,7 +10,7 @@ restores them for release cuts. This includes the installed-example deployment-t
 release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
 inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing required inputs
 fail, including pinned checkpoint revisions and the published placement-inputs
-PROGRAMS.json with adjacent expert metadata. CUTEAFD_DEPLOYMENT_TEST_PROGRAMS
+share/PROGRAMS.json with sibling lib/fp8 and adjacent expert metadata. CUTEAFD_DEPLOYMENT_TEST_PROGRAMS
 overrides manifest discovery; the gate only reads exports, never builds them.
 Receipts name every exclusion; compiled test inventories reject dead exclusion
 IDs. --slow separately adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
@@ -85,7 +85,8 @@ INSTALLED_PLANNERS = (
     'installed_example_deployments_publish_executable_prefill_shapes',
     'installed_release_matrix_recipe_ids_parse_from_checkpoint_headers',
 )
-MERGE_INSTALLED_PLANNERS = ('installed_v41_sim5090_head_pools_preserve_1m',)
+MERGE_INSTALLED_PLANNERS = ('installed_v41_sim5090_head_pools_preserve_1m',
+                            'installed_mimo_min_onboarding_is_eligible')
 INSTALLED_INPUT_TESTS = (
     *MERGE_INSTALLED_PLANNERS,
     *LIVE_PLANNERS,
@@ -495,7 +496,7 @@ def cargo(source, root, args, env):
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
     env.setdefault('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
-                   str(Path(env.get('HOME', str(Path.home()))) / '.cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json'))
+                   str(Path(env.get('HOME', str(Path.home()))) / '.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json'))
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
     code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
