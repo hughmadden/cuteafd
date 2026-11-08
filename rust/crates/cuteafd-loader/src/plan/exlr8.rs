@@ -260,6 +260,12 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let mut memory = memory;
     append_spark_devices(&mut memory, layout, &residents)?;
     append_spark_encoder(&mut memory, report.encoder.as_ref())?;
+    let context = if layout.context_tokens > 0 { layout.context_tokens } else {
+        report.cache_requirements.as_ref().and_then(|cache| cache.checkpoint_max_context_tokens).unwrap_or(0) };
+    let physical = layout.rtx_bytes.iter().map(|&bytes| crate::placement::CoordinatorCard::planned(
+        bytes, layout.physical_sms).physical_bytes).min().unwrap_or(u64::MAX);
+    report.memory_policy_lines = crate::placement::reserve::layout_lines(&memory,
+        family.id(), context, &layout.rtx_bytes, physical);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
     if !model.contract_admission() {

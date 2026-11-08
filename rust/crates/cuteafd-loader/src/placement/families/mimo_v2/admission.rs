@@ -101,11 +101,12 @@ pub fn production_budgets(cards: &[(u64, u64)], headrooms: &[u64], baselines: Ve
 }
 
 /// Rank reserve kept free: the memory policy's named reserve, and on the head
-/// GPU at least the drained Spark intake startup probe (a named component,
-/// released before serving; zero under `GPU_RESERVE`).
+/// GPU at least the drained Spark intake startup probe (released before serving).
+/// Release padding stays additive outside that maximum; `GPU_RESERVE` replaces both.
 pub fn device_headroom(rank: usize, startup_probe_bytes: u64) -> u64 {
     let probe = if rank == 0 { crate::placement::reserve::gpu_component(startup_probe_bytes) } else { 0 };
-    crate::placement::reserve::gpu("mimo_v2").max(probe)
+    let padding = cuteafd_core::memory_policy::MemoryPolicy::current().release_padding();
+    crate::placement::reserve::gpu("mimo_v2").saturating_sub(padding).max(probe).saturating_add(padding)
 }
 
 pub fn production_request(context: impl Into<crate::placement::planner::Context>, pool: Option<u64>, onboard: crate::placement::Onboard,
@@ -850,4 +851,27 @@ pub fn route_exchange_bytes(rows: u64, topk: u64, lanes: u64) -> anyhow::Result<
     prefill_slots.checked_mul(slot(rows)?).and_then(|bytes| bytes.checked_add(decode))
         .and_then(|bytes| bytes.checked_add(control.max(256))).and_then(|bytes| bytes.checked_add(256))
         .ok_or_else(|| anyhow::anyhow!("MiMo route exchange bytes overflow"))
+}
+
+#[cfg(test)]
+mod release_padding_tests {
+    use super::*;
+    use cuteafd_core::memory_policy::{MemoryPolicy, DEFAULT_MEMORY_PADDING};
+
+    #[test]
+    fn padding_is_not_swallowed_by_the_drained_intake_probe() {
+        let probe = 64 << 20;
+        assert_eq!(device_headroom(0, probe), DEFAULT_MEMORY_PADDING + probe);
+        assert_eq!(device_headroom(1, probe), DEFAULT_MEMORY_PADDING);
+        MemoryPolicy { memory_padding: Some(0), ..Default::default() }.scoped(|| {
+            assert_eq!(device_headroom(0, probe), probe);
+            assert_eq!(device_headroom(1, probe), 0);
+        });
+        for reserve in [0, 123] {
+            MemoryPolicy { gpu_reserve: Some(reserve), ..Default::default() }.scoped(|| {
+                assert_eq!(device_headroom(0, probe), reserve);
+                assert_eq!(device_headroom(1, probe), reserve);
+            });
+        }
+    }
 }

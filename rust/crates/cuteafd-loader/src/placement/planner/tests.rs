@@ -3285,7 +3285,7 @@ fn gpu_reserve_override_replaces_every_builtin_reserve_component() {
 fn family_reserve_adds_to_the_measured_components() {
     use cuteafd_core::memory_policy::MemoryPolicy;
     let contract = with_reserve_components(1 << 15);
-    let solved = MemoryPolicy { family_reserve: Some(640), ..Default::default() }.scoped(|| {
+    let solved = MemoryPolicy { family_reserve: Some(640), memory_padding: Some(0), ..Default::default() }.scoped(|| {
         let mut budgets = vec![budget(1500 + 64 * 100)];
         budgets[0].headroom = crate::placement::reserve::gpu("glm5");
         solve(request(), budgets, &Prepared(contract.clone()))
@@ -3358,4 +3358,68 @@ fn automatic_floor_is_bounded_by_an_explicit_target() {
                 vec![budget(2 << 20)], &Linear::new()).unwrap();
             assert_eq!((solved.pool_tokens, solved.served_context()), (131_072, 131_072));
         });
+}
+
+#[test]
+fn release_padding_charges_once_per_gpu_for_every_family() {
+    use cuteafd_core::memory_policy::{MemoryPolicy, DEFAULT_MEMORY_PADDING};
+    for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2",
+        "qwen4", "qwen3_5", "kimi_k3", "muse_spark", "mistral_large4", "step5"] {
+        for gpus in [1, 2] {
+            let solve_with = |padding: Option<u64>| MemoryPolicy { memory_padding: padding,
+                kv_target: Some(DEFAULT_MEMORY_PADDING + 64 * 100), kv_min: Some(64), ..Default::default() }.scoped(|| {
+                let reserve = crate::placement::reserve::gpu(family);
+                let mut contract = with_reserve_components((DEFAULT_MEMORY_PADDING / 64) + 100);
+                contract.gpus = gpus as usize;
+                for gpu in 1..gpus {
+                    let mut extra = contract.components.clone();
+                    for component in &mut extra {
+                        match &mut component.kind {
+                            ComponentKind::Allocation { template: allocation, .. } => {
+                                allocation.id = format!("gpu{gpu}.{}", allocation.id);
+                                allocation.location = Location::coordinator(gpu);
+                            }
+                            ComponentKind::Allowance(allowance) => allowance.location = Location::coordinator(gpu),
+                            _ => unreachable!("linear fixture has only allocations and allowances"),
+                        }
+                    }
+                    contract.components.extend(extra);
+                }
+                let budgets = (0..gpus).map(|gpu| {
+                    let mut b = budget(crate::placement::reserve::family_constant(family)
+                        + DEFAULT_MEMORY_PADDING + 1500 + 64 * 100);
+                    b.id = format!("rtx{gpu}");
+                    b.locations = vec![Location::coordinator(gpu)];
+                    b.headroom = reserve;
+                    b
+                }).collect();
+                solve(request(), budgets, &Prepared(contract)).unwrap()
+            });
+            let unpadded = solve_with(Some(0));
+            let padded = solve_with(None);
+            assert_eq!(padded.pool_tokens, 64 * 100, "{family}/{gpus}");
+            assert_eq!(unpadded.pool_tokens - padded.pool_tokens, DEFAULT_MEMORY_PADDING, "64 B per 64-token page: {family}/{gpus}");
+            for (before, after) in unpadded.budgets.iter().zip(&padded.budgets) {
+                assert_eq!(after.headroom - before.headroom, DEFAULT_MEMORY_PADDING, "{family}/{gpus}");
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_padding_is_identical_to_a_plan_with_no_padding_component() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let contract = with_reserve_components(1 << 15);
+    for family in ["glm5", "glm5_flash", "mimo_v2", "step5"] {
+        let mut bare = budget(crate::placement::reserve::family_constant(family) + 1500 + 64 * 100);
+        bare.headroom = crate::placement::reserve::family_constant(family);
+        // Reconstruct the pre-padding budget directly, without calling the
+        // padding helper or dropping any real reserve owner.
+        let expected = solve(request(), vec![bare.clone()], &Prepared(contract.clone())).unwrap();
+        let actual = MemoryPolicy { memory_padding: Some(0), ..Default::default() }.scoped(|| {
+            bare.headroom = crate::placement::reserve::gpu(family);
+            solve(request(), vec![bare], &Prepared(contract.clone())).unwrap()
+        });
+        assert_eq!(actual, expected, "{family}: all decisions, owners and phases must match");
+    }
 }

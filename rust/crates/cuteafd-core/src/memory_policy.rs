@@ -6,7 +6,7 @@
 //! refused below the KV min.
 //!
 //! The reserve is a sum of named components. Families supply their measured
-//! components (CUDA context, loaded code, graphs, runtime growth) and a
+//! components (CUDA context, loaded code, graphs, runtime growth), release padding and a
 //! `FAMILY_RESERVE` constant; the operator may replace the whole reserve with
 //! `GPU_RESERVE` / `SPARK_RESERVE`, which zeroes every built-in component.
 //! Installed once per process before planning or allocation, like the Spark
@@ -24,6 +24,9 @@ pub const SMALL_CARD_BYTES: u64 = 32 << 30;
 pub const SMALL_CARD_KV_TARGET_TOKENS: u64 = 1 << 20;
 /// Agentic context floor: the default KV min when the model allows it.
 pub const AGENTIC_FLOOR_TOKENS: u64 = 262_144;
+/// Explicit release allowance for unassigned memory, lowered each release as
+/// the remaining owners are attributed. Per coordinator GPU, inside its cap.
+pub const DEFAULT_MEMORY_PADDING: u64 = 100 << 20;
 
 /// A byte size with an explicit unit: `B`, `MB`, `GB`, `MiB` or `GiB`. No
 /// percentages. A bare number is bytes.
@@ -92,6 +95,9 @@ pub struct MemoryPolicy {
     pub spark_reserve: Option<u64>,
     /// Per-GPU named reserve (`FAMILY_RESERVE`); `None` is the family constant.
     pub family_reserve: Option<u64>,
+    /// Per-GPU release padding (`MEMORY_PADDING`); `None` uses the release default.
+    #[serde(default)]
+    pub memory_padding: Option<u64>,
     pub kv_target: Option<u64>,
     pub kv_min: Option<u64>,
     pub kv_max: Option<u64>,
@@ -143,14 +149,20 @@ impl MemoryPolicy {
     }
 
     /// The per-device named reserve the budget keeps free (never allocated):
-    /// the whole override when one is set, else `FAMILY_RESERVE` on GPUs
+    /// the whole override when one is set, else `FAMILY_RESERVE` plus release padding on GPUs
     /// (the key, or the family constant) and nothing on Sparks.
     pub fn named_reserve(&self, kind: DeviceKind, family_constant: u64) -> u64 {
         match (self.reserve_override(kind), kind) {
             (Some(bytes), _) => bytes,
-            (None, DeviceKind::Gpu) => self.family_reserve.unwrap_or(family_constant),
+            (None, DeviceKind::Gpu) => self.family_reserve.unwrap_or(family_constant).saturating_add(self.release_padding()),
             (None, DeviceKind::Spark) => 0,
         }
+    }
+
+    /// Release padding is independent of family reserve; a whole GPU reserve
+    /// override replaces both. Sparks never receive this allowance.
+    pub fn release_padding(&self) -> u64 {
+        self.component(DeviceKind::Gpu, self.memory_padding.unwrap_or(DEFAULT_MEMORY_PADDING))
     }
 
     /// KV target, min and max for the smallest physical coordinator card.
@@ -272,10 +284,10 @@ mod tests {
     fn override_zeroes_components_and_family_reserve_adds() {
         let auto = MemoryPolicy::default();
         assert_eq!(auto.component(DeviceKind::Gpu, 700), 700);
-        assert_eq!(auto.named_reserve(DeviceKind::Gpu, 2 * GIB), 2 * GIB);
+        assert_eq!(auto.named_reserve(DeviceKind::Gpu, 2 * GIB), 2 * GIB + DEFAULT_MEMORY_PADDING);
         let family = MemoryPolicy { family_reserve: Some(GIB), ..auto };
         // FAMILY_RESERVE replaces only the family constant; components stay.
-        assert_eq!((family.component(DeviceKind::Gpu, 700), family.named_reserve(DeviceKind::Gpu, 2 * GIB)), (700, GIB));
+        assert_eq!((family.component(DeviceKind::Gpu, 700), family.named_reserve(DeviceKind::Gpu, 2 * GIB)), (700, GIB + DEFAULT_MEMORY_PADDING));
         let overridden = MemoryPolicy { gpu_reserve: Some(3 * GIB), family_reserve: Some(GIB), ..auto };
         assert_eq!(overridden.component(DeviceKind::Gpu, 700), 0);
         assert_eq!(overridden.named_reserve(DeviceKind::Gpu, 2 * GIB), 3 * GIB);
@@ -283,6 +295,27 @@ mod tests {
         assert_eq!(overridden.component(DeviceKind::Spark, 5), 5);
         let spark = MemoryPolicy { spark_reserve: Some(GIB), ..auto };
         assert_eq!((spark.component(DeviceKind::Spark, 5), spark.named_reserve(DeviceKind::Spark, 0)), (0, GIB));
+    }
+
+    #[test]
+    fn release_padding_is_explicit_gpu_only_and_whole_reserve_replaces_it() {
+        let default = MemoryPolicy::default();
+        assert_eq!(default.release_padding(), DEFAULT_MEMORY_PADDING);
+        assert_eq!(default.named_reserve(DeviceKind::Gpu, 7), 7 + DEFAULT_MEMORY_PADDING);
+        assert_eq!(default.named_reserve(DeviceKind::Spark, 7), 0);
+        let disabled = MemoryPolicy { memory_padding: Some(0), ..default };
+        assert_eq!(disabled.named_reserve(DeviceKind::Gpu, 7), 7);
+        let custom = MemoryPolicy { memory_padding: Some(123), ..default };
+        assert_eq!(custom.named_reserve(DeviceKind::Gpu, 7), 130);
+        for reserve in [0, 456] {
+            let whole = MemoryPolicy { gpu_reserve: Some(reserve), ..custom };
+            assert_eq!(whole.release_padding(), 0);
+            assert_eq!(whole.named_reserve(DeviceKind::Gpu, 7), reserve);
+        }
+        let encoded = serde_json::to_value(default).unwrap();
+        let mut old = encoded;
+        old.as_object_mut().unwrap().remove("memory_padding");
+        assert_eq!(serde_json::from_value::<MemoryPolicy>(old).unwrap().release_padding(), DEFAULT_MEMORY_PADDING);
     }
 
     #[test]

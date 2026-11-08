@@ -127,7 +127,7 @@ memory_get() { get "$1"; }
 release_memory_args memory_policy_args memory_get
 # The plan takes the resolved per-GPU cap (the smaller of the card and the key) separately.
 release_memory_args plan_memory_args memory_get GPU_MEMORY_CAP
-release_memory_args spark_memory_args memory_get GPU_MEMORY_CAP GPU_RESERVE FAMILY_RESERVE KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS
+release_memory_args spark_memory_args memory_get GPU_MEMORY_CAP GPU_RESERVE FAMILY_RESERVE MEMORY_PADDING KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS
 # RDMA_BOND_BALANCE: the coordinator's expert QPs connect with RoCE v2 flow labels it chooses,
 # so a coordinator port that is an LACP bond carries as many of them on each member: off
 # (default: the kernel's per-QP labels, re-rolled at every start), labels (fixed labels, the
@@ -509,7 +509,7 @@ launch_deepseek_v41() {
 release_load_config "$config"
 release_memory_args memory_policy_args release_memory_variable
 release_memory_args plan_memory_args release_memory_variable GPU_MEMORY_CAP
-release_memory_args spark_memory_args release_memory_variable GPU_MEMORY_CAP GPU_RESERVE FAMILY_RESERVE KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS
+release_memory_args spark_memory_args release_memory_variable GPU_MEMORY_CAP GPU_RESERVE FAMILY_RESERVE MEMORY_PADDING KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS
 # V4.1 serves its established ranges until its runtime consumes solver placement.
 attention_placement="${ATTENTION_PLACEMENT:-auto}"
 release_check_attention_placement "$attention_placement" deepseek_v41

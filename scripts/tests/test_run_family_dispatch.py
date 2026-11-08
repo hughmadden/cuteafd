@@ -2831,6 +2831,8 @@ def test_glmf_resolved_units_and_memory_policy_are_forwarded(tmp_path, keys, exp
     ("GLM5_FLASH_GRAPH_BUDGET_MIB", "512", "unknown configuration key: GLM5_FLASH_GRAPH_BUDGET_MIB"),
     ("FAMILY_RESERVE", "-1", "FAMILY_RESERVE must be a size"),
     ("FAMILY_RESERVE", "10%", "FAMILY_RESERVE must be a size"),
+    ("MEMORY_PADDING", "10%", "MEMORY_PADDING must be a size"),
+    ("MEMORY_PADDING", "-1", "MEMORY_PADDING must be a size"),
     ("GPU_RESERVE", "1TiB", "GPU_RESERVE must be a size"),
 ])
 def test_glmf_invalid_units_or_memory_keys_fail_before_workers_launch(tmp_path, key, value, message):
@@ -2845,7 +2847,7 @@ def test_glmf_invalid_units_or_memory_keys_fail_before_workers_launch(tmp_path, 
 MEMORY_POLICY_KEYS = {
     "GPU_MEMORY_CAP": ("--gpu-memory-cap", "80GiB"), "SPARK_MEMORY_CAP": ("--spark-memory-cap", "100GiB"),
     "GPU_RESERVE": ("--gpu-reserve", "3GiB"), "SPARK_RESERVE": ("--spark-reserve", "2.5GiB"),
-    "FAMILY_RESERVE": ("--family-reserve", "512MiB"), "KV_TARGET_TOKENS": ("--kv-target-tokens", "1048576"),
+    "FAMILY_RESERVE": ("--family-reserve", "512MiB"), "MEMORY_PADDING": ("--memory-padding", "100MiB"), "KV_TARGET_TOKENS": ("--kv-target-tokens", "1048576"),
     "KV_MIN_TOKENS": ("--kv-min-tokens", "131072"), "KV_MAX_TOKENS": ("--kv-max-tokens", "4194304"),
 }
 
@@ -2881,7 +2883,7 @@ def test_every_memory_policy_key_reaches_the_plan_and_the_serve_argv(tmp_path, f
     for worker in workers:
         assert worker[worker.index("--spark-memory-cap") + 1] == "100GiB"
         assert worker[worker.index("--spark-reserve") + 1] == "2.5GiB"
-        assert "--gpu-memory-cap" not in worker and "--family-reserve" not in worker
+        assert "--gpu-memory-cap" not in worker and "--family-reserve" not in worker and "--memory-padding" not in worker
 
 
 @pytest.mark.parametrize("key,value", [("GPU_MEMORY_CAP", "90%"), ("SPARK_MEMORY_CAP", "50%"),

@@ -888,7 +888,7 @@ mod tests {
             });
             // The plan keeps the drained 64 MiB intake probe as rank 0's named reserve.
             let reserve = crate::placement::families::mimo_v2::admission::device_headroom(0, 64 << 20);
-            assert_eq!(reserve, 64 << 20);
+            assert_eq!(reserve, (64 << 20) + cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
             profile.steady.devices[0].reserve_bytes = reserve;
             let policy = CapacityPolicy { concurrency: 4,
                 target_pool_tokens: if total <= 32 * GIB { 1 << 20 } else { 2 << 20 },
