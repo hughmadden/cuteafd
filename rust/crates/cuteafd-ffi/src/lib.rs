@@ -523,7 +523,7 @@ pub type CuteafdStatus = c_int;
 /// A native-library call returned a non-OK status. This is a device/driver
 /// failure (CUDA, RDMA or NCCL), not a host-side invariant failure: callers
 /// that keep device state alive across calls must treat it as terminal.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{context} returned status {status}: {detail}")]
 pub struct NativeStatusError {
     pub context: String,
