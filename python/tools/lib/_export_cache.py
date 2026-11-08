@@ -877,6 +877,13 @@ def stats(event: str, **fields) -> None:
             handle.write(json.dumps({"event": event, **fields}) + "\n")
 
 
+# A fork pin bump rewrites the lock, which manifests embed, so whole-command
+# entries key it. An exported program does not embed it: the fork files it
+# compiled from are keyed by content (and lock verification proves the tree is
+# the locked one), so one kernel edit re-exports only the programs that read it.
+PROGRAM_NEUTRAL_CHECKS = frozenset({"file|src:third_party/sparkinfer.lock.json"})
+
+
 class ProgramCache:
     """Per-program reuse inside one recorded export (export_b12x_dsv4_aot.py).
 
@@ -945,7 +952,7 @@ class ProgramCache:
             self.uncacheable += 1
             return
         with self.recorder.lock:
-            names = self.prelude | scope.checks
+            names = (self.prelude | scope.checks) - PROGRAM_NEUTRAL_CHECKS
             checks = {name: self.recorder.checks[name] for name in names if name in self.recorder.checks}
         stored = {}
         with paused():
