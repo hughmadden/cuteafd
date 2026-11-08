@@ -330,13 +330,10 @@ fn preflight_shape(
             && layers == cfg.layers
             && (routed_layers == 0 || backend != ExpertBackend::None),
     )?;
-    // Internal graph components of the auto reserve (calibrated per-executable
-    // storage; the provisional driver margin is zero under GPU_RESERVE).
-    let graph_exec_bytes = cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES;
-    let graph_driver_margin = cuteafd_loader::placement::reserve::gpu_component(
-        cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES);
+    // Retained startup graph owners: measured whole-capture bytes per rank,
+    // charged before KV sizing. No driver margin or per-executable envelope.
     let graph_reservations = (0..ranks)
-        .map(|rank| graph_plan.reservations(rank, graph_exec_bytes, graph_driver_margin))
+        .map(|rank| graph_plan.reservations(rank))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let graph_bound_bytes = graph_reservations
         .iter()

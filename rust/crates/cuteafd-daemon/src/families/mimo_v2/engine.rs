@@ -2302,6 +2302,10 @@ impl<'a> MimoEngine<'a> {
             self.late_captures.set(self.late_captures.get() + 1);
             tracing::debug!(rank, ?key, "MiMo decode segment captured while serving");
         }
+        // Instantiation allocates driver graph storage; name the owner and the
+        // exact shape so a failed capture reports them instead of owner=null.
+        let _scope = cuteafd_ffi::memory_ledger::scope_owned("decode graph");
+        let _owner = cuteafd_ffi::memory_ledger::owner(&format!("mimo/decode-graph/rank{rank}/{key:?}"));
         // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host or allocates.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;

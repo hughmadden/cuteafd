@@ -32,13 +32,18 @@ pub const DECODE_ROWS: u64 = 64;
 /// Other shapes retain their own forecast; this is not a cross-family margin.
 pub const FLASH_MIN_BASELINE_BYTES: u64 = 575 << 20;
 
-/// Measured unnamed post-ready CUDA/runtime growth, excluding tracked owners:
-/// corrected peak 99,185,393,664 - known owners 97,985,769,216 - observer-
-/// subtracted baseline 602,472,448 = 597,152,000 B, rounded up to MiB.
-/// Source: 389a8037e, drop-occupancy-ceiling-mimo-smoke, 2026-11-06, Flash min.
-/// This replaces (does not add to) the old 32 MiB allowance. Other MiMo layouts
-/// retain the same per-rank allowance policy; only Flash min was measured.
-pub const POST_READY_RUNTIME_BYTES: u64 = 570 << 20;
+/// Peak CUDA streams live in one coordinator context after Ready. Enumerated
+/// from their creators: the engine's serving stream
+/// (`families/mimo_v2/mod.rs`), the prefix `PrefixCopies` rank stream
+/// (`shared/prefix/copy_stream.rs`), the prefix cache's Store and Restore
+/// `StreamState`s, each with its nonblocking probe stream
+/// (`shared/prefix/cuda_copy.rs`, 4 per registered device), and the Spark
+/// intake copy stream (`shared/spark_intake.rs`). Load, push and warm streams
+/// have retired before Ready. A TP2 peer exchange adds one stream
+/// (`families/mimo_v2/mod.rs`), still inside the same four-stream slab band.
+pub fn startup_peak_live_streams() -> u64 {
+    1 + 1 + 4 + 1
+}
 
 fn invalid(detail: impl std::fmt::Display) -> Refusal {
     Refusal::InvalidFact(format!("MiMo component contract: {detail}"))
@@ -611,21 +616,21 @@ impl Recipe for MimoRecipe<'_> {
         }
         contract.components.extend(crate::placement::planner::serving::blas_components(
             "sm_120", &blas, maximum, contract.phase_order)?);
-        let measured_runtime = matches!(self.cfg.program_family(), Ok("mimof"))
-            && self.gpus == 1 && self.spark_ranks == 2;
-        let runtime_source = if measured_runtime {
-            "measured MiMo post-ready runtime growth; Flash min, 389a8037e, observer subtracted, 2026-11-06"
-        } else {
-            "estimated MiMo post-ready runtime growth; same per-rank allowance as Flash min, 389a8037e, observer subtracted, 2026-11-06"
-        };
+        // Retained driver stream slabs are a named owner, not a cudaMalloc
+        // request, so they receive no allocation-tail charge. Pinned host
+        // backings' driver page tables are added by the shared solve
+        // (`Contract::add_driver_page_tables`) and charged at runtime through
+        // `resolved_capacity`.
+        let stream_slabs = crate::placement::planner::cuda_stream_slab_bytes(startup_peak_live_streams())?;
+        let streams = startup_peak_live_streams();
         for rank in 0..self.gpus {
             contract.components.push(Component {
                 activation: crate::placement::planner::Activation::always(),
-                bytes: ByteCurve::fixed(POST_READY_RUNTIME_BYTES, maximum),
+                bytes: ByteCurve::fixed(stream_slabs, maximum),
                 kind: crate::placement::planner::ComponentKind::Allowance(crate::placement::planner::Allowance {
-                    location: Location::coordinator(rank as u8), bytes: POST_READY_RUNTIME_BYTES,
-                    lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
-                    source: runtime_source.into(), assumed: !measured_runtime,
+                    location: Location::coordinator(rank as u8), bytes: stream_slabs,
+                    lifetime: Lifetime::RESIDENT, assumed: false,
+                    source: format!("mimo/driver-stream-slabs/gpu{rank} ({streams} peak live streams, SM120 driver/runtime13020 LAZY, #1511 2026-11-08)"),
                 }),
             });
         }
@@ -801,6 +806,14 @@ pub fn resolved_capacity(admitted: &AdmittedMimo, concurrency: u32, rings: u32)
             owner.location == Location::coordinator(rank as u8)
                 && owner.lifetime.contains(Phase::Ready, admitted.solved.facts.phase_order))
             .map(|owner| MemoryReservation { name: owner.source.clone(), bytes: owner.bytes }));
+        // Portable CUDA host backings (the retained prefix chunks and every
+        // other PINNED owner) register driver page tables in each coordinator
+        // context. The solve charged them; this list must too, or the pool
+        // sized around them reads back as an unexplained residual.
+        reservations.extend(admitted.solved.facts.driver_page_tables.iter().filter(|mapping|
+            mapping.location == Location::coordinator(rank as u8)
+                && mapping.lifetime.contains(Phase::Ready, admitted.solved.facts.phase_order))
+            .map(|mapping| MemoryReservation { name: mapping.source(), bytes: mapping.bytes() }));
         let reserved = reservations.iter().try_fold(0u64, |sum, reservation|
             sum.checked_add(reservation.bytes))
             .ok_or(PlacementError::Overflow("MiMo reservations"))?;
