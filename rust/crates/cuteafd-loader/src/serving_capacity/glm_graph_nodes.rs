@@ -13,7 +13,7 @@ const PROVENANCE: GraphRateProvenance = GraphRateProvenance {
 };
 
 // Ordered 256-capture block fit: a=2675.552041747176, c=103661.85617785223.
-// Nearest-byte coefficients preserve both packed calibration/validation totals.
+// Whole-byte coefficients preserve the 1M calibration; independent 128K is +1 chunk.
 pub const GLM_SM120_NODE_RATES: [GraphNodeRate; 1] = [
     GraphNodeRate { family: "glm5", architecture: "sm_120", bytes_per_node: 2676,
         bytes_per_executable: 103662, provenance: PROVENANCE },

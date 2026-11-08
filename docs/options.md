@@ -156,7 +156,11 @@ Both counts come from the declared set; rates are per family and architecture.
 It applies even with `GPU_RESERVE` or `SPARK_RESERVE`. An integer adds that many
 bytes to each coefficient (per node and per executable); per-architecture values
 may mix forms, e.g. `rtx=2.5%,spark=100`. Missing Spark rates require a Spark census,
-never an RTX substitution.
+never an RTX substitution. Whole-byte GLM SM120 coefficients reproduce the 1M
+calibration exactly; the independent 128K prediction is one 2 MiB chunk above
+measurement (within the independent-validation bar of plus or minus one chunk).
+Flash's archived calibration also retains a one-chunk overprediction; it has no
+independent context validation yet.
 
 For the archived GLM 5.3 count this adds 74,660,034 B (about 71 MiB) before chunk
 rounding; Flash adds 57,692,320 B (about 55 MiB). Together with `MEMORY_PADDING`'s
