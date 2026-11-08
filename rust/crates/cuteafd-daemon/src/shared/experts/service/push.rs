@@ -99,7 +99,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     let device = Device { library, id: library.cuda_get_device()? };
     let joined = (|| -> Result<_> {
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
-        let arena = LoadingArena::new(device, plan.layout.clone(), expected, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+        let arena = LoadingArena::new(device, plan.layout.clone(), expected, cuteafd_core::memory_layout::ArenaTag::experts("experts/spark-exl3-push"))?;
         let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let rank = client.join(JoinArgs { group, token,
             rank: u32::try_from(rank_id)?, ring_fd: ring.fd().as_raw_fd(),

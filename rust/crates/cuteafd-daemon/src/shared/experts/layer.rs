@@ -648,7 +648,7 @@ impl<'a> ExpertWeights<'a> {
         catalog: &OfficialV41Catalog, layers: impl IntoIterator<Item = ExpertLayer>)
         -> Result<crate::shared::memory::weight_arena::DeviceWeightArena<'b>> {
         let layout = Self::arena_layout(device, catalog, layers)?;
-        crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))
+        crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/native"))
     }
 
     pub(crate) fn arena_layout(device: crate::shared::memory::device::Device<'_>,
@@ -701,7 +701,7 @@ impl<'a> ExpertWeights<'a> {
         let layout = Self::arena_layout(device, catalog, [layer])?;
         let staging = Self::plan(library, catalog, layer)?.device_staging_bytes;
         super::weight_layout::admit(&layout, staging, 0, available_device_bytes)?;
-        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+        let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/native"))?;
         Self::load_into(library, catalog, layer, available_device_bytes, &arena)
     }
 
@@ -987,7 +987,7 @@ impl<'a> ExpertWeights<'a> {
             Ok(layout)
         }).collect::<Result<Vec<_>>>()?;
         let arenas = layouts.into_iter().enumerate().map(|(rank, layout)|
-            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")))
+            crate::shared::memory::weight_arena::DeviceWeightArena::new(devices[rank], layout, cuteafd_core::memory_layout::ArenaTag::experts("experts/native-pair")))
             .collect::<Result<Vec<_>>>()?;
         let mut staging_bytes = [0; 2];
         let mut pinned_admitted = 0;

@@ -671,7 +671,7 @@ mod tests {
                     let mut allocate = |id, name: &str, bytes| {
                         assert_eq!(id, device.id);
                         requested.borrow_mut().push((name.to_owned(), bytes));
-                        let owner = weight_allocation(device, arena, name, bytes, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+                        let owner = weight_allocation(device, arena, name, bytes, crate::shared::memory::TEST_ARENA)?;
                         if let Some(arena) = arena {
                             let offset = end.div_ceil(256) * 256;
                             let root = *base.get_or_insert(owner.buffer.ptr as usize);
@@ -727,7 +727,7 @@ mod tests {
                 });
                 let baseline_bytes = digest(&baseline)?;
                 for recorded in [false, true] {
-                    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/draft", expected.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+                    let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/draft", expected.clone())?, crate::shared::memory::TEST_ARENA)?;
                     let owners = if recorded {
                         let (owners, records) = dense::recording(|| run(device, &snapshot, &cfg, rank, ranks, representation, &expected, Some(&arena)))?;
                         assert!(!records.operands.is_empty());

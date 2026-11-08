@@ -201,7 +201,7 @@ mod tests {
                 let mut inventory = Inventory::new(topology, &format!("muse.draft.{id}"),
                     Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "Muse drafter");
                 for (name, bytes) in requests {
-                    let view = weight_allocation(device, Some(arena), name, *bytes, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+                    let view = weight_allocation(device, Some(arena), name, *bytes, crate::shared::memory::TEST_ARENA)?;
                     assert_eq!(view.buffer.device_id, id);
                     assert_eq!(view.buffer.bytes, *bytes);
                     assert_eq!(view.buffer.ptr as usize % 256, 0);
@@ -209,7 +209,7 @@ mod tests {
                     views.push(view);
                 }
                 assert!(weight_allocation(Device { library: &library, id: 1 - id },
-                    Some(arena), &requests[0].0, requests[0].1, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")).is_err());
+                    Some(arena), &requests[0].0, requests[0].1, crate::shared::memory::TEST_ARENA).is_err());
                 let payload = requests.iter().map(|(_, bytes)| bytes).sum::<usize>();
                 let large = requests.iter().filter(|(_, bytes)| *bytes > 1 << 20).collect::<Vec<_>>();
                 let old_tail = large.iter().map(|(_, bytes)| bytes.div_ceil(2 << 20) * (2 << 20) - bytes).sum::<usize>();

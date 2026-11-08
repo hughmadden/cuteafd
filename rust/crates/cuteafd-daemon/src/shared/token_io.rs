@@ -1311,7 +1311,7 @@ mod tests {
         let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(
             crate::shared::memory::device::Device { library: &library, id: 0 },
             cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/embedding",
-                [("embedding.table".into(), payload.len())])?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+                [("embedding.table".into(), payload.len())])?, crate::shared::memory::TEST_ARENA)?;
         let (packed, ()) = TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu,
             || Ok(()), |name, bytes| arena.view(name, bytes))?;
         let ((recorded, ()), packed_records) = dense::recording(||

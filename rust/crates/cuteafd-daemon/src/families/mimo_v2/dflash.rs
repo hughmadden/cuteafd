@@ -617,7 +617,7 @@ impl<'a> MimoDrafter<'a> {
         // One planned arena per rank (DraftLoad, after target KV); views retain it.
         let device = Device { library, id: library.cuda_get_device()? };
         let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
-            cuteafd_loader::families::mimo_v2::weight_arena::dflash_arena_requests(&source_cfg, representation, rank, ranks)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+            cuteafd_loader::families::mimo_v2::weight_arena::dflash_arena_requests(&source_cfg, representation, rank, ranks)?, cuteafd_core::memory_layout::ArenaTag::drafter_weights("mimo/dflash"))?;
         let mut allocate = |id: i32, name: &str, bytes: usize| {
             ensure!(id == device.id, "MiMo DFlash rank {rank} allocates on GPU {id}, not {}", device.id);
             arena.view(name, bytes)

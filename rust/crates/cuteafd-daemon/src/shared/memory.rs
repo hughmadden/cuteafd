@@ -5,6 +5,10 @@ pub(crate) use cuteafd_ffi::memory_ledger::{tag, MemoryKind, Tag};
 /// Scratch allocated by this crate's tests; absent from every non-test build.
 #[cfg(test)]
 pub(crate) const TEST: Tag = Tag::workspace("test/scratch");
+/// An immutable arena tag for this crate's tests; absent from every non-test build.
+#[cfg(test)]
+pub(crate) const TEST_ARENA: cuteafd_core::memory_layout::ArenaTag<cuteafd_core::memory_layout::arena_class::Immutable> =
+    cuteafd_core::memory_layout::ArenaTag::weights("test/arena");
 use std::ffi::c_void;
 
 #[path = "memory/receipts.rs"]

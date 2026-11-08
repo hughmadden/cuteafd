@@ -226,7 +226,7 @@ fn recorded_for_ranks<'a>(library: &'a NativeLibrary, model: &Installed,
         let layers = selected.iter().map(|layouts| layouts[rank].shared_layout()).collect::<Vec<_>>();
         let layout = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(
             rank, &global, &layers.iter().collect::<Vec<_>>())?;
-        Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
+        Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, crate::shared::memory::TEST_ARENA)?))
     }).collect::<Result<BTreeMap<_, _>>>()?.into();
     let mut global = Vec::new();
     for (rank, layout) in globals.iter().enumerate() { global.push((rank, records.global(devices[rank], layout)?)); }

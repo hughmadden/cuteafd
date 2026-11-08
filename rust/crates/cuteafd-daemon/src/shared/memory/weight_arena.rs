@@ -749,8 +749,8 @@ mod tests {
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
         let layout = ArenaLayout::new([512], 512)?.with_generated(vec![256..512])?;
-        assert!(LoadingArena::new(device, layout.clone(), expected(512)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")).is_err());
-        let mut loading = LoadingArena::new(device, layout, expected(16)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+        assert!(LoadingArena::new(device, layout.clone(), expected(512)?, crate::shared::memory::TEST_ARENA).is_err());
+        let mut loading = LoadingArena::new(device, layout, expected(16)?, crate::shared::memory::TEST_ARENA)?;
         let generated = loading.destination(256, 256)?;
         let mut bytes = vec![0xff; 256];
         library.copy_d2h(&mut bytes, generated)?;
@@ -778,7 +778,7 @@ mod tests {
         };
         fixture.configure_memory(&library, 1, 4096)?;
         let mut loading =
-            LoadingArena::new(device, ArenaLayout::new([256, 256], 512)?, expected(16)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+            LoadingArena::new(device, ArenaLayout::new([256, 256], 512)?, expected(16)?, crate::shared::memory::TEST_ARENA)?;
         let base = loading.destination(0, 16)?.ptr;
         assert!(loading.destination(510, 4).is_err());
         loading.copied(0, 8)?;
@@ -813,7 +813,7 @@ mod tests {
         let footprint = ExpectedCoverage::spans(&[(0, 4), (256, 4)]);
         let layout = ArenaLayout::new([256], 256)?.with_validation(4, 4)?;
         assert!(ArenaLayout::new([256], 256)?.with_validation(4, 3).is_err());
-        let mut loading = LoadingArena::new(device, layout, footprint, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+        let mut loading = LoadingArena::new(device, layout, footprint, crate::shared::memory::TEST_ARENA)?;
         assert!(loading.copied(16, 4).is_err()); // Equal-size padding is not planned payload.
         assert!(loading.copied(256, 4).is_err()); // No device copy to host tail.
         loading.copied(0, 4)?;
@@ -840,10 +840,10 @@ mod tests {
             library: &library,
             id: 0,
         };
-        let loading = LoadingArena::new(device, ArenaLayout::new([256], 256)?, expected(4)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
+        let loading = LoadingArena::new(device, ArenaLayout::new([256], 256)?, expected(4)?, crate::shared::memory::TEST_ARENA)?;
         assert!(loading.done().is_err());
         let delivered =
-            LoadingArena::new(device, ArenaLayout::new([256], 256)?, expected(0)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?.done()?;
+            LoadingArena::new(device, ArenaLayout::new([256], 256)?, expected(0)?, crate::shared::memory::TEST_ARENA)?.done()?;
         assert!(delivered
             .initialize(|_| anyhow::bail!("semantic check failed"))
             .is_err());
