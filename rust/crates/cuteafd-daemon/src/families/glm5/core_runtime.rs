@@ -1,6 +1,6 @@
 //! GLM's native K6 projection seams over shared compressed-weight owners.
 use crate::shared::{dense_trellis::{CoreWeights, Projection, ProjectionLayout, ProjectionScratch},
-    memory::device::{Allocation, Device}};
+    memory::{device::{Allocation, Device}, Tag}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, dense_trellis::TrellisDType, programs::Programs,
     Bf16F32Add, F32Bf16Narrow, V41PeerCopy};
@@ -147,8 +147,9 @@ impl<'a> CorePrograms<'a> {
         ensure!(rows == layout.rows, "GLM K6 scratch differs from admitted row capacity");
         let projection = layout.allocate(device)?;
         let stages = self.stages[index].extents.iter().map(|(&name, &bytes)|
-            Ok((name, Allocation::untagged(device, bytes)?))).collect::<Result<_>>()?;
-        let native = (self.native_scratch[index] > 0).then(|| Allocation::untagged(device, self.native_scratch[index])).transpose()?;
+            Ok((name, Allocation::new(device, bytes, Tag::workspace("glm/core-scratch"))?))).collect::<Result<_>>()?;
+        let native = (self.native_scratch[index] > 0)
+            .then(|| Allocation::new(device, self.native_scratch[index], Tag::workspace("glm/core-scratch"))).transpose()?;
         Ok(CoreScratch { projection, stages, native, prefill: !decode })
     }
 }

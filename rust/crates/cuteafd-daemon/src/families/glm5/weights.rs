@@ -16,7 +16,7 @@
 //! `w_gate_up`) concatenate their grids (every part but the last is a whole
 //! number of 128-row blocks). BF16 operands: norms, the router, the LM head and
 //! `w_ik` (`wk` FP8 dequantized on the GPU with its scales, `weights_proj` BF16).
-use crate::shared::memory::{DeviceAllocation, device::Device};
+use crate::shared::memory::{DeviceAllocation, Tag, device::Device};
 use crate::shared::dense_trellis::{CoreWeightLayout, CoreWeights};
 use cuteafd_loader::families::glm5::core::CoreInventory;
 use cuteafd_loader::families::glm5::names::Operand as Op;
@@ -312,7 +312,8 @@ impl<'a> GlmLoader<'a> {
                         let mut bytes = vec![0u8; source.bytes];
                         crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(&source.path)?
                             .read_exact_at(&mut bytes, source.offset))?;
-                        let allocation = DeviceAllocation::untagged(self.library, bytes.len().max(256))?;
+                        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256),
+                            Tag::weights("glm/tp2-router"))?;
                         self.library.copy_h2d(allocation.buffer, &bytes)?;
                         Ok(allocation)
                     } else { GlmLoader { arenas: None, ..self.clone() }.one(operand, &name) }
