@@ -26,6 +26,8 @@ impl<'a, K: Hash + Eq + Clone + std::fmt::Debug> BindingGraphs<'a, K> {
     pub unsafe fn insert(&mut self, key: K, raw: *mut c_void) -> Result<()> {
         // SAFETY: the containing wave retains weights, buffers and workspace.
         let owner = unsafe { GraphOwner::new(self.library, self.device, raw, ())? };
+        super::census::capture_key("deepseek_v41", std::any::type_name::<K>(),
+            self as *const Self as usize, self.device, None, &key, raw);
         self.bank.insert(key.clone(), owner, None);
         self.current = Some(key.clone());
         tracing::debug!(target: "cuteafd::graph_capture", site="dspark_binding", ?key,

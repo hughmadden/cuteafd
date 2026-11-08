@@ -66,6 +66,7 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
         let device = self.library.cuda_get_device()?;
         // SAFETY: the weight borrow pins its storage and the containing wave pins workspace.
         let owner = unsafe { GraphOwner::new(self.library, device, graph, weights)? };
+        self.bank.census_capture_key(std::any::type_name::<W>(), device, None, &(layer, rows), graph);
         self.bank.insert((layer, rows), owner, None);
         self.current[layer] = Some(rows);
         drop(self.bank.drain_retired(|| Ok(()))?);
@@ -136,6 +137,7 @@ impl<'a> RowGraphs<'a> {
                 self.bank.retire_oldest(|&r| r > decode_rows && r != rows);
             }
         }
+        self.bank.census_capture_key(self.site, device, None, &rows, graph);
         self.bank.insert(rows, owner, None);
         drop(self.bank.drain_retired(|| Ok(()))?);
         tracing::debug!(target: "cuteafd::graph_capture", site = self.site, rows, device,

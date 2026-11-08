@@ -9,6 +9,15 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("CUTEAFD_GRAPH_CENSUS").is_some_and(|v| v == "1"))
 }
 
+/// Capture identity is emitted only when explicitly collecting a census. A null
+/// lane means the bank does not carry a logical lane; its instance stays unique.
+pub(crate) fn capture_key<K: std::fmt::Debug>(family: &str, bank: &str, instance: usize,
+    rank: i32, lane: Option<usize>, key: &K, exec: *mut std::ffi::c_void) {
+    if !enabled() { return }
+    tracing::info!(target: "cuteafd::graph_capture", family, bank, instance, rank, ?lane,
+        key = ?key, exec = ?exec, "graph census capture key");
+}
+
 fn bank_id(bank: &str) -> Option<u8> {
     Some(match bank { "baseline" => 0, "sparse" => 1, "index" => 2,
         "layer_row" => 3, "head" => 4, "dspark" => 5, "window" => 6, _ => return None })

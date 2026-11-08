@@ -646,6 +646,9 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
       const cudaError_t type_status = cudaGraphNodeGetType(nodes[i], &type);
       details += "{\"kind\":" + std::to_string(type_status == cudaSuccess ? static_cast<int>(type) : -1);
       if (type_status == cudaSuccess && type == cudaGraphNodeTypeKernel) {
+        CUDA_KERNEL_NODE_PARAMS driver_params{};
+        const CUresult params_status = cuGraphKernelNodeGetParams(
+            reinterpret_cast<CUgraphNode>(nodes[i]), &driver_params);
         cudaKernelNodeParams params{};
         const char* name = nullptr;
         cudaError_t name_status = cudaGraphKernelNodeGetParams(nodes[i], &params);
@@ -657,8 +660,7 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
         // Driver-loaded AOT kernels may not have a runtime host-function entry.
         CUresult driver_name_status = CUDA_ERROR_NOT_SUPPORTED;
         if (name == nullptr) {
-          CUDA_KERNEL_NODE_PARAMS driver_params{};
-          driver_name_status = cuGraphKernelNodeGetParams(reinterpret_cast<CUgraphNode>(nodes[i]), &driver_params);
+          driver_name_status = params_status;
           if (driver_name_status == CUDA_SUCCESS) {
             driver_name_status = cuFuncGetName(&name, driver_params.func);
           }
@@ -666,6 +668,38 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
         details += ",\"kernel\":" + census_json_string(name != nullptr ? name : "unresolved");
         details += ",\"driver_name_status\":" + std::to_string(static_cast<int>(driver_name_status));
         details += ",\"name_status\":" + std::to_string(static_cast<int>(name_status));
+        size_t param_count = 0, param_bytes = 0, param_payload_bytes = 0;
+        CUresult param_status = params_status;
+#if CUDA_VERSION >= 12040
+        if (params_status == CUDA_SUCCESS) {
+          // Extent includes ABI alignment holes; payload sums argument sizes.
+          // INVALID_VALUE at the first absent index terminates the parameter list.
+          for (; param_count < 4096; ++param_count) {
+            size_t offset = 0, size = 0;
+            param_status = cuFuncGetParamInfo(driver_params.func, param_count, &offset, &size);
+            if (param_status == CUDA_ERROR_INVALID_VALUE) { param_status = CUDA_SUCCESS; break; }
+            if (param_status != CUDA_SUCCESS) { break; }
+            param_bytes = std::max(param_bytes, offset + size);
+            param_payload_bytes += size;
+          }
+          if (param_count == 4096) { param_status = CUDA_ERROR_INVALID_VALUE; }
+        }
+#else
+        param_status = CUDA_ERROR_NOT_SUPPORTED;
+#endif
+        int constant_bytes = 0, local_bytes = 0;
+        const CUresult constant_status = params_status == CUDA_SUCCESS
+            ? cuFuncGetAttribute(&constant_bytes, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, driver_params.func) : params_status;
+        const CUresult local_status = params_status == CUDA_SUCCESS
+            ? cuFuncGetAttribute(&local_bytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, driver_params.func) : params_status;
+        details += ",\"param_count\":" + std::to_string(param_count);
+        details += ",\"param_bytes\":" + std::to_string(param_bytes);
+        details += ",\"param_payload_bytes\":" + std::to_string(param_payload_bytes);
+        details += ",\"param_status\":" + std::to_string(static_cast<int>(param_status));
+        details += ",\"constant_bytes\":" + std::to_string(constant_bytes);
+        details += ",\"constant_status\":" + std::to_string(static_cast<int>(constant_status));
+        details += ",\"local_bytes\":" + std::to_string(local_bytes);
+        details += ",\"local_status\":" + std::to_string(static_cast<int>(local_status));
       }
       details += '}';
     }
@@ -684,6 +718,8 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
     return std::fopen(cuteafd_graph_census_captures_path(std::getenv("CUTEAFD_PROFILE_DIR"), host).c_str(), "a");
   }();
   const uint64_t id = serial.fetch_add(1) + 1;
+  int runtime_version = 0;
+  cudaRuntimeGetVersion(&runtime_version);
   if (captures == nullptr) {
     std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"capture_write_failed\",\"id\":%llu}\n",
         static_cast<unsigned long long>(id));
@@ -693,9 +729,10 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
   flockfile(captures);
   const int written = std::fprintf(captures,
       "CUTEAFD_GRAPH_CENSUS {\"event\":\"capture\",\"id\":%llu,\"exec\":\"%p\",\"device\":%d,"
+      "\"cuda_runtime_version\":%d,"
       "\"nodes\":%zu,\"node_status\":%d,\"instantiate_bytes\":%lld,\"bytes_valid\":%s,%s,\"details\":%s}\n",
       static_cast<unsigned long long>(id), reinterpret_cast<void*>(exec), device,
-      count, static_cast<int>(status), static_cast<long long>(delta), bytes_valid ? "true" : "false", driver.c_str(), details.c_str());
+      runtime_version, count, static_cast<int>(status), static_cast<long long>(delta), bytes_valid ? "true" : "false", driver.c_str(), details.c_str());
   const bool saved = std::fflush(captures) == 0 && written >= 0;
   funlockfile(captures);
   std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"%s\",\"id\":%llu,\"exec\":\"%p\"}\n",

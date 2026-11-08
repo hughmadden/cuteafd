@@ -1,5 +1,10 @@
 #include "cuteafd_native.h"
 #include <cuda_runtime_api.h>
+#include <cuda.h>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -15,6 +20,13 @@ static void CUDART_CB hold(void* state) {
   while (!gate.release.load(std::memory_order_acquire)) std::this_thread::yield();
 }
 int main() {
+  const char* tmp = std::getenv("TMPDIR");
+  const auto profile = std::filesystem::path(tmp ? tmp : ".") /
+      ("graph-census-selftest-" + std::to_string(getpid()));
+  std::filesystem::create_directories(profile);
+  check(setenv("CUTEAFD_GRAPH_CENSUS", "1", 1) == 0);
+  check(setenv("CUTEAFD_PROFILE_DIR", profile.c_str(), 1) == 0);
+  check(setenv("CUTEAFD_PROFILE_HOST", "selftest", 1) == 0);
   void* pending = nullptr;
   void* peer = nullptr;
   check(cuteafd_cuda_stream_create(&pending) == CUTEAFD_STATUS_OK);
@@ -68,6 +80,46 @@ int main() {
     check(cudaMemcpy(&first, buffer.ptr, 1, cudaMemcpyDeviceToHost) == cudaSuccess && first == 0x2a);
   }
   check(cuteafd_cuda_graph_exec_destroy(graph) == CUTEAFD_STATUS_OK);
+  // A driver-loaded kernel has a known ABI and no runtime host-function entry.
+  const char* ptx = R"(.version 7.0
+.target sm_80
+.address_size 64
+.visible .entry census_store(.param .u64 dst, .param .u32 value) {
+  .reg .u64 %rd;
+  .reg .u32 %r;
+  ld.param.u64 %rd, [dst];
+  ld.param.u32 %r, [value];
+  st.global.u32 [%rd], %r;
+  ret;
+})";
+  CUmodule module = nullptr;
+  CUfunction function = nullptr;
+  check(cuModuleLoadData(&module, ptx) == CUDA_SUCCESS);
+  check(cuModuleGetFunction(&function, module, "census_store") == CUDA_SUCCESS);
+  CUdeviceptr dst = reinterpret_cast<CUdeviceptr>(buffer.ptr);
+  unsigned value = 42;
+  void* args[] = {&dst, &value};
+  check(cuteafd_cuda_graph_begin_capture(pending) == CUTEAFD_STATUS_OK);
+  check(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
+      reinterpret_cast<CUstream>(pending), args, nullptr) == CUDA_SUCCESS);
+  check(cuteafd_cuda_graph_end_capture(pending, &graph) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_graph_launch(graph, pending) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
+  unsigned actual = 0;
+  check(cudaMemcpy(&actual, buffer.ptr, sizeof(actual), cudaMemcpyDeviceToHost) == cudaSuccess && actual == value);
+  std::ifstream captures(profile / "graph-census-captures-selftest.jsonl");
+  std::ostringstream records;
+  records << captures.rdbuf();
+  const auto text = records.str();
+  check(text.find("\"cuda_driver_version\":") != std::string::npos);
+  check(text.find("\"kernel\":\"census_store\"") != std::string::npos);
+  check(text.find("\"param_count\":2,\"param_bytes\":12,\"param_payload_bytes\":12,\"param_status\":0") != std::string::npos);
+  check(text.find("\"constant_status\":0") != std::string::npos);
+  check(text.find("\"local_status\":0") != std::string::npos);
+  check(cudaGetLastError() == cudaSuccess);
+  check(cuteafd_cuda_graph_exec_destroy(graph) == CUTEAFD_STATUS_OK);
+  check(cuModuleUnload(module) == CUDA_SUCCESS);
+  std::filesystem::remove_all(profile);
   check(cuteafd_cuda_event_destroy(end) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_event_destroy(start) == CUTEAFD_STATUS_OK);
   check(cuteafd_free_device_buffer(&buffer) == CUTEAFD_STATUS_OK);

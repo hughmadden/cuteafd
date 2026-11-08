@@ -2312,6 +2312,8 @@ impl<'a> MimoEngine<'a> {
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
         let exec = GraphExec(exec?, self.library);
+        crate::shared::decode_graph::census::capture_key("mimo_v2", "decode",
+            graphs.as_ptr() as usize, rank as i32, Some(0), &key, exec.0);
         if launch {
             // SAFETY: as for a replay.
             self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.0, stream) })?;

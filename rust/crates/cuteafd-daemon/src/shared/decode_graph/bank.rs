@@ -126,6 +126,11 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     pub fn startup_declared(&self) -> bool { self.startup.is_some() }
 
+    pub fn census_capture_key(&self, bank: &str, rank: i32, lane: Option<usize>, key: &K,
+        exec: *mut std::ffi::c_void) {
+        super::census::capture_key(self.family, bank, self as *const Self as usize, rank, lane, key, exec);
+    }
+
     pub fn capture_allowed(&self, key: &K) -> bool {
         !self.startup_sealed && self.startup.as_ref().map_or(
             self.policy != GraphPolicy::FixedStartup, |keys| keys.contains(key))
