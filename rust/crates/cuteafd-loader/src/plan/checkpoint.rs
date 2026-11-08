@@ -103,7 +103,7 @@ pub struct Checkpoint {
     pub quantize_config: Option<Value>,
     /// Authoritative inventory, including tensors whose shards are not local.
     pub weight_map: BTreeMap<String, String>,
-    /// Payload and declared native-attention classification headers, sorted by name.
+    /// Headers selected for this role's payload, sorted by name.
     pub tensors: Vec<CheckpointTensor>,
     /// Shards named by the index that are not readable (absent or incomplete).
     pub missing_shards: Vec<String>,
@@ -143,20 +143,34 @@ impl Checkpoint {
         self.view.as_ref().map_or(AttentionMode::Hqa, CheckpointView::mode)
     }
 
-    /// Whether this role has loaded a tensor header, independent of index membership.
+    /// Whether a payload or classification header is available, independent of index membership.
     pub fn has_header(&self, name: &str) -> bool {
-        self.tensors.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name)).is_ok()
+        self.header(name).is_some()
+    }
+
+    /// Validated metadata for classification, including native operands not owned by this role.
+    pub fn header(&self, name: &str) -> Option<&SafetensorsTensorMetadata> {
+        [self.tensors.as_slice(), self.classification_headers()].into_iter().find_map(|headers|
+            headers.binary_search_by(|tensor| tensor.meta.name.as_str().cmp(name))
+                .ok().map(|at| &headers[at].meta))
+    }
+
+    fn classification_headers(&self) -> &[CheckpointTensor] {
+        self.view.as_ref().map_or(&[], |view| view.classification_headers.as_slice())
     }
 
     /// Per-projection classification shared by runtime and push planning.
     /// Call on a role-opened checkpoint so all selected projection headers exist.
     pub fn projection(&self, stem: &str) -> Result<SelectedProjection> {
         let prefix = format!("{stem}.");
-        let start = self.tensors.partition_point(|tensor| tensor.meta.name.as_str() < prefix.as_str());
-        let tensors: Vec<_> = self.tensors[start..].iter()
-            .take_while(|tensor| tensor.meta.name.starts_with(&prefix))
-            .filter(|tensor| !tensor.meta.name[prefix.len()..].contains('.')
-                && self.contains_tensor(&tensor.meta.name)).cloned().collect();
+        let mut tensors = Vec::new();
+        for headers in [self.tensors.as_slice(), self.classification_headers()] {
+            let start = headers.partition_point(|tensor| tensor.meta.name.as_str() < prefix.as_str());
+            tensors.extend(headers[start..].iter()
+                .take_while(|tensor| tensor.meta.name.starts_with(&prefix))
+                .filter(|tensor| !tensor.meta.name[prefix.len()..].contains('.')
+                    && self.contains_tensor(&tensor.meta.name)).cloned());
+        }
         let weight = tensors.iter().find(|tensor| tensor.meta.name == format!("{stem}.weight"));
         let trellis = tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.trellis"));
         ensure!(!(weight.is_some() && trellis), "{stem}: checkpoint contains both native and EXL3 storage");
@@ -234,8 +248,8 @@ impl Checkpoint {
     }
 
     /// A runtime role declares its payload reads before any shard is opened.
-    /// Declared native-attention headers also remain available for classification;
-    /// they do not add role payload bytes. Every selected header must be readable.
+    /// Declared native-attention headers remain available for classification only,
+    /// outside `tensors` and role payload bytes. Every selected header must be readable.
     pub fn open_view_for_role(view: &CheckpointView, role: &str, needed: impl Fn(&str) -> bool) -> Result<Self> {
         Self::open_view_filtered(view, Some(role), needed, None)
     }
@@ -303,6 +317,7 @@ impl Checkpoint {
             if needed(name) || native.contains(name.as_str()) { shards.entry(shard).or_default().insert(name); }
         }
         let mut tensors = Vec::with_capacity(weight_map.len());
+        let mut classification_headers = Vec::new();
         let mut missing_shards = Vec::new();
         let mut shard_bytes = 0u64;
         for (shard, names) in shards {
@@ -343,18 +358,21 @@ impl Checkpoint {
             if names.iter().any(|name| needed(name)) { shard_bytes += metadata.len(); }
             for meta in headers {
                 if names.contains(meta.name.as_str()) {
-                    tensors.push(CheckpointTensor {
-                        shard: shard.clone(),
-                        meta,
-                    });
+                    let selected = needed(&meta.name);
+                    let tensor = CheckpointTensor { shard: shard.clone(), meta };
+                    if selected { tensors.push(tensor); }
+                    else { classification_headers.push(tensor); }
                 }
             }
         }
-        view.check_attention_headers(tensors.iter().map(|tensor| &tensor.meta))?;
+        view.check_attention_headers(tensors.iter().chain(&classification_headers).map(|tensor| &tensor.meta))?;
         tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        classification_headers.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        let mut view = view.clone();
+        view.classification_headers = std::sync::Arc::new(classification_headers);
         debug_assert!(tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
         Ok(Self {
-            view: Some(view.clone()),
+            view: Some(view),
             snapshot: snapshot.to_path_buf(),
             config,
             quantize_config,
@@ -382,8 +400,7 @@ impl Checkpoint {
     pub fn module_numerics(&self, module: &str) -> Result<ModuleNumerics> {
         let stem = module.strip_suffix(".weight").unwrap_or(module);
         let weight = format!("{stem}.weight");
-        let dtype = self.tensors.binary_search_by(|tensor| tensor.meta.name.cmp(&weight))
-            .ok().map(|at| self.tensors[at].meta.dtype.clone());
+        let dtype = self.header(&weight).map(|header| header.dtype.clone());
         match dtype {
             Some(dtype) => self.module_numerics_with_header(stem, dtype),
             None => self.declared_numerics(stem),
