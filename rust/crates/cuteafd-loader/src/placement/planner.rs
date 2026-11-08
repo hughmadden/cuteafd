@@ -192,7 +192,7 @@ impl<'a> CoordinatorDevices<'a> {
     }
 
     /// Preserve the selected plan, capacities and chronology while translating
-    /// backing identities in every owner scope, including resident-weight claims.
+    /// backing identities in every owner scope, including derived-owner references.
     pub fn remap_plan_weight_arenas(self, plan: &ResolvedPlan) -> Result<ResolvedPlan, Refusal> {
         validate(&plan.facts, &plan.budgets)?;
         let allocations = plan.facts.allocations.iter().chain(&plan.facts.deferred)
@@ -203,6 +203,14 @@ impl<'a> CoordinatorDevices<'a> {
         let mut out = plan.clone();
         for owner in &mut out.facts.resident_weights {
             if let Some(id) = names.get(owner.id.as_str()) { owner.id = (*id).into(); }
+        }
+        for mapping in &mut out.facts.driver_page_tables {
+            if let Some(id) = names.get(mapping.backing.as_str()) { mapping.backing = (*id).into(); }
+        }
+        for owner in &mut out.facts.allocation_granularity {
+            for backing in &mut owner.backings {
+                if let Some(id) = names.get(backing.backing.as_str()) { backing.backing = (*id).into(); }
+            }
         }
         for (owner, mapped) in out.facts.allocations.iter_mut().chain(&mut out.facts.deferred)
             .chain(out.facts.sequential.iter_mut().flat_map(|group| &mut group.members)).zip(mapped) {
