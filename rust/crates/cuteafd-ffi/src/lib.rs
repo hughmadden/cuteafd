@@ -2333,6 +2333,7 @@ impl NativeLibrary {
         let rdma_rc_endpoint_try_poll_fn =
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;
+        memory_ledger::fault::install(&lib);
         Ok(Self {
             artifact_root,
             loaded_path: path,
@@ -2410,9 +2411,11 @@ impl NativeLibrary {
 
     pub fn free_host_buffer(&self, buffer: &mut CuteafdHostBuffer) -> Result<()> {
         let free_fn: FreeHostBufferFn = self.cuteafd_free_host_buffer()?;
-        memory_ledger::record_free(buffer.ptr as usize);
+        let address = buffer.ptr as usize;
         let status = unsafe { free_fn(buffer) };
-        self.status_to_result("cuteafd_free_host_buffer", status)
+        self.status_to_result("cuteafd_free_host_buffer", status)?;
+        memory_ledger::record_free(address);
+        Ok(())
     }
 
     /// Physical free and total bytes, including other processes and CUDA's
@@ -2481,7 +2484,7 @@ impl NativeLibrary {
         budget.admit(cuteafd_core::serving_capacity::DeviceMemory {
             device: u32::try_from(self.cuda_get_device()?)?, total_bytes: total as u64,
             baseline_free_bytes: free as u64,
-        }, bytes as u64)?;
+        }, bytes as u64).map_err(|error| memory_ledger::capture_failure(error.into()))?;
         Ok(Some(guard))
     }
 
@@ -2603,9 +2606,11 @@ impl NativeLibrary {
 
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
         let free_fn: FreeDeviceBufferFn = self.cuteafd_free_device_buffer()?;
-        memory_ledger::record_free(buffer.ptr as usize);
+        let address = buffer.ptr as usize;
         let status = unsafe { free_fn(buffer) };
-        self.status_to_result("cuteafd_free_device_buffer", status)
+        self.status_to_result("cuteafd_free_device_buffer", status)?;
+        memory_ledger::record_free(address);
+        Ok(())
     }
 
     pub fn cuda_stream_create(&self) -> Result<*mut c_void> {
@@ -5087,6 +5092,7 @@ impl NativeLibrary {
 
     fn status_to_result(&self, context: &str, status: CuteafdStatus) -> Result<()> {
         if status == CUTEAFD_STATUS_OK {
+            memory_ledger::fault::clear_failure();
             return Ok(());
         }
         let last_error = self

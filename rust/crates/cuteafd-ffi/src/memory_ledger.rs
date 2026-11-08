@@ -10,6 +10,8 @@
 //! (context, modules, cuBLAS, graph executables) is the gap between the ledger
 //! and `cudaMemGetInfo`.
 
+pub mod fault;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -56,6 +58,8 @@ struct Live {
     key: Key,
     bytes: usize,
     endpoint: Option<usize>,
+    name: Option<&'static str>,
+    site: &'static std::panic::Location<'static>,
 }
 
 /// Aggregation key: pool, device (-1 for host memory), category, tensor stem
@@ -81,6 +85,9 @@ struct State {
     peak: BTreeMap<(Space, i32), usize>,
     current: BTreeMap<(Space, i32), usize>,
     audits: Vec<Weak<Mutex<AuditEvents>>>,
+    ready: bool,
+    post_ready_bytes: usize,
+    post_ready_sites: BTreeMap<&'static std::panic::Location<'static>, usize>,
     unscoped_sites: HashSet<&'static std::panic::Location<'static>>,
 }
 
@@ -329,6 +336,14 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
     let caller = std::panic::Location::caller();
     let site = CONTEXT.with(|context| context.borrow().site).unwrap_or(caller);
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = state.live.get_mut(&ptr) {
+        if existing.bytes == bytes && existing.key == key {
+            // The raw native allocation event may precede its Rust wrapper's
+            // ownership registration; it is one backing, not pointer reuse.
+            if endpoint.is_some() { existing.endpoint = endpoint; }
+            return;
+        }
+    }
     let warn = key.scope == "other" && matches!(space, Space::Device | Space::Pinned | Space::Managed)
         && state.unscoped_sites.insert(site);
     if let (Some(name), Some(format)) = (name, key.format) {
@@ -347,7 +362,7 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
     let now = *current;
     let peak = state.peak.entry((space, device)).or_default();
     *peak = (*peak).max(now);
-    if let Some(previous) = state.live.insert(ptr, Live { key, bytes, endpoint }) {
+    if let Some(previous) = state.live.insert(ptr, Live { key, bytes, endpoint, name, site }) {
         // A pointer reused without a recorded free (freed outside the library).
         release(&mut state, previous);
         audit_event(&mut state, AllocationEvent::UnobservedRelease(AllocationRecord {
@@ -355,7 +370,18 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
         }));
     }
     audit_event(&mut state, AllocationEvent::Allocated(AllocationRecord { address: ptr, key, bytes, endpoint }));
+    let growth = state.ready && matches!(space, Space::Device | Space::Pinned | Space::Managed);
+    let new_site = growth && !state.post_ready_sites.contains_key(site);
+    if growth {
+        state.post_ready_bytes = state.post_ready_bytes.saturating_add(bytes);
+        *state.post_ready_sites.entry(site).or_default() += bytes;
+    }
+    let post_ready_bytes = state.post_ready_bytes;
     drop(state);
+    if new_site {
+        tracing::info!(target: "cuteafd::memory", %site, bytes, post_ready_bytes,
+            scope = key.scope, "post-ready growth");
+    }
     if warn {
         tracing::warn!(target: "cuteafd::memory", %site, owner = key.owner,
             tensor = key.tensor, name, bytes, device, space = space.label(),
@@ -374,6 +400,12 @@ fn release(state: &mut State, live: Live) {
     if let Some(current) = state.current.get_mut(&(live.key.space, live.key.device)) {
         *current = current.saturating_sub(live.bytes);
     }
+}
+
+/// Read-only source locations keyed by live physical backing address.
+pub fn allocation_sites() -> BTreeMap<usize, &'static std::panic::Location<'static>> {
+    state().lock().unwrap_or_else(|e| e.into_inner()).live.iter()
+        .map(|(&address, live)| (address, live.site)).collect()
 }
 
 /// Read one live-byte counter without cloning the allocation ledger.
@@ -501,6 +533,7 @@ pub fn snapshot() -> Snapshot {
 pub struct FailureSnapshot {
     pub ledger: Snapshot,
     pub device_memory: BTreeMap<i32, (usize, usize)>,
+    pub report: Option<Arc<fault::FailureReport>>,
     source: anyhow::Error,
 }
 
@@ -517,7 +550,7 @@ impl std::error::Error for FailureSnapshot {
 impl FailureSnapshot {
     pub fn new(source: anyhow::Error, ledger: Snapshot,
         device_memory: BTreeMap<i32, (usize, usize)>) -> Self {
-        Self { ledger, device_memory, source }
+        Self { ledger, device_memory, source, report: None }
     }
 
     fn into_error(self) -> anyhow::Error {
@@ -533,13 +566,15 @@ impl FailureSnapshot {
 }
 
 pub(crate) fn capture_failure(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| cause.is::<FailureSnapshot>()) { return error; }
+    let report = fault::take_failure().or_else(fault::fallback);
     let ledger = snapshot();
-    // Error reporting must not change the failing thread's selected device.
-    let devices = ledger.devices();
-    let device_memory = std::thread::spawn(move || devices.into_iter()
-        .filter_map(|device| device_memory(device).map(|memory| (device, memory))).collect())
-        .join().unwrap_or_default();
-    FailureSnapshot::new(error, ledger, device_memory).into_error()
+    // A native callback has already sampled before cleanup. Do not replace it
+    // with post-cleanup telemetry or change the failing thread's device.
+    let device_memory = BTreeMap::new();
+    let mut failure = FailureSnapshot::new(error, ledger, device_memory);
+    failure.report = report;
+    failure.into_error()
 }
 
 fn loaded_cuda_runtime() -> Option<&'static libloading::os::unix::Library> {
