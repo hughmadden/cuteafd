@@ -2492,8 +2492,11 @@ audio_encoder_hash=""
     count_args+=(--config /run/cuteafd-plan.config)
     plan_config_mounts=(-v "$plan_config:/run/cuteafd-plan.config:ro")
   fi
-  # Keep checkpoint paths unchanged inside the full namespace mount.
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
+  # Keep checkpoint paths unchanged inside the full namespace mount. The plan
+  # admits under the same instrumentation the server will launch with, so a
+  # profiled run (e.g. PROFILE=census) plans what that server actually charges.
+  shared_profile_args
+  plan_json="$(docker run --rm --network none "${profile_args[@]}" "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}" "${plan_memory_args[@]}" \
     --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --coordinator-weight-budget-gib "$(release_gib "$plan_cap")" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -2858,7 +2861,6 @@ peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")
 shared_api_state "$coordinator_image" "${instance:-default}"
 family_args+=("${api_args[@]}")
-shared_profile_args
 shared_graph_census_args
 shared_bench_nonce_args
 tp2_env_args=()
