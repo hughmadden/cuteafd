@@ -119,7 +119,7 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     let mut actual = Digests::new();
     mount(&library, &checkpoint, &cfg, |fp8_decode| Qwen4Loader { library: &library, checkpoint: &checkpoint,
         fp8_decode, fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
-        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&library)) }, &mut actual)?;
+        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&library)), arenas: None }, &mut actual)?;
     check(&actual)
 }
 
@@ -147,7 +147,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
         for placed in [false, true] {
             let load = std::rc::Rc::new(DenseLoad::push(&library));
             let loader = Qwen4Loader { library: &library, checkpoint: &checkpoint, fp8_decode: fp8,
-                fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(), dense: load.clone() };
+                fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(), dense: load.clone(), arenas: None };
             let weights = if placed {
                 let ranks: Vec<_> = (0..2).map(|id| (Device { library: &library, id }, std::ptr::null_mut())).collect();
                 loader.model_placed(&cfg, &(0..layers).map(|l| l % 2).collect::<Vec<_>>(), &ranks, true, true)?
