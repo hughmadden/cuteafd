@@ -504,6 +504,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     };
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
+    match kimi::stream_slab_owners(gpus, maximum_pages) {
+        Ok(owners) => recipe.owners.extend(owners),
+        Err(error) => { report.refuse_placement(format!("Kimi stream slab owners refused: {error}"),
+            "Use supported coordinator stream counts."); return memory; }
+    }
     match kimi::native_load_owners(&model.core, gpus, maximum_pages) {
         Ok(owners) => recipe.owners.extend(owners),
         Err(error) => { report.refuse_placement(format!("Kimi native load owners refused: {error:#}"),

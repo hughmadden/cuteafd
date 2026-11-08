@@ -941,6 +941,20 @@ pub fn host_upload_owner(maximum: u64) -> Component {
             assumed: true }) }
 }
 
+/// Retained CUDA stream slabs are driver storage that survives every destroyed
+/// stream, so one owner per coordinator GPU charges the startup live peak. This
+/// is not a cudaMalloc request and receives no allocation-tail charge (#1511).
+pub fn stream_slab_owners(ranks: usize, maximum: u64) -> Result<Vec<Component>, Refusal> {
+    let peak = crate::plan::families::kimi::startup_peak_live_streams();
+    let bytes = cuda_stream_slab_bytes(peak)?;
+    Ok((0..ranks).map(|rank| Component {
+        activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum),
+        kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
+            bytes, lifetime: Lifetime::RESIDENT, assumed: false,
+            source: format!("kimi/driver-stream-slabs/gpu{rank} ({peak} peak live streams, SM120 driver/runtime 13020 LAZY, #1511 2026-11-08)") }),
+    }).collect())
+}
+
 pub fn host_scoring_bytes(decode_rows: usize, prefill_rows: usize, vocab: usize) -> Result<u64, Refusal> {
     cuteafd_core::memory_layout::host_logits_bytes(decode_rows as u64, prefill_rows as u64, vocab as u64)
         .ok_or(Refusal::Overflow("Kimi host scoring logits"))
@@ -954,9 +968,14 @@ pub fn host_scoring_owner(bytes: u64, maximum: u64) -> Component {
     )
 }
 
+/// The retained prefix quota is one portable mapped pin, allocated when the
+/// shared scheduler builds the cache before readiness. `add_driver_page_tables`
+/// therefore charges one SM120 mapping per coordinator context at
+/// ceil(bytes / 512) from Ready, matching Step-5's portable host prefix.
 pub fn host_prefix_owner(bytes: u64, maximum: u64) -> Component {
-    Component::allocation(Allocation::buffer("kimi.host.prefix", Location::HOST, bytes,
-        Lifetime::RESIDENT, Category::Prefix, "Kimi retained host prefix quota"),
+    Component::allocation(Allocation::buffer("kimi.host.prefix", Location::PINNED, bytes,
+        Lifetime { first: Phase::Ready, last: Phase::Growth }, Category::Prefix,
+        "Kimi retained host prefix quota"),
         ByteCurve::fixed(bytes, maximum), true, maximum)
 }
 
@@ -1204,9 +1223,11 @@ mod tests {
         host.logical_bytes = envelope.bytes().unwrap() + 1024;
         budgets.push(host);
         let admitted = recipe.admit(single(), budgets.clone()).unwrap();
-        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(0));
+        // The retained prefix joins at Ready; Load holds only the push staging.
+        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(1024));
         assert_eq!(admitted.solved.remaining("host", Phase::Ready), Some(envelope.bytes().unwrap()));
-        budgets.last_mut().unwrap().logical_bytes -= 1;
+        // Load owns the push staging alone; one byte below its exact threshold refuses.
+        budgets.last_mut().unwrap().logical_bytes -= 1024 + 1;
         let refusal = recipe.admit(single(), budgets).unwrap_err();
         let limiting = match &refusal {
             Refusal::FullContextShortfall { limiting, .. } => limiting.as_ref(),
@@ -1261,9 +1282,65 @@ mod tests {
         budgets.push(host);
         let admitted = recipe.admit(single(), budgets.clone()).unwrap();
         assert_eq!(admitted.solved.remaining("host", Phase::Ready), Some(0));
-        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(scoring));
+        // The portable prefix is retained from Ready, so Load holds no host bytes.
+        assert_eq!(admitted.solved.remaining("host", Phase::Load), Some(1024 + scoring));
         budgets.last_mut().unwrap().logical_bytes -= 1;
         assert!(recipe.admit(single(), budgets).is_err());
+    }
+
+    #[test]
+    fn portable_host_prefix_maps_once_per_coordinator_context_only_while_retained() {
+        use crate::placement::planner::{driver_page_table_bytes, Location, Phase};
+        for gpus in [1, 2] {
+            let mut recipe = recipe();
+            recipe.gpus = gpus;
+            recipe.records_per_page = vec![64; gpus];
+            recipe.arenas = recipe.arenas.iter().map(|arena| Arena { count: arena.count,
+                peak: vec![arena.peak[0]; gpus], resident: vec![arena.resident[0]; gpus],
+                weights: vec![arena.weights[0]; gpus] }).collect();
+            let bytes = 1 << 30;
+            recipe.owners.push(host_prefix_owner(bytes, recipe.maximum_pages));
+            let mut contract = recipe.prepare(&single()).unwrap();
+            contract.add_driver_page_tables();
+            let selected = vec![0; contract.variables.len()];
+            let facts = contract.facts(&selected, 1).unwrap();
+            let prefix = facts.deferred.iter().find(|owner| owner.id == "kimi.host.prefix").unwrap();
+            assert_eq!((prefix.location, prefix.bytes), (Location::PINNED, bytes));
+            assert!(prefix.lifetime.contains(Phase::Ready, facts.phase_order));
+            assert!(prefix.lifetime.contains(Phase::Growth, facts.phase_order));
+            assert!(!prefix.lifetime.contains(Phase::Load, facts.phase_order));
+            let mappings = facts.driver_page_tables.iter().filter(|owner|
+                owner.backing == prefix.id).collect::<Vec<_>>();
+            assert_eq!(mappings.len(), gpus);
+            for rank in 0..gpus {
+                let mapping = mappings.iter().find(|owner|
+                    owner.location == Location::coordinator(rank as u8)).unwrap();
+                assert_eq!(mapping.mapped_bytes, bytes);
+                assert_eq!(mapping.bytes(), driver_page_table_bytes(bytes));
+                assert!(!mapping.lifetime.contains(Phase::Load, facts.phase_order));
+                assert!(mapping.lifetime.contains(Phase::Ready, facts.phase_order));
+                assert!(mapping.lifetime.contains(Phase::Growth, facts.phase_order));
+            }
+        }
+    }
+
+    #[test]
+    fn stream_slab_owner_charges_the_startup_live_peak_per_coordinator_context() {
+        let peak = crate::plan::families::kimi::startup_peak_live_streams();
+        assert_eq!(peak, 7);
+        let bytes = cuda_stream_slab_bytes(peak).unwrap();
+        assert_eq!(bytes, 4 << 20);
+        let owners = stream_slab_owners(2, 4).unwrap();
+        assert_eq!(owners.len(), 2);
+        for (rank, component) in owners.iter().enumerate() {
+            let ComponentKind::Allowance(owner) = &component.kind else { panic!("stream slabs are one allowance") };
+            assert!(!owner.assumed);
+            assert_eq!(owner.location, Location::coordinator(rank as u8));
+            assert_eq!(owner.bytes, bytes);
+            assert_eq!(owner.lifetime, Lifetime::RESIDENT);
+            assert!(owner.source.starts_with(&format!("kimi/driver-stream-slabs/gpu{rank} ({peak} peak live streams")));
+            assert_eq!(component.bytes.at(4).unwrap(), bytes);
+        }
     }
 
     #[test]

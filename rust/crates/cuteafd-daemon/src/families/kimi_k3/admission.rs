@@ -882,6 +882,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let scoring_bytes = kimi::host_scoring_bytes(if full_prefill_logits { rows } else { rows.min(64) }, rows, cfg.vocab_size)?;
     recipe.owners.push(kimi::host_scoring_owner(scoring_bytes, maximum_pages));
     recipe.owners.push(kimi::host_upload_owner(maximum_pages));
+    recipe.owners.extend(kimi::stream_slab_owners(RANKS, maximum_pages)?);
     let push_host = kimi::selected_push_host_envelope(cfg, &core, RANKS)?;
     recipe.owners.extend(kimi::push_host_owners(&push_host, maximum_pages)?);
     recipe.owners.extend(kimi::native_load_owners(&core, RANKS, maximum_pages)?);
