@@ -830,6 +830,22 @@ mod draft_cli_tests {
         check_options(&parse(&["--fp8-head", "packed", "--target-head", "exact"])).unwrap();
     }
 
+    #[test]
+    fn native_k6_head_normalizes_before_conversion_only_refusals() {
+        for extra in [
+            &["--fp8-head", "packed", "--split-device", "1"][..],
+            &["--fp8-head", "packed", "--target-head", "tensor"][..],
+            &["--fp8-head", "true", "--target-head", "tensor"][..],
+        ] {
+            let mut args = parse(extra);
+            native::normalize_head(&mut args, false);
+            assert!(check_options(&args).is_err());
+            native::normalize_head(&mut args, true);
+            assert_eq!(args.head_format, head::GlmfHeadFormat::Bf16);
+            check_options(&args).unwrap();
+        }
+    }
+
     /// `--fp8-head` keeps its boolean spellings (a bare flag is FP8) and adds `packed`, the exact
     /// 12-bit head, which serves one GPU: the head split is refused before any load.
     #[test]
@@ -1724,11 +1740,14 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         ensure!(args.exlr8_manifest.is_some(), "native Flash requires --exlr8-manifest k2, k3 or k4");
         ensure!(args.kda_state == engine::KdaState::F32, "native Flash requires F32 KDA state programs");
     } else { ensure!(args.exlr8_manifest.is_none(), "--exlr8-manifest requires a native EXLR8 checkpoint"); }
+    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
+    let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
+    let core = if native { Default::default() } else {
+        cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)? };
+    native::normalize_head(&mut resolved, core.get_weight("lm_head").is_some());
     native::publish_resolved(&resolved);
     let args = &resolved;
     check_options(args)?;
-    let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
-    let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
     cuteafd_bench::context::set_family(cfg.family_id());
     native::validate_headers(format, || {
         header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
@@ -1736,8 +1755,6 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         Ok(())
     })?;
     if let Some(snapshot) = &args.draft {
-        let core = if native { Default::default() } else {
-            cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)? };
         if !native && core.get_weight("lm_head").is_none() {
             let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
                 .context("DFlash target has no supported vocabulary head")?;
@@ -2123,12 +2140,7 @@ impl Opened {
             resolved.kda_output_shard = false;
             resolved.kda_prefill_expanded = false;
         }
-        if core.get_weight("lm_head").is_some() {
-            if args.head_format != head::GlmfHeadFormat::Bf16 {
-                tracing::warn!(requested = args.head_format.setting(), "--fp8-head does not apply to the native K6 head");
-            }
-            resolved.head_format = head::GlmfHeadFormat::Bf16;
-        }
+        native::normalize_head(&mut resolved, core.get_weight("lm_head").is_some());
         if args.split_device.is_some()
             && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
             resolved.split_device = None;
@@ -2731,16 +2743,6 @@ impl Opened {
             .map(|owner| owner.bytes).sum::<u64>()).context("GLM Flash embedding admission")?;
         tracing::info!(rank = embedding_rank, device = embedding_device.id, bytes = embedding.device_bytes(),
             "GLM Flash embedding matches admission (peer-readable single residency)");
-        let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
-        let receipt_devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
-        let mut weight_census = crate::shared::memory::receipts::Census::default();
-        weight_census.owners(model.allocation_receipts(&shares, receipt_devices)?);
-        weight_census.owners(embedding.allocation_receipts(receipt_devices, "glm5_flash.embedding")?);
-        weight_census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
-        tracing::info!(owners = weight_census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),
-            aliases = weight_census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),
-            "GLM Flash retained weight arena census");
-        probe("target-weights")?;
         // `--fp8-head packed`: every operand has landed (through the mount, or the committed push
         // group), so the BF16 head packs into its exact 12-bit copy and is released.
         let model = if args.head_format == head::GlmfHeadFormat::Packed {
@@ -2752,6 +2754,16 @@ impl Opened {
             })?;
             weights::GlmfWeights { layers: body, norm, head }
         } else { model };
+        let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
+        let receipt_devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+        let mut weight_census = crate::shared::memory::receipts::Census::default();
+        weight_census.owners(model.allocation_receipts(&shares, receipt_devices)?);
+        weight_census.owners(embedding.allocation_receipts(receipt_devices, "glm5_flash.embedding")?);
+        weight_census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        tracing::info!(owners = weight_census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),
+            aliases = weight_census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),
+            "GLM Flash retained weight arena census");
+        probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
         let single = model.check_single_residency(args.kda_fp8, args.head_format)?;

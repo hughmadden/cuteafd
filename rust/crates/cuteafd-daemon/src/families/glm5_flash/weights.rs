@@ -1493,6 +1493,7 @@ impl<'a> GlmfLoader<'a> {
                 super::head::GlmfHead::Fp8 { values, scales }
             } else if self.packed_head {
                 ensure!(self.tensor("lm_head.weight")?.meta.dtype == DType::Bf16, "--fp8-head packed packs a BF16 head");
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("staging/glmf.load.head.bf16");
                 let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
                 super::head::GlmfHead::Bf16(self.whole_in(0, "lm_head.weight", false)?)
             } else {

@@ -31,6 +31,15 @@ pub(super) fn normalize(args: &mut EngineArgs) {
     args.fp8_prefill.push(super::Fp8PrefillGroup::None);
 }
 
+pub(super) fn normalize_head(args: &mut EngineArgs, native_head: bool) {
+    if native_head {
+        if args.head_format != super::head::GlmfHeadFormat::Bf16 {
+            tracing::warn!(requested = args.head_format.setting(), "--fp8-head does not apply to the native K6 head");
+        }
+        args.head_format = super::head::GlmfHeadFormat::Bf16;
+    }
+}
+
 pub(super) fn publish_resolved(args: &EngineArgs) {
     for (name, value) in resolved_settings(args) { cuteafd_bench::context::set_resolved(name, &value); }
 }
