@@ -7,8 +7,9 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use std::{borrow::Cow, collections::HashMap, ffi::c_void, path::{Path, PathBuf}};
 
-#[derive(Clone, Copy)]
-pub(crate) enum ShardAxis { Rows, Columns }
+pub(crate) use cuteafd_loader::families::glm5::draft_physical::{
+    ShardAxis, gqa_weight_recipe, gqa_checkpoint_arena_requests as gqa_arena_requests,
+};
 
 fn shard(mut rect: Rect, axis: ShardAxis, rank: usize, ranks: usize) -> Result<Rect> {
     ensure!(matches!(ranks, 1 | 2) && rank < ranks, "drafter shard rank {rank} of {ranks}");
@@ -55,13 +56,6 @@ impl Source {
 
     fn parts(&self, parts: &[(&str, usize)], cols: usize) -> Result<Vec<Rect>> {
         parts.iter().map(|(name, rows)| self.rect(name, &[*rows, cols])).collect()
-    }
-
-    fn matrix_rects(&self, parts: &[(&str, usize)], cols: usize, axis: Option<ShardAxis>,
-        rank: usize, ranks: usize) -> Result<Vec<Rect>> {
-        self.parts(parts, cols)?.into_iter().map(|rect| match axis {
-            Some(axis) => shard(rect, axis, rank, ranks), None => Ok(rect),
-        }).collect()
     }
 
     pub fn rect(&self, name: &str, shape: &[usize]) -> Result<Rect> {
@@ -288,60 +282,6 @@ impl<'a, 'b> Load<'a, 'b> {
     }
 }
 
-pub(crate) struct GqaLayerWeights<T, M> {
-    pub input_norm: T, pub post_norm: T,
-    pub attn_conv: M, pub attn_base: T, pub mlp_conv: M, pub mlp_base: T,
-    pub qkv: M, pub q_norm: T, pub k_norm: T, pub o: M, pub gate_up: M, pub down: M,
-}
-
-pub(crate) struct GqaWeights<T, M> {
-    pub layers: Vec<GqaLayerWeights<T, M>>,
-    pub fc: M, pub hidden_norm: T, pub norm: T,
-    pub selector: Option<(M, T, T)>,
-}
-
-/// The same traversal selects checkpoint slices for CPU requests and real loading.
-/// Only immutable destinations pass through these two operations.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gqa_weight_recipe<T, M>(
-    source: &cuteafd_loader::families::glm5::draft_physical::GlmDflashConfig,
-    rank: usize, ranks: usize,
-    tensor: impl Fn(&str, &[usize]) -> Result<T>,
-    matrix: impl Fn(&[(&str, usize)], usize, Option<ShardAxis>) -> Result<M>,
-) -> Result<GqaWeights<T, M>> {
-    ensure!(rank < ranks, "invalid DFlash recipe rank {rank}/{ranks}");
-    let cfg = source.for_tp(ranks)?;
-    let h = cfg.hidden;
-    let mut layers = Vec::with_capacity(cfg.layers);
-    for l in 0..cfg.layers {
-        let p = format!("layers.{l}");
-        let a = format!("{p}.self_attn");
-        layers.push(GqaLayerWeights {
-            input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
-            post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-            attn_conv: matrix(&[(&format!("{p}.attention_conv.kernel_projection.weight"), cfg.conv_width())], h, None)?,
-            attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-            mlp_conv: matrix(&[(&format!("{p}.mlp_conv.kernel_projection.weight"), cfg.conv_width())], h, None)?,
-            mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-            qkv: matrix(&[(&format!("{a}.q_proj.weight"), source.heads * cfg.head_dim),
-                (&format!("{a}.k_proj.weight"), source.kv_width()),
-                (&format!("{a}.v_proj.weight"), source.kv_width())], h, Some(ShardAxis::Rows))?,
-            q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
-            k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-            o: matrix(&[(&format!("{a}.o_proj.weight"), h)], source.heads * cfg.head_dim, Some(ShardAxis::Columns))?,
-            gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), source.intermediate),
-                (&format!("{p}.mlp.up_proj.weight"), source.intermediate)], h, Some(ShardAxis::Rows))?,
-            down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], source.intermediate, Some(ShardAxis::Columns))?,
-        });
-    }
-    Ok(GqaWeights { layers, fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h, None)?,
-        hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
-        selector: if rank == 0 { Some((matrix(&[("candidate_selector.hidden_projection.weight", cfg.rank)], h, None)?,
-            tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
-            tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?)) } else { None },
-    })
-}
-
 pub(crate) struct MlaLayerWeights<T, M> {
     pub input_norm: T, pub post_norm: T,
     pub attn_conv: M, pub attn_base: T, pub mlp_conv: M, pub mlp_base: T,
@@ -441,27 +381,6 @@ pub(crate) fn mla_arena_requests(snapshot: &Path,
             requests.borrow_mut().extend([(format!("{name}.uk"), m.heads * uk),
                 (format!("{name}.uv"), m.heads * uv)]);
             Ok(((), ()))
-        })?;
-    Ok(requests.into_inner())
-}
-
-pub(crate) fn gqa_arena_requests(snapshot: &Path,
-    representation: cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation,
-    rank: usize, ranks: usize) -> Result<Vec<(String, usize)>> {
-    use cuteafd_loader::families::glm5::draft_physical::GlmDflashConfig;
-    let cfg = GlmDflashConfig::read(snapshot)?;
-    let source = Source::open(snapshot)?;
-    for (name, shape) in cfg.tensor_shapes() { source.rect(&name, &shape)?; }
-    let requests = std::cell::RefCell::new(Vec::new());
-    gqa_weight_recipe(&cfg, rank, ranks,
-        |name, shape| {
-            let rect = source.rect(name, shape)?;
-            requests.borrow_mut().push((name.to_owned(), rect.bytes().max(256)));
-            Ok(())
-        },
-        |parts, cols, axis| {
-            let rects = source.matrix_rects(parts, cols, axis, rank, ranks)?;
-            matrix_requests(&requests, &rects, representation)
         })?;
     Ok(requests.into_inner())
 }
@@ -655,7 +574,10 @@ mod tests {
         }
         for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
             for ranks in [1, 2] { for rank in 0..ranks {
-                let expected = gqa_arena_requests(&snapshot, representation, rank, ranks)?;
+                let expected = cuteafd_loader::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
+                    &snapshot, representation, rank, ranks)?;
+                assert_eq!(expected, cuteafd_loader::families::glm5::draft_physical::gqa_arena_requests(
+                    &cfg, representation, rank, ranks)?);
                 #[allow(clippy::too_many_arguments)]
                 fn run<'a>(device: Device<'a>, snapshot: &Path, cfg: &super::super::dflash::DflashConfig,
                     rank: usize, ranks: usize, representation: GlmDraftRepresentation,
