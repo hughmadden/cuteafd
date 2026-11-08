@@ -449,7 +449,7 @@ mod tests {
                     assert_eq!(embedding.verify_resident()?, global.embedding);
                     census.owners(embedding.allocation_receipts(devices, "muse.embedding")?);
                 }
-                census.normalize(cuteafd_loader::placement::planner::PhaseOrder::DRAFT_THEN_TARGET)?;
+                census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
                 assert_eq!(census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count(), 1);
             }
         }

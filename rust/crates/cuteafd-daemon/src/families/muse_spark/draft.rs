@@ -220,7 +220,7 @@ mod tests {
             }
             drop(arenas);
             assert!(views.iter().all(|view| view.weight_backing().is_some()));
-            census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+            census.normalize(PhaseOrder::TARGET_THEN_DRAFT)?;
             assert_eq!(census.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count(), devices.len());
             library.cuda_set_device(0)?;
             drop(views);

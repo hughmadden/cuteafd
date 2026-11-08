@@ -402,7 +402,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         census.owners(owners.receipts);
         census.owners(embedding.allocation_receipts(devices, "muse.target.embedding")?);
         census.owners(draft_receipts);
-        census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+        census.normalize(PhaseOrder::TARGET_THEN_DRAFT)?;
         tracing::info!("Muse startup named census covers target weights and drafter; other owners remain in native-live records");
         Some(census)
     } else { None };
