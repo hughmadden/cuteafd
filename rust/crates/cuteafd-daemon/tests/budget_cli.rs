@@ -682,6 +682,51 @@ fn deployment_device_audit_accepts_real_v41_missing_export_refusal() {
     }
 }
 
+fn assert_v41_sim5090_head_pools(root: &std::path::Path, snapshot: &std::path::Path,
+    programs: &std::path::Path, hf_home: &std::path::Path) {
+    let matrix: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        root.join("scripts/bench/kits/gate/matrix-gate.json")).unwrap()).unwrap();
+    let entry = matrix["entries"].as_array().unwrap().iter()
+        .find(|entry| entry["name"] == "v41-flash-sim5090").unwrap();
+    let mut config = std::fs::read_to_string(root.join(entry["config"].as_str().unwrap())).unwrap();
+    for (key, value) in entry["set"].as_object().unwrap() {
+        config.push_str(&format!("\n{key}={}\n", value.as_str().unwrap()));
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("sim5090.config");
+    std::fs::write(&path, config).unwrap();
+    let cap = entry["set"]["GPU_MEMORY_CAP"].as_str().unwrap();
+    let context = entry["set"]["MAX_CONTEXT_TOKENS"].as_str().unwrap();
+    let ranks = entry["set"]["SPARK_COUNT"].as_str().unwrap();
+    let speculator = entry["set"]["SPECULATOR"].as_str().unwrap();
+    let concurrency = cuteafd_core::serving_capacity::default_concurrency(
+        cap.parse::<cuteafd_core::memory_policy::Size>().unwrap().0).to_string();
+    for head in ["all", "packed"] {
+        let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+            .arg(snapshot).arg("--config").arg(&path).arg("--workspace-manifest").arg(programs)
+            .arg("--hf-home").arg(hf_home)
+            .args(["--layout", "--json", "--require-ready", "--gpu-memory-cap", cap,
+                "--spark-ranks", ranks, "--available-sparks", ranks, "--speculator", speculator,
+                "--max-context-tokens", context, "--concurrency", &concurrency,
+                "--vision", "spark", "--audio", "off"])
+            .env("CUTEAFD_V41_FP8_HEAD", head).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("sim5090 {head}: {error}; {stderr}"));
+        assert!(output.status.success(), "sim5090 {head}: {stderr}; {:?}", report["hints"]);
+        assert_eq!(report["memory_layout"]["pool_tokens"], 1_048_576, "sim5090 {head}: {report}");
+    }
+}
+
+#[test]
+fn v41_sim5090_overlay_preserves_1m_pool_for_all_and_packed() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let snapshot = tempfile::tempdir().unwrap();
+    cuteafd_loader::plan::testing::write_v41_snapshot(snapshot.path());
+    let programs = cuteafd_loader::plan::testing::write_v41_workspaces(snapshot.path());
+    assert_v41_sim5090_head_pools(&root, snapshot.path(), &programs, snapshot.path());
+}
+
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
     root: &std::path::Path) {
@@ -733,6 +778,9 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
             installed_mimo_min_onboarding_matches_smoke(root, &snapshot, &example, &programs);
         }
         if config.get("MODEL_ID").is_some_and(|id| id.contains("DeepSeek-V4.1")) {
+            if name == "deepseek-v41-mxfp4-min.config" {
+                assert_v41_sim5090_head_pools(root, &snapshot, &programs, &hf_home);
+            }
             let temporary = tempfile::tempdir().unwrap();
             let interpreter = std::env::var_os("CUTEAFD_TEST_PYTHON")
                 .expect("CUTEAFD_TEST_PYTHON must name the gate's venv Python for launcher checks");

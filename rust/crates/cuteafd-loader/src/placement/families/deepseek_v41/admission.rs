@@ -951,7 +951,9 @@ pub fn expert_usage_geometry(config: &serde_json::Value) -> Result<cuteafd_core:
 }
 
 impl<'a> ProductionInput<'a> {
-    pub fn prepare(self) -> Result<PreparedV41<'a>, Refusal> {
+    pub fn prepare(mut self) -> Result<PreparedV41<'a>, Refusal> {
+        self.owners.extend(super::owners::packed_head_load_owners(&self.weight_arenas)
+            .map_err(|error| invalid(&error.to_string()))?);
         let routed = self.experts.len();
         if !(1..=2).contains(&self.gpus)
             || routed != 40

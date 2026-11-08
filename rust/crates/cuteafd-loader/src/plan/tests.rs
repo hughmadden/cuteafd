@@ -4878,10 +4878,15 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // card (8192, else a multiple of 64 rows), split into roundup64(R / k)
     // units; the pool takes what remains. Only an explicit pin changes it.
     use crate::serving_capacity::prefill_waves::unit_rows_in;
+    use crate::placement::families::deepseek_v41::resident::Fp8Head;
     let dir = strict_v41_snapshot(false);
+    // This synthetic boundary includes an extra 4 GiB drafter. Preserve its
+    // original E4M3-relative headroom, not a claim about a real 32 GiB card.
+    let source = 129280 * 5120 * 2;
+    let head_delta = Fp8Head::configured().resident(source).0 - Fp8Head::All.resident(source).0;
     let layout = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
-        drafter_bytes: 4 << 30, prefill_rows: 0, ..Default::default() };
+        drafter_bytes: (4 << 30) - head_delta, prefill_rows: 0, ..Default::default() };
     let roomy = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], ..layout.clone() }), ..sparks(4) };
     let roomy = plan_spark_count(dir.path(), &roomy, 6, Some(4)).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));

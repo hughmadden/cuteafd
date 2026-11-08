@@ -360,10 +360,11 @@ def test_serving_containers_keep_namespace_paths_and_host_identity() -> None:
         assert run["command"][run["command"].index("--snapshot") + 1].startswith("<root>/hf/hub/")
 
 
-@pytest.mark.parametrize("value", [None, "off", "draft", "all", "packed"])
-def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch, value) -> None:
-    """V41_FP8_HEAD=off|draft|all|packed forwards CUTEAFD_V41_FP8_HEAD to the coordinator and
-    the planner (both read it); unset forwards nothing (the engine default, all)."""
+@pytest.mark.parametrize("case", ["deepseek-v41-mxfp4-min", "deepseek-v41-mxfp4-max"])
+@pytest.mark.parametrize("value", [None, "auto", "off", "draft", "all", "packed"])
+def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch, value, case) -> None:
+    """Plan and serve receive the same unresolved head request on both layouts.
+    Unset forwards nothing; the shared engine resolver selects packed for unset/auto."""
     import v41_launch_capture as capture_module
 
     original = capture_module.example_config
@@ -375,7 +376,7 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         return config
 
     monkeypatch.setattr(capture_module, "example_config", with_key)
-    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    result = capture_module.capture(ROOT, case)
     coordinator = parse_run(result["containers"][0]["argv"])["env"]
     plan = result["plans"][0]
     if value is None:
@@ -531,7 +532,7 @@ def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeyp
     env["HF_HOME"] = str(tmp_root / "hf")
     result = subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config), "--dry-run"],
                             capture_output=True, text=True, env=env)
-    assert result.returncode == 2 and "V41_FP8_HEAD must be off, draft, all or packed" in result.stderr
+    assert result.returncode == 2 and "V41_FP8_HEAD must be auto, off, draft, all or packed" in result.stderr
     result = subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config), "--set", "V41_FP8_HEAD=off",
                              "--dry-run"], capture_output=True, text=True,
                             env={**env, "CUTEAFD_V41_FP8_HEAD": "draft"})
