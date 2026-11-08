@@ -363,6 +363,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             if host_embedding { for rank in &mut alternate { rank.embedding = 0; } }
             process.alternate_resident = Some(alternate);
         }
+        process.target(checkpoint, &inputs, exlr8)?;
         let geometry = glmf::admission::host_geometry(&inputs)?;
         let quota = if options.prefix_entries("glm5_flash") == 0 || options.host_cache_bytes == Some(0) { 0 }
             else { geometry.resolve(options.host_cache_bytes, context, sequences, host.0, geometry.chunk_bytes())

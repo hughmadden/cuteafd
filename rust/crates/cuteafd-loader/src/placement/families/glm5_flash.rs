@@ -484,11 +484,11 @@ impl GlmfWorkingSetExt for GlmfWorkingSet {
     }
 }
 
-/// The fixed embedding demand is also the executor's immutable table home.
-/// Host-mapped tables have no device demand and retain the entry GPU's alias.
+/// The zero-byte embedding alias records its home without charging the table twice.
+/// Host-mapped tables have no device alias and retain the entry GPU's home.
 pub fn embedding_home(placed: &Placement) -> u8 {
     placed.items.iter().position(|items| items.iter().any(|item|
-        item.category == Category::Embedding && item.group == "embedding" && item.bytes > 0))
+        item.category == Category::Embedding && item.group == "embedding"))
         .unwrap_or(0) as u8
 }
 

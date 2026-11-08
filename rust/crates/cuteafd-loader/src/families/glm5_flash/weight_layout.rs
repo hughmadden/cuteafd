@@ -152,6 +152,27 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
         format!("glm5_flash/target/{rank}"), requests)).collect()
 }
 
+/// Complete target alternatives for every legal embedding home. The offline
+/// planner and serving admission use this same header-derived recipe.
+pub fn target_options(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
+    ranks: usize, representation: super::resident::GlmfRepresentation, embedding_bytes: u64,
+    native: Option<&crate::plan::exlr8::native::DenseFacts>) -> Result<Vec<Vec<WeightArenaLayout>>> {
+    let homes = if embedding_bytes == 0 { 1 } else { ranks };
+    if let Some(facts) = native {
+        use crate::plan::exlr8::dense::requests::NativeDenseRecords;
+        let owners = modes.iter().enumerate().filter_map(|(layer, mode)| match mode {
+            LayerMode::Whole { gpu, .. } if cfg.attention[layer] == GlmNextAttention::Mla && ranks > 1 =>
+                Some((layer, usize::from(*gpu))), _ => None,
+        }).collect();
+        let dense = (0..ranks).map(|rank| NativeDenseRecords::from_records(&facts.records, &facts.selection,
+            modes.len(), ranks, rank, &owners)).collect::<Result<Vec<_>>>()?;
+        return (0..homes).map(|home| native_target(facts, &dense, cfg, home)).collect();
+    }
+    (0..homes).map(|home| target(checkpoint, cfg, modes, ranks, representation.kda_fp8,
+        representation.output_shard, representation.fp8_head,
+        (embedding_bytes > 0).then_some((home, usize::try_from(embedding_bytes)?)))).collect()
+}
+
 /// Native EXLR8 target arenas, one per rank: every layer's records (KDA conv
 /// weights in one plain pack), rank zero's final norm, the row-FP8 embedding on
 /// `embedding_rank` and head on rank zero, and the embedding facade on rank
@@ -182,8 +203,10 @@ pub fn native_target(facts: &crate::plan::exlr8::native::DenseFacts,
     }
     // The embedding facade has its own final placeholder, not a BF16 vocabulary source.
     requests[0].push(("embedding.table".into(), 256));
-    requests.into_iter().enumerate().map(|(rank, requests)|
-        WeightArenaLayout::new(format!("glm5_flash/target/{rank}"), requests)).collect()
+    requests.into_iter().enumerate().map(|(rank, mut requests)| {
+        requests.sort_by(|left, right| left.0.cmp(&right.0));
+        WeightArenaLayout::new(format!("glm5_flash/target/{rank}"), requests)
+    }).collect()
 }
 
 #[cfg(test)]

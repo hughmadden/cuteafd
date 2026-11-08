@@ -2000,6 +2000,7 @@ impl Opened {
                 representation, args.token_io.embed_placement,
                 engine::GlmfAttention { first_owner: attention.first_owner ^ 1, ..attention })?);
         }
+        process.target(&headers, &inputs, native_admission.map(|native| (&native.facts, &native.metadata)))?;
         let geometry = admission::admission::host_geometry(&inputs)?;
         let host_config = args.serving_prefix.as_ref().map(|prefix| {
             use cuteafd_engine::prefix::{FamilyLayout, MarkStore, PageOwners};
@@ -2664,10 +2665,11 @@ impl Opened {
             Ok((loaded.0, (loaded.1, tp2)))
             })?
         };
-        embedding.validate_residency(embedding_device.id, placement.items[embedding_rank].iter()
-            .filter(|item| item.category == cuteafd_core::memory_layout::Category::Embedding
-                && item.group == "embedding" && item.bytes > 0)
-            .map(|item| item.bytes).sum::<u64>()).context("GLM Flash embedding admission")?;
+        embedding.validate_residency(embedding_device.id, admitted_plan.facts.allocations.iter()
+            .filter(|owner| owner.location == cuteafd_loader::placement::planner::Location::coordinator(embedding_rank as u8)
+                && owner.category == cuteafd_core::memory_layout::Category::Embedding
+                && owner.group == "embedding" && owner.view.is_some())
+            .map(|owner| owner.bytes).sum::<u64>()).context("GLM Flash embedding admission")?;
         tracing::info!(rank = embedding_rank, device = embedding_device.id, bytes = embedding.device_bytes(),
             "GLM Flash embedding matches admission (peer-readable single residency)");
         let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();

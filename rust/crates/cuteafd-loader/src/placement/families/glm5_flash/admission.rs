@@ -19,6 +19,13 @@ pub struct ProcessOwners {
     pub auto_vision: bool,
     pub media_cache_bytes: u64,
     pub alternate_resident: Option<Vec<GlmfResidentRank>>,
+    /// Exact target layouts by embedding-home option, then coordinator rank.
+    pub target_arenas: Vec<Vec<crate::serving_capacity::WeightArenaLayout>>,
+    pub alternate_target_arenas: Vec<Vec<crate::serving_capacity::WeightArenaLayout>>,
+    /// Native shared experts retain their independent format-owned backings.
+    pub shared_arenas: Vec<Vec<(String, u64)>>,
+    /// Standalone drafter layouts; TP1 has one home-independent layout.
+    pub draft_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
     pub push_host: Option<crate::push_load::PushHostEnvelope>,
     /// The drafter's standalone push group, after the target group has committed.
     pub draft_push: Option<DraftPush>,
@@ -196,8 +203,32 @@ impl NativeLoad {
 impl ProcessOwners {
     pub fn new(host: (u64, u64), host_headroom: u64) -> Self {
         Self { host, host_headroom, allocations: vec![], links: vec![], remote_experts: true, physical_sparks: 0, native_load: None, mount_load: None,
-            encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None, push_host: None,
+            encoders: vec![], auto_vision: false, media_cache_bytes: 0, alternate_resident: None,
+            target_arenas: vec![], alternate_target_arenas: vec![], shared_arenas: vec![], draft_arenas: vec![], push_host: None,
             draft_push: None, draft_tp2: vec![] }
+    }
+
+    /// Prepare the exact target backings before admission, including the
+    /// alternate whole-MLA profile when the solver may choose its first owner.
+    pub fn target(&mut self, checkpoint: &crate::plan::Checkpoint, i: &GlmfInputs<'_>,
+        native: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> anyhow::Result<()> {
+        let layouts = |input: &GlmfInputs<'_>| crate::families::glm5_flash::weight_layout::target_options(
+            checkpoint, input.cfg, &modes(input), input.gpus.len(), input.representation,
+            input.resident.iter().map(|rank| rank.embedding).sum(), native.map(|(facts, _)| facts));
+        self.target_arenas = layouts(i)?;
+        if let Some(resident) = &self.alternate_resident {
+            let mut alternate = i.clone();
+            alternate.attention.first_owner ^= 1;
+            alternate.resident = resident.clone();
+            self.alternate_target_arenas = layouts(&alternate)?;
+        }
+        self.shared_arenas = if let Some((_, metadata)) = native {
+            (0..i.gpus.len()).map(|rank| (0..i.layers).filter(|&layer| !i.cfg.dense[layer]).map(|layer| {
+                let plan = metadata.plan(layer, i.gpus.len(), rank, crate::plan::exlr8::residency::ExpertSet::Shared)?;
+                Ok((format!("glm.weights.gpu.{rank}.shared.layer.{layer}.backing"), plan.resident_bytes as u64))
+            }).collect::<anyhow::Result<Vec<_>>>()).collect::<anyhow::Result<Vec<_>>>()?
+        } else { vec![] };
+        Ok(())
     }
 
     pub fn serving(&mut self, i: &GlmfInputs<'_>, quota: u64, chunk: u64, host_embedding: u64,
@@ -385,6 +416,16 @@ fn add_demand(contract: &mut p::Contract, demand: &Demand, id: String,
     Ok(())
 }
 
+fn add_arena(contract: &mut p::Contract, layout: &crate::serving_capacity::WeightArenaLayout,
+    gpu: usize, lifetime: p::Lifetime, activation: &p::Activation) -> Result<(), p::Refusal> {
+    for mut owner in p::weight_arena_components(layout, p::Location::coordinator(gpu as u8),
+        lifetime, contract.maximum_pages)? {
+        owner.activation = activation.clone();
+        contract.components.push(owner);
+    }
+    Ok(())
+}
+
 fn modes(i: &GlmfInputs<'_>) -> Vec<LayerMode> {
     let mut mla_owner = i.attention.first_owner;
     (0..i.layers).map(|layer| {
@@ -406,6 +447,7 @@ pub fn prepare<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, mut pro
     -> Result<PreparedGlmf<'a>, p::Refusal> {
     let started = std::time::Instant::now();
     let alternate = process.alternate_resident.take();
+    let alternate_arenas = std::mem::take(&mut process.alternate_target_arenas);
     let mut prepared = prepare_fixed(i, sms, rtx_experts, process.clone())?;
     if let Some(resident) = alternate {
         if i.gpus.len() != 2 || i.attention.mode != AttentionPlacement::Layers || resident.len() != 2 {
@@ -414,6 +456,10 @@ pub fn prepare<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, mut pro
         let mut input = i.clone();
         input.attention.first_owner ^= 1;
         input.resident = resident;
+        if !process.target_arenas.is_empty() && alternate_arenas.is_empty() {
+            return Err(invalid("Flash alternate attention arena inventory"));
+        }
+        process.target_arenas = alternate_arenas;
         let alternate = prepare_fixed(&input, sms, rtx_experts, process)?;
         let first_mla = i.cfg.attention[..i.layers].iter().position(|kind| *kind == GlmNextAttention::Mla)
             .ok_or_else(|| invalid("Flash alternating ownership lacks MLA layer"))?;
@@ -681,6 +727,48 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             contract.components.push(owner);
         }
     }
+    let target_arenas = if process.target_arenas.is_empty() {
+        // Byte-only unit fixtures model final arena requests, never a second
+        // production payload route. Real callers must supply header recipes.
+        #[cfg(test)]
+        {
+            let homes = if embedding == 0 { 1 } else { gpus };
+            (0..homes).map(|home| (0..gpus).map(|rank| {
+                let mut requests = vec![("weights".into(), i.resident[rank].weights as usize)];
+                if embedding > 0 && home == rank { requests.push(("embedding.table".into(), embedding as usize)); }
+                crate::serving_capacity::WeightArenaLayout::new(format!("glm5_flash/target/{rank}"), requests).map_err(invalid)
+            }).collect::<Result<Vec<_>, _>>()).collect::<Result<Vec<_>, _>>()?
+        }
+        #[cfg(not(test))]
+        { return Err(invalid("Flash target arena recipe missing")); }
+    } else { process.target_arenas.clone() };
+    let homes = if embedding == 0 { 1 } else { gpus };
+    if target_arenas.len() != homes || target_arenas.iter().any(|ranks| ranks.len() != gpus) {
+        return Err(invalid("Flash target arena candidate inventory"));
+    }
+    for (home, layouts) in target_arenas.iter().enumerate() {
+        let activation = p::Activation::choice(embedding_variable, home);
+        for (rank, layout) in layouts.iter().enumerate() {
+            add_arena(&mut contract, layout, rank, p::Lifetime::RESIDENT, &activation)?;
+            for (name, view) in layout.views().iter().filter(|(name, _)|
+                name.as_str() == "embedding.table" && embedding > 0 && process.shared_arenas.is_empty()
+                    || name.starts_with("embedding.") && name.as_str() != "embedding.table") {
+                let mut alias = p::Allocation::buffer(format!("glmf.embedding.{rank}.{name}"),
+                    p::Location::coordinator(rank as u8), view.bytes() as u64,
+                    p::Lifetime::RESIDENT, Category::Embedding, "embedding");
+                alias.view = Some(p::View { backing: layout.id().into(), offset: view.offset() as u64 });
+                let mut owner = p::Component::allocation(alias, p::ByteCurve::fixed(view.bytes() as u64, maximum), false, maximum);
+                owner.activation = activation.clone();
+                contract.components.push(owner);
+            }
+        }
+    }
+    for (rank, layouts) in process.shared_arenas.iter().enumerate() {
+        for (id, bytes) in layouts {
+            contract.components.extend(p::weight_arena_extent_components(id, *bytes,
+                p::Location::coordinator(rank as u8), p::Lifetime::RESIDENT, maximum)?);
+        }
+    }
     for (index, row) in facts.fixed.iter().enumerate() {
         if row.demand.group == "pending code" {
             if row.demand.bytes > 0 {
@@ -694,7 +782,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             }
             continue;
         }
-        if row.demand.group == "embedding" || matches!(row.demand.group.as_str(), "graphs" | "graph growth")
+        if matches!(row.demand.group.as_str(), "embedding" | "target weights" | "graphs" | "graph growth")
             || row.demand.group == "Spark intake" && !process.links.is_empty()
             || row.demand.group == "wide decode selector" { continue; }
         let activation = match row.component {
@@ -706,11 +794,6 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         add_demand(&mut contract, &row.demand, format!("glmf.fixed.{index}"), activation)?;
     }
     for gpu in 0..gpus {
-        if embedding > 0 {
-            add_demand(&mut contract, &Demand::new(gpu as u8, Category::Embedding, "embedding", embedding, Basis::Exact)
-                .with_resident_weights(ResidentWeights(embedding)), format!("glmf.embedding.{gpu}"),
-                p::Activation::choice(embedding_variable, gpu))?;
-        }
         let geometry = &facts.geometry.ranks[gpu];
         let bytes = geometry.persistent_unit_bytes.checked_add(geometry.pool_metadata_unit_bytes)
             .and_then(|bytes| bytes.checked_add(geometry.glmf_pool_mark_backing_unit_bytes(i.pool_marks)))
@@ -910,6 +993,11 @@ impl PreparedGlmf<'_> {
             items: (0..i.gpus.len()).map(|gpu| solved.items(p::Location::coordinator(gpu as u8))).collect::<Result<_, _>>()? };
         super::super::GLM5_FLASH.check(&placement).map_err(invalid)?;
         for (gpu, items) in placement.items.iter_mut().enumerate() {
+            if solved.facts.allocations.iter().any(|owner| owner.location == p::Location::coordinator(gpu as u8)
+                && owner.category == Category::Embedding && owner.group == "embedding" && owner.view.is_some()) {
+                items.push(cuteafd_core::memory_layout::Item::new(Category::Embedding, "embedding",
+                    "alias of target weight arena; charged in weight arena", 0, Basis::Exact));
+            }
             items.extend(solved.facts.allocations.iter().filter(|owner|
                 owner.location == p::Location::coordinator(gpu as u8)
                     && owner.view.is_none() && owner.lifetime.first == p::Phase::Growth)
