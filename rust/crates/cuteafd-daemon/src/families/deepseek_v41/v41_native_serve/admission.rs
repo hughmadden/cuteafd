@@ -1232,7 +1232,10 @@ mod admission_tests {
                         + families::deepseek_v41::runtime_reserve(total as u64, ranks)
                             as usize
                         + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
-                    (bytes + reserve + deferred[gpu] as usize + usage_bytes, total)
+                    let mappings = admitted.placement.items[gpu].iter()
+                        .filter(|item| item.group == cuteafd_loader::placement::planner::DRIVER_PAGE_TABLES_GROUP)
+                        .map(|item| item.bytes as usize).sum::<usize>();
+                    (bytes + reserve + deferred[gpu] as usize + usage_bytes + mappings, total)
                 })
                 .collect::<Vec<_>>();
             assert_eq!(

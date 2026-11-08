@@ -236,6 +236,17 @@ impl Default for HostInputs {
     }
 }
 
+impl HostInputs {
+    pub fn from_contract(contract: &super::coordinator::CoordinatorContract, cfg: &Config,
+        gpus: usize, memory: (u64, u64), cache_bytes: Option<u64>, headroom: u64) -> Result<Self> {
+        Ok(Self { memory, cache_bytes, headroom,
+            retained_sync_h2d_bytes: contract.retained_sync_h2d_bytes()?,
+            attention_mount_load: contract.attention_mount_load(gpus)?,
+            push: Some(push_host_envelope(contract, cfg, gpus)?),
+        })
+    }
+}
+
 /// Header-derived upper bound for dense transforms and expert validation.
 /// Estimated staging until a Step-5 census supplies a tighter per-rank bound.
 pub fn push_host_envelope(contract: &super::coordinator::CoordinatorContract, cfg: &Config,
@@ -759,7 +770,12 @@ mod tests {
                 assert_eq!(allowances[0].bytes, 4 << 20);
                 assert!(!allowances[0].assumed);
                 let payload = admission.reservations[rank].pages as u64;
-                assert_eq!(charged, fixed + hops[rank] + payload + tails + allowances[0].bytes);
+                let mappings = admission.solved.facts.driver_page_tables.iter()
+                    .filter(|owner| owner.location == crate::placement::planner::Location::coordinator(rank as u8)
+                        && owner.lifetime.contains(crate::placement::planner::Phase::Ready, admission.solved.facts.phase_order))
+                    .map(|owner| owner.bytes()).sum::<u64>();
+                assert!(mappings > 0);
+                assert_eq!(charged, fixed + hops[rank] + payload + tails + allowances[0].bytes + mappings);
             }
             assert_eq!(admission.ownership.execution().mode(3)?, WHOLE0);
             if ranks == 2 {

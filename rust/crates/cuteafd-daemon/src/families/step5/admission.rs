@@ -284,8 +284,11 @@ mod tests {
                     }
                 })
                 .collect();
+            let contract = cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+            let cfg = cuteafd_loader::plan::families::step5::Config::parse(&checkpoint)?;
             let mut inputs = RuntimeInputs {
-                host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
+                host: admission::HostInputs::from_contract(&contract, &cfg, ranks,
+                    opts.host_memory.unwrap(), host, 8 << 30)?, resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),
                 spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format,
                 inventory: Inventory {

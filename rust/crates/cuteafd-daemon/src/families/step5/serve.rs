@@ -336,17 +336,12 @@ fn with_backend<T>(args: &ServeArgs,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
-    inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs {
-        memory: cuteafd_loader::formats::mapped_preload::host_memory()?,
-        cache_bytes: match args.prefix.host_cache_bytes {
+    inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs::from_contract(
+        &contract, &cfg, ids.len(), cuteafd_loader::formats::mapped_preload::host_memory()?,
+        match args.prefix.host_cache_bytes {
             crate::shared::prefix::budget::HostBudget::Auto => None,
             crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes),
-        },
-        headroom: args.prefix.host_cache_headroom_bytes,
-        retained_sync_h2d_bytes: contract.retained_sync_h2d_bytes()?,
-        attention_mount_load: contract.attention_mount_load(ids.len())?,
-        push: Some(cuteafd_loader::plan::families::step5::admission::push_host_envelope(&contract, &cfg, ids.len())?),
-    };
+        }, args.prefix.host_cache_headroom_bytes)?;
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
     let planning = std::time::Instant::now();
     // One admission: the contract prices every retained owner, and native ABIs
